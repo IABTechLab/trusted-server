@@ -1,10 +1,17 @@
 # Server-side identity providers
 
-Status: Draft, revision 12. Revised after review rounds 1 to 11. Section 17
-maps each finding to its fix.
+Status: Draft, revision 15. Revised after review rounds 1 to 14. Revision 14
+made `ts-eids-s` a client-only cookie, at the user's request. Revision 15
+removes the `ts-eids-r` removal cookies, runs providers only on writer
+navigations, makes capture revoke-only and moves KV to schema version 2,
+accepting breaking changes. Section 16 lists the decisions; the
+[review log](2026-10-20-server-side-identity-providers-review-log.md) maps
+each earlier finding to its fix.
 
-Issue: none filed yet. Related: [#1245](https://github.com/IABTechLab/trusted-server/issues/1245)
-(LiveRamp server-to-server), [#90](https://github.com/IABTechLab/trusted-server/issues/90)
+Issue: none filed yet. Related:
+[#1245](https://github.com/IABTechLab/trusted-server/issues/1245)
+(LiveRamp server-to-server),
+[#90](https://github.com/IABTechLab/trusted-server/issues/90)
 and [#353](https://github.com/IABTechLab/trusted-server/issues/353) (ID5),
 [#1246](https://github.com/IABTechLab/trusted-server/issues/1246) (Lockr IDs to
 KV), [#777](https://github.com/IABTechLab/trusted-server/issues/777)
@@ -33,6 +40,11 @@ Terms used throughout:
 
 - **EID / UID**: an OpenRTB extended identifier, `{source, uids[]}`, and one
   entry of its `uids`, `{id, atype?, ext?}` (OpenRTB 2.6 §3.2.27, §3.2.28).
+- **EID-level fields**: an EID's `inserter`, `matcher`, `mm` and its own
+  `ext`, as opposed to a UID's `atype` and `ext`.
+- **Entry set**: every EID entry stored for one source, written by one writer
+  and replaced or removed whole (section 6.1). A provider may return several
+  entries per source, each with several UIDs.
 - **Identity provider**: a vendor that turns request signals into an EID,
   such as ID5, LiveRamp ATS, Lockr AIM or UID2.
 - **Source**: the EID `source` domain a provider's IDs carry, such as
@@ -48,20 +60,23 @@ Terms used throughout:
   `/_ts/page-bids`, and integration proxy calls.
 - **Writer request**: the one request in a page load allowed to write KV
   (section 5.1).
-- **Stager**: every other request. It reads cookies and KV and saves changes
-  into `ts-eids-s` for the next writer request to write.
-- **KV gap**: the registered sources a browser sent to `/auction` that the
-  visitor's KV row does not have yet.
+- **Stager**: every other request. It reads cookies and KV, runs no
+  resolving provider and persists no positive ID. Its only KV write is the
+  capture removal write, for a revocation a proxied call carries (section
+  5.3).
 - **Hold mode / after-send mode**: whether a provider is called before the
   auction, with the auction waiting for it, or after the response has been
   sent.
 - **Orphan recovery**: what TS does when a visitor's EC cookie has no KV row
   (`ec/finalize.rs:282`).
 - **`ts-eids`**: the existing first-party cookie the Prebid shim writes with
-  the browser's EIDs. Unchanged by this spec.
-- **`ts-eids-s`**: a new server-owned cookie, named `__Host-ts-eids-s`, that
-  caches provider-collected IDs and holds staged changes. Defined in section
-  6.2.
+  the browser's EIDs. Unchanged by this spec, except that its trim keeps
+  registered sources first (section 5.3).
+- **`ts-eids-s`**: a new client-only cookie, named `__Host-ts-eids-s`, that
+  the shim writes from the servable server set TS returns in `/auction` and
+  `/_ts/page-bids` responses. It mirrors server IDs for page scripts. The
+  server never opens, parses or trusts it, and the shim never copies it
+  into `ts-eids` or the `/auction` body. Defined in section 6.2.
 
 ## 1. Problem statement
 
@@ -81,7 +96,9 @@ avoids the browser request.
 This spec builds that server-side path. In v1 it helps:
 
 - providers that need no hashed email, such as ID5
-- providers whose traffic TS already proxies, such as Lockr
+- providers whose traffic TS already proxies, such as Lockr, for removals
+  and opt-outs. A positive capture on a proxied API call is not persisted
+  (section 2.3)
 - generic pull partners
 - any owning provider that can refresh an ID a browser module obtained
   earlier, so the ID survives when the module later fails in that browser
@@ -160,12 +177,18 @@ can be written, and each extra write is another CAS race between tabs.
 - **G4.** At most one browser-driven KV write per page load, and a write
   that fails is not retried. This is strict. The only page-load exceptions
   are a consent withdrawal's tombstone (section 5.1), which also covers a
-  capture provider's global revoke (section 8), and a removal batch from a
-  real browser that the removal cookies cannot hold (section 6.2). Writers outside page loads
-  keep their own writes: batch sync, the admin endpoints and the deferred
-  deletion framework (sections 2.2, 5.5).
-- **G5.** Provider-collected IDs are stored in both a first-party cookie
-  (`ts-eids-s`) and KV, and the cookie is read first.
+  capture provider's global revoke (section 8), and the two removal writes:
+  the capture removal write a proxied revocation from a real browser makes
+  (section 5.3), and the removal-only retry of a failed flush (section 5.2,
+  phase 4). All are rare and removal-only. Writers outside page loads keep
+  their own
+  writes: batch sync, the admin endpoints and the deferred deletion
+  framework (sections 2.2, 5.5).
+- **G5.** Provider-collected IDs are stored in KV and mirrored in a
+  first-party cookie (`ts-eids-s`) that page scripts read. KV is the only
+  server-side source of provider IDs: eligibility, the auction merge,
+  `/identify` and servability read KV, never `ts-eids-s`. Section 15 asks
+  whether this meets the product rule that the cookie is read first.
 - **G6.** Each source has at most one owning provider, configured by the
   operator. A valid ID the owner wrote wins in the auction over the
   browser's.
@@ -176,22 +199,37 @@ can be written, and each extra write is another CAS race between tabs.
   behaviour that does change.
 - **G9.** The trait can model a provider that needs a HEM, even though v1
   has no way to obtain one.
-- **G10.** No browser EID that reaches KV today is lost. Everything today's
-  `/auction` ingest writes still reaches KV, through the next writer request.
-  What today's `/_ts/page-bids` ingest writes comes from `ts-eids`, which the
-  next navigation ingests; only an SPA session longer than that cookie's
-  one-day lifetime can lose such an ID. A body-only ID beyond the `ts-eids`
-  trim is lost only when KV-gap entries alone exceed the `ts-eids-s` cap
-  and the browser sends no further `/auction` before the next navigation.
+- **G10.** No browser EID that reaches KV today is lost, within one bound.
+  Browser ingest runs only on the writer request, from `ts-eids`. The shim
+  trims `ts-eids` keeping registered sources first (section 5.3), so the
+  next writer request ingests every registered source today's `/auction`
+  ingest writes from the body. A body-only registered ID is lost only when
+  the registered sources alone exceed the 3,072-byte trim. What today's
+  `/_ts/page-bids` ingest writes comes from `ts-eids` too; only an SPA
+  session longer than that cookie's one-day lifetime can lose such an ID.
 - **G11.** Writing a provider is easy, and extending the trait does not
   break one. A simple provider is one struct, one descriptor and two short
   methods (section 4.2).
-- **G12.** Removals win. An ID removed from KV (opt-out, invalidation,
-  withdrawal, deletion) stops reaching bidders within a bounded time, even
-  from the cookie. A removal staged by a stager stops that client's
-  bidstream at once and reaches KV at the client's next writer navigation; a
-  client that never makes one, such as a script that fails the real-browser
-  check (section 4.7), keeps it in `ts-eids-r` until it does.
+- **G12.** Removals win. Every removal (opt-out, invalidation, withdrawal,
+  deletion) is written to KV on the request that carries it, and TS serves
+  only from KV, so the ID stops reaching bidders through TS at once. A
+  removed provider ID also stops reaching them as a browser value: the
+  removing provider's `ps.iv`, `ps.ov` and `ps.o` filter browser candidates
+  (section 7.1). The `ts-eids-s` mirror drops it at the next `/auction` or
+  `/_ts/page-bids` response. The one bound: a removal write that fails all
+  its attempts is lost (section 2.3).
+- **G13.** A provider can return complete EIDs, with the same fidelity the
+  browser's `/auction` body has: several EID entries per source, several
+  UIDs per entry, UID-level `atype` and `ext`, and the EID-level fields. TS
+  stores the entry set whole in KV, mirrors it whole in `ts-eids-s` when it
+  fits, and sends it to bidders whole (sections 4.5, 6.1, 6.2, 7.1). This is
+  additive in behaviour: G13 itself changes none of the paths that predate
+  this spec. Browser ingest, `ts-eids`, batch sync, generic pull and
+  `/identify` keep the behaviour the rest of this spec gives them (sections
+  5, 6.2, 7.2, 10.4), and every record they write is one entry with one
+  UID and no EID-level fields. The storage shape changes for every record
+  (schema version 2, section 6.1); what bidders receive for these records
+  does not.
 
 ### 2.2 Non-goals
 
@@ -210,6 +248,58 @@ can be written, and each extra write is another CAS race between tabs.
 - **Batch sync and admin writes.** They keep their own writes. Section 7.2
   changes only how batch sync treats an owned source.
 - **Removing `ts-eids` or `x-ts-eids`.** Both stay.
+- **Storing the browser's complete EID set.** Browser ingest keeps today's
+  rules: registered sources only, one UID per source picked as
+  `collect_eid_updates` picks it today (`ec/prebid_eids.rs:146-151`: for a
+  repeated source, the first valid UID of its last entry, with the sharedId
+  cookie applied last), no EID-level fields, fill-missing
+  (`ec/kv.rs:145-155`).
+  The browser's complete set still reaches bidders from the `/auction` body,
+  as the EID fidelity work defines. G13 applies only to IDs a provider
+  writes.
+
+- **Unregistered sources for providers.** A provider still claims only
+  sources with an `[[ec.partners]]` entry (section 10.2). Full fidelity
+  changes what a provider may return for a source, not which sources.
+
+### 2.3 Accepted tradeoffs
+
+Revisions 14 and 15 make `ts-eids-s` client-only, keep every positive ID
+off stagers and drop every server-owned identity cookie. The design accepts
+these costs for it:
+
+- **Providers run only on writer navigations.** `/auction` and
+  `/_ts/page-bids` call no provider; they serve what KV holds. On a site
+  whose auctions all go through `/auction`, hold-mode providers run after
+  send on the navigation, and their answers reach the next auction from KV
+  (section 4.7, step 7).
+- **Positive captures are not used in v1.** Capture is revoke-only: a
+  proxied call can remove IDs, opt a provider out and clear that opt-out,
+  and nothing else. The browser path (Prebid `ortb2` into `ts-eids`) still
+  carries to KV the one UID browser ingest picks for each registered source
+  (section 2.2). Full-fidelity sets from capture wait for open question 4
+  (sections 4.7,
+  12.2, 15).
+- **A failed removal write can be lost.** A capture removal write is tried
+  before send with the withdrawal path's CAS attempts and once more after
+  send (section 5.3). A writer whose flush fails retries its removals alone
+  with the same CAS attempts (section 5.2, phase 4). When every attempt
+  fails, the removal is logged at error and counted in `removal_lost`, and
+  nothing keeps it. Removals are rare, and a vendor's own SDK holds a
+  revocation too.
+- **A failed flush has no backup.** Browser ingest is re-derived from
+  `ts-eids`, and provider results are resolved again by a later writer
+  (section 5.2, phase 4).
+- **Every returning writer navigation reads KV once.** No navigation is
+  answered from a cookie with zero reads (section 5.2).
+- **Server-only IDs are readable by page scripts.** UID2 advertising tokens
+  and LiveRamp envelopes are in `ts-eids-s`, which is not `HttpOnly`.
+  `x-ts-eids` already exposes them (section 9.3).
+- **No provider runs on a new visitor's first navigation.** A visitor who
+  leaves after one page never gets a provider ID. Section 15 asks whether
+  hold-mode providers should feed the create.
+- **Rollback past rollout step 1 is unsupported.** Step 1 writes KV schema
+  version 2, which older builds reject (sections 6.1, 14).
 
 ## 3. Background
 
@@ -238,6 +328,9 @@ send. The result is consent-gated and reported in `x-ts-eids`
 
 Browser ingest is fill-missing: a different stored value is never replaced,
 because a browser value carries no freshness signal (`ec/kv.rs:146-154`).
+A KV record holds one UID per source and no EID-level fields
+(`ec/kv_types.rs:102`), and a KV value goes out as one entry with the
+partner's `openrtb_atype` (`ec/eids.rs:64-76`).
 
 ### 3.3 The existing provider pattern
 
@@ -255,7 +348,8 @@ follows the same split.
   (`ec/mod.rs:407-455`). Finalize refuses a generated cookie without a
   backing row (`ec/finalize.rs:145-149`). This spec keeps that.
 - **After-send work starts after the last byte.** `send_edgezero_response`
-  streams the whole body before returning (`adapter-fastly/src/main.rs:699-702`),
+  streams the whole body before returning
+  (`adapter-fastly/src/main.rs:699-702`),
   and pull sync runs after that (`main.rs:510-517`). The response has been
   moved into the send by then, so after-send code cannot see its status
   unless it is captured first (`main.rs:512-517`).
@@ -281,7 +375,8 @@ follows the same split.
   publisher fallback may rotate (`adapter-fastly/src/app.rs:885-890`).
 - **Today's navigation preload finds orphans.** Every returning GET
   navigation preloads the row unless a valid pull-complete marker lets it
-  skip (`publisher.rs:3110-3117`, `:4819-4831`).
+  skip (`publisher.rs:3110-3117`, `:4819-4831`). This spec removes the
+  marker (section 10.4), so every returning navigation preloads.
 - **Withdrawal tombstones existing rows only,** with a CAS write of up to five
   attempts and then a completion-marker write, per withdrawn ID
   (`ec/kv.rs:1349-1430`, `:1115-1124`; `finalize.rs:490`, `:509-525`).
@@ -298,10 +393,12 @@ follows the same split.
   everyone behind one address shares one budget.
 - **The shim's `ts-eids` is small.** It is trimmed to 3,072 encoded bytes,
   lives one day and has no EID-level `ext` (EID fidelity spec §4.3). The
-  server accepts up to 8 KB (`ec/prebid_eids.rs:24`).
+  server accepts up to 8 KB (`ec/prebid_eids.rs:24`). This spec changes
+  only the trim order: registered sources are kept first (section 5.3).
 - **Prebid Server receives the browser's cookies.** The Prebid transport
   copies the inbound `Cookie` header into every Prebid Server call and strips
-  only consent cookies, only in `OpenrtbOnly` mode (`integrations/prebid.rs:2091-2108`,
+  only consent cookies, only in `OpenrtbOnly` mode
+  (`integrations/prebid.rs:2091-2108`,
   `consent_config.rs:137-150`). The publisher proxy forwards the `Cookie`
   header to the origin unchanged (`publisher.rs:3124-3147`).
 
@@ -312,20 +409,18 @@ follows the same split.
 ```mermaid
 flowchart TD
     subgraph Writer["Writer request: a top-level navigation"]
-        A[Read ts-ec, consent, ts-eids, ts-eids-s] --> B{Cookies answer<br/>everything?}
-        B -- no --> C[KV snapshot read]
-        B -- yes --> D
+        A[Read ts-ec, consent, ts-eids] --> C[Returning EC:<br/>KV snapshot read]
         C --> D[Pick eligible providers]
         D --> E[Hold-mode providers, if the<br/>navigation runs an auction]
-        E --> F[Finalize: queue changes,<br/>set cookies only if needed]
+        E --> F[Finalize: queue changes]
         F --> G[Send response]
-        G --> H[Returning EC: re-read live row]
+        G --> H[After-send provider due:<br/>re-read live row]
         H --> I[After-send providers]
         I --> J[Apply IdentityMutation:<br/>one conditional write]
     end
     subgraph Stagers["Stagers: /auction, /_ts/page-bids, integration proxy"]
-        K[Read cookies, and KV where<br/>the route reads it today] --> L[Hold-mode providers,<br/>passive capture]
-        L --> M[Save results and the KV gap<br/>into ts-eids-s; never write KV]
+        K[Read KV where the<br/>route reads it today] --> L[No providers;<br/>revoke-only capture]
+        L --> M[Mirror payload in the JSON response;<br/>a captured revocation writes KV]
     end
 ```
 
@@ -337,25 +432,35 @@ The design has four parts:
 3. **`IdentityMutation`** (section 5.4). A request-scoped accumulator. Every
    KV change in the writer request is added to it, and it is applied with one
    write.
-4. **`ts-eids-s` cookie** (section 6.2). The cookie-first copy of
-   provider-collected IDs and the place stagers save changes.
+4. **The mirror** (section 6.2). `ts-eids-s` is a client-only cookie the
+   shim writes from the servable server set, for page scripts. The server
+   sets no identity cookie of its own beyond `ts-ec`.
 
 New code lives in `crates/trusted-server-core/src/ec/identity/`:
 
-| File              | Contents                                                               |
-| ----------------- | ---------------------------------------------------------------------- |
-| `mod.rs`          | Module docs, re-exports                                                |
-| `provider.rs`     | The `IdentityProvider` and `IdentityProviderConfig` traits             |
-| `descriptor.rs`   | `ProviderDescriptor`, `Resolves`, `Captures`, `Input`, `ConsentPolicy` |
-| `input.rs`        | `ResolveInput`, `CaptureInput`, `StoredId`, `HashedEmail`, `UnixTime`  |
-| `exchange.rs`     | `ProviderRequest`, `ProviderResponse`                                  |
-| `resolution.rs`   | `Resolution`, `ResolvedId`, `IdentityProviderError`                    |
-| `coordinator.rs`  | Eligibility, dispatch, circuit breaker, result-to-change map           |
-| `mutation.rs`     | `IdentityMutation` and its merge into a live `KvEntry`                 |
-| `cookie.rs`       | `ts-eids-s` and `ts-eids-r`: seal, open, encode, decode, size caps     |
-| `generic_pull.rs` | `GenericPullProvider`, today's pull sync on the trait                  |
-| `config.rs`       | `[ec.identity]` settings and ownership validation                      |
-| `test_support.rs` | `ProviderHarness`, a fake HTTP client and a write-counting KV store    |
+| File              | Contents                                                                        |
+| ----------------- | ------------------------------------------------------------------------------- |
+| `mod.rs`          | Module docs, re-exports                                                         |
+| `ids.rs`          | `IdentityProviderId`, `SourceDomain`, `UnixTime`                                |
+| `provider.rs`     | The `IdentityProvider` and `IdentityProviderConfig` traits                      |
+| `descriptor.rs`   | `ProviderDescriptor`, `Resolves`, `Captures`, `Input`, `ConsentPolicy`          |
+| `input.rs`        | `ResolveInput`, `CaptureInput`, `StoredId`, `HashedEmail`                       |
+| `exchange.rs`     | `ProviderRequest`, `ProviderResponse`                                           |
+| `resolution.rs`   | `Resolution`, `ResolvedEid`, `ResolvedUid`, `IdentityProviderError`, entry sets |
+| `policy.rs`       | Consent policy evaluation and the consent fingerprint                           |
+| `revision.rs`     | Revisions and the UID hashes of `ps.iv` and `ps.ov`                             |
+| `catalog.rs`      | The configured providers, their narrowed sources and source ownership           |
+| `servable.rs`     | The servability check of section 7.1                                            |
+| `coordinator.rs`  | Eligibility, dispatch, circuit breaker, result-to-change map                    |
+| `mutation.rs`     | `IdentityMutation` and its merge into a live `KvEntry`                          |
+| `mirror.rs`       | The `ts-eids-s` mirror payload and its size cap                                 |
+| `request.rs`      | The writer decision and the request's identity state                            |
+| `removal.rs`      | The capture removal write of section 5.3                                        |
+| `runtime.rs`      | `IdentityRuntime`: the catalog and keys an adapter builds once                  |
+| `flush.rs`        | Phase 4, the single write after send                                            |
+| `generic_pull.rs` | `GenericPullProvider`, today's pull sync on the trait                           |
+| `config.rs`       | `[ec.identity]` settings and ownership validation                               |
+| `test_support.rs` | `ProviderHarness`, a fake HTTP client and a write-counting KV store             |
 
 ### 4.2 The trait
 
@@ -377,10 +482,8 @@ The trait follows five rules:
 - **Pure.** `request`, `response` and `capture` have no side effects and no
   hidden inputs. Randomness comes only from `ResolveInput::random_bytes`,
   and anything `response` needs from `request` travels in the call context
-  (section 4.5). The coordinator may call `request` twice in one request,
-  first as a dry run (section 5.2). `input.is_dry_run()` lets a provider skip
-  expensive work in the dry run. A provider with private state gets no dry
-  run.
+  (section 4.5). The coordinator calls `request` at most once per
+  dispatch.
 - **Safe defaults.** The default consent policy is the strictest one, a
   provider can read only what it declared, and a capability declared but not
   implemented fails loudly in tests (section 13).
@@ -504,14 +607,19 @@ the descriptor. Providers never read them.
 **Conventions for the listings below.** Every builder method and getter is
 `#[must_use]`. `Resolves`, `Captures` and `EidProvenance` implement
 `Default`. `Input`, `Access`, `ResolveKind` and `UsOptOut` derive
-`Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, derive_more::Display`.
+`Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord,
+derive_more::Display`.
 `When` derives `Debug, Clone, Copy, PartialEq, Eq` only, because `Duration`
-has no `Display`. `ProviderRequest`, `StoredId` and `HashedEmail` derive
-`Debug, Clone`; `HashedEmail`'s `Debug` prints a redacted marker.
+has no `Display`. `ProviderRequest` derives `Debug, Clone`. `StoredId` and
+`HashedEmail` derive `Clone` and have redacting `Debug` implementations
+(section 9.3).
 `StateChange` derives `Debug, PartialEq, Eq`. `ProviderDescriptor`,
 `Resolves`, `Captures`, `ConsentPolicy` and `EidProvenance` derive
-`Debug, Clone, PartialEq, Eq`, so tests can compare descriptors. `UnixTime` derives
-`Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord`. `IdentityProviderId`
+`Debug, Clone, PartialEq, Eq`, so tests can compare descriptors. `UnixTime`
+derives
+`Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord`. `ResolvedEid` and
+`ResolvedUid` derive `Clone` and have redacting `Debug` implementations
+(section 9.3). `IdentityProviderId`
 and `SourceDomain` derive `Debug, Clone, PartialEq, Eq, Hash, PartialOrd,
 Ord, derive_more::Display` and implement `FromStr` (with
 `type Err = Report<IdentityProviderError>`), `Serialize` and `Deserialize`.
@@ -566,16 +674,21 @@ impl ProviderDescriptorBuilder {
     /// Marks the IDs of one declared source as expiring, for a provider
     /// whose sources differ.
     pub fn with_expiring_source(self, source: &SourceDomain) -> Self;
-    /// EID-level fields for a declared source. The coordinator adds them to
-    /// every server-side value of that source this provider wrote. No KV
-    /// field stores them.
+    /// Default EID-level fields for a declared source. At output, the
+    /// coordinator applies them to a stored entry of that source, written
+    /// by this provider, only when the entry sets none of `inserter`,
+    /// `matcher` and `mm`. An entry that sets any of them is the vendor's
+    /// complete statement, so vendor and config provenance never mix in one
+    /// entry. The defaults are not stored, so a config change applies at
+    /// once.
     pub fn with_provenance(self, source: &SourceDomain, provenance: EidProvenance) -> Self;
     /// # Errors
     ///
     /// Returns `Config` when the descriptor has no source, no capability, a
     /// resolver with no endpoint or host, an endpoint that is not an `https`
-    /// URL, a host that is not a bare hostname, or provenance or an
-    /// expiring mark for a source it does not declare.
+    /// URL, a host that is not a bare hostname, provenance or an expiring
+    /// mark for a source it does not declare, or a provenance `inserter` or
+    /// `matcher` that is blank or over 255 bytes, or an `mm` below 0.
     pub fn build(self) -> Result<ProviderDescriptor, Report<IdentityProviderError>>;
 }
 
@@ -594,8 +707,8 @@ impl Resolves {
     pub fn with_wants(self, inputs: impl IntoIterator<Item = Input>) -> Self;
     /// The kinds this provider handles. Default: `Initial` and `Refresh`.
     pub fn with_kinds(self, kinds: impl IntoIterator<Item = ResolveKind>) -> Self;
-    /// This provider keeps private state, so it runs only on the writer
-    /// request, where state can be stored (section 5.3).
+    /// This provider keeps private state in KV (`ps.st`, section 6.1). It
+    /// can then read [`ResolveInput::state`] and return a state change.
     pub fn with_private_state(self) -> Self;
 }
 
@@ -605,16 +718,13 @@ impl Captures {
     pub fn with_path(self, method: Method, path: &str) -> Self;
     /// Offers proxied responses whose path starts with `prefix`. Repeatable.
     pub fn with_path_prefix(self, prefix: &str) -> Self;
-    /// JSON pointers to consent strings in the proxied request's JSON body
-    /// (TCF, GPP or US Privacy, detected by format). The coordinator
-    /// extracts and decodes only these fields, and gates capture by the
-    /// stricter of the cookie consent and the body consent. The provider
-    /// never sees the body.
-    pub fn with_request_consent(self, pointers: impl IntoIterator<Item = &'static str>) -> Self;
 }
 
-/// EID-level fields (OpenRTB 2.6 §3.2.27) that bidders read, such as who
-/// inserted an ID and how it was matched.
+/// Default EID-level fields (OpenRTB 2.6 §3.2.27) that bidders read, such as
+/// who inserted an ID and how it was matched. A provider whose vendor
+/// returns these per response sets them on each `ResolvedEid` instead
+/// (section 4.5). An unset field stays unset: OpenRTB 2.6 reads a missing
+/// `matcher` as `source`, so a default never needs a blank value.
 impl EidProvenance {
     pub fn new() -> Self;
     pub fn with_inserter(self, inserter: &str) -> Self;
@@ -688,7 +798,8 @@ accessor with the same visibility. Only `generic_pull.rs` uses them.
 
 Every capture path and prefix must lie under the registering integration's
 own proxy routes (`IntegrationProxy::routes`, `integrations/registry.rs:316`).
-`IntegrationRegistration::build()` cannot fail (`integrations/registry.rs:720-722`),
+`IntegrationRegistration::build()` cannot fail
+(`integrations/registry.rs:720-722`),
 so the check runs in `IntegrationRegistry::with_plan`
 (`integrations/registry.rs:842-865`), which already returns an error and
 merges every registration. The error names the integration.
@@ -728,7 +839,8 @@ Accessors fail in two ways:
 - **`UndeclaredInput { access }`**: the descriptor never declared the input,
   the endpoint or private state. That is a provider bug. `.ok()` would hide
   it, so every accessor also records an undeclared read on the
-  `ResolveInput`. After `request` or `response` returns, the coordinator logs any recorded
+  `ResolveInput`. After `request` or `response` returns, the coordinator
+  logs any recorded
   read as `Config`, and the harness fails the test (section 13), whatever
   the provider did with the error.
 - **`InputUnavailable { input }`**: the input was declared but is missing
@@ -758,11 +870,6 @@ impl ResolveInput<'_> {
     /// starts fresh (section 8). Without `with_private_state()` it is
     /// `UndeclaredInput`.
     pub fn state<T: DeserializeOwned>(&self) -> Result<Option<T>, Report<IdentityProviderError>>;
-    /// True during the dry run of section 5.2. The request is discarded, so
-    /// a provider may skip expensive work and return `Some` early. Always
-    /// false for a provider declared `with_private_state()`, which gets no
-    /// dry run.
-    pub fn is_dry_run(&self) -> bool;
     /// The endpoint declared with `Resolves::with_endpoint`.
     pub fn endpoint(&self) -> Result<&Url, Report<IdentityProviderError>>;
     pub fn consent(&self) -> &ProviderConsent;
@@ -787,7 +894,7 @@ impl CaptureInput<'_> {
     pub fn primary_source(&self) -> &SourceDomain;
     pub fn source_named(&self, name: &str) -> Option<&SourceDomain>;
     pub fn stored(&self, source: &SourceDomain) -> Option<&StoredId>;
-    /// The stricter of the cookie consent and the request-body consent.
+    /// The request's consent, from its cookies and headers.
     pub fn consent(&self) -> &ProviderConsent;
     pub fn publisher_domain(&self) -> &str;
     pub fn now(&self) -> UnixTime;
@@ -803,12 +910,22 @@ pub enum ResolveKind {
     Refresh,
 }
 
+/// A source's stored record: its entry set and the record's metadata.
 impl StoredId {
+    /// Every stored entry for the source, in stored order, with its UIDs and
+    /// EID-level fields. A record that browser ingest, generic pull, batch
+    /// sync or a schema version 1 row wrote is one entry with one UID.
+    pub fn eids(&self) -> &[Eid];
+    /// The first UID of the first entry. What a single-UID refresh, such as
+    /// LiveRamp's, sends back.
     pub fn uid(&self) -> &str;
+    /// The `atype` of that first UID.
     pub fn atype(&self) -> Option<i32>;
-    /// UID-level ext, as bidders read it in `uids[].ext`.
+    /// The UID-level ext of that first UID, as bidders read it in
+    /// `uids[].ext`.
     pub fn ext(&self) -> Option<&serde_json::Value>;
-    /// The provider that wrote it. `None` for browser ingest and legacy rows.
+    /// The provider that wrote it. `None` for browser ingest and version 1
+    /// records.
     pub fn writer(&self) -> Option<&IdentityProviderId>;
     pub fn acquired_at(&self) -> Option<UnixTime>;
     pub fn expires_at(&self) -> Option<UnixTime>;
@@ -861,13 +978,12 @@ page URL into `EcContext`, because after-send code no longer has the request
 - **`ClientIp`**: `services.client_info().client_ip`, the platform's address
   (as `publisher.rs:5574-5578` does), never a request header and never the
   normalized EC IP.
-- **`PageUrl`**: the navigation URL; on `/auction`, the Referer as the
-  auction sanitizer reduces it (`auction/formats.rs:106-155`); on
-  `/_ts/page-bids`, the request origin plus the normalized `path` parameter
-  (`publisher.rs:6978-6989`). Always without query string or fragment. A
-  path can still carry identifiers on some sites, so `PageUrl` is a wanted
-  input for most providers, never needed.
-- **`Region`**: from the request's `GeoInfo` (`adapter-fastly/src/app.rs:423-432`).
+- **`PageUrl`**: the navigation URL, the only request providers run on
+  (section 4.7, step 7). Always without query string or fragment. A path
+  can still carry identifiers on some sites, so `PageUrl` is a wanted input
+  for most providers, never needed.
+- **`Region`**: from the request's `GeoInfo`
+  (`adapter-fastly/src/app.rs:423-432`).
   `GeoInfo.region` is a free-form `Option<String>` (`platform/types.rs:32`),
   so the coordinator normalizes it to the ISO 3166-2 subdivision and upper
   case. City, coordinates, metro and ASN are never passed.
@@ -938,11 +1054,15 @@ impl ProviderResponse {
 }
 
 impl Resolution {
-    /// One or more IDs, at most one per source: KV holds one UID per
-    /// source. The coordinator keeps the first ID for a source, discards the
-    /// rest with a log, and the harness fails the test. An empty set becomes
-    /// `no_match`, and `is_no_match()` then returns true.
-    pub fn found(ids: impl IntoIterator<Item = ResolvedId>) -> Self;
+    /// One or more EID entries. A source may appear in several entries, in
+    /// the order bidders should see them. The entries of one source form its
+    /// new entry set. For an owned source it replaces the stored set whole
+    /// (section 6.1); for an unowned source it only fills an absent or
+    /// expired record (`FillMissing`, section 7.2) and is never replaced by
+    /// its writer. A source the result does not name is left as it is. An
+    /// empty result becomes `no_match`, and `is_no_match()` then returns
+    /// true.
+    pub fn found(eids: impl IntoIterator<Item = ResolvedEid>) -> Self;
     /// The provider recognized no one, or a capture held nothing.
     pub fn no_match() -> Self;
     /// The stored ID for `source` is no longer valid.
@@ -968,7 +1088,7 @@ impl Resolution {
     pub fn replacing_state(self, state: &impl Serialize) -> Self;
     pub fn clearing_state(self) -> Self;
 
-    pub fn ids(&self) -> &[ResolvedId];
+    pub fn eids(&self) -> &[ResolvedEid];
     pub fn invalidated(&self) -> &[SourceDomain];
     pub fn is_no_match(&self) -> bool;
     pub fn is_opted_out(&self) -> bool;
@@ -983,12 +1103,23 @@ pub enum StateChange<'a> {
     Clear,
 }
 
-impl ResolvedId {
-    pub fn new(source: &SourceDomain, uid: impl Into<String>) -> Self;
-    pub fn with_atype(self, atype: i32) -> Self;
-    /// UID-level ext. Over 256 serialized bytes it is dropped and the ID
-    /// kept.
+/// One OpenRTB EID entry a provider returns: a source, its UIDs and its
+/// EID-level fields.
+impl ResolvedEid {
+    /// An entry with one UID, the common case.
+    pub fn new(source: &SourceDomain, uid: ResolvedUid) -> Self;
+    /// Adds another UID to this entry. Repeatable.
+    pub fn with_uid(self, uid: ResolvedUid) -> Self;
+    /// EID-level fields. An entry that sets any of `inserter`, `matcher`
+    /// and `mm` takes no `with_provenance` default (section 4.3).
+    pub fn with_inserter(self, inserter: &str) -> Self;
+    pub fn with_matcher(self, matcher: &str) -> Self;
+    pub fn with_mm(self, mm: i32) -> Self;
+    /// EID-level ext. Over 2,048 bytes as compact JSON it is dropped and
+    /// the entry kept.
     pub fn with_ext(self, ext: serde_json::Value) -> Self;
+    /// Timing applies to the source's whole entry set. When several entries
+    /// of one source set it, the earliest time wins (below).
     pub fn with_expires_in(self, delay: Duration) -> Self;
     pub fn with_expires_at(self, at: UnixTime) -> Self;
     pub fn with_refresh_in(self, delay: Duration) -> Self;
@@ -1000,12 +1131,27 @@ impl ResolvedId {
     pub fn with_refresh_until(self, at: UnixTime) -> Self;
 
     pub fn source(&self) -> &SourceDomain;
-    pub fn uid(&self) -> &str;
-    pub fn atype(&self) -> Option<i32>;
+    pub fn uids(&self) -> &[ResolvedUid];
+    pub fn inserter(&self) -> Option<&str>;
+    pub fn matcher(&self) -> Option<&str>;
+    pub fn mm(&self) -> Option<i32>;
     pub fn ext(&self) -> Option<&serde_json::Value>;
     pub fn expiry(&self) -> Option<When>;
     pub fn refresh(&self) -> Option<When>;
     pub fn refresh_until(&self) -> Option<UnixTime>;
+}
+
+/// One UID within a [`ResolvedEid`].
+impl ResolvedUid {
+    pub fn new(id: impl Into<String>) -> Self;
+    pub fn with_atype(self, atype: i32) -> Self;
+    /// UID-level ext. Over 2,048 bytes as compact JSON it is dropped and the
+    /// UID kept.
+    pub fn with_ext(self, ext: serde_json::Value) -> Self;
+
+    pub fn id(&self) -> &str;
+    pub fn atype(&self) -> Option<i32>;
+    pub fn ext(&self) -> Option<&serde_json::Value>;
 }
 
 /// A time as a provider gave it: relative to `now`, or absolute.
@@ -1058,14 +1204,53 @@ Relative times (`with_expires_in`, `with_refresh_in`, `with_retry_in`) are
 resolved against the request's `now` by the coordinator, so providers rarely
 need the clock.
 
-The coordinator discards a `ResolvedId` whose source the provider does not
-claim (or that the operator narrowed away), or whose `uid` is empty or over
-`MAX_UID_LENGTH` (`ec/kv_types.rs:35`). It logs each discard with the
-provider ID and source only. An ID of an expiring source that carries no
-expiry keeps the stored `exp` when its UID is unchanged, and is discarded
-otherwise, because an owned expiring ID without `exp` is never served
-(section 6.1). That fallback is for a vendor that omits an expiry at
-runtime; the harness fails a fixture that does.
+**From entries to an entry set.** The coordinator groups a result's entries
+by source, keeping their order, and checks each group with the browser
+parser's field rules (EID fidelity spec §4.4), then with per-source caps
+the browser parser does not have: 8 entries, 32 UIDs across them, and
+`MAX_ENTRY_SET_BYTES`. The limits are counted before the result joins the
+mutation, so a stateful result whose set is discarded is handled like an
+oversized state: its positive part is rejected whole (section 5.4) and its
+removals still apply:
+
+- An entry whose source the provider does not claim (or that the operator
+  narrowed away) is discarded.
+- A UID whose `id` is empty, blank or over `MAX_UID_LENGTH`
+  (`ec/kv_types.rs:35`) is dropped. An entry left with no UID is discarded.
+- An `inserter` or `matcher` that is blank or over 255 bytes, a UID-level or
+  EID-level `ext` that is not an object or is over 2,048 bytes as compact
+  JSON, and an `mm` or `atype` below 0 are dropped as fields, and the entry
+  is kept. OpenRTB 2.6 reads a missing `matcher` as `source`, so dropping a
+  blank one keeps its meaning, unless the entry is left with no EID-level
+  field and a provenance default then applies (section 4.3).
+- An entry equal to an earlier kept entry of the same source is dropped.
+- A source keeps its first 8 entries and its first 32 UIDs across them.
+- A source's entry set over `MAX_ENTRY_SET_BYTES` (4,096 bytes) is
+  discarded whole, never trimmed, because a trimmed set is not what the
+  vendor returned. The field caps do not guarantee the set cap: a set whose
+  legal fields exceed 4,096 bytes is discarded whole. The harness fails a
+  fixture that hits this.
+
+`MAX_ENTRY_SET_BYTES` is measured on the stored `eids` array of section 6.1:
+entries without `source`, after the field rules above, without provenance
+defaults, serialized by `serde_json::to_vec`. The coordinator and
+`KvEntry::validate` call the same function, so a set one accepts the other
+accepts.
+
+A discarded set leaves the stored set as it is, as if the result did not
+name the source. A result all of whose sets are discarded is handled as
+`Malformed` (section 8): `f` grows with its backoff, and its removals still
+apply.
+
+Each discard and drop is logged with the provider ID, source and field
+only. The set's `exp`, `ra` and `ru` are the earliest values its kept
+entries set, so a set is never served or refreshed past any of its entries'
+times. A dropped entry's times do not count.
+A set of an expiring source that carries no expiry keeps the stored `exp`
+when its entries are unchanged, and is discarded otherwise, because an
+owned expiring ID without `exp` is never served (section 6.1). That
+fallback is for a vendor that omits an expiry at runtime; the harness fails
+a fixture that does.
 
 `replacing_state` with a value that does not serialize is handled like an
 oversized one: the positive part of the result is rejected whole, so a new ID
@@ -1185,15 +1370,16 @@ impl IdentityProvider for ExampleIdProvider {
             return Ok(Resolution::no_match());
         };
 
-        let mut id = ResolvedId::new(input.primary_source(), uid).with_atype(1);
+        let mut uid = ResolvedUid::new(uid).with_atype(1);
         if let Some(link_type) = reply.link_type {
-            id = id.with_ext(json!({ "linkType": link_type }));
+            uid = uid.with_ext(json!({ "linkType": link_type }));
         }
+        let mut eid = ResolvedEid::new(input.primary_source(), uid);
         if let Some(max_age) = reply.max_age_sec {
-            id = id.with_refresh_in(Duration::from_secs(max_age));
+            eid = eid.with_refresh_in(Duration::from_secs(max_age));
         }
 
-        let resolution = Resolution::found([id]);
+        let resolution = Resolution::found([eid]);
         Ok(match reply.signature {
             Some(signature) => resolution.replacing_state(&ExampleIdState { signature }),
             None => resolution,
@@ -1245,15 +1431,23 @@ impl IdentityProvider for ExampleCaptureProvider {
         };
         Ok(Resolution::found(reply.tokens.into_iter().filter_map(|token| {
             let source = input.source_named(&token.source)?;
-            Some(ResolvedId::new(source, token.value).with_expires_at(UnixTime::from_secs(token.expires)))
+            Some(
+                ResolvedEid::new(source, ResolvedUid::new(token.value))
+                    .with_expires_at(UnixTime::from_secs(token.expires)),
+            )
         })))
     }
 }
 ```
 
 Its descriptor declares
-`.with_captures(Captures::new().with_path(Method::POST, "/integrations/examplecapture/api/token"))`
-and no `resolves`, so it is never dispatched.
+`.with_captures(Captures::new().with_path(Method::POST,
+"/integrations/examplecapture/api/token"))`
+and no `resolves`, so it is never dispatched. In v1 the coordinator uses a
+capture's removals and opt-out, and uses its positive IDs only as the sign
+that the vendor issued again (section 4.7). The IDs themselves are not
+stored. The trait returns them anyway, so a later durable path needs no
+trait change (section 15).
 
 ### 4.7 The coordinator
 
@@ -1263,20 +1457,9 @@ rate limiter, runtime services) travel in one `IdentityDeps` struct, because
 `handle_auction` and `handle_publisher_request` already take the maximum of
 seven arguments (`auction/endpoints.rs:114-122`, `publisher.rs:4433-4441`).
 
-**The eligibility view.** Eligibility reads one merged view of stored state,
-on every route:
-
-- KV is the base when the request read it, else the cookie's last
-  confirmed copy.
-- Cookie entries with `k: 0` override it when their `pv` matches the base
-  revision. Removals and opt-outs in the removals cookie `ts-eids-r` always
-  apply (section 6.2).
-- `ps.n` is the later of the cookie's and KV's. `ps.iv` is the union.
-- `ps.o`: a staged opt-out (in `ts-eids-r`, not yet in KV) always counts,
-  unless `ts-eids-s` stages a clear `ps.oc` later than it (section 8). A
-  mirrored opt-out (a copy in `ts-eids-s`) yields to KV when this request
-  read KV, so a clear in KV (section 8) is not undone by the browser's copy.
-- Pending markers come from the cookie only.
+**The eligibility view.** Eligibility reads the KV row the writer read in
+phase 1, and nothing else. It never reads `ts-eids-s`. Every removal is
+already in KV (section 5.3), so no cookie has to be applied on top.
 
 **Eligibility.** A provider that declares `resolves` is eligible for this
 request when all of these hold:
@@ -1306,23 +1489,19 @@ request when all of these hold:
      the provider is skipped and the skip is logged at debug.
 5. `ps.n` (next eligible time) has passed, and no sticky `ps.o` opt-out is
    set (section 8).
-6. No unanswered pending marker `p` is set for the provider (section 6.2).
-7. The provider's circuit breaker is closed (below).
-8. The request mode allows it, subject to the restrictions on stateful
-   providers and first navigations below:
-   - Hold-mode providers run on any request that runs an auction: a
-     navigation with matched slots, `/auction` or `/_ts/page-bids`.
-   - After-send providers run only on the writer request for a returning
-     EC. A new visitor's navigation runs none, so its create stays the page
-     load's one write (section 5.2). Its after-send providers start at the
-     next navigation.
-   - A provider declared `with_private_state()` runs only on the writer
-     request. In hold mode it runs on writer navigations that run an
-     auction, and after send on writer navigations that do not, so a site
-     whose auctions all go through `/auction` still refreshes it.
-   - No provider runs on a new visitor's first navigation, in either mode.
-     Its row is created before routing, carrying only browser ingest.
-9. The per-visitor burst cap is not exceeded. This check comes last, just
+6. The provider's circuit breaker is closed (below).
+7. The request is the writer request for a returning EC. Stagers run no
+   resolving provider, in either mode, and a new visitor's first
+   navigation runs none, so its create stays the page load's one write
+   (section 5.2). Within the writer:
+   - Hold-mode providers run before the auction when the navigation runs
+     one (matched slots). When it runs none, they run after send instead,
+     so a site whose auctions all go through `/auction` still stores their
+     answers, and its next `/auction` serves them from KV. Moved after send,
+     a hold-mode provider waits `after_send_timeout_ms`, not the hold
+     budget, and a miss is an ordinary timeout (section 8).
+   - After-send providers run after send, with `after_send_timeout_ms`.
+8. The per-visitor burst cap is not exceeded. This check comes last, just
    before dispatch, because the Fastly limiter increments on every check under
    the limit (`adapter-fastly/src/rate_limiter.rs:54-66`). The cap is
    `max_calls_per_minute` on the key `identity:<provider>:<visitor>`, where
@@ -1332,16 +1511,17 @@ request when all of these hold:
 
 Pacing per visitor comes from `ps.n` and the refresh rules in step 4, not
 from the limiter. The limiter only caps bursts, because its windows are 60
-seconds long.
+seconds long. It also keeps two overlapping writer navigations from both
+dispatching one provider. Every call runs on a writer, so every outcome,
+`no_match` and failure backoff included, is stored in `ps` (section 8).
 
 **Pre-disclosure revalidation.** Before any byte goes to a provider for a
-returning EC, the request must have read the live KV row and found it live
-and consenting. Eligibility steps 4 to 6 are then recomputed from that live
-row, so an opt-out or removal that the cookie has not caught up with still
-stops the call. That read is the writer's phase 1 read for hold mode, its
-phase 4 read for after-send mode (section 5.2), or the read `/auction` and
-`/_ts/page-bids` already do. A new visitor's first navigation runs no
-provider (step 8), so every provider call follows a confirmed row.
+returning EC, the writer must have read the live KV row and found it live
+and consenting, and computed eligibility steps 4 and 5 from it. That read
+is the phase 1 read for a provider dispatched before send, and the phase 4
+re-read for one dispatched after send (section 5.2). A new visitor's first
+navigation runs no provider (step 7), so every provider call follows a
+confirmed row.
 
 **Dispatch.** For each eligible provider, the coordinator builds a
 `ResolveInput` holding only the declared inputs and calls `request`. It then
@@ -1354,7 +1534,8 @@ checks the request before sending it:
 A request that fails a check is dropped and logged as `Config`. The
 coordinator sends it through `RuntimeServices::http_client().send_async`, up
 to `max_concurrency` at once, with a backend first-byte timeout of the
-provider's timeout (for hold mode, `min(timeout_ms, remaining budget)`,
+provider's timeout (`after_send_timeout_ms` after send; before the auction,
+`min(timeout_ms, remaining budget)`,
 rounded to buckets as `auction/orchestrator.rs:453-473` does). It does not
 follow redirects. It reads at most `max_response_bytes`, checked against
 `Content-Length` first (`pull_sync.rs:412`) and against the buffered body
@@ -1381,7 +1562,7 @@ Why 100 ms:
 - Missing the budget costs that one auction the ID. A call cut off by the
   budget is not a failure: it does not count toward `ps.f` or the breaker.
   It sets `ps.n = now + hold_retry_sec` (default 300 seconds), so the next
-  request does not wait on the same slow provider straight away.
+  navigation does not wait on the same slow provider straight away.
 
 The coordinator logs each provider's response time. An operator raises the
 budget only when a provider's measured p95 latency at the edge exceeds it.
@@ -1392,13 +1573,11 @@ provider delays bid dispatch. In modes where the origin fetch waits for
 dispatch, it also delays the page's first byte by up to `hold_budget_ms`. A
 provider is due rarely (step 4), so few navigations pay this.
 
-**Results and headers.** A hold-mode call either answers within its budget
-or is cut off; no call outlives the router (section 3.4). An answer is saved
-in that response's `ts-eids-s` with `k: 0`, on the writer request as on
-stagers, and a writer also adds it to its mutation. So a later request reads
-it from the cookie first, and a failed flush loses nothing. After-send
-results exist only in phase 4, after headers are sent. The writer marks each
-after-send provider with a pending marker before headers go out (section
+**Results.** A hold-mode call either answers within its budget or is cut
+off; no call outlives the router (section 3.4). An answer feeds that
+navigation's auction and joins the writer's mutation. No answer goes into
+a cookie. After-send results exist only in phase 4, after headers are
+sent, and are dispatched and committed in the same phase 4 flush (section
 5.2).
 
 **Circuit breaker.** The rate-limiter trait (`ec/rate_limiter.rs:16-47`)
@@ -1415,63 +1594,48 @@ counters are kept per POP, so the breaker is too.
 `IntegrationProxy::handle` itself has no EC context
 (`integrations/registry.rs:319-324`).
 
-Capture is off by default. `capture_enabled` (section 10.1) defaults to
-`false` for every provider that declares `captures`. While it is false, the
-coordinator still runs `capture`, discards the result's positive IDs and
-logs at debug what it discarded, by provider ID and source only. The
-result's removals and opt-outs still apply as below, because removals win
-(G12): an ID captured while capture was on must stay removable after it is
-turned off. An operator turns capture on per provider after the rollout
-checklist (section 14).
+Capture is revoke-only in v1. Every proxied API call is a stager (section
+5.1), and a stager persists no positive ID, so a capture result does three
+things only:
+
+- Its removals (`invalidate`, `also_invalidate`) and opt-out (`opted_out`)
+  are written to KV.
+- A positive result clears the provider's opt-out, under the rules below.
+- Its positive IDs are counted in `capture_unpersisted`, by provider ID and
+  source, with no value, so the operator can measure what a durable path
+  would add (section 15). They are not stored.
 
 For each provider with a capture rule (`with_path` or `with_path_prefix`)
 matching the request:
 
-- **Before `handle`.** When the descriptor's `Captures` declares `with_request_consent` and the
-  request has a body, `handle_proxy` buffers it with the existing
-  `collect_body_bounded` (`integrations/mod.rs:182`, 256 KiB cap), extracts
-  only the named JSON pointers, and re-wraps the bytes with
-  `EdgeBody::from` before calling `handle`, so the integration forwards them
-  unchanged. Today the request moves into `handle` unread
-  (`integrations/registry.rs:1061`), and Lockr buffers its own copy inside
-  `handle_api_proxy` (`integrations/lockr.rs:208-210`), out of the
-  coordinator's reach. A body over the cap or not valid JSON allows no
-  positive IDs; removals still apply.
-- **The consent to apply.** `consent::stricter_of(cookie, body)` is a new
-  function. It combines two consent contexts field by field: any opt-out,
-  missing purpose or missing vendor consent in either one wins.
-- **After `handle`,** on 2xx responses only, the coordinator decodes
-  `Content-Encoding` under the byte caps, builds a `CaptureInput` and calls
-  `capture`.
-- **It applies the result.** Removals and opt-outs apply whatever the
-  consent, because a revocation arrives after consent is denied. Positive
-  IDs apply only when `capture_enabled` is true, eligibility steps 1 to 3
-  pass under the stricter consent, and the provider has no sticky `ps.o`,
-  unless this result clears it: a capture-only provider without a GVL ID
-  that returns IDs under consenting cookie and body consent stages a clear,
-  `ps.oc = now`, beside its IDs in `ts-eids-s` (section 8).
-- **The real-browser gate.** Eligibility step 1 already keeps positive IDs
-  from a client that fails `looks_like_browser()`. Such a client's removals
-  and opt-outs go only into its own response's `ts-eids-r` cookie. They never
-  trigger the removal overflow write (section 6.2), and a global revoke
-  (section 8) is staged as a provider opt-out instead. The batch reaches KV
-  only if that client later makes a writer navigation, which needs a real
-  browser (section 5.1). So a script replaying a copied `ts-ec` cookie
-  through the proxy can neither enrich the row nor strip or tombstone it.
-  Consent withdrawal keeps its own exception (section 5.1).
-
-The result is staged on `EcContext`. `ec_finalize_response`, which already
-runs for proxy responses (`adapter-fastly/src/app.rs:909`,
-`main.rs:606-614`), writes positive IDs into `ts-eids-s` and removals and
-opt-outs into `ts-eids-r`, including on the unusable-consent path (section
-6.2). On a writer request the result also joins the mutation.
+- **After `handle`,** on 2xx responses only, `handle_proxy` buffers the
+  response body up to `max_response_bytes` (a larger body is passed through
+  uncaptured), decodes a copy under the same cap, builds a `CaptureInput`
+  and calls `capture`. It re-wraps the original bytes with
+  `EdgeBody::from(bytes)`, so the browser receives the response unchanged.
+  The request body is never read.
+- **Removals and opt-outs apply whatever the consent,** because a
+  revocation arrives after consent is denied. The capture removal write
+  stores them on this request (section 5.3).
+- **A clear** needs a positive result under the request's consent:
+  eligibility steps 1 to 3 pass, and the provider has a sticky `ps.o` that
+  only a capture can clear (a capture-only provider without a GVL ID,
+  section 8). The same capture removal write stores it as `ps.oc = now`.
+- **The real-browser gate.** A client that fails `looks_like_browser()`
+  makes no capture removal write and no clear. Its removals, opt-outs and
+  global revokes are dropped and logged with the provider ID and source
+  only. Earlier revisions staged them in that client's own cookie, where
+  they reached KV only if the same client later made a real-browser
+  navigation, which in practice never happens. So a script replaying a
+  copied `ts-ec` cookie through the proxy can neither strip nor tombstone a
+  row. Consent withdrawal keeps its own exception (section 5.1).
 
 Capture never touches `ps.n`, `ps.f` or the breaker: a proxied call that
-held nothing is not a provider failure. Only an opt-out and its IDs
-persist. Capture never changes provider state: a state change in its result
-is ignored with a warning, on writers and stagers alike, and the harness's
-conformance check fails a `capture` that returns one (section 13). This
-holds whether or not the provider declares `with_private_state()`.
+held nothing is not a provider failure. Capture never changes provider
+state: a state change in its result is ignored with a warning, and the
+harness's conformance check fails a `capture` that returns one (section
+13). This holds whether or not the provider declares
+`with_private_state()`.
 
 Lockr's API responses are already buffered on Fastly: a non-streaming send
 reads the body whole, up to 10 MiB (`adapter-fastly/src/platform.rs:413-429`).
@@ -1506,21 +1670,26 @@ An integration-proxy writer never rotates an EC, as today
 
 The adapter captures the response status before `send_edgezero_response`
 consumes the response, and passes it to phase 4 (`main.rs:512-517`, `:618`).
-A returning EC's writer flushes only when that status is 2xx or 304. For any
-other status it drops its mutation and dispatches no after-send provider. It
-saves the answers of hold-mode calls it already made in the response's
-cookie, because those calls happen before the origin status is known
-(`publisher.rs:4887-4894`, `:5151-5175`). A redirect is followed by another
-navigation, which recomputes everything from the same cookies.
+A returning EC's writer flushes its whole mutation only when that status is
+2xx or 304. For any other status it dispatches no after-send provider and
+flushes everything in its mutation except the positive part of the hold-mode
+calls it already made before the origin status was known
+(`publisher.rs:4887-4894`, `:5151-5175`): their removals and opt-outs, and
+the `ps.n` and `ps.f` of every outcome other than `found`, so a `no_match`,
+a failure or a cut-off call still backs off. Their positive answers, with
+their state and scheduling, are resolved again by a later writer. Browser
+ingest is dropped and re-derived at the next navigation. A redirect is
+followed by another
+navigation, which recomputes everything from KV and the same cookies.
 
-A new visitor's create (section 5.2, phase 1, before routing) is written whatever the
-status, as today, because the response sets the EC cookie.
+A new visitor's create (section 5.2, phase 1, before routing) is written
+whatever the status, as today, because the response sets the EC cookie.
 
 Every other request is a **stager**: `/auction`, `/_ts/page-bids`,
 integration proxy calls that are not navigations (including Lockr's API
 proxy), prefetches, iframes, clients that send no `Sec-Fetch-Dest`, and every
-other route. Stagers read cookies and KV but never write KV. Section 5.3
-covers what they save instead.
+other route. Stagers read cookies and KV, run no resolving provider, and
+write KV only for a captured revocation (section 5.3).
 
 `/_ts/api/v1/identify` stops writing too. The once-per-EC `cluster_size`
 evaluation (`ec/identify.rs:107`, `ec/kv.rs:1484`) moves into the writer's
@@ -1532,46 +1701,44 @@ script reports each change to `/_ts/page-bids` (`publisher.rs:6890-6894`).
 An SPA view is part of the page load that loaded the document, so
 `/_ts/page-bids` is a stager. Today it ingests `ts-eids` into KV
 (`publisher.rs:6925`). Under this design it stops. A visitor who stays in an
-SPA has their staged changes written at their next full navigation.
-Auctions keep using the staged entries from the cookie in the meantime.
+SPA has their `ts-eids` ingested at their next full navigation. Auctions in
+the meantime use KV and the browser's EIDs.
 
 **Exception: consent withdrawal.** A withdrawal writes its tombstone on
-whichever request carries it, before the response is sent, exactly as today.
-That includes stagers and clients the bot gate does not treat as real
-browsers (`adapter-fastly/src/app.rs:446-452`). Revocation cannot wait for a
+whichever request carries it, before the response is sent, as today. That
+includes stagers and clients the bot gate does not treat as real browsers
+(`adapter-fastly/src/app.rs:446-452`). Revocation cannot wait for a
 navigation that may never come. The exception covers the whole of today's
 withdrawal path: a CAS tombstone with up to five attempts, then its
 completion-marker write, for each withdrawn EC ID (one or two;
-`ec/kv.rs:1349-1430`, `:1115-1124`; `finalize.rs:509-525`). The same
+`ec/kv.rs:1349-1430`, `:1115-1124`; `finalize.rs:509-525`). New in this
+spec: when those attempts fail before send, the path runs once more after
+send, by which time Fastly's per-key limit has usually passed. The same
 exception covers a captured opt-out from a provider with
 `revoke_scope = "global"` (section 8), from a real browser only: it runs this
-path on the request that carries it. It and the removal overflow write
-(section 6.2) are the only page-load exceptions to G4. The tombstone is not
-part of any `IdentityMutation`. A
-writer whose phase 4 re-read finds the tombstone drops its mutation (section
-5.4, step 1).
+path on the request that carries it. It and the two removal writes (sections
+5.2, phase 4, and 5.3) are the only page-load exceptions to G4. The
+tombstone is not
+part of any `IdentityMutation`. A writer whose phase 4 re-read finds the
+tombstone drops its mutation (section 5.4, step 1).
 
 ### 5.2 Phases of the writer request
 
 **Phase 1, at the routing decision. No KV write.**
 
-- Read `ts-ec`, consent, `ts-eids`, sharedId and `ts-eids-s`. Verify
-  `ts-eids-s` (section 6.2).
+- Read `ts-ec`, consent, `ts-eids` and sharedId. `ts-eids-s` is never read.
 - Decide whether this is the writer request (section 5.1).
 - Capture the user agent, DNT and page URL into `EcContext` (section 4.4).
-- Read the KV snapshot when section 6.3 says to. A missing row for a
-  returning EC starts today's orphan recovery: confirm the absence, then
-  rotate before send (`ec/finalize.rs:371-400`). The rotated EC's create
-  carries this request's browser ingest, as today (`ec/finalize.rs:323`),
-  and its removals and sticky `ps.o`, `ps.oc` and `ps.iv`, but never
-  positive staged IDs. It is the page load's one write (section 5.6): a
-  request that rotates drops the rest of its mutation and its pending
-  markers, and skips phase 4. When the create is `Written`, its response
-  deletes the `ts-eids-r` cookies, whose contents the create carried, and
-  sets a new `ts-eids-s` from the created row. Otherwise both are kept. If the confirm
-  read finds the row after all, no rotation happens and that read is the
-  phase 1 snapshot (today's code writes at once there, `ec/finalize.rs:383-386`;
-  here the change joins the mutation).
+- For a returning EC, read the KV snapshot. Every returning writer
+  navigation reads it once (section 6.3). A missing row starts today's
+  orphan recovery: confirm the absence, then rotate before send
+  (`ec/finalize.rs:371-400`). The rotated EC's create carries this
+  request's browser ingest, as today (`ec/finalize.rs:323`). It is the page
+  load's one write (section 5.5): a request that rotates drops the rest of
+  its mutation and skips phase 4. If the confirm read finds the row after
+  all, no rotation happens and that read is the phase 1 snapshot (today's
+  code writes at once there, `ec/finalize.rs:383-386`; here the change joins
+  the mutation).
 - For a new visitor, `generate_if_needed` creates the row before routing, as
   today (`ec/mod.rs:407-455`), so no unconfirmed ID is ever used. Today that
   create is an empty row and browser ingest is a second write in finalize
@@ -1581,213 +1748,151 @@ writer whose phase 4 re-read finds the tombstone drops its mutation (section
 
 **Phase 2, routing.**
 
-- The coordinator computes eligible providers from the merged view.
+- The coordinator computes eligible providers from the phase 1 snapshot
+  (section 4.7).
 - If the navigation runs an auction, due hold-mode providers are dispatched
-  before it, after eligibility is recomputed from the phase 1 read, and
-  awaited within the hold budget. Their answers feed the auction.
-- For a returning EC, the coordinator calls `request` for each eligible
-  after-send provider as a dry run, with `input.is_dry_run()` true. `request`
-  is pure and does no I/O. A provider that returns `Some` gets a pending
-  marker in phase 3. One that returns `None` is skipped (section 8). The real
-  request is rebuilt in phase 4 from the live row.
-- A provider declared `with_private_state()` gets no dry run, because its
-  state is only in KV. When it is due on the cookie view it gets a marker,
-  and phase 4 rebuilds its request with the state from the live row. A
-  rebuilt `None` sets `ps.n` (section 8). This saves a phase 1 read on each
-  of its refreshes.
-- Any other dry run sees what KV holds only when phase 1 read it. Section
-  6.3 makes phase 1 read KV whenever an after-send provider is eligible on
-  the cookie view and has a candidate source that is unowned or only a
-  stub.
+  before it and awaited within the hold budget. Their answers feed the
+  auction. If it runs none, due hold-mode providers join the after-send
+  providers (section 4.7, step 7).
+- A provider due on the phase 1 snapshot in after-send mode is due for
+  dispatch in phase 4, which rebuilds its request from the live row. There
+  is no dry run: phase 4 calls `request` once. A `None` then sets `ps.n`
+  (section 8).
 
 **Phase 3, finalize, before send.**
 
 - **New visitor.** Nothing to write: the row was created before routing
   (phase 1). `ts-ec` is set because the create was `Written`, as today
   (`ec/finalize.rs:145-149`). Phase 4 does nothing for a new visitor, and no
-  provider runs on its first navigation (section 4.7, step 8).
+  provider runs on its first navigation (section 4.7, step 7).
 - **Returning EC.**
   - Browser ingest from `ts-eids` and sharedId adds `FillMissing` changes to
     the mutation, instead of calling `sync_eid_cookie_updates`
     (`ec/finalize.rs:183`). It covers owned sources too, which seeds them
     for their owner (section 7.2).
-  - Staged entries from `ts-eids-s` pass the flush checks (section 5.3) and
-    are added to the mutation.
-  - Hold-mode answers and this request's captures join the mutation.
+  - Hold-mode answers join the mutation. A capture on an integration-proxy
+    writer navigation goes through the capture removal write, as on a stager
+    (section 4.7), and never joins the mutation.
 - **Consent withdrawal** runs today's synchronous path (section 5.1).
-- **Cookies.** Removals and opt-outs from this request go into a new
-  `__Host-ts-eids-r-<id>` cookie (section 6.2). `ts-eids-s` is set on the HTML response only
-  when needed:
-  - for a new EC, from its created row
-  - with the results of hold-mode providers that answered, saved with
-    `k: 0`, except a provider with private state: its answer stays in the
-    mutation only, because its ID and its state must land together
-  - with a pending marker for each after-send provider whose dry run
-    returned `Some`, only when the response status is 2xx or 304 (finalize
-    already holds the response)
-  - when the phase 1 read changed the cookie under the section 6.3 merge
-  - when the cookie was missing, failed to open, opened under a previous
-    key (section 6.2) or was past its revalidation age
+- **Cookies.** This spec sets no cookie on the writer's response. A
+  returning visitor's HTML gets no new `Set-Cookie` from it and stays
+  cacheable.
 
 **Phase 4, after send. Returning ECs only. The only write.**
 
-1. If the mutation is empty and no after-send provider was marked, stop. No
+1. If the mutation is empty and no after-send provider is due, stop. No
    read, no write.
-2. If phase 1 read the row successfully and no after-send provider is
-   marked, do not read again (a failed phase 1 read counts as no read, and
-   phase 4 re-reads): apply the mutation to the phase 1 snapshot and, if anything
-   changes, write with that generation. A concurrent change since then
-   fails the CAS, as any conflict does. Otherwise re-read the live row.
-   Either way, the snapshot or the live row decides:
+2. If phase 1 read the row successfully and no after-send provider is due,
+   do not read again (a failed phase 1 read counts as no read, and phase 4
+   re-reads): apply the mutation to the phase 1 snapshot and, if anything
+   changes, write with that generation. A concurrent change since then,
+   such as a capture removal write by another request of the page load
+   (section 5.3), fails the CAS, as any conflict does. Otherwise re-read
+   the live row. Either way, the snapshot or the live row decides:
    - A tombstone, or `consent.ok = false`: drop the mutation and stop.
-   - Missing: drop the mutation and stop. The next request that reads KV
-     finds the orphan (section 6.3). This covers an integration-proxy
-     writer, which never rotates.
-   - Failed: drop the mutation and stop. Staged entries stay in the cookie.
-3. Recompute eligibility steps 4 to 6 from the live row, rebuild each marked
+   - Missing: drop the mutation and stop. The next writer navigation's
+     phase 1 read finds the orphan (section 6.3). This covers an
+     integration-proxy writer, which never rotates.
+   - Failed: drop the mutation and stop.
+3. Recompute eligibility steps 4 and 5 from the live row, build each due
    provider's request, dispatch the after-send providers and turn their
    results into changes. This happens after the re-read, so no EC ID is
    disclosed before consent is confirmed (`ec/pull_sync.rs:100-110` does the
    same today).
 4. Apply the mutation to the live entry (section 5.4). If anything changed,
-   write it once with `IfGenerationMatch`.
+   write it once with `IfGenerationMatch`. The after-send results commit in
+   this write; nothing marks them as pending in between.
 5. If the write fails, on a precondition failure, Fastly's per-key rate
-   limit or any other error, log and stop. It is not retried. Fastly limits
-   writes to one key to about one per second, and the limit can be stricter,
-   so an immediate retry after a conflict would usually fail too. Nothing is
-   lost for good:
+   limit or any other error, log. The flush is not retried as a whole.
+   Fastly limits writes to one key to about one per second, and the limit
+   can be stricter, so an immediate retry after a conflict would usually
+   fail too. When the mutation holds removals, opt-outs or clears, they are
+   then written alone, with the CAS loop of the capture removal write
+   (section 5.3): a re-read, the removal rules of section 5.4 and up to five
+   attempts. When those fail too, they are lost and counted in
+   `removal_lost`. Nothing else backs the flush, so:
    - browser ingest is re-derived from `ts-eids` by the next navigation
-   - staged entries and stateless hold-mode answers are still `k: 0` in the
-     cookie
-   - removals and opt-outs stay in `ts-eids-r` until a KV read shows them
-     applied
-   - an after-send provider's result is lost, an `invalidate` or `opted_out`
-     included. The ID it rejected stays served, as it was before the call,
-     until the provider is called again once its pending marker passes its
-     deadline and repeats the removal. Nothing after send can save it,
-     because the KV write is what failed
-   - a stateful hold-mode provider's answer, state change and `ps.n`/`ps.f`
-     are lost with the mutation. Its answer never went into the cookie
-     (phase 3), so no ID can flush later without its state, and the next
-     writer calls it again with the state KV still holds. If the vendor has
-     rotated that state (a used UID2 refresh token, for example), the call
-     fails, the stored ID ages out, and the browser or a later initial call
-     re-seeds it
+   - every positive provider result is lost: hold-mode answers and
+     after-send results, with their state changes and `ps.n`/`ps.f`. Each
+     provider is still due, and the next writer calls it again, paced by the
+     burst cap. Their removals survive through the retry above, unless it
+     fails too
+   - a stateful provider is called again with the state KV still holds. If
+     the vendor has rotated that state (a used UID2 refresh token, for
+     example), the call fails, the stored ID ages out, and the browser or a
+     later initial call re-seeds it
 
-**Cost per page load.** Writes are at most one, and never retried. Reads,
+**Cost per page load.** Writes are at most one, plus the removal-only retry
+when a flush that holds removals fails. Reads,
 compared with today:
 
-| Navigation                                                      | Today                  | This design                                                            |
-| --------------------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------- |
-| Runs an auction                                                 | 1 (preload)            | 1 (phase 1). Phase 4 reuses it unless an after-send provider is marked |
-| No auction, registered source in `ts-eids`                      | 1 (ingest compare)     | 1 (phase 4)                                                            |
-| No auction, nothing due, staged or pending, valid recent cookie | 0 or 1                 | 0                                                                      |
-| An after-send provider dispatches                               | 2 (preload, pull sync) | 1 or 2: the phase 4 re-read, plus phase 1 when section 6.3 requires it |
+| Navigation                        | Today                  | This design                                                         |
+| --------------------------------- | ---------------------- | ------------------------------------------------------------------- |
+| Runs an auction                   | 1 (preload)            | 1 (phase 1). Phase 4 reuses it unless an after-send provider is due |
+| No auction, no provider due       | 0 or 1                 | 1 (phase 1). Phase 4 reuses it                                      |
+| An after-send provider dispatches | 2 (preload, pull sync) | 2: phase 1 and the phase 4 re-read                                  |
 
-Today's preload never skips a navigation whose auction needs the row
-(`publisher.rs:3110-3116`, `:4825-4828`), and the cookie does not cache
-unowned values, so such a navigation reads KV once, as today. The 6.3
-trigger list states the rule.
-Each `/auction` and `/_ts/page-bids` keeps its one existing read. Orphan
-recovery adds the reads it adds today, in the rare case it runs.
-
-A digest of the last-compared browser set in `ts-eids-s` could remove the
-read on navigations with no auction. It is left out until measurements show
-the read matters.
+Every returning writer navigation reads KV once in phase 1. That read finds
+orphans, answers eligibility and filters browser candidates, so no cookie
+copy of the row is needed. Each `/auction` and `/_ts/page-bids` keeps its
+one existing read. Orphan recovery adds the reads it adds today, in the rare
+case it runs.
 
 ### 5.3 Stagers
 
-A stager never writes KV. It saves positive changes into `ts-eids-s` and
-removals and opt-outs into `ts-eids-r`, on its own response (section 6.2).
-`ts-eids-s` is set in the returning-visitor branch of `ec_finalize_response`
-(`ec/finalize.rs:81-127`), replacing today's ingest write at
-`finalize.rs:110-112`. That branch already has the request's client EIDs
-(`ec/mod.rs:568-578`) and its KV snapshot. `ts-eids-r` is also written from
-`finalize_unusable_consent` (`ec/finalize.rs:457`), because a revocation can
-arrive while consent is unusable but not explicitly withdrawn, and that path
-returns before the returning-visitor branch (`finalize.rs:62-78`). A stager
-saves:
+A stager runs no resolving provider and never persists a positive ID. It
+reads KV only where its route already does: `/auction` reads the row it
+reads today (`auction/endpoints.rs:307-311`), and `/_ts/page-bids` reads it
+only when its auction runs (`publisher.rs:7077-7090`). Its auction serves
+the server set from that read (section 7.1). It no longer runs today's
+ingest write in the returning-visitor branch of `ec_finalize_response`
+(`ec/finalize.rs:110-112`).
 
-- **The KV gap, on `/auction`.** `/auction` holds the full body set
-  (`auction/endpoints.rs:298-303`) and the KV row it already reads
-  (`endpoints.rs:307-311`). For each registered source in the consent-gated
-  body set that the KV row lacks or holds only expired, it saves
-  `{s, u, b: 1, k: 0}`. It picks the
-  UID with today's ingest rules (`collect_eid_updates`,
-  `ec/prebid_eids.rs:151`). It saves only absent or expired sources,
-  because ingest is fill-missing (sections 3.2 and 5.4), and skips a UID that matches `ps.iv` (section
-  7.2). It costs no extra KV read.
-  - When the client set came from the `ts-eids` cookie rather than a body,
-    nothing is saved: the next navigation ingests that cookie anyway.
-  - When the KV read failed, found the row missing or found a tombstone,
-    nothing is saved.
-  - `/auction` returns early on consent denial, before it reads KV
-    (`endpoints.rs:231-275`). Then nothing is saved.
-- **Hold-mode results** on `/auction` and `/_ts/page-bids`, from providers
-  without state: IDs as entries with `pv` (the revision they replace) in
-  `ts-eids-s`, `ps` changes marked `sg: 1`, and invalidations and opt-outs
-  in `ts-eids-r`. `/_ts/page-bids` reads KV only when its auction
-  runs (`publisher.rs:7077-7090`), so it runs hold mode only then.
-- **Passive capture results** on integration proxy responses (Lockr), the
-  same way.
-- **Cookie upkeep from the KV read** that `/auction` and `/_ts/page-bids`
-  already do (section 6.3). These responses are JSON and already private, so
-  cookie upkeep costs no HTML cacheability.
+Earlier revisions let stagers run stateless hold-mode providers in memory.
+With no `ps.n` or `ps.f` stored on a stager, a provider that answered
+`no_match` or a 4xx was called again once a minute on every `/auction`, for
+the whole of an SPA session. Revision 15 removes that.
 
-Providers with state run only on the writer request (section 4.7, step 8),
-because state lives in KV only and a stager cannot write it. A stager that
-sees one of them due leaves it to the next navigation.
+**The capture removal write.** A revocation captured from a real browser
+(section 4.7) is written to KV on the proxied request that carries it. It is one of the page-load exceptions to G4 (section 5.1). The write:
 
-**No lost EIDs (G10).** If the KV gap does not fit in the cookie's size cap,
-the next `/auction` finds the same gap, since KV still lacks it, and saves it
-again. An ID is delayed by a page view, never dropped, as long as the browser
-keeps sending it. Today's `/auction` ingest writes the same fill-missing set
-(`ec/kv.rs:146-154`), so everything it writes still reaches KV.
+- reads the row and applies only the capture's removals (with the `ps.iv` or `ps.ov` hashes they derive), its opt-out and its clear, under the rules of
+  section 5.4
+- writes with a CAS and the withdrawal path's five attempts, re-reading and
+  trying again only when the generation no longer matches. Any other
+  failure, Fastly's per-key limit included, ends the attempt at once
+- runs before the proxied response is sent and, when that attempt fails,
+  once more after send
+- writes nothing when the read shows a tombstone, a missing row or the
+  removal already applied
+- when both attempts fail, logs at error with the provider ID and source
+  only, and increments `removal_lost`. Nothing keeps the removal
+  (section 2.3)
 
-**Concurrent stagers.** Parallel `/auction` or `/_ts/page-bids` calls each
-rewrite the whole cookie from their own copy, and the last `Set-Cookie`
-wins. A saved entry can be lost this way:
+It runs whatever the request's consent, including when consent is unusable
+but not withdrawn, because a revocation can arrive then. A writer
+navigation of the same page load that flushes with its phase 1 generation
+after this write fails its CAS and is not retried (section 5.2, phase 4);
+its browser ingest is re-derived at the next navigation.
 
-- A lost KV-gap entry is saved again by the next `/auction`.
-- A lost hold-mode result costs one later provider call. The per-visitor
-  burst cap, one call per minute by default, makes near-simultaneous
-  duplicate calls rare. The limiter is best-effort under concurrency
-  (`ec/rate_limiter.rs:25-27`), so they are not impossible.
-- Removals and opt-outs are never lost this way. Each batch lives in its own
-  `ts-eids-r` cookie, which no other response rewrites and only a writer
-  whose KV read shows it applied deletes (section 6.2), so a concurrent
-  rewrite of `ts-eids-s` or a second removal cannot drop them. A capture cannot be re-derived, so this matters most for
-  Lockr's `revoke-consent`.
+`/auction` and `/_ts/page-bids` return the mirror payload of section 6.2 in
+their JSON response, from the KV row they read. The shim writes
+`ts-eids-s` from it. These responses are already private, so the mirror
+costs no HTML cacheability.
 
-The loss of positive entries is accepted.
+**The `ts-eids` trim keeps registered sources first.** Today `/auction`
+ingests registered sources from its body, which carries more than the
+3,072-byte `ts-eids` cookie. Under this design only the writer ingests, and
+only from `ts-eids`. So the shim, when it trims `ts-eids` (EID fidelity
+spec §4.3), drops unregistered sources before any registered one. It learns
+the registered source domains from the configuration TS injects with its
+script. Within each group the EID fidelity trim order is unchanged. Every
+registered source today's `/auction` ingest writes then reaches the next
+writer's ingest, unless the registered sources alone exceed the trim (G10).
 
-**Flush checks for staged entries.** In phase 3, the writer adds a staged
-entry to its mutation only when it passes all of these:
-
-These checks apply to positive entries. Removals and staged opt-outs keep
-only the binding and revision checks (section 5.6).
-
-- The cookie opens with this EC's ID as associated data (section 6.2).
-- The entry is fresh: its staged-at time `sa` is no more than
-  `staged_max_age_sec` ago. Older entries are dropped from the cookie on its
-  next rewrite.
-- Its writer `w` is an enabled provider that currently claims the source and,
-  for an owned source, owns it.
-- It passes `gate_eid_updates_by_consent` (`ec/finalize.rs:268`) and the
-  writing provider's consent policy, both against this request's consent,
-  which may have changed since staging.
-- A provider entry is dropped when `ps.o` marks that provider opted out,
-  unless the cookie also stages a clear `ps.oc` later than that opt-out's
-  `at`. A replayed old cookie therefore cannot re-insert an opted-out ID: its
-  clear predates the opt-out.
-- A provider entry becomes an `OwnerWrite` with its `pv` as the expected
-  revision when its writer currently owns the source, and a `FillMissing`
-  otherwise, so an unowned source keeps the fill-missing contract. The cookie
-  may hold `k: 0` entries for unowned sources; it caches only owned sources
-  once they are in KV. A removal from `ts-eids-r` becomes an `OwnerRemove`,
-  or a `WriterRemove` when it carries no revision. A browser entry becomes a
-  `FillMissing`. A staged `ps` change merges as described in
-  section 6.2.
+**Concurrent stagers.** Stagers set no server cookie, so concurrent
+responses cannot overwrite each other's state. Each can return a mirror
+payload; the last one the shim writes wins, and all of them come from KV.
 
 ### 5.4 `IdentityMutation`
 
@@ -1800,43 +1905,56 @@ pub(crate) struct IdentityMutation {
 }
 
 /// The positive part of one stateful provider's result, applied whole or not
-/// at all. Its removals, opt-out and `iv` hashes are not part of it: they go
-/// into `partner_ids` and `provider_state` and apply on their own.
+/// at all. Its removals and opt-out are not part of it: they go into
+/// `partner_ids` and `provider_state` and apply on their own.
 pub(crate) struct ProviderResult {
     provider: IdentityProviderId,
     /// `OwnerWrite` and `FillMissing` changes for the sources it returned.
     ids: Vec<PartnerIdChange>,
     /// The state replacement or clear, and the new `n` and `f`.
     state: ProviderStateChange,
-    /// Keyed hash of the `ps.st` the call read. `None`: it read no state.
+    /// Hash of the `ps.st` the call read. `None`: it read no state.
     expected_state: Option<StateRevision>,
 }
 
 pub(crate) enum PartnerIdChange {
-    /// From browser ingest, a KV-gap entry or an unowned provider.
+    /// From browser ingest or an unowned provider.
     /// Applies only if the source is absent or its record is expired.
     FillMissing { source: SourceDomain, record: StoredRecord },
     /// From the owning provider. Applies if the live record's revision equals
     /// `expected`, or if `expected` is `None` and the source has no valid ID
-    /// that this provider wrote. A browser-seeded or legacy value never
-    /// blocks the owner.
+    /// that this provider wrote. A browser-seeded value never blocks the
+    /// owner.
     OwnerWrite { source: SourceDomain, record: StoredRecord, expected: Option<Revision> },
     /// From `Resolution::invalidate` or `also_invalidate`. Applies only if
-    /// the revision matches.
-    OwnerRemove { source: SourceDomain, expected: Revision },
-    /// From `Resolution::opted_out`, or a staged removal without a revision.
-    /// Removes the source's record if this provider wrote it, at any
-    /// revision.
+    /// the revision matches. Applying it appends the hash of every UID of the
+    /// record it removes to `provider`'s `ps.iv` (section 7.2). `provider` is
+    /// the provider that invalidated, which for an unowned source is not an
+    /// owner: its `ps.iv` still filters the browser's candidates (section 7.1).
+    OwnerRemove { source: SourceDomain, provider: IdentityProviderId, expected: Revision },
+    /// From `Resolution::opted_out`. Removes the source's record if this
+    /// provider wrote it, at any revision. For a capture-only provider it
+    /// also removes a record no provider wrote (browser ingest, schema
+    /// version 1 rows), because such a provider never writes one itself
+    /// (section 8).
     WriterRemove { source: SourceDomain, writer: IdentityProviderId },
 }
 
+/// A `StoredRecord` is a source's whole record: its entry set (section 6.1),
+/// `w`, the timing fields and `rv`. Every change below writes or removes a
+/// source's set whole. No change edits one entry or one UID, so one `rv`
+/// per source covers every entry in it.
+///
 /// A record's opaque revision: its KV `rv`, 64 random bits from the
 /// platform generator, drawn fresh on every write of the record, including a
 /// refresh that keeps the UID. Neither the UID nor `acquired_at` can serve:
-/// two refreshes of an unchanged UID in one second share both. A legacy
-/// record without `rv` uses the keyed hash of its `(uid, at)` pair until its
-/// next write. The cookie's `pv` stores the revision a staged entry replaces.
-pub(crate) struct Revision(RecordRevision);
+/// two refreshes of an unchanged UID in one second share both. A record
+/// without `rv`, which only a schema version 1 row holds, has the revision
+/// `Unset` until its next write gives it one.
+pub(crate) enum Revision {
+    Unset,
+    Set(RecordRevision),
+}
 ```
 
 A new visitor's create is not a mutation: `generate_if_needed` builds the
@@ -1847,21 +1965,31 @@ Applying the mutation to a live entry, in order:
 1. If the live entry is a tombstone, drop everything.
 2. Apply removals first: every `OwnerRemove` and `WriterRemove`. Applying a
    new `ps.o` for a provider also removes every live record that provider
-   wrote, owned or unowned, at any revision. Removals are never skipped.
+   wrote, owned or unowned, at any revision, and for a capture-only
+   provider every record of its sources that no provider wrote. Removals
+   are never skipped. Every invalidation that applies appends to the invalidating
+   provider's `ps.iv`, and every opt-out removal appends to the provider's `ps.ov`, the
+   hash of every UID of the live record it removes, so the hashes always
+   come from the record KV held. One that no longer
+   applies adds none: the record it named is gone or was replaced.
    An opt-out applies when its `at` is after the live `ps.o.at` and at or
    after the live `ps.oc`, so an opt-out and a clear in the same second
-   leave the provider opted out. Then apply each staged clear `ps.oc` that is
-   strictly later
-   than the provider's opt-out `at`, live or staged, and store it as the
-   live `ps.oc`, so the next step sees the provider as not opted out and a
-   later replay of the old opt-out is stale. A clear that is not later is
-   dropped.
+   leave the provider opted out. Then apply a clear (section 4.7) when it
+   is strictly later than the provider's live opt-out `at`, and store it as
+   the live `ps.oc`, so the next step sees the provider as not opted out. A
+   clear that applies also empties the provider's `ps.ov`, so the IDs its
+   opt-out removed can come back through the browser path. `ps.iv` is never
+   emptied: an invalidation is about the ID, not about consent.
+   A clear that is not later is dropped. A clear with no live opt-out to
+   clear is dropped too and writes nothing.
 3. Apply the positive changes by their own rules. Every change written by
    a provider the live `ps.o` marks opted out is skipped, `OwnerWrite` and
-   `FillMissing` alike, and so is a staged entry whose `sa` is at or before
-   that provider's latest opt-out `at`, even after a later clear. A
-   `FillMissing` whose UID matches the live `ps.iv` is skipped. Changes that
-   no longer apply are dropped silently: a newer write won.
+   `FillMissing` alike. A `FillMissing` any of whose UIDs matches the live
+   `ps.iv` or `ps.ov` of a provider that claims the source is skipped, owned
+   or
+   unowned. A browser-ingest `FillMissing` for a source of an opted-out
+   capture-only provider is skipped too.
+   Changes that no longer apply are dropped silently: a newer write won.
    Each `ProviderResult` applies atomically. Its IDs, its state change and
    its `n` and `f` apply together, and only when every ID change in it
    would apply on its own and the live `ps.st` still hashes to
@@ -1869,8 +1997,14 @@ Applying the mutation to a live entry, in order:
    phase 4 re-read finds that another writer committed a newer ID or state
    since its call read the row therefore stores neither its ID nor its
    state, and no row pairs one call's ID with another call's state.
-4. Apply `provider_state` changes (`n`, `f`, `o`, `iv`, `st`) and
-   `cluster_size`. Drop the `ps` entries of providers no longer configured.
+4. Apply `provider_state` changes (`n`, `f`, `o`, `iv`, `ov`, `st`) and
+   `cluster_size`. Truncate each `ps.iv` and `ps.ov` from the front to
+   `MAX_INVALIDATED_UIDS` (section 6.1), so step 5 never fails on them. For
+   a provider no longer configured, drop every `ps` field except `o`, `oc`
+   and `ov`, so a rollback and a roll-forward never forget an opt-out
+   (section
+   14). Such an entry still counts toward the 32-provider cap, and is the
+   first dropped when the cap is exceeded.
    Drop expired records, except **refresh anchors**: an expired record of an
    owned source whose owner still holds `ps.st` and whose `ru` has not
    passed. An anchor is never served (section 7.1), but it keeps the
@@ -1880,15 +2014,18 @@ Applying the mutation to a live entry, in order:
    included) or missing, or when the owner is no longer configured. A
    record without `ru` is dropped at expiry, as before. After a drop the
    owner sees no record and selects `Initial`.
+
 5. Validate the result with `KvEntry::validate`. If it fails, keep only the
    removals and opt-outs and validate again, so a full row can always
    shrink. If that also fails, drop the mutation and log. An invalid row is
    never written.
 6. If nothing changed, skip the write.
 
+The capture removal write (section 5.3) applies a mutation that holds only
+removals, an opt-out and a clear, through steps 1, 2, 4 (the `o`, `oc`, `iv` and `ov` fields only), 5 and 6.
+
 Because the rules are checked against the live entry, a later writer can
-re-apply the same changes, re-derived or still staged, without losing a
-concurrent tab's newer data.
+re-apply re-derived changes without losing a concurrent tab's newer data.
 
 ### 5.5 Orphans, collisions and deletion
 
@@ -1901,11 +2038,11 @@ safety properties, which a deferred create would lose:
 - **Collisions are caught.** An `AlreadyExists` on the first create re-mints
   the ID before any cookie is set, so no browser adopts another visitor's
   row.
-- **Orphans are found.** A row that goes missing later is found by a KV read
-  and recovered by today's rotation, before send (section 5.2, phase 1).
-  Section 6.3 guarantees such a read at least every `kv_revalidate_sec`, and
-  any stager that sees the row missing replaces `ts-eids-s` with a minimal
-  `m: 1` cookie to force one at the next navigation.
+- **Orphans are found.** A row that goes missing later is found by the next
+  writer navigation's phase 1 read, which every returning writer navigation
+  makes, and recovered by today's rotation, before send (section 5.2,
+  phase 1). A stager that sees the row missing stores nothing and tells the
+  shim to clear `ts-eids-s`.
 
 **Deletion.** The IAB data-deletion framework, deferred today, would
 hard-delete rows (`ec/kv.rs:1551-1563`). When that framework lands, it writes
@@ -1913,69 +2050,32 @@ a tombstone with `TOMBSTONE_TTL` (24 hours, `ec/kv.rs:38-39`) instead, using
 its own unconditional writer and today's completion marker. That replaces
 one delete with one write, the TTL removes the tombstone with no further
 write, and every TS request that reads the row in those 24 hours treats the
-identity as withdrawn. A browser that visits within those 24 hours
-revalidates (section 6.3) and expires its cookie. One that returns later
-finds the row missing, and section 5.6 makes a missing row expire the cookie
-and rotate without carrying any positive IDs, so a deletion is never undone
-through the cookie.
+identity as withdrawn. A browser that visits within those 24 hours reads
+the tombstone at its next writer navigation or `/auction`, and the latter
+tells the shim to clear `ts-eids-s`. One that returns later finds the row
+missing and rotates. The rotation carries no positive ID, because the
+server keeps none outside KV, so a deletion is never undone through a
+cookie.
 
-### 5.6 Rules that keep removals winning and markers answered
+### 5.6 Rules that keep removals winning
 
-Round 4 found paths where a cookie could undo a removal or a marker could
-loop. These rules close them, and take precedence over any earlier sentence
-that seems to allow otherwise:
-
-- **Removals survive every filter.** Removals and staged `ps.o` and `ps.iv`
-  live in `ts-eids-r` (section 6.2). They are exempt from the consent
-  re-gate, the writer-still-owns check and `staged_max_age_sec` in the flush
-  checks (section 5.3), and keep only the EC binding and, when they carry
-  one, the revision check. Withdrawing consent, disabling a provider or a
-  week in an SPA can delay a positive ID, never a removal. The one gate a
-  removal does face is the real-browser gate on capture (section 4.7): a
-  capture removal from a client that fails `looks_like_browser()` stays in
-  that client's own `ts-eids-r` and reaches KV only through that client's
-  own writer navigation, never through the removal overflow write.
-- **A config change keeps removals.** When the `cf` of `ts-eids-s` does not
-  match, its positive entries are discarded and it is rebuilt from KV.
-  Pending markers are kept. `ts-eids-r` carries no `cf`, so its removals
-  apply against the current config unchanged.
-- **A missing row empties the cookie.** Any KV read that finds the row
+- **Removals reach KV on the request that carries them.** A provider's
+  removals, opt-outs and clears are written by the writer's own flush, or
+  by the capture removal write for a proxied call (section 5.3). They
+  apply whatever the consent and whether or not their provider is still
+  enabled, and no cookie or config change can strand one. The one gate a
+  removal faces is the real-browser gate on capture (section 4.7).
+- **A missing row carries no positive ID.** Any KV read that finds the row
   missing (outside a recovery in the same request) treats it like a
-  tombstone for the server set: no positive entries or markers survive, and
-  `ts-eids-s` is replaced by a minimal cookie holding only `m: 1`, so the
-  next navigation reads KV and recovers. `ts-eids-r` is kept. `/auction`
-  saves no KV gap when the row is missing. Orphan rotation carries its
-  removals and sticky `ps.o`, `ps.oc` and `ps.iv` into the new row, never
-  positive staged IDs.
-- **Markers are answered without busy writes.** A KV read answers a marker
-  when the live row makes that provider ineligible (eligibility steps 4 to
-  6), as well as by the rules of section 6.2. Phase 4 adds
-  `ps.n = max(ps.n, now + 60 s)` only for a marked provider it did not dispatch for a
-  reason the live row does not show, such as the burst cap or the breaker. A
-  rebuilt `request` that returns `None` already sets `ps.n` (section 8). If
-  the flush fails, the marker expires at its deadline as before.
-- **Unowned dry runs need KV.** A dry run for a provider whose sources are
-  unowned returns `Some` only when the phase 1 read showed the source missing
-  and the pull-complete marker is absent. Otherwise the cookie cannot know,
-  and no marker is set.
-- **Staged entries trigger a reconciling read.** A cookie holding `k: 0`
-  entries makes the writer read KV in phase 1. That read flips flushed
-  entries to `k: 1` on this response (phase 3's "the phase 1 read changed the
-  cookie" rule). Phase 4 reuses that generation only when no after-send
-  provider is marked. Otherwise it re-reads the live row before any
-  dispatch, so a withdrawal that lands after send is always seen.
-- **Withdrawn consent never refills the cookie.** A stager whose decoded
-  consent denies EID persistence never writes positive entries into
-  `ts-eids-s`, so a concurrent `/auction` that started before a withdrawal
-  cannot bring IDs back. It may still set removals in a new `ts-eids-r`
-  cookie.
-- **The cookie is rewritten only when it changes.** A request that read KV
-  re-emits `ts-eids-s` only when its entries, markers or `ps` changed, when
-  the inbound `kc` is older than half of `kv_revalidate_sec`, or when it
-  opened under a previous key (section 6.2), so it moves to the current key.
-  Phase 3
-  stamps `kc` only when this request read KV. This keeps `Set-Cookie` off
-  most responses and narrows the window for concurrent overwrites.
+  tombstone for the server set: an `/auction` or `/_ts/page-bids` response
+  tells the shim to clear `ts-eids-s`. Nothing carries `ps` across an
+  orphan rotation, so after one a UID a provider rejected can be re-seeded
+  once, and an opted-out provider can be called again until it reports the
+  opt-out again.
+- **Withdrawn consent never refills the mirror.** A stager whose decoded
+  consent denies EID persistence returns a clear for `ts-eids-s`, never a
+  value, so a concurrent `/auction` that started before a withdrawal cannot
+  bring IDs back.
 - **Cluster size rides on a write.** `/_ts/api/v1/identify` is a
   cross-site, bearer-token endpoint (`ec/identify.rs:23-60`), so it cannot
   rely on TS cookies. When it reads a row without `cluster_size`, it
@@ -1985,12 +2085,6 @@ that seems to allow otherwise:
   list (`ec/kv.rs:1460-1469`) never delays a page. That is one list and at
   most one write per EC, once, as today (`ec/kv.rs:1497-1529`); the write
   is the page load's one write.
-- **The size cap always holds.** If dropping every droppable entry still
-  leaves `ts-eids-s` over its cap (section 6.2), it is replaced by a minimal
-  cookie with `kc = 0` and the markers only, which forces a read at the next
-  navigation. A source that is stubbed on every rewrite is left as a stub,
-  and the auction reads it from KV only when the navigation's auction needs
-  that source.
 - **EC minting on non-writer navigations.** Today a real browser gets an EC
   on any navigation `is_navigation_request` accepts, including prefetch and
   the `Accept: text/html` fallback (`adapter-fastly/src/app.rs:846-857`).
@@ -1998,21 +2092,41 @@ that seems to allow otherwise:
   visitor's writer does, and that create is its page load's one write. It
   runs no providers and writes nothing else.
 - **Proxy capture plumbing.** `ProxyDispatchInput` gains `is_real_browser`,
-  the writer decision and `IdentityDeps`. To capture, `handle_proxy` buffers
-  the response body up to `max_response_bytes` (a larger body is passed
-  through uncaptured), decodes a copy for `capture`, and re-wraps the
-  original bytes with `EdgeBody::from(bytes)`, so the browser receives the
-  response unchanged.
+  the writer decision and `IdentityDeps`. Section 4.7 covers how
+  `handle_proxy` buffers and decodes a response for `capture`.
 
 ## 6. Storage
 
 ### 6.1 KV record
 
-`KvPartnerId` (`ec/kv_types.rs:102`) gains optional fields. `KvEntry` gains
-`ps`. All new fields use `#[serde(default, skip_serializing_if = ...)]`, so
-`SCHEMA_VERSION` stays 1 and old rows read unchanged. KV item metadata, which
-Fastly caps at 2,048 bytes, holds no IDs (`ec/kv_types.rs:199-219`) and is
-unaffected.
+`SCHEMA_VERSION` becomes 2 (`ec/kv_types.rs:17`). `KvPartnerId`
+(`ec/kv_types.rs:102`) is replaced by one record shape, and `KvEntry`
+gains `ps`. KV item metadata, which Fastly caps at 2,048 bytes, holds no IDs
+(`ec/kv_types.rs:199-219`) and is unaffected.
+
+**One record shape.** Every record stores its source's entry set in `eids`:
+an array of OpenRTB EID entries without `source` (the map key holds it),
+each `{uids: [{id, atype?, ext?}], inserter?, matcher?, mm?, ext?}`. A
+record that browser ingest, generic pull or batch sync writes is one entry
+with one UID and no EID-level fields; only a provider result writes more.
+The stored entry types are dedicated (`KvEid`, `KvUid`), carry no `source`
+and ignore unknown fields. They are never `openrtb::Eid`, which denies
+unknown fields and requires `source` (`openrtb.rs:72`), so a field a later
+build adds never makes an older build fail to read the row.
+
+**Reading schema version 1.** Every row on `main` is version 1, whose
+records hold one `uid`. The reader accepts both versions. It reads a
+version 1 record as one entry holding that `uid`, with no `w`, no `rv` and
+no timing beyond `at`, and the next write of the row stores it as version 2.
+Today's reader rejects any version but its own (`ec/kv_types.rs:376-381`),
+so a build older than rollout step 1 cannot read a row step 1 has written
+(section 14).
+
+`KvEntry::validate` rejects, when a row is written, a record whose `eids` is
+empty or whose set breaks the limits of section 4.5. It runs on every read
+too (`ec/kv.rs:366`), so on read a bad record is dropped from the row and
+the violation is logged with the source only. One bad record never makes
+the row unreadable. Only `serialize_entry` rejects.
 
 `KvPartnerId` and `KvEntry` are public structs without `Default`, and about
 30 `KvPartnerId { .. }` literals in 8 files would stop compiling (for example
@@ -2023,18 +2137,46 @@ literals move to them. `PartnerIdUpdate` (`ec/kv.rs:75-90`) gains
 
 ```json
 {
+  "v": 2,
   "ids": {
     "id5-sync.com": {
-      "uid": "ID5*example",
       "w": "id5",
       "rv": "9c1d04b7e6a83f2a",
       "at": 1760000000,
       "exp": 1767776000,
       "ra": 1760086400,
-      "atype": 1,
-      "ext": { "linkType": 2 }
+      "eids": [
+        {
+          "uids": [
+            { "id": "ID5*example", "atype": 1, "ext": { "linkType": 2 } }
+          ]
+        }
+      ]
     },
-    "sharedid.org": { "uid": "example-shared-id", "at": 1759990000 }
+    "example-ids.example.com": {
+      "w": "exampleid",
+      "rv": "4be71f0c2d9a6e35",
+      "at": 1760000000,
+      "eids": [
+        {
+          "uids": [
+            { "id": "example-a", "atype": 1 },
+            { "id": "example-b", "atype": 3, "ext": { "stype": "ppuid" } }
+          ],
+          "inserter": "example.com",
+          "mm": 3
+        },
+        {
+          "uids": [{ "id": "example-c", "atype": 1 }],
+          "matcher": "partner.example.com"
+        }
+      ]
+    },
+    "sharedid.org": {
+      "rv": "07a3c9e15b2d48f6",
+      "at": 1759990000,
+      "eids": [{ "uids": [{ "id": "example-shared-id" }] }]
+    }
   },
   "ps": {
     "id5": { "n": 1760003600, "f": 1, "st": "example-opaque-state" }
@@ -2042,354 +2184,168 @@ literals move to them. `PartnerIdUpdate` (`ec/kv.rs:75-90`) gains
 }
 ```
 
-| Field   | Meaning                                                                                                             |
-| ------- | ------------------------------------------------------------------------------------------------------------------- |
-| `w`     | Writer: a provider ID. Absent for browser ingest and legacy rows                                                    |
-| `rv`    | The record's revision: 16 hex digits, drawn at random on every write of the record (section 5.4)                    |
-| `at`    | Unix seconds when the ID was acquired or last refreshed                                                             |
-| `exp`   | Unix seconds after which the ID must not be sent                                                                    |
-| `ra`    | Unix seconds after which the ID is due for refresh                                                                  |
-| `ru`    | Unix seconds after which the ID can no longer be refreshed. Keeps an expired record as a refresh anchor until then  |
-| `atype` | Provider-supplied atype. Absent: use `[[ec.partners]].openrtb_atype`                                                |
-| `ext`   | UID-level ext, at most 256 serialized bytes                                                                         |
-| `ps.n`  | Unix seconds before which the provider must not be called                                                           |
-| `ps.f`  | Consecutive failures, for backoff                                                                                   |
-| `ps.o`  | Sticky opt-out: `{at, fp}`, when it was reported and the consent fingerprint                                        |
-| `ps.oc` | When the provider's opt-out was last cleared. An opt-out reported before it is stale and never re-applied           |
-| `ps.iv` | Keyed hashes of UIDs the owner invalidated, at most 4, so they are not re-seeded                                    |
-| `ps.st` | The provider's private state, as embedded JSON (a raw value, not an escaped string) of at most 1,024 bytes. KV only |
+| Field   | Meaning                                                                                                                                     |
+| ------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `w`     | Writer: a provider ID. Absent for browser ingest and version 1 records                                                                      |
+| `rv`    | The record's revision: 16 hex digits, drawn at random on every write of the record (section 5.4)                                            |
+| `at`    | Unix seconds when the ID was acquired or last refreshed                                                                                     |
+| `exp`   | Unix seconds at or after which the ID must not be sent                                                                                      |
+| `ra`    | Unix seconds after which the ID is due for refresh                                                                                          |
+| `ru`    | Unix seconds after which the ID can no longer be refreshed. Keeps an expired record as a refresh anchor until then                          |
+| `eids`  | The source's entry set, in order, with UID-level and EID-level fields (section 4.5). A missing `atype` uses `[[ec.partners]].openrtb_atype` |
+| `ps.n`  | Unix seconds before which the provider must not be called                                                                                   |
+| `ps.f`  | Consecutive failures, for backoff                                                                                                           |
+| `ps.o`  | Sticky opt-out: `{at, fp}`, when it was reported and the consent bits the provider's policy read then (section 8)                           |
+| `ps.oc` | When the provider's opt-out was last cleared. An opt-out reported before it is stale and never re-applied                                   |
+| `ps.iv` | Hashes of UIDs the owner invalidated, oldest first, at most 128, so they are not re-seeded (section 7.2)                                    |
+| `ps.ov` | Hashes of UIDs the provider's opt-out removed, oldest first, at most 128. Emptied when the opt-out clears (section 8)                       |
+| `ps.st` | The provider's private state, as embedded JSON (a raw value, not an escaped string) of at most 1,024 bytes. KV only                         |
 
-`KvEntry` validation (`ec/kv_types.rs:375`) adds: `ext` at most 256 bytes,
-`st` at most 1,024 bytes of embedded JSON, `ps` at most 32 providers.
-Mutations prune the `ps` entries of providers no longer configured, and more
+`KvEntry` validation (`ec/kv_types.rs:375`) adds: the entry-set limits of
+section 4.5 (UID-level and EID-level `ext` at most 2,048 bytes, 8 entries
+and 32 UIDs per source, a set at most 4,096 bytes), `st` at most 1,024
+bytes of embedded JSON, `ps` at most 32 providers and `ps.iv` and `ps.ov` each at most `MAX_INVALIDATED_UIDS` (128) hashes. Mutations prune the `ps` entries
+of providers no longer configured to their opt-out (section 5.4), and more
 than 32 enabled providers is a config error (section 10.2), so the cap is
-never reached in practice. With every cap reached,
-eight owned sources come to about 7 KB, plus 1 KB for each provider with
-state. A row normally carries one or two stateful providers. That is above the ~5 KB estimate in
-`ec/kv_types.rs:40`, which is a documented estimate rather than an enforced
-limit. Fastly's value limit is far larger.
+never reached in practice.
+
+`ps.iv` and `ps.ov` are ordered lists, oldest first, with the same rules.
+Each hash is the first 16 hex
+digits of the unkeyed SHA-256 of the UID. A new hash is appended, and a
+hash already present moves to the end. Mutations truncate it from the front
+before validation (section 5.4). 128 hashes hold four whole 32-UID sets, so
+one removal never evicts the previous one, and an `also_invalidate` of
+several sources keeps all their UIDs. The hash is unkeyed because the same
+row stores every live UID in plain text, so a key would protect nothing,
+and an unkeyed hash survives an `ec.passphrase` rotation (section 9.3).
+
+Size. A one-UID record is about 120 bytes: today's `uid`, the `eids`
+wrapper and the metadata. A record at every cap is at most
+`MAX_ENTRY_SET_BYTES` (4,096 bytes) plus its metadata, about 4.2 KB. With
+every cap reached, eight owned sources come to about 34 KB, plus 1 KB for
+each provider with state, and `ps.iv` and `ps.ov` add up to 2.4 KB each per
+provider. A row
+that carries two full sets and two stateful providers at every cap is about
+15 KB, and typical sets are far smaller. That is above the ~5 KB estimate
+in `ec/kv_types.rs:40`, which is a documented estimate rather than an
+enforced limit, and the estimate is updated. Fastly's value limit is far
+larger. A row that only browser ingest and pull sync write grows by about
+60 bytes per source.
 
 The admin EC lookup returns the stored JSON verbatim (`ec/admin.rs:394-397`).
 It redacts `ps.st`.
 
-**Rollback rule.** The current reader drops unknown fields when it writes the
-row again. If TS is rolled back after providers have written metadata, the
-next write strips `w`, `exp` and the rest. So, for an owned source whose
-provider marks the source as expiring, only records with `w` set to the owner and an
+**Serving owned expiring sources.** For an owned source whose provider
+marks it as expiring, only records with `w` set to the owner and an
 unexpired `exp` are sent to bidders from the server. Any other record for
-that source (browser-seeded, or stripped by an older writer) is used only as
-the input to the owner's refresh. This fails closed: an ID is re-fetched,
-never sent past its real expiry.
+that source, such as a browser-seeded one, is used only as the input to the
+owner's refresh. This fails closed: an ID is re-fetched, never sent past
+its real expiry.
 
-### 6.2 The `ts-eids-s` and `ts-eids-r` cookies
+### 6.2 The `ts-eids-s` mirror
 
-Two server-owned cookies:
+`ts-eids-s` (`__Host-ts-eids-s`) is client-only. The shim writes it from
+the mirror payload TS returns, and page scripts read it. The server never
+sets, opens, parses or trusts it. Earlier revisions also had a family of
+sealed, server-owned removal cookies, `ts-eids-r`; revision 15 removes them,
+because every removal now reaches KV on the request that carries it
+(section 5.3).
 
-- **`ts-eids-s`** (`__Host-ts-eids-s`) caches provider-collected IDs for owned
-  sources, holds positive entries stagers saved, and carries pending markers
-  and mirrored `ps`.
-- **`ts-eids-r`** is a family of cookies, normally at most four,
-  `__Host-ts-eids-r-<id>`, that hold removals and opt-outs not yet in KV.
-  Each response that produces a removal or opt-out sets a new one, with a
-  fresh random 8-hex-digit `<id>`, holding only its own batch. No response
-  rewrites another's cookie, so neither a concurrent `/auction` rewriting
-  `ts-eids-s` nor another removal in flight can lose a batch. The one
-  rewrite is the writer's re-seal after a key rotation (below), which keeps
-  the same name and the same batch. Stagers never
-  delete one. They are deleted, by name, in three cases only: by the writer
-  navigation, after its phase 1 read shows a cookie's entries all applied
-  or the cookie fails to open; by any request whose KV read confirms a
-  tombstone; and by an orphan rotation whose create was `Written`. That keeps a capture's revocation, which
-  nothing can re-derive, safe (section 5.3).
+**Readers.** The mirror is for page scripts that need the server IDs. This
+spec names no consumer yet. Section 15 asks for one before rollout step 1
+ships the mirror; without one, step 1 ships without it.
 
-**Attributes.** Both use `Path=/; Secure; SameSite=Lax; HttpOnly`, with
-`Max-Age=31536000`. The `ts-eids-r` cookies get the same lifetime so that a
-batch never expires before a writer applies it; they are deleted once
-applied, and their count and size caps bound them. The
-`__Host-` prefix makes them host-only, with no `Domain`. They are caches of
-KV, so per-host copies are fine. The repo's other server-set cookie, the
-pull-complete marker, is host-only for the same reason: a `Domain` attribute
-would let sibling hosts that share the passphrase replay it
-(`pull_sync_marker.rs:198-201`). Host-only also stops a sibling subdomain from
-reading the IDs or planting a competing cookie. A request carrying two
-cookies of the same name is treated as carrying none.
+**Attributes.** `__Host-ts-eids-s`, with `Path=/; Secure; SameSite=Lax`,
+and no `Domain`. It is not `HttpOnly`, because the shim writes it with
+`document.cookie` and page scripts read it. Its `Max-Age` comes from the
+mirror payload.
 
-**Sealed, not just signed.** These cookies are stripped before the origin
-and Prebid Server (section 6.2, outbound requests), but they still travel in
-every request from the browser, through any intermediary that logs headers.
-A signed cookie would show server-only IDs, such as UID2 tokens and LiveRamp
-envelopes, in plain text there, and to the origin if the strip ever
-regressed. So each value is sealed with AES-256-GCM:
-`v1.<kid>.<nonce>.<ciphertext and tag>`, with the nonce and ciphertext in
-base64url without padding. `<kid>` names the sealing key: 1 to 8
-characters of `[a-z0-9]`, in plain text, because it is not secret. The keys
-are dedicated secrets from the secret store, listed in
-`[ec.identity.cookie_keys]` (section 10.1) and in `secret_fields()` (section
-10.2). They are not derived from `ec.passphrase`. Each cookie's AES key is
-derived from a keyring secret with a namespaced label
-(`trusted-server/ts-eids-s/key/v1`, `trusted-server/ts-eids-r/key/v1`). The
-nonce is 12 random bytes from the platform generator. The full EC ID is the
-associated data, so it is authenticated but not stored:
-
-- A cookie copied from another visitor, or left over after an EC rotation,
-  fails to open and is ignored.
-- The payload of `ts-eids-s` carries `kc` and `cf`. A `cf` that does not match
-  the current identity config makes its positive entries be ignored and
-  rebuilt from KV (section 5.6). `ts-eids-r` carries no `cf`.
-- An old `ts-eids-s` replayed by its own visitor carries an old `kc`, which
-  forces a KV read (section 6.3), and the read overrides it. Replay can delay
-  a removal by at most `kv_revalidate_sec`.
-
-`ec_hash` is not used for binding, because it is the HMAC of the client IP
-and is shared by every browser behind one address (`ec/generation.rs:83-93`).
-A cookie that fails to open or decode is ignored and rebuilt by the next
-request that reads KV. The failure is logged without the value. Sealing
-needs an AES-GCM implementation, a new dependency (section 14), which the
-UID2 provider needs anyway (section 12.3).
-
-**Key rotation.** TS seals every new cookie with the `current` key and
-opens a cookie with any key in the keyring: the current key and the
-previous keys still configured. A cookie whose `<kid>` is not in the
-keyring fails to open, as any other cookie that fails to open. Rotation must
-never drop an unapplied removal batch, so:
-
-- A writer whose phase 1 read finds a `ts-eids-r` cookie opened under a
-  previous key and not yet all applied re-seals it under the current key, in
-  place: same name, same batch, a fresh nonce and a new `Max-Age`. A partly
-  applied cookie is re-sealed whole. Every writer navigation reads KV when a
-  `ts-eids-r` cookie is present (section 6.3), so it re-seals or deletes
-  every one it carries. Stagers never re-seal.
-- A `ts-eids-s` opened under a previous key is re-emitted under the current
-  key by the next request that reads KV and sets it (section 5.6).
-- A rotation is two deploys: add the new key to the keyring, wait until
-  every POP serves that config, then make it `current`. A POP that does not
-  yet know a key ID would otherwise fail to open the new cookies, and its
-  writer would delete their batches.
-
-How long a previous key must stay configured:
-
-- **`ts-eids-s`:** at least `staged_max_age_sec` (default 7 days). By then
-  every staged entry sealed under it is too old to flush anyway, and a
-  cookie that fails to open is rebuilt from KV. A client that keeps
-  navigating moves to the current key within `kv_revalidate_sec`.
-- **`ts-eids-r`:** one year, the cookies' `Max-Age`, after the key stops
-  being current. A client's batch moves to the current key at its first
-  writer navigation after the rotation, so a shorter retention covers every
-  client that navigates within it. Only the full year guarantees that no
-  browser can still hold a batch sealed under the removed key.
-
-Residual risk: a client that holds an unapplied batch and makes no writer
-navigation before its key is removed loses that batch when it returns. Its
-writer deletes the cookie as failing to open, and the removed ID can reach
-that browser's bidstream again until the provider removes it again. A
-client that never returns holds a batch nobody applies, rotation or not. An
-emergency rotation that removes a compromised key at once accepts this loss
-for every batch sealed under it.
-
-The hashes of section 9.3 keep their `ec.passphrase`-derived keys.
-
-**Why it is sealed.** Staged entries become KV writes, and sealing proves TS
-wrote them. Without it, a visitor could plant an arbitrary ID in KV, where it
-would also be sent from the server on routes without the cookie. Encryption
-also keeps the IDs out of origin logs and browser extensions.
-
-**`ts-eids-s` payload.** Compact JSON. A source is written as its index into
-the sorted list of configured sources, which `cf` fingerprints, so a config
-change that reorders sources also invalidates the indexes.
+**The mirror payload.** `/auction` returns it as `ext.ts_eids_s` in its
+response (`ResponseExt`, `openrtb.rs:232`), and `/_ts/page-bids` as a
+`ts_eids_s` member of its JSON body. It takes one of two shapes, or is
+absent:
 
 ```json
 {
-  "v": 1,
-  "kc": 1760000000,
-  "cf": "1a2b3c4d",
-  "ids": [
-    {
-      "s": 2,
-      "u": "ID5*example",
-      "w": "id5",
-      "t": 1760000000,
-      "e": 1767776000,
-      "r": 1760086400,
-      "a": 1,
-      "x": { "linkType": 2 },
-      "pv": "3f2a9c1d04b7e6a8",
-      "sa": 1760000000,
-      "k": 0
-    },
-    {
-      "s": 4,
-      "u": "example-envelope",
-      "t": 1760000000,
-      "sa": 1760000000,
-      "b": 1,
-      "k": 0
-    },
-    { "s": 0, "d": 1 }
-  ],
-  "ps": {
-    "id5": { "n": 1760003600, "f": 1, "sg": 1 },
-    "pull-ssp-example-com": { "p": 1760000000 }
-  }
+  "value": "eyJ2IjoxLCJlaWRzIjpbeyJzb3VyY2UiOiJleGFtcGxlLmNvbSIsInVpZHMiOlt7ImlkIjoiZXhhbXBsZS1hIiwiYXR5cGUiOjF9XX1dfQ",
+  "max_age": 86400
 }
 ```
 
-| Field         | Meaning                                                                                    |
-| ------------- | ------------------------------------------------------------------------------------------ |
-| `kc`          | When a request last confirmed this cookie against the KV row                               |
-| `cf`          | Fingerprint of the identity config: providers, sources and owners                          |
-| `m`           | A request saw this EC's row missing. The next writer reads KV in phase 1                   |
-| `s`           | The source, as an index into the configured source list                                    |
-| `u`…`x`, `rv` | Mirror the KV fields `uid`, `w`, `at`, `exp`, `ra`, `atype`, `ext`, `rv`. Staged: no `rv`  |
-| `pv`          | The revision (`rv`) of the record this entry replaces. Absent: none                        |
-| `sa`          | When the entry was staged                                                                  |
-| `b`           | `1` for a browser KV-gap entry (`FillMissing`)                                             |
-| `k`           | `1` when the entry is known to be in KV, `0` when staged and not yet written               |
-| `d`           | A stub: the entry was dropped for size and is still in KV                                  |
-| `ps.n/f/o/iv` | Mirror KV `ps`. `sg: 1` marks a staged change not yet written                              |
-| `ps.oc`       | A staged opt-out clear from a capture (section 8), with its time                           |
-| `ps.p`        | Pending marker: when an after-send dispatch happened whose result is not in the cookie yet |
+```json
+{ "clear": true }
+```
 
-**`ts-eids-r` payload.** Removals as `{s, w, pv?, sa}`, where `s` is the
-source domain itself, never an index: `ts-eids-r` carries no `cf`, so an
-index could point at another source after a config change. An entry
-without `pv` removes the source's record if `w` wrote it and acquired it at
-or before `sa`. A tie goes to the removal, so an acquisition in the same
-second never dismisses a revocation; an ID re-acquired in that second is
-removed too and resolved again later. Opt-outs as `o: {<provider>: <at>}`, and invalidated UIDs as
-`iv: {<provider>: [<hash>]}`.
+- **`value`** when the request read a live, consenting row and the servable
+  server set is not empty. `max_age` is the smaller of 86,400 seconds, the
+  lifetime of `ts-eids`, and the time until the earliest `exp` in the
+  mirrored set, so the mirror never outlives an ID.
+- **`clear`** when the request's consent denies EID persistence, when its
+  KV read finds a tombstone, `consent.ok = false` or a missing row, and
+  when the servable server set is empty.
+- **Absent** when the request read no KV, such as a `/_ts/page-bids` call
+  whose auction does not run. The shim leaves the cookie as it is.
 
-An entry is **applied**, and is skipped if the mutation meets it again,
-when the live row shows:
+The shim writes `value` as the cookie value with the given `Max-Age`, and
+expires the cookie on `clear`. It skips the write when the value is
+unchanged.
 
-- a removal with `pv`: the record is gone or at another revision
-- a removal without `pv`: the record is gone, written by another writer, or
-  acquired after `sa`
-- an opt-out: KV's `ps.o.at` is at or after `at`, or KV's `ps.oc` is after
-  `at`, so a cleared opt-out is never re-applied. A clear in the same second
-  as the opt-out does not count: the opt-out still applies
+`value` is the base64url encoding, without padding, of compact JSON:
+`{"v": 1, "eids": [...]}`. The example above encodes one entry,
+`{"source": "example.com", "uids": [{"id": "example-a", "atype": 1}]}`.
+`eids` holds the server-side entries the auction merge would send for this
+request (section 7.1), before browser precedence: every KV record that
+passes the servability check, for sources with `bidstream_enabled = true`,
+after `gate_eids_by_consent`. Each entry is an OpenRTB EID with its
+`source`, its UIDs with `atype` and `ext`, and its EID-level fields,
+provenance defaults included, exactly as bidders receive it. It never holds
+`ps`, `ps.st`, refresh tokens or any other provider state, and no revision,
+writer or timing field.
 
-`iv` entries never keep a cookie alive: they are applied with the cookie's
-other entries and then dropped with it. The writer's phase 1 read deletes
-each cookie whose entries are all applied, and any `__Host-ts-eids-r-`
-cookie that fails to open, for example one sealed under a key no longer in
-the keyring. A cookie that is only partly applied is kept whole, and its
-applied entries are skipped when re-applied. One opened under a previous
-key is re-sealed (above).
+**Size cap.** At most 2,048 bytes for the cookie value, so at most about
+1,536 bytes of payload JSON. When the set does not fit, whole sources are
+left out, in ascending `cookie_priority` (section 10.1) and then largest
+first, and each omission is logged with the provider and source. A source's
+entry set is mirrored whole or not at all, never trimmed. A left-out source
+still reaches bidders through TS from KV.
 
-**Size.** Each cookie's sealed value is at most 512 bytes. The `v1.`
-prefix, a key ID of at most 8 characters, the base64url nonce and their
-separators take at most 29 bytes, base64url turns every 3 bytes into 4, and
-the tag takes 16, so a cookie holds at most 346 bytes of payload JSON. A
-removal costs 56 bytes plus its source domain
-and provider ID: about four fit with typical names (a 15-byte source and an
-8-byte provider), and one with a 253-byte source domain. An `iv` hash costs
-19 bytes, and an opt-out about 15 bytes plus the provider ID.
+**Who writes it.** Only the shim. TS never sets `ts-eids-s`, not even on a
+JSON response, so writer HTML responses stay cacheable. A withdrawal or
+tombstone met on a writer navigation is cleared from the mirror at the
+page's next `/auction` or `/_ts/page-bids`, whose consent check or KV read
+returns `clear`. Until then the mirror can hold IDs TS no longer serves.
+TS's own bidstream is unaffected, because the server never reads the
+mirror.
 
-A batch is never coarsened to fit. It is not merged into another
-response's cookie, its removals are not widened, its `iv` hashes are not
-dropped, and an invalidation never becomes an opt-out.
+**No feedback.** The shim never copies mirror IDs into `ts-eids` or the
+`/auction` body. A page script that does so anyway, for example by writing
+them into Prebid's `ortb2` config, turns them into ordinary browser
+candidates. Browser ingest stores them with `FillMissing`, one entry with
+one UID, under today's rules (section 2.2), and the provider denials of
+section 7.1 filter them before the auction, for owned and unowned sources
+alike. So a stale copy of an ID a provider removed is not sent. A mirror ID
+never becomes an owner write and never carries its writer, timing or
+EID-level fields back into KV.
 
-**Overflow.** A response to a real browser writes its batch to KV before
-send, instead of setting a cookie, when the batch does not fit one cookie
-or the request already carries four openable `ts-eids-r` cookies. A
-response to a client that fails `looks_like_browser()` never makes this
-write (section 4.7): it sets the batch in new cookies of its own, split as
-needed, as when the write fails. This removal overflow
-write is the second page-load exception to G4 (section 5.1). It reads the
-row and applies only the batch's removals, opt-outs and `iv` hashes under
-the rules of section 5.4, with a CAS and the withdrawal path's five
-attempts. Like that path, it re-reads and tries again only when the CAS
-generation no longer matches. Any other failure, Fastly's per-key limit
-included, ends the write at once. When it lands, or the read shows the batch
-already applied, no cookie is set. When it fails, the response sets the
-batch in new cookies of its own, split across as many 512-byte cookies as it
-needs, so the batch is never lost.
-
-Four is where TS stops relying on cookies, not a hard cap. Concurrent
-responses each count from their own inbound snapshot, so five responses
-that start with no removal cookie can set five. The count passes four only
-while removal batches race or overflow writes fail, and the next writer
-navigation deletes every applied cookie. A metric reports the number and
-total size of `ts-eids-r` cookies per request (section 14).
-
-**Staged `ps` changes** merge at flush: `n` takes the later value, `f` the
-cookie's, `iv` is the union, and an opt-out from `ts-eids-r` is kept unless
-it is applied or stale under the rules above. A staged clear `ps.oc` is
-dropped from `ts-eids-s` once KV holds an equal or later `ps.oc`.
-A mirrored `o` in `ts-eids-s` yields to KV (section 4.7).
-
-**Pending markers.** While a marker is unanswered, the provider is not
-dispatched again, and the next writer request reads KV in phase 1 (section
-6.3). Until that read, the provider's cookie entries are not used in
-auctions, because its after-send result may have removed them. A KV read
-answers a marker when any of these hold, and the reader then clears it and
-copies the result into the cookie, removals included:
-
-- `ps.n` for the provider is at or after `p`.
-- `ps.o` for the provider is set.
-- A source the provider claims has `at` at or after `p`, or lost the value
-  the cookie holds.
-- The live row makes the provider ineligible (section 5.6).
-
-A marker that a read does not answer by `p + timeout_ms + pending_grace_sec`
-is dropped: the dispatch was cancelled or its flush failed, and the provider
-is eligible again. A marker cannot block a provider for good.
-
-**Size cap.** At most 2,048 bytes for the sealed value of `ts-eids-s`. When it
-is over, entries are dropped in this order:
-
-1. Entries with `k: 1` become stubs `{s, d: 1}`. They are still in KV. A
-   stub makes the next request that needs the source read KV.
-2. `ps` entries with no marker and no staged change. They are still in KV.
-3. Provider entries with `k: 0`, in ascending `cookie_priority` (section
-   10.1). Each one lost costs a later provider call.
-4. Browser KV-gap entries (`b: 1`), last, because nothing re-derives one
-   unless the browser sends it on another `/auction` (section 5.3).
-
-Pending markers are never dropped. Each drop is logged with the provider and
-source.
-
-**Who writes them.**
-
-- **`ts-eids-s`:** the writer request's HTML response only when needed
-  (section 5.2, phase 3), because any HTML response with `Set-Cookie` becomes
-  `private, max-age=0` (section 3.4); and stagers, whenever they save an
-  entry or their KV read changes the cookie (section 5.6). Their JSON
-  responses are already private.
-- **`ts-eids-r`:** any response that produces a removal or opt-out, on any
-  route, including the unusable-consent path (section 5.3), adds a new
-  cookie for its batch, unless its overflow write landed (above; a client
-  that fails the real-browser check never makes one); and the writer
-  navigation's HTML response deletes the cookies its phase 1 read showed
-  applied and re-seals, in place, those opened under a previous key that
-  are not yet all applied.
-- **A consent withdrawal, or any KV read that finds a tombstone,** sets
-  `Max-Age=0` on `ts-eids-s`. Once the tombstone is confirmed (written by
-  this request, or read), the `ts-eids-r` cookies are pointless and are
-  deleted too, because the tombstone removes everything. If the
-  withdrawal's tombstone write failed, they are kept.
-
-The browser shim never reads or writes either cookie. Both join `ts-ec`,
-`ts-eids` and sharedId in the list of identity cookies the template cache
-refuses as cache keys (`cookies/template_cache_policy.rs:35`), so no operator
-can split the shared template cache per visitor with them.
+**Template cache.** `ts-eids-s` joins `ts-ec`, `ts-eids` and sharedId in
+the list of identity cookies the template cache refuses as cache keys
+(`cookies/template_cache_policy.rs:35`), so no operator can split the
+shared template cache per visitor with it.
 
 **Outbound requests.** TS's identity cookies never reach third parties. One
-list, `TS_IDENTITY_COOKIE_NAMES` (`ts-ec`, `ts-eids`, `__Host-ts-eids-s`,
-every `__Host-ts-eids-r-` cookie by prefix, `ts-ec-pull-complete`), is stripped from Prebid Server
-requests and never added to proxy or provider requests. The publisher origin
-is not a third party, but it gets only the small ones:
+list, `TS_IDENTITY_COOKIE_NAMES` (`ts-ec`, `ts-eids`, `__Host-ts-eids-s`),
+is stripped from Prebid Server requests and never added to proxy or
+provider requests. The publisher origin is not a third party, but it gets
+only the small one:
 
 - **Publisher origin. ID cookies stripped.** The publisher proxy removes
-  `ts-eids`, `__Host-ts-eids-s` and every `__Host-ts-eids-r-` cookie
-  (`TS_ORIGIN_STRIPPED_COOKIE_NAMES`) from the `Cookie` header it forwards
-  (`publisher.rs:3124-3147`), and drops the header when nothing is left.
-  `ts-ec` and `ts-ec-pull-complete` still reach the origin, as today,
-  because publishers' servers may read `ts-ec`. Without the strip the ID cookies
-  add up to about 5.5 KB to every origin request, and up to 2 KB more while
-  removal batches wait, and common origin
-  servers reject a header line over about 8 KB with 400 or 431, which would
-  fail the page itself. Stripping `ts-eids` from the origin is a behaviour
+  `ts-eids` and `__Host-ts-eids-s` (`TS_ORIGIN_STRIPPED_COOKIE_NAMES`) from
+  the `Cookie` header it forwards (`publisher.rs:3124-3147`), and drops the
+  header when nothing is left. `ts-ec` still reaches the origin, as today,
+  because publishers' servers may read it. Without the strip the ID cookies
+  add up to about 5 KB to every origin request, and common origin servers
+  reject a header line over about 8 KB with 400 or 431, which would fail
+  the page itself. Stripping `ts-eids` from the origin is a behaviour
   change: an origin that read it must read `x-ts-eids` or ask TS instead. A
   metric still reports the inbound `Cookie` header size (section 14).
 - **Prebid Server.** Stripped in the Prebid transport before the
@@ -2403,86 +2359,34 @@ is not a third party, but it gets only the small ones:
   header (section 4.7).
 
 The strip iterates every `Cookie` field, as `gpt_diagnostics.rs:394-416` does,
-and drops the header when nothing is left. Only the routes of section 6.3
-open the cookies, lazily, at most once per request, keeping the result on
-`EcContext`. Assets and other routes never decrypt them: the origin and
-Prebid Server strips match cookie names only. The derived keys, `cf` and
-the source index are computed once per settings load, not per request.
+and drops the header when nothing is left. It matches cookie names only; no
+route opens `ts-eids-s`. The configured source list is computed once per
+settings load, not per request.
 
 ### 6.3 Read order
 
-For a request with a valid EC that uses identity (the writer request,
-`/auction`, `/_ts/page-bids`, a proxy capture, or any request dispatching a
-hold-mode provider):
+The server-side view of provider IDs is the KV row, and nothing else. For a
+request with a valid EC that uses identity (the writer request, `/auction`,
+`/_ts/page-bids`, or a capture removal write):
 
-1. If `ts-eids-s` opens, use its IDs for owned sources (skipping expired
-   entries, stubs and the entries of providers with an unanswered marker),
-   its staged entries, and its `ps` for eligibility (section 4.7). Whether
-   or not it opens, apply `ts-eids-r` on top: its removals hide the records
-   they name, from the cookie view and from KV, and its opt-outs block their
-   providers.
-2. **The writer's phase 1** reads the KV snapshot when any of these hold:
-   - `ts-eids-s` is missing, fails to open, or has a `cf` that does not
-     match
-   - `now - kc` exceeds `kv_revalidate_sec`
-   - `m` is set
-   - any `ts-eids-r` cookie is present, so the writer can delete the
-     applied ones
-   - any pending marker is unanswered
-   - the navigation's auction needs a source that is only a stub
-   - a hold-mode provider is due, so the read is its pre-disclosure
-     revalidation
-   - an after-send provider without private state is eligible on the
-     cookie view and has a candidate source that is unowned or only a stub,
-     so its dry run sees what KV holds (section 5.2). A valid pull-complete
-     marker removes a generic-pull provider's sources from the cookie-view
-     candidates, as today, and step 3's cookie-only `ps.n` keeps this from
-     firing on every navigation.
-   - the navigation runs an auction that needs the row, as today's preload
-     decides (`auction_needs_row`, `publisher.rs:3110-3117`). Today that is
-     every auction navigation with unowned bidstream sources, because the
-     cookie caches no unowned values
-   - consent is withdrawn and the tombstone path needs the row, as today
+1. **The writer's phase 1** reads the KV snapshot on every returning-EC
+   navigation. The read finds orphans (section 5.5), feeds eligibility
+   (section 4.7), filters browser candidates (section 7.1) and serves the
+   withdrawal path when consent is withdrawn.
+2. `/auction` and `/_ts/page-bids` keep their existing reads and gain no new
+   triggers. A stager navigation that runs an auction, such as a prefetch,
+   preloads as today, without the pull-complete marker's skip (section
+   10.4).
+3. **Any request that read KV** uses the row as the base:
+   - A tombstone, or `consent.ok = false`, empties the server set. An
+     `/auction` or `/_ts/page-bids` response returns `clear` for the
+     mirror.
+   - A missing row, unless this request is about to recover it, empties the
+     server set and stores nothing (section 5.6).
 
-   `/auction` and `/_ts/page-bids` keep their existing reads and gain no new
-   triggers.
-
-3. **Any request that read KV** merges the two as below and sets `kc = now`.
-   It re-emits the cookie only when the merge changed it or the inbound `kc`
-   is older than half of `kv_revalidate_sec` (section 5.6):
-   - A tombstone, or `consent.ok = false`, empties the server set and expires
-     the cookie.
-   - A missing row, unless this request is about to recover it, replaces
-     `ts-eids-s` with a minimal cookie holding only `m: 1`: no positive
-     entries and no markers (section 5.6).
-   - For each owned source, the KV record wins, with one exception: a staged
-     provider entry that `OwnerWrite` would still apply (its `pv` matches, or
-     it has no `pv` and KV holds only a value the provider did not write)
-     stays `k: 0`.
-   - A `k: 1` entry whose source KV no longer holds, or holds at a different
-     revision, is dropped or replaced.
-   - A staged entry KV already holds becomes `k: 1`. A `b: 1` entry is dropped
-     once KV holds any value for its source.
-   - A stub is replaced by the KV record.
-   - Answered pending markers are cleared, and `m` is cleared when the row is
-     present.
-   - A provider the row shows ineligible because all its unowned candidate
-     sources are present gets `ps.n = now + refresh_after_sec` in the
-     cookie only, stored with the KV `n` it saw. A later read that shows a
-     different KV `n` (an `invalidate` sets `n = now`, for example) drops
-     the cookie-only value. Owned sources need no such value: the cookie
-     caches them with their `ra` and `exp`, so the cookie view already knows
-     when they are due.
-   - On the writer only, each `ts-eids-r` cookie whose entries the row shows
-     all applied is deleted, and each one opened under a previous key that
-     is not yet all applied is re-sealed under the current key (section
-     6.2). Stagers leave the `ts-eids-r` cookies alone.
-
-   The writer's HTML response carries the result only under phase 3's rules,
-   which include "the phase 1 read changed the cookie".
-
-Missing cookie, KV present: the writer request reads KV and rebuilds the
-cookie. The visitor loses nothing.
+A request that read no KV, such as a proxied Lockr API call with no
+revocation, has no server set. It needs none, because it persists no
+positive ID (section 5.3).
 
 ## 7. Auction merge and ownership
 
@@ -2490,8 +2394,8 @@ cookie. The visitor loses nothing.
 
 `merge_auction_eids` (`auction/endpoints.rs:505`), and the navigation and
 page-bids merge (`publisher.rs:5547-5568`), take a third input: the server
-set. It holds IDs from `ts-eids-s` (including staged entries) and KV, with
-expired entries, stubs and removed entries left out. The server set requires
+set. It holds the KV records the request read, with expired records left
+out. It never holds anything from `ts-eids-s`. The server set requires
 what today's KV path requires: `ec_allowed()`, and a live consenting row
 whenever the request read KV (`endpoints.rs:446-460`). Each server-side ID
 must also pass, for this request, the consent policy of the provider that
@@ -2502,7 +2406,7 @@ not disclosed once that provider's policy fails. A record whose writer is
 disabled or no longer configured has no policy left to check, so it is
 never served, and it counts as absent for `FillMissing` and for unowned
 `Initial`, so the browser or another provider can replace it. A record
-without `w` (browser ingest or legacy) needs the owner's policy for an owned
+without `w` (browser ingest or version 1) needs the owner's policy for an owned
 source, and only the generic gates for an unowned one, as today.
 
 For each source, the value sent to bidders is:
@@ -2518,45 +2422,90 @@ current value. It may be stale, which is the problem the EID fidelity work
 fixed (D9). For a provider whose IDs expire, a browser-seeded record is never
 sent from the server at all (section 6.1).
 
-A server value uses its stored `atype`, else `[[ec.partners]].openrtb_atype`,
-and its stored UID-level `ext`. A value the provider wrote also gets the
-EID-level `inserter`, `matcher` and `mm` the provider declared for that
-source (`with_provenance`, section 4.3). A browser value keeps the browser's
-own EID-level fields, as the EID fidelity work requires.
+**How a server value goes out.** A server value is the source's whole entry
+set, one outbound EID per stored entry, in stored order, after the browser
+entries (EID fidelity spec §4.5). A one-UID record without EID-level
+fields is one entry, exactly as today (`ec/eids.rs:64-76`). For each entry:
 
-**Owner denials apply to browser candidates.** Before the precedence above,
-the browser's candidate for an owned source passes the owner's denials, read
-from KV and from `ts-eids-r` alike, so they hold before the removal reaches
-KV:
+- Each UID uses its stored `atype`, else `[[ec.partners]].openrtb_atype`,
+  and its stored UID-level `ext`.
+- The entry keeps its stored EID-level fields. For a value a provider
+  wrote, an entry that sets none of `inserter`, `matcher` and `mm` gets
+  that provider's `with_provenance` default for the source (section 4.3).
+- An owner's valid value replaces every browser entry for the source, all
+  of them when the browser repeated the source. Its set is never mixed
+  with browser entries.
 
-- A browser UID whose keyed hash is in the owner's `ps.iv` is dropped. Once
-  the owner invalidates UID A, an A still in the `/auction` body or in
-  `ts-eids` is not sent.
-- While the owner has a sticky `ps.o`, the browser's value for every source
-  that provider owns is dropped, until the opt-out clears (section 8).
+A browser value keeps the browser's own entries and EID-level fields, as the
+EID fidelity work requires. A browser-seeded or version 1 record is one
+entry with one UID, so everything that predates this spec goes out
+unchanged.
+
+This needs the output path to carry a set. Today `resolve_partner_ids`
+returns `ResolvedPartnerId { uid, openrtb_atype }` and `to_eids` builds one
+EID from each (`ec/eids.rs:21-28`, `:64-78`), for the auction
+(`auction/endpoints.rs:465-466`) and the admin view
+(`ec/admin.rs:485-486`). `ResolvedPartnerId` gains the record's servable
+entry set and its writer, and `to_eids` emits one `Eid` per stored entry
+under the rules above. `build_eids_header` and both callers use it
+otherwise unchanged. For a one-UID record without `w`, the output is
+byte-identical to today's.
+
+**Provider denials apply to browser candidates.** Before the precedence
+above, the browser's candidates pass the denials of the providers that
+claim their source, read from KV:
+
+- A browser UID whose hash is in the `ps.iv` or `ps.ov` of a provider that
+  claims the
+  source is dropped, for owned and unowned sources alike. Once a provider
+  invalidates UID A, or removes it with an opt-out, an A still in the
+  `/auction` body or in `ts-eids` is not sent.
+- While the owner of a source has a sticky `ps.o`, the browser's value for
+  that source is dropped, until the opt-out clears (section 8). The same
+  holds for every source of a capture-only provider with a sticky `ps.o`,
+  owned or not, because its IDs reach TS only through the browser.
 
 These run before `gate_eids_by_consent`, which knows nothing of
-provider-specific rejections. `ps.iv` keeps the four most recent hashes, so
-an older rejected UID can be sent again once evicted. Unowned sources keep
-today's browser-first rule: no provider can veto them.
+provider-specific rejections. `ps.iv` and `ps.ov` each keep the 128 most recent hashes, so an older rejected UID can be sent again once evicted. A removed set adds a
+hash for each of its UIDs (section 7.2), so a browser entry is filtered UID
+by UID, and an entry left with no UID is dropped. Every writer navigation,
+`/auction` and `/_ts/page-bids` auction reads KV and filters fully.
+Unowned sources otherwise keep today's browser-first rule: a provider can
+veto only the UIDs it removed itself, never the source.
+
+The browser's candidates include any `ts-eids-s` mirror ID a page script
+fed back through Prebid (section 6.2). It is filtered like any other
+browser value, so a stale mirror copy of an ID a provider has since removed
+is not sent.
 
 Sources with `bidstream_enabled = false` are
 left out, as `resolve_partner_ids` does today (`ec/eids.rs:36`).
 
 The merged set is consent-gated (`gate_eids_by_consent`) and reported in
-`x-ts-eids` exactly as today, with the same 4 KB cap. `x-ts-eids` therefore
-shows server-only IDs. The calling script can read it, and so can any page
-script that wraps `fetch`, so `HttpOnly` on `ts-eids-s` does not hide server
-IDs from the page. The header stays for validation and troubleshooting, and
-this exposure is accepted.
+`x-ts-eids` exactly as today, with the same 4 KB cap. A full entry set can
+reach that cap sooner, and `x-ts-eids-truncated` is set as today. The
+header's truncation stays per entry, as today (`encode_eids_header`,
+`ec/eids.rs:106`), because the header also carries the browser's entries,
+whose truncation must not change. So the header can hold part of a set;
+`user.eids` always holds it whole. `x-ts-eids` therefore shows server-only
+IDs, EID-level fields included. The calling script can read it, and so can
+any page script that wraps `fetch`. The `ts-eids-s` mirror shows the same
+server-side entries to every page script (section 6.2). The header stays
+for validation and troubleshooting, and both exposures are accepted
+(section 9.3).
 
-One shared servability check covers expiry, the rollback rule, the
-writer's and owner's consent policies, and opt-outs: a record whose writer has `ps.o` set, in KV or
-in `ts-eids-r`, is never served, even before the removal reaches KV. `resolve_partner_ids` (`ec/eids.rs:36`), the admin view
+One shared servability check covers expiry, the rollback rule, the writer's
+and owner's consent policies, and opt-outs: a record whose writer has `ps.o`
+set is never served. `resolve_partner_ids` (`ec/eids.rs:36`), the admin view
 (`ec/admin.rs:485`) and `/_ts/api/v1/identify` all use it. `/identify` reads
 `entry.ids` directly today (`ec/identify.rs:99-103`), so it switches to the
-check. The stale module comment at `ec/eids.rs:1-5` is corrected. So expired
-IDs are never returned by any of them (G7).
+check. Its response shape does not change: `uid` is the first UID of the
+first entry of the source's record, when that record passes the
+servability check, and `eid` is built from that UID with the partner's
+`openrtb_atype`, as today (`ec/identify.rs:127-135`). A partner calling
+`/identify` gets the one UID it gets today, never a provider's full set. The
+stale module comment at `ec/eids.rs:1-5` is corrected. So expired IDs are
+never returned by any of them (G7).
 
 **Consent for `/identify`.** The policies are checked against the visitor's
 consent on this request, never against the row's stored `consent.tcf` and
@@ -2584,15 +2533,27 @@ no consent update.
 
 - **Owned source.** The owner is authoritative. It refreshes when due
   (section 4.7, step 4), and its valid value wins in the auction. Browser
-  ingest and KV-gap entries may only fill the source when it is absent or
-  its record is expired.
+  ingest may only fill the source when it is absent or its record is
+  expired. That includes a `ts-eids-s` mirror ID the page fed back
+  (section 6.2).
   That seeds it: the owner treats a value it did not write as due, and
   refreshes it at once. No other provider may claim the source (section
   10.2).
-- **Invalidated values are not re-seeded.** When the owner invalidates a
-  value, its keyed hash goes into `ps.iv`. Browser ingest and KV-gap entries
-  skip a UID in `ps.iv`, so the browser cannot re-seed the value the owner
-  just rejected, and no invalidate-reseed-refresh loop starts.
+- **Removed values are not re-seeded.** When a provider's invalidation or
+  opt-out removes a record, the hash of each UID in the removed set goes
+  into that provider's `ps.iv` or, for an opt-out, its `ps.ov` (section
+  5.4). Browser ingest skips a UID in the `ps.iv` or `ps.ov` of any provider
+  that claims the source, so the browser cannot
+  re-seed a value a provider just rejected, and no
+  invalidate-reseed-refresh loop starts.
+- **A provider replaces its own set whole.** For an owned source, a result
+  that names it replaces every stored entry for it, so the owner drops one
+  entry by returning the set without it. For an unowned source a result
+  only fills an absent or expired record (`FillMissing`) and never
+  replaces one, so an unowned provider cannot drop an entry. Browser ingest
+  never adds an entry to a
+  provider's set: it fills a source only when it is absent or expired, as
+  today.
 - **Unowned source.** Any provider claiming it, and the browser, write with
   `FillMissing` only. Unowned sources are never refreshed. This is exactly
   today's pull-sync contract. The auction is browser-first.
@@ -2602,54 +2563,59 @@ no consent update.
 
 ## 8. Errors and outcomes
 
-Every effect below goes into the mutation (writer request), or a stager's
-cookies: positive changes into `ts-eids-s`, removals and opt-outs into
-`ts-eids-r`.
+Every resolving provider runs on the writer, so every effect below goes
+into the writer's mutation. A capture, the only provider result on a
+stager, stores its removals, opt-out and clear through the capture removal
+write (section 5.3), and nothing else.
 
-| Result or error                                                                | Stored IDs                                                            | `ps`                                                                                  | Log   |
-| ------------------------------------------------------------------------------ | --------------------------------------------------------------------- | ------------------------------------------------------------------------------------- | ----- |
-| `Resolution::found`                                                            | `OwnerWrite` or `FillMissing` per source                              | `f = 0`; `st` replaced or cleared when the resolution says so                         | debug |
-| A stateful result whose IDs or state lost to a newer write (section 5.4)       | unchanged; the result's removals still apply                          | unchanged                                                                             | debug |
-| `replacing_state` oversized or unserializable                                  | no IDs stored; the result's removals still apply                      | `st` unchanged; `f` and `n` as for `Malformed`                                        | warn  |
-| `Resolution::no_match`                                                         | unchanged                                                             | `n = now + retry_in` (default 24 h, max 7 d)                                          | debug |
-| `Resolution::invalidate`, `also_invalidate`                                    | `OwnerRemove` with the revision the request read                      | UID hash added to `iv`; `n = now`: eligible for `Initial`                             | info  |
-| `Resolution::opted_out`                                                        | `WriterRemove` for every record this provider wrote, owned or unowned | `o = {at: now, fp}`, `st` cleared                                                     | info  |
-| `with_retry_in` on any resolution                                              | as above                                                              | `n` is at least `now + retry_in`                                                      | debug |
-| `request` returns `None`, or `InputUnavailable`                                | unchanged                                                             | `n = now + refresh_after_sec`                                                         | debug |
-| A recorded `InvalidState`, whatever the provider returned                      | as the result says                                                    | `st` cleared, `f` unchanged, `n = now + refresh_after_sec` unless the result sets `n` | warn  |
-| Hold-mode budget spent before the answer                                       | unchanged                                                             | `n = now + hold_retry_sec`                                                            | debug |
-| `Rejected` with a 4xx other than 429, `Config`, `UndeclaredInput`, `Malformed` | unchanged                                                             | `f += 1`, `n = now + min(1 h × 2^(f-1), 24 h)`                                        | warn  |
-| `Rejected` with 429 or 5xx, `Transport`, timeout                               | unchanged                                                             | `f += 1`, `n = now + min(5 min × 2^(f-1), 1 h)`; breaker `record`                     | info  |
-| Breaker open                                                                   | not dispatched                                                        | unchanged                                                                             | debug |
-| Capture: any result or error                                                   | IDs and removals as above                                             | only `o`; never `n`, `f` or the breaker                                               | debug |
-| Capture with `capture_enabled = false`                                         | positive IDs discarded; removals as above                             | only `o`                                                                              | debug |
-| Captured `opted_out`, `revoke_scope = "global"`, real browser                  | the withdrawal tombstone removes the row (section 5.1)                | removed with the row                                                                  | info  |
+| Result or error                                                                | Stored IDs                                                                                                                                             | `ps`                                                                                   | Log   |
+| ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------- | ----- |
+| `Resolution::found`                                                            | `OwnerWrite` or `FillMissing` per source                                                                                                               | `f = 0`; `st` replaced or cleared when the resolution says so                          | debug |
+| A stateful result whose IDs or state lost to a newer write (section 5.4)       | unchanged; the result's removals still apply                                                                                                           | unchanged                                                                              | debug |
+| `replacing_state` oversized or unserializable                                  | no IDs stored; the result's removals still apply                                                                                                       | `st` unchanged; `f` and `n` as for `Malformed`                                         | warn  |
+| `Resolution::no_match`                                                         | unchanged                                                                                                                                              | `n = now + retry_in` (default 24 h, max 7 d)                                           | debug |
+| `Resolution::invalidate`, `also_invalidate`                                    | `OwnerRemove` of the whole set, with the revision the request read                                                                                     | on apply, a hash per UID of the removed set added to `iv`; `n = now`                   | info  |
+| `Resolution::opted_out`                                                        | `WriterRemove` for every record this provider wrote, owned or unowned; for a capture-only provider, also every record of its sources no provider wrote | `o = {at: now, fp}`, `st` cleared; a hash per UID of each removed record added to `ov` | info  |
+| `with_retry_in` on any resolution                                              | as above                                                                                                                                               | `n` is at least `now + retry_in`                                                       | debug |
+| `request` returns `None`, or `InputUnavailable`                                | unchanged                                                                                                                                              | `n = now + refresh_after_sec`                                                          | debug |
+| A recorded `InvalidState`, whatever the provider returned                      | as the result says                                                                                                                                     | `st` cleared, `f` unchanged, `n = now + refresh_after_sec` unless the result sets `n`  | warn  |
+| Hold-mode budget spent before the answer                                       | unchanged                                                                                                                                              | `n = now + hold_retry_sec`                                                             | debug |
+| `Rejected` with a 4xx other than 429, `Config`, `UndeclaredInput`, `Malformed` | unchanged                                                                                                                                              | `f += 1`, `n = now + min(1 h × 2^(f-1), 24 h)`                                         | warn  |
+| `Rejected` with 429 or 5xx, `Transport`, timeout                               | unchanged                                                                                                                                              | `f += 1`, `n = now + min(5 min × 2^(f-1), 1 h)`; breaker `record`                      | info  |
+| Breaker open                                                                   | not dispatched                                                                                                                                         | unchanged                                                                              | debug |
+| Capture: any result or error                                                   | removals as above; positive IDs counted in `capture_unpersisted`, never stored                                                                         | only `o`, `oc`, `iv` and `ov`; never `n`, `f` or the breaker                           | debug |
+| Captured `opted_out`, `revoke_scope = "global"`, real browser                  | the withdrawal tombstone removes the row (section 5.1)                                                                                                 | removed with the row                                                                   | info  |
 
 **Sticky opt-outs.** `ps.o = {at, fp}` records a provider-reported opt-out
 and the consent fingerprint at that time. Server-side calls do not carry the
 vendor's own opt-out cookie, so `o` is TS's only record of it. Applying it
-removes every record the provider wrote (section 5.4), and while it is set
-no record that provider wrote is served (section 7.1). It is cleared only by
-an affirmative re-grant for this provider:
+removes every record the provider wrote, and for a capture-only provider
+every record of its sources that no provider wrote (section 5.4). While it
+is set no record that provider wrote is served, and the browser's values it
+denies are dropped (section 7.1). It is cleared only by an affirmative
+re-grant for this provider, and clearing it empties `ps.ov` (section 5.4):
 
 - **A provider with a GVL ID:** a TC string whose `LastUpdated` is after `at`
   and that grants the provider's vendor and purposes.
 - **Any provider, under GPP:** the applicable US section showing no sale,
   sharing or targeted-advertising opt-out for the signals the provider's
-  policy reads, where the fingerprint at `at` showed one. GPP carries no
-  creation time, so the clear is by section values.
+  policy reads, where `fp` at `at` recorded one. GPP carries no creation
+  time, so the clear is by section values: the opt-out clears when `fp`
+  records at least one US opt-out bit (sale, sharing, targeted
+  advertising, GPC) and the current consent shows none of the opt-outs
+  `fp` records.
 - **A capture-only provider without a GVL ID, such as Lockr:** a later 2xx
-  capture that returns IDs, under consenting cookie and body consent. That
-  is the vendor issuing again after the visitor re-consented through it.
-  The capture's proxy request is a stager, so it stages `ps.oc` beside the
-  IDs in `ts-eids-s`, and the next writer applies the clear before the IDs
-  (section 5.4). If a concurrent `/auction` overwrites that cookie, both
-  are lost together, and the next capture stages them again.
+  capture that returns IDs, under the request's consent. That is the
+  vendor issuing again after the visitor re-consented through it. The
+  capture removal write stores the clear as `ps.oc = now` on that request,
+  under the ordering of section 5.4 (section 5.3). The captured IDs
+  themselves are not stored; once the clear is in KV, the browser path
+  carries them through browser ingest.
 - **An operator,** through the admin endpoints.
 
 A change of jurisdiction, a newly present GPP string, or a privacy signal the
-provider relaxes never clears it. A clear is written to KV, and the
-browser's mirrored copy yields to it (section 4.7). A consent withdrawal's
+provider relaxes never clears it. A clear is written to KV as `ps.oc`. A
+consent withdrawal's
 tombstone removes everything, provider opt-outs included: after it, the
 visitor starts again with a new EC.
 
@@ -2659,21 +2625,22 @@ visitor starts again with a new EC.
 `opted_out` from a real browser runs today's consent-withdrawal tombstone
 path on that request instead (section 5.1): the row is tombstoned, the EC
 cookie is cleared, and everything is removed, provider opt-outs included.
-It uses the withdrawal's existing exception, so G4 keeps exactly two
-page-load exceptions. From a client that fails `looks_like_browser()`, a
-global revoke is staged as a provider opt-out in that client's own
-`ts-eids-r` (section 4.7), so a replayed `ts-ec` cannot tombstone another
-browser's row. An opt-out from `resolves` is always provider-scoped.
+It uses the withdrawal's existing exception, so it adds no page-load exception to G4. From a client that fails `looks_like_browser()`, a
+global revoke is dropped (section 4.7), so a replayed `ts-ec` cannot
+tombstone another browser's row. An opt-out from `resolves` is always
+provider-scoped.
 
-The **consent fingerprint** is the first 16 hex digits of an HMAC, keyed from
-`ec.passphrase`, over the consent signals the provider's policy reads:
+The **consent fingerprint** `fp` is a bitmask, written as hex, of the
+consent signals the provider's policy reads:
 
 - its TCF purpose bits and vendor bit
 - the US sale, sharing and targeted-advertising opt-outs it does not relax
 - GPC and DNT, unless relaxed
 
-It is not computed over the raw consent string, which changes whenever a CMP
-re-saves it.
+It is stored in plain form: the same row already holds the raw consent
+strings (`KvConsent`, `ec/kv_types.rs:69-80`), so a keyed hash would protect
+nothing, and a plain bitmask can be compared bit by bit. It is not the raw
+consent string, which changes whenever a CMP re-saves it.
 
 Rules:
 
@@ -2721,17 +2688,19 @@ Rules:
 - **Before disclosure:** the live-row read and eligibility recomputation
   described in section 4.7.
 - **At write:** the CAS on that read's generation.
-- **At flush and on every cookie write:** staged positive entries, and IDs
-  written into `ts-eids-s`, pass the generic gate and the writing provider's
-  policy against the current consent (section 5.3). Removals and opt-outs
-  never need consent to apply (section 5.6).
+- **In the mirror payload:** the IDs returned for `ts-eids-s` pass the
+  servability check and the generic gate against the request's consent
+  (section 6.2). Removals and opt-outs never need consent to apply
+  (section 5.6).
 - **In the bidstream and `/identify`:** server-side IDs pass their
   writer's policy and, for an owned source, the owner's, against the
   request's visitor consent (section 7.1). Owner denials also filter the
   browser's candidates.
 - **On withdrawal:** the tombstone is written synchronously on whichever
-  request carries it, and the response expires `ts-eids-s` (section 5.1). A
-  global revoke from a real browser takes the same path (section 8).
+  request carries it (section 5.1), and the next `/auction` or
+  `/_ts/page-bids` response tells the shim to clear `ts-eids-s` (section
+  6.2). A global revoke from a real browser takes the same path (section
+  8).
 
 ### 9.2 Outbound requests
 
@@ -2760,39 +2729,48 @@ Rules:
 - Provider errors are logged with `current_context()` only, never with
   `{:?}` of the report, whose attachments could carry a URL or body.
 - `ProviderRequest`, `ProviderResponse`, `ResolveInput`, `CaptureInput`,
-  `StoredId`, `ResolvedId`, `ProviderConsent` and `HashedEmail` have
-  redacting `Debug` implementations. `ConsentContext` gets one too, because
-  it derives `Debug` over the raw consent strings today
+  `StoredId`, `ResolvedEid`, `ResolvedUid`, `ProviderConsent` and
+  `HashedEmail` have redacting `Debug` implementations. `ConsentContext`
+  gets one too, because it derives `Debug` over the raw consent strings today
   (`consent/types.rs:109`).
 - The Lockr proxy logs only the path of the upstream URL, not its query
   (`integrations/lockr.rs:202-204`).
-- Hashes of identifiers (the rate-limit visitor key, `pv`, `ps.iv`, the
-  consent fingerprint) are HMACs with keys derived from `ec.passphrase`, so
-  they cannot be linked to an EC ID without the key. They do not move to the
-  rotating cookie keys (section 6.2). `ps.iv`, the consent fingerprint and
-  the legacy revision hash a `pv` can hold are stored and compared on later
-  requests, so each rotation would break them: a rejected UID could be
-  re-seeded, an opt-out's fingerprint would never match again, and a staged
-  removal with a legacy `pv` would look applied and be skipped. The visitor
-  rate-limit key would survive a rotation, because its windows last 60
-  seconds, but it stays with the others.
-- Cookie sealing keys come from the secret store and are never logged. A
-  key ID may be logged.
+- The rate-limit visitor key is an HMAC of the full EC ID with a key
+  derived from `ec.passphrase`, because it leaves the row for the rate
+  limiter. Its windows last 60 seconds, so a passphrase rotation costs
+  nothing. Nothing stored in the row is keyed: `ps.iv` and `ps.ov` hold unkeyed UID hashes (section 6.1) and the consent fingerprint is a plain bitmask
+  (section 8), because the same row already holds the raw UIDs and consent
+  strings. So a passphrase rotation breaks nothing stored.
 - `CaptureInput` never exposes request bodies or request headers. Proxied
-  requests can contain an email or HEM. TS forwards them, and reads from a
-  body only the consent pointers a descriptor declares (section 4.7). It
-  never reads anything else for identity.
+  requests can contain an email or HEM. TS forwards them, and never reads a
+  proxied request body for identity.
 - Provider state stays in KV. It is never sent to bidders, put in a cookie or
   returned by the admin lookup.
+- A provider's EID-level `ext` and UID-level `ext` are vendor data, such as
+  segments or match metadata. They are stored in KV and never in `ts-eids`,
+  which keeps dropping EID-level `ext` (EID fidelity spec §4.3). They reach
+  bidders, `x-ts-eids` and the `ts-eids-s` mirror under the same consent
+  gates as the UIDs. A vendor spec that stores such data states what it
+  holds, as part of its privacy review.
+- **Server-only IDs are readable by page scripts.** `ts-eids-s` is not
+  `HttpOnly` and is not sealed, so every script on the page can read the
+  servable server set, including UID2 advertising tokens and LiveRamp
+  envelopes. `x-ts-eids` already exposes the same IDs to the calling script
+  and to any script that wraps `fetch` (section 7.1), so the mirror adds no
+  new class of reader. The mirror holds only what bidders receive: never
+  `ps.st`, refresh tokens or other provider state (section 6.2). It is
+  stripped from origin and Prebid Server requests like the other ID
+  cookies. A vendor spec whose IDs must not reach page scripts says so, and
+  the operator gives its source `bidstream_enabled = false` or keeps the
+  provider off.
 
 ### 9.4 Caching
 
-Responses that set `ts-eids-s` follow the same cookie-privacy rule as every
-cookie-bearing response: `private, max-age=0`, with edge-cache headers
-removed (`response_privacy.rs:122-145`). The Fastly terminal hook re-applies
-it after late mutations (`adapter-fastly/src/main.rs:745`). Section 5.2 keeps
-`ts-eids-s` off returning-visitor HTML except when something is due, changed
-or stale.
+This spec adds no `Set-Cookie` to any response. TS never sets `ts-eids-s`:
+the shim writes it from JSON responses that are already private (section
+6.2). Returning-visitor HTML keeps today's cacheability, and removing the
+pull-complete marker (section 10.4) takes away the one `Set-Cookie` a
+returning-visitor navigation could carry today (section 3.4).
 
 ## 10. Configuration
 
@@ -2801,7 +2779,7 @@ or stale.
 ```toml
 # Coordinator policy: vendor-neutral, one place for every timing choice.
 [ec.identity]
-# Replaces ec.pull_sync_concurrency. The old key is accepted and deprecated.
+# Replaces ec.pull_sync_concurrency, which is removed (section 10.2).
 max_concurrency = 4
 # Shared wall-clock budget for all hold-mode providers, in milliseconds.
 # Default 100 (section 4.7 explains why).
@@ -2811,22 +2789,18 @@ hold_budget_ms = 100
 hold_retry_sec = 300
 # Per provider response, before and after decoding.
 max_response_bytes = 65536
-# Seconds a pending marker outlives its provider's timeout. Default 300.
-pending_grace_sec = 300
-# Staged cookie entries older than this are not written. Default 604800.
-staged_max_age_sec = 604800
-# A cookie not confirmed against KV for this long forces a KV read.
-# Must be below the 24-hour tombstone TTL. Default 3600.
-kv_revalidate_sec = 3600
 
 [ec.identity.providers.id5]
-# "hold" or "after_send". Default "after_send". ID5 keeps private state, so
-# it runs only on the writer navigation: before the auction when that
-# navigation runs one, after send when it does not (section 4.7, step 8).
+# "hold" or "after_send". Default "after_send". Providers run only on
+# writer navigations. Hold mode runs before the navigation's auction, and
+# after send when the navigation runs none (section 4.7, step 7).
 mode = "hold"
-# Hold mode: min(timeout_ms, remaining hold budget). Default: hold_budget_ms
-# in hold mode, 1000 after send.
+# Hold dispatch before the auction: min(timeout_ms, remaining hold budget).
+# Default: hold_budget_ms.
 timeout_ms = 80
+# Any dispatch after send, including a hold-mode provider on a navigation
+# that runs no auction. Default 1000.
+after_send_timeout_ms = 1000
 # Narrows the sources this provider may write. Default: every source its
 # descriptor declares. Narrowed here to the one source registered below.
 sources = ["id5-sync.com"]
@@ -2839,30 +2813,18 @@ max_calls_per_minute = 1
 # timeouts, 429s or 5xx responses happen within one 60-second window.
 # Default 50.
 breaker_failures_per_minute = 50
-# Lower is dropped first when ts-eids-s exceeds its cap. Default 0.
+# Lower is left out of the ts-eids-s mirror first when it exceeds its cap.
+# Default 0.
 cookie_priority = 10
 
 [ec.identity.providers.lockr]
-# Only for providers that declare `captures`. Default false: captured
-# positive IDs are discarded and logged at debug; removals still apply.
-capture_enabled = true
+# Required for a capture-only provider: its opt-out removes browser-ingested
+# records of every source listed here (section 5.4).
+sources = ["id5-sync.com"]
 # Only for providers that declare `captures`. "provider" or "global".
 # Default "provider": a captured opt-out removes this provider's records.
 # "global" runs the consent-withdrawal tombstone instead (section 8).
 revoke_scope = "provider"
-
-# Keys that seal ts-eids-s and ts-eids-r (section 6.2). No default:
-# required when `ec.ec_store` is set.
-[ec.identity.cookie_keys]
-# The key ID that seals new cookies. It must be one of `keys`.
-current = "k2"
-# The current key and every previous key still accepted for opening. Each
-# `secret` is a secret-store key name at rest, resolved at startup to 32
-# bytes in base64.
-keys = [
-  { id = "k2", secret = "ts-identity-cookie-key-k2" },
-  { id = "k1", secret = "ts-identity-cookie-key-k1" },
-]
 
 # Source policy: the existing table, with one new field.
 [[ec.partners]]
@@ -2879,10 +2841,8 @@ enabled = true
 partner_id = 1234
 ```
 
-`[ec.identity]` and each `[ec.identity.providers.<id>]` table are optional,
-except `[ec.identity.cookie_keys]`, which is required when `ec.ec_store` is
-set, because the cookies cannot be sealed without it. A provider with no
-table uses the defaults.
+`[ec.identity]` and each `[ec.identity.providers.<id>]` table are optional.
+A provider with no table uses the defaults.
 
 ### 10.2 Validation
 
@@ -2902,7 +2862,9 @@ each provider's `sources` narrowing before checking ownership.
 Each of these is an error:
 
 - `owner` names a provider that is not enabled.
-- `owner` names a provider whose descriptor does not include that source.
+- `owner` names a provider whose descriptor does not include that source,
+  or a capture-only provider, which never writes a record in v1 (section
+  4.7).
 - A descriptor fails to build (section 4.3).
 - An enabled provider claims a source with no `[[ec.partners]]` entry.
 - An enabled provider claims a source owned by a different provider. Use
@@ -2910,27 +2872,26 @@ Each of these is an error:
   `id5-sync.com`, Lockr is narrowed to the sources no native provider owns.
 - `sources` names a source the provider's descriptor does not declare, or
   narrows the provider to no source at all.
+- A capture-only provider has no `sources` setting. Its opt-out removes
+  browser-ingested records of every source it keeps, including IDs other
+  vendors' own modules produced (section 5.4), so the operator must list the
+  sources it is the delivery path for; the default of every declared source
+  is not allowed.
 - Two providers have the same ID (section 10.4).
 - A capture rule lies outside the registering integration's proxy routes.
   `IntegrationRegistry::with_plan` reports it at startup (section 4.3).
 - `[ec.identity.providers.<id>]` names an unknown provider.
-- `mode` is not `hold` or `after_send`. A provider with state runs only on
-  the writer request in either mode: in hold mode on writer navigations that
-  run an auction, and after send on those that do not (section 4.7, step 8).
+- `mode` is not `hold` or `after_send`.
 - More than 32 providers are enabled, generic pull partners included. A KV
   row holds `ps` for at most 32 (section 6.1).
 - `timeout_ms` is greater than `hold_budget_ms` for a hold-mode provider.
 - `hold_budget_ms` is over 1,000, `max_concurrency` is 0,
-  `refresh_after_sec` is 0, or `kv_revalidate_sec` is not below 86,400.
-- `capture_enabled` or `revoke_scope` is set for a provider whose
-  descriptor declares no `captures`, or `revoke_scope` is not `provider` or
-  `global`.
-- `ec.ec_store` is set and `[ec.identity.cookie_keys]` is missing.
-- `current` is not one of `keys`, two keys share an `id`, or an `id` is not
-  1 to 8 characters of `[a-z0-9]`.
-- At startup, after secret resolution, a key's secret does not decode from
-  base64 to exactly 32 bytes. Deploy validation sees only key names, so this
-  check runs in `validate_settings_for_runtime`.
+  `refresh_after_sec` is 0, or `after_send_timeout_ms` is 0 or over 10,000.
+- `revoke_scope` is set for a provider whose descriptor declares no
+  `captures`, or is not `provider` or `global`.
+- A removed key is set: `ec.pull_sync_concurrency`, or
+  `pull_sync_ttl_sec` or `pull_sync_rate_limit` on an `[[ec.partners]]`
+  entry. The error names the replacement (sections 10.1, 10.4).
 
 Validation never calls a provider. Live approvals, such as a LiveRamp
 placement or an approved origin, stay on the rollout checklist of each vendor
@@ -2941,9 +2902,7 @@ secret, are `Redacted<String>` config fields. At rest the config holds their
 secret-store key names, and they are resolved in memory before runtime
 settings are built (`secret_resolution.rs`). Each identity integration adds
 its secret paths to `TrustedServerAppConfig::secret_fields()`
-(`config.rs:136-175`). The cookie keys' secrets are listed there too, at
-`ec.identity.cookie_keys.keys[].secret`, as an optional path like the
-partner tokens. `build_descriptor` must never read a secret field,
+(`config.rs:136-175`). `build_descriptor` must never read a secret field,
 because deploy validation runs before resolution and would see key names.
 The harness's `check_descriptor_ignores_secrets` builds the descriptor from
 a config whose secrets are placeholder key names and from one with resolved
@@ -2957,7 +2916,8 @@ secrets, so a descriptor that depends on a secret fails the test (section
 (`integrations/registry.rs:663`), and
 `.try_with_identity_provider(Result<P, Report<IdentityProviderError>>)`,
 which wraps a constructor's result for the common case (section 4.6). An
-integration can register more than one provider. The registry exposes `identity_providers()` to build the
+integration can register more than one provider. The registry exposes
+`identity_providers()` to build the
 coordinator. `handle_proxy` offers a proxied response to every provider whose
 descriptor has a capture rule matching it (section 4.7). A compile-time guard,
 `const _: Option<&dyn IdentityProvider> = None;`, keeps the trait
@@ -2979,8 +2939,6 @@ Unchanged:
 - Fill-missing only, unless the operator sets `owner`.
 - The hourly rotation of partner order, which keeps dispatch fair under
   `max_concurrency` (`pull_sync.rs:143-156`).
-- The pull-complete marker, which stays the signal that every pull partner
-  already has an ID (section 6.3).
 
 Its descriptor, built from the `[[ec.partners]]` entry:
 
@@ -2990,12 +2948,9 @@ Its descriptor, built from the `[[ec.partners]]` entry:
 - A consent policy that blocks exactly what pull sync blocks today. The
   migration parity tests (section 13) pin it.
 - Default `after_send`, and unowned.
-- Optional `owner = "pull-<domain>"` makes it authoritative, and the legacy
-  `pull_sync_ttl_sec` becomes its `refresh_after_sec`.
-- `pull_sync_rate_limit` (per hour) maps to
-  `max_calls_per_minute = max(1, ceil(pull_sync_rate_limit / 60))`, which is
-  what the limiter enforces today. A `[ec.identity.providers.<id>]` table
-  overrides it.
+- Optional `owner = "pull-<domain>"` makes it authoritative.
+- Its pacing comes from `[ec.identity.providers.pull-<domain>]`, like any
+  provider's (section 10.1).
 
 What changes:
 
@@ -3010,6 +2965,16 @@ What changes:
 - The rate-limit key moves from `pull:<domain>:<ec_hash>`
   (`pull_sync.rs:373`) to the per-visitor key of section 4.7. Counters reset
   at deploy.
+- `pull_sync_ttl_sec` and `pull_sync_rate_limit` are removed from
+  `[[ec.partners]]` (`settings.rs:430-439`). Their roles move to
+  `refresh_after_sec` and `max_calls_per_minute`. Today's hourly limit
+  already rounds to a per-minute one (section 3.4), so an operator who set
+  `pull_sync_rate_limit = N` sets `max_calls_per_minute = ceil(N / 60)`.
+- The pull-complete marker (`pull_sync_marker.rs`) is removed. Every
+  returning writer navigation reads KV in phase 1 (section 6.3), so the
+  marker saves no read. TS stops setting and reading `ts-ec-pull-complete`;
+  a cookie a browser still holds expires within its one-hour `Max-Age`
+  (`pull_sync_marker.rs:22`).
 
 `dispatch_pull_sync` and `build_pull_sync_context` are removed.
 `run_edgezero_pull_sync_after_send` (`adapter-fastly/src/main.rs:618`)
@@ -3030,7 +2995,8 @@ KV identity runs only on Fastly. Axum, Cloudflare and Spin build an
 `EcContext` for consent-gated routes, but have no `KvIdentityGraph`, no EC
 finalize and no EC generation (`publisher.rs:6896-6899`).
 
-This design changes nothing on them except the Prebid Server and origin cookie strips, which
+This design changes nothing on them except the Prebid Server and origin
+cookie strips, which
 apply on every adapter. Providers are never dispatched there, and their
 `/auction` and `/_ts/page-bids` keep resolving client EIDs without KV. When
 EC identity is ported to them (#777 rows 52 to 54), phase 4 runs after send
@@ -3045,7 +3011,8 @@ framework does not depend on any detail in them. Endpoints, payloads,
 consent parameters, size limits and semantics such as what Lockr's
 revocation covers are decided in each vendor's implementation plan, which
 replaces any shape marked "assumed" below. `IntegrationConfig` impls are
-omitted; they match section 4.6. Endpoints come from operator config, shown with
+omitted; they match section 4.6. Endpoints come from operator config, shown
+with
 `example.com` hosts. Section 12.5 lists what writing them changed in the
 API.
 
@@ -3185,10 +3152,9 @@ impl IdentityProvider for LiveRampProvider {
         };
 
         let lifetime_days = if input.region()?.is("US", "CA") { 15 } else { 30 };
-        let id = ResolvedId::new(source, envelope.value)
-            .with_atype(3)
+        let eid = ResolvedEid::new(source, ResolvedUid::new(envelope.value).with_atype(3))
             .with_expires_in(Duration::from_secs(lifetime_days * 86_400));
-        Ok(Resolution::found([id]))
+        Ok(Resolution::found([eid]))
     }
 }
 ```
@@ -3215,12 +3181,14 @@ What this shows:
 
 ### 12.2 Lockr (passive capture)
 
-Lockr exercises capture from several exact paths, a revocation path that
-must work after consent is denied, consent signals carried in the request
-body, vendor key names mapped to sources, expiry in milliseconds, and
-EID-level provenance. The paths and payloads come from the earlier Lockr
-capture design (`spec/lockr-identity-capture`, its section 2), measured on a
-live page.
+Lockr exercises capture from several exact paths, a revocation path that must
+work after consent is denied, an opt-out cleared by the vendor issuing
+again, vendor key names mapped to sources, expiry in milliseconds, and a
+complete
+EID: every UID and the EID-level fields as the vendor returned them, with a
+declared default for fields a response omits. The paths and payloads come from
+the earlier Lockr capture design (`spec/lockr-identity-capture`, its section
+2), measured on a live page.
 
 ```rust
 const LOCKR_API: &str = "/integrations/lockr/api/publisher/app/v2/identityLockr";
@@ -3235,8 +3203,7 @@ const KEY_SOURCES: &[(&str, &str)] = &[
 
 impl IdentityProviderConfig for LockrConfig {
     fn build_descriptor(&self) -> Result<ProviderDescriptor, Report<IdentityProviderError>> {
-        let mut captures = Captures::new()
-            .with_request_consent(["/consentString", "/gppString", "/ccpaString"]);
+        let mut captures = Captures::new();
         for endpoint in ["page-view", "generate-tokens", "refresh-tokens", "sync-no-hem-ids", "revoke-consent"] {
             captures = captures.with_path(Method::POST, &format!("{LOCKR_API}/{endpoint}"));
         }
@@ -3249,7 +3216,7 @@ impl IdentityProviderConfig for LockrConfig {
         builder
             .with_provenance(
                 &"id5-sync.com".parse()?,
-                EidProvenance::new().with_inserter("Lockr-For-Publishers").with_matcher("").with_mm(2),
+                EidProvenance::new().with_inserter("Lockr-For-Publishers").with_mm(2),
             )
             .build()
     }
@@ -3283,6 +3250,10 @@ struct LockrEid {
     source: String,
     #[serde(default)]
     uids: Vec<LockrUid>,
+    inserter: Option<String>,
+    matcher: Option<String>,
+    mm: Option<i32>,
+    ext: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -3324,20 +3295,40 @@ impl IdentityProvider for LockrProvider {
                 return None;
             }
 
-            let uid = entry.eid.uids.first()?;
-            let mut id = ResolvedId::new(source, uid.id.clone());
-            if let Some(atype) = uid.atype {
-                id = id.with_atype(atype);
+            let mut uids = entry.eid.uids.iter().map(resolved_uid);
+            let mut eid = ResolvedEid::new(source, uids.next()?);
+            for uid in uids {
+                eid = eid.with_uid(uid);
             }
-            if let Some(ext) = &uid.ext {
-                id = id.with_ext(ext.clone());
+            if let Some(inserter) = &entry.eid.inserter {
+                eid = eid.with_inserter(inserter);
+            }
+            if let Some(matcher) = &entry.eid.matcher {
+                eid = eid.with_matcher(matcher);
+            }
+            if let Some(mm) = entry.eid.mm {
+                eid = eid.with_mm(mm);
+            }
+            if let Some(ext) = &entry.eid.ext {
+                eid = eid.with_ext(ext.clone());
             }
             if let Some(at) = expires {
-                id = id.with_expires_at(at);
+                eid = eid.with_expires_at(at);
             }
-            Some(id)
+            Some(eid)
         })))
     }
+}
+
+fn resolved_uid(uid: &LockrUid) -> ResolvedUid {
+    let mut resolved = ResolvedUid::new(uid.id.clone());
+    if let Some(atype) = uid.atype {
+        resolved = resolved.with_atype(atype);
+    }
+    if let Some(ext) = &uid.ext {
+        resolved = resolved.with_ext(ext.clone());
+    }
+    resolved
 }
 ```
 
@@ -3348,24 +3339,33 @@ What this shows:
 - **Revocation outlives consent.** `revoke-consent` arrives after the visitor
   has denied consent, so the request's consent gate would block it. A
   capture's removals must apply whatever the consent (section 12.5). It is
-  provider-scoped by default (`revoke_scope = "provider"`): it removes
-  Lockr-written records only, never the EC. An operator who sets
+  provider-scoped by default (`revoke_scope = "provider"`): it removes the
+  records of Lockr's sources that Lockr or browser ingest wrote, and blocks
+  the browser's values for them until Lockr issues again, never the EC.
+  Lockr never writes a record in v1, so without the browser-ingest part the
+  revoke would remove nothing (section 5.4). An operator who sets
   `revoke_scope = "global"` makes it a full withdrawal that tombstones the
   row, from real browsers only (section 8). Lockr's plan settles which
   scope Lockr's revocation means.
-- **Capture sees a token once.** Lockr returns a token only when it first
-  issues one. On a reload its SDK sends the saved ID with `noGenerate`, and
-  the response carries no new token (#1246). So capture sees an ID only at
-  its first issue, and the browser path carries it on later page views:
-  Lockr writes the ID into Prebid's `ortb2` config, which the EID fidelity
-  work forwards in the `/auction` body and `ts-eids`.
-- **Consent in the request body.** Lockr's SDK sends its own consent strings
-  in the body. The descriptor names them, the coordinator extracts and
-  decodes only those fields, and capture is gated by the stricter of the
-  cookie consent and the body consent. The provider never sees the body.
-- **Provenance.** Lockr's ID5 EID carries `inserter`, `matcher` and `mm`,
-  which bidders read. The descriptor declares them once per source, and the
-  coordinator adds them to every server-side value Lockr wrote.
+- **Capture sees a token once, and v1 does not keep it.** Lockr returns a
+  token only when it first issues one. On a reload its SDK sends the saved
+  ID with `noGenerate`, and the response carries no new token (#1246).
+  Lockr's API calls are stagers, so the captured IDs are discarded and
+  counted in `capture_unpersisted` (section 5.3). The browser path carries
+  the UID browser ingest picks for each registered source (section 2.2) to
+  KV: Lockr writes the ID into
+  Prebid's `ortb2` config, which the EID fidelity work forwards in the
+  `/auction` body and `ts-eids`, and the next writer ingests it (section
+  2.3).
+- **Complete EIDs.** Lockr's ID5 EID carries `inserter`, `matcher` and `mm`,
+  which bidders read, and can carry more than one UID. The capture copies
+  every UID and every EID-level field the response holds, so a stored set
+  is what Lockr issued, under the limits of section 4.5. In v1 capture
+  stores no set; the full set matters once a durable path exists (section
+  15). The descriptor's
+  `with_provenance` stays as the default for a response entry that sets
+  none of `inserter`, `matcher` and `mm`; an entry that sets any of them
+  is Lockr's complete statement (section 4.3).
 - **Milliseconds.** `UnixTime::from_millis` converts Lockr's expiry, and a
   token already expired at capture time is skipped.
 - **Optional expiry.** Lockr gives an expiry only for tokens listed in
@@ -3378,10 +3378,13 @@ What this shows:
   output, not a vendor's input.
 - **The opt-out lasts until Lockr issues again.** Lockr has no GVL ID for a
   TC string to re-grant, so its `ps.o` is cleared by a later successful
-  token capture under consenting cookie and body consent (section 8).
-- **Ownership.** Lockr claims `liveramp.com` and `uidapi.com` too. Where native
-  providers own those, the operator narrows Lockr with `sources` (section
-  10.2).
+  token capture under the request's consent, which the capture removal
+  write stores (section 8).
+- **Ownership and narrowing.** Lockr claims `liveramp.com` and `uidapi.com`
+  too. A capture-only provider must list its `sources` (section 10.2), so
+  the operator keeps only the sources Lockr delivers on that site. A Lockr
+  revoke then removes and blocks only those, not IDs the ID5 or LiveRamp
+  modules produced for a source Lockr is not narrowed to.
 
 ### 12.3 UID2 (secrets, crypto, private state)
 
@@ -3520,12 +3523,12 @@ impl IdentityProvider for Uid2Provider {
             "optout" => Ok(Resolution::opted_out()),
             "success" => {
                 let identity = reply.body.ok_or_else(IdentityProviderError::malformed)?;
-                let id = ResolvedId::new(input.primary_source(), identity.advertising_token)
-                    .with_atype(3)
+                let uid = ResolvedUid::new(identity.advertising_token).with_atype(3);
+                let eid = ResolvedEid::new(input.primary_source(), uid)
                     .with_expires_at(UnixTime::from_millis(identity.identity_expires))
                     .with_refresh_at(UnixTime::from_millis(identity.refresh_from))
                     .with_refresh_until(UnixTime::from_millis(identity.refresh_expires));
-                Ok(Resolution::found([id]).replacing_state(&Uid2State {
+                Ok(Resolution::found([eid]).replacing_state(&Uid2State {
                     refresh_token: identity.refresh_token,
                     refresh_response_key: identity.refresh_response_key,
                     refresh_expires: identity.refresh_expires,
@@ -3549,8 +3552,6 @@ What this shows:
   the refresh token lives. `with_refresh_until` keeps the expired record as
   a refresh anchor until `refresh_expires` (section 5.4), and the provider
   still checks `refresh_expires` itself.
-- **No dry run.** UID2 keeps private state, so it gets no dry run (section
-  5.2), and its `request` always builds the real, encrypted call.
 - **Randomness.** The envelope needs a random IV and nonce. A provider has no
   safe source of its own in a pure method, so `ResolveInput::random_bytes`
   supplies them, and the harness makes them deterministic.
@@ -3573,7 +3574,10 @@ What this shows:
   `ext.linkType` per UID. It declares three sources (`id5-sync.com`, the
   EUID source its responses name, and `true-link-id5-sync.com`,
   `id5IdSystem.js:40-41`, `:130-170`) and uses `also_invalidate` for a
-  declared source a response no longer returns.
+  declared source a response no longer returns. Each source's EID goes
+  through `ResolvedEid` with the UID-level `ext` and EID-level fields the
+  response gives, so a response that returns several UIDs or entries for a
+  source stores them all.
 - **Generic pull** is built in (section 10.4).
 - **A local provider**, one that needs no outbound call, does not fit v1. An
   example is a publisher login ID read from a first-party cookie and
@@ -3586,25 +3590,29 @@ What this shows:
 Writing the examples found these gaps. Each is now in the API of sections 4
 to 6:
 
-| Gap                                                          | Found by          | Change                                                                           |
-| ------------------------------------------------------------ | ----------------- | -------------------------------------------------------------------------------- |
-| `response` cannot know what `request` sent                   | LiveRamp, UID2    | `ProviderRequest::try_with_call_context`, `ProviderResponse::call_context` (4.5) |
-| No safe randomness in a pure method                          | UID2              | `ResolveInput::random_bytes`, deterministic in the harness (4.2, 4.4, 13)        |
-| Secrets have no stated path                                  | UID2              | Secret fields in `secret_fields()`; `build_descriptor` never reads them (10.2)   |
-| Text bodies                                                  | UID2              | `post_text`, `success_text` (4.5)                                                |
-| State cap too small for refresh tokens                       | UID2              | 1,024 bytes (4.5, 6.1)                                                           |
-| Expiry in milliseconds                                       | Lockr, UID2       | `UnixTime::from_millis` (4.4)                                                    |
-| Prefix capture is too broad                                  | Lockr             | `Captures::with_path(method, path)` (4.3)                                        |
-| Revocation arrives after consent is denied                   | Lockr             | Capture removals bypass the consent gate (4.7)                                   |
-| Consent signals in the request body                          | Lockr             | `Captures::with_request_consent`; the stricter consent wins (4.3, 4.7)           |
-| EID-level `inserter`, `matcher` and `mm` cannot be expressed | Lockr             | `ProviderDescriptorBuilder::with_provenance`, applied on output (4.3, 7.1)       |
-| A source string from a response must match a declared source | Lockr             | `SourceDomain::matches` normalizes before comparing (4.3)                        |
-| An oversized UID-level `ext` discarded the whole ID          | Lockr (ID5 `pba`) | The `ext` is dropped and the ID kept (4.5)                                       |
-| Region tests need country and subdivision                    | LiveRamp          | `Region::country`, `Region::is` (4.4)                                            |
-| An expired record stranded refreshable providers             | UID2, LiveRamp    | `Refresh` covers expired records; the provider decides (4.4, 4.7)                |
-| The dry run repeated expensive work and could not see state  | UID2              | No dry run for providers with private state (5.2)                                |
-| Every example parsed its endpoint twice                      | all               | `Resolves::with_endpoint(&str)`, checked by `build()` (4.3)                      |
-| Capture had two ways to say "nothing"                        | Lockr             | `capture` returns `Resolution`; `no_match` means nothing (4.2)                   |
+| Gap                                                                     | Found by          | Change                                                                                                                                  |
+| ----------------------------------------------------------------------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `response` cannot know what `request` sent                              | LiveRamp, UID2    | `ProviderRequest::try_with_call_context`, `ProviderResponse::call_context` (4.5)                                                        |
+| No safe randomness in a pure method                                     | UID2              | `ResolveInput::random_bytes`, deterministic in the harness (4.2, 4.4, 13)                                                               |
+| Secrets have no stated path                                             | UID2              | Secret fields in `secret_fields()`; `build_descriptor` never reads them (10.2)                                                          |
+| Text bodies                                                             | UID2              | `post_text`, `success_text` (4.5)                                                                                                       |
+| State cap too small for refresh tokens                                  | UID2              | 1,024 bytes (4.5, 6.1)                                                                                                                  |
+| Expiry in milliseconds                                                  | Lockr, UID2       | `UnixTime::from_millis` (4.4)                                                                                                           |
+| Prefix capture is too broad                                             | Lockr             | `Captures::with_path(method, path)` (4.3)                                                                                               |
+| Revocation arrives after consent is denied                              | Lockr             | Capture removals bypass the consent gate (4.7)                                                                                          |
+| EID-level `inserter`, `matcher` and `mm` cannot be expressed            | Lockr             | `ProviderDescriptorBuilder::with_provenance`, applied on output (4.3, 7.1)                                                              |
+| A source string from a response must match a declared source            | Lockr             | `SourceDomain::matches` normalizes before comparing (4.3)                                                                               |
+| An oversized UID-level `ext` discarded the whole ID                     | Lockr (ID5 `pba`) | The `ext` is dropped and the ID kept (4.5)                                                                                              |
+| Region tests need country and subdivision                               | LiveRamp          | `Region::country`, `Region::is` (4.4)                                                                                                   |
+| A provider could return one UID per source, with fixed EID-level fields | Lockr, ID5        | `ResolvedEid` and `ResolvedUid`: several entries and UIDs per source, EID-level fields per entry, stored and sent whole (4.5, 6.1, 7.1) |
+| An expired record stranded refreshable providers                        | UID2, LiveRamp    | `Refresh` covers expired records; the provider decides (4.4, 4.7)                                                                       |
+| Every example parsed its endpoint twice                                 | all               | `Resolves::with_endpoint(&str)`, checked by `build()` (4.3)                                                                             |
+| Capture had two ways to say "nothing"                                   | Lockr             | `capture` returns `Resolution`; `no_match` means nothing (4.2)                                                                          |
+
+Revision 15 removed two earlier entries. Request-body consent for capture
+(`Captures::with_request_consent`) only gated positive captures, which v1
+no longer stores. The dry run, and with it `is_dry_run`, saved one KV
+re-read in the rare case a stateless provider skipped its call.
 
 ## 13. Testing
 
@@ -3630,7 +3638,11 @@ assert_eq!(
 let resolution = harness
     .respond(StatusCode::OK, &json!({ "uid": "example-uid", "signature": "example-signature" }))
     .expect("should parse the response");
-assert_eq!(resolution.ids()[0].uid(), "example-uid", "should return the uid");
+assert_eq!(
+    resolution.eids()[0].uids()[0].id(),
+    "example-uid",
+    "should return the uid"
+);
 ```
 
 `harness.respond_raw(status, headers, bytes)` covers empty bodies such as a
@@ -3644,13 +3656,14 @@ sees what production would:
 - **Eligibility.** It applies the consent policy (eligibility step 1) and
   step 4: sources whose kind's needs are missing are left out, and with none
   left `request()` returns `Ok(None)` without calling the provider.
-- **Provenance.** `ProviderDescriptor::provenance` gives the EID-level
-  fields; the harness adds nothing of its own.
+- **Provenance.** Applied only by `output_eids`, as the bidstream applies
+  it (section 7.1). The `Resolution` getters show what the provider set.
 
 The harness API, in the test-support module, gated by
-`#[cfg(any(test, feature = "test-support"))]`. A dependent crate never sees
-`cfg(test)`, so a provider in its own crate enables `test-support` as a
-dev-dependency feature of `trusted-server-core`:
+`#[cfg(any(test, feature = "test-utils"))]`, the crate's existing
+test-helper feature. A dependent crate never sees `cfg(test)`, so a
+provider in its own crate enables `test-utils` as a dev-dependency feature
+of `trusted-server-core`:
 
 ```rust
 impl<'p> ProviderHarness<'p> {
@@ -3669,7 +3682,6 @@ impl<'p> ProviderHarness<'p> {
     /// The fixed clock. Default: a constant test time.
     pub fn with_now(self, now: UnixTime) -> Self;
     pub fn with_random_seed(self, seed: u64) -> Self;
-    pub fn as_dry_run(self) -> Self;
 
     /// Calls `request` and keeps the built request and its call context.
     pub fn request(&mut self) -> Result<Option<ProviderRequest>, Report<IdentityProviderError>>;
@@ -3691,18 +3703,25 @@ impl<'p> ProviderHarness<'p> {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> Result<Resolution, Report<IdentityProviderError>>;
-    /// Runs a capture as the coordinator does, consent extraction included.
+    /// Runs a capture as the coordinator does, response decoding included.
     pub fn capture(&self, fixture: &CaptureFixture) -> Result<Resolution, Report<IdentityProviderError>>;
     /// Resolves an expiry or refresh against the fixed clock.
     pub fn resolve(&self, when: When) -> UnixTime;
     /// The replacement state in a result, decoded, for assertions.
     pub fn state_of<T: DeserializeOwned>(&self, resolution: &Resolution) -> Option<T>;
+    /// The EIDs bidders would see for a result: the section 4.5 rules, then
+    /// the descriptor's provenance defaults (section 7.1).
+    pub fn output_eids(&self, resolution: &Resolution) -> Vec<Eid>;
 
     /// Runs only the cases passed in, never the harness's own inputs. A
     /// provider declared `with_private_state()` fails here with a pointer to
     /// `check_conformance_with_state`.
     pub fn check_conformance(&self, cases: &ConformanceCases);
     pub fn check_conformance_with_state<S: Serialize + DeserializeOwned>(&self, cases: &ConformanceCases);
+    /// The same checks, returning the first failure instead of failing the
+    /// test. `check_conformance` wraps it. A panic aborts a `wasm32-wasip1`
+    /// test run, so the harness's own negative tests use this.
+    pub fn try_check_conformance(&self, cases: &ConformanceCases) -> Result<(), ConformanceFailure>;
 }
 
 /// Inputs for one harness run. The harness's own `with_*` methods delegate
@@ -3742,7 +3761,6 @@ pub struct CaptureFixture { /* private */ }
 
 impl CaptureFixture {
     pub fn new(method: Method, path: &str) -> Self;
-    pub fn with_request_body(self, body: &serde_json::Value) -> Self;
     pub fn with_response(self, status: StatusCode, body: &serde_json::Value) -> Self;
 }
 
@@ -3772,6 +3790,8 @@ impl ConformanceCases {
 /// Test-only constructors, behind the same gate.
 impl StoredId {
     pub fn for_test(source: &SourceDomain, uid: &str) -> Self;
+    /// A stored full set. `uid()` becomes its first UID.
+    pub fn with_eids(self, eids: Vec<Eid>) -> Self;
     pub fn written_by(self, writer: &IdentityProviderId) -> Self;
     pub fn expiring_at(self, at: UnixTime) -> Self;
 }
@@ -3801,24 +3821,25 @@ harness never guesses which setup makes a provider call out:
 - A provider without `with_private_state()` never returns state.
 - Requests go only to declared hosts, over HTTPS, with no `Cookie` header and
   with valid header names and values.
-- Returned IDs are only for declared sources, at most one per source.
-- `ResolvedId::expiry()` and `refresh()` report what the provider set, and a
-  fixture ID of a source marked expiring carries an expiry.
+- Returned entries are only for declared sources, and no fixture's result
+  hits a limit of section 4.5: no dropped UID or field, no discarded entry
+  and no set over `MAX_ENTRY_SET_BYTES`. A vendor whose real responses can
+  exceed a limit says so in its spec; the fixture does not hide it.
+- `ResolvedEid::expiry()` and `refresh()` report what the provider set, and
+  a fixture set of a source marked expiring carries an expiry.
 - `capture` never returns a state change.
 - For every case with state, the harness also injects a stored state that
   is a bare JSON string, which no struct decodes, and checks that the
   provider neither panics nor treats it as valid state. A
   `#[serde(default)]` state type that decodes anything fails here. That the
   coordinator then clears it is a coordinator test.
-- During the dry run, `is_dry_run()` is true and the built request is
-  discarded unsent. `as_dry_run()` fails the test for a provider declared
-  `with_private_state()`, which never gets one.
 
 `harness.check_conformance_with_state::<S>(&cases)` also checks that the
 state type round-trips through `replacing_state` and `input.state()`.
 `check_descriptor_ignores_secrets::<C>(&placeholder, &resolved)` builds the
 descriptor from a config with placeholder secret names and from one with
-resolved secrets, and fails if the two differ (section 10.2). Vendor tests add a
+resolved secrets, and fails if the two differ (section 10.2). Vendor tests
+add a
 fixture response for each outcome the vendor can return, and assert it
 through the `Resolution` getters.
 
@@ -3828,11 +3849,8 @@ The harness also:
   reproducible
 - carries the built request's call context into `respond`, as the
   coordinator does
-- takes capture fixtures with a request body, and checks that only the
-  declared consent pointers are read from it and that a stricter body
-  consent blocks positive IDs but not removals
-- applies a provider's provenance, so a test can assert the EID-level fields
-  bidders will see
+- applies a provider's provenance in `output_eids`, so a test can assert the
+  EID-level fields bidders will see
 
 The examples in section 12 are the first harness cases: LiveRamp's initial
 and refresh 204s, Lockr's page-view and revoke-consent, and UID2's success,
@@ -3841,50 +3859,66 @@ refresh and opt-out.
 **Coordinator.**
 
 - An eligibility matrix: consent × ownership × per-source kind × due state ×
-  inputs × mode × writer or stager × new or returning EC.
-- The merged eligibility view: a cookie-only `no_match` or result stops a
-  re-call on the next `/auction`; KV's `o` blocks dispatch even when the
-  cookie lacks it.
+  inputs × mode × writer or stager × new or returning EC. No stager
+  dispatches a resolving provider in any cell.
+- The eligibility view is the phase 1 KV row alone: `ts-eids-s` never
+  changes eligibility, whatever it holds.
+- On a site whose auctions all go through `/auction`, a hold-mode provider
+  runs after send on the next writer navigation that runs no auction, its
+  answer reaches KV, and the following `/auction` serves it from KV without calling the provider. Moved after send, it waits `after_send_timeout_ms`, and a miss backs off as a timeout, not as a hold cut-off.
+- A `no_match` or 4xx on a writer stores `ps.n`, so a run of `/auction` and
+  `/_ts/page-bids` calls in the same SPA session never calls the provider
+  again before `ps.n`.
 - `sources` narrowing, owner takeover of a browser-seeded record, sticky
   `ps.o` surviving a jurisdiction change and cleared only by a newer grant,
   and `ps.iv` stopping a re-seed.
 - Hold budget: a fake HTTP client with controlled latency shows the auction
-  starts at the budget, an answer is saved with `k: 0`, and a cut-off call
-  sets `hold_retry_sec` without counting a failure.
-- A dry-run `None` sets no pending marker. A `None` or `InputUnavailable`
+  starts at the budget, an answer joins the writer's mutation, and a
+  cut-off call sets `hold_retry_sec` without counting a failure.
+- `request` is called once per dispatch. A `None` or `InputUnavailable`
   waits `refresh_after_sec`.
-- Pending markers block re-dispatch, hide that provider's cookie entries
-  until a read, are answered by each of the three rules (including a
-  removal), and are dropped past their deadline.
+- After-send results commit in the same phase 4 write. Two overlapping
+  writer navigations for one EC do not both dispatch a provider within the
+  burst cap's window.
 - A navigation answered with a status other than 2xx or 304 dispatches no
-  after-send provider and keeps hold-mode answers in its cookie.
+  after-send provider, stores no positive hold-mode answer, and flushes
+  those answers' removals, opt-outs and backoff, so a `no_match` or 4xx on a
+  404 page is not called again before its `ps.n`.
 - An `UndeclaredInput` is logged as `Config` and backs off.
 - Only transport failures, timeouts, 429 and 5xx feed the breaker. 4xx and
   `Malformed` from many visitors never open it.
 - The burst cap is checked after every other eligibility step.
 - Passive capture runs from `handle_proxy` only for providers with a capture
   rule matching the request, decodes gzip and brotli bodies under the caps,
-  reads only the declared consent pointers from a request body, and never
-  touches `n`, `f` or the breaker.
-- With `capture_enabled = false`, a capture's positive IDs reach neither
-  cookie nor KV and are logged at debug without values, while its removals
-  and opt-outs still apply.
-- A capture from a client that fails `looks_like_browser()` stores no
-  positive ID, puts its removals and opt-outs only in its own `ts-eids-r`,
-  never makes the removal overflow write, and turns a global revoke into a
-  provider opt-out. A later writer navigation from that client applies the
-  batch. A replayed `ts-ec` on the proxy changes no KV row.
+  never reads the request body, and never touches `n`, `f` or the breaker.
+- A capture stores no positive ID and increments `capture_unpersisted`
+  without logging a value. Its removals, opt-out and any clear are written
+  by the capture removal write on that request, before send.
+- The capture removal write retries only a CAS conflict, up to five
+  attempts, tries once more after send when those fail, and on a second
+  failure increments `removal_lost` without logging a value. It
+  writes nothing for a tombstone, a missing row or an already applied
+  removal, and it runs on the unusable-consent path.
+- A writer navigation whose phase 1 snapshot predates a capture removal
+  write of the same page load fails its CAS and is not retried; the next
+  navigation re-derives its browser ingest.
+- A capture from a client that fails `looks_like_browser()` writes nothing,
+  drops its removals, opt-outs and global revoke, and logs them without
+  values. A replayed `ts-ec` on the proxy changes no KV row.
 - With `revoke_scope = "global"`, a captured opt-out from a real browser
   tombstones the row and clears the EC cookie on that request, as a consent
   withdrawal does. With `"provider"`, it removes only that provider's
-  records.
-- A Lockr `revoke-consent` captured on the proxy removes every Lockr-written
-  record, owned or unowned, including sources the cookie holds only as
-  stubs, and survives a concurrent `/auction` rewriting `ts-eids-s`.
-- Providers declared `with_private_state()` never run on stagers. A due
-  stateful provider gets a marker without a dry run, phase 4 rebuilds its
-  request with the live state, and a writer navigation without an auction
-  runs it after send.
+  records and, for a capture-only provider, the records of its sources no
+  provider wrote.
+- A Lockr-style `revoke-consent` captured on the proxy removes the
+  browser-ingested record of each of Lockr's narrowed sources, adds their
+  UIDs to `ps.ov`, and drops the browser's values for those sources. A later
+  token capture clears the opt-out and empties `ps.ov`, and the next writer
+  navigation ingests the same stable UID again. A source Lockr is not
+  narrowed to keeps its browser value throughout.
+- A due stateful provider is dispatched in phase 4 with its request built
+  from the live state, and a writer navigation without an auction runs it
+  after send.
 - A provider's `ResolveKind` is `Refresh` for a stored record whether it is
   still valid or expired, and an expired record counts as absent for
   `FillMissing`.
@@ -3907,143 +3941,131 @@ refresh and opt-out.
 - A decodable GPP string with no applicable section, the header-only
   `DBAA` shape, does not block a strict policy where TCF does not apply.
 - A targeted-advertising opt-out without a sale opt-out produces no
-  server-side IDs in `user.eids`, no flush of that provider's entries, and no
-  IDs written into the cookie.
+  server-side IDs in `user.eids` and none in the `ts-eids-s` mirror
+  payload.
+- The consent fingerprint is a plain bitmask: a GPP opt-out clears exactly
+  when `fp` records a US opt-out bit and the current consent shows none of
+  the opt-outs `fp` records, whatever else changed.
 
 **One-write invariant.** A new test store counts writes by mode (Add,
-`IfGenerationMatch`, Overwrite) and is shared through a test-support feature
+`IfGenerationMatch`, Overwrite) and is shared through the `test-utils` feature
 so adapter tests can use it. `KvIdentityGraph::counting` counts reads only
 (`ec/kv.rs:1596-1605`, `ec/kv_backend.rs:205-221`).
 
-| Scenario                                                             | KV writes                                            |
-| -------------------------------------------------------------------- | ---------------------------------------------------- |
-| New visitor, navigation                                              | 1 (create, before send)                              |
-| New visitor whose first ID collides                                  | 1 (create with a re-minted ID)                       |
-| Returning visitor, changes pending                                   | 1                                                    |
-| Returning visitor, nothing changed                                   | 0                                                    |
-| 304 revalidation with changes pending                                | 1                                                    |
-| Returning EC, navigation answered with 3xx, 4xx or 5xx               | 0                                                    |
-| New visitor, prefetch or prerender navigation                        | 1 (create, before send)                              |
-| Returning visitor, prefetch or prerender navigation                  | 0                                                    |
-| New visitor, client without `Sec-Fetch-Dest`                         | 1 (create, before send)                              |
-| Returning visitor, iframe HTML or no `Sec-Fetch-Dest`                | 0                                                    |
-| Integration-proxy navigation that mints an EC                        | 1 (create)                                           |
-| `/auction`, `/_ts/page-bids`, `/identify`, Lockr API proxy, assets   | 0                                                    |
-| Consent withdrawal, on any request                                   | CAS tombstone (up to 5 attempts) plus marker, per ID |
-| Global revoke captured from a real browser                           | as a consent withdrawal                              |
-| Removal batch from a real browser that overflows the removal cookies | CAS removal write before send (up to 5 attempts)     |
-| Capture removal, opt-out or global revoke from a non-browser client  | 0                                                    |
-| CAS conflict or per-key limit on the flush                           | 1 attempt, not retried                               |
+| Scenario                                                            | KV writes                                                                  |
+| ------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| New visitor, navigation                                             | 1 (create, before send)                                                    |
+| New visitor whose first ID collides                                 | 1 (create with a re-minted ID)                                             |
+| Returning visitor, changes pending                                  | 1                                                                          |
+| Returning visitor, nothing changed                                  | 0                                                                          |
+| 304 revalidation with changes pending                               | 1                                                                          |
+| Returning EC, navigation answered with 3xx, 4xx or 5xx              | 0, or 1 when its hold-mode calls returned removals or backoff              |
+| New visitor, prefetch or prerender navigation                       | 1 (create, before send)                                                    |
+| Returning visitor, prefetch or prerender navigation                 | 0                                                                          |
+| New visitor, client without `Sec-Fetch-Dest`                        | 1 (create, before send)                                                    |
+| Returning visitor, iframe HTML or no `Sec-Fetch-Dest`               | 0                                                                          |
+| Integration-proxy navigation that mints an EC                       | 1 (create)                                                                 |
+| `/auction`, `/_ts/page-bids`, `/identify`, assets                   | 0                                                                          |
+| Lockr API proxy, no revocation                                      | 0                                                                          |
+| Captured revocation from a real browser                             | CAS removal write (up to 5 attempts), once more after send                 |
+| Consent withdrawal, on any request                                  | CAS tombstone (up to 5 attempts) plus marker, per ID; once more after send |
+| Global revoke captured from a real browser                          | as a consent withdrawal                                                    |
+| Capture removal, opt-out or global revoke from a non-browser client | 0                                                                          |
+| CAS conflict or per-key limit on the flush                          | 1 attempt; its removals, if any, then written alone (up to 5 attempts)     |
 
 **Withdrawal and removal.**
 
 - A withdrawal on `/auction` after the navigation's send leaves a tombstone,
   and the navigation's phase 4 drops its mutation and calls no provider.
+- A withdrawal tombstone whose attempts fail before send is tried once more
+  after send.
 - After `opted_out` or `invalidate`, the removed ID stops reaching bidders
-  from the cookie by the next request that reads KV, and within
-  `kv_revalidate_sec` at most.
-- A KV read that finds a tombstone expires `ts-eids-s`.
-- A deletion tombstone makes every browser drop its cookie copy within
-  `kv_revalidate_sec`.
+  through TS on the next request, and the next `/auction` or
+  `/_ts/page-bids` response leaves it out of the mirror payload.
+- An `/auction` or `/_ts/page-bids` response whose KV read finds a
+  tombstone, a missing row or `consent.ok = false`, or whose consent denies
+  EID persistence, returns `clear` for the mirror, and the shim expires
+  `ts-eids-s`.
+- A deletion tombstone is honoured at the visitor's next writer navigation
+  or `/auction`, whatever `ts-eids-s` holds.
+- No response sets a server identity cookie other than `ts-ec`.
 
-**Failed flush.** After a refused write, staged entries and hold-mode answers
-are still `k: 0` in the cookie, and the next navigation writes them.
+**Failed flush.** After a refused write, the mutation's removals, opt-outs and clears are written alone with up to five CAS attempts, and a mutation without them makes no second write. When those attempts fail too, `removal_lost` is incremented without logging a value. The next writer navigation re-derives browser ingest from `ts-eids` and calls the still-due providers again within the burst cap.
 
-**Reads.** A returning visitor with a valid, recently confirmed `ts-eids-s`,
-nothing due, staged or pending, and no registered source in `ts-eids` pays
-zero KV reads on the navigation. `/auction` and `/_ts/page-bids` pay their
-existing one read and no more.
+**Reads.** Every returning writer navigation pays exactly one KV read in
+phase 1, plus the phase 4 re-read when an after-send provider dispatches.
+`/auction` and `/_ts/page-bids` pay their existing one read and no more. No
+request opens or parses `ts-eids-s`.
 
 **No lost EIDs (G10).**
 
-- A registered source present only in the `/auction` body (beyond the
-  cookie trim) is saved as a KV gap and written by the next navigation.
-- A gap too large for the cookie is saved again by the next `/auction` and
-  eventually written.
-- Every source today's `/auction` ingest would write reaches KV.
+- The shim's `ts-eids` trim keeps every registered source before any
+  unregistered one, and keeps the EID fidelity order within each group.
+- A registered source present in the `/auction` body but beyond today's
+  trim is kept in `ts-eids` and written by the next navigation.
+- When the registered sources alone exceed the trim, only those the trim
+  drops are lost, and the test pins which.
+- Every source today's `/auction` ingest would write reaches KV whenever
+  the registered sources fit the trim.
 - An EID present only in Prebid's `ortb2` config, as Lockr writes its ID5,
   reaches `ts-eids` and KV.
 
 **Orphans and collisions (section 5.5).**
 
-- A row deleted out of band is found within `kv_revalidate_sec` and recovered
-  by rotation before send.
-- A stager that sees the row missing sets `m`, and the next writer recovers.
+- A row deleted out of band is found by the next writer navigation's phase
+  1 read and recovered by rotation before send.
+- A stager that sees the row missing stores nothing and returns `clear` for
+  the mirror, and the next writer recovers.
 - A collision on the first create re-mints before any cookie is set.
 
 **Storage.**
 
-- `KvPartnerId` and `ps` round-trip, with and without the new fields.
-- The rollback rule: a stripped or browser-seeded record of an expiring
-  owned source is never sent from the server.
+- A schema version 1 row reads as version 2, each `uid` as one entry with
+  one UID, and its next write stores version 2. A version 2 row and `ps`
+  round-trip.
+- An owned expiring source's record is served from the server only when
+  its `w` is the owner and its `exp` has not passed.
 - Revision-checked `OwnerRemove` and `OwnerWrite` lose to a newer write.
-  Re-applying changes on a later writer keeps the other tab's change.
+  Re-applying changes on a later writer keeps the other tab's change. An
+  `OwnerRemove` of a version 1 record matches `Revision::Unset` until the
+  record's next write.
 - Two refreshes of an unchanged UID in the same second get different `rv`,
   so an invalidation read before the second refresh does not remove it.
 - An opt-out and a clear in the same second leave the provider opted out.
+  A clear with no opt-out to clear writes nothing, and a clear not later
+  than the opt-out is dropped.
+- `ps.iv` and `ps.ov` hold unkeyed hashes, and they still match after an
+  `ec.passphrase` rotation, as does the consent fingerprint.
 - `ts-eids-s`:
-  - sealing and opening with the EC ID as associated data; a cookie sealed
-    for another EC, or tampered with, fails to open and is ignored without
-    logging its value
-  - rejection of a duplicate `__Host-ts-eids-s`
-  - a `cf` that does not match the identity config discards the cookie's
-    positive entries and keeps its removals
-  - a stale `kc` forcing a read
-  - the size cap's drop order, stubs forcing a read, and removals and
-    markers never dropped
-  - a staged refresh that `OwnerWrite` would apply survives the merge, and
-    one it would not is dropped
-  - the flush checks (freshness, writer still enabled and owning, consent
-    re-gate, opt-out, revision)
-  - a replayed old cookie cannot re-insert an opted-out ID, and is overridden
-    at its next revalidation
-- `ts-eids-r`:
-  - an entry written by a removal-producing response survives a concurrent
-    `/auction` that rewrites `ts-eids-s` from an older copy
-  - two removal-producing responses in flight together both keep their
-    batches, each in its own cookie
-  - a batch that does not fit one cookie, or meets four openable cookies,
-    is written to KV before send; when that write fails it is set in new
-    cookies of its own, and no other cookie is rewritten
-  - concurrent responses that each create a first cookie, or each
-    overflow, from the same inbound snapshot all keep their batches
-  - a 253-byte source domain and a long provider ID fit the per-cookie
-    budget, and no batch is widened, stripped of `iv` or turned into an
-    opt-out to fit
-  - a partly applied cookie is kept whole
-  - a Lockr revoke followed by a re-consent capture, before and across
-    navigations, ends with Lockr's new IDs in KV and the old opt-out never
-    re-applied (`ps.oc` in KV), including after a failed flush
-  - a removal names its source by domain, so a config change that reorders
-    sources removes the right one
-  - a cookie that fails to open is deleted by the writer and never counted
-  - a removal without `pv` skips a record its writer re-acquired after `sa`,
-    and removes one acquired in the same second as `sa`
-  - it is honoured on the unusable-consent path, where `ts-eids-s` is
-    expired, until the next writer applies it
-  - the 512-byte sealed cap per cookie with an 8-character key ID, the
-    one-year `Max-Age`, and that stagers never delete one
-- Cookie keys:
-  - a cookie sealed under a previous key opens; one whose key ID is not in
-    the keyring fails to open
-  - a writer re-seals an unapplied `ts-eids-r` cookie opened under a
-    previous key, in place, with the same batch, and deletes an applied one;
-    a stager never re-seals
-  - a `ts-eids-s` opened under a previous key is re-emitted under the
-    current key by the next request that reads KV
-  - across a rotation, with the new key added before it becomes current,
-    no unapplied removal batch is lost
-  - `ps.iv`, the consent fingerprint and a legacy `pv` hash still match
-    after a cookie key rotation
+  - the mirror payload holds only what bidders would receive from the
+    server set: no `ps`, `ps.st`, refresh token, revision, writer or timing
+    field, and nothing a consent gate or `bidstream_enabled = false`
+    excludes
+  - `value` is base64url JSON; `max_age` is at most 86,400 and never past
+    the earliest `exp`; an empty set returns `clear`; a request with no KV
+    read returns no payload
+  - the 2,048-byte cap leaves out whole sources in ascending
+    `cookie_priority`, never trims a set, and a left-out source still
+    reaches bidders
+  - the server never opens it: a forged, stale or malformed `ts-eids-s`
+    changes no eligibility, merge, `/identify` answer or KV write
+  - no response sets it with `Set-Cookie`
+  - the shim writes it as `__Host-ts-eids-s` with `Path=/`, `Secure` and
+    `SameSite=Lax`, without `HttpOnly`, skips an unchanged value, expires
+    it on `clear`, and never copies it into `ts-eids` or the `/auction`
+    body
+  - a mirror ID a page script feeds back through Prebid is ingested only as
+    a one-UID `FillMissing`, and the `ps.iv`, `ps.ov` and `ps.o` denials of
+    section
+    7.1 filter it for owned and unowned sources
 - The admin lookup redacts `ps.st`.
 
 **Outbound requests.** Requests to Prebid Server, in every
 consent-forwarding mode, carry none of the `TS_IDENTITY_COOKIE_NAMES`
 cookies, keep every other cookie, and drop the header when nothing is left.
-Requests to the publisher origin carry none of `ts-eids`,
-`__Host-ts-eids-s` or any `__Host-ts-eids-r-` cookie, keep `ts-ec`,
-`ts-ec-pull-complete` and every other cookie, and drop the header when
-nothing is left.
+Requests to the publisher origin carry neither `ts-eids` nor
+`__Host-ts-eids-s`, keep `ts-ec` and every other cookie, and drop the
+header when nothing is left.
 
 **Merge.**
 
@@ -4051,9 +4073,9 @@ nothing is left.
 - A browser-seeded record never beats the browser's current value.
 - Expired IDs are never sent.
 - `x-ts-eids` matches what was sent.
-- After the owner invalidates UID A, or reports an opt-out, a stale A in the
-  `/auction` body or in `ts-eids` is not sent, before and after the removal
-  reaches KV.
+- After a provider invalidates UID A, or reports an opt-out that removes
+  it, a stale A in the `/auction` body or in `ts-eids` is not sent, for an
+  owned or an unowned source.
 - An unowned source a strict provider wrote stops reaching bidders and
   `/identify` once that provider's vendor consent is denied or a
   targeted-advertising opt-out applies. A record whose writer is disabled
@@ -4066,484 +4088,252 @@ nothing is left.
 
 **Batch sync.** An update to an owned source applies only when absent.
 
+**Complete provider EIDs (G13).**
+
+- A result with several entries for a source, several UIDs per entry and
+  every UID-level and EID-level field round-trips through the mutation, KV
+  and the merge, and reaches `user.ext.eids`, `x-ts-eids` and the
+  `ts-eids-s` mirror in the order the provider returned it.
+- Each limit of section 4.5 drops exactly what it names: a blank `inserter`,
+  an `ext` over 2,048 bytes, a ninth entry, a 33rd UID, a duplicate entry.
+  A set over 4,096 bytes, measured by the shared `MAX_ENTRY_SET_BYTES`
+  function, is discarded whole and leaves the stored set as it is; for a
+  stateful provider the positive part of the result is rejected with its
+  removals kept; a stateless result all of whose sets are discarded is
+  handled as `Malformed`.
+- For an owned source, a result that names it replaces its whole set; a
+  later result without one entry removes it. A source the result does not
+  name is left as it is. An unowned provider's set only fills an absent
+  record.
+- The set's `exp`, `ra` and `ru` are the earliest its kept entries set, and
+  an expired set is never served. Expired means `now >= exp`.
+- Descriptor provenance applies only to an entry with no EID-level field;
+  an entry with any keeps exactly what the provider set.
+- `build()` rejects a blank provenance `inserter` or `matcher` and an `mm`
+  below 0.
+- An owner's valid set replaces every browser entry for the source,
+  including repeated browser entries; an unowned set goes out only when the
+  browser did not send the source.
+- An invalidation of a 32-UID set appends 32 hashes to `ps.iv` from the
+  live record it removes, and the filter then holds through `ps.iv`. Two
+  such invalidations keep all 64 hashes.
+- A full set too large for the `ts-eids-s` mirror is left out of it whole,
+  never trimmed, and still reaches bidders from KV.
+- `KvEntry::validate` rejects, on write, a record with an empty `eids`. On
+  read, a record that breaks a limit is dropped from the row with its
+  source logged, and the rest of the row reads normally.
+- A stored entry with a field this build does not know reads normally.
+- `/identify` returns the same `uid` and `eid` shape for a full set as for
+  a one-UID record: the first UID, with the partner's `openrtb_atype`.
+- A mutation on a build that no longer configures a provider keeps that
+  provider's `ps.o`, `ps.oc` and `ps.ov` and drops its other `ps` fields.
+
+**Behaviour that predates this spec (G13).** Golden tests pin each path that
+G13 must not change:
+
+- browser ingest writes a one-UID record holding the UID
+  `collect_eid_updates` picks today (for a repeated source, the first valid
+  UID of its last entry; the sharedId cookie last), and nothing for an
+  unregistered source, whatever EID-level fields or extra UIDs the browser
+  sent. The expected values are captured from `main`, not written from
+  this sentence
+- the `x-ts-eids` header's per-entry truncation
+- the `ts-eids` cookie's content and EID-level `ext` removal, and its trim
+  order apart from the registered-first rule G10 adds
+- `/auction` body forwarding and the merge of browser entries
+- a row read from `main`'s schema version 1 goes out to bidders exactly as
+  it does on `main`, and the golden requests of the EID fidelity spec
+  (§4.7) do not change
+
 **Migration parity.** Today's `ec/pull_sync.rs` tests are ported against
 `GenericPullProvider`. Each behaviour change in section 10.4 gets its own
 test.
 
 **Config.** Each validation error in section 10.2, `build_descriptor`
-running in `ts config validate` without secrets, acceptance of a config
-with no `[ec.identity]` at all when `ec.ec_store` is unset, and acceptance
-of one with only `[ec.identity.cookie_keys]` when it is set. The
-strips-only release accepts `[ec.identity.cookie_keys]` (section 14).
-
-**First-auction metric.** The shim reports the race flag of section 14 on
-the first `/auction` of a page load only, and only where the Lockr
-integration is active. The log line carries the flag and no identifier
-value.
+running in `ts config validate` without secrets, and acceptance of a
+config with no `[ec.identity]` at all.
 
 **Adapters.** Phase 4 runs after send on Fastly. Axum, Cloudflare and Spin
-behave as before apart from the Prebid Server and origin cookie strips. The parity test crate
-passes
-(`cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity`).
+behave as before apart from the Prebid Server and origin cookie strips. The
+parity test crate passes
+(`cargo test --manifest-path
+crates/trusted-server-integration-tests/Cargo.toml --test parity`).
 
 ## 14. Rollout
 
-Three steps, each shippable on its own:
+Two steps, each shippable on its own:
 
-0. **Strips first.** One release before any new cookie is set, ship only
-   the cookie strips (origin and Prebid Server, by name and by the
-   `__Host-ts-eids-r-` prefix) and the template cache's identity cookie
-   list. Stripping `ts-eids` from origin requests is a behaviour change for
-   any origin that read it. A rollback after step 1 then lands on code that
-   still keeps the new one-year cookies away from the origin and its header
-   limit. This release is the rollback floor. It also parses and validates
-   `[ec.identity.cookie_keys]` and lists its secrets in `secret_fields()`,
-   without using them. `Ec` denies unknown fields (`settings.rs:541-542`),
-   so without this a config holding the keys would fail to load after a
-   rollback to it. Operators provision the keys in the secret store and add
-   the table during this release, so step 1 finds them.
 1. **One write, no new vendors.** This step includes:
-   - the writer-request rule and the `IdentityMutation` single flush, with
-     no retry; the new visitor's create stays before routing, as today
-   - `/identify` and `/_ts/page-bids` stopping their writes
-   - `ts-eids-s`: the host-only cookie sealed with AES-256-GCM (a new
-     `aes-gcm` dependency, which the UID2 provider later reuses) under the
-     rotating cookie keys, `kc` revalidation, KV-gap staging on `/auction`,
-     pending and `m` markers, the size cap
-   - the `ts-eids-r` removal cookies, and their re-seal after a key
-     rotation (section 6.2)
-   - a metric for the inbound `Cookie` header size, and for the number and
-     total size of `ts-eids-r` cookies (section 6.2)
-   - a first-auction race metric for the open question in section 15. The
-     shim adds one boolean to the first `/auction` body of each page load,
-     only where the Lockr integration is active: whether the browser's
-     resource timing already shows a completed response from the Lockr
-     proxy's `page-view` path. TS counts first auctions with and without it.
-     It is counted once per page load and logs no identifier value. Capture
-     comes in step 2, but the race does not depend on it, so step 1 measures
-     it before step 2 relies on the cookie
-   - metadata-preserving `KvPartnerId` and `ps`, with `Default` and
-     constructors
+   - the outbound cookie strips (origin and Prebid Server) and the
+     template cache's identity cookie list. Stripping `ts-eids` from origin
+     requests is a behaviour change for any origin that read it
+   - the writer-request rule and the `IdentityMutation` single flush, with no retry except the removal-only one of section 5.2, phase 4; the new visitor's create stays before routing, as today
+   - `/auction`, `/_ts/page-bids` and `/identify` stopping their writes
+   - one after-send attempt for a withdrawal tombstone that failed before
+     send (section 5.1)
+   - the `ts-eids-s` mirror payload in `/auction` and `/_ts/page-bids`
+     responses, and the shim code that writes and clears the cookie, once
+     section 15 names a consumer; without one, this step ships without the
+     mirror
+   - the shim's registered-first `ts-eids` trim, with the registered source
+     list in the injected configuration (section 5.3)
+   - a metric for the inbound `Cookie` header size
+   - KV schema version 2 (section 6.1): the one record shape, `ps`, with
+     `Default` and constructors, and the read of version 1 rows. Full entry
+     sets are read, served and validated, though nothing in this step
+     writes one, so a rollback from step 2 to step 1 keeps every set a
+     provider wrote readable, and keeps each vendor's opt-out (below)
    - `GenericPullProvider` replacing pull sync, which brings the trait, the
-     descriptor, the harness and the write-counting test store
+     descriptor, the harness and the write-counting test store, and the
+     removal of the pull-complete marker and of the legacy pull sync keys
+     (section 10.4)
    - the shared servability check for `/identify` and the bidstream
 
    It changes behaviour on its own: fewer KV writes, `/auction`,
-   `/_ts/page-bids` and `/identify` stop writing, and new visitors reach
-   pull partners from their second page load. Write and read counters per
-   page load show the effect.
+   `/_ts/page-bids` and `/identify` stop writing, every returning writer
+   navigation reads KV once, and new visitors reach pull partners from
+   their second page load. Write and read counters per page load show the
+   effect. Operators move `pull_sync_ttl_sec`, `pull_sync_rate_limit` and
+   `ec.pull_sync_concurrency` to their replacements before deploying it,
+   because validation rejects them (section 10.2).
 
 2. **Providers.** `.with_identity_provider` and
    `.try_with_identity_provider` for vendors, ownership and its
-   validation, hold mode, passive capture with `capture_enabled` off by
-   default and `revoke_scope` defaulting to `"provider"`, the real-browser
-   gate on capture effects, provider state, the rate-limiter `record` and
-   `count` methods and the circuit breaker, and the consent decoder
-   extensions of section 9.1. Vendor modules follow in their own specs.
-   Capture stays off for a provider until the checklist below has passed
-   once on a live service.
+   validation, hold mode, revoke-only passive capture with `revoke_scope`
+   defaulting to `"provider"`, the capture removal write with its
+   `capture_unpersisted` and `removal_lost` counters, the
+   real-browser gate on capture effects, provider state, the rate-limiter
+   `record` and `count` methods and the circuit breaker, the consent
+   decoder extensions of section 9.1, and the first full-set writes, from
+   provider results with more than one entry or UID or with EID-level
+   fields (G13). Vendor modules follow in their own specs.
 
-**Capture provider checklist.** Before setting `capture_enabled = true`:
+**Capture provider checklist.** Before enabling a capture provider on a
+live service:
 
-- Each captured source has an `[[ec.partners]]` entry with
+- Each source it declares has an `[[ec.partners]]` entry with
   `bidstream_enabled = true` and the right `openrtb_atype`. Lockr's ID5 uses
   `1` (#1246).
+- Its required `sources` list holds only the sources it is the delivery path
+  for, because its opt-out removes browser-ingested records of every source
+  it keeps, whoever produced them (sections 5.4, 10.2).
 - A source moving to an owner is moved off pull sync first. A
   `pull_sync_enabled` entry registers a generic pull provider that claims
   the source, and two providers cannot claim an owned source (section 10.2).
-- Live acceptance: after an eligible request, `/_ts/admin/eids` lists the
-  source as matched (`ingest.matched`, `ec/admin.rs:532-536`), and then
-  `/_ts/admin/ec` shows the stored UID (`ec/admin.rs:276`).
+- Live acceptance: after a revocation captured on a live page,
+  `/_ts/admin/ec` (`ec/admin.rs:276`) shows the provider's `ps.o` and no
+  record for its sources. After the vendor issues again, it shows `ps.oc`,
+  and the next writer navigation ingests the source again.
 
-**Rotating the cookie keys.** Add the new key to `keys` and deploy. Once
-every POP serves that config, make it `current` and deploy again. Keep the
-previous key for the retention section 6.2 gives: `staged_max_age_sec` for
-`ts-eids-s`, one year for `ts-eids-r`. Removing it sooner can drop an
-unapplied removal batch of a client that has not navigated since.
+**Rolling back from step 2 to step 1.** Step 1 configures no vendor
+providers, so:
 
-After providers write metadata, do not roll back past step 1. Step 1's reader
-preserves the new fields. A rollback past it strips them:
+- Remove `owner` and the vendor `[ec.identity.providers.*]` tables from the
+  config first. Step 1's validation rejects an owner or a provider table it
+  does not know (section 10.2).
+- Full sets stay readable but are not served while their writer is not
+  configured, and browser ingest may replace them (section 7.1).
+- A mutation drops each vendor's `ps` fields except `o`, `oc` and `ov`
+  (section 5.4), so opt-outs and the IDs they removed survive, and `ps.iv`
+  and `ps.st` do not: invalidated values can be re-seeded once, and
+  stateful providers start over when rolled forward.
 
-- `w`, `exp`, `ra` and `at`. The rollback rule of section 6.1 turns these into
-  re-fetches, not stale IDs, once rolled forward again.
-- `ps.o`. Opted-out providers would be called again after rolling forward,
-  except where the cookie still holds the sticky `o`.
-- `ps.st`. Providers with state start over.
-- `ps.iv`. Rejected values could be re-seeded once.
-
-While rolled back, `exp` is not enforced at all. Rolling back past step 1
-also restores today's `/auction` ingest. Step 0's code ignores `ts-eids-s`
-and the `ts-eids-r` cookies but still strips them, and the browser keeps
-sending what it staged.
+**Rolling back past step 1 is unsupported.** Step 1 writes schema version 2,
+and today's reader rejects any version but 1 (`ec/kv_types.rs:376-381`), so
+an older build fails to read every row step 1 has written. Going back needs
+a KV migration to version 1, which this spec does not provide.
 
 ## 15. Open questions
 
 1. **How long single-page apps wait.** Some sites are single-page apps:
    after the first page loads, they change pages with JavaScript instead of
    loading a new document from TS. TS hears about those page changes only
-   through `/_ts/page-bids`, which never writes KV (section 5.1). So on those
-   sites, entries saved in `ts-eids-s` wait until the visitor's next full
-   page load. After launch, measure how long saved entries wait before they
-   are written, and revisit if the wait is long.
-2. **Tombstone failures.** Today's withdrawal tombstone is a CAS write with
-   up to five attempts (`ec/kv.rs:1349-1430`). It can fail on CAS exhaustion,
-   on Fastly's per-key limit when another write to the same key landed
-   within about a second, on a read failure, or on a KV error. Should a
-   failed tombstone be retried after send, with a delay?
-3. **How often the first auction misses Lockr's ID.** On the affected route,
-   Lockr's `page-view` call and the first `/auction` start close together.
-   How often does the first `/auction` leave before the proxied Lockr
-   response sets `ts-eids-s`? Then that auction lacks the captured ID, and a
-   first visit's first auction gets it only from the browser path. Step 1's
-   race metric (section 14) measures it before capture is turned on (#1260
-   review).
-4. **Global revoke and a granting CMP.** A global revoke clears the EC
+   through `/_ts/page-bids`, which never writes KV and calls no provider
+   (section 5.1). So on those sites, browser ingest and provider refreshes
+   wait until the visitor's next full page load. After launch, measure how
+   long they wait, and revisit if the wait is long.
+2. **Lost removals.** A removal write that fails all its attempts is lost
+   (sections 5.2, 5.3). After launch, watch
+   `removal_lost`. If it is not close to zero, should a durable
+   fallback come back, and in what form?
+3. **Global revoke and a granting CMP.** A global revoke clears the EC
    cookie, as a withdrawal does, but the CMP's consent may still grant. The
    next navigation then mints a new EC. Should a global revoke also stop
    minting until consent changes?
+4. **Durable stager results.** Stagers persist no positive ID (section
+   5.3), so a positive Lockr capture, with its full entry set, reaches KV
+   only as the one UID browser ingest picks. Should a durable path
+   come back for it, for example a capture-driven write within G4, if
+   `capture_unpersisted` shows that captures carry IDs or fields the
+   browser path does not?
+5. **Who reads `ts-eids-s`, and does it meet the product rule?** The
+   product rule is that provider IDs go to a first-party cookie and to KV,
+   with the cookie read first. Since revision 14 the server never reads the
+   cookie, and no page script is named as its reader (section 6.2). Before
+   rollout step 1 ships the mirror, name its consumer and confirm with the
+   product lead that a client-only mirror meets the rule. Without a
+   consumer, the mirror costs about 2 KB on every request to the host and
+   exposes server-only IDs to page scripts for nothing.
+6. **Providers on a new visitor's first navigation.** No provider runs on
+   a first navigation (section 4.7, step 7), so a visitor who leaves after
+   one page never gets a provider ID. One option keeps one write and never
+   uses an unconfirmed ID: mint the EC, run hold-mode providers (which need
+   no EC ID; only generic pull does), create the row with their answers,
+   then run the auction. It moves the create from before routing into
+   routing, and adds the hold budget to every first navigation that runs
+   an auction. Is that worth it?
 
 ## 16. Decisions log
 
 Decisions made while writing this spec, with the user:
 
-| Decision                         | Choice                                                                                                                                                                                                                                                                    |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Scope                            | Framework and trait. Vendors get their own specs.                                                                                                                                                                                                                         |
-| HEM input                        | Typed slot, always empty in v1. Intake is a later spec.                                                                                                                                                                                                                   |
-| Browser vs server precedence     | Configured per source through `owner`. The owner's valid value wins.                                                                                                                                                                                                      |
-| Cookie for server IDs            | Separate `ts-eids-s`, server-owned and HttpOnly, sealed with AES-256-GCM so the origin and its logs never see server-only IDs.                                                                                                                                            |
-| Structure                        | Trait plus coordinator, with an optional passive-capture capability.                                                                                                                                                                                                      |
-| Trait shape                      | One required method, `descriptor`. Capabilities are default methods. Synchronous. Additive by construction.                                                                                                                                                               |
-| Inputs                           | Declared in the descriptor and enforced: a provider can read only what it declared.                                                                                                                                                                                       |
-| Page load for the one-write rule | A navigation plus every request it causes. Only the navigation writes. Strict.                                                                                                                                                                                            |
-| New-visitor write                | One create before routing, as today, carrying browser EIDs. No provider runs on the first navigation. Changed in rounds 3 and 4.                                                                                                                                          |
-| New-visitor recovery             | Today's rotation. The cookie-proof recreation of revision 3 is removed with the deferred create.                                                                                                                                                                          |
-| Failed write                     | Not retried. Changed from one merge-retry once Fastly's per-key limit was confirmed.                                                                                                                                                                                      |
-| Browser EIDs beyond the cookie   | `/auction` saves the KV gap in `ts-eids-s`. The next navigation writes it.                                                                                                                                                                                                |
-| Delay on body-less routes        | Accepted: a browser ID first seen in an `/auction` body reaches KV one page view later.                                                                                                                                                                                   |
-| SPA views (`/_ts/page-bids`)     | Stagers. They never write KV.                                                                                                                                                                                                                                             |
-| Hold budget                      | `hold_budget_ms` defaults to 100 ms, reduced from 300 ms (section 4.7 gives the reasons).                                                                                                                                                                                 |
-| Outbound cookies                 | TS's identity cookies are stripped from Prebid Server requests. The origin keeps `ts-ec` but loses `ts-eids`, `ts-eids-s` and `ts-eids-r`, to stay under header limits.                                                                                                   |
-| Deletion                         | A tombstone with the 24-hour `TOMBSTONE_TTL` replaces the hard delete. No extra writes.                                                                                                                                                                                   |
-| GPP opt-outs                     | Sharing and targeted-advertising opt-outs are decoded, and the strict policy blocks them.                                                                                                                                                                                 |
-| `x-ts-eids`                      | Kept as a full troubleshooting header. Its exposure of server-only IDs to page scripts is accepted.                                                                                                                                                                       |
-| Consent withdrawal               | Synchronous tombstone on any request, one of two G4 exceptions with the removal overflow write. Proposed in review; not yet confirmed.                                                                                                                                    |
-| Removal overflow                 | A synchronous, removal-only KV write before send, the second G4 exception. It retries only a CAS conflict and falls back to new cookies. Confirmed after round 10.                                                                                                        |
-| Equal-second ties                | A removal or opt-out wins a tie with an acquisition or clear. An ID re-acquired in that second is resolved again later. Confirmed after round 10.                                                                                                                         |
-| Server cookie lifetime           | #1260's handoff cookie lived five minutes, only filled absent sources and was never authoritative. `ts-eids-s` lives a year, revalidates against KV every `kv_revalidate_sec` and can carry owner writes, so staged entries survive failed flushes and long SPA sessions. |
+| Decision                         | Choice                                                                                                                                                                                                                                   |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Scope                            | Framework and trait. Vendors get their own specs.                                                                                                                                                                                        |
+| HEM input                        | Typed slot, always empty in v1. Intake is a later spec.                                                                                                                                                                                  |
+| Browser vs server precedence     | Configured per source through `owner`. The owner's valid value wins.                                                                                                                                                                     |
+| Cookie for server IDs            | Separate `ts-eids-s`, a client-only mirror the shim writes and the server never reads. Revision 14 replaced the server-owned, sealed, HttpOnly cookie of revisions 1 to 13. Revision 15 removed the `ts-eids-r` removal cookies as well. |
+| Structure                        | Trait plus coordinator, with an optional passive-capture capability.                                                                                                                                                                     |
+| Trait shape                      | One required method, `descriptor`. Capabilities are default methods. Synchronous. Additive by construction.                                                                                                                              |
+| Inputs                           | Declared in the descriptor and enforced: a provider can read only what it declared.                                                                                                                                                      |
+| Page load for the one-write rule | A navigation plus every request it causes. Only the navigation writes and only the navigation calls providers. Strict.                                                                                                                   |
+| New-visitor write                | One create before routing, as today, carrying browser EIDs. No provider runs on the first navigation. Changed in rounds 3 and 4; open question 6 asks whether to revisit.                                                                |
+| New-visitor recovery             | Today's rotation. The cookie-proof recreation of revision 3 is removed with the deferred create.                                                                                                                                         |
+| Failed write                     | Not retried. Changed from one merge-retry once Fastly's per-key limit was confirmed.                                                                                                                                                     |
+| Browser EIDs beyond the cookie   | The shim's `ts-eids` trim keeps registered sources first, and the next navigation ingests them. Revision 14 removed the KV gap that `/auction` saved in `ts-eids-s`.                                                                     |
+| Delay on body-less routes        | Accepted: a browser ID first seen in an `/auction` body reaches KV one page view later.                                                                                                                                                  |
+| SPA views (`/_ts/page-bids`)     | Stagers. They never write KV and call no provider.                                                                                                                                                                                       |
+| Hold budget                      | `hold_budget_ms` defaults to 100 ms, reduced from 300 ms (section 4.7 gives the reasons).                                                                                                                                                |
+| Outbound cookies                 | TS's identity cookies are stripped from Prebid Server requests. The origin keeps `ts-ec` but loses `ts-eids` and `ts-eids-s`, to stay under header limits.                                                                               |
+| Deletion                         | A tombstone with the 24-hour `TOMBSTONE_TTL` replaces the hard delete. No extra writes.                                                                                                                                                  |
+| GPP opt-outs                     | Sharing and targeted-advertising opt-outs are decoded, and the strict policy blocks them.                                                                                                                                                |
+| `x-ts-eids`                      | Kept as a full troubleshooting header. Its exposure of server-only IDs to page scripts is accepted.                                                                                                                                      |
+| Consent withdrawal               | Synchronous tombstone on any request, a G4 exception with the two removal writes. Revision 15 adds one after-send attempt when it fails. Proposed in review; not yet confirmed.                                                          |
+| Equal-second ties                | A removal or opt-out wins a tie with an acquisition or clear. An ID re-acquired in that second is resolved again later. Confirmed after round 10.                                                                                        |
+| Complete provider EIDs           | A provider can return several EID entries per source, several UIDs each, with UID-level and EID-level fields. The set is stored and sent whole. Added in revision 13.                                                                    |
+| Entry-set writer                 | One writer per source. A result replaces the source's set whole, and one `rv` covers it, so ownership, revisions and removals stay per source.                                                                                           |
+| Behaviour before this spec       | G13 changes none of it. Browser ingest, `ts-eids`, batch sync, generic pull and `/identify` keep the behaviour the rest of this spec gives them and write one entry with one UID; only provider results write more.                      |
+| Removal hashes                   | Derived when a removal applies, from the live record it removes. Unkeyed, ordered, at most 128 per list. Invalidations go to `ps.iv`, kept; opt-out removals go to `ps.ov`, emptied by the clear.                                        |
+| Provenance default               | Applied only to an entry that sets no EID-level field, so vendor and config provenance never mix in one entry. Added in round 13.                                                                                                        |
+| Mirror lifetime                  | `ts-eids-s` lives at most a day and never past the earliest `exp` it holds.                                                                                                                                                              |
 
-Round 7 proposed these, and they are applied in revision 8 pending the
-user's review of the spec:
+Revision 15 applies these decisions, made by the user after the round 14
+review, which allowed breaking changes:
 
-| Decision                | Choice                                                                                                      |
-| ----------------------- | ----------------------------------------------------------------------------------------------------------- |
-| Removals and opt-outs   | One `__Host-ts-eids-r-<id>` cookie per removal batch, up to four, so no concurrent response can lose one    |
-| Provider opt-out        | Removes every record the provider wrote, with no revision check. Opted-out writers are never served         |
-| Expired records         | `Refresh` covers a stored record, valid or expired. An expired record counts as absent for `FillMissing`    |
-| Stateful hold providers | Run only on the writer: before the auction when it runs one, after send when it does not                    |
-| `capture` result        | Returns `Resolution`; `no_match` means nothing was captured                                                 |
-| Registration            | `try_with_identity_provider` converts a constructor's error once; `build()` stays infallible                |
-| KV read cost            | An auction navigation reads once, as today. Phase 4 reuses that snapshot unless an after-send provider runs |
-| Provider count          | At most 32 enabled providers, so a row's `ps` never fills up                                                |
+| Decision             | Choice                                                                                                                                                                            |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Stager providers     | None. Resolving providers run only on writer navigations, so every outcome, backoff included, is stored. Stagers serve KV                                                         |
+| Removals             | Written to KV on the request that carries them. `ts-eids-r`, its keyring and secrets, the overflow write and the strips-only rollout step are removed                             |
+| Non-browser removals | Dropped, since earlier revisions could apply them only through a later real-browser navigation from the same client                                                               |
+| Capture              | Revoke-only: removals, opt-out and clear. Positive IDs are counted, never stored. `capture_enabled` and request-body consent are removed                                          |
+| Capture-only opt-out | Also removes the records of its sources that no provider wrote, and blocks the browser's values for them. A capture-only provider cannot own a source and must list its `sources` |
+| Provider denials     | A provider's `ps.iv` and `ps.ov` filter browser candidates for unowned sources too. An opt-out's removals go to `ps.ov`, which its clear empties                                  |
+| Mirror feedback      | The shim never copies `ts-eids-s` into `ts-eids` or the `/auction` body                                                                                                           |
+| Dry run              | Removed, with `is_dry_run`                                                                                                                                                        |
+| KV schema            | Version 2 with one record shape. Version 1 rows are read and upgraded on write. Rollback past rollout step 1 is unsupported                                                       |
+| Stored hashes        | `ps.iv` hashes are unkeyed and the consent fingerprint is a plain bitmask, because the row already holds the raw values. No legacy revision hash                                  |
+| Pull sync            | The pull-complete marker and the legacy pull sync config keys are removed                                                                                                         |
+| Withdrawal retry     | A tombstone that fails before send gets one more attempt after send                                                                                                               |
 
-Round 10 proposed these, and they are applied in revision 11 pending the
-user's review of the spec:
-
-| Decision            | Choice                                                                                               |
-| ------------------- | ---------------------------------------------------------------------------------------------------- |
-| Record revision     | A random `rv` per record write                                                                       |
-| Stateful results    | IDs, state and scheduling apply atomically. An invalid replacement state rejects the positive result |
-| Refresh anchors     | An expired owned record is kept, unserved, while its owner holds state, until its `ru`               |
-| Disclosure policy   | The writer's policy always, plus the owner's. Records of disabled writers are not served             |
-| Browser candidates  | The owner's `ps.iv` and `ps.o` filter the browser's value for owned sources                          |
-| `/identify` consent | The request's visitor consent. No persisted visitor authorization                                    |
-
-Round 11 proposed these, and they are applied in revision 12 pending the
-user's review of the spec:
-
-| Decision          | Choice                                                                                                                                |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| Real-browser gate | A non-browser capture stores no positive ID, stages removals only in its own `ts-eids-r`, and never makes the overflow write          |
-| Global revoke     | `revoke_scope`, default `"provider"`. `"global"` runs the withdrawal tombstone, from real browsers only, under the existing exception |
-| Cookie keys       | Dedicated rotating keys from the secret store, `v1.<kid>.<nonce>.<ciphertext>`. Writers re-seal unapplied removal batches             |
-
-## 17. Review log
-
-**Round 1** (2026-10-21) found 5 blocking issues, 16 significant gaps and 17
-accuracy problems. Revision 2 resolved them. Its findings covered the
-deferred create's rotation risk, staged refreshes, pending-marker liveness,
-provider state, the writer definition, hold-mode latency, concurrent cookie
-writes, HTML cacheability, multi-source providers, inputs, `ext` level,
-owner takeover, `/identify` and batch sync, the size cap, flush checks, rate
-limits, the breaker, tombstones, `/auction` ingest and deploy-time
-validation.
-
-**Round 2** (2026-10-21) answered the open questions and reworked the trait
-for ergonomics and additivity (revision 3).
-
-**Round 3** (2026-10-21) ran four independent reviews: Rust API, write
-protocol, code references, and privacy and consent. They found 7 blocking
-issues and about 30 significant ones. Revision 4 resolves them as follows:
-
-| Finding                                                                                          | Resolution                                                               |
-| ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------ |
-| Deferred create loses withdrawals, collision checks and orphan detection (B1, B2, B3, C1, D1)    | Create before send, sections 5.2, 5.5                                    |
-| Cookie IDs outlive KV removals (D2, B5)                                                          | `kc` revalidation, merge rules, G12, 6.2, 6.3                            |
-| `ts-eids-s` reaches Prebid Server (D3, C11)                                                      | Strip from Prebid Server; origin unchanged (revision 5), 6.2             |
-| Stagers cannot save removals, state or `ps` (B4)                                                 | Removal entries, staged `ps`, state writer-only, 5.3                     |
-| Eligibility on stagers ignored the cookie (B6)                                                   | Merged eligibility view, 4.7                                             |
-| Invalidate and re-seed loop (B7)                                                                 | `ps.iv`, 7.2                                                             |
-| Writer could not clear markers or flip `k` (B8, C16)                                             | Phase 3 cookie rule, 5.2                                                 |
-| Late hold results impossible; overruns tripped the breaker (B9, C2)                              | Cut-off calls, `hold_retry_sec`, 4.7, 8                                  |
-| `request` returning `None` left providers due forever (A1)                                       | `None` waits `refresh_after_sec`, dry run, 4.7, 8                        |
-| Capture backoff on unrecognised bodies (A2)                                                      | Capture never backs off, 4.7, 8                                          |
-| `MissingInput` conflated a bug and a skip; state could drop IDs (A3)                             | `UndeclaredInput`, `InputUnavailable`, `with_state(&T)`, 4.4, 4.5        |
-| EC ID and capture prefix unenforced (A4)                                                         | Crate-private EC ID, prefix check, 4.3                                   |
-| Multi-source invalidation (A5)                                                                   | `also_invalidate`, 4.5                                                   |
-| Registration snippet and config trait (A6)                                                       | `change_context`, `IdentityProviderConfig: IntegrationConfig`, 4.6, 10.2 |
-| `#[non_exhaustive]` ineffective in-crate (A7)                                                    | Additivity by construction, opt-in kinds, 4.2                            |
-| Getters, setters and naming (A8, A13)                                                            | `with_*` setters, getters, renames, 4.3 to 4.5                           |
-| Second `ProviderId` (A9)                                                                         | `IdentityProviderId`, 4.3                                                |
-| Error type and header validation (A10, A11)                                                      | 4.5                                                                      |
-| Lint and doc conventions; silent mis-wiring (A12, A14)                                           | Conventions note, conformance checks, 4.2, 13                            |
-| Phase 4 lacked UA, page URL, DNT and a usable IP (C3)                                            | Captured in phase 1, 4.4                                                 |
-| `/identify` bypassed the expiry filter (C4, D6)                                                  | Shared servability check, 7.1                                            |
-| Missing writes; withdrawal path misdescribed (C5, B10, D13)                                      | P3 table, 5.1, 13, 15                                                    |
-| Writer decision placement and prefetch visibility (C6)                                           | 5.1                                                                      |
-| Rate-limiter API and breaker (C7, B11, D12)                                                      | `record`/`count`, cap last, transport-only breaker, 4.7                  |
-| Capture buffering, encoding and cookie site (C8, C18)                                            | 4.7, 5.3                                                                 |
-| Unowned completeness signal (C9)                                                                 | Pull-complete marker kept, 6.3, 10.4                                     |
-| Domain-wide cookie and MAC binding (C10, D5)                                                     | `__Host-`, delimited MAC, `cf`, 6.2                                      |
-| Clock failure, schema literals, write-counting tests (C12, C13, C14)                             | 4.4, 6.1, 13                                                             |
-| Policies gated only dispatch (D4)                                                                | Re-applied at flush, cookie, merge, `/identify`, 9.1                     |
-| Opt-out fingerprint lapsed (D8)                                                                  | Sticky `o`, 8                                                            |
-| Strict policy failed open (D9)                                                                   | Fail closed, more decoding, 9.1                                          |
-| Minimization leaks: geo, jurisdiction, page URL, `x-ts-eids` (D10)                               | `Region`, `ProviderConsent`, sanitized URL, documented header, 4.4, 7.1  |
-| Logging holes (D11)                                                                              | 9.3                                                                      |
-| `Sec-Fetch-Dest` fallback, undefined transitions, rollback losses (B12, B13, B14, B15, C15, C17) | 3.4, 5.1, 5.2, 6.2, 6.3, 14                                              |
-| Reference corrections (C19)                                                                      | Throughout                                                               |
-
-**Round 4** (2026-10-21) re-reviewed revision 4 with two independent
-reviewers. They found 6 blocking issues, all with contained fixes, and
-confirmed most round-3 fixes. Revision 5 resolves them:
-
-| Finding                                                                                                               | Resolution                                                                 |
-| --------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| A minted ID was used in routing before its deferred create, on publisher and proxy routes                             | Create stays before routing; no provider on the first navigation, 4.7, 5.2 |
-| A config change discarded staged removals and opt-outs                                                                | 5.6                                                                        |
-| Flush checks could veto removals                                                                                      | Removals exempt, 5.6                                                       |
-| Orphan rotation re-bound positive IDs, undoing deletion                                                               | Missing row expires the cookie, 5.5, 5.6                                   |
-| Markers could not be answered when phase 4 wrote nothing                                                              | Phase 4 always answers; unowned dry runs need KV, 5.6                      |
-| Markers set on non-2xx responses                                                                                      | 5.2                                                                        |
-| Unowned hold answers became `OwnerWrite`                                                                              | 5.3                                                                        |
-| Writer never flipped its flushed entries to `k: 1`                                                                    | Reconciling read, 5.6                                                      |
-| EC minting on non-writer navigations undefined                                                                        | 5.6                                                                        |
-| Withdrawal windows and `kc` stamping                                                                                  | 5.6                                                                        |
-| G4 named withdrawal the only exception                                                                                | G4 scoped to page loads                                                    |
-| `cluster_size` had no trigger; size cap could fail                                                                    | 5.6                                                                        |
-| `pv` hash compared with a raw revision                                                                                | `RevisionHash`, 5.4                                                        |
-| Capture plumbing, Prebid strip paths, default `capture`, `ProviderConsent`, `type Err`, `with_private_state()` naming | 4.2, 4.3, 5.6, 6.2                                                         |
-
-**Round 5** (2026-10-21), a final review focused on trait ergonomics, found
-3 blocking and 6 significant issues, all fixed in revision 6:
-
-- Phase 4 re-reads before dispatching whenever after-send providers are
-  marked, so a withdrawal after send is always seen (5.6).
-- Conformance checks a provider against at least one working harness setup
-  and a fixture, so UID2- and LiveRamp-style providers pass (13).
-- The capture-prefix check moves to `IntegrationRegistration::build()` (4.3).
-- Undeclared input and state reads are recorded and caught even through
-  `.ok()` (4.4).
-- Every capability default, including `request`, returns a
-  `not_implemented` marker (4.2, 4.5).
-- State is enforced: `with_state` and `state()` need `with_private_state()`
-  (4.4, 4.5).
-- Less boilerplate: `Resolves::with_endpoint`, `primary_endpoint`,
-  `ResolveInput::primary_source`; the example parses its endpoint once (4.6).
-- Consistent names: `with_private_state`, `with_expiring_ids`,
-  `also_invalidate`; `found([])` is `no_match` (4.3, 4.5).
-- Stale references, outbound-cookie wording, capture state, the additivity
-  claim for consent, mixed-kind inputs and the step 8 wording are corrected.
-
-**Round 6** (2026-10-21) was an example-driven review. LiveRamp ATS, Lockr
-and UID2 were written as full providers against the API (section 12), and
-everything they could not express was added. Section 12.5 lists the gaps:
-
-- a call context from `request` to `response`
-- deterministic randomness
-- a stated path for secrets
-- text bodies
-- a larger state cap
-- millisecond times
-- exact capture paths
-- capture removals that bypass the consent gate
-- consent from the request body
-- EID-level provenance
-- source matching
-- keeping an ID whose `ext` is oversized
-- region tests
-
-**Round 7** (2026-10-21) ran two final reviews in parallel. One covered the
-API, the examples and feasibility against the code. The other covered the
-protocol, privacy, consistency and efficiency. Together they found 2
-blocking, 13 significant and 11 minor issues, three of them found by both.
-All are fixed in revision 8:
-
-- A provider opt-out removes every record that provider wrote, with no
-  revision check, and servability excludes records whose writer is opted
-  out. `OwnerRemove` is never skipped because of `ps.o` (5.4, 7.1).
-- Capture removals and opt-outs go into a new append-only cookie,
-  `ts-eids-r`, which a concurrent `/auction` cannot overwrite. It is also
-  written on the unusable-consent path (5.3, 6.2).
-- A due stateful provider, or one with an unowned or stubbed candidate
-  source, triggers the phase 1 KV read, so its dry run sees KV. A dry run
-  without loaded state never sets `ps.n` (5.2, 6.3).
-- `Refresh` covers expired records, and an expired record counts as absent
-  for `FillMissing`. An expiring ID without an expiry keeps the stored `exp`
-  when its UID is unchanged, and is discarded otherwise (4.4, 4.5, 5.4).
-- `ps` is pruned on every mutation, more than 32 providers is a config
-  error, and a mutation that fails validation falls back to its removals
-  (5.4, 6.1, 10.2).
-- `ts-eids-s` is sealed with AES-256-GCM, compactly encoded and capped at
-  2,048 bytes. Rollout adds a `Cookie` header size metric and an origin
-  header-limit checklist item (6.2, 14).
-- A stateful hold-mode provider runs after send on writer navigations
-  without an auction (4.7, 10.1).
-- Opt-out clearing: a mirrored `o` yields to KV, GPP clears by section
-  values, a capture-only provider clears on a later positive capture, and a
-  withdrawal resets every opt-out (8).
-- Efficiency: the read-cost table is corrected, phase 4 reuses the phase 1
-  snapshot, cluster evaluation runs only for `/identify` and after send, the
-  cookie is rewritten only when it changed, and `is_dry_run`, cached
-  `state()`, embedded-JSON `st` and one cookie decode per request remove
-  repeated work (4.2, 4.4, 5.2, 5.6, 6.1).
-- Request-body consent is buffered in `handle_proxy` with
-  `collect_body_bounded` and merged by `consent::stricter_of` (4.7, 9.3).
-- The capture-path check runs in `IntegrationRegistry::with_plan`, so
-  `build()` stays infallible (4.3, 10.3).
-- API: `Resolves::with_endpoint(&str)`, an `Access` enum in
-  `UndeclaredInput`, a fallible `try_with_call_context` and `call_context`,
-  `expiry()` and `refresh()` getters, `StateChange`, `capture` returning
-  `Resolution`, `with_retry_in`, `replacing_state`, `CaptureInput`
-  accessors, and full listings for `Region`, `HashedEmail`, `UnixTime`,
-  `SourceDomain::matches` and `try_with_identity_provider` (4.2 to 4.6).
-- Harness: `check_conformance(&ConformanceCases)` and
-  `check_descriptor_ignores_secrets` (13).
-- Lockr parses into permissive local types and skips expired tokens (12.2).
-- Minimization claims and stale wording are corrected (9.2, and
-  throughout).
-
-After round 7, at the user's request, `ts-eids`, `ts-eids-s` and `ts-eids-r`
-are also stripped from publisher origin requests, which keep `ts-ec`. This
-replaces the origin header-limit checklist item (6.2, 14).
-
-**Round 8** (2026-10-21) was a last overall review: two parallel reviews,
-one on the protocol and design and one on the API, examples and
-efficiency, plus an outside review. They found 1 blocking, 9 significant
-and 22 minor issues, several found more than once. All are fixed in
-revision 9:
-
-- Removal batches no longer share a cookie. Each removal-producing
-  response sets its own `__Host-ts-eids-r-<id>` (up to four), stagers never
-  delete one, and only the writer deletes those its phase 1 read shows
-  applied. The cookies last a year, so a removal never expires before a
-  writer applies it (6.2, 6.3).
-- Orphan rotation drops the rest of its mutation and skips phase 4, and
-  phase 4 applies the tombstone, missing and failed rules to a reused
-  snapshot too (5.2).
-- A failed flush drops a stateful provider's staged IDs with its state,
-  and the loss of an after-send removal is bounded by the marker deadline
-  (5.2).
-- Pull sync no longer reads KV on every navigation: the pull-complete
-  marker and a cookie-only `ps.n` stop the trigger (6.3).
-- `cluster_size` is no longer driven by a `/identify` cookie flag. A writer
-  that is already writing adds it after send (5.6).
-- A missing row has one outcome, a minimal `m: 1` cookie, and saves no KV
-  gap. The KV gap also fills expired sources (5.3, 5.6, 6.3).
-- Lockr's opt-out can be cleared: a positive capture stages `ps.oc`, which
-  the writer applies before the IDs (5.4, 8).
-- Expiry is declared per source (`with_expiring_source`, `is_expiring`).
-  Lockr marks none, because its expiry is optional (4.3, 12.2).
-- `state()` returns `Result<Option<T>>` with a new `InvalidState` error, and
-  `capture` never changes state (4.4, 4.5, 4.7).
-- The harness has a full listing, including `HarnessSetup`, `TestConsent`,
-  `CaptureFixture`, `ConformanceCases` and test-only constructors (13).
-- Stateful providers skip the dry run, saving a phase 1 read per refresh.
-  Cookies open lazily, only on identity routes. Browser KV-gap entries are
-  dropped last at the size cap (5.2, 6.2).
-- Smaller fixes: provenance getters, descriptor derives, the LiveRamp
-  refresh pacing, Lockr narrowing, the G10 and G12 bounds, and stale
-  wording.
-
-**Round 9** (2026-10-21) ran two parallel reviews, protocol and design, and
-API, examples and harness, plus an outside review of developer experience.
-They found 2 blocking, 11 significant and 16 minor issues. All are fixed in
-revision 10:
-
-- A re-consent clear is stored in KV as `ps.oc`, so an old opt-out batch is
-  never re-applied, and "applied" is defined for every removal kind (5.4,
-  6.1, 6.2).
-- `ts-eids-r` names sources by domain, deletes cookies that fail to open,
-  and has a bounded fallback when four cookies are full (6.2).
-- A stateful hold provider's answer stays out of the cookie, so its ID
-  never flushes without its state (5.2).
-- The cookie-only `ps.n` applies to unowned sources and yields to a changed
-  KV `n` (6.3). Undispatched markers back off by at least 60 seconds (5.6).
-- `cluster_size` is evaluated once per EC from any writer read, as today
-  (5.6).
-- A strips-only release ships first and is the rollback floor (14).
-- UID2's dead dry-run branch is gone; `InvalidState` always clears state and
-  has a section 8 row (4.4, 8, 12.3).
-- The harness gains a raw resolve case, `HarnessSetup` methods, more
-  `TestConsent` setters, `state_of`, and stated kind and eligibility rules.
-  It is gated by `cfg(any(test, feature = "test-support"))`, so provider
-  crates can use it (13).
-- `ProviderRequest::new` and `with_body` cover any method and body; both
-  header helpers follow one `Cookie` rule; `found` takes at most one ID per
-  source (4.5).
-- Derives are corrected (`When` has no `Display`; `Hash` and `Ord` added),
-  and stale wording is fixed.
-
-**Round 10** (2026-10-21), an outside review of revision 10, found 6 blocking
-issues and 1 question. Small executable models confirmed the ordering and
-concurrency counterexamples. Revision 11 resolves them:
-
-| Finding                                                                    | Resolution                                                                      |
-| -------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| The browser fallback could resend an ID the owner invalidated or opted out | Owner denials filter browser candidates for owned sources, 7.1                  |
-| Unowned provider-written IDs skipped the writer's consent policy           | Writer's policy always, owner's too; disabled writers unserved, 4.7, 7.1, 9.1   |
-| A re-read could pair one call's ID with another's state                    | `ProviderResult` applies atomically; invalid state rejects it, 4.5, 5.4, 8      |
-| Pruning an expired ID stranded valid refresh state                         | Refresh anchors bounded by `ru`, `with_refresh_until`, 4.5, 4.7, 5.4, 6.1, 12.3 |
-| Removal-cookie overflow could lose a batch under concurrency               | Removal overflow write before send; measured byte budget; no coarsening, 6.2    |
-| `hash(uid, at)` and equal-second ties could dismiss a revocation           | Random `rv`; ties go to the removal or opt-out, 5.4, 6.1, 6.2                   |
-| The consent `/identify` checks against was undefined                       | The request's visitor consent; the stored snapshot authorizes nothing, 7.1      |
-
-The review's non-blocking notes are not applied here: the contract covers
-the declared capabilities rather than every provider shape, HEM intake and
-multi-step exchanges stay out of v1 (section 2.2), and the vendor examples
-are illustrations, to be checked against protocol fixtures in their own
-specs.
-
-**Round 11** (2026-10-23) folded in findings from
-[#1246](https://github.com/IABTechLab/trusted-server/issues/1246) (Lockr IDs to
-KV) and the review of
-[#1260](https://github.com/IABTechLab/trusted-server/pull/1260) (server-side
-identity foundation and Lockr capture). The Lockr ID5 EID lives in Prebid's
-`ortb2` config, and capture sees it only at first issue. The first auction
-can race the Lockr response. An empty GPP string must not block. Capture
-should stay off until live acceptance. A replayed `ts-ec` could change a
-row through the proxy, a revoke's scope needs an operator choice, and the
-cookie keys should rotate apart from `ec.passphrase`. Revision 12 resolves
-them:
-
-| Finding                                                                     | Source       | Resolution                                                                             |
-| --------------------------------------------------------------------------- | ------------ | -------------------------------------------------------------------------------------- |
-| Lockr's ID5 EID is only in `ortb2`, which `getUserIdsAsEids()` misses       | #1246        | Dependency on the EID fidelity collector stated; capture-once note, 12.2; G10 test, 13 |
-| The first `/auction` can leave before the Lockr response sets `ts-eids-s`   | #1260 review | Open question 3, 15; race metric in rollout step 1, 14                                 |
-| A header-only GPP string (`DBAA`) blocked capture                           | #1260 review | Stated in 9.1; consent test, 13                                                        |
-| Capture defaulted to on                                                     | #1260 review | `capture_enabled`, default `false`, 4.7, 8, 10.1, 10.2, 14                             |
-| Owner, partner entry and pull sync prerequisites were implicit              | #1260 review | Capture provider checklist, 14                                                         |
-| The handoff cookie's lifetime differed from `ts-eids-s`                     | #1260        | Decisions log row, 16                                                                  |
-| A replayed `ts-ec` could enrich, strip or tombstone a row through the proxy | #1260 review | Real-browser gate on capture effects, G12, 4.7, 5.6, 6.2, 8, 13                        |
-| Global revoke had no operator gate                                          | #1260        | `revoke_scope`, default `"provider"`, 5.1, 8, 10.1, 10.2, 12.2, 13                     |
-| Cookie keys came from `ec.passphrase` and could not rotate                  | #1260        | Dedicated rotating keys, re-seal, retention, 6.2, 9.3, 10.1, 10.2, 13, 14              |
+Decisions from earlier rounds, and the finding behind each revision, are in
+the [review log](2026-10-20-server-side-identity-providers-review-log.md).
