@@ -189,11 +189,11 @@ impl<'a> Harness<'a> {
                 .current_dir(crate_root)
                 .arg(if release { "--release" } else { "--dev" })
                 .arg("--out-dir")
-                .arg(self.workspace.join("build"))
-                .args(["--features", "cloudflare,test-utils", "--locked"]);
+                .arg(self.workspace.join("build"));
             if !release {
                 command.arg("--no-opt");
             }
+            command.args(["--features", "cloudflare,test-utils", "--locked"]);
             self.run(&mut command, "build-runtime")?;
             self.workspace.join("build/index.js")
         } else {
