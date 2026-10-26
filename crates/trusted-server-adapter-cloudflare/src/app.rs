@@ -22,6 +22,7 @@ use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
     deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
+use trusted_server_core::ec::finalize::BrowserSeed;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -545,6 +546,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                         ec_context: &mut ec_context,
                         services: &services,
                         is_real_browser: false,
+                        seed: &BrowserSeed::empty(),
                         req,
                     })
                     .await

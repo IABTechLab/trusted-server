@@ -100,6 +100,8 @@ impl PartnerIdUpdate {
 }
 
 /// Terminal result of one browser EID-cookie persistence attempt.
+// Temporary: the browser-ingest write path moved into the identity mutation; a later identity task deletes this.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
 pub(crate) enum EidCookieSyncOutcome {
     /// The stored values already matched without a write.
@@ -134,6 +136,8 @@ pub(crate) enum EidCookieSyncOutcome {
     Failed,
 }
 
+// Temporary: the browser-ingest write path moved into the identity mutation; a later identity task deletes this.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CookieUpdateApplication {
     AlreadyMatched,
@@ -141,6 +145,8 @@ enum CookieUpdateApplication {
     DeferredFreshness,
 }
 
+// Temporary: the browser-ingest write path moved into the identity mutation; a later identity task deletes this.
+#[allow(dead_code)]
 fn apply_cookie_partner_id_updates(
     entry: &mut KvEntry,
     updates: &[PartnerIdUpdate],
@@ -182,6 +188,8 @@ fn apply_cookie_partner_id_updates(
     }
 }
 
+// Temporary: the browser-ingest write path moved into the identity mutation; a later identity task deletes this.
+#[allow(dead_code)]
 fn partner_id_updates_match(entry: &KvEntry, updates: &[PartnerIdUpdate]) -> bool {
     let mut latest_updates = BTreeMap::new();
     for update in updates {
@@ -586,6 +594,8 @@ impl KvIdentityGraph {
     /// conflict this method never writes again. A live follow-up becomes the
     /// authoritative snapshot; a missing or failed follow-up retains the live
     /// pre-write snapshot as proof and defers the update.
+    // Temporary: the browser-ingest write path moved into the identity mutation; a later identity task deletes this.
+    #[allow(dead_code)]
     pub(crate) fn sync_eid_cookie_updates_from_snapshot(
         &self,
         ec_id: &str,

@@ -89,9 +89,10 @@ use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 use device::DeviceSignals;
 
+use self::finalize::BrowserSeed;
 use self::identity::request::{RequestIdentity, WriterDecision};
 use self::identity::runtime::IdentityRuntime;
-use self::kv::{CreateIfAbsentOutcome, KvIdentityGraph};
+use self::kv::{CreateIfAbsentOutcome, KvIdentityGraph, apply_partner_id_updates};
 use self::kv_types::KvEntry;
 use self::pull_sync_marker::{PullSyncMarkerState, validate_marker_state};
 
@@ -387,6 +388,10 @@ impl EcContext {
     /// If an EC ID already exists (from the request), this is a no-op.
     /// If consent does not permit EC creation, this is a no-op.
     ///
+    /// The new row carries `seed`, the request's browser ingest, so a new
+    /// visitor's create is the one write (spec 5.2 phase 1). Pass
+    /// [`BrowserSeed::empty`] when there is nothing to seed.
+    ///
     /// # Errors
     ///
     /// Returns an error if the client IP is unavailable and generation is
@@ -395,6 +400,7 @@ impl EcContext {
         &mut self,
         settings: &Settings,
         kv: Option<&KvIdentityGraph>,
+        seed: &BrowserSeed,
     ) -> Result<(), Report<TrustedServerError>> {
         if self.ec_value.is_some() {
             return Ok(());
@@ -429,6 +435,7 @@ impl EcContext {
                 .device_signals
                 .as_ref()
                 .map(DeviceSignals::to_kv_device);
+            apply_partner_id_updates(&mut entry, seed.updates());
 
             if let Some(graph) = kv {
                 match graph.create_if_absent(&ec_id, &entry) {
@@ -526,15 +533,11 @@ impl EcContext {
 
     /// The identity state this request decides and collects.
     #[must_use]
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn identity(&self) -> &RequestIdentity {
         &self.identity
     }
 
     /// The identity state this request decides and collects, to fill.
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn identity_mut(&mut self) -> &mut RequestIdentity {
         &mut self.identity
     }
@@ -656,6 +659,8 @@ impl EcContext {
 
     /// Returns the current request's own EIDs, if the route captured any.
     #[must_use]
+    // Temporary: finalize no longer ingests the `/auction` body; Task 26 removes this plumbing.
+    #[allow(dead_code)]
     pub(crate) fn client_eids(&self) -> Option<&[Eid]> {
         self.client_eids.as_deref()
     }
@@ -992,7 +997,7 @@ mod tests {
             EcContext::new_for_test_with_ip(None, granting_consent(), Some("192.0.2.5".to_owned()));
         let graph = KvIdentityGraph::new(AddCollidingEcKv::new(2));
 
-        ec.generate_if_needed(&settings, Some(&graph))
+        ec.generate_if_needed(&settings, Some(&graph), &BrowserSeed::empty())
             .expect("should generate after bounded collisions");
 
         assert!(ec.ec_value().is_some(), "should allocate a fresh EC ID");
@@ -1011,7 +1016,7 @@ mod tests {
         // Collide on every attempt so the bounded retry is exhausted.
         let graph = KvIdentityGraph::new(AddCollidingEcKv::new(u32::MAX));
 
-        let result = ec.generate_if_needed(&settings, Some(&graph));
+        let result = ec.generate_if_needed(&settings, Some(&graph), &BrowserSeed::empty());
 
         assert!(result.is_err(), "should fail after exhausting attempts");
         assert!(
@@ -1232,7 +1237,7 @@ mod tests {
 
         let mut ec = EcContext::read_from_request(&settings, &req, &noop_services())
             .expect("should read EC context");
-        ec.generate_if_needed(&settings, None)
+        ec.generate_if_needed(&settings, None, &BrowserSeed::empty())
             .expect("should not error when EC already exists");
 
         assert_eq!(

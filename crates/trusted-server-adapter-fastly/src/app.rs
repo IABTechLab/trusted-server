@@ -112,6 +112,7 @@ use trusted_server_core::ec::admin::{
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
+use trusted_server_core::ec::finalize::{BrowserSeed, browser_seed};
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::identity::IdentityRuntime;
 use trusted_server_core::ec::kv::KvIdentityGraph;
@@ -379,6 +380,30 @@ impl EcRequestState {
             sharedid_cookie: self.sharedid_cookie,
             is_real_browser: self.is_real_browser,
             services: self.services,
+        }
+    }
+}
+
+/// Collects the request's browser ingest for a new EC's one create.
+///
+/// An unreadable partner registry yields an empty seed: the create still
+/// happens, without the ingest.
+fn browser_seed_for(state: &AppState, ec: &EcRequestState) -> BrowserSeed {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    match PartnerRegistry::from_config(&state.settings.ec.partners) {
+        Ok(registry) => browser_seed(
+            &state.settings,
+            &registry,
+            ec.ec_context.consent(),
+            ec.eids_cookie.as_deref(),
+            ec.sharedid_cookie.as_deref(),
+            now,
+        ),
+        Err(err) => {
+            log::warn!("Browser ingest skipped: partner registry is unavailable: {err:?}");
+            BrowserSeed::empty()
         }
     }
 }
@@ -835,6 +860,7 @@ async fn dispatch_fallback(
         // publisher.max_buffered_body_bytes. Publisher fallback below uses the
         // publisher-specific streaming finalizer instead.
         ec.ec_context.decide_writer(&req, true, ec.is_real_browser);
+        let seed = browser_seed_for(state, &ec);
         state
             .registry
             .handle_proxy(ProxyDispatchInput {
@@ -845,6 +871,7 @@ async fn dispatch_fallback(
                 ec_context: &mut ec.ec_context,
                 services,
                 is_real_browser: ec.is_real_browser,
+                seed: &seed,
                 req,
             })
             .await
@@ -875,10 +902,11 @@ async fn dispatch_fallback(
             ec.ec_context.set_eid_sync_source(EidSyncSource::Navigation);
         }
         let is_publisher_navigation = ec.is_real_browser && is_navigation;
+        let seed = browser_seed_for(state, &ec);
         if is_publisher_navigation
-            && let Err(err) = ec
-                .ec_context
-                .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
+            && let Err(err) =
+                ec.ec_context
+                    .generate_if_needed(&state.settings, ec.kv_graph.as_ref(), &seed)
         {
             log::warn!("EC generation failed for publisher proxy: {err:?}");
         }

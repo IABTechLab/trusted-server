@@ -11,6 +11,7 @@ use matchit::Router;
 use crate::auction::AuctionPlan;
 use crate::constants::HEADER_X_TS_EC;
 use crate::ec::EcContext;
+use crate::ec::finalize::BrowserSeed;
 use crate::ec::kv::KvIdentityGraph;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
@@ -808,6 +809,8 @@ pub struct ProxyDispatchInput<'a> {
     pub services: &'a RuntimeServices,
     /// Whether the client looks like a real browser. EC generation needs it.
     pub is_real_browser: bool,
+    /// The request's browser ingest, carried by an EC minted here.
+    pub seed: &'a BrowserSeed,
     pub req: Request<EdgeBody>,
 }
 
@@ -1042,6 +1045,7 @@ impl IntegrationRegistry {
             ec_context,
             services,
             is_real_browser,
+            seed,
             mut req,
         } = input;
         if let Some((proxy, _)) = self.find_route(method, path) {
@@ -1050,7 +1054,7 @@ impl IntegrationRegistry {
             // subresource requests may lack consent signals such as the
             // Sec-GPC header.
             if is_real_browser && is_navigation_request(&req) {
-                if let Err(err) = ec_context.generate_if_needed(settings, kv) {
+                if let Err(err) = ec_context.generate_if_needed(settings, kv, seed) {
                     log::warn!("EC generation failed for integration proxy: {err:?}");
                 }
             } else {
@@ -1695,6 +1699,7 @@ mod tests {
             ec_context: &mut ec_context,
             services: &noop_services(),
             is_real_browser: true,
+            seed: &BrowserSeed::empty(),
             req,
         }))
         .expect("should match route")
@@ -2053,6 +2058,7 @@ mod tests {
             ec_context: &mut ec_context,
             services: &services,
             is_real_browser: true,
+            seed: &BrowserSeed::empty(),
             req,
         }));
 
@@ -2107,6 +2113,7 @@ mod tests {
                 ec_context: &mut ec_context,
                 services: &services,
                 is_real_browser,
+                seed: &BrowserSeed::empty(),
                 req,
             }));
 
@@ -2121,6 +2128,92 @@ mod tests {
             minted,
             [false, true],
             "should mint an EC only when the client is a real browser"
+        );
+    }
+
+    #[test]
+    fn integration_proxy_new_ec_carries_browser_ingest() {
+        let settings = create_test_settings();
+        let registry = IntegrationRegistry::from_routes(vec![(
+            Method::GET,
+            "/integrations/test/ec",
+            (
+                Arc::new(EcTestProxy) as Arc<dyn IntegrationProxy>,
+                "ec_test",
+            ),
+        )]);
+        let services = noop_services();
+        let (graph, store) = KvIdentityGraph::write_counting("ec-store");
+        let consent = crate::consent::ConsentContext {
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+            ..crate::consent::ConsentContext::default()
+        };
+        let mut ec_context =
+            EcContext::new_for_test_with_ip(None, consent, Some("192.0.2.1".to_owned()));
+        let partner_registry =
+            crate::ec::registry::PartnerRegistry::from_config(&[crate::settings::EcPartner {
+                name: "Shared ID".to_owned(),
+                source_domain: "sharedid.org".to_owned(),
+                openrtb_atype: crate::settings::EcPartner::default_openrtb_atype(),
+                bidstream_enabled: true,
+                api_token: Some(crate::redacted::Redacted::new(
+                    "token-sharedid.org-32-bytes-minimum-value".to_owned(),
+                )),
+                batch_rate_limit: crate::settings::EcPartner::default_batch_rate_limit(),
+                pull_sync_enabled: false,
+                pull_sync_url: None,
+                pull_sync_allowed_domains: vec![],
+                removed_pull_sync_ttl_sec: None,
+                removed_pull_sync_rate_limit: None,
+                ts_pull_token: None,
+            }])
+            .expect("should build partner registry");
+        let seed = crate::ec::finalize::browser_seed(
+            &settings,
+            &partner_registry,
+            ec_context.consent(),
+            None,
+            Some("example-shared-id"),
+            1_760_000_000,
+        );
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("https://test-publisher.com/integrations/test/ec")
+            .header("sec-fetch-dest", "document")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
+            method: &Method::GET,
+            path: "/integrations/test/ec",
+            settings: &settings,
+            kv: Some(&graph),
+            ec_context: &mut ec_context,
+            services: &services,
+            is_real_browser: true,
+            seed: &seed,
+            req,
+        }));
+
+        assert!(
+            result.is_some_and(|response| response.is_ok()),
+            "should handle the request"
+        );
+        let writes = store.writes();
+        assert_eq!(writes.add, 1, "should write one create");
+        assert_eq!(writes.total(), 1, "should write nothing else");
+        let ec_id = ec_context.ec_value().expect("should mint an EC");
+        let (stored, _) = graph
+            .get(ec_id)
+            .expect("should read store")
+            .expect("should hold the new row");
+        assert_eq!(
+            stored
+                .ids
+                .get("sharedid.org")
+                .and_then(crate::ec::kv_types::KvPartnerId::first_uid),
+            Some("example-shared-id"),
+            "should carry the seeded UID in the create"
         );
     }
 
@@ -2159,6 +2252,7 @@ mod tests {
             ec_context: &mut ec_context,
             services: &services,
             is_real_browser: true,
+            seed: &BrowserSeed::empty(),
             req,
         }))
         .expect("should handle proxy request");
@@ -2209,6 +2303,7 @@ mod tests {
             ec_context: &mut ec_context,
             services: &services,
             is_real_browser: true,
+            seed: &BrowserSeed::empty(),
             req,
         }))
         .expect("should handle proxy request");
@@ -2256,6 +2351,7 @@ mod tests {
             ec_context: &mut ec_context,
             services: &services,
             is_real_browser: true,
+            seed: &BrowserSeed::empty(),
             req,
         }));
 

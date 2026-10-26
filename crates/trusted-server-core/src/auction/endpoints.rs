@@ -743,14 +743,13 @@ mod tests {
             1,
             "finalization must reuse the endpoint snapshot instead of reading again"
         );
-        let (stored, _) = graph
-            .get(&ec_id)
-            .expect("should read store")
-            .expect("row should exist");
-        assert_eq!(
-            stored.ids.get("sharedid.org").and_then(|id| id.first_uid()),
-            Some("shared-cookie-id"),
-            "the sharedId update must still be ingested from the shared snapshot"
+        assert!(
+            stored_ids(&graph, &ec_id).is_empty(),
+            "/auction is a stager and must not write the sharedId"
+        );
+        assert!(
+            ec_context.identity().mutation().is_empty(),
+            "/auction is a stager and must not queue the sharedId"
         );
     }
 
@@ -799,7 +798,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auction_ingests_its_body_eids_and_not_a_cookie_only_source() {
+    async fn auction_ingests_nothing_from_its_body_or_the_cookie() {
         let settings = create_test_settings();
         let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
             enabled: true,
@@ -851,15 +850,18 @@ mod tests {
             &mut response,
         );
 
-        assert_eq!(
-            stored_ids(&graph, &ec_id),
-            vec![("body.example.com".to_owned(), "body-uid".to_owned())],
-            "KV should learn the body's source and not the cookie-only source"
+        assert!(
+            stored_ids(&graph, &ec_id).is_empty(),
+            "KV should learn nothing from an /auction"
+        );
+        assert!(
+            ec_context.identity().mutation().is_empty(),
+            "/auction should queue nothing"
         );
     }
 
     #[tokio::test]
-    async fn disabled_auction_ingests_nothing_from_the_cookie_but_keeps_shared_id() {
+    async fn disabled_auction_ingests_nothing() {
         let settings = create_test_settings();
         let orchestrator = AuctionOrchestrator::new(AuctionConfig {
             enabled: false,
@@ -899,23 +901,35 @@ mod tests {
             &mut response,
         );
 
-        assert_eq!(
-            stored_ids(&graph, &ec_id),
-            vec![("sharedid.org".to_owned(), "shared-cookie-id".to_owned())],
-            "an /auction that resolved no client set should ingest only the sharedId cookie"
+        assert!(
+            stored_ids(&graph, &ec_id).is_empty(),
+            "a disabled /auction should ingest nothing"
+        );
+        assert!(
+            ec_context.identity().mutation().is_empty(),
+            "a disabled /auction should queue nothing"
         );
     }
 
     #[test]
-    fn navigation_ingests_the_cookie_only_source() {
+    fn writer_navigation_queues_the_cookie_only_source() {
         // Control for the two tests above: the registry does match the
-        // cookie-only source when the route reads the cookie.
+        // cookie-only source when the writer navigation reads the cookie.
         let settings = create_test_settings();
         let registry = ingestion_registry("body.example.com");
         let ec_id = format!("{}.ingnav", "a".repeat(64));
         let graph = seeded_graph(&ec_id);
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
         ec_context.set_eid_sync_source(crate::ec::EidSyncSource::Navigation);
+        ec_context.identity_mut().set_writer_decision(
+            crate::ec::identity::request::WriterDecision {
+                writer: true,
+                is_real_browser: true,
+                user_agent: None,
+                dnt: false,
+                page_url: None,
+            },
+        );
         let cookie = cookie_only_ts_eids();
         let mut response = http::Response::new(EdgeBody::empty());
 
@@ -929,21 +943,26 @@ mod tests {
             &mut response,
         );
 
-        assert_eq!(
-            stored_ids(&graph, &ec_id),
-            vec![(COOKIE_ONLY_SOURCE.to_owned(), "cookie-uid".to_owned())],
-            "a navigation should ingest the cookie's registered source"
+        assert!(
+            stored_ids(&graph, &ec_id).is_empty(),
+            "a navigation should leave the write to phase 4"
+        );
+        let queued = ec_context.identity().mutation().positive_changes();
+        assert!(
+            matches!(
+                queued,
+                [crate::ec::identity::mutation::PartnerIdChange::FillMissing { source, record }]
+                    if source.as_str() == COOKIE_ONLY_SOURCE
+                        && record.first_uid() == Some("cookie-uid")
+            ),
+            "a navigation should queue the cookie's registered source"
         );
     }
 
     #[tokio::test]
-    async fn auction_body_eids_reach_kv_even_when_the_ts_eids_cookie_is_absent() {
-        // Regression test for #1184: `/auction` sends every EID it has in the
-        // request body, but response finalization used to ingest identity
-        // graph updates only from the `ts-eids` cookie — which the browser
-        // caps in size and may not have sent at all. `handle_auction` must
-        // hand its parsed body EIDs to `ec_context` so finalization ingests
-        // them regardless of what the cookie carried.
+    async fn auction_body_eids_never_reach_kv() {
+        // The `/auction` body reaches bidders but is not an ingest input
+        // (spec G10): finalization neither writes nor queues it.
         let settings = create_test_settings();
         let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
             enabled: true,
@@ -998,15 +1017,6 @@ mod tests {
         )
         .await;
 
-        assert_eq!(
-            ec_context.client_eids().map(|eids| eids
-                .iter()
-                .map(|eid| eid.source.as_str())
-                .collect::<Vec<_>>()),
-            Some(vec!["id5-sync.com"]),
-            "the endpoint must hand its parsed body EIDs to the request context"
-        );
-
         let mut response = http::Response::new(EdgeBody::empty());
         crate::ec::finalize::ec_finalize_response(
             &settings,
@@ -1018,14 +1028,13 @@ mod tests {
             &mut response,
         );
 
-        let (stored, _) = graph
-            .get(&ec_id)
-            .expect("should read store")
-            .expect("row should exist");
-        assert_eq!(
-            stored.ids.get("id5-sync.com").and_then(|id| id.first_uid()),
-            Some("ID5_from_body"),
-            "the body's EID must be ingested into KV without a ts-eids cookie"
+        assert!(
+            stored_ids(&graph, &ec_id).is_empty(),
+            "the body's EID must not be ingested into KV"
+        );
+        assert!(
+            ec_context.identity().mutation().is_empty(),
+            "the body's EID must not be queued"
         );
     }
 

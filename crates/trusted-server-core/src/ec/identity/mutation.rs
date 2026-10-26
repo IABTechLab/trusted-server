@@ -131,8 +131,6 @@ pub(crate) struct ProviderResult {
 
 /// Everything one request changes in the identity row.
 #[derive(Debug, Clone, Default, PartialEq)]
-// Temporary: first used by a later identity task.
-#[allow(dead_code)]
 pub(crate) struct IdentityMutation {
     partner_ids: Vec<PartnerIdChange>,
     provider_state: BTreeMap<IdentityProviderId, ProviderStateChange>,
@@ -142,8 +140,6 @@ pub(crate) struct IdentityMutation {
 
 impl IdentityMutation {
     /// Adds a change that stands alone.
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn add_change(&mut self, change: PartnerIdChange) {
         self.partner_ids.push(change);
     }
@@ -199,6 +195,12 @@ impl IdentityMutation {
     #[must_use]
     pub(crate) fn change_count(&self) -> usize {
         self.partner_ids.len() + self.results.len() + self.provider_state.len()
+    }
+
+    /// The stand-alone changes, for tests that check what a caller staged.
+    #[cfg(test)]
+    pub(crate) fn positive_changes(&self) -> &[PartnerIdChange] {
+        &self.partner_ids
     }
 
     /// Whether nothing would change.
