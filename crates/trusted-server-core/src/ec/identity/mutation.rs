@@ -291,12 +291,21 @@ impl IdentityMutation {
     /// Cuts the mutation down for a navigation whose origin status was not
     /// 2xx or 304 (spec 5.1).
     ///
-    /// Keeps every removal, opt-out and clear, the stand-alone state changes
-    /// (the `n` and `f` of every outcome other than `found`) and the cluster
-    /// size. Drops browser ingest and every other positive change, and each
-    /// provider result whole, keeping only its opt-out and clear.
+    /// Keeps every removal, opt-out and clear, the `n` and `f` of each
+    /// stand-alone state change, and the cluster size. Drops browser ingest,
+    /// every other positive change, any stand-alone `st`, and each provider
+    /// result whole, keeping only its opt-out and clear.
+    ///
+    /// A stand-alone state change carries the `n` and `f` of an outcome other
+    /// than a stateful `found`, whose scheduling rides in its result. A
+    /// stateless provider's `found` also lands here, so its `f = 0` is kept;
+    /// Part 1 dispatches no provider before the status is known, so no such
+    /// change reaches this cut yet.
     pub(crate) fn retain_for_error_status(&mut self) {
         self.partner_ids.retain(PartnerIdChange::is_removal);
+        for state in self.provider_state.values_mut() {
+            state.st = StateUpdate::Keep;
+        }
         for result in core::mem::take(&mut self.results) {
             if result.state.has_removal() {
                 self.merge_state(result.provider, result.state.removals());

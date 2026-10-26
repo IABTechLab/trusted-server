@@ -513,10 +513,15 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
             send_edgezero_response(response, request_filter_effects.as_ref(), counters.as_ref());
         };
         if let Some(state) = app_state.as_deref() {
-            let graph = || state.identity_graph.clone();
+            let graph = || {
+                if state.identity_graph.is_none() {
+                    log::warn!("identity graph unavailable: ec.ec_store is not configured");
+                }
+                state.identity_graph.clone()
+            };
             finalize_send_and_flush(
                 PostRouteInput {
-                    runtime: &state.identity,
+                    runtime: Some(&state.identity),
                     settings: &state.settings,
                     ec_state: &mut ec_state,
                     graph: &graph,
@@ -528,34 +533,45 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
             return;
         }
         match load_settings_from_config_store(&runtime_stores) {
-            Ok(settings) => match build_identity_runtime(&settings) {
-                Ok(identity) => {
-                    // No application state was built, so the identity runtime
-                    // comes from the reloaded settings.
-                    ec_state
-                        .ec_context
-                        .set_identity_runtime(Arc::clone(&identity));
-                    let graph = || maybe_identity_graph(&settings);
-                    finalize_send_and_flush(
-                        PostRouteInput {
-                            runtime: &identity,
-                            settings: &settings,
-                            ec_state: &mut ec_state,
-                            graph: &graph,
-                            rate_limiter: &limiter,
-                        },
-                        response,
-                        &mut send,
-                    );
-                    return;
-                }
-                Err(e) => {
-                    log::warn!(
-                        "EdgeZero EC finalize skipped: identity runtime unavailable after settings reload: {}",
-                        e.current_context()
-                    );
-                }
-            },
+            Ok(settings) => {
+                // No application state was built, so the identity runtime
+                // comes from the reloaded settings. Without one, finalize and
+                // the withdrawal retry still run; only phase 4 is skipped.
+                let identity = match build_identity_runtime(&settings) {
+                    Ok(identity) => {
+                        ec_state
+                            .ec_context
+                            .set_identity_runtime(Arc::clone(&identity));
+                        Some(identity)
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "identity flush skipped: identity runtime unavailable after settings reload: {}",
+                            e.current_context()
+                        );
+                        None
+                    }
+                };
+                let graph = || {
+                    require_identity_graph(&settings)
+                        .map_err(|e| {
+                            log::warn!("identity graph unavailable: {}", e.current_context());
+                        })
+                        .ok()
+                };
+                finalize_send_and_flush(
+                    PostRouteInput {
+                        runtime: identity.as_deref(),
+                        settings: &settings,
+                        ec_state: &mut ec_state,
+                        graph: &graph,
+                        rate_limiter: &limiter,
+                    },
+                    response,
+                    &mut send,
+                );
+                return;
+            }
             Err(e) => {
                 log::warn!("EdgeZero EC finalize skipped: failed to reload settings: {e:?}");
             }
@@ -603,7 +619,9 @@ fn apply_entry_point_finalize_headers(
 /// What the post-route work reads. It takes the runtime and settings rather
 /// than [`AppState`], because the settings-reload branch has none.
 struct PostRouteInput<'a> {
-    runtime: &'a IdentityRuntime,
+    /// `None` when the runtime could not be built: finalize and the
+    /// withdrawal retry still run, and phase 4 is skipped.
+    runtime: Option<&'a IdentityRuntime>,
     settings: &'a Settings,
     ec_state: &'a mut EcFinalizeState,
     /// Builds the identity graph. Called only when finalize or the after-send
@@ -663,6 +681,9 @@ fn finalize_send_and_flush(
             None => log::warn!("withdrawal retry skipped: identity graph unavailable"),
         }
     }
+    let Some(runtime) = runtime else {
+        return Some(FlushOutcome::Skipped);
+    };
     if !ec_state.is_real_browser || !may_flush(&ec_state.ec_context) {
         return Some(FlushOutcome::Skipped);
     }
@@ -929,6 +950,12 @@ mod tests {
             Some("1:65536;2:0;4:6291456;6:262144"),
         ));
         request
+            .extensions_mut()
+            .insert(trusted_server_core::platform::ClientInfo {
+                client_ip: Some("192.0.2.10".parse().expect("should parse the client IP")),
+                ..trusted_server_core::platform::ClientInfo::default()
+            });
+        request
     }
 
     /// Routes `request`, then finalizes, sends and flushes it as
@@ -937,17 +964,29 @@ mod tests {
         state: &Arc<AppState>,
         request: HttpRequest,
     ) -> (HttpResponse, Option<FlushOutcome>) {
+        drive_with_runtime(state, request, Some(&state.identity), |_| {})
+    }
+
+    /// As [`drive_request_for_test`], with the runtime the post-route work
+    /// gets: `None` is the settings-reload branch without a runtime.
+    fn drive_with_runtime(
+        state: &Arc<AppState>,
+        request: HttpRequest,
+        runtime: Option<&IdentityRuntime>,
+        prepare: impl FnOnce(&mut EcFinalizeState),
+    ) -> (HttpResponse, Option<FlushOutcome>) {
         let router = TrustedServerApp::routes_for_state(state);
         let mut response =
             futures::executor::block_on(router.oneshot(request)).expect("should route the request");
         let Some(mut ec_state) = response.extensions_mut().remove::<EcFinalizeState>() else {
             return (response, None);
         };
+        prepare(&mut ec_state);
         let mut sent = None;
         let graph = || state.identity_graph.clone();
         let outcome = finalize_send_and_flush(
             PostRouteInput {
-                runtime: &state.identity,
+                runtime,
                 settings: &state.settings,
                 ec_state: &mut ec_state,
                 graph: &graph,
@@ -1013,7 +1052,7 @@ mod tests {
 
         let outcome = finalize_send_and_flush(
             PostRouteInput {
-                runtime: &state.identity,
+                runtime: Some(&state.identity),
                 settings: &state.settings,
                 ec_state: &mut ec_state,
                 graph: &graph,
@@ -1057,7 +1096,7 @@ mod tests {
 
         let outcome = finalize_send_and_flush(
             PostRouteInput {
-                runtime: &state.identity,
+                runtime: Some(&state.identity),
                 settings: &state.settings,
                 ec_state: &mut ec_state,
                 graph: &graph,
@@ -1092,6 +1131,73 @@ mod tests {
             1,
             "should read the row whatever the old marker cookie says"
         );
+
+        let (withdrawn, _) = drive_with_runtime(
+            &state,
+            navigation(Some(&cookie)),
+            Some(&state.identity),
+            withdraw,
+        );
+        let cookies = set_cookies(&withdrawn);
+        assert!(
+            cookies
+                .iter()
+                .any(|value| value.starts_with("ts-ec=;") && value.contains("Max-Age=0")),
+            "control: finalize should still expire ts-ec on a withdrawal: {cookies:?}"
+        );
+        assert!(
+            cookies
+                .iter()
+                .all(|value| !value.starts_with("ts-ec-pull-complete")),
+            "should not expire a pull-complete cookie either: {cookies:?}"
+        );
+    }
+
+    /// Turns the request's consent into an explicit withdrawal (GPC in a US
+    /// state). Viceroy has no geo, so routing alone cannot produce one.
+    fn withdraw(ec_state: &mut EcFinalizeState) {
+        let consent = ec_state.ec_context.consent_mut();
+        consent.jurisdiction =
+            trusted_server_core::consent::jurisdiction::Jurisdiction::UsState("CA".to_owned());
+        consent.gpc = true;
+    }
+
+    fn set_cookies(response: &HttpResponse) -> Vec<String> {
+        response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|value| value.to_str().ok().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn reload_without_identity_runtime_still_finalizes() {
+        let (state, _) = seeded_state();
+
+        let (response, outcome) = drive_with_runtime(
+            &state,
+            navigation(Some(&format!("ts-ec={EC_ID}"))),
+            None,
+            withdraw,
+        );
+
+        let cookies = set_cookies(&response);
+        assert!(
+            cookies
+                .iter()
+                .any(|value| value.starts_with("ts-ec=;") && value.contains("Max-Age=0")),
+            "should still finalize and expire ts-ec without a runtime: {cookies:?}"
+        );
+        let (row, _) = state
+            .identity_graph
+            .as_ref()
+            .expect("should hold the graph")
+            .get(EC_ID)
+            .expect("should read the row")
+            .expect("should keep the tombstone");
+        assert!(!row.consent.ok, "should still tombstone the row");
+        assert_eq!(outcome, Some(FlushOutcome::Skipped), "should skip phase 4");
     }
 
     #[test]
