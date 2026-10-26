@@ -84,6 +84,12 @@ impl Fixture {
     }
 }
 
+pub(in crate::ordinary) fn checked_fixture() -> Checked {
+    Fixture::new()
+        .checked()
+        .expect("should construct an unqualified ordinary test comparison")
+}
+
 #[test]
 fn joins_exact_archives_and_emits_only_an_ordinary_matched_receipt() {
     let receipt = Fixture::new()

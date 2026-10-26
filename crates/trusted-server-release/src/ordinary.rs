@@ -16,6 +16,7 @@ use crate::error::ReleaseError;
 
 mod archive;
 mod inputs;
+mod output;
 mod run;
 mod transfer;
 
