@@ -17,6 +17,8 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
+# Opt-in local runtime fixture and its diagnostic stderr sink.
+test-utils = ["trusted-server-core/test-utils"]
 spin = ["edgezero-adapter-spin/spin"]
 
 [dependencies]
