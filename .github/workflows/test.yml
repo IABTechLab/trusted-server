@@ -1,4 +1,4 @@
-name: "Run Tests"
+name: 'Run Tests'
 
 permissions:
   contents: read
@@ -178,6 +178,13 @@ jobs:
       - name: Run release producer primitive and process tests
         run: cargo test --package trusted-server-release --target x86_64-unknown-linux-gnu --locked
 
+      - name: Run checked and ordinary JS release build fixtures
+        shell: bash
+        run: |
+          cargo test --package trusted-server-js --target x86_64-unknown-linux-gnu --locked --test release_prebuilt -- --list > "$RUNNER_TEMP/js-release-tests.txt"
+          grep -Fx 'ordinary_release_without_prebuilt_builds_private_bundles: test' "$RUNNER_TEMP/js-release-tests.txt"
+          cargo test --package trusted-server-js --target x86_64-unknown-linux-gnu --locked --test release_prebuilt
+
       # The codegen crate is not a default member and no adapter alias builds it,
       # so its tests only run if invoked explicitly on the host target.
       - name: Run host-target OpenRTB codegen tests
@@ -243,7 +250,7 @@ jobs:
           TRUSTED_SERVER__PUBLISHER__ORIGIN_URL: http://127.0.0.1:8080
           TRUSTED_SERVER__PUBLISHER__PROXY_SECRET: integration-test-proxy-secret
           TRUSTED_SERVER__EC__PASSPHRASE: integration-test-ec-secret-padded-32
-          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
+          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: 'false'
         run: cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
 
       - name: Run Spin adapter tests (native host)
@@ -283,7 +290,7 @@ jobs:
       - name: Set up Rust toolchain
         uses: ./.github/actions/setup-rust
         with:
-          components: "clippy, rustfmt"
+          components: 'clippy, rustfmt'
           cache-key: cargo-cli
 
       - name: Read pinned Node.js version for CLI fixtures
@@ -357,7 +364,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
-          cache: "npm"
+          cache: 'npm'
           cache-dependency-path: crates/trusted-server-js/lib/package.json
 
       - name: Install dependencies

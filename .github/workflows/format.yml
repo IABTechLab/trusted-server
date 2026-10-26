@@ -1,4 +1,4 @@
-name: "Run Format"
+name: 'Run Format'
 
 on:
   push:
@@ -61,7 +61,7 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           target: wasm32-wasip1,wasm32-unknown-unknown
-          components: "clippy, rustfmt"
+          components: 'clippy, rustfmt'
           cache-key: cargo-clippy
 
       - name: Run cargo fmt
@@ -94,6 +94,9 @@ jobs:
       - name: Run host-target release producer clippy
         run: cargo clippy --package trusted-server-release --target x86_64-unknown-linux-gnu --all-targets --all-features --locked -- -D warnings
 
+      - name: Lint native JS release build fixtures
+        run: cargo clippy --package trusted-server-js --target x86_64-unknown-linux-gnu --all-targets --all-features --locked -- -D warnings
+
       # The codegen crate is a workspace member but is not a default member and
       # is not covered by any adapter-scoped alias, so lint it explicitly.
       - name: Run host-target OpenRTB codegen clippy
@@ -123,7 +126,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
-          cache: "npm"
+          cache: 'npm'
           cache-dependency-path: crates/trusted-server-js/lib/package.json
 
       - name: Install dependencies
@@ -154,7 +157,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
-          cache: "npm"
+          cache: 'npm'
           cache-dependency-path: docs/package.json
 
       - name: Install dependencies

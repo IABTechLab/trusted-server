@@ -16,6 +16,20 @@ import * as fs from 'node:fs'
 import vm from 'node:vm'
 import { isDeepStrictEqual } from 'node:util'
 import { checkBinary, checkSource, mergeSboms, sentinels } from './phase1.mjs'
+
+test('checked JS inventory metadata is confined to its exact build script', () => {
+  const source = 'option_env!("TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY")'
+  assert.doesNotThrow(() =>
+    checkSource('crates/trusted-server-js/build.rs', source)
+  )
+  for (const file of [
+    'crates/example/build.rs',
+    'crates/trusted-server-js/src/lib.rs',
+    'crates/trusted-server-js-other/build.rs',
+    'other/crates/trusted-server-js/build.rs',
+  ])
+    assert.throws(() => checkSource(file, source), /compile-time/)
+})
 test('rejects every planted operator value, including inside binary data', () => {
   for (const marker of sentinels) {
     assert.throws(

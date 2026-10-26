@@ -1,11 +1,20 @@
 #![allow(
     clippy::expect_used,
     clippy::panic,
-    reason = "build script failures should stop Cargo with a clear diagnostic"
+    clippy::print_stdout,
+    reason = "Cargo directives require stdout and build script failures must stop the build"
 )]
 
 #[path = "build/bundle_set.rs"]
 mod bundle_set;
+#[allow(dead_code, reason = "only the shared release guard is needed here")]
+#[path = "../trusted-server-core/build_support/git_version.rs"]
+mod git_version;
+#[path = "build/inventory.rs"]
+mod inventory;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "build/prebuilt.rs"]
+mod prebuilt;
 
 use std::env;
 use std::fmt::Write as _;
@@ -16,20 +25,31 @@ use std::process::{Command, ExitStatus};
 use build_print::info;
 use sha2::{Digest as _, Sha256};
 
-use crate::bundle_set::{bundle_file_name, check_bundle_set, expected_module_ids, scan_bundle_dir};
+use self::bundle_set::{bundle_file_name, check_bundle_set, expected_module_ids, scan_bundle_dir};
 
 const PREBUILT_DIR_VAR: &str = "TSJS_PREBUILT_DIR";
+const INVENTORY_VAR: &str = "TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY";
+const RELEASE_VAR: &str = "TRUSTED_SERVER__RELEASE_BUILD";
+const SOURCE_VAR: &str = "TRUSTED_SERVER__GIT_VERSION";
 const SKIP_BUILD_VAR: &str = "TSJS_SKIP_BUILD";
 const TEST_VAR: &str = "TSJS_TEST";
 
 fn main() {
+    run_with_hook(|_, _| {});
+}
+
+/// Run the actual build script with a crate-private post-copy race fixture.
+pub(crate) fn run_with_hook(hook: impl FnMut(&Path, &Path)) {
     // Cargo scans directories recursively, so these cover every TS source.
     // Every path must exist: a missing entry makes Cargo rerun this script on
     // every build, the opposite of the intent.
     for path in [
         "lib/src",
         "lib/build-all.mjs",
+        "lib/build-module-options.mjs",
         "lib/build-prebid-external.mjs",
+        "lib/release-composition.mjs",
+        "lib/vitest.config.ts",
         "lib/package.json",
         "lib/package-lock.json",
         "lib/tsconfig.json",
@@ -37,8 +57,49 @@ fn main() {
     ] {
         println!("cargo:rerun-if-changed={path}");
     }
-    for var in [PREBUILT_DIR_VAR, SKIP_BUILD_VAR, TEST_VAR] {
+    for var in [
+        PREBUILT_DIR_VAR,
+        INVENTORY_VAR,
+        SKIP_BUILD_VAR,
+        TEST_VAR,
+        RELEASE_VAR,
+        SOURCE_VAR,
+    ] {
         println!("cargo:rerun-if-env-changed={var}");
+    }
+
+    assert!(
+        env::var_os(SKIP_BUILD_VAR).is_none(),
+        "tsjs: {SKIP_BUILD_VAR} is no longer supported whenever present"
+    );
+    let source = env::var_os(SOURCE_VAR);
+    let release =
+        git_version::release_source(env::var_os(RELEASE_VAR).as_deref(), source.as_deref())
+            .unwrap_or_else(|error| panic!("tsjs: {error}"));
+    let prebuilt_dir = env::var_os(PREBUILT_DIR_VAR).map(PathBuf::from);
+    let inventory_path = env::var_os(INVENTORY_VAR).map(PathBuf::from);
+    // Ordinary releases build fresh private bundles. Selecting prebuilt release
+    // inputs instead requires the complete checked pair, never a loose folder.
+    if release.is_some() && (prebuilt_dir.is_some() || inventory_path.is_some()) {
+        assert!(
+            prebuilt_dir.is_some(),
+            "tsjs: release builds require {PREBUILT_DIR_VAR}"
+        );
+        assert!(
+            inventory_path.is_some(),
+            "tsjs: release builds require {INVENTORY_VAR}"
+        );
+    }
+    assert!(
+        inventory_path.is_none() || prebuilt_dir.is_some(),
+        "tsjs: {INVENTORY_VAR} requires {PREBUILT_DIR_VAR}"
+    );
+    if let Some(path) = &inventory_path {
+        assert!(
+            path.is_absolute(),
+            "tsjs: {INVENTORY_VAR} must be an absolute path"
+        );
+        println!("cargo:rerun-if-changed={}", path.display());
     }
 
     let crate_dir = PathBuf::from(
@@ -52,7 +113,7 @@ fn main() {
     let expected = expected_module_ids(&ts_dir.join("src"))
         .unwrap_or_else(|err| panic!("tsjs: failed to discover modules: {err}"));
 
-    if let Some(prebuilt_dir) = env::var_os(PREBUILT_DIR_VAR).map(PathBuf::from) {
+    if let Some(prebuilt_dir) = prebuilt_dir {
         assert!(
             prebuilt_dir.is_absolute(),
             "tsjs: {PREBUILT_DIR_VAR} must be an absolute path because Cargo runs build \
@@ -64,8 +125,41 @@ fn main() {
             "tsjs: Using prebuilt bundles from {}",
             prebuilt_dir.display()
         );
-        validate_bundle_dir(&expected, &prebuilt_dir);
-        copy_prebuilt_bundles(&expected, &prebuilt_dir, &bundle_dir);
+        if let Some(path) = inventory_path {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                prebuilt::inventory_outside(&prebuilt_dir, &path).unwrap_or_else(|error| {
+                    panic!("tsjs: invalid inventory path {}: {error}", path.display())
+                });
+                let inventory = inventory::read_inventory(&path, &expected, release.as_deref())
+                    .unwrap_or_else(|error| {
+                        panic!("tsjs: invalid inventory {}: {error}", path.display())
+                    });
+                prebuilt::copy_checked(
+                    &expected,
+                    &prebuilt_dir,
+                    &bundle_dir,
+                    &inventory.inventory,
+                    hook,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "tsjs: invalid prebuilt inventory inputs in {}: {error}",
+                        prebuilt_dir.display()
+                    )
+                });
+                // Cargo JSON build-script messages expose the prepared input
+                // identity to the later release evidence collector.
+                println!(
+                    "cargo:rustc-env=TRUSTED_SERVER__TSJS_INVENTORY_SHA256={}",
+                    inventory.raw_sha256
+                );
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            panic!("tsjs: checked prebuilt copying requires a supported Linux or macOS build host");
+        } else {
+            copy_prebuilt(&expected, &prebuilt_dir, &bundle_dir);
+        }
     } else {
         build_bundles(&ts_dir, &bundle_dir);
     }
@@ -80,6 +174,22 @@ fn main() {
     write_module_table(&expected, &bundle_dir, &out_dir);
 }
 
+fn copy_prebuilt(expected: &[String], source: &Path, destination: &Path) {
+    let found =
+        bundle_set::scan_legacy_bundle_dir(source).unwrap_or_else(|error| panic!("tsjs: {error}"));
+    check_bundle_set(expected, &found)
+        .unwrap_or_else(|error| panic!("tsjs: invalid prebuilt bundle set: {error}"));
+    if destination.exists() {
+        fs::remove_dir_all(destination).expect("should clear private prebuilt destination");
+    }
+    fs::create_dir_all(destination).expect("should create private prebuilt destination");
+    for id in expected {
+        let filename = bundle_file_name(id);
+        fs::copy(source.join(&filename), destination.join(&filename))
+            .unwrap_or_else(|error| panic!("tsjs: failed to copy {filename}: {error}"));
+    }
+}
+
 fn build_bundles(ts_dir: &Path, bundle_dir: &Path) {
     let how_to_prebuild = format!(
         "To embed prebuilt bundles instead, run `npm run build` in {} and set \
@@ -88,11 +198,6 @@ fn build_bundles(ts_dir: &Path, bundle_dir: &Path) {
         ts_dir.with_file_name("dist").display()
     );
 
-    assert!(
-        !env::var(SKIP_BUILD_VAR).is_ok_and(|value| value == "1"),
-        "tsjs: {SKIP_BUILD_VAR} is no longer supported because it embedded whatever \
-         dist/ held. {how_to_prebuild}"
-    );
     assert!(
         ts_dir.join("package.json").is_file(),
         "tsjs: {} not found. {how_to_prebuild}",
@@ -209,27 +314,6 @@ fn validate_bundle_dir(expected: &[String], dir: &Path) {
     let found = scan_bundle_dir(dir).unwrap_or_else(|err| panic!("tsjs: {err}"));
     if let Err(err) = check_bundle_set(expected, &found) {
         panic!("tsjs: invalid bundle set in {}: {err}", dir.display());
-    }
-}
-
-fn copy_prebuilt_bundles(expected: &[String], prebuilt_dir: &Path, bundle_dir: &Path) {
-    if bundle_dir.exists() {
-        fs::remove_dir_all(bundle_dir)
-            .unwrap_or_else(|err| panic!("tsjs: failed to clean {}: {err}", bundle_dir.display()));
-    }
-    fs::create_dir_all(bundle_dir)
-        .unwrap_or_else(|err| panic!("tsjs: failed to create {}: {err}", bundle_dir.display()));
-    for id in expected {
-        let file_name = bundle_file_name(id);
-        let source = prebuilt_dir.join(&file_name);
-        let target = bundle_dir.join(&file_name);
-        fs::copy(&source, &target).unwrap_or_else(|err| {
-            panic!(
-                "tsjs: failed to copy {} to {}: {err}",
-                source.display(),
-                target.display()
-            )
-        });
     }
 }
 

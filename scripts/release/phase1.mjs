@@ -289,6 +289,10 @@ export function checkSource(file, source) {
     'TRUSTED_SERVER__RELEASE_BUILD',
     'TRUSTED_SERVER__BUILD_TARGET',
   ])
+  // Checked prebuilt inventory is build metadata for this exact producer only.
+  // The ordinary release script still refuses TSJS_PREBUILT_DIR entirely.
+  if (file === 'crates/trusted-server-js/build.rs')
+    allowedBuild.add('TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY')
   const expression = (start) => {
     if (
       ['env', 'option_env'].includes(tokens[start]) &&

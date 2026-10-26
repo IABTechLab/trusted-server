@@ -570,3 +570,9 @@ The tracked cohort is validated as exactly seven ordinary rows. The four `FIXED_
 The retained tools/consumer policy selects GitHub CLI 2.97.0 for its destination contract. The current operator guide uses 2.102.0 and the ordinary publisher records its installed version; carrying the destination pins does not enforce them in the ordinary path. Other selected tool versions match current source pins.
 
 The inspector recipe link is restored after the recipe port. A startup documentation link now names the private accepted-module type directly, without restoring a Phase 3-only re-export. Three workflow-contract command tests are held for their Phase 3 command.
+
+### JS preparation staging
+
+The frozen lifecycle observer remains byte-identical and closed to esbuild 0.28.2 in the current npm lock; it accepts only 0.27.3. The full collector case is retained with a visible skipped reason and a guard against enabling its unsupported test control. This is a known controlled-recipe gap requiring a separate esbuild review. Ordinary release builds and the Gate 1 A/B adapter do not invoke that observer.
+
+The JS build-script port preserves ordinary fresh npm/private-output builds. Only explicitly selected prebuilt release inputs require both checked paths. Current Vite/Vitest versions and npm lock bytes are retained, checked-copy/process fixtures run in CI only, and local JS verification uses an audited pure selection.

@@ -324,3 +324,11 @@ The Fastly provenance attestation adds the rebuild-check subject while retaining
 Phase 2 validates all seven current ordinary cohort rows strictly. The retained controlled recipes, consumer policy and index schema still cover four destination artifacts. Projection uses those four source-owned names in fixed order; the three ordinary Axum rows grant no controlled recipe or seven-asset index authority. The separate Phase 3 index amendment remains required. No carried cohort, tools, consumer-policy or schema bytes are changed by this split.
 
 The carried tools and consumer policy name GitHub CLI 2.97.0 as a destination pin. Current operator instructions use 2.102.0, and the ordinary publisher records the installed version. Qualification pins, controlled reproducibility profiles and the destination GitHub CLI pin are not enforced by the ordinary producer. Its existing publication, signing and verification checks remain in force.
+
+### Controlled JS observer gap
+
+Controlled JS preparation does not support the current npm lock: the frozen observer admits esbuild 0.27.3, while the lock selects 0.28.2. The observer is ported unchanged. Ordinary release builds and the Gate 1 Fastly A/B adapter do not use it. Adapting the observer belongs to the gated controlled-recipe work and requires its own review of the esbuild change.
+
+The full collector test stays ported with an explicit skipped reason naming both versions; no CI job claims it passes. A cheap configuration guard rejects `TRUSTED_SERVER__RELEASE_JS_TESTS=1` against an unsupported lock, and a pure regression test checks that refusal. Existing observer fixture tests and the ordinary/checked-prebuilt build fixtures remain separate.
+
+Unlike the frozen controlled producer, ordinary release mode may select neither prebuilt input and build fresh private bundles with npm. Explicit prebuilt release selection still requires both the absolute bundle directory and inventory, with source/hash, strict-copy and race checks unchanged. Phase 1 continues to refuse all prebuilt overrides. The build-input audit allows the inventory metadata name only in the exact JS build script, never in other build scripts or compile-time application reads.
