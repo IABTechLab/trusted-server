@@ -246,6 +246,7 @@ async fn dispatch_fallback(
     // slots; `handle_publisher_request` matches them against the request path.
     let mut ec_context = build_ec_context(state, services, &req);
     let auction = AuctionDispatch {
+        integration_registry: &state.registry,
         orchestrator: &state.orchestrator,
         slots: state.settings.creative_opportunity_slots(),
         registry: None,
@@ -526,6 +527,7 @@ fn named_route_handler(
                         } else {
                             let mut ec_context = build_ec_context(&state, &services, &req);
                             let auction = AuctionDispatch {
+                                integration_registry: &state.registry,
                                 orchestrator: &state.orchestrator,
                                 slots: state.settings.creative_opportunity_slots(),
                                 registry: None,
