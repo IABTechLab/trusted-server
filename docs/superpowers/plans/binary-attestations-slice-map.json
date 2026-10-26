@@ -1138,7 +1138,7 @@
   },
   "landing_status": {
     "Cargo.lock": {
-      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
       "state": "Staged Phase 2 dependency/support subset"
     },
     "Cargo.toml": {
@@ -1505,6 +1505,74 @@
       "commit": "d1c1d6967c4a6813fe6d3b6c0168fb37a6618360",
       "state": "Ported Phase 2 source or approved split"
     },
+    "crates/trusted-server-js/Cargo.toml": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-js/README.md": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-js/build.rs": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-js/build/bundle_set.rs": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-js/build/inventory.rs": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-js/build/prebuilt.rs": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-js/lib/.gitignore": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-js/lib/.prettierignore": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-js/lib/build-all.mjs": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-js/lib/build-module-options.mjs": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-js/lib/eslint.config.js": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-js/lib/package.json": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-js/lib/release-composition.mjs": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-js/lib/test/observe-npm.test.mjs": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-js/lib/test/release-composition.test.mjs": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-js/lib/vitest.config.ts": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-js/tests/release_prebuilt.rs": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
     "crates/trusted-server-release/src/javascript.rs": {
       "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
       "state": "Ported Phase 2 source or approved split"
@@ -1643,6 +1711,30 @@
     },
     "crates/trusted-server-release/src/preparation/tests/full.rs": {
       "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "scripts/release/build-js.sh": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "scripts/release/collect-js.mjs": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "scripts/release/observe-npm.mjs": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "scripts/release/tests/js-fixture.Dockerfile": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "scripts/release/tests/prepare-js-fixture.mjs": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-adapter-cloudflare/build.sh": {
+      "commit": "f721ddbe029eeb87941b9892c43e169993419dbe",
       "state": "Ported Phase 2 source or approved split"
     },
     "crates/trusted-server-release/src/inspect.rs": {
@@ -1961,8 +2053,24 @@
       "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
       "state": "Ported Phase 2 source or approved split"
     },
+    "scripts/release/build.sh": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "scripts/release/tests/cargo-fixture.Dockerfile": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
     "scripts/release/tests/cli-builder.Dockerfile": {
       "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "scripts/release/tests/prepare-cargo-fixture.mjs": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "scripts/release/tests/prepare-cli-fixture.mjs": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
       "state": "Ported Phase 2 source or approved split"
     },
     "crates/trusted-server-release/schemas/SPDX-LICENSE": {
@@ -2066,8 +2174,52 @@
       "state": "Ported Phase 2 source or approved split"
     },
     ".github/workflows/format.yml": {
-      "commit": "1534d462d052debae8b5d886268701077bf879a5",
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
       "state": "Staged Phase 2 dependency/support subset"
+    },
+    "CHANGELOG.md": {
+      "commit": "f721ddbe029eeb87941b9892c43e169993419dbe",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-adapter-spin/src/app.rs": {
+      "commit": "f721ddbe029eeb87941b9892c43e169993419dbe",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-adapter-spin/src/middleware.rs": {
+      "commit": "f721ddbe029eeb87941b9892c43e169993419dbe",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-adapter-spin/tests/routes.rs": {
+      "commit": "f721ddbe029eeb87941b9892c43e169993419dbe",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "docs/guide/edgezero.md": {
+      "commit": "f721ddbe029eeb87941b9892c43e169993419dbe",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "docs/guide/error-reference.md": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "docs/guide/getting-started.md": {
+      "commit": "f721ddbe029eeb87941b9892c43e169993419dbe",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "scripts/docs-proposal/hunks.mjs": {
+      "commit": "f721ddbe029eeb87941b9892c43e169993419dbe",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "scripts/docs-proposal/hunks.test.mjs": {
+      "commit": "f721ddbe029eeb87941b9892c43e169993419dbe",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "scripts/release/qualification/README.md": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "scripts/release/tests/fixtures/README.md": {
+      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
+      "state": "Ported Phase 2 source or approved split"
     }
   }
 }

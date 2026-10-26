@@ -239,7 +239,7 @@ The landing phase below is exclusive file ownership. Shared files receive later 
 | `crates/trusted-server-adapter-fastly/build.rs`                                                                | 1 — carried   | Build facts landed in #1435; preserve current refinements |
 | `crates/trusted-server-adapter-fastly/src/main.rs`                                                             | 1 — carried   | Build facts landed in #1435; preserve current refinements |
 | `crates/trusted-server-cli/build.rs`                                                                           | 1 — carried   | Build facts landed in #1435; preserve current refinements |
-| `crates/trusted-server-cli/src/prebid_bundle.rs`                                                               | 2             | Initial source-identical port                             |
+| `crates/trusted-server-cli/src/prebid_bundle.rs`                                                               | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-cli/tests/release_build_facts.rs`                                                       | 1 — carried   | Build facts landed in #1435; preserve current refinements |
 | `crates/trusted-server-core/build.rs`                                                                          | 1 — carried   | Build facts landed in #1435; preserve current refinements |
 | `crates/trusted-server-core/build_support/git_version.rs`                                                      | 1 — carried   | Build facts landed in #1435; preserve current refinements |
@@ -252,23 +252,23 @@ The landing phase below is exclusive file ownership. Shared files receive later 
 | `crates/trusted-server-integration-tests/tests/frameworks/mod.rs`                                              | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-integration-tests/tests/parity.rs`                                                      | 2             | Ported Phase 2 source or approved split                   |
 | `docs/superpowers/specs/2026-09-25-git-version-header-design.md`                                               | 2             | Ported Phase 2 source or approved split                   |
-| `crates/trusted-server-js/Cargo.toml`                                                                          | 2             | Pending                                                   |
-| `crates/trusted-server-js/README.md`                                                                           | 2             | Pending                                                   |
-| `crates/trusted-server-js/build.rs`                                                                            | 2             | Pending                                                   |
-| `crates/trusted-server-js/build/bundle_set.rs`                                                                 | 2             | Pending                                                   |
-| `crates/trusted-server-js/build/inventory.rs`                                                                  | 2             | Pending                                                   |
-| `crates/trusted-server-js/build/prebuilt.rs`                                                                   | 2             | Pending                                                   |
-| `crates/trusted-server-js/lib/.gitignore`                                                                      | 2             | Pending                                                   |
-| `crates/trusted-server-js/lib/.prettierignore`                                                                 | 2             | Pending                                                   |
-| `crates/trusted-server-js/lib/build-all.mjs`                                                                   | 2             | Pending                                                   |
-| `crates/trusted-server-js/lib/build-module-options.mjs`                                                        | 2             | Pending                                                   |
-| `crates/trusted-server-js/lib/eslint.config.js`                                                                | 2             | Pending                                                   |
-| `crates/trusted-server-js/lib/package.json`                                                                    | 2             | Pending                                                   |
-| `crates/trusted-server-js/lib/release-composition.mjs`                                                         | 2             | Pending                                                   |
-| `crates/trusted-server-js/lib/test/observe-npm.test.mjs`                                                       | 2             | Pending                                                   |
-| `crates/trusted-server-js/lib/test/release-composition.test.mjs`                                               | 2             | Pending                                                   |
-| `crates/trusted-server-js/lib/vitest.config.ts`                                                                | 2             | Pending                                                   |
-| `crates/trusted-server-js/tests/release_prebuilt.rs`                                                           | 2             | Pending                                                   |
+| `crates/trusted-server-js/Cargo.toml`                                                                          | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-js/README.md`                                                                           | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-js/build.rs`                                                                            | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-js/build/bundle_set.rs`                                                                 | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-js/build/inventory.rs`                                                                  | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-js/build/prebuilt.rs`                                                                   | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-js/lib/.gitignore`                                                                      | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-js/lib/.prettierignore`                                                                 | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-js/lib/build-all.mjs`                                                                   | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-js/lib/build-module-options.mjs`                                                        | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-js/lib/eslint.config.js`                                                                | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-js/lib/package.json`                                                                    | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-js/lib/release-composition.mjs`                                                         | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-js/lib/test/observe-npm.test.mjs`                                                       | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-js/lib/test/release-composition.test.mjs`                                               | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-js/lib/vitest.config.ts`                                                                | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-js/tests/release_prebuilt.rs`                                                           | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-release/src/javascript.rs`                                                              | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-release/src/javascript/contributions.rs`                                                | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-release/src/javascript/contributions/tests.rs`                                          | 2             | Ported Phase 2 source or approved split                   |
@@ -304,12 +304,12 @@ The landing phase below is exclusive file ownership. Shared files receive later 
 | `crates/trusted-server-release/src/preparation.rs`                                                             | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-release/src/preparation/tests.rs`                                                       | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-release/src/preparation/tests/full.rs`                                                  | 2             | Ported Phase 2 source or approved split                   |
-| `scripts/release/build-js.sh`                                                                                  | 2             | Pending                                                   |
-| `scripts/release/collect-js.mjs`                                                                               | 2             | Pending                                                   |
-| `scripts/release/observe-npm.mjs`                                                                              | 2             | Pending                                                   |
-| `scripts/release/tests/js-fixture.Dockerfile`                                                                  | 2             | Pending                                                   |
-| `scripts/release/tests/prepare-js-fixture.mjs`                                                                 | 2             | Pending                                                   |
-| `crates/trusted-server-adapter-cloudflare/build.sh`                                                            | 2             | Pending                                                   |
+| `scripts/release/build-js.sh`                                                                                  | 2             | Ported Phase 2 source or approved split                   |
+| `scripts/release/collect-js.mjs`                                                                               | 2             | Ported Phase 2 source or approved split                   |
+| `scripts/release/observe-npm.mjs`                                                                              | 2             | Ported Phase 2 source or approved split                   |
+| `scripts/release/tests/js-fixture.Dockerfile`                                                                  | 2             | Ported Phase 2 source or approved split                   |
+| `scripts/release/tests/prepare-js-fixture.mjs`                                                                 | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-adapter-cloudflare/build.sh`                                                            | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-release/src/inspect.rs`                                                                 | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-release/src/inspect/elf.rs`                                                             | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-release/src/inspect/elf/loader.rs`                                                      | 2             | Ported Phase 2 source or approved split                   |
@@ -392,11 +392,11 @@ The landing phase below is exclusive file ownership. Shared files receive later 
 | `crates/trusted-server-release/src/recipe/tests/spdx_candidate.rs`                                             | 3             | Pending                                                   |
 | `crates/trusted-server-release/src/recipe/tests/tools.rs`                                                      | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-release/src/recipe/tools.rs`                                                            | 2             | Ported Phase 2 source or approved split                   |
-| `scripts/release/build.sh`                                                                                     | 2             | Pending                                                   |
-| `scripts/release/tests/cargo-fixture.Dockerfile`                                                               | 2             | Pending                                                   |
+| `scripts/release/build.sh`                                                                                     | 2             | Ported Phase 2 source or approved split                   |
+| `scripts/release/tests/cargo-fixture.Dockerfile`                                                               | 2             | Ported Phase 2 source or approved split                   |
 | `scripts/release/tests/cli-builder.Dockerfile`                                                                 | 2             | Ported Phase 2 source or approved split                   |
-| `scripts/release/tests/prepare-cargo-fixture.mjs`                                                              | 2             | Pending                                                   |
-| `scripts/release/tests/prepare-cli-fixture.mjs`                                                                | 2             | Pending                                                   |
+| `scripts/release/tests/prepare-cargo-fixture.mjs`                                                              | 2             | Ported Phase 2 source or approved split                   |
+| `scripts/release/tests/prepare-cli-fixture.mjs`                                                                | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-release/schemas/SPDX-LICENSE`                                                           | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-release/schemas/spdx-2.3.schema.json`                                                   | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-release/src/composition.rs`                                                             | 2             | Ported Phase 2 source or approved split                   |
@@ -545,21 +545,21 @@ The landing phase below is exclusive file ownership. Shared files receive later 
 | `crates/trusted-server-cli/tests/fixtures/release/upstream-formats.json`                                       | 4             | Pending                                                   |
 | `crates/trusted-server-cli/tests/release_cli.rs`                                                               | 4             | Pending                                                   |
 | `.github/workflows/format.yml`                                                                                 | 2             | Staged Phase 2 dependency/support subset                  |
-| `CHANGELOG.md`                                                                                                 | 2             | Pending                                                   |
-| `crates/trusted-server-adapter-spin/src/app.rs`                                                                | 2             | Pending                                                   |
-| `crates/trusted-server-adapter-spin/src/middleware.rs`                                                         | 2             | Pending                                                   |
-| `crates/trusted-server-adapter-spin/tests/routes.rs`                                                           | 2             | Pending                                                   |
+| `CHANGELOG.md`                                                                                                 | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-adapter-spin/src/app.rs`                                                                | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-adapter-spin/src/middleware.rs`                                                         | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-adapter-spin/tests/routes.rs`                                                           | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-release/tests/fixtures/README.md`                                                       | 3             | Pending                                                   |
 | `docs/.vitepress/config.mts`                                                                                   | 4             | Pending                                                   |
 | `docs/guide/cli.md`                                                                                            | 4             | Pending                                                   |
-| `docs/guide/edgezero.md`                                                                                       | 2             | Pending                                                   |
-| `docs/guide/error-reference.md`                                                                                | 2             | Pending                                                   |
-| `docs/guide/getting-started.md`                                                                                | 2             | Pending                                                   |
+| `docs/guide/edgezero.md`                                                                                       | 2             | Ported Phase 2 source or approved split                   |
+| `docs/guide/error-reference.md`                                                                                | 2             | Ported Phase 2 source or approved split                   |
+| `docs/guide/getting-started.md`                                                                                | 2             | Ported Phase 2 source or approved split                   |
 | `docs/guide/release-verification.md`                                                                           | 4             | Pending                                                   |
-| `scripts/docs-proposal/hunks.mjs`                                                                              | 2             | Pending                                                   |
-| `scripts/docs-proposal/hunks.test.mjs`                                                                         | 2             | Pending                                                   |
-| `scripts/release/qualification/README.md`                                                                      | 2             | Pending                                                   |
-| `scripts/release/tests/fixtures/README.md`                                                                     | 2             | Pending                                                   |
+| `scripts/docs-proposal/hunks.mjs`                                                                              | 2             | Ported Phase 2 source or approved split                   |
+| `scripts/docs-proposal/hunks.test.mjs`                                                                         | 2             | Ported Phase 2 source or approved split                   |
+| `scripts/release/qualification/README.md`                                                                      | 2             | Ported Phase 2 source or approved split                   |
+| `scripts/release/tests/fixtures/README.md`                                                                     | 2             | Ported Phase 2 source or approved split                   |
 
 ## Current port boundary at `13f63f020`
 
@@ -576,3 +576,9 @@ The inspector recipe link is restored after the recipe port. A startup documenta
 The frozen lifecycle observer remains byte-identical and closed to esbuild 0.28.2 in the current npm lock; it accepts only 0.27.3. The full collector case is retained with a visible skipped reason and a guard against enabling its unsupported test control. This is a known controlled-recipe gap requiring a separate esbuild review. Ordinary release builds and the Gate 1 A/B adapter do not invoke that observer.
 
 The JS build-script port preserves ordinary fresh npm/private-output builds. Only explicitly selected prebuilt release inputs require both checked paths. Current Vite/Vitest versions and npm lock bytes are retained, checked-copy/process fixtures run in CI only, and local JS verification uses an audited pure selection.
+
+### Remaining integration at `f721ddbe0`
+
+The mapped new source files, staged JS preparation, residual prose and formatting hunks are ported. Shared manifests, command/workflow support and changelog remain staged for the approved Gate 1 integration; the ordinary runtime recorder, authenticated archive acquisition, atomic companion writer, signing/publication wiring and rehearsal are not complete. `c8ea09d6b` adds canonical source/lock/private-JS identities; it enables no command. Local checks now include 238 audited pure producer cases and 19 audited pure JS cases. The 39-test native JS fixture harness compiles and lists its tests; its subprocess cases remain CI-only.
+
+The release scripts pass shellcheck. The Cloudflare script retains exactly its four baseline SC1090/SC1091/SC2164 findings; its port changes only the locked-install explanation and equivalent flag order. No new warning is claimed resolved.
