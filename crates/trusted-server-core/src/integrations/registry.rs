@@ -769,23 +769,29 @@ fn validate_capture_rules(
         let Some(captures) = provider.descriptor().captures() else {
             continue;
         };
-        let paths_ok = captures.paths().iter().all(|(_, path)| {
-            routes.iter().any(|route| match route.strip_suffix('*') {
-                Some(base) if base.ends_with('/') => path.starts_with(base),
-                _ => route == path,
+        let rejected = captures
+            .paths()
+            .iter()
+            .map(|(_, path)| path)
+            .find(|path| {
+                !routes.iter().any(|route| match route.strip_suffix('*') {
+                    Some(base) if base.ends_with('/') => path.starts_with(base),
+                    _ => route == *path,
+                })
             })
-        });
-        // An exact route never contains a prefix, which matches more paths.
-        let prefixes_ok = captures.prefixes().iter().all(|prefix| {
-            routes.iter().any(|route| match route.strip_suffix('*') {
-                Some(base) if base.ends_with('/') => prefix.starts_with(base),
-                _ => false,
-            })
-        });
-        if !paths_ok || !prefixes_ok {
+            // An exact route never contains a prefix, which matches more paths.
+            .or_else(|| {
+                captures.prefixes().iter().find(|prefix| {
+                    !routes.iter().any(|route| match route.strip_suffix('*') {
+                        Some(base) if base.ends_with('/') => prefix.starts_with(base),
+                        _ => false,
+                    })
+                })
+            });
+        if let Some(rejected) = rejected {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
-                    "integration `{}` identity provider `{}` captures a path outside its own routes",
+                    "integration `{}` identity provider `{}` captures `{rejected}`, which is outside its own routes",
                     registration.integration_id,
                     provider.descriptor().id()
                 ),
@@ -1533,7 +1539,7 @@ mod tests {
     use crate::ec::identity::examples::{
         ExampleCaptureProvider, ExampleIdProvider, example_config,
     };
-    use crate::ec::identity::test_support::fixed_capture_provider;
+    use crate::ec::identity::test_support::{fixed_capture_provider, fixed_provider};
     use crate::platform::test_support::noop_services;
     use http::{HeaderValue, StatusCode, header};
 
@@ -2802,5 +2808,81 @@ mod tests {
             IntegrationRegistry::from_registrations(vec![registration("other")]).is_err(),
             "should reject a prefix outside the routes"
         );
+    }
+
+    struct ExactRouteProxy;
+
+    #[async_trait(?Send)]
+    impl IntegrationProxy for ExactRouteProxy {
+        fn integration_name(&self) -> &'static str {
+            "examplecapture"
+        }
+
+        fn routes(&self) -> Vec<IntegrationEndpoint> {
+            vec![IntegrationEndpoint::post(
+                "/integrations/examplecapture/api",
+            )]
+        }
+
+        async fn handle(
+            &self,
+            _settings: &Settings,
+            _services: &RuntimeServices,
+            _req: Request<EdgeBody>,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+            Ok(Response::new(EdgeBody::empty()))
+        }
+    }
+
+    #[test]
+    fn capture_prefix_under_an_exact_route_is_rejected_with_the_prefix_named() {
+        let registration = |proxy: Arc<dyn IntegrationProxy>| {
+            IntegrationRegistration::builder("examplecapture")
+                .with_proxy(proxy)
+                .with_identity_provider(fixed_capture_provider(
+                    "examplecapture",
+                    &["examplecapture.example.com"],
+                ))
+                .build()
+        };
+
+        IntegrationRegistry::from_registrations(vec![registration(Arc::new(ExampleCaptureProxy))])
+            .expect("control: a wildcard route should contain the prefix");
+        let error =
+            IntegrationRegistry::from_registrations(vec![registration(Arc::new(ExactRouteProxy))])
+                .err()
+                .expect("should reject a prefix under an exact route");
+        assert!(
+            format!("{error}").contains("/integrations/examplecapture/"),
+            "should name the rejected prefix: {error}"
+        );
+    }
+
+    #[test]
+    fn two_integrations_registering_the_same_provider_id_fail_at_startup() {
+        let registration = |integration: &'static str| {
+            IntegrationRegistration::builder(integration)
+                .with_identity_provider(fixed_provider("shared-id", &["shared.example.com"]))
+                .build()
+        };
+
+        let registry = IntegrationRegistry::from_registrations(vec![registration("first")])
+            .expect("control: one registration should build");
+        let duplicated = IntegrationRegistry::from_registrations(vec![
+            registration("first"),
+            registration("second"),
+        ])
+        .expect("should merge both registrations");
+        let error = crate::ec::identity::catalog::ProviderCatalog::from_settings(
+            &crate::test_support::tests::create_test_settings(),
+            &duplicated.identity_providers(),
+        )
+        .err()
+        .expect("should reject the duplicate provider ID");
+        assert!(
+            format!("{error}").contains("`shared-id` is declared more than once"),
+            "should report the duplicate: {error}"
+        );
+        assert_eq!(registry.identity_providers().len(), 1, "should hold one");
     }
 }

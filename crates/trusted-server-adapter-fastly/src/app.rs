@@ -245,15 +245,31 @@ pub(crate) fn build_identity_runtime(
 /// Builds the identity runtime for settings loaded without application
 /// state, from the integration registry those settings describe.
 ///
+/// A plan or registry failure is logged and the runtime is built with no
+/// registered providers, so generic pull providers still run.
+///
 /// # Errors
 ///
-/// Returns an error when the integration registry or the identity runtime
-/// cannot be built.
+/// Returns an error when the identity runtime cannot be built.
 pub(crate) fn build_identity_runtime_from_reloaded_settings(
     settings: &Settings,
 ) -> Result<Arc<IdentityRuntime>, Report<TrustedServerError>> {
-    let plan = Arc::new(compile_auction_plan(settings)?);
-    let registry = IntegrationRegistry::with_plan(settings, plan)?;
+    let registry = compile_auction_plan(settings)
+        .and_then(|plan| IntegrationRegistry::with_plan(settings, Arc::new(plan)));
+    identity_runtime_from_registry_result(settings, registry)
+}
+
+fn identity_runtime_from_registry_result(
+    settings: &Settings,
+    registry: Result<IntegrationRegistry, Report<TrustedServerError>>,
+) -> Result<Arc<IdentityRuntime>, Report<TrustedServerError>> {
+    let registry = registry.unwrap_or_else(|error| {
+        log::warn!(
+            "identity runtime built without registered providers: integration registry unavailable after settings reload: {}",
+            error.current_context()
+        );
+        IntegrationRegistry::default()
+    });
     build_identity_runtime(settings, &registry)
 }
 
@@ -1531,6 +1547,7 @@ mod tests {
     use edgezero_core::params::PathParams;
     use edgezero_core::router::RouterService;
     use std::net::{IpAddr, Ipv4Addr};
+    use trusted_server_core::ec::identity::test_support::ec_partner;
 
     use error_stack::Report;
     use futures::executor::block_on;
@@ -1619,6 +1636,28 @@ mod tests {
 
     fn route(router: &RouterService, request: edgezero_core::http::Request) -> Response {
         block_on(router.oneshot(request)).expect("should route request")
+    }
+
+    #[test]
+    fn reloaded_identity_runtime_keeps_pull_providers_when_the_registry_fails() {
+        let mut settings = test_settings();
+        settings.ec.partners = vec![ec_partner(
+            "ssp.example.com",
+            "https://sync.ssp.example.com/pull",
+            "example-token-value-0123456789abcdef",
+        )];
+        let failed = Err(Report::new(TrustedServerError::Configuration {
+            message: "registry failed".to_owned(),
+        }));
+
+        let runtime = super::identity_runtime_from_registry_result(&settings, failed)
+            .expect("should still build the pull runtime");
+
+        assert_eq!(
+            format!("{runtime:?}"),
+            "IdentityRuntime { providers: 1, .. }",
+            "should hold the generic pull provider"
+        );
     }
 
     fn test_settings() -> Settings {
