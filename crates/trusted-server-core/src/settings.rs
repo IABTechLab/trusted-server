@@ -437,6 +437,12 @@ pub struct EcPartner {
     /// can name its replacement, and it is never serialized.
     #[serde(default, rename = "pull_sync_rate_limit", skip_serializing)]
     pub removed_pull_sync_rate_limit: Option<serde_json::Value>,
+    /// The identity provider that owns this partner's source domain.
+    ///
+    /// The owner refreshes the source and wins in the auction (spec 7.2). It
+    /// must name an enabled provider that resolves the source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     /// Outbound bearer token for pull sync requests.
     #[serde(default)]
     pub ts_pull_token: Option<Redacted<String>>,
@@ -4228,6 +4234,7 @@ mod tests {
             pull_sync_allowed_domains: Vec::new(),
             removed_pull_sync_ttl_sec: None,
             removed_pull_sync_rate_limit: None,
+            owner: None,
             ts_pull_token: Some(Redacted::new(CANARY_EC_PARTNER_TS_PULL_TOKEN.to_string())),
         }];
 
@@ -6040,6 +6047,7 @@ source_domain = "partner.example.com"
             pull_sync_allowed_domains: vec!["partner.example.com".to_owned()],
             removed_pull_sync_ttl_sec: None,
             removed_pull_sync_rate_limit: None,
+            owner: None,
             ts_pull_token: Some(Redacted::new(ts_pull_token.to_owned())),
         }
     }

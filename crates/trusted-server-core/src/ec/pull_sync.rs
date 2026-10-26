@@ -75,6 +75,7 @@ mod tests {
             pull_sync_url: Some("https://sync.partner.test/pull".to_owned()),
             pull_sync_allowed_domains: vec!["sync.partner.test".to_owned()],
             ts_pull_token: Some(Redacted::new("token".to_owned())),
+            owner: None,
         }
     }
 

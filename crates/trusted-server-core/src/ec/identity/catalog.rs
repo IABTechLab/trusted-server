@@ -25,8 +25,13 @@ fn catalog_error(message: String) -> Report<TrustedServerError> {
 /// It rejects a duplicate provider ID, more than 32 providers, an
 /// `[ec.identity.providers.<id>]` table that names no enabled provider, and
 /// `revoke_scope` on a provider whose descriptor declares no `captures`. It
-/// is the one place these rules live. It reads descriptors only, so it runs
-/// on unresolved deploy-time settings.
+/// also checks source ownership, after each provider's `sources` narrowing: a
+/// `sources` list must name declared sources and keep at least one, a
+/// capture-only provider must list its `sources`, an `owner` must name an
+/// enabled provider that is not capture-only and keeps the source, every
+/// claimed source needs an `[[ec.partners]]` entry, and no second provider
+/// may claim an owned source. It is the one place these rules live. It reads
+/// descriptors only, so it runs on unresolved deploy-time settings.
 ///
 /// # Errors
 ///
@@ -86,6 +91,126 @@ pub(crate) fn validate_identity_catalog(
             )));
         }
     }
+
+    validate_source_ownership(descriptors, partners, identity)
+}
+
+/// Whether `descriptor` captures and never resolves.
+fn is_capture_only(descriptor: &ProviderDescriptor) -> bool {
+    descriptor.captures().is_some() && descriptor.resolves().is_none()
+}
+
+/// Each descriptor's sources after its `sources` narrowing, rejecting a list
+/// that names an undeclared source or keeps none, and a capture-only
+/// provider that has no list.
+fn narrowed_sources<'a>(
+    descriptors: &'a [ProviderDescriptor],
+    identity: &IdentitySettings,
+) -> Result<BTreeMap<&'a str, Vec<SourceDomain>>, Report<TrustedServerError>> {
+    let mut narrowed = BTreeMap::new();
+    for descriptor in descriptors {
+        let id = descriptor.id().as_str();
+        let listed = identity
+            .providers
+            .get(id)
+            .and_then(|table| table.sources.as_ref());
+        let Some(listed) = listed else {
+            if is_capture_only(descriptor) {
+                return Err(catalog_error(format!(
+                    "provider `{id}` is capture-only, so ec.identity.providers.{id}.sources must \
+                     list the sources it is the delivery path for"
+                )));
+            }
+            narrowed.insert(id, descriptor.sources().to_vec());
+            continue;
+        };
+        let mut kept = Vec::with_capacity(listed.len());
+        for name in listed {
+            let declared = name
+                .parse::<SourceDomain>()
+                .ok()
+                .filter(|source| descriptor.sources().contains(source));
+            let Some(source) = declared else {
+                return Err(catalog_error(format!(
+                    "ec.identity.providers.{id}.sources names `{name}`, which provider `{id}` does not declare"
+                )));
+            };
+            kept.push(source);
+        }
+        if kept.is_empty() {
+            return Err(catalog_error(format!(
+                "ec.identity.providers.{id}.sources narrows provider `{id}` to no source"
+            )));
+        }
+        narrowed.insert(id, kept);
+    }
+    Ok(narrowed)
+}
+
+/// The ownership rules of spec 10.2, on narrowed sources.
+fn validate_source_ownership(
+    descriptors: &[ProviderDescriptor],
+    partners: &[EcPartner],
+    identity: &IdentitySettings,
+) -> Result<(), Report<TrustedServerError>> {
+    let narrowed = narrowed_sources(descriptors, identity)?;
+
+    // A partner whose source does not parse is reported by partner validation.
+    let partner_sources: BTreeMap<SourceDomain, Option<&str>> = partners
+        .iter()
+        .filter_map(|partner| {
+            Some((
+                partner.source_domain.parse().ok()?,
+                partner.owner.as_deref(),
+            ))
+        })
+        .collect();
+
+    for descriptor in descriptors {
+        let id = descriptor.id().as_str();
+        for source in &narrowed[id] {
+            if !partner_sources.contains_key(source) {
+                return Err(catalog_error(format!(
+                    "identity provider `{id}` claims source `{source}`, which has no [[ec.partners]] entry"
+                )));
+            }
+        }
+    }
+
+    for (source, owner) in &partner_sources {
+        let Some(owner) = owner else {
+            continue;
+        };
+        let Some(descriptor) = descriptors
+            .iter()
+            .find(|descriptor| descriptor.id().as_str() == *owner)
+        else {
+            return Err(catalog_error(format!(
+                "ec.partners source `{source}` names owner `{owner}`, which is not an enabled identity provider"
+            )));
+        };
+        if is_capture_only(descriptor) {
+            return Err(catalog_error(format!(
+                "ec.partners source `{source}` names owner `{owner}`, which is capture-only; \
+                 a capture-only provider stores no positive ID and cannot own a source"
+            )));
+        }
+        if !narrowed[*owner].contains(source) {
+            return Err(catalog_error(format!(
+                "ec.partners source `{source}` names owner `{owner}`, which does not claim that source"
+            )));
+        }
+        let other = descriptors
+            .iter()
+            .map(|other| other.id().as_str())
+            .find(|other| other != owner && narrowed[*other].contains(source));
+        if let Some(other) = other {
+            return Err(catalog_error(format!(
+                "identity provider `{other}` claims source `{source}`, which `{owner}` owns; \
+                 use ec.identity.providers.{other}.sources to narrow one of them"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -104,8 +229,8 @@ impl ProviderCatalog {
     /// It reads `settings.ec.partners` directly and never builds a
     /// `PartnerRegistry`, so a deploy-time `api_token` that holds a secret
     /// store key name is fine. It holds the generic pull providers, then
-    /// the `registered` providers integrations contributed, with no source
-    /// owners yet. It validates every descriptor with
+    /// the `registered` providers integrations contributed, with each
+    /// source owner from `[[ec.partners]].owner`. It validates every descriptor with
     /// [`validate_identity_catalog`] before building, so a duplicate ID is
     /// reported by that one validator.
     ///
@@ -139,7 +264,16 @@ impl ProviderCatalog {
             .map(|provider| provider.descriptor().clone())
             .collect();
         validate_identity_catalog(&descriptors, &settings.ec.partners, &settings.ec.identity)?;
-        Ok(Self::new(providers, BTreeMap::new()))
+        let owners = settings
+            .ec
+            .partners
+            .iter()
+            .filter_map(|partner| {
+                let owner = partner.owner.as_deref()?;
+                Some((partner.source_domain.parse().ok()?, owner.parse().ok()?))
+            })
+            .collect();
+        Ok(Self::new(providers, owners))
     }
 
     /// A catalog with no providers.
@@ -249,7 +383,7 @@ impl ProviderCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ec::identity::descriptor::Captures;
+    use crate::ec::identity::descriptor::{Captures, Resolves};
     use crate::ec::identity::examples::{ExampleIdProvider, example_config};
     use crate::ec::identity::generic_pull::generic_pull_descriptors;
     use crate::ec::identity::test_support::{ec_partner, fixed_capture_provider};
@@ -264,6 +398,49 @@ mod tests {
             "https://sync.ssp.example.com/pull",
             TOKEN,
         )
+    }
+
+    fn owned_partner(source: &str, owner: Option<&str>) -> EcPartner {
+        let mut partner = ec_partner(source, &format!("https://sync.{source}/pull"), TOKEN);
+        partner.pull_sync_enabled = false;
+        partner.owner = owner.map(ToOwned::to_owned);
+        partner
+    }
+
+    fn resolving_descriptor(id: &str, sources: &[&str]) -> ProviderDescriptor {
+        let mut builder = ProviderDescriptor::builder(id.parse().expect("should parse the ID"))
+            .with_resolves(Resolves::new().with_endpoint("https://api.example.com/fetch"));
+        for source in sources {
+            builder = builder.with_source(source.parse().expect("should parse the source"));
+        }
+        builder.build().expect("should build the descriptor")
+    }
+
+    fn capture_descriptor(id: &str, sources: &[&str]) -> ProviderDescriptor {
+        fixed_capture_provider(id, sources).descriptor().clone()
+    }
+
+    fn listing(sources: &[&str]) -> ProviderSettings {
+        ProviderSettings {
+            sources: Some(sources.iter().map(|source| (*source).to_owned()).collect()),
+            ..ProviderSettings::default()
+        }
+    }
+
+    fn identity_tables(tables: Vec<(&str, ProviderSettings)>) -> IdentitySettings {
+        let mut identity = IdentitySettings::default();
+        for (id, settings) in tables {
+            identity.providers.insert(id.to_owned(), settings);
+        }
+        identity
+    }
+
+    fn validate_with(
+        descriptors: &[ProviderDescriptor],
+        partners: &[EcPartner],
+        identity: &IdentitySettings,
+    ) -> Result<(), String> {
+        validate_identity_catalog(descriptors, partners, identity).map_err(|e| format!("{e}"))
     }
 
     fn identity_with(id: &str, settings: ProviderSettings) -> IdentitySettings {
@@ -325,10 +502,14 @@ mod tests {
                 .is_some_and(|c| *c != Captures::new()),
             "should hold a capturing descriptor for the control"
         );
+        let capturing_scope = ProviderSettings {
+            sources: Some(vec!["capture.example.com".to_owned()]),
+            ..with_scope
+        };
         validate_identity_catalog(
             &[capturing.descriptor().clone()],
-            &[],
-            &identity_with("capturer", with_scope),
+            &[owned_partner("capture.example.com", None)],
+            &identity_with("capturer", capturing_scope),
         )
         .expect("control: revoke_scope on a capturing provider should pass");
     }
@@ -375,7 +556,7 @@ mod tests {
             catalog
                 .owner_of(&"ssp.example.com".parse().expect("should parse"))
                 .is_none(),
-            "should have no owners in Part 1"
+            "should have no owner for a partner that names none"
         );
     }
 
@@ -394,6 +575,10 @@ mod tests {
             "should report the duplicate ID: {error}"
         );
 
+        settings
+            .ec
+            .partners
+            .push(owned_partner("exampleid.example.com", None));
         let registered =
             ExampleIdProvider::new(&example_config()).expect("should build the example provider");
         let catalog = ProviderCatalog::from_settings(&settings, &[Arc::new(registered)])
@@ -405,6 +590,235 @@ mod tests {
         assert!(
             catalog.is_configured(&"pull-ssp-example-com".parse().expect("should parse")),
             "should keep the pull provider"
+        );
+    }
+
+    #[test]
+    fn owner_must_name_an_enabled_provider_that_declares_the_source() {
+        let descriptors = vec![resolving_descriptor(
+            "exampleid",
+            &["exampleid.example.com"],
+        )];
+        let ok = vec![owned_partner("exampleid.example.com", Some("exampleid"))];
+        validate_with(&descriptors, &ok, &IdentitySettings::default())
+            .expect("should accept an owner that declares the source");
+
+        let unknown = vec![owned_partner("exampleid.example.com", Some("missing"))];
+        let error = validate_with(&descriptors, &unknown, &IdentitySettings::default())
+            .expect_err("should reject an owner that is not enabled");
+        assert!(error.contains("missing"), "should name the owner: {error}");
+
+        let wrong_source = vec![
+            owned_partner("exampleid.example.com", None),
+            owned_partner("other.example.com", Some("exampleid")),
+        ];
+        let error = validate_with(&descriptors, &wrong_source, &IdentitySettings::default())
+            .expect_err("should reject an owner whose descriptor lacks the source");
+        assert!(
+            error.contains("other.example.com"),
+            "should name the source: {error}"
+        );
+    }
+
+    #[test]
+    fn owner_uses_the_narrowed_descriptor() {
+        let descriptors = vec![resolving_descriptor(
+            "exampleid",
+            &["a.example.com", "b.example.com"],
+        )];
+        let partners = vec![
+            owned_partner("a.example.com", Some("exampleid")),
+            owned_partner("b.example.com", None),
+        ];
+        validate_with(
+            &descriptors,
+            &partners,
+            &identity_tables(vec![("exampleid", listing(&["a.example.com"]))]),
+        )
+        .expect("control: an owner keeping its source should pass");
+
+        let error = validate_with(
+            &descriptors,
+            &partners,
+            &identity_tables(vec![("exampleid", listing(&["b.example.com"]))]),
+        )
+        .expect_err("should reject an owner narrowed away from its source");
+        assert!(
+            error.contains("a.example.com"),
+            "should name the source: {error}"
+        );
+    }
+
+    #[test]
+    fn provider_claiming_a_source_without_a_partner_entry_is_rejected() {
+        let descriptors = vec![resolving_descriptor(
+            "exampleid",
+            &["a.example.com", "b.example.com"],
+        )];
+        let partners = vec![owned_partner("a.example.com", None)];
+        let error = validate_with(&descriptors, &partners, &IdentitySettings::default())
+            .expect_err("should reject a claimed source with no partner entry");
+        assert!(
+            error.contains("b.example.com") && error.contains("exampleid"),
+            "should name the source and the provider: {error}"
+        );
+
+        validate_with(
+            &descriptors,
+            &partners,
+            &identity_tables(vec![("exampleid", listing(&["a.example.com"]))]),
+        )
+        .expect("control: narrowing to the declared partner should pass");
+        validate_with(
+            &descriptors,
+            &[
+                owned_partner("a.example.com", None),
+                owned_partner("b.example.com", None),
+            ],
+            &IdentitySettings::default(),
+        )
+        .expect("control: a partner entry per source should pass");
+    }
+
+    #[test]
+    fn two_providers_claiming_an_owned_source_are_rejected() {
+        let descriptors = vec![
+            resolving_descriptor("first", &["a.example.com"]),
+            resolving_descriptor("second", &["a.example.com", "b.example.com"]),
+        ];
+        let owned = vec![
+            owned_partner("a.example.com", Some("first")),
+            owned_partner("b.example.com", None),
+        ];
+        let error = validate_with(&descriptors, &owned, &IdentitySettings::default())
+            .expect_err("should reject a second claimant of an owned source");
+        assert!(
+            error.contains("a.example.com") && error.contains("second"),
+            "should name the source and the other claimant: {error}"
+        );
+
+        validate_with(
+            &descriptors,
+            &owned,
+            &identity_tables(vec![("second", listing(&["b.example.com"]))]),
+        )
+        .expect("control: narrowing the other claimant away should pass");
+
+        let unowned = vec![
+            owned_partner("a.example.com", None),
+            owned_partner("b.example.com", None),
+        ];
+        validate_with(&descriptors, &unowned, &IdentitySettings::default())
+            .expect("control: two claimants of an unowned source should pass");
+    }
+
+    #[test]
+    fn sources_must_name_declared_sources_and_not_narrow_to_nothing() {
+        let descriptors = vec![resolving_descriptor("exampleid", &["a.example.com"])];
+        let partners = vec![
+            owned_partner("a.example.com", None),
+            owned_partner("c.example.com", None),
+        ];
+        validate_with(
+            &descriptors,
+            &partners,
+            &identity_tables(vec![("exampleid", listing(&["a.example.com"]))]),
+        )
+        .expect("control: a declared source should pass");
+
+        let error = validate_with(
+            &descriptors,
+            &partners,
+            &identity_tables(vec![("exampleid", listing(&["c.example.com"]))]),
+        )
+        .expect_err("should reject an undeclared source");
+        assert!(
+            error.contains("c.example.com") && error.contains("exampleid"),
+            "should name the source and the provider: {error}"
+        );
+
+        let error = validate_with(
+            &descriptors,
+            &partners,
+            &identity_tables(vec![("exampleid", listing(&[]))]),
+        )
+        .expect_err("should reject narrowing to nothing");
+        assert!(
+            error.contains("exampleid") && error.contains("no source"),
+            "should name the provider: {error}"
+        );
+    }
+
+    #[test]
+    fn capture_only_provider_without_sources_is_rejected() {
+        let descriptors = vec![capture_descriptor("capturer", &["capture.example.com"])];
+        let partners = vec![owned_partner("capture.example.com", None)];
+        let error = validate_with(&descriptors, &partners, &IdentitySettings::default())
+            .expect_err("should reject a capture-only provider with no sources list");
+        assert!(
+            error.contains("capturer") && error.contains("sources"),
+            "should name the provider and the key: {error}"
+        );
+
+        validate_with(
+            &descriptors,
+            &partners,
+            &identity_tables(vec![("capturer", ProviderSettings::default())]),
+        )
+        .expect_err("should reject a provider table that lists no sources");
+
+        validate_with(
+            &descriptors,
+            &partners,
+            &identity_tables(vec![("capturer", listing(&["capture.example.com"]))]),
+        )
+        .expect("control: a sources list should pass");
+
+        let resolving = vec![resolving_descriptor("exampleid", &["capture.example.com"])];
+        validate_with(&resolving, &partners, &IdentitySettings::default())
+            .expect("control: a resolving provider needs no sources list");
+    }
+
+    #[test]
+    fn capture_only_provider_cannot_own_a_source() {
+        let descriptors = vec![capture_descriptor("capturer", &["capture.example.com"])];
+        let identity = identity_tables(vec![("capturer", listing(&["capture.example.com"]))]);
+        let owned = vec![owned_partner("capture.example.com", Some("capturer"))];
+        let error = validate_with(&descriptors, &owned, &identity)
+            .expect_err("should reject a capture-only owner");
+        assert!(
+            error.contains("capturer") && error.contains("capture-only"),
+            "should name the provider and the reason: {error}"
+        );
+
+        let unowned = vec![owned_partner("capture.example.com", None)];
+        validate_with(&descriptors, &unowned, &identity)
+            .expect("control: the same provider without ownership should pass");
+
+        let resolving = vec![resolving_descriptor("capturer", &["capture.example.com"])];
+        validate_with(&resolving, &owned, &IdentitySettings::default())
+            .expect("control: a resolving provider may own the source");
+    }
+
+    #[test]
+    fn from_settings_records_owners_from_partners() {
+        let mut settings = create_test_settings();
+        settings.ec.partners = vec![owned_partner("exampleid.example.com", Some("exampleid"))];
+        let registered =
+            ExampleIdProvider::new(&example_config()).expect("should build the example provider");
+        let catalog = ProviderCatalog::from_settings(&settings, &[Arc::new(registered)])
+            .expect("should build");
+
+        assert_eq!(
+            catalog.owner_of(&"exampleid.example.com".parse().expect("should parse")),
+            Some(&"exampleid".parse().expect("should parse the ID")),
+            "should record the partner's owner"
+        );
+        assert!(
+            catalog
+                .owner_of(&"other.example.com".parse().expect("should parse"))
+                .is_none(),
+            "control: an unowned source has no owner"
         );
     }
 }

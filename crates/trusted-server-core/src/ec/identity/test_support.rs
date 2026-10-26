@@ -375,6 +375,7 @@ pub fn ec_partner(source: &str, pull_sync_url: &str, token: &str) -> EcPartner {
         pull_sync_allowed_domains: vec![host],
         removed_pull_sync_ttl_sec: None,
         removed_pull_sync_rate_limit: None,
+        owner: None,
         ts_pull_token: Some(Redacted::new(token.to_owned())),
     }
 }

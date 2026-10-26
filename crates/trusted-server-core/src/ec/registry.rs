@@ -40,6 +40,8 @@ pub struct PartnerConfig {
     pub pull_sync_allowed_domains: Vec<String>,
     /// Outbound bearer token for pull sync requests.
     pub ts_pull_token: Option<Redacted<String>>,
+    /// The identity provider that owns this source, when one does.
+    pub owner: Option<String>,
 }
 
 /// In-memory partner registry with O(1) lookups by source domain and API key hash.
@@ -295,6 +297,7 @@ fn build_partner_config(
         pull_sync_url: partner.pull_sync_url.clone(),
         pull_sync_allowed_domains: partner.pull_sync_allowed_domains.clone(),
         ts_pull_token: partner.ts_pull_token.clone(),
+        owner: partner.owner.clone(),
     }
 }
 
@@ -412,6 +415,7 @@ mod tests {
             pull_sync_allowed_domains: vec![],
             removed_pull_sync_ttl_sec: None,
             removed_pull_sync_rate_limit: None,
+            owner: None,
             ts_pull_token: None,
         }
     }

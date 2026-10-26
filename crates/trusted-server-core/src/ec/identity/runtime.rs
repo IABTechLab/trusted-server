@@ -208,12 +208,6 @@ mod tests {
             &IntegrationRegistry::default(),
         )
         .expect("should build");
-        let dropped = IdentityRuntime::from_settings(
-            &settings_with_listed_sources(Some(vec!["other.example.com".to_owned()])),
-            &IntegrationRegistry::default(),
-        )
-        .expect("should build");
-
         assert_eq!(
             unlisted.catalog().sources_of(&id),
             [source("ssp.example.com")],
@@ -224,9 +218,14 @@ mod tests {
             [source("ssp.example.com")],
             "should keep a listed source"
         );
+        let error = IdentityRuntime::from_settings(
+            &settings_with_listed_sources(Some(vec!["other.example.com".to_owned()])),
+            &IntegrationRegistry::default(),
+        )
+        .expect_err("should reject a source the descriptor does not declare");
         assert!(
-            dropped.catalog().sources_of(&id).is_empty(),
-            "should drop a source the table does not list"
+            format!("{error}").contains("other.example.com"),
+            "should name the undeclared source: {error}"
         );
     }
 }
