@@ -687,7 +687,7 @@
     "2": {
       "branch": "feature/binary-attestations-phase2",
       "base": "feature/binary-attestations-phase1",
-      "pull_request": null
+      "pull_request": 1449
     },
     "3": {
       "branch": "feature/binary-attestations-phase3",
