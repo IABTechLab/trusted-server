@@ -13,13 +13,16 @@ use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
 use trusted_server_core::constants::HEADER_X_TS_VERSION;
+use trusted_server_core::ec::EcKvSnapshot;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::{ec_finalize_response, retry_failed_withdrawals};
 use trusted_server_core::ec::identity::IdentityRuntime;
 use trusted_server_core::ec::identity::flush::{
     AfterSendInput, FlushOutcome, may_flush, run_after_send,
 };
+use trusted_server_core::ec::identity::measurement::{IdentityMeasurement, MeasurementInput};
 use trusted_server_core::ec::kv::KvIdentityGraph;
+use trusted_server_core::ec::kv_backend::KvOperationCounts;
 use trusted_server_core::ec::rate_limiter::RateLimiter;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
@@ -631,15 +634,30 @@ struct PostRouteInput<'a> {
 }
 
 /// Finalizes the response, hands it to `send`, then runs the after-send work:
-/// the withdrawal retry first, then phase 4's one flush (spec 5.2).
+/// the withdrawal retry first, then phase 4's one flush (spec 5.2), and logs
+/// the request's `identity request measurement` line.
 ///
 /// `send` is a callback so phase 4 runs only after the response is sent.
 /// Returns phase 4's outcome, or `None` when finalize could not run.
 fn finalize_send_and_flush(
     input: PostRouteInput<'_>,
-    mut response: HttpResponse,
+    response: HttpResponse,
     send: &mut dyn FnMut(HttpResponse),
 ) -> Option<FlushOutcome> {
+    let (outcome, measurement) = finalize_send_and_flush_measured(input, response, send);
+    if let Some(measurement) = measurement {
+        measurement.log();
+    }
+    outcome
+}
+
+/// As [`finalize_send_and_flush`], returning the measurement instead of
+/// logging it. The measurement is `None` when finalize could not run.
+fn finalize_send_and_flush_measured(
+    input: PostRouteInput<'_>,
+    mut response: HttpResponse,
+    send: &mut dyn FnMut(HttpResponse),
+) -> (Option<FlushOutcome>, Option<IdentityMeasurement>) {
     let PostRouteInput {
         runtime,
         settings,
@@ -652,11 +670,19 @@ fn finalize_send_and_flush(
         Err(e) => {
             log::error!("EdgeZero EC finalize skipped: failed to build partner registry: {e:?}");
             send(response);
-            return None;
+            return (None, None);
         }
     };
+    // Every KV operation from here on counts into this; phase 1's read is
+    // known from the snapshot the route left.
+    let kv_counts = KvOperationCounts::default();
+    let phase_one_read = !matches!(ec_state.ec_context.kv_snapshot(), EcKvSnapshot::NotRead);
     let mut built: Option<Option<KvIdentityGraph>> = None;
-    let mut graph_once = || built.get_or_insert_with(graph).clone();
+    let mut graph_once = || {
+        built
+            .get_or_insert_with(|| graph().map(|graph| graph.with_operation_counts(&kv_counts)))
+            .clone()
+    };
 
     let finalize_kv_graph = if ec_state.use_finalize_kv {
         graph_once()
@@ -675,23 +701,56 @@ fn finalize_send_and_flush(
     let status = response.status();
     send(response);
 
-    if ec_state.ec_context.has_failed_withdrawals() {
+    // A retry skipped because the graph is unavailable leaves the ID failed, so
+    // it counts as a failed run.
+    let withdrawal_after_send = ec_state.ec_context.has_failed_withdrawals();
+    if withdrawal_after_send {
         match graph_once() {
             Some(graph) => retry_failed_withdrawals(&mut ec_state.ec_context, &graph),
             None => log::warn!("withdrawal retry skipped: identity graph unavailable"),
         }
     }
+    let withdrawal_after_send_failed = ec_state.ec_context.has_failed_withdrawals();
+
+    let outcome = flush_after_send(
+        runtime,
+        settings,
+        ec_state,
+        &mut graph_once,
+        status,
+        rate_limiter,
+    );
+    let measurement = ec_state.ec_context.identity_measurement(&MeasurementInput {
+        phase_one_read,
+        kv_reads: kv_counts.reads(),
+        kv_writes: kv_counts.writes(),
+        flush: Some(&outcome),
+        withdrawal_after_send,
+        withdrawal_after_send_failed,
+    });
+    (Some(outcome), Some(measurement))
+}
+
+/// Phase 4's one flush, or [`FlushOutcome::Skipped`] when it cannot run.
+fn flush_after_send(
+    runtime: Option<&IdentityRuntime>,
+    settings: &Settings,
+    ec_state: &mut EcFinalizeState,
+    graph_once: &mut dyn FnMut() -> Option<KvIdentityGraph>,
+    status: edgezero_core::http::StatusCode,
+    rate_limiter: &dyn RateLimiter,
+) -> FlushOutcome {
     let Some(runtime) = runtime else {
-        return Some(FlushOutcome::Skipped);
+        return FlushOutcome::Skipped;
     };
     if !ec_state.is_real_browser || !may_flush(&ec_state.ec_context) {
-        return Some(FlushOutcome::Skipped);
+        return FlushOutcome::Skipped;
     }
     let Some(graph) = graph_once() else {
         log::debug!("identity flush skipped: identity graph unavailable");
-        return Some(FlushOutcome::Skipped);
+        return FlushOutcome::Skipped;
     };
-    Some(run_after_send(AfterSendInput {
+    run_after_send(AfterSendInput {
         runtime,
         settings,
         services: &ec_state.services,
@@ -699,7 +758,7 @@ fn finalize_send_and_flush(
         context: &mut ec_state.ec_context,
         status,
         rate_limiter,
-    }))
+    })
 }
 
 /// Sends a finalized `EdgeZero` response to the client.
@@ -892,6 +951,7 @@ mod tests {
     use edgezero_core::http::HeaderValue;
     use edgezero_core::http::response_builder;
     use fastly::mime;
+    use trusted_server_core::ec::identity::measurement::RouteKind;
     use trusted_server_core::integrations::HeaderMutation;
 
     const TEST_SETTINGS_TOML: &str = r#"
@@ -1002,6 +1062,36 @@ mod tests {
         (sent.expect("should send the response"), outcome)
     }
 
+    /// As [`drive_request_for_test`], keeping the request's measurement.
+    fn drive_measured_for_test(
+        state: &Arc<AppState>,
+        request: HttpRequest,
+    ) -> (Option<FlushOutcome>, IdentityMeasurement) {
+        let router = TrustedServerApp::routes_for_state(state);
+        let mut response =
+            futures::executor::block_on(router.oneshot(request)).expect("should route the request");
+        let mut ec_state = response
+            .extensions_mut()
+            .remove::<EcFinalizeState>()
+            .expect("should leave EC state on the response");
+        let graph = || state.identity_graph.clone();
+        let (outcome, measurement) = finalize_send_and_flush_measured(
+            PostRouteInput {
+                runtime: Some(&state.identity),
+                settings: &state.settings,
+                ec_state: &mut ec_state,
+                graph: &graph,
+                rate_limiter: &AllowAll,
+            },
+            response,
+            &mut |_| {},
+        );
+        (
+            outcome,
+            measurement.expect("should measure a finalized request"),
+        )
+    }
+
     /// A returning visitor's live row, without a cluster size so the flush
     /// has one change to write.
     fn seeded_state() -> (
@@ -1020,6 +1110,57 @@ mod tests {
         store.reset_counts();
         let state = crate::app::app_state_with_graph_for_test(test_settings(), graph);
         (state, store)
+    }
+
+    #[test]
+    fn identity_measurement_records_counts_for_a_writer_navigation() {
+        let (state, _store) = seeded_state();
+        let cookie = format!("ts-ec={EC_ID}");
+
+        let (outcome, measurement) = drive_measured_for_test(&state, navigation(Some(&cookie)));
+
+        assert_eq!(outcome, Some(FlushOutcome::Written), "should flush once");
+        assert_eq!(
+            measurement.cookie_header_bytes(),
+            cookie.len(),
+            "should hold the inbound Cookie header size"
+        );
+        assert_eq!(measurement.kv_reads(), 1, "should count the phase 1 read");
+        assert_eq!(measurement.kv_writes(), 1, "should count the one write");
+        assert_eq!(
+            measurement.route(),
+            RouteKind::Writer,
+            "should label a returning navigation as the writer"
+        );
+        assert_eq!(
+            measurement.flush(),
+            "written",
+            "should hold the phase 4 outcome"
+        );
+        assert_eq!(measurement.removal_lost(), 0, "should lose no removal");
+        assert!(
+            !measurement.withdrawal_after_send() && !measurement.withdrawal_after_send_failed(),
+            "should need no after-send withdrawal run"
+        );
+    }
+
+    #[test]
+    fn identity_measurement_holds_no_identifier() {
+        let (state, _store) = seeded_state();
+        let cookie = format!("ts-ec={EC_ID}; ts-eids=secret-uid-value");
+
+        let (_, measurement) = drive_measured_for_test(&state, navigation(Some(&cookie)));
+        let line = measurement.to_string();
+
+        assert!(
+            line.contains(&format!("cookie_header_bytes={}", cookie.len())),
+            "should still carry the cookie size: {line}"
+        );
+        assert!(!line.contains(EC_ID), "should not hold the EC ID: {line}");
+        assert!(
+            !line.contains("secret-uid-value"),
+            "should not hold a cookie value: {line}"
+        );
     }
 
     #[test]

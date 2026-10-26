@@ -15,6 +15,7 @@ pub mod flush;
 pub(crate) mod generic_pull;
 pub mod ids;
 pub mod input;
+pub mod measurement;
 pub(crate) mod mirror;
 pub(crate) mod mutation;
 pub(crate) mod policy;

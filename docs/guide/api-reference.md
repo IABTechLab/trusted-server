@@ -212,6 +212,22 @@ curl -X POST https://edge.example.com/auction \
   -d '{"adUnits":[{"code":"banner","mediaTypes":{"banner":{"sizes":[[300,250]]}}}]}'
 ```
 
+#### `ts_eids_s` mirror payload
+
+The endpoint never writes KV. The response may carry `ext.ts_eids_s`, the
+payload for the client-only `__Host-ts-eids-s` mirror cookie that the shim
+writes for page scripts. It has one of three forms:
+
+- `{ "value": "<base64url>", "max_age": 86400 }` when the request read a live,
+  consenting row and the servable server IDs are not empty. `value` is the
+  unpadded base64url encoding of compact JSON `{"v":1,"eids":[...]}`, at most
+  2,048 bytes. `max_age` is at most 86,400 seconds and never past the earliest
+  expiry of an ID in the set.
+- `{ "clear": true }` when consent denies EID persistence, when the row is a
+  tombstone or missing, or when the servable set is empty. The shim expires
+  the cookie.
+- Absent when the request read no KV. The shim leaves the cookie as it is.
+
 #### Browser EIDs (`eids`)
 
 The optional `eids` array carries OpenRTB 2.6 EID objects from the browser:
@@ -332,6 +348,16 @@ any `OPTIONS` returns `403`; missing `[creative_opportunities]` returns `404`.
 The `200`, `400`, and `403` terminal responses are `private, no-store`. The
 endpoint has no built-in authentication, CORS grant, or rate limiter.
 
+**Identity:** the endpoint never writes KV. Its JSON body may carry a
+`ts_eids_s` member, the payload for the client-only `__Host-ts-eids-s` mirror
+cookie (see [`ext.ts_eids_s`](#ts-eids-s-mirror-payload) under `POST /auction`
+for its shape):
+
+- `{ "value": "...", "max_age": 86400 }`: write the cookie with this value and
+  `Max-Age`.
+- `{ "clear": true }`: expire the cookie.
+- Absent: the request read no KV, so leave the cookie as it is.
+
 **Configuration:** `[creative_opportunities]`, `[auction]`, slot page patterns,
 provider profiles, and consent settings. Bot and prefetch requests retain slot
 shape but skip live provider calls.
@@ -368,6 +394,8 @@ below `[publisher].domain` receive reflected credentialed CORS for
 `200` for no origin or an allowed origin. There is no endpoint rate limiter.
 The endpoint is Fastly-only and requires the EC store and a statically
 configured `[[ec.partners]]` token.
+
+**No writes:** the endpoint never writes KV, and it omits an ID that has expired. The response shape is unchanged: one UID per source, even for a record that holds several.
 
 **Request:**
 

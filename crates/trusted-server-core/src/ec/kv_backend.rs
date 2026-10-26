@@ -11,6 +11,8 @@
 //! expressed through [`EcKvWriteMode`] so compare-and-swap loops stay in
 //! core while the platform supplies the actual precondition mechanics.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use error_stack::Report;
@@ -172,6 +174,89 @@ pub trait EcKvStore: Send + Sync {
     ///
     /// Returns [`TrustedServerError::KvStore`] on store open or delete failure.
     fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>>;
+}
+
+/// Counts of KV operations one request makes, shared by every clone.
+///
+/// Reads are row lookups and writes are inserts and deletes. Existence
+/// checks and key listings are not counted: they read no row. A graph reports into it through
+/// [`KvIdentityGraph::with_operation_counts`](super::kv::KvIdentityGraph::with_operation_counts).
+#[derive(Debug, Clone, Default)]
+pub struct KvOperationCounts {
+    reads: Arc<AtomicU32>,
+    writes: Arc<AtomicU32>,
+}
+
+impl KvOperationCounts {
+    /// Reads counted so far.
+    #[must_use]
+    pub fn reads(&self) -> u32 {
+        self.reads.load(Ordering::Relaxed)
+    }
+
+    /// Writes counted so far.
+    #[must_use]
+    pub fn writes(&self) -> u32 {
+        self.writes.load(Ordering::Relaxed)
+    }
+
+    fn record_read(&self) {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_write(&self) {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// An [`EcKvStore`] that counts every operation it forwards.
+pub(crate) struct OperationCountingEcKv {
+    inner: Arc<dyn EcKvStore>,
+    counts: KvOperationCounts,
+}
+
+impl OperationCountingEcKv {
+    /// Wraps `inner`, reporting into `counts`.
+    pub(crate) fn new(inner: Arc<dyn EcKvStore>, counts: KvOperationCounts) -> Self {
+        Self { inner, counts }
+    }
+}
+
+impl EcKvStore for OperationCountingEcKv {
+    fn store_name(&self) -> &str {
+        self.inner.store_name()
+    }
+
+    fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+        self.counts.record_read();
+        self.inner.lookup(key)
+    }
+
+    fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+        self.inner.key_exists(key)
+    }
+
+    fn insert(
+        &self,
+        key: &str,
+        write: EcKvWrite<'_>,
+    ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+        self.counts.record_write();
+        self.inner.insert(key, write)
+    }
+
+    fn list_keys_with_prefix(
+        &self,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<String>, Report<TrustedServerError>> {
+        self.inner.list_keys_with_prefix(prefix, limit)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+        self.counts.record_write();
+        self.inner.delete(key)
+    }
 }
 
 /// An in-memory store for tests, reachable from other crates through the

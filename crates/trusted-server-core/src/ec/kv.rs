@@ -20,7 +20,10 @@ use error_stack::{Report, ResultExt};
 use crate::error::TrustedServerError;
 
 use super::generation::ec_hash;
-use super::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
+use super::kv_backend::{
+    EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome, KvOperationCounts,
+    OperationCountingEcKv,
+};
 use super::kv_types::{KvEntry, KvMetadata};
 use super::{EcKvSnapshot, checked_current_timestamp, current_timestamp, log_id};
 
@@ -99,41 +102,13 @@ impl PartnerIdUpdate {
     }
 }
 
-/// Terminal result of one browser EID-cookie persistence attempt.
-// Temporary: the browser-ingest write path moved into the identity mutation; a later identity task deletes this.
-#[allow(dead_code)]
+/// Terminal result of the browser EID-cookie persistence the `EID sync
+/// measurement` line still reports: a new EC's create.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
 pub(crate) enum EidCookieSyncOutcome {
-    /// The stored values already matched without a write.
-    #[display("already_matched")]
-    AlreadyMatched,
-    /// The one conditional write succeeded.
+    /// The new EC's create stored the browser ingest.
     #[display("written")]
     Written,
-    /// The write added missing IDs while deferring different values of unknown freshness.
-    #[display("written_with_deferred_freshness")]
-    WrittenWithDeferredFreshness,
-    /// A conflicting writer persisted every desired value.
-    #[display("conflict_matched")]
-    ConflictMatched,
-    /// A conflict left at least one desired value absent or different.
-    #[display("deferred_conflict")]
-    DeferredConflict,
-    /// A different stored value had unknown freshness.
-    #[display("deferred_freshness")]
-    DeferredFreshness,
-    /// An eventually consistent read missed a row already proven to exist.
-    #[display("deferred_stale_read")]
-    DeferredStaleRead,
-    /// The identity graph row was missing.
-    #[display("missing")]
-    Missing,
-    /// Consent had been withdrawn in the identity graph.
-    #[display("consent_withdrawn")]
-    ConsentWithdrawn,
-    /// KV or serialization failed.
-    #[display("failed")]
-    Failed,
 }
 
 pub(crate) fn apply_partner_id_updates(entry: &mut KvEntry, updates: &[PartnerIdUpdate]) -> bool {
@@ -200,6 +175,15 @@ impl KvIdentityGraph {
     pub fn new(store: impl EcKvStore + 'static) -> Self {
         Self {
             store: Arc::new(store),
+        }
+    }
+
+    /// Returns a graph over the same store that also counts its operations
+    /// into `counts`.
+    #[must_use]
+    pub fn with_operation_counts(self, counts: &KvOperationCounts) -> Self {
+        Self {
+            store: Arc::new(OperationCountingEcKv::new(self.store, counts.clone())),
         }
     }
 

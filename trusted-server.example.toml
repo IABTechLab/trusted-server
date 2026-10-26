@@ -83,10 +83,12 @@ ec_store = "ec_identity_store"
 # cluster_trust_threshold = 10    # entries with cluster_size <= this are individual users
 # cluster_recheck_secs = 3600     # re-evaluate cluster_size after this many seconds
 
-# Server-side identity provider policy (defaults shown except max_concurrency).
-[ec.identity]
-# Max identity providers dispatched at once.
-max_concurrency = 3
+# Server-side identity provider policy. Every key is optional; the values
+# below are the defaults.
+# [ec.identity]
+# Max identity providers dispatched at once. Replaces the removed
+# ec.pull_sync_concurrency.
+# max_concurrency = 4
 # Total time a navigation may wait for hold-mode providers (at most 1000).
 # hold_budget_ms = 100
 # Seconds before a provider that timed out in hold mode is held again.
@@ -94,8 +96,13 @@ max_concurrency = 3
 # Largest provider response body accepted, in bytes.
 # max_response_bytes = 65536
 
-# Per-provider policy; the table name is the identity provider ID.
-# [ec.identity.providers.example-provider]
+# Per-provider policy; the table name is the identity provider ID. A pull
+# partner (`pull_sync_enabled = true`) registers as `pull-` plus its source
+# domain with dots replaced by `-`, so `ssp.example.com` is
+# `pull-ssp-example-com`. These keys replace the removed per-partner
+# `pull_sync_ttl_sec` (now `refresh_after_sec`) and `pull_sync_rate_limit = N`
+# (now `max_calls_per_minute = ceil(N / 60)`).
+# [ec.identity.providers.pull-ssp-example-com]
 # mode = "after_send"             # or "hold"
 # timeout_ms = 100                # hold mode only; at most hold_budget_ms
 # after_send_timeout_ms = 1000    # 1..=10000
@@ -103,7 +110,8 @@ max_concurrency = 3
 # max_calls_per_minute = 1
 # breaker_failures_per_minute = 50
 # cookie_priority = 0
-# revoke_scope = "provider"       # or "global"
+# `revoke_scope = "provider"` (or "global") applies only to a provider that
+# captures IDs, from Part 2 of the identity rollout; do not set it here.
 
 # Example partner configuration. Provision referenced keys in
 # trusted_server_secrets before validating/pushing.

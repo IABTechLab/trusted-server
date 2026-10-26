@@ -40,6 +40,7 @@ pub(crate) struct RequestIdentity {
     mutation: IdentityMutation,
     pending_removals: Option<IdentityMutation>,
     removal_lost: u32,
+    cookie_header_bytes: usize,
     capture_unpersisted: BTreeMap<(IdentityProviderId, SourceDomain), u32>,
 }
 
@@ -122,6 +123,17 @@ impl RequestIdentity {
     #[must_use]
     pub(crate) fn removal_lost(&self) -> u32 {
         self.removal_lost
+    }
+
+    /// The inbound `Cookie` header size in bytes.
+    #[must_use]
+    pub(crate) fn cookie_header_bytes(&self) -> usize {
+        self.cookie_header_bytes
+    }
+
+    /// Records the inbound `Cookie` header size in bytes.
+    pub(crate) fn set_cookie_header_bytes(&mut self, bytes: usize) {
+        self.cookie_header_bytes = bytes;
     }
 
     /// Counts one removal that every attempt failed to write.

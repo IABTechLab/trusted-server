@@ -88,17 +88,22 @@ use crate::settings::Settings;
 use device::DeviceSignals;
 
 use self::finalize::BrowserSeed;
+use self::identity::measurement::{IdentityMeasurement, MeasurementInput, RouteKind, flush_label};
 use self::identity::request::{RequestIdentity, WriterDecision};
 use self::identity::runtime::IdentityRuntime;
 use self::kv::{CreateIfAbsentOutcome, KvIdentityGraph, apply_partner_id_updates};
 use self::kv_types::KvEntry;
 
-/// Bounded request classifications that may persist browser EID cookies.
+/// Bounded request classifications that may stage browser EID cookies.
 ///
 /// Adapters classify publisher navigations and `POST /auction` only after
 /// pre-route filters allow dispatch. The shared page-bids handler classifies an
 /// admitted SPA navigation, while EC finalization classifies new identities.
-/// Challenged or blocked requests remain unclassified and cannot persist EIDs.
+/// Challenged or blocked requests remain unclassified and cannot stage EIDs.
+///
+/// Only [`Self::NewEc`] still reports an `EID sync measurement` line. A
+/// returning visitor's request reports the `identity request measurement`
+/// line instead, which carries no source label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
 pub enum EidSyncSource {
     /// Publisher top-level document navigation.
@@ -353,7 +358,17 @@ impl EcContext {
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
             eid_sync_source: None,
-            identity: RequestIdentity::default(),
+            identity: {
+                let mut identity = RequestIdentity::default();
+                identity.set_cookie_header_bytes(
+                    req.headers()
+                        .get_all(header::COOKIE)
+                        .iter()
+                        .map(|value| value.as_bytes().len())
+                        .sum(),
+                );
+                identity
+            },
             failed_withdrawals: Vec::new(),
         })
     }
@@ -507,6 +522,34 @@ impl EcContext {
     /// [`generate_if_needed`]: Self::generate_if_needed
     pub fn set_device_signals(&mut self, signals: DeviceSignals) {
         self.device_signals = Some(signals);
+    }
+
+    /// Builds the `identity request measurement` for this request after
+    /// phase 4 (spec 14, step 1).
+    ///
+    /// The route kind is `new_ec` for a request that generated an EC,
+    /// `writer` for the one browser-driven writer, and `stager` otherwise.
+    #[must_use]
+    pub fn identity_measurement(&self, input: &MeasurementInput<'_>) -> IdentityMeasurement {
+        let route = if self.ec_generated {
+            RouteKind::NewEc
+        } else if self.identity.writer() {
+            RouteKind::Writer
+        } else {
+            RouteKind::Stager
+        };
+        IdentityMeasurement {
+            cookie_header_bytes: self.identity.cookie_header_bytes(),
+            route,
+            kv_reads: input
+                .kv_reads
+                .saturating_add(u32::from(input.phase_one_read)),
+            kv_writes: input.kv_writes,
+            flush: flush_label(input.flush),
+            removal_lost: self.identity.removal_lost(),
+            withdrawal_after_send: input.withdrawal_after_send,
+            withdrawal_after_send_failed: input.withdrawal_after_send_failed,
+        }
     }
 
     /// The identity state this request decides and collects.

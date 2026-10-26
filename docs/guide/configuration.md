@@ -636,28 +636,50 @@ Legacy consent-store records are not read or migrated into `ec.ec_store`. Their 
 
 ### Identity Providers (`[ec.identity]`)
 
-Policy for server-side identity providers. The table is optional; every key has a default. `ec.pull_sync_concurrency` was removed: a config that sets it fails validation. Use `max_concurrency` instead.
+Policy for server-side identity providers. The table is optional; every key has a default.
 
-| Field                | Type    | Default | Description                                                             |
-| -------------------- | ------- | ------- | ----------------------------------------------------------------------- |
-| `max_concurrency`    | Integer | `4`     | Maximum providers dispatched at once (at least 1)                       |
-| `hold_budget_ms`     | Integer | `100`   | Total time a navigation may wait for hold-mode providers (at most 1000) |
-| `hold_retry_sec`     | Integer | `300`   | Seconds before a provider that timed out in hold mode is held again     |
-| `max_response_bytes` | Integer | `65536` | Largest provider response body accepted                                 |
+| Key                  | Type    | Default | Meaning                                                                                |
+| -------------------- | ------- | ------- | -------------------------------------------------------------------------------------- |
+| `max_concurrency`    | Integer | `4`     | Most providers dispatched at once (at least 1). Replaces `ec.pull_sync_concurrency`.   |
+| `hold_budget_ms`     | Integer | `100`   | Total wall-clock time a navigation may wait for all hold-mode providers (at most 1000) |
+| `hold_retry_sec`     | Integer | `300`   | Seconds to wait before calling a provider again after the hold budget cut its call off |
+| `max_response_bytes` | Integer | `65536` | Largest provider response body accepted, before and after decoding                     |
 
-Each provider can have an `[ec.identity.providers.<id>]` table:
+Each provider can have an `[ec.identity.providers.<id>]` table. A provider with no table uses the defaults.
 
-| Field                         | Type    | Default      | Description                                                        |
-| ----------------------------- | ------- | ------------ | ------------------------------------------------------------------ |
-| `mode`                        | String  | `after_send` | `hold` or `after_send`                                             |
-| `timeout_ms`                  | Integer | none         | Hold-mode timeout, at most `hold_budget_ms`; the budget when unset |
-| `after_send_timeout_ms`       | Integer | `1000`       | Timeout for any dispatch after send, `1` to `10000`                |
-| `sources`                     | Array   | none         | Source domains the provider may write                              |
-| `refresh_after_sec`           | Integer | `86400`      | Seconds before a stored ID is refreshed (greater than 0)           |
-| `max_calls_per_minute`        | Integer | `1`          | Provider calls allowed per minute                                  |
-| `breaker_failures_per_minute` | Integer | `50`         | Failures per minute that open the circuit breaker                  |
-| `cookie_priority`             | Integer | `0`          | Ordering of the provider's ID when the cookie is trimmed           |
-| `revoke_scope`                | String  | `provider`   | `provider` or `global`                                             |
+| Key                           | Type    | Default                            | Meaning                                                                                                                                           |
+| ----------------------------- | ------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mode`                        | String  | `after_send`                       | `hold` runs before the navigation's auction; `after_send` runs after the response is sent. Providers run only on a returning visitor's page load. |
+| `timeout_ms`                  | Integer | `hold_budget_ms`                   | Hold-mode call timeout, at most `hold_budget_ms`                                                                                                  |
+| `after_send_timeout_ms`       | Integer | `1000`                             | Timeout for any call made after send, `1` to `10000`                                                                                              |
+| `sources`                     | Array   | every source the provider declares | Narrows the source domains the provider may write. Required for a capture-only provider.                                                          |
+| `refresh_after_sec`           | Integer | `86400`                            | Seconds before a stored ID is refreshed, and the wait after a skipped call (greater than 0)                                                       |
+| `max_calls_per_minute`        | Integer | `1`                                | Per-visitor burst cap, enforced in 60-second windows                                                                                              |
+| `breaker_failures_per_minute` | Integer | `50`                               | Transport failures, timeouts, 429s and 5xx responses in one 60-second window after which the provider is skipped for every visitor                |
+| `cookie_priority`             | Integer | `0`                                | Lower values are left out of the `__Host-ts-eids-s` mirror first when it exceeds its size cap                                                     |
+| `revoke_scope`                | String  | `provider` (capture only)          | `provider` or `global`. Applies only to a provider that captures IDs, from Part 2 of the identity rollout.                                        |
+
+**Pull partner provider IDs.** Each `[[ec.partners]]` entry with `pull_sync_enabled = true` registers a provider whose ID is `pull-` plus the source domain with dots replaced by `-`. For example, `ssp.example.com` is `pull-ssp-example-com`. A domain that contains `-`, or an ID that would be longer than 63 characters, also gets `-` and the first 8 hex digits of the SHA-256 of the full domain, so `a-b.example.com` and `a.b.example.com` get different IDs. Configure the partner's pacing in `[ec.identity.providers.pull-ssp-example-com]`.
+
+**Removed keys.** Validation rejects each of these with an error that names its replacement:
+
+| Removed key                                | Replacement                                                                  |
+| ------------------------------------------ | ---------------------------------------------------------------------------- |
+| `ec.pull_sync_concurrency`                 | `[ec.identity].max_concurrency`                                              |
+| `[[ec.partners]].pull_sync_ttl_sec`        | `refresh_after_sec` in `[ec.identity.providers.<pull-id>]`                   |
+| `[[ec.partners]].pull_sync_rate_limit = N` | `max_calls_per_minute = ceil(N / 60)` in `[ec.identity.providers.<pull-id>]` |
+
+The old rate limit counted calls per hour; the new one counts them per minute and defaults to 1, so a partner that kept the old default of 10 per hour is now paced at an effective 60 per hour.
+
+#### Rolling back
+
+This release moves the KV identity row to schema version 2. A release before it cannot read a version 2 row, so rolling back past this release is unsupported once it has written one; going back needs a KV migration to version 1, which is not provided.
+
+A later release that adds vendor providers can be rolled back to this one with these steps:
+
+- Remove `owner` and every vendor `[ec.identity.providers.*]` table from the config first. This release rejects an `owner` or a provider table it does not know.
+- Complete entry sets that a vendor wrote stay readable, but they are not served while the provider that wrote them is not configured.
+- A write prunes an unconfigured provider's state down to its opt-out fields, so opt-outs survive. Its invalidated-value list and its provider state do not, so invalidated values can be seeded once more and stateful providers start over when rolled forward again.
 
 ### `[ec]`
 

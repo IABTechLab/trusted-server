@@ -243,49 +243,13 @@ fn queue_browser_ingest(ec_context: &mut EcContext, ec_id: &str, updates: &[Part
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EidSyncMeasurement {
-    source: EidSyncSource,
-    outcome: EidCookieSyncOutcome,
-    already_matched: u8,
-    written: u8,
-    conflict_duplicate: u8,
-    deferred: u8,
-}
-
-impl EidSyncMeasurement {
-    fn new(source: EidSyncSource, outcome: EidCookieSyncOutcome) -> Self {
-        Self {
-            source,
-            outcome,
-            already_matched: u8::from(matches!(outcome, EidCookieSyncOutcome::AlreadyMatched)),
-            written: u8::from(matches!(
-                outcome,
-                EidCookieSyncOutcome::Written | EidCookieSyncOutcome::WrittenWithDeferredFreshness
-            )),
-            conflict_duplicate: u8::from(matches!(outcome, EidCookieSyncOutcome::ConflictMatched)),
-            deferred: u8::from(matches!(
-                outcome,
-                EidCookieSyncOutcome::WrittenWithDeferredFreshness
-                    | EidCookieSyncOutcome::DeferredConflict
-                    | EidCookieSyncOutcome::DeferredFreshness
-                    | EidCookieSyncOutcome::DeferredStaleRead
-            )),
-        }
-    }
-}
-
+/// Logs the one remaining `EID sync measurement` line: a new EC whose
+/// create carried the browser ingest. Returning visitors log the
+/// `identity request measurement` line instead.
 fn record_eid_sync_terminal(source: EidSyncSource, outcome: EidCookieSyncOutcome) {
-    let measurement = EidSyncMeasurement::new(source, outcome);
     log::info!(
-        "EID sync measurement: source={} outcome={} attempted=1 already_matched={} written={} \
-         conflict_duplicate={} deferred={}",
-        measurement.source,
-        measurement.outcome,
-        measurement.already_matched,
-        measurement.written,
-        measurement.conflict_duplicate,
-        measurement.deferred,
+        "EID sync measurement: source={source} outcome={outcome} attempted=1 already_matched=0 \
+         written=1 conflict_duplicate=0 deferred=0",
     );
 }
 
@@ -1427,91 +1391,16 @@ mod tests {
             EidSyncSource::PageBids,
             EidSyncSource::NewEc,
         ];
-        let outcomes = [
-            EidCookieSyncOutcome::AlreadyMatched,
-            EidCookieSyncOutcome::Written,
-            EidCookieSyncOutcome::WrittenWithDeferredFreshness,
-            EidCookieSyncOutcome::ConflictMatched,
-            EidCookieSyncOutcome::DeferredConflict,
-            EidCookieSyncOutcome::DeferredFreshness,
-            EidCookieSyncOutcome::DeferredStaleRead,
-            EidCookieSyncOutcome::Missing,
-            EidCookieSyncOutcome::ConsentWithdrawn,
-            EidCookieSyncOutcome::Failed,
-        ];
 
         assert_eq!(
             sources.map(|source| source.to_string()),
-            ["navigation", "auction", "page_bids", "new_ec"]
+            ["navigation", "auction", "page_bids", "new_ec"],
+            "should label each source with a bounded name"
         );
         assert_eq!(
-            outcomes.map(|outcome| outcome.to_string()),
-            [
-                "already_matched",
-                "written",
-                "written_with_deferred_freshness",
-                "conflict_matched",
-                "deferred_conflict",
-                "deferred_freshness",
-                "deferred_stale_read",
-                "missing",
-                "consent_withdrawn",
-                "failed",
-            ]
-        );
-
-        assert_eq!(
-            EidSyncMeasurement::new(
-                EidSyncSource::Navigation,
-                EidCookieSyncOutcome::AlreadyMatched,
-            ),
-            EidSyncMeasurement {
-                source: EidSyncSource::Navigation,
-                outcome: EidCookieSyncOutcome::AlreadyMatched,
-                already_matched: 1,
-                written: 0,
-                conflict_duplicate: 0,
-                deferred: 0,
-            }
-        );
-        assert_eq!(
-            EidSyncMeasurement::new(
-                EidSyncSource::Auction,
-                EidCookieSyncOutcome::WrittenWithDeferredFreshness,
-            ),
-            EidSyncMeasurement {
-                source: EidSyncSource::Auction,
-                outcome: EidCookieSyncOutcome::WrittenWithDeferredFreshness,
-                already_matched: 0,
-                written: 1,
-                conflict_duplicate: 0,
-                deferred: 1,
-            }
-        );
-        assert_eq!(
-            EidSyncMeasurement::new(EidSyncSource::NewEc, EidCookieSyncOutcome::ConflictMatched,),
-            EidSyncMeasurement {
-                source: EidSyncSource::NewEc,
-                outcome: EidCookieSyncOutcome::ConflictMatched,
-                already_matched: 0,
-                written: 0,
-                conflict_duplicate: 1,
-                deferred: 0,
-            }
-        );
-        assert_eq!(
-            EidSyncMeasurement::new(
-                EidSyncSource::PageBids,
-                EidCookieSyncOutcome::DeferredStaleRead,
-            ),
-            EidSyncMeasurement {
-                source: EidSyncSource::PageBids,
-                outcome: EidCookieSyncOutcome::DeferredStaleRead,
-                already_matched: 0,
-                written: 0,
-                conflict_duplicate: 0,
-                deferred: 1,
-            }
+            EidCookieSyncOutcome::Written.to_string(),
+            "written",
+            "should label the one outcome the new-EC line reports"
         );
     }
 
