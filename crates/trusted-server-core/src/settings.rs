@@ -53,6 +53,7 @@ pub struct Publisher {
     pub origin_host_header_override: Option<String>,
     /// Secret used to encrypt/decrypt proxied URLs in `/first-party/proxy`.
     /// Keep this secret stable to allow existing links to decode.
+    #[serde(default, skip_serializing)]
     #[validate(custom(function = validate_redacted_not_empty))]
     pub proxy_secret: Redacted<String>,
     /// Maximum number of bytes buffered when a publisher origin response is
@@ -420,9 +421,9 @@ impl DerefMut for IntegrationSettings {
 
 /// A partner (SSP, DSP, identity vendor) configured in `[[ec.partners]]`.
 ///
-/// Partners are defined statically in `trusted-server.toml` rather than
-/// registered via API. At startup, each configured `api_token` is hashed
-/// (SHA-256) for O(1) auth lookups; the plaintext is never stored at runtime.
+/// Partners are defined in `trusted-server.toml`. When `api_token_enabled` is
+/// true, startup resolves the partner's implicit credential and hashes it for
+/// O(1) registry authentication; config never supplies its key or value.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct EcPartner {
@@ -445,10 +446,13 @@ pub struct EcPartner {
     pub bidstream_enabled: bool,
     /// Plaintext API token used by inbound batch sync and identify requests.
     ///
-    /// When present, the token is hashed at startup for auth lookups. Omitting
-    /// it disables inbound partner API authentication for this partner.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// This resolved shadow is not config authority. `api_token_enabled` controls
+    /// activation, and the registry authenticates using the loaded capability.
+    #[serde(default, skip_serializing)]
     pub api_token: Option<Redacted<String>>,
+    /// Require this partner's implicit inbound credential binding.
+    #[serde(default)]
+    pub api_token_enabled: bool,
     /// Max batch sync API requests per partner per minute.
     #[serde(
         default = "EcPartner::default_batch_rate_limit",
@@ -480,8 +484,8 @@ pub struct EcPartner {
         deserialize_with = "from_value_or_str"
     )]
     pub pull_sync_rate_limit: u32,
-    /// Outbound bearer token for pull sync requests.
-    #[serde(default)]
+    /// Resolved outbound bearer token shadow; not app-config authority.
+    #[serde(default, skip_serializing)]
     pub ts_pull_token: Option<Redacted<String>>,
 }
 
@@ -584,6 +588,7 @@ impl EcPartner {
 #[serde(deny_unknown_fields)]
 pub struct Ec {
     /// Publisher passphrase used as HMAC key for EC generation.
+    #[serde(default, skip_serializing)]
     #[validate(custom(function = Ec::validate_passphrase))]
     pub passphrase: Redacted<String>,
 
@@ -720,6 +725,7 @@ pub struct Handler {
     pub path: String,
     #[validate(custom(function = validate_redacted_not_empty))]
     pub username: Redacted<String>,
+    #[serde(default, skip_serializing)]
     #[validate(custom(function = validate_redacted_not_empty))]
     pub password: Redacted<String>,
     #[serde(skip, default)]
@@ -820,14 +826,6 @@ fn default_request_signing_enabled() -> bool {
     false
 }
 
-fn default_s3_access_key_id() -> Redacted<String> {
-    Redacted::new("access_key_id".to_string())
-}
-
-fn default_s3_secret_access_key() -> Redacted<String> {
-    Redacted::new("secret_access_key".to_string())
-}
-
 fn default_asset_image_optimizer_enabled() -> bool {
     true
 }
@@ -912,8 +910,8 @@ impl AssetOriginAuth {
 /// AWS Signature Version 4 configuration for `S3` asset origins.
 ///
 /// The route `origin_url` must use the same `S3` host that `AWS` validates in
-/// the `SigV4` canonical request. Credential fields hold secret-store key names
-/// in app config and resolved values at runtime.
+/// the `SigV4` canonical request. Config supplies policy only. Resolved credential
+/// fields are validation shadows; loaded route bindings authorize signing.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct S3SigV4AuthConfig {
@@ -922,15 +920,18 @@ pub struct S3SigV4AuthConfig {
     /// Deprecated per-route store selector accepted for migration only.
     #[serde(default, skip_serializing)]
     pub secret_store: Option<String>,
-    /// Secret reference containing the `AWS` access key ID.
-    #[serde(default = "default_s3_access_key_id")]
+    /// Resolved access ID shadow; the loaded route binding owns export authority.
+    #[serde(default, skip_serializing)]
     pub access_key_id: Redacted<String>,
-    /// Secret reference containing the `AWS` secret access key.
-    #[serde(default = "default_s3_secret_access_key")]
+    /// Resolved secret-key shadow, never serialized into app config.
+    #[serde(default, skip_serializing)]
     pub secret_access_key: Redacted<String>,
-    /// Optional secret reference containing an `AWS` session token.
-    #[serde(default)]
+    /// Resolved optional session-token shadow.
+    #[serde(default, skip_serializing)]
     pub session_token: Option<Redacted<String>>,
+    /// Require the route's implicit session-token binding.
+    #[serde(default)]
+    pub session_token_enabled: bool,
     /// Query-string handling policy for the signed `S3` origin request.
     ///
     /// Set this to `strip` when request query parameters are transformation
@@ -954,12 +955,7 @@ impl S3SigV4AuthConfig {
                 "S3 secret_store is deprecated and ignored; static credentials resolve through the default app-config secret store"
             );
         }
-        self.access_key_id = Redacted::new(self.access_key_id.expose().trim().to_string());
-        self.secret_access_key = Redacted::new(self.secret_access_key.expose().trim().to_string());
-        self.session_token = self.session_token.take().and_then(|value| {
-            let value = value.expose().trim().to_string();
-            (!value.is_empty()).then(|| Redacted::new(value))
-        });
+        // Credential bytes are opaque. Only the loader validates resolved values.
     }
 
     fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
@@ -975,12 +971,8 @@ impl S3SigV4AuthConfig {
                         .to_string(),
             }));
         }
-        if self.access_key_id.expose().is_empty() || self.secret_access_key.expose().is_empty() {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: "proxy.asset_routes auth s3_sigv4 credentials must not be empty after secret resolution"
-                    .to_string(),
-            }));
-        }
+        // This preparation also runs for unresolved config. Required credentials
+        // are enforced by the binding loader, not by mutable reference fields.
         Ok(())
     }
 }
@@ -1946,7 +1938,7 @@ pub struct TinybirdSettings {
     /// Master enablement for auction telemetry ingestion.
     #[serde(default)]
     pub enabled: bool,
-    /// Regional Tinybird API host, without scheme or path.
+    /// Regional Tinybird DNS authority, optionally with an HTTPS port.
     #[serde(default)]
     pub api_host: String,
     /// Deprecated feature-specific store selector accepted for migration only.
@@ -1955,8 +1947,8 @@ pub struct TinybirdSettings {
     /// Auction Events API datasource name.
     #[serde(default = "default_tinybird_auction_dataset")]
     pub auction_dataset: String,
-    /// Secret reference containing the auction datasource APPEND token.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Resolved APPEND-token shadow, omitted from app-config serialization.
+    #[serde(default, skip_serializing)]
     pub auction_token_secret: Option<Redacted<String>>,
     /// Reserved for future access-log telemetry.
     ///
@@ -2015,11 +2007,7 @@ impl TinybirdSettings {
                 "tinybird.secret_store is deprecated and ignored; static credentials resolve through the default app-config secret store"
             );
         }
-        self.auction_dataset = self.auction_dataset.trim().to_owned();
-        self.auction_token_secret = self.auction_token_secret.take().and_then(|value| {
-            let value = value.expose().trim().to_owned();
-            (!value.is_empty()).then(|| Redacted::new(value))
-        });
+        // Dataset identity and resolved credential bytes must remain exact.
         self.access_dataset = self.access_dataset.trim().to_owned();
         self.access_token_secret = None;
     }
@@ -2046,35 +2034,19 @@ impl TinybirdSettings {
         }
         validate_tinybird_api_host(&self.api_host)?;
         validate_tinybird_dataset(&self.auction_dataset, "tinybird.auction_dataset")?;
-        let token = self.auction_token_secret.as_ref().ok_or_else(|| {
-            Report::new(TrustedServerError::Configuration {
-                message:
-                    "tinybird.auction_token_secret is required when Tinybird telemetry is enabled"
-                        .to_owned(),
-            })
-        })?;
-        validate_tinybird_secret(token.expose(), "tinybird.auction_token_secret")
+        if let Some(token) = &self.auction_token_secret {
+            validate_tinybird_secret(token.expose(), "tinybird.auction_token_secret")?;
+        }
+        Ok(())
     }
 }
 
 fn validate_tinybird_api_host(host: &str) -> Result<(), Report<TrustedServerError>> {
-    if host.is_empty()
-        || host.contains('/')
-        || host.contains(':')
-        || host.chars().any(char::is_control)
-        || host.starts_with("http://")
-        || host.starts_with("https://")
-    {
-        return Err(Report::new(TrustedServerError::Configuration {
-            message: "tinybird.api_host must be a regional host without scheme, port, or path"
-                .to_owned(),
-        }));
-    }
-    validate_host_header_override_value(host).map_err(|reason| {
-        Report::new(TrustedServerError::Configuration {
-            message: format!("tinybird.api_host {reason}"),
-        })
-    })
+    crate::secret_bindings::normalize_endpoint(
+        &format!("https://{host}/v0/events"),
+        "tinybird.api_host",
+    )
+    .map(|_| ())
 }
 
 fn validate_tinybird_dataset(value: &str, setting: &str) -> Result<(), Report<TrustedServerError>> {
@@ -2899,6 +2871,7 @@ pub struct TrustedClientIpConfig {
     /// Header containing the shared-secret authentication value.
     pub auth_header: String,
     /// Shared secret required before accepting the forwarded client IP address.
+    #[serde(default, skip_serializing)]
     #[validate(custom(function = validate_trusted_client_ip_shared_secret))]
     pub shared_secret: Redacted<String>,
 }
@@ -3000,6 +2973,10 @@ fn validate_trusted_client_ip_shared_secret(
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
+    /// Validated credential/target capabilities, constructed only by native loading.
+    #[serde(skip)]
+    #[validate(skip)]
+    pub resolved_bindings: crate::secret_bindings::ResolvedBindings,
     #[validate(nested)]
     pub publisher: Publisher,
     #[serde(default)]
@@ -3066,8 +3043,9 @@ impl Settings {
 
     /// Creates a new [`Settings`] instance from a JSON value.
     ///
-    /// Runtime config-store loading uses this after verifying the `app_config`
-    /// blob envelope and extracting the same typed settings shape.
+    /// This standalone helper expects resolved local-comparison values. It does
+    /// not create export authority. Production config-store loading instead
+    /// verifies feature configuration and resolves native credential bindings.
     ///
     /// # Errors
     ///
@@ -4087,14 +4065,14 @@ mod tests {
     }
 
     #[test]
-    fn serialized_default_config_stays_readable_by_the_base_revision_schema() {
+    fn serialized_top_level_keys_stay_within_the_base_revision_key_set() {
         let settings = Settings::from_toml(&crate_test_settings_str())
             .expect("should parse settings without trusted client IP configuration");
 
         let value = serde_json::to_value(&settings).expect("should serialize settings");
 
         serde_json::from_value::<BaseRevisionSettings>(value)
-            .expect("base revision schema should accept a config blob with no trusted client IP");
+            .expect("base revision top-level key set should accept the serialized fields");
     }
 
     #[test]
@@ -4172,6 +4150,7 @@ mod tests {
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: false,
             api_token: Some(Redacted::new(CANARY_EC_PARTNER_API_TOKEN.to_string())),
+            api_token_enabled: true,
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: false,
             pull_sync_url: None,
@@ -4194,6 +4173,7 @@ mod tests {
             access_key_id: Redacted::new(CANARY_S3_ACCESS_KEY_ID.to_string()),
             secret_access_key: Redacted::new(CANARY_S3_SECRET_ACCESS_KEY.to_string()),
             session_token: Some(Redacted::new(CANARY_S3_SESSION_TOKEN.to_string())),
+            session_token_enabled: true,
             origin_query: None,
         }));
         settings.proxy.asset_routes = vec![asset_route];
@@ -5984,6 +5964,7 @@ source_domain = "partner.example.com"
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: false,
             api_token: api_token.map(|token| Redacted::new(token.to_owned())),
+            api_token_enabled: api_token.is_some(),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: true,
             pull_sync_url: Some("https://partner.example.com/sync".to_owned()),
@@ -7152,8 +7133,9 @@ source_domain = "partner.example.com"
             AssetOriginAuth::S3SigV4(config) => {
                 assert_eq!(config.region, "us-east-1");
                 assert_eq!(config.secret_store, None);
-                assert_eq!(config.access_key_id.expose(), "access_key_id");
-                assert_eq!(config.secret_access_key.expose(), "secret_access_key");
+                assert!(config.access_key_id.expose().is_empty());
+                assert!(config.secret_access_key.expose().is_empty());
+                assert!(!config.session_token_enabled);
             }
         }
     }
@@ -7420,7 +7402,12 @@ source_domain = "partner.example.com"
             toml::from_str(&toml).expect("should deserialize unnormalized settings");
         let value = serde_json::to_value(raw).expect("should serialize unnormalized settings");
 
-        for result in [Settings::from_toml(&toml), Settings::from_json_value(value)] {
+        let mut unresolved: Settings = serde_json::from_value(value)
+            .expect("should deserialize credential-free feature settings");
+        unresolved
+            .normalize_deserialized()
+            .expect("should normalize feature settings without credential values");
+        for result in [Settings::from_toml(&toml), Ok(unresolved)] {
             let settings = result.expect("should accept non-colliding keys");
             assert_eq!(
                 settings.image_optimizer.profile_sets.len(),

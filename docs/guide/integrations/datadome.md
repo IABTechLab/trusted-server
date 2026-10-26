@@ -43,8 +43,7 @@ rewrite_sdk = true
 
 # Server-side Protection API layer
 enable_protection = false
-# Required only when enable_protection = true.
-server_side_key_secret_name = "datadome_server_side_key"
+# Enabled Protection requires the generated datadome.server binding.
 protection_api_origin = "https://api-fastly.datadome.co"
 timeout_ms = 1500
 protection_excluded_methods = ["OPTIONS"]
@@ -76,7 +75,6 @@ patterns = ["(?i)\\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|
 | `cache_ttl_seconds`                    | integer | `3600`                           | Cache TTL for `tags.js`                                                 |
 | `rewrite_sdk`                          | boolean | `true`                           | Rewrite DataDome script URLs in HTML to first-party paths               |
 | `enable_protection`                    | boolean | `false`                          | Call the Protection API before route matching                           |
-| `server_side_key_secret_name`          | string  | none                             | Default-store secret reference required when protection is enabled      |
 | `protection_api_origin`                | string  | `https://api-fastly.datadome.co` | Protection API origin                                                   |
 | `timeout_ms`                           | integer | `1500`                           | Dynamic backend first-byte timeout for Protection API calls             |
 | `protection_excluded_methods`          | array   | `["OPTIONS"]`                    | HTTP methods skipped before the Protection API call                     |
@@ -155,7 +153,7 @@ When `enable_protection = true`, Trusted Server calls DataDome before normal rou
 - **Challenge**: return the DataDome response directly without contacting the publisher origin.
 - **Fail-open condition**: continue routing without DataDome effects when the Protection API times out, returns malformed instructions, or returns an unexpected status.
 
-`server_side_key_secret_name` is a key reference in the logical `trusted_server_secrets` store. It must resolve to a non-empty value when server-side protection is enabled. Missing or invalid credentials fail startup before requests are served. Protection API transport and response failures continue to fail open per request.
+Enabled Protection requires the implicit `datadome.server` binding in the logical `trusted_server_secrets` store. Its generated key includes the exact HTTPS `/validate-request` endpoint. Provision from a reviewed plan through [secure input](../secrets), not a credential-name property. A changed endpoint needs a new binding. Missing or invalid credentials fail startup before requests are served. Credential-bearing requests require verified TLS and do not follow redirects; remote transport/response failures preserve per-request fail-open behavior.
 
 ### Protected traffic
 
@@ -184,7 +182,6 @@ Protection API:
 # Runtime activation also requires FASTLY_IS_STAGING=1.
 [integrations.datadome.protection_test_bypass]
 enabled = true
-credential_secret_name = "datadome_test_bypass"
 ```
 
 `protection_test_bypass` requires `enable_protection = true`; it is disabled
@@ -195,7 +192,7 @@ staging through the `X-TS-ENV: staging` response signal and the integration
 activation log, and verify production omits that response signal. A retained
 section cannot bypass protection in a production or other non-staging runtime.
 Store a randomly generated credential containing at least 32 bytes of
-high-entropy material under the referenced key in `trusted_server_secrets`, configure this section
+high-entropy material at the generated, separate `datadome.bypass` binding in `trusted_server_secrets`. Configure this section
 only while needed, protect the site with an outer access control such as Basic
 Auth, and remove the section when testing finishes.
 
@@ -373,7 +370,6 @@ TRUSTED_SERVER__INTEGRATIONS__DATADOME__API_ORIGIN=https://api-js.datadome.co
 TRUSTED_SERVER__INTEGRATIONS__DATADOME__CACHE_TTL_SECONDS=3600
 TRUSTED_SERVER__INTEGRATIONS__DATADOME__REWRITE_SDK=true
 TRUSTED_SERVER__INTEGRATIONS__DATADOME__ENABLE_PROTECTION=true
-TRUSTED_SERVER__INTEGRATIONS__DATADOME__SERVER_SIDE_KEY_SECRET_NAME=datadome_server_side_key
 TRUSTED_SERVER__INTEGRATIONS__DATADOME__CLIENT_SIDE_KEY=your-client-side-key
 ```
 
@@ -418,7 +414,6 @@ Check that both fields are configured:
 [integrations.datadome]
 enabled = true
 enable_protection = true
-server_side_key_secret_name = "datadome_server_side_key"
 ```
 
 Also verify the request is not excluded by the default internal/static route exclusions or your custom inclusion/exclusion regexes.

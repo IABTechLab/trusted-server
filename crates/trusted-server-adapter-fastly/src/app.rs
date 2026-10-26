@@ -213,6 +213,7 @@ pub(crate) fn load_settings_from_config_store(
         &stores.config_key,
         &stores.secret_store_name,
     )
+    .map(|loaded| loaded.settings().clone())
 }
 
 pub(crate) fn build_state_from_settings(
@@ -225,7 +226,7 @@ pub(crate) fn build_state_from_settings(
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
-    let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
+    let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings)?;
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
 
     Ok(Arc::new(AppState {
@@ -578,7 +579,7 @@ async fn execute_named(
         handler,
         NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup
     ) {
-        let response = PartnerRegistry::from_config(&state.settings.ec.partners)
+        let response = PartnerRegistry::from_settings(&state.settings)
             .and_then(|registry| match handler {
                 NamedRouteHandler::AdminEcLookup => {
                     // Deliberately do not use an EC request-state graph: that
@@ -659,7 +660,7 @@ async fn run_named_route(
                 cors_preflight_identify(&state.settings, &req)
             } else {
                 let kv = crate::require_identity_graph(&state.settings)?;
-                let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+                let partner_registry = PartnerRegistry::from_settings(&state.settings)?;
                 handle_identify(
                     &state.settings,
                     &kv,
@@ -673,7 +674,7 @@ async fn run_named_route(
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
         NamedRouteHandler::Auction => {
             ec.ec_context.set_eid_sync_source(EidSyncSource::Auction);
-            let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+            let partner_registry = PartnerRegistry::from_settings(&state.settings)?;
             let registry_ref = if partner_registry.is_empty() {
                 None
             } else {
@@ -697,7 +698,7 @@ async fn run_named_route(
             if req.method() == Method::OPTIONS {
                 return Ok(page_bids_preflight_denied());
             }
-            let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+            let partner_registry = PartnerRegistry::from_settings(&state.settings)?;
             let registry_ref = if partner_registry.is_empty() {
                 None
             } else {
@@ -744,7 +745,7 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
     let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
-        let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+        let partner_registry = PartnerRegistry::from_settings(&state.settings)?;
         let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
         handle_batch_sync(&kv, &partner_registry, &limiter, req)
     });
@@ -866,7 +867,7 @@ async fn dispatch_fallback(
         // EC identity-graph KV (`ec.kv_graph`) enrich the bid request with
         // server-side EIDs, same as the legacy auction.
         let slots = state.settings.creative_opportunity_slots();
-        match PartnerRegistry::from_config(&state.settings.ec.partners) {
+        match PartnerRegistry::from_settings(&state.settings) {
             Ok(partner_registry) => {
                 let auction = AuctionDispatch {
                     integration_registry: &state.registry,

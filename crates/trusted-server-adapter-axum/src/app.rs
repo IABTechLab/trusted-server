@@ -70,7 +70,7 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
         &config_key,
         &trusted_server_core::settings_data::default_secret_store_name(),
     )?;
-    build_state_with_settings(settings)
+    build_state_with_settings(settings.settings().clone())
 }
 
 /// Build the application state from explicit settings.
@@ -497,8 +497,7 @@ fn named_route_handler(
                         Ok(admin_ec_lookup_not_supported())
                     }
                     NamedRouteHandler::AdminEidsLookup => {
-                        let partner_registry =
-                            PartnerRegistry::from_config(&state.settings.ec.partners)?;
+                        let partner_registry = PartnerRegistry::from_settings(&state.settings)?;
                         handle_admin_eids_lookup(&partner_registry, &req)
                     }
                     NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),

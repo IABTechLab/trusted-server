@@ -37,7 +37,7 @@ const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 #[derive(Debug, Clone)]
 pub struct S3Credentials {
     /// `AWS` access key ID.
-    pub access_key_id: String,
+    pub access_key_id: Redacted<String>,
     /// `AWS` secret access key.
     pub secret_access_key: Redacted<String>,
     /// Optional `AWS` session token for temporary credentials.
@@ -59,7 +59,7 @@ pub struct S3Credentials {
 ///
 /// Returns a proxy error when a required signing header is missing or a signing
 /// header value is invalid.
-pub fn sign_headers(
+pub(crate) fn sign_headers(
     method: &Method,
     url: &Url,
     headers: &mut HeaderMap,
@@ -67,6 +67,22 @@ pub fn sign_headers(
     credentials: &S3Credentials,
     now: SystemTime,
 ) -> Result<(), Report<TrustedServerError>> {
+    if !matches!(*method, Method::GET | Method::HEAD) || url.scheme() != "https" {
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: "S3 signing requires HTTPS GET or HEAD".to_owned(),
+        }));
+    }
+    crate::secret_bindings::validate_credential(
+        "s3id",
+        credentials.access_key_id.expose().as_bytes(),
+    )?;
+    crate::secret_bindings::validate_credential(
+        "s3secret",
+        credentials.secret_access_key.expose().as_bytes(),
+    )?;
+    if let Some(token) = &credentials.session_token {
+        crate::secret_bindings::validate_credential("s3sess", token.expose().as_bytes())?;
+    }
     let datetime = DateTime::<Utc>::from(now);
     let amz_date = datetime.format("%Y%m%dT%H%M%SZ").to_string();
     let date_stamp = datetime.format("%Y%m%d").to_string();
@@ -92,7 +108,7 @@ pub fn sign_headers(
     {
         headers.insert(
             "x-amz-security-token",
-            HeaderValue::from_str(token).change_context_invalid_header("x-amz-security-token")?,
+            sensitive_header(token).change_context_invalid_header("x-amz-security-token")?,
         );
     }
 
@@ -114,15 +130,21 @@ pub fn sign_headers(
     let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
     let authorization = format!(
         "{ALGORITHM} Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}",
-        credentials.access_key_id,
+        credentials.access_key_id.expose(),
     );
 
     headers.insert(
         header::AUTHORIZATION,
-        HeaderValue::from_str(&authorization).change_context_invalid_header("authorization")?,
+        sensitive_header(&authorization).change_context_invalid_header("authorization")?,
     );
 
     Ok(())
+}
+
+fn sensitive_header(value: &str) -> Result<HeaderValue, http::header::InvalidHeaderValue> {
+    let mut header = HeaderValue::from_str(value)?;
+    header.set_sensitive(true);
+    Ok(header)
 }
 
 fn canonical_headers(headers: &HeaderMap) -> Result<(String, String), Report<TrustedServerError>> {
@@ -264,7 +286,7 @@ mod tests {
             HeaderValue::from_static("examplebucket.s3.amazonaws.com"),
         );
         let credentials = S3Credentials {
-            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            access_key_id: Redacted::new("AKIAIOSFODNN7EXAMPLE".to_string()),
             secret_access_key: Redacted::new(
                 "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
             ),
@@ -304,7 +326,7 @@ mod tests {
     #[test]
     fn credentials_debug_redacts_secret_material() {
         let credentials = S3Credentials {
-            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            access_key_id: Redacted::new("AKIAIOSFODNN7EXAMPLE".to_string()),
             secret_access_key: Redacted::new("debug-secret-key".to_string()),
             session_token: Some(Redacted::new("debug-session-token".to_string())),
         };
@@ -312,8 +334,8 @@ mod tests {
         let debug_output = format!("{credentials:?}");
 
         assert!(
-            debug_output.contains("AKIAIOSFODNN7EXAMPLE"),
-            "should leave non-secret access key ID visible"
+            !debug_output.contains("AKIAIOSFODNN7EXAMPLE"),
+            "should redact the access key ID"
         );
         assert!(
             debug_output.contains("[REDACTED]"),

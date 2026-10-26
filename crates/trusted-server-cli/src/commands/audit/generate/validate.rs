@@ -15,15 +15,15 @@ use crate::error::{CliResult, cli_error};
 ///
 /// Runs [`TrustedServerAppConfig::new`], the push-time validation path, after
 /// deserializing the source TOML. This checks slot and template compilation,
-/// provider configuration, and secret key references without I/O. Secret values
-/// are resolved and validated separately at runtime; treating source key names
-/// as resolved secrets would incorrectly reject otherwise valid baselines.
+/// provider configuration, and implicit credential contexts without I/O. Native
+/// credentials are resolved and validated separately at runtime, not serialized
+/// into the source document.
 ///
 /// `baseline` is the config as it was read from disk. When the baseline is
 /// *already* unloadable, this run cannot be blamed for it: the candidate is
 /// accepted and the pre-existing error is returned as a warning instead. Without
-/// that escape hatch a freshly bootstrapped config carrying placeholder secrets
-/// could never be updated by `generate`.
+/// that escape hatch a freshly bootstrapped config carrying placeholder publisher
+/// settings could never be updated by `generate`.
 ///
 /// # Errors
 ///
@@ -49,9 +49,10 @@ pub(super) fn check_candidate(candidate: &str, baseline: &str) -> CliResult<Vec<
 
 /// Validates one source config without echoing config values.
 ///
-/// Parse and schema errors report only a byte offset. Deploy validation errors
-/// report only the failed phase because their messages can contain literal
-/// values, including validator parameters and invalid patterns.
+/// Parse and schema errors report only a byte offset when the parser supplies
+/// one, otherwise a fixed load-failure category. Deploy validation errors report
+/// only the failed phase because their messages can contain literal values,
+/// including validator parameters and invalid patterns.
 fn validate_source_config(source: &str) -> CliResult<()> {
     let config: TrustedServerAppConfig = toml::from_str(source).map_err(|error| {
         error.span().map_or_else(
@@ -68,7 +69,7 @@ fn validate_source_config(source: &str) -> CliResult<()> {
 mod tests {
     use super::*;
 
-    /// A source config containing secret references, as an operator would edit it.
+    /// Feature-only source config, with credentials supplied separately at runtime.
     fn baseline() -> String {
         crate::commands::config::init::EXAMPLE_CONFIG
             .replace("\"example.com\"", "\"publisher.example.com\"")
@@ -149,8 +150,11 @@ mod tests {
     }
 
     #[test]
-    fn schema_failure_reports_a_load_failure() {
-        let source = baseline().replace("\"publisher.example.com\"", "true");
+    fn schema_failure_reports_a_safe_load_failure() {
+        let source = baseline().replace(
+            "\"publisher.example.com\"",
+            "[\"FICTIONAL_SECRET_SENTINEL\"]",
+        );
         toml::from_str::<toml::Value>(&source).expect("should be syntactically valid TOML");
         let error = validate_source_config(&source).expect_err("should reject wrong field type");
         assert!(
@@ -158,9 +162,20 @@ mod tests {
             "should cover schema as well as syntax errors"
         );
         assert!(
-            error.contains("byte offset"),
-            "should keep the parser location"
+            !error.contains("FICTIONAL_SECRET_SENTINEL"),
+            "should not echo schema values"
         );
+        if let Some(offset) = error.strip_prefix("config could not be loaded at byte offset ") {
+            assert!(
+                offset.parse::<usize>().is_ok(),
+                "should expose only a numeric source offset"
+            );
+        } else {
+            assert_eq!(
+                error, "config could not be loaded",
+                "should keep a safe category when the schema boundary has no source span"
+            );
+        }
     }
 
     #[test]

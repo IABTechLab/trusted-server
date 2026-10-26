@@ -19,32 +19,30 @@ This guide covers:
 
 ## 1) Required Configuration
 
-Generate the passphrase and partner token independently with
-`openssl rand -base64 32`, then set EC configuration in `trusted-server.toml`.
-The `replace-with-*` values below are intentionally rejected placeholders:
+Set ordinary EC configuration in `trusted-server.toml`, then provision the
+implicit EC passphrase and partner inbound bindings from a reviewed plan.
+Keep the raw values out of config and overlays:
 
 ```toml
 [ec]
-passphrase = "ec_passphrase"
 ec_store = "ec_identity_store"
 
 [[ec.partners]]
 name = "Mocktioneer SSP"
-source_domain = "formally-vital-lion.edgecompute.app"
-api_token = "partner_api_token"
+source_domain = "ssp.example.com"
+api_token_enabled = true
 bidstream_enabled = true
 ```
 
-The `passphrase` and `api_token` fields contain keys in the Trusted Server
-secret store, not the credential values. This workflow calls the inbound
-identify and batch-sync APIs, so its partner needs `api_token`. Partners that
-do not call either API may omit it. Provision high-entropy values under
-`ec_passphrase` and `partner_api_token`; see
-[Configuration](/guide/configuration#secret-store-migration).
+This workflow calls inbound identify and batch-sync APIs, so set
+`api_token_enabled = true` and provision `ec.inbound` for the reviewed
+partner domain. It defaults to false. Provision `ec.passphrase` separately.
+See [Provision app credentials](./secrets). No credential-name properties belong
+in TOML; outbound pull uses a separate `ec.pull` binding and exact endpoint.
 
 Required behavior assumptions:
 
-- The value stored under `ec_passphrase` is long-lived HMAC-SHA256 keying material for EC ID derivation; use a high-entropy random value of at least 32 characters
+- The value provisioned for `ec.passphrase` is long-lived HMAC-SHA256 keying material for EC ID derivation; use a high-entropy random value of at least 32 characters
 - `ec_store` is linked to the active Fastly service version
 - `ec_store` is the only KV-backed EC lifecycle store; it contains identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones
 - Live consent is interpreted from request cookies, headers, geolocation, and policy defaults rather than a separate consent KV store
@@ -60,7 +58,7 @@ MOCK_SSP_URL="https://ssp.example.com"
 
 PARTNER_SOURCE_DOMAIN="ssp.example.com"
 PARTNER_NAME="Mocktioneer SSP"
-# Use the value provisioned under the partner_api_token secret-store key.
+# Use the value provisioned for the reviewed ec.inbound binding.
 PARTNER_API_KEY="<resolved-partner-api-token>"
 
 # Optional: use a real browser EC if already present
@@ -77,13 +75,13 @@ Partners are configured in `trusted-server.toml` and loaded at startup:
 ```toml
 [[ec.partners]]
 name = "Mocktioneer SSP"
-source_domain = "formally-vital-lion.edgecompute.app"
-api_token = "partner_api_token"
+source_domain = "ssp.example.com"
+api_token_enabled = true
 bidstream_enabled = true
 ```
 
-Provision the bearer token value under `partner_api_token`, then deploy or
-restart after changing partner configuration. The token is required for this
+Provision the reviewed `ec.inbound` binding, then recreate state after changing
+partner configuration or replacing a credential. The token is required for this
 demo because it exercises the inbound partner APIs.
 
 ## 4) Acquire or Reuse EC Cookie

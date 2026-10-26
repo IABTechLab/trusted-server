@@ -52,12 +52,12 @@ config push --adapter spin --local`. Without that mapping, the push can land in
 a store the runtime never reads. Local push writes the temporary
 `.spin/sqlite_key_value.db`; no repository-local Spin state is used.
 
-Spin encodes `v_<store>_v_<key>` names. The smoke supplies these exact
-variables:
-
-- `v_trusted_x5fserver_x5fsecrets_v_handler_x5fpassword`
-- `v_trusted_x5fserver_x5fsecrets_v_publisher_x5fproxy_x5fsecret`
-- `v_trusted_x5fserver_x5fsecrets_v_ec_x5fpassphrase`
+Generate exact names and both application/component declarations with
+`ts secrets plan --adapter spin`. Follow the
+[native variable walkthrough](./secrets#spin-native-variables). Merge component
+entries into one table, retain required secret declarations without plaintext
+defaults, and use protected provider input. `secret = true` alone does not
+encrypt storage. The local smoke must use generated contexts, not old labels.
 
 It first launches `spin up` before config is pushed, then relaunches it while
 omitting each variable independently. Every publisher request must return 503,
@@ -71,8 +71,10 @@ manifest, SQLite store, response captures, and logs.
 
 ## Runtime boundaries
 
-Use the same store mapping and encoded variables in the deployment provider;
-empty variable defaults fail closed. Spin's request-time store registry is
+Use the same store mapping and generated declarations in the deployment provider.
+Direct `set` and native presence `check` are unsupported; `check` exits nonzero.
+Verify native component reads, provider/name limits, HTTPS/no-follow, and
+config-writer permission separation before release. Host tests do not prove them. Spin's request-time store registry is
 currently unwired, so EC KV lookup, request-signing key variables, and key
 rotation are unavailable. The read-only `/_ts/admin/eids` diagnostic remains
 available. Forwarded client-IP headers are sanitized, and Spin derives its

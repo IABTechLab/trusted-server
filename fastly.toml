@@ -49,26 +49,23 @@ build = """
             key = "api_key"
             env = "FASTLY_KEY"
 
-        # Local-only values for the three secret references in
-        # trusted-server.example.toml. These are public development fixtures.
-        # App-config references use logical `trusted_server_secrets`. Viceroy
-        # exposes the store under that ID, matching the resource link a
-        # deployment creates for the selected physical store.
-        [[local_server.secret_stores.trusted_server_secrets]]
-            key = "publisher_proxy_secret"
-            data = "local-only-publisher-proxy-secret"
+# Local-only fictional values compiled from trusted-server.example.toml.
+# Regenerate with scripts/generate-integration-viceroy-configs.sh --local-manifests.
+# BEGIN GENERATED APP SECRET FIXTURES
 
-        [[local_server.secret_stores.trusted_server_secrets]]
-            key = "ec_passphrase"
-            data = "local-only-ec-passphrase-32-bytes"
+[[local_server.secret_stores.trusted_server_secrets]]
+key = "ts1_juuqz3tbywbbzruyd2bvt56qmxuiokdflb4ii2dfmjvw7ypyjwbq"
+data = "integration-test-ec-secret-padded-32"
 
-        [[local_server.secret_stores.trusted_server_secrets]]
-            key = "handler_password"
-            data = "local-only-handler-password"
+[[local_server.secret_stores.trusted_server_secrets]]
+key = "ts1_kw4dni7h367mab3ywnml5mqvumkwivjjxzduonjz7mw3mihm42da"
+data = "integration-admin-password-32-bytes-ok"
 
-        [[local_server.secret_stores.trusted_server_secrets]]
-            key = "tinybird_auction_append_token"
-            data = "test-tinybird-auction-append-token"
+[[local_server.secret_stores.trusted_server_secrets]]
+key = "ts1_mu4d7mg5sfuleogirpka2zbh2b33lsocgyl6wcovawmjs4nfmi6a"
+data = "integration-test-proxy-secret-32-bytes-ok"
+
+# END GENERATED APP SECRET FIXTURES
 
     [local_server.config_stores]
         [local_server.config_stores.trusted_server_config]

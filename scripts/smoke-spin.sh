@@ -6,11 +6,13 @@ set -euo pipefail
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source=scripts/smoke-common.sh
 . "$REPO_ROOT/scripts/smoke-common.sh"
+smoke_use_local_store_mappings default
 
 smoke_require_command cargo
 smoke_require_command curl
 smoke_require_command python3
 smoke_require_command spin
+smoke_require_command jq
 smoke_require_command pgrep
 smoke_require_spin_version
 
@@ -43,6 +45,7 @@ fi
 smoke_start_origin "$WORKSPACE" "$ORIGIN_PORT"
 ORIGIN_PID=$SMOKE_ORIGIN_PID
 smoke_initialize_config "$REPO_ROOT" "$WORKSPACE" "$ORIGIN_PORT"
+smoke_generate_bindings "$REPO_ROOT" "$WORKSPACE" spin
 
 SPIN_WORK="$WORKSPACE/spin"
 mkdir -p "$SPIN_WORK"
@@ -55,9 +58,14 @@ sed \
     -e "s|manifest = \"$REPO_ROOT/crates/trusted-server-adapter-spin/spin.toml\"|manifest = \"$SPIN_WORK/spin.toml\"|" \
     "$REPO_ROOT/edgezero.toml" >"$WORKSPACE/edgezero.toml"
 
-SPIN_HANDLER_VAR=v_trusted_x5fserver_x5fsecrets_v_handler_x5fpassword
-SPIN_PROXY_VAR=v_trusted_x5fserver_x5fsecrets_v_publisher_x5fproxy_x5fsecret
-SPIN_EC_VAR=v_trusted_x5fserver_x5fsecrets_v_ec_x5fpassphrase
+"$SMOKE_GENERATOR" --adapter spin --template "$SPIN_WORK/spin.toml" \
+    --app-config "$SMOKE_APP_CONFIG" --output "$SPIN_WORK/spin.generated.toml"
+# Only the isolated negative-test manifest permits empty defaults, so omission
+# reaches core's native-value validation rather than failing at Spin startup.
+sed 's/^required = true$/default = ""/' "$SPIN_WORK/spin.generated.toml" >"$SPIN_WORK/spin.toml"
+SPIN_HANDLER_VAR=$SMOKE_HANDLER_ENV
+SPIN_PROXY_VAR=$SMOKE_PROXY_ENV
+SPIN_EC_VAR=$SMOKE_EC_ENV
 
 run_case() {
     local case_name="$1"
@@ -77,15 +85,9 @@ run_case() {
         --truncate-logs
     )
     smoke_assert_process_alive "$ORIGIN_PID" "stub origin" "$WORKSPACE/origin.log"
-    if [ "$missing_variable" != "$SPIN_HANDLER_VAR" ]; then
-        spin_args+=(--variable "$SPIN_HANDLER_VAR=$SMOKE_HANDLER_VALUE")
-    fi
-    if [ "$missing_variable" != "$SPIN_PROXY_VAR" ]; then
-        spin_args+=(--variable "$SPIN_PROXY_VAR=$SMOKE_PROXY_VALUE")
-    fi
-    if [ "$missing_variable" != "$SPIN_EC_VAR" ]; then
-        spin_args+=(--variable "$SPIN_EC_VAR=$SMOKE_EC_VALUE")
-    fi
+    while IFS=$'\t' read -r name value; do
+        [ "$name" = "$missing_variable" ] || spin_args+=(--variable "$name=$value")
+    done < <(jq -r '.[] | [.native.native_name, .value] | @tsv' "$SMOKE_BINDINGS")
 
     "${spin_args[@]}" >"$log_path" 2>&1 &
     APP_PID=$!
@@ -129,11 +131,11 @@ EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=default \
 CONFIG_PUSHED=true
 
 run_case missing-handler "$((BASE_PORT + 1))" "$SPIN_HANDLER_VAR" 503 \
-    "resolved secret at \`handlers[0].password\` must not be empty"
+    "handlers[0].password: empty credential"
 run_case missing-proxy "$((BASE_PORT + 2))" "$SPIN_PROXY_VAR" 503 \
-    "resolved secret at \`publisher.proxy_secret\` must not be empty"
+    "publisher.proxy_secret: empty credential"
 run_case missing-ec "$((BASE_PORT + 3))" "$SPIN_EC_VAR" 503 \
-    "resolved secret at \`ec.passphrase\` must not be empty"
+    "ec.passphrase: empty credential"
 run_case positive "$((BASE_PORT + 4))" "" 200
 
 echo "Spin first-success smoke passed"

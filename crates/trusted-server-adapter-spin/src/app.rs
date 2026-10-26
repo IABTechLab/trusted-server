@@ -105,6 +105,7 @@ fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
         })?;
     let secret_store = SpinSecretStoreAdapter;
     settings_from_config_blob(&raw_envelope, &secret_store, &default_secret_store_name())
+        .map(|loaded| loaded.settings().clone())
 }
 
 #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
@@ -652,7 +653,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let req = ctx.into_request();
-                let result = PartnerRegistry::from_config(&s.settings.ec.partners)
+                let result = PartnerRegistry::from_settings(&s.settings)
                     .and_then(|registry| handle_admin_eids_lookup(&registry, &req));
                 Ok::<Response, EdgeError>(result.unwrap_or_else(|e| http_error(&e)))
             }

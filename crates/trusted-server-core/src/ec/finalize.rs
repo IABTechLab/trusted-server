@@ -607,6 +607,7 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
+            api_token_enabled: true,
             api_token: Some(Redacted::new(format!(
                 "token-{source_domain}-32-bytes-minimum-value"
             ))),
@@ -1178,8 +1179,14 @@ mod tests {
         partner.pull_sync_enabled = true;
         partner.pull_sync_url = Some("https://sync.example.com/pull".to_owned());
         partner.pull_sync_allowed_domains = vec!["sync.example.com".to_owned()];
-        partner.ts_pull_token = Some(Redacted::new("pull-token".to_owned()));
-        let registry = PartnerRegistry::from_config(&[partner]).expect("should build registry");
+        partner.ts_pull_token = Some(Redacted::new(
+            "fictional-pull-token-with-32-bytes-minimum".to_owned(),
+        ));
+        let mut settings = settings;
+        settings.ec.partners = vec![partner];
+        crate::test_support::secret_bindings::install_test_bindings(&mut settings)
+            .expect("should resolve fixture bindings");
+        let registry = PartnerRegistry::from_settings(&settings).expect("should build registry");
         let graph = KvIdentityGraph::in_memory("test_store");
         let mut response = empty_response();
 
@@ -2303,8 +2310,14 @@ mod tests {
         partner.pull_sync_enabled = true;
         partner.pull_sync_url = Some("https://sync.example.com/pull".to_owned());
         partner.pull_sync_allowed_domains = vec!["sync.example.com".to_owned()];
-        partner.ts_pull_token = Some(Redacted::new("pull-token".to_owned()));
-        let registry = PartnerRegistry::from_config(&[partner]).expect("should build registry");
+        partner.ts_pull_token = Some(Redacted::new(
+            "fictional-pull-token-with-32-bytes-minimum".to_owned(),
+        ));
+        let mut settings = settings;
+        settings.ec.partners = vec![partner];
+        crate::test_support::secret_bindings::install_test_bindings(&mut settings)
+            .expect("should resolve fixture bindings");
+        let registry = PartnerRegistry::from_settings(&settings).expect("should build registry");
         let mut ec_context = make_context(
             Some(&ec_id),
             Some(&ec_id),

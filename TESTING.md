@@ -1,5 +1,29 @@
 # Testing auction orchestration
 
+## Secret-binding release evidence
+
+App config must contain no removed credential properties. Provision fictional
+generated bindings from the same compiler/renderer as runtime; direct resolved
+`Settings` unit fixtures are internal, not public TOML examples. See
+[provisioning](docs/guide/secrets.md), [CI](docs/guide/secrets-ci.md), and
+[migration](docs/guide/secret-binding-migration.md).
+
+Host Rust tests, native-name rendering, metadata presence, and route smoke tests
+are different evidence. Release still requires nonempty shipping Rust test runs,
+actual reads and HTTPS/no-follow flows on Axum, Viceroy/Fastly, Wrangler/workerd,
+and Spin, isolated Fastly create/replace/read-through tests, secure CLI/CI input
+tests, config-only versus secret-writer IAM proof, and migration/retirement/
+rollback rehearsals. No credentials or provider access were used to write these
+guides. Unavailable environments are blockers, not passes.
+
+Rehearse all four native walkthroughs with fictional values in isolated resources.
+Test config/plan/overlay/compiler/manifest/service/store drift before input and
+with zero mutations, repeated-role selection, unsupported adapter writes,
+cancellation, invalid bytes/newlines, provider failures and uncertain outcomes.
+Inspect argv/stdin/output without printing sentinel credentials. Test same-context
+replacement, fresh versus retained states, S3 maintenance, and old-context replay
+after deletion. Do not claim Tinybird response observation or fleet-wide refresh.
+
 ## Start the local server
 
 Configure at least one reachable provider in `trusted-server.toml`, then start the

@@ -100,6 +100,12 @@ export default withMermaid(
           items: [
             { text: 'EdgeZero Lifecycle', link: '/guide/edgezero' },
             { text: 'Configuration', link: '/guide/configuration' },
+            { text: 'App credentials', link: '/guide/secrets' },
+            { text: 'CI provisioning', link: '/guide/secrets-ci' },
+            {
+              text: 'Secret binding migration',
+              link: '/guide/secret-binding-migration',
+            },
             { text: 'CLI', link: '/guide/cli' },
             { text: 'Dev Proxy', link: '/guide/ts-dev-proxy' },
             { text: 'Testing', link: '/guide/testing' },

@@ -37,11 +37,7 @@ pub fn config_env_var(store_name: &str, key: &str) -> String {
 }
 
 fn secret_env_var(store_name: &str, key: &str) -> String {
-    format!(
-        "TRUSTED_SERVER_SECRET_{}_{}",
-        normalize_env_segment(store_name),
-        normalize_env_segment(key),
-    )
+    trusted_server_core::secret_bindings::axum_secret_name(store_name, key)
 }
 
 // ---------------------------------------------------------------------------

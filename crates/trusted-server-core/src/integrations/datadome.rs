@@ -79,6 +79,7 @@ use crate::integrations::{
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::redacted::Redacted;
+use crate::secret_bindings::ResolvedBinding;
 use crate::settings::{IntegrationConfig, Settings};
 
 mod protection;
@@ -139,10 +140,8 @@ pub struct ProtectionTestBypassConfig {
     #[serde(default)]
     pub credential_secret_store: Option<String>,
 
-    /// Secret reference containing the bypass credential.
-    ///
-    /// Holds the store key name in app config and the resolved credential at
-    /// runtime. Treat it as secret material after settings are built.
+    /// Internal resolved credential shadow. Unresolved config rejects this
+    /// former property; the private loaded binding authorizes bypass use.
     #[serde(default)]
     pub credential_secret_name: Option<Redacted<String>>,
 }
@@ -184,10 +183,8 @@ pub struct DataDomeConfig {
     #[serde(default)]
     pub server_side_key_secret_store: Option<String>,
 
-    /// Secret reference containing the `DataDome` server-side key.
-    ///
-    /// Holds the store key name in app config and the resolved key at runtime.
-    /// Treat it as secret material after settings are built.
+    /// Internal resolved credential shadow. Unresolved config rejects this
+    /// former property; only the private loaded binding authorizes export.
     #[serde(default)]
     pub server_side_key_secret_name: Option<Redacted<String>>,
 
@@ -378,12 +375,47 @@ impl IntegrationConfig for DataDomeConfig {
 pub struct DataDomeIntegration {
     config: DataDomeConfig,
     protection_scope: ProtectionScope,
+    protection_binding: Option<ResolvedBinding>,
+    bypass_binding: Option<ResolvedBinding>,
 }
 
 impl DataDomeIntegration {
     #[cfg(test)]
     fn new(config: DataDomeConfig) -> Arc<Self> {
-        Self::try_new(config).expect("should create DataDome integration")
+        Self::with_test_bindings(config).expect("should create DataDome integration")
+    }
+
+    #[cfg(test)]
+    fn with_test_bindings(config: DataDomeConfig) -> Result<Arc<Self>, Report<TrustedServerError>> {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.integrations.insert_config("datadome", &serde_json::json!({
+            "enabled": config.enabled,
+            "enable_protection": config.enable_protection,
+            "protection_api_origin": config.protection_api_origin,
+            "server_side_key_secret_name": config.server_side_key_secret_name.as_ref().map(Redacted::expose),
+            "protection_test_bypass": {
+                "enabled": config.protection_test_bypass.as_ref().is_some_and(|bypass| bypass.enabled),
+                "credential_secret_name": config.protection_test_bypass.as_ref().and_then(|bypass| bypass.credential_secret_name.as_ref()).map(Redacted::expose)
+            }
+        }))?;
+        crate::test_support::secret_bindings::install_test_bindings(&mut settings)?;
+        let mut integration = Self::try_new(config)?;
+        let inner = Arc::get_mut(&mut integration).expect("should own integration");
+        inner.protection_binding = settings
+            .resolved_bindings
+            .get(
+                "datadome.server",
+                "integrations.datadome.server_side_key_secret_name",
+            )
+            .cloned();
+        inner.bypass_binding = settings
+            .resolved_bindings
+            .get(
+                "datadome.bypass",
+                "integrations.datadome.protection_test_bypass.credential_secret_name",
+            )
+            .cloned();
+        Ok(integration)
     }
 
     fn try_new(mut config: DataDomeConfig) -> Result<Arc<Self>, Report<TrustedServerError>> {
@@ -392,12 +424,6 @@ impl DataDomeIntegration {
                 "DataDome server_side_key_secret_store is deprecated and ignored; static credentials resolve through the default app-config secret store"
             );
         }
-        config.server_side_key_secret_name =
-            config.server_side_key_secret_name.take().and_then(|value| {
-                let value = value.expose().trim().to_string();
-                (!value.is_empty()).then(|| Redacted::new(value))
-            });
-        config.protection_api_origin = config.protection_api_origin.trim().to_string();
         config.client_side_tag_url = config.client_side_tag_url.trim().to_string();
         if let Some(bypass) = &mut config.protection_test_bypass
             && bypass.credential_secret_store.take().is_some()
@@ -408,11 +434,6 @@ impl DataDomeIntegration {
         }
 
         if config.enable_protection {
-            if config.server_side_key_secret_name.is_none() {
-                return Err(Report::new(Self::error(
-                    "server_side_key_secret_name is required when enable_protection is true",
-                )));
-            }
             Self::validate_protection_api_origin(&config.protection_api_origin)?;
         }
         Self::validate_protection_test_bypass(&config)?;
@@ -430,6 +451,8 @@ impl DataDomeIntegration {
         Ok(Arc::new(Self {
             config,
             protection_scope,
+            protection_binding: None,
+            bypass_binding: None,
         }))
     }
 
@@ -497,7 +520,7 @@ impl DataDomeIntegration {
     fn validate_protection_test_bypass(
         config: &DataDomeConfig,
     ) -> Result<(), Report<TrustedServerError>> {
-        let Some(bypass) = config
+        let Some(_bypass) = config
             .protection_test_bypass
             .as_ref()
             .filter(|bypass| bypass.enabled)
@@ -508,15 +531,6 @@ impl DataDomeIntegration {
         if !config.enable_protection {
             return Err(Report::new(Self::error(
                 "protection_test_bypass requires enable_protection to be true",
-            )));
-        }
-        if bypass
-            .credential_secret_name
-            .as_ref()
-            .is_none_or(|credential| credential.expose().is_empty())
-        {
-            return Err(Report::new(Self::error(
-                "protection_test_bypass credential_secret_name is required when enabled",
             )));
         }
 
@@ -954,7 +968,47 @@ fn build(
         return Ok(None);
     };
 
-    let integration = DataDomeIntegration::try_new(config)?;
+    let protection_binding = if config.enable_protection {
+        Some(
+            settings
+                .resolved_bindings
+                .require_for_settings(
+                    settings,
+                    "datadome.server",
+                    "integrations.datadome.server_side_key_secret_name",
+                )?
+                .clone(),
+        )
+    } else {
+        None
+    };
+    let bypass_binding = if config.enable_protection
+        && config
+            .protection_test_bypass
+            .as_ref()
+            .is_some_and(|bypass| bypass.enabled)
+    {
+        Some(
+            settings
+                .resolved_bindings
+                .require_for_settings(
+                    settings,
+                    "datadome.bypass",
+                    "integrations.datadome.protection_test_bypass.credential_secret_name",
+                )?
+                .clone(),
+        )
+    } else {
+        None
+    };
+    let mut integration = DataDomeIntegration::try_new(config)?;
+    let inner = Arc::get_mut(&mut integration).ok_or_else(|| {
+        Report::new(DataDomeIntegration::error(
+            "integration construction failed",
+        ))
+    })?;
+    inner.protection_binding = protection_binding;
+    inner.bypass_binding = bypass_binding;
     let protection_test_bypass_configured = integration
         .config
         .protection_test_bypass
@@ -1277,7 +1331,7 @@ mod tests {
                 credential_secret_name: credential.map(|value| Redacted::new(value.to_string())),
             });
 
-            let err = match DataDomeIntegration::try_new(config) {
+            let err = match DataDomeIntegration::with_test_bindings(config) {
                 Ok(_) => panic!("should reject invalid protection test bypass configuration"),
                 Err(err) => err,
             };
@@ -1289,7 +1343,7 @@ mod tests {
     }
 
     #[test]
-    fn protection_test_bypass_accepts_short_resolved_credential() {
+    fn protection_test_bypass_rejects_short_resolved_credential() {
         let mut config = test_config();
         config.enable_protection = true;
         config.server_side_key_secret_name = Some(Redacted::new("resolved-server-key".to_string()));
@@ -1299,8 +1353,7 @@ mod tests {
             credential_secret_name: Some(Redacted::new("short".to_string())),
         });
 
-        DataDomeIntegration::try_new(config)
-            .expect("should defer bypass credential strength enforcement to requests");
+        assert!(DataDomeIntegration::with_test_bindings(config).is_err());
     }
 
     #[test]
@@ -1315,17 +1368,15 @@ mod tests {
             credential_secret_name: Some(Redacted::new(credential.to_owned())),
         });
 
-        let integration =
-            DataDomeIntegration::try_new(config).expect("should create DataDome integration");
+        let integration = DataDomeIntegration::with_test_bindings(config)
+            .expect("should create DataDome integration");
         let resolved = integration
-            .config
-            .protection_test_bypass
+            .bypass_binding
             .as_ref()
-            .and_then(|bypass| bypass.credential_secret_name.as_ref())
-            .expect("should retain the resolved bypass credential");
+            .expect("should retain loaded bypass binding");
 
         assert_eq!(
-            resolved.expose(),
+            resolved.credential(),
             credential,
             "should not normalize resolved secret material"
         );
@@ -1335,9 +1386,9 @@ mod tests {
     fn protection_enabled_requires_server_side_key_secret_name() {
         let mut config = test_config();
         config.enable_protection = true;
-        config.server_side_key_secret_name = Some(Redacted::new(" ".to_string()));
+        config.server_side_key_secret_name = None;
 
-        let err = match DataDomeIntegration::try_new(config) {
+        let err = match DataDomeIntegration::with_test_bindings(config) {
             Ok(_) => panic!("should reject empty name"),
             Err(err) => err,
         };

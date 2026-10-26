@@ -5,7 +5,7 @@ proxy and click URLs. For usage and endpoints, see [First-Party Proxy](/guide/fi
 
 ## Signature Generation
 
-Signatures use HMAC-SHA256 with the publisher's `proxy_secret`:
+Signatures use HMAC-SHA256 with the publisher's implicit `publisher.proxy` credential:
 
 ```
 1. Reconstruct full URL: tsurl + query params (sorted)
@@ -15,16 +15,13 @@ Signatures use HMAC-SHA256 with the publisher's `proxy_secret`:
 5. Result = tstoken
 ```
 
-**Configuration**:
+**Provisioning**:
 
-```toml
-[publisher]
-proxy_secret = "publisher_proxy_secret"
-```
-
-The config value is a key in the Trusted Server secret store. Provision a
-secure random signing value under `publisher_proxy_secret`; at least 32 random
-bytes are recommended.
+Provision the fixed `publisher.proxy` role from a [reviewed plan](./secrets).
+No `proxy_secret` property belongs in public TOML. Use a confidential,
+cryptographically random value, with at least 32 random bytes recommended.
+Replacing it invalidates existing proxy URLs and requires state recreation.
+This is separate from request-signing `signing_keys`/JWKS rotation.
 
 ## Signature Validation
 

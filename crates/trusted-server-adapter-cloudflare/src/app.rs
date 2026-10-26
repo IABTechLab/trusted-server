@@ -157,6 +157,7 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
     let secret_store = crate::platform::CloudflareSecretStoreAdapter { env };
     let default_secret_store = StoreName::from(DEFAULT_SECRET_STORE_ID);
     settings_from_config_blob(envelope, &secret_store, &default_secret_store)
+        .map(|loaded| loaded.settings().clone())
 }
 
 #[cfg(any(test, target_arch = "wasm32"))]
@@ -649,7 +650,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .get(
                 "/_ts/admin/eids",
                 make_handler(Arc::clone(&state), |s, _services, req| async move {
-                    let partner_registry = PartnerRegistry::from_config(&s.settings.ec.partners)?;
+                    let partner_registry = PartnerRegistry::from_settings(&s.settings)?;
                     handle_admin_eids_lookup(&partner_registry, &req)
                 }),
             )
