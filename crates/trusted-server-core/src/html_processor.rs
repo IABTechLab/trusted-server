@@ -700,6 +700,8 @@ pub(crate) fn create_html_processor_with_document_state(
 
     // Selector callbacks retain lol_html's CSS matching; only the composed text
     // callback mutates a fragment. Start each script with fresh match state.
+    // Match flags are flat: nested SVG scripts do not restore an outer script's
+    // flags when the inner script ends.
     // Without script rewriters, skip script text capture entirely.
     if !script_rewriters.is_empty() {
         let script_matches = Rc::new(RefCell::new(vec![false; script_rewriters.len()]));
