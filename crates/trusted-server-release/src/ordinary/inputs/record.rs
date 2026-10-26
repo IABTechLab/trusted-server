@@ -112,6 +112,24 @@ fn version_matches(kind: &str, pin: &str, version: &str) -> bool {
         })
 }
 
+/// Checks recorded versions against the independent comparison checkout's pins.
+///
+/// # Errors
+///
+/// Rejects ambiguous source pins or any recorded compiler/Node version mismatch.
+pub(in crate::ordinary) fn verify_versions(
+    checkout: &Path,
+    value: &serde_json::Value,
+) -> Result<(), Report<ReleaseError>> {
+    let pins = pins(checkout)?;
+    let tools: Tools = serde_json::from_value(value.clone()).map_err(|_| rejected())?;
+    require(
+        version_matches("rustc", &pins.rust, &tools.rustc.version)
+            && version_matches("node", &pins.node, &tools.node.version),
+        "ordinary recorded tool versions differ from comparison source pins",
+    )
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Request {

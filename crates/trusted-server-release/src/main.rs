@@ -14,7 +14,6 @@ mod inspect;
 mod javascript;
 #[allow(dead_code, reason = "consumed by Task 7 material preparation")]
 mod materials;
-#[allow(dead_code, reason = "ordinary adapter command assembly is pending")]
 mod ordinary;
 mod package;
 mod policy;
@@ -72,6 +71,29 @@ enum Command {
     },
     /// Diagnostic report of pending inputs; constructs no authorization.
     AuditInputs,
+    /// Record one actual ordinary Fastly build; grants no recipe qualification.
+    OrdinaryMeasure {
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Validate current-run upload bindings before downloading exact artifact IDs.
+    OrdinaryTransferPlan {
+        #[arg(long)]
+        input: PathBuf,
+    },
+    /// Compare the four bound archives and seal only actual ordinary equality.
+    OrdinaryCompare {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        archives: PathBuf,
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Inspect a retained manual Fastly package against independently approved digests.
     InspectFastlyPackage {
         #[arg(long)]
@@ -142,6 +164,27 @@ fn run(
             Ok(ExitCode::SUCCESS)
         }
         Command::AuditInputs => audit_inputs(),
+        Command::OrdinaryMeasure { request, output } => {
+            ordinary::measure_build(&request, &output)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::OrdinaryTransferPlan { input } => {
+            let value = ordinary::transfer_plan(&input)?;
+            let bytes = documents::canonical_json(&value, documents::Role::Metadata)?;
+            std::io::stdout().write_all(&bytes).map_err(|_| {
+                Report::new(ReleaseError::Document).attach("cannot write ordinary transfer plan")
+            })?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::OrdinaryCompare {
+            input,
+            archives,
+            source,
+            output,
+        } => {
+            ordinary::compare_transfers(&input, &archives, &source, &output)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::InspectFastlyPackage {
             package_dir,
             manifest,

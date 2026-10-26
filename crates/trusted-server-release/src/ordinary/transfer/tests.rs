@@ -90,6 +90,30 @@ pub(in crate::ordinary) fn checked_fixture() -> Checked {
         .expect("should construct an unqualified ordinary test comparison")
 }
 
+pub(in crate::ordinary) fn command_fixture(
+    source: &std::path::Path,
+) -> ([Vec<u8>; 3], [Vec<u8>; 4]) {
+    let mut fixture = Fixture::new();
+    let identity = crate::ordinary::inputs::source_identity(source, &"a".repeat(40))
+        .expect("should derive fixture recipe from independent comparison source");
+    for (index, mut observed) in [(1, tests::fixture()), (3, tests::reproduction())] {
+        observed["recipe_sha256"] = json!(identity.recipe_sha256);
+        observed["cargo_lock_sha256"] = json!(identity.cargo_lock_sha256);
+        observed["npm_lock_sha256"] = json!(identity.npm_lock_sha256);
+        observed["tools"]["rustc"]["version"] = json!("rustc 1.98.1 (abcdef123 2026-01-01)");
+        fixture.archives[index] = zip(&[("fastly-observation.json", &encoded(&observed))], false);
+    }
+    fixture.refresh();
+    (
+        [
+            encoded(&fixture.request),
+            encoded(&fixture.jobs),
+            encoded(&fixture.artifacts),
+        ],
+        fixture.archives,
+    )
+}
+
 #[test]
 fn joins_exact_archives_and_emits_only_an_ordinary_matched_receipt() {
     let receipt = Fixture::new()

@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::{PermissionsExt as _, symlink};
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -604,4 +604,174 @@ fn bootstrap_checks_rust_toolchain_at_its_repository_root() {
         stderr(&output).contains("rust-toolchain"),
         "should reject the repository-root pin even from another working directory"
     );
+}
+
+/// Process fixtures stay in this CI-only integration harness, never the pure selection.
+fn ordinary_measurement(root: &Path, node_body: &str) -> Output {
+    let checkout = root.join("source");
+    let target = root.join("target");
+    fs::create_dir(&checkout).expect("should create ordinary source root");
+    fs::create_dir(&target).expect("should create ordinary target root");
+    for name in [
+        "scripts/release/phase1-build.sh",
+        ".cargo/config.toml",
+        "Cargo.toml",
+        "Cargo.lock",
+        "crates/trusted-server-js/lib/package-lock.json",
+    ] {
+        write(&checkout, name, b"fictional source input\n");
+    }
+    write(
+        &checkout,
+        "rust-toolchain.toml",
+        b"[toolchain]\nchannel = \"1.98.1\"\n",
+    );
+    write(&checkout, ".tool-versions", b"nodejs 24.20.0\n");
+    write(
+        &checkout,
+        "crates/trusted-server-js/Cargo.toml",
+        b"fictional JS package\n",
+    );
+    write(
+        &checkout,
+        "crates/trusted-server-js/lib/src/core/index.ts",
+        b"export {};\n",
+    );
+    write(
+        &checkout,
+        "release-assets/trusted-server-fastly.wasm",
+        b"\0asm\x01\0\0\0",
+    );
+    let js = checkout.join("crates/trusted-server-js");
+    fs::create_dir_all(js.join("lib/src/integrations"))
+        .expect("should retain an empty integration module set");
+    let out = target.join("wasm32-wasip1/release/build/trusted-server-js-fixture/out");
+    fs::create_dir_all(out.join("tsjs-dist")).expect("should create consumed private output");
+    fs::write(
+        out.join("tsjs-dist/tsjs-core.js"),
+        b"fictional private bundle",
+    )
+    .expect("should retain consumed bundle");
+    let package = format!("path+file://{}#0.1.0", js.display());
+    fs::write(
+        target.join("metadata.json"),
+        serde_json::to_vec(&json!({
+            "workspace_root":checkout,"workspace_members":[package],"packages":[{
+                "id":package,"name":"trusted-server-js","manifest_path":js.join("Cargo.toml")
+            }]
+        }))
+        .expect("should encode metadata"),
+    )
+    .expect("should retain locked metadata fixture");
+    let messages = [
+        json!({"reason":"build-script-executed","package_id":package,"out_dir":out,"env":[]}),
+        json!({"reason":"build-finished","success":true}),
+    ];
+    let lines = messages
+        .iter()
+        .map(|value| serde_json::to_string(value).expect("should encode Cargo line"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(target.join("messages.jsonl"), lines).expect("should retain completed Cargo output");
+    for (name, body) in [
+        ("rustc", "printf 'rustc 1.98.1 (abcdef123 2026-01-01)\\n'"),
+        ("node", node_body),
+    ] {
+        let script = format!(
+            "#!/bin/sh\nset -eu\ntest \"$#\" -eq 1\ntest \"$1\" = --version\ntest -z \"${{GH_TOKEN+x}}\"\ntest \"$LC_ALL/$TZ\" = C/UTC\n{body}\n"
+        );
+        write(&checkout, &format!("tools/{name}"), script.as_bytes());
+        fs::set_permissions(
+            checkout.join("tools").join(name),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("should set fixture executable permissions");
+    }
+    let request = json!({
+        "role":"canonical","source_commit":"a".repeat(40),
+        "environment":{
+            "checkout_root":checkout,"target_root":target,"started_at_seconds":1700000000_u64,
+            "umask":18,"jobs":4,"locale":"C","timezone":"UTC",
+            "uid":fs::metadata(&checkout).expect("should inspect actual fixture owner").uid()
+        },
+        "rustc":checkout.join("tools/rustc"),"node":checkout.join("tools/node"),
+        "cargo_messages":target.join("messages.jsonl"),"cargo_metadata":target.join("metadata.json")
+    });
+    let request_path = root.join("request.json");
+    fs::write(
+        &request_path,
+        serde_json::to_vec(&request).expect("should encode capture"),
+    )
+    .expect("should retain capture");
+    Command::new(RELEASE_BIN)
+        .current_dir(root)
+        .env_clear()
+        .env("GH_TOKEN", "fictional-credential-canary")
+        .arg("ordinary-measure")
+        .arg("--request")
+        .arg(request_path)
+        .arg("--output")
+        .arg(root.join("observed"))
+        .output()
+        .expect("should execute fixed measurement command only in CI")
+}
+
+#[test]
+fn ordinary_measurement_command_queries_only_versions_without_inherited_secrets() {
+    let temporary = tempdir().expect("should create process fixture");
+    let root = fs::canonicalize(temporary.path()).expect("should resolve process fixture");
+    let result = ordinary_measurement(&root, "printf 'v24.20.0\\n'");
+    assert!(
+        result.status.success(),
+        "should retain actual fixed-query measurements: {}",
+        stderr(&result)
+    );
+    let observed: Value = serde_json::from_slice(
+        &fs::read(root.join("observed/fastly-observation.json"))
+            .expect("should retain unpublished observation"),
+    )
+    .expect("should parse real observation");
+    assert_eq!(
+        observed["tools"]["node"]["version"], "v24.20.0",
+        "should measure child version output"
+    );
+    assert_eq!(
+        observed["release_qualification"], false,
+        "should not qualify ordinary builds"
+    );
+    assert!(
+        !root
+            .join("observed/trusted-server-fastly.wasm.rebuild-check.json")
+            .exists(),
+        "should not manufacture equality from one build"
+    );
+}
+
+#[test]
+fn ordinary_measurement_command_rejects_wrong_versions_and_sanitizes_failed_queries() {
+    for body in [
+        "printf 'v24.12.0\\n'",
+        "printf 'fictional-query-secret\\n' >&2; exit 1",
+    ] {
+        let temporary = tempdir().expect("should create failing process fixture");
+        let root = fs::canonicalize(temporary.path()).expect("should resolve process fixture");
+        let result = ordinary_measurement(&root, body);
+        assert!(
+            !result.status.success(),
+            "should fail on wrong version or failed query"
+        );
+        assert!(
+            result.stdout.is_empty(),
+            "should emit no acceptance on failure"
+        );
+        assert!(
+            !stderr(&result).contains("fictional-query-secret"),
+            "should not leak captured child diagnostics"
+        );
+        assert!(
+            !root.join("observed").exists(),
+            "should retain no output after failed measurement"
+        );
+    }
 }

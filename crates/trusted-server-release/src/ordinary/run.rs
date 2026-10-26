@@ -67,6 +67,7 @@ pub(super) struct Bindings {
 
 impl Bindings {
     /// The distinct canonical and reproduction producing jobs.
+    #[cfg(test)]
     pub(super) fn job_ids(&self) -> [u64; 2] {
         [self.canonical.job_id, self.reproduction.job_id]
     }

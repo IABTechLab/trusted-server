@@ -65,7 +65,7 @@ impl Checked {
             "artifact": upload(&build.artifact),
             "observation_artifact": upload(&build.observation),
             "environment": observation.value()["environment"],
-            "size": observation.facts.artifact.size,
+            "size": self.equality.size(),
             "sha256": observation.facts.artifact.sha256,
             "spdx_sha256": spdx,
         })

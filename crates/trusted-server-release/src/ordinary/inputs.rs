@@ -14,6 +14,8 @@ use crate::error::ReleaseError;
 
 mod record;
 
+pub(super) use record::{measure, verify_versions};
+
 /// Source-owned ordinary build input identities, independent of runner paths.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct SourceIdentity {
@@ -280,4 +282,4 @@ fn expected_bundles(checkout: &Path) -> Result<BTreeSet<String>, Report<ReleaseE
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

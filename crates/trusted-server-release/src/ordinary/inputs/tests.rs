@@ -6,14 +6,14 @@ use serde_json::{Value, json};
 
 use super::{javascript_identity, source_identity};
 
-pub(super) struct Fixture {
+pub(in crate::ordinary) struct Fixture {
     _temporary: tempfile::TempDir,
-    pub(super) checkout: PathBuf,
+    pub(in crate::ordinary) checkout: PathBuf,
     pub(super) target: PathBuf,
 }
 
 impl Fixture {
-    pub(super) fn new() -> Self {
+    pub(in crate::ordinary) fn new() -> Self {
         let temporary = tempfile::tempdir().expect("should create source fixture");
         let outer = fs::canonicalize(temporary.path()).expect("should resolve fixture root");
         let checkout = outer.join("source");

@@ -15,10 +15,13 @@ use crate::documents::{self, Role};
 use crate::error::ReleaseError;
 
 mod archive;
+mod commands;
 mod inputs;
 mod output;
 mod run;
 mod transfer;
+
+pub(crate) use commands::{compare_transfers, measure_build, transfer_plan};
 
 const PROFILE: &str = "ordinary-release-fastly-byte-equality-v1";
 const ASSET: &str = "trusted-server-fastly.wasm";

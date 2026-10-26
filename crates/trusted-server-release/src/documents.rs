@@ -39,6 +39,10 @@ pub(crate) enum Role {
     CargoMessage,
     /// Internal Cargo observations; never a published metadata contract.
     CargoObservation,
+    /// One immutable hosted artifact ZIP, checked before narrow parsing.
+    ArtifactArchive,
+    /// One private ordinary observation ZIP, bounded before allocation.
+    ObservationArchive,
 }
 
 impl Role {
@@ -50,6 +54,8 @@ impl Role {
             Self::Companion | Self::Bundle => 32 * 1024 * 1024,
             Self::Spdx | Self::CargoObservation => 16 * 1024 * 1024,
             Self::Executable => 512 * 1024 * 1024,
+            Self::ArtifactArchive => 768 * 1024 * 1024,
+            Self::ObservationArchive => 2 * 1024 * 1024,
         }
     }
 }
