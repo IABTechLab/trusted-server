@@ -8154,8 +8154,11 @@ mod tests {
         let mut settings = create_test_settings();
         settings.ec.partners = vec![pull_partner_config("ids.example.com")];
         ec_context.set_identity_runtime(Arc::new(
-            crate::ec::identity::IdentityRuntime::from_settings(&settings)
-                .expect("should build the runtime"),
+            crate::ec::identity::IdentityRuntime::from_settings(
+                &settings,
+                &IntegrationRegistry::default(),
+            )
+            .expect("should build the runtime"),
         ));
         let cookie_entries = serde_json::json!([
             { "source": "ids.example.com", "uids": [{ "id": "invalidated", "atype": 1 }] }

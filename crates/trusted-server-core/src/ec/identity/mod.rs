@@ -10,6 +10,10 @@ pub(crate) mod catalog;
 pub(crate) mod coordinator;
 pub(crate) mod denials;
 pub mod descriptor;
+// Temporary: later identity tasks import the items they use.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) mod examples;
 pub mod exchange;
 pub mod flush;
 pub(crate) mod generic_pull;

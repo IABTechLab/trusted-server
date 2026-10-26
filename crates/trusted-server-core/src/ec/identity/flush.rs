@@ -573,7 +573,11 @@ mod tests {
         }
 
         fn with_settings(row: Option<&KvEntry>, settings: Settings) -> Self {
-            let runtime = IdentityRuntime::from_settings(&settings).expect("should build runtime");
+            let runtime = IdentityRuntime::from_settings(
+                &settings,
+                &crate::integrations::IntegrationRegistry::default(),
+            )
+            .expect("should build runtime");
             let client = Arc::new(FakeHttpClient::new());
             let backend = Arc::new(FakeBackend::new());
             let services = fake_services(&client, &backend);

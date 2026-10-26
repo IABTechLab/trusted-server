@@ -48,8 +48,8 @@ mod template_cache;
 mod tinybird;
 
 use crate::app::{
-    AppState, EcFinalizeState, RuntimeStoreConfig, TrustedServerApp, build_identity_runtime,
-    load_settings_from_config_store,
+    AppState, EcFinalizeState, RuntimeStoreConfig, TrustedServerApp,
+    build_identity_runtime_from_reloaded_settings, load_settings_from_config_store,
 };
 use crate::ec_kv::FastlyEcKvStore;
 use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers, resolve_geo_for_response};
@@ -540,7 +540,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
                 // No application state was built, so the identity runtime
                 // comes from the reloaded settings. Without one, finalize and
                 // the withdrawal retry still run; only phase 4 is skipped.
-                let identity = match build_identity_runtime(&settings) {
+                let identity = match build_identity_runtime_from_reloaded_settings(&settings) {
                     Ok(identity) => {
                         ec_state
                             .ec_context

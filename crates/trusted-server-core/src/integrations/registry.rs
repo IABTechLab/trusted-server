@@ -12,6 +12,7 @@ use crate::auction::AuctionPlan;
 use crate::constants::HEADER_X_TS_EC;
 use crate::ec::EcContext;
 use crate::ec::finalize::BrowserSeed;
+use crate::ec::identity::{IdentityProvider, IdentityProviderError};
 use crate::ec::kv::KvIdentityGraph;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
@@ -630,6 +631,7 @@ pub struct IntegrationRegistration {
     pub html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
     pub head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     pub request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    pub identity_providers: Vec<Arc<dyn IdentityProvider>>,
 }
 
 impl IntegrationRegistration {
@@ -656,6 +658,7 @@ impl IntegrationRegistrationBuilder {
                 html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                identity_providers: Vec::new(),
             },
         }
     }
@@ -702,6 +705,34 @@ impl IntegrationRegistrationBuilder {
         self
     }
 
+    /// Registers an identity provider this integration contributes.
+    #[must_use]
+    pub fn with_identity_provider(mut self, provider: Arc<dyn IdentityProvider>) -> Self {
+        self.registration.identity_providers.push(provider);
+        self
+    }
+
+    /// Registers a provider built by a fallible constructor.
+    ///
+    /// A failure becomes [`TrustedServerError::Integration`], naming the
+    /// integration the builder already holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Integration`] when `provider` is an error.
+    pub fn try_with_identity_provider<P: IdentityProvider + 'static>(
+        self,
+        provider: Result<P, Report<IdentityProviderError>>,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        match provider {
+            Ok(provider) => Ok(self.with_identity_provider(Arc::new(provider))),
+            Err(error) => Err(Report::new(TrustedServerError::Integration {
+                integration: self.registration.integration_id.to_owned(),
+                message: error.current_context().to_string(),
+            })),
+        }
+    }
+
     /// Mark this integration's JS module for deferred loading via
     /// `<script defer>` instead of the main synchronous bundle.
     #[must_use]
@@ -722,6 +753,46 @@ impl IntegrationRegistrationBuilder {
     pub fn build(self) -> IntegrationRegistration {
         self.registration
     }
+}
+
+/// Rejects a capture rule outside the registering integration's own routes.
+fn validate_capture_rules(
+    registration: &IntegrationRegistration,
+) -> Result<(), Report<TrustedServerError>> {
+    let routes: Vec<String> = registration
+        .proxies
+        .iter()
+        .flat_map(|proxy| proxy.routes())
+        .map(|route| route.path)
+        .collect();
+    for provider in &registration.identity_providers {
+        let Some(captures) = provider.descriptor().captures() else {
+            continue;
+        };
+        let paths_ok = captures.paths().iter().all(|(_, path)| {
+            routes.iter().any(|route| match route.strip_suffix('*') {
+                Some(base) if base.ends_with('/') => path.starts_with(base),
+                _ => route == path,
+            })
+        });
+        // An exact route never contains a prefix, which matches more paths.
+        let prefixes_ok = captures.prefixes().iter().all(|prefix| {
+            routes.iter().any(|route| match route.strip_suffix('*') {
+                Some(base) if base.ends_with('/') => prefix.starts_with(base),
+                _ => false,
+            })
+        });
+        if !paths_ok || !prefixes_ok {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "integration `{}` identity provider `{}` captures a path outside its own routes",
+                    registration.integration_id,
+                    provider.descriptor().id()
+                ),
+            }));
+        }
+    }
+    Ok(())
 }
 
 type RouteValue = (Arc<dyn IntegrationProxy>, &'static str);
@@ -746,6 +817,7 @@ struct IntegrationRegistryInner {
     html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
     head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    identity_providers: Vec<Arc<dyn IdentityProvider>>,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -767,6 +839,7 @@ impl Default for IntegrationRegistryInner {
             html_stream_processors: Vec::new(),
             head_injectors: Vec::new(),
             request_filters: Vec::new(),
+            identity_providers: Vec::new(),
         }
     }
 }
@@ -840,15 +913,10 @@ impl IntegrationRegistry {
     /// # Errors
     ///
     /// Returns an error if route registration fails due to duplicate routes or invalid paths.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a route path ends with `/*` but `strip_suffix` unexpectedly fails (invariant violation).
     pub fn with_plan(
         settings: &Settings,
         plan: Arc<AuctionPlan>,
     ) -> Result<Self, Report<TrustedServerError>> {
-        let mut inner = IntegrationRegistryInner::default();
         let mut registrations = Vec::new();
         if let Some(registration) = crate::integrations::prebid::register_for_plan(settings, &plan)?
         {
@@ -867,7 +935,30 @@ impl IntegrationRegistry {
             }
         }
 
+        let mut registry = Self::from_registrations(registrations)?;
+        registry.plan = Some(plan);
+        Ok(registry)
+    }
+
+    /// Merges registrations into a registry with no auction plan.
+    ///
+    /// Tests pass a registration no settings can produce.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when a route fails to
+    /// register, or when an identity provider's capture rule lies outside
+    /// the routes of the integration that registered it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a route path ends with `/*` but `strip_suffix` unexpectedly fails (invariant violation).
+    pub(crate) fn from_registrations(
+        registrations: Vec<IntegrationRegistration>,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        let mut inner = IntegrationRegistryInner::default();
         for registration in registrations {
+            validate_capture_rules(&registration)?;
             inner
                 .enabled_integration_ids
                 .push(registration.integration_id);
@@ -929,6 +1020,9 @@ impl IntegrationRegistry {
                 .extend(registration.html_stream_processors);
             inner.head_injectors.extend(registration.head_injectors);
             inner.request_filters.extend(registration.request_filters);
+            inner
+                .identity_providers
+                .extend(registration.identity_providers);
             if registration.js_disabled {
                 inner.disabled_js_ids.push(registration.integration_id);
             } else if registration.js_deferred {
@@ -938,8 +1032,14 @@ impl IntegrationRegistry {
 
         Ok(Self {
             inner: Arc::new(inner),
-            plan: Some(plan),
+            plan: None,
         })
+    }
+
+    /// The identity providers integrations registered.
+    #[must_use]
+    pub fn identity_providers(&self) -> Vec<Arc<dyn IdentityProvider>> {
+        self.inner.identity_providers.clone()
     }
 
     /// Return whether this registry and another consumer share the same plan allocation.
@@ -1292,6 +1392,7 @@ impl IntegrationRegistry {
                 html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                identity_providers: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
@@ -1322,6 +1423,7 @@ impl IntegrationRegistry {
                 html_stream_processors: Vec::new(),
                 head_injectors,
                 request_filters: Vec::new(),
+                identity_providers: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
@@ -1348,6 +1450,7 @@ impl IntegrationRegistry {
                 html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters,
+                identity_providers: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
@@ -1414,6 +1517,7 @@ impl IntegrationRegistry {
                 html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                identity_providers: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
@@ -1426,6 +1530,10 @@ impl IntegrationRegistry {
 mod tests {
     use super::*;
     use crate::constants::COOKIE_TS_EC;
+    use crate::ec::identity::examples::{
+        ExampleCaptureProvider, ExampleIdProvider, example_config,
+    };
+    use crate::ec::identity::test_support::fixed_capture_provider;
     use crate::platform::test_support::noop_services;
     use http::{HeaderValue, StatusCode, header};
 
@@ -2596,6 +2704,103 @@ mod tests {
         assert_eq!(
             recombined, all_sorted,
             "should reconstruct full module list from immediate + deferred"
+        );
+    }
+
+    struct ExampleCaptureProxy;
+
+    #[async_trait(?Send)]
+    impl IntegrationProxy for ExampleCaptureProxy {
+        fn integration_name(&self) -> &'static str {
+            "examplecapture"
+        }
+
+        fn routes(&self) -> Vec<IntegrationEndpoint> {
+            vec![IntegrationEndpoint::post("/integrations/examplecapture/*")]
+        }
+
+        async fn handle(
+            &self,
+            _settings: &Settings,
+            _services: &RuntimeServices,
+            _req: Request<EdgeBody>,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+            Ok(Response::new(EdgeBody::empty()))
+        }
+    }
+
+    fn capture_registration(path: &str) -> IntegrationRegistration {
+        IntegrationRegistration::builder("examplecapture")
+            .with_proxy(Arc::new(ExampleCaptureProxy))
+            .try_with_identity_provider(ExampleCaptureProvider::with_capture_path(path))
+            .expect("should register the capture provider")
+            .build()
+    }
+
+    #[test]
+    fn try_with_identity_provider_converts_a_constructor_error_once() {
+        let failing: Result<ExampleIdProvider, Report<IdentityProviderError>> =
+            Err(IdentityProviderError::config("bad partner id"));
+        let error = IntegrationRegistration::builder("exampleid")
+            .try_with_identity_provider(failing)
+            .err()
+            .expect("should fail on a constructor error");
+        assert!(
+            matches!(error.current_context(), TrustedServerError::Integration { integration, .. } if integration == "exampleid"),
+            "should name the integration"
+        );
+
+        let built = IntegrationRegistration::builder("exampleid")
+            .try_with_identity_provider(ExampleIdProvider::new(&example_config()))
+            .expect("should register a valid provider")
+            .build();
+        assert_eq!(
+            built.identity_providers.len(),
+            1,
+            "should hold one registered provider"
+        );
+    }
+
+    #[test]
+    fn capture_rule_outside_the_integrations_routes_is_rejected_at_startup() {
+        let error = IntegrationRegistry::from_registrations(vec![capture_registration(
+            "/integrations/other/api",
+        )])
+        .err()
+        .expect("should reject a capture rule outside the integration's routes");
+        assert!(
+            format!("{error}").contains("examplecapture"),
+            "should name the integration"
+        );
+
+        let registry = IntegrationRegistry::from_registrations(vec![capture_registration(
+            "/integrations/examplecapture/api/token",
+        )])
+        .expect("should accept a capture rule under the integration's own routes");
+        assert_eq!(
+            registry.identity_providers().len(),
+            1,
+            "should expose the registered provider"
+        );
+    }
+
+    #[test]
+    fn capture_prefix_must_lie_under_a_wildcard_route() {
+        let registration = |provider_id: &str| {
+            IntegrationRegistration::builder("examplecapture")
+                .with_proxy(Arc::new(ExampleCaptureProxy))
+                .with_identity_provider(fixed_capture_provider(
+                    provider_id,
+                    &["examplecapture.example.com"],
+                ))
+                .build()
+        };
+
+        IntegrationRegistry::from_registrations(vec![registration("examplecapture")])
+            .expect("should accept a prefix under the wildcard route");
+        assert!(
+            IntegrationRegistry::from_registrations(vec![registration("other")]).is_err(),
+            "should reject a prefix outside the routes"
         );
     }
 }

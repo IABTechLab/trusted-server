@@ -1994,11 +1994,19 @@ mod tests {
         let mut settings = create_test_settings();
         settings.ec.partners = vec![partner];
         let with_provider = std::sync::Arc::new(
-            IdentityRuntime::from_settings(&settings).expect("should build the runtime"),
+            IdentityRuntime::from_settings(
+                &settings,
+                &crate::integrations::IntegrationRegistry::default(),
+            )
+            .expect("should build the runtime"),
         );
         settings.ec.partners = Vec::new();
         let without_provider = std::sync::Arc::new(
-            IdentityRuntime::from_settings(&settings).expect("should build the runtime"),
+            IdentityRuntime::from_settings(
+                &settings,
+                &crate::integrations::IntegrationRegistry::default(),
+            )
+            .expect("should build the runtime"),
         );
 
         let ec_id = format!("{}.ABC123", "a".repeat(64));
@@ -2471,7 +2479,11 @@ mod tests {
         let mut settings = create_test_settings();
         settings.ec.partners = vec![partner];
         let runtime = std::sync::Arc::new(
-            IdentityRuntime::from_settings(&settings).expect("should build the runtime"),
+            IdentityRuntime::from_settings(
+                &settings,
+                &crate::integrations::IntegrationRegistry::default(),
+            )
+            .expect("should build the runtime"),
         );
         let registry = merge_registry(&["ssp.example.com"]);
         let ec_id = merge_ec_id();

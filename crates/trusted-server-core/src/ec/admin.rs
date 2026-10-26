@@ -1135,7 +1135,11 @@ mod tests {
             .expect("should build registry");
         let mut settings = create_test_settings();
         settings.ec.partners = vec![partner];
-        let runtime = IdentityRuntime::from_settings(&settings).expect("should build the runtime");
+        let runtime = IdentityRuntime::from_settings(
+            &settings,
+            &crate::integrations::IntegrationRegistry::default(),
+        )
+        .expect("should build the runtime");
         let mut entry = KvEntry::minimal("other.example.com", "other", 1);
         entry.ids.insert(
             "ssp.example.com".to_owned(),

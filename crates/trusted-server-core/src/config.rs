@@ -13,6 +13,7 @@ use error_stack::Report;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use validator::{Validate, ValidationError, ValidationErrors};
 
+use crate::ec::identity::ProviderDescriptor;
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
 use crate::integrations::{
@@ -269,7 +270,7 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     validate_identity_settings(&settings.ec.identity)?;
     validate_removed_keys(settings)?;
     crate::ec::identity::catalog::validate_identity_catalog(
-        &crate::ec::identity::generic_pull::generic_pull_descriptors(&settings.ec.partners)?,
+        &identity_descriptors_for_deploy(settings)?,
         &settings.ec.partners,
         &settings.ec.identity,
     )?;
@@ -294,11 +295,28 @@ pub fn validate_settings_for_runtime(
     validate_identity_settings(&settings.ec.identity)?;
     validate_removed_keys(settings)?;
     crate::ec::identity::catalog::validate_identity_catalog(
-        &crate::ec::identity::generic_pull::generic_pull_descriptors(&settings.ec.partners)?,
+        &identity_descriptors_for_deploy(settings)?,
         &settings.ec.partners,
         &settings.ec.identity,
     )?;
     Ok(())
+}
+
+/// Every identity provider descriptor a deploy declares, built from
+/// settings alone.
+///
+/// It holds the generic pull descriptors from `settings.ec.partners`, which
+/// carry no secret, then one line per identity integration. No integration
+/// has a line yet.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when a pull partner cannot
+/// be described.
+pub(crate) fn identity_descriptors_for_deploy(
+    settings: &Settings,
+) -> Result<Vec<ProviderDescriptor>, Report<TrustedServerError>> {
+    crate::ec::identity::generic_pull::generic_pull_descriptors(&settings.ec.partners)
 }
 
 fn identity_configuration_error(message: String) -> Report<TrustedServerError> {

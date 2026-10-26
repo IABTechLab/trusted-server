@@ -237,8 +237,24 @@ pub(crate) fn load_settings_from_config_store(
 /// Returns an error when a provider cannot be described or the catalog rules fail.
 pub(crate) fn build_identity_runtime(
     settings: &Settings,
+    integrations: &IntegrationRegistry,
 ) -> Result<Arc<IdentityRuntime>, Report<TrustedServerError>> {
-    IdentityRuntime::from_settings(settings).map(Arc::new)
+    IdentityRuntime::from_settings(settings, integrations).map(Arc::new)
+}
+
+/// Builds the identity runtime for settings loaded without application
+/// state, from the integration registry those settings describe.
+///
+/// # Errors
+///
+/// Returns an error when the integration registry or the identity runtime
+/// cannot be built.
+pub(crate) fn build_identity_runtime_from_reloaded_settings(
+    settings: &Settings,
+) -> Result<Arc<IdentityRuntime>, Report<TrustedServerError>> {
+    let plan = Arc::new(compile_auction_plan(settings)?);
+    let registry = IntegrationRegistry::with_plan(settings, plan)?;
+    build_identity_runtime(settings, &registry)
 }
 
 pub(crate) fn build_state_from_settings(
@@ -250,7 +266,7 @@ pub(crate) fn build_state_from_settings(
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Fastly)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
-    let identity = build_identity_runtime(&settings)?;
+    let identity = build_identity_runtime(&settings, &registry)?;
 
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
@@ -1693,8 +1709,8 @@ mod tests {
         filters: Vec<Arc<dyn IntegrationRequestFilter>>,
     ) -> RouterService {
         let settings = test_settings();
-        let identity =
-            build_identity_runtime(&settings).expect("should build the identity runtime");
+        let identity = build_identity_runtime(&settings, &IntegrationRegistry::default())
+            .expect("should build the identity runtime");
         let plan = Arc::new(
             trusted_server_core::auction::compile_auction_plan(&settings)
                 .expect("should compile auction plan"),

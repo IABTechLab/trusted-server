@@ -11,6 +11,7 @@ use super::input::RandomSource;
 use super::revision::IdentityKeys;
 use crate::ec::rate_limiter::RateLimiter;
 use crate::error::TrustedServerError;
+use crate::integrations::IntegrationRegistry;
 use crate::platform::RuntimeServices;
 use crate::settings::{IdentitySettings, Settings};
 
@@ -39,14 +40,18 @@ impl core::fmt::Debug for IdentityRuntime {
 }
 
 impl IdentityRuntime {
-    /// Builds the runtime from settings, without resolving any secret.
+    /// Builds the runtime from settings and the providers `integrations`
+    /// registered, without resolving any secret.
     ///
     /// # Errors
     ///
     /// Returns [`TrustedServerError::Configuration`] when a provider cannot be
     /// described or the catalog rules fail.
-    pub fn from_settings(settings: &Settings) -> Result<Self, Report<TrustedServerError>> {
-        let catalog = ProviderCatalog::from_settings(settings)?
+    pub fn from_settings(
+        settings: &Settings,
+        integrations: &IntegrationRegistry,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        let catalog = ProviderCatalog::from_settings(settings, &integrations.identity_providers())?
             .with_narrowing(narrowing(&settings.ec.identity));
         Ok(Self {
             catalog,
@@ -170,7 +175,8 @@ mod tests {
     #[test]
     fn runtime_debug_prints_no_key_material() {
         let settings = settings_with_listed_sources(None);
-        let runtime = IdentityRuntime::from_settings(&settings).expect("should build");
+        let runtime = IdentityRuntime::from_settings(&settings, &IntegrationRegistry::default())
+            .expect("should build");
 
         let printed = format!("{runtime:?}");
 
@@ -192,15 +198,20 @@ mod tests {
     fn runtime_narrows_providers_by_their_sources_table() {
         let id = pid("pull-ssp-example-com");
 
-        let unlisted = IdentityRuntime::from_settings(&settings_with_listed_sources(None))
-            .expect("should build");
-        let kept = IdentityRuntime::from_settings(&settings_with_listed_sources(Some(vec![
-            "ssp.example.com".to_owned(),
-        ])))
+        let unlisted = IdentityRuntime::from_settings(
+            &settings_with_listed_sources(None),
+            &IntegrationRegistry::default(),
+        )
         .expect("should build");
-        let dropped = IdentityRuntime::from_settings(&settings_with_listed_sources(Some(vec![
-            "other.example.com".to_owned(),
-        ])))
+        let kept = IdentityRuntime::from_settings(
+            &settings_with_listed_sources(Some(vec!["ssp.example.com".to_owned()])),
+            &IntegrationRegistry::default(),
+        )
+        .expect("should build");
+        let dropped = IdentityRuntime::from_settings(
+            &settings_with_listed_sources(Some(vec!["other.example.com".to_owned()])),
+            &IntegrationRegistry::default(),
+        )
         .expect("should build");
 
         assert_eq!(

@@ -103,16 +103,21 @@ impl ProviderCatalog {
     ///
     /// It reads `settings.ec.partners` directly and never builds a
     /// `PartnerRegistry`, so a deploy-time `api_token` that holds a secret
-    /// store key name is fine. In Part 1 it holds generic pull providers
-    /// only, with no source owners. It validates their descriptors with
-    /// [`validate_identity_catalog`] before building.
+    /// store key name is fine. It holds the generic pull providers, then
+    /// the `registered` providers integrations contributed, with no source
+    /// owners yet. It validates every descriptor with
+    /// [`validate_identity_catalog`] before building, so a duplicate ID is
+    /// reported by that one validator.
     ///
     /// # Errors
     ///
     /// Returns [`TrustedServerError::Configuration`] when a pull partner
     /// cannot be described or the catalog rules fail.
-    pub(crate) fn from_settings(settings: &Settings) -> Result<Self, Report<TrustedServerError>> {
-        let providers = settings
+    pub(crate) fn from_settings(
+        settings: &Settings,
+        registered: &[Arc<dyn IdentityProvider>],
+    ) -> Result<Self, Report<TrustedServerError>> {
+        let mut providers = settings
             .ec
             .partners
             .iter()
@@ -128,6 +133,7 @@ impl ProviderCatalog {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        providers.extend(registered.iter().cloned());
         let descriptors: Vec<_> = providers
             .iter()
             .map(|provider| provider.descriptor().clone())
@@ -244,6 +250,7 @@ impl ProviderCatalog {
 mod tests {
     use super::*;
     use crate::ec::identity::descriptor::Captures;
+    use crate::ec::identity::examples::{ExampleIdProvider, example_config};
     use crate::ec::identity::generic_pull::generic_pull_descriptors;
     use crate::ec::identity::test_support::{ec_partner, fixed_capture_provider};
     use crate::settings::{ProviderSettings, RevokeScope};
@@ -359,7 +366,7 @@ mod tests {
             crate::ec::registry::PartnerRegistry::from_config(&settings.ec.partners).is_err(),
             "should hold settings the registry rejects"
         );
-        let catalog = ProviderCatalog::from_settings(&settings).expect("should build");
+        let catalog = ProviderCatalog::from_settings(&settings, &[]).expect("should build");
 
         let id = "pull-ssp-example-com".parse().expect("should parse the ID");
         assert!(catalog.is_configured(&id), "should hold the pull provider");
@@ -369,6 +376,35 @@ mod tests {
                 .owner_of(&"ssp.example.com".parse().expect("should parse"))
                 .is_none(),
             "should have no owners in Part 1"
+        );
+    }
+
+    #[test]
+    fn registered_provider_with_a_generic_pull_id_is_rejected_by_the_shared_validator() {
+        let mut settings = create_test_settings();
+        settings.ec.partners = vec![partner()];
+
+        let duplicate = fixed_capture_provider("pull-ssp-example-com", &["other.example.com"]);
+        let error = ProviderCatalog::from_settings(&settings, &[duplicate])
+            .err()
+            .expect("should reject a registered ID that a pull partner already uses");
+        assert!(
+            format!("{error}")
+                .contains("identity provider `pull-ssp-example-com` is declared more than once"),
+            "should report the duplicate ID: {error}"
+        );
+
+        let registered =
+            ExampleIdProvider::new(&example_config()).expect("should build the example provider");
+        let catalog = ProviderCatalog::from_settings(&settings, &[Arc::new(registered)])
+            .expect("control: a distinct registered ID should build");
+        assert!(
+            catalog.is_configured(&"exampleid".parse().expect("should parse")),
+            "should hold the registered provider"
+        );
+        assert!(
+            catalog.is_configured(&"pull-ssp-example-com".parse().expect("should parse")),
+            "should keep the pull provider"
         );
     }
 }
