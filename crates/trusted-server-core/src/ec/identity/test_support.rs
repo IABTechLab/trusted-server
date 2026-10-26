@@ -355,6 +355,7 @@ pub(crate) mod fake_http {
         routes: Mutex<BTreeMap<String, Route>>,
         delays: Mutex<BTreeMap<String, Duration>>,
         sent: Mutex<Vec<String>>,
+        uris: Mutex<Vec<String>>,
     }
 
     impl FakeHttpClient {
@@ -363,6 +364,7 @@ pub(crate) mod fake_http {
                 routes: Mutex::new(BTreeMap::new()),
                 delays: Mutex::new(BTreeMap::new()),
                 sent: Mutex::new(Vec::new()),
+                uris: Mutex::new(Vec::new()),
             }
         }
 
@@ -409,6 +411,11 @@ pub(crate) mod fake_http {
                 .insert(host.to_owned(), delay);
         }
 
+        /// The URIs requests were sent to, in order.
+        pub(crate) fn sent_uris(&self) -> Vec<String> {
+            self.uris.lock().expect("should lock the sent URIs").clone()
+        }
+
         /// The hosts requests were sent to, in order.
         pub(crate) fn sent_hosts(&self) -> Vec<String> {
             self.sent
@@ -436,6 +443,10 @@ pub(crate) mod fake_http {
                 .lock()
                 .expect("should lock the sent hosts")
                 .push(host.clone());
+            self.uris
+                .lock()
+                .expect("should lock the sent URIs")
+                .push(request.request.uri().to_string());
             let route = self
                 .routes
                 .lock()
@@ -567,6 +578,7 @@ pub(crate) mod fake_http {
     pub(crate) struct ScriptedProvider {
         descriptor: ProviderDescriptor,
         reads_user_agent: bool,
+        stateful: bool,
     }
 
     impl ScriptedProvider {
@@ -587,12 +599,34 @@ pub(crate) mod fake_http {
             Self {
                 descriptor,
                 reads_user_agent: false,
+                stateful: false,
             }
         }
 
         /// Reads `user_agent()` without declaring it, and ignores the error.
         pub(crate) fn reading_undeclared_user_agent(mut self) -> Self {
             self.reads_user_agent = true;
+            self
+        }
+
+        /// Declares private state, and sends what it read in a `state` query.
+        pub(crate) fn stateful(mut self) -> Self {
+            self.stateful = true;
+            self.descriptor = ProviderDescriptor::builder(self.descriptor.id().clone())
+                .with_source(self.descriptor.primary_source().clone())
+                .with_resolves(
+                    Resolves::new()
+                        .with_endpoint(
+                            self.descriptor
+                                .endpoint()
+                                .expect("should have an endpoint")
+                                .as_str(),
+                        )
+                        .with_private_state(),
+                )
+                .with_consent_policy(ConsentPolicy::eid_persistence_only())
+                .build()
+                .expect("should build the descriptor");
             self
         }
 
@@ -613,7 +647,15 @@ pub(crate) mod fake_http {
             if self.reads_user_agent {
                 let _ = input.user_agent().ok();
             }
-            Ok(Some(ProviderRequest::get(input.endpoint()?)))
+            let mut request = ProviderRequest::get(input.endpoint()?);
+            if self.stateful {
+                let state = input.state::<serde_json::Value>()?;
+                request = request.with_query(
+                    "state",
+                    &state.map_or_else(|| "none".to_owned(), |state| state.to_string()),
+                );
+            }
+            Ok(Some(request))
         }
 
         fn response(

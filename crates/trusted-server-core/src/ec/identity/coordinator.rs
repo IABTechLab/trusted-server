@@ -992,6 +992,9 @@ pub(crate) struct IdentityDeps<'a> {
 pub(crate) struct Call {
     pub(crate) provider: IdentityProviderId,
     pub(crate) kinds: BTreeMap<SourceDomain, ResolveKind>,
+    /// This provider's stored private state `ps.st`, as JSON. Only this
+    /// call's `ResolveInput` sees it.
+    pub(crate) state_json: Option<String>,
 }
 
 /// A call that was sent and is waiting for its answer.
@@ -999,6 +1002,13 @@ struct InFlightCall<'a> {
     provider: &'a dyn IdentityProvider,
     input: ResolveInput<'a>,
     call_context: Option<String>,
+    /// When the request was sent.
+    sent_at: Instant,
+    /// How long the backend waits for the first byte.
+    timeout: Duration,
+    /// The remaining hold budget, not the provider's `timeout_ms`, set the
+    /// timeout.
+    budget_limited: bool,
 }
 
 /// What preparing one call came to.
@@ -1006,7 +1016,7 @@ enum Prepared<'a> {
     /// The call is settled without being sent.
     Settled(CallOutcome),
     /// The call was sent.
-    Sent(InFlightCall<'a>, PlatformPendingRequest),
+    Sent(Box<InFlightCall<'a>>, PlatformPendingRequest),
 }
 
 /// Whether the provider is a generic pull provider, the only kind given the
@@ -1235,9 +1245,10 @@ fn call_timeout(
     deps: &IdentityDeps<'_>,
     settings: &ProviderSettings,
     remaining: Option<Duration>,
-) -> Option<Duration> {
+) -> Option<(Duration, bool)> {
     let policy = deps.services.backend().naming_policy();
     let millis = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
+    let mut budget_limited = false;
     let timeout_ms = match remaining {
         None => {
             let configured = millis(settings.after_send_timeout_ms);
@@ -1250,10 +1261,11 @@ fn call_timeout(
                     .unwrap_or(deps.settings.ec.identity.hold_budget_ms),
             );
             let remaining_ms = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX);
+            budget_limited = remaining_ms < configured;
             policy.canonicalize_transport_timeout_ms(remaining_ms, configured)
         }
     };
-    (timeout_ms > 0).then(|| Duration::from_millis(u64::from(timeout_ms)))
+    (timeout_ms > 0).then(|| (Duration::from_millis(u64::from(timeout_ms)), budget_limited))
 }
 
 /// Whether the burst cap stops the call. `Err` when it could not be read.
@@ -1267,7 +1279,7 @@ fn burst_capped(
         return Ok(false);
     };
     let Some(ec_id) = ec_id else {
-        log::warn!("Identity provider '{provider}' not dispatched: the request has no EC ID");
+        log::debug!("Identity provider '{provider}' not dispatched: the request has no EC ID");
         return Err(());
     };
     let key = format!("identity:{provider}:{}", visitor_key(deps.keys, ec_id));
@@ -1300,7 +1312,8 @@ fn prepare_call<'a>(
     let id = descriptor.id();
     let settings = deps.settings.ec.identity.provider(id);
 
-    let input = ResolveInput::new(descriptor, call.kinds.clone(), signals);
+    let input = ResolveInput::new(descriptor, call.kinds.clone(), signals)
+        .with_state_json(call.state_json.clone());
     let request = provider.request(&input);
     if !input.recorded_errors().is_empty() {
         log::error!("Identity provider '{id}' read an input it did not declare");
@@ -1317,7 +1330,7 @@ fn prepare_call<'a>(
     }
 
     let remaining = budget.map(|budget| budget.saturating_sub(started.elapsed()));
-    let Some(timeout) = call_timeout(deps, &settings, remaining) else {
+    let Some((timeout, budget_limited)) = call_timeout(deps, &settings, remaining) else {
         return Prepared::Settled(CallOutcome::HoldCutOff);
     };
     match burst_capped(deps, id, signals.ec_id.as_deref(), &settings) {
@@ -1368,11 +1381,14 @@ fn prepare_call<'a>(
             .send_async(PlatformHttpRequest::new(outbound, backend)),
     ) {
         Ok(pending) => Prepared::Sent(
-            InFlightCall {
+            Box::new(InFlightCall {
                 provider,
                 input,
                 call_context,
-            },
+                sent_at: Instant::now(),
+                timeout,
+                budget_limited,
+            }),
             pending,
         ),
         Err(error) => {
@@ -1444,10 +1460,10 @@ pub(crate) fn dispatch(
     let calls = dispatch_order(calls, deps.catalog, signals.now);
     let mut outcomes = Vec::with_capacity(calls.len());
     let mut in_flight: Vec<(IdentityProviderId, PlatformPendingRequest)> = Vec::new();
-    let mut sent: BTreeMap<IdentityProviderId, InFlightCall<'_>> = BTreeMap::new();
+    let mut sent: BTreeMap<IdentityProviderId, Box<InFlightCall<'_>>> = BTreeMap::new();
 
     let drain = |in_flight: &mut Vec<(IdentityProviderId, PlatformPendingRequest)>,
-                 sent: &mut BTreeMap<IdentityProviderId, InFlightCall<'_>>,
+                 sent: &mut BTreeMap<IdentityProviderId, Box<InFlightCall<'_>>>,
                  outcomes: &mut Vec<(IdentityProviderId, CallOutcome)>| {
         let within_budget = || budget.is_none_or(|budget| started.elapsed() < budget);
         for (id, waited) in drain_in_flight(in_flight, deps.services, within_budget) {
@@ -1458,7 +1474,17 @@ pub(crate) fn dispatch(
                 Waited::Response(response) => {
                     finish_call(&call, response, identity.max_response_bytes)
                 }
-                Waited::Failed if budget.is_some() => CallOutcome::HoldCutOff,
+                // A failed wait is a cut off only when the hold budget was
+                // spent: the whole budget, or a timeout the remaining budget
+                // set. Any other failure counts against the provider.
+                Waited::Failed
+                    if budget.is_some_and(|budget| started.elapsed() >= budget)
+                        || (budget.is_some()
+                            && call.budget_limited
+                            && call.sent_at.elapsed() >= call.timeout) =>
+                {
+                    CallOutcome::HoldCutOff
+                }
                 Waited::Failed => CallOutcome::TransportFailure,
                 Waited::Dropped => CallOutcome::HoldCutOff,
             };
@@ -3603,6 +3629,17 @@ mod tests {
             budget: Option<Duration>,
             limiter: Option<&dyn RateLimiter>,
         ) -> Vec<(IdentityProviderId, CallOutcome)> {
+            self.run_with_state(ids, &[], now, budget, limiter)
+        }
+
+        fn run_with_state(
+            &self,
+            ids: &[&str],
+            states: &[(&str, &str)],
+            now: u64,
+            budget: Option<Duration>,
+            limiter: Option<&dyn RateLimiter>,
+        ) -> Vec<(IdentityProviderId, CallOutcome)> {
             let deps = IdentityDeps {
                 settings: &self.settings,
                 catalog: &self.catalog,
@@ -3619,6 +3656,10 @@ mod tests {
                         .get(&pid(id))
                         .expect("should hold the provider");
                     Call {
+                        state_json: states
+                            .iter()
+                            .find(|(owner, _)| owner == id)
+                            .map(|(_, state)| (*state).to_owned()),
                         provider: pid(id),
                         kinds: BTreeMap::from([(
                             provider.descriptor().primary_source().clone(),
@@ -3639,7 +3680,6 @@ mod tests {
                 random: &ThreadRandom,
                 ec_id: Some(format!("{}.ABC123", "a".repeat(64))),
                 stored: BTreeMap::new(),
-                state_json: None,
             };
             dispatch(&deps, calls, &signals, budget)
         }
@@ -3860,12 +3900,86 @@ mod tests {
         );
         assert!(
             matches!(outcome_of(&outcomes, "c"), CallOutcome::HoldCutOff),
-            "should drop a later call too, and a hold timeout is a cut off"
+            "should drop a call the budget ran out before waiting on"
         );
         assert_eq!(
             fixture.backend.first_byte_timeouts().len(),
             3,
             "should have sent all three before the budget ran out"
+        );
+    }
+
+    #[test]
+    fn hold_failure_before_the_budget_is_spent_is_a_transport_failure() {
+        let mut fixture =
+            DispatchFixture::new(vec![scripted("p", "p.example.com", "p.example.com")]);
+        fixture.settings.ec.identity.providers.insert(
+            "p".to_owned(),
+            ProviderSettings {
+                timeout_ms: Some(10),
+                ..ProviderSettings::default()
+            },
+        );
+        fixture.client.time_out("p.example.com");
+
+        let outcomes = fixture.run(&["p"], 1_000, Some(Duration::from_secs(60)), None);
+
+        assert!(
+            matches!(outcome_of(&outcomes, "p"), CallOutcome::TransportFailure),
+            "should count a failure under timeout_ms as a transport failure, not a cut off"
+        );
+    }
+
+    #[test]
+    fn each_call_reads_only_its_own_providers_state() {
+        let fixture = DispatchFixture::new(vec![
+            ScriptedProvider::new("one", "one.example.com", "one.example.com", false)
+                .stateful()
+                .into_provider(),
+            ScriptedProvider::new("two", "two.example.com", "two.example.com", false)
+                .stateful()
+                .into_provider(),
+            ScriptedProvider::new("three", "three.example.com", "three.example.com", false)
+                .stateful()
+                .into_provider(),
+        ]);
+        for host in ["one", "two", "three"] {
+            fixture
+                .client
+                .respond(&format!("{host}.example.com"), 200, b"{}");
+        }
+
+        fixture.run_with_state(
+            &["one", "two", "three"],
+            &[
+                ("one", r#"{"token":"first-secret"}"#),
+                ("two", r#"{"token":"second-secret"}"#),
+            ],
+            1_000,
+            None,
+            None,
+        );
+
+        let uris = fixture.client.sent_uris();
+        let uri_for = |host: &str| {
+            uris.iter()
+                .find(|uri| uri.contains(host))
+                .expect("should have sent to the host")
+                .clone()
+        };
+        let first = uri_for("one.example.com");
+        assert!(
+            first.contains("first-secret") && !first.contains("second-secret"),
+            "should give the first provider only its own state"
+        );
+        let second = uri_for("two.example.com");
+        assert!(
+            second.contains("second-secret") && !second.contains("first-secret"),
+            "should give the second provider only its own state"
+        );
+        assert!(
+            uri_for("three.example.com").contains("state=none"),
+            "should give a provider with no stored state none"
         );
     }
 

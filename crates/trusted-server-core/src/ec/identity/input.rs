@@ -379,7 +379,6 @@ pub(crate) struct ResolveSignals<'a> {
     #[allow(dead_code)]
     pub(crate) ec_id: Option<String>,
     pub(crate) stored: BTreeMap<SourceDomain, StoredId>,
-    pub(crate) state_json: Option<String>,
 }
 
 /// What one provider may read for one call.
@@ -389,6 +388,7 @@ pub struct ResolveInput<'a> {
     signals: &'a ResolveSignals<'a>,
     declared: BTreeSet<Input>,
     available: BTreeSet<Input>,
+    state_json: Option<String>,
     undeclared: RefCell<Vec<Access>>,
     state_failed: RefCell<bool>,
 }
@@ -431,9 +431,19 @@ impl<'a> ResolveInput<'a> {
             signals,
             declared,
             available,
+            state_json: None,
             undeclared: RefCell::new(Vec::new()),
             state_failed: RefCell::new(false),
         }
+    }
+
+    /// Gives the call its own provider's stored private state `ps.st`, as
+    /// JSON. State is per provider and sensitive, so it never rides on the
+    /// signals every call shares.
+    #[must_use]
+    pub(crate) fn with_state_json(mut self, state_json: Option<String>) -> Self {
+        self.state_json = state_json;
+        self
     }
 
     fn record(&self, access: Access) -> Report<IdentityProviderError> {
@@ -514,7 +524,7 @@ impl<'a> ResolveInput<'a> {
         {
             return Err(self.record(Access::PrivateState));
         }
-        let Some(raw) = self.signals.state_json.as_deref() else {
+        let Some(raw) = self.state_json.as_deref() else {
             return Ok(None);
         };
         serde_json::from_str(raw).map(Some).map_err(|_| {
@@ -751,7 +761,6 @@ mod tests {
             random: &ThreadRandom,
             ec_id: Some("a".repeat(64) + ".ABC123"),
             stored: BTreeMap::new(),
-            state_json: None,
         }
     }
 
@@ -876,9 +885,9 @@ mod tests {
                 .with_endpoint("https://a.example.com")
                 .with_private_state(),
         );
-        let mut good = signals();
-        good.state_json = Some(r#"{"signature":"s"}"#.to_owned());
-        let input = ResolveInput::new(&descriptor, kinds(&descriptor, ResolveKind::Refresh), &good);
+        let good = signals();
+        let input = ResolveInput::new(&descriptor, kinds(&descriptor, ResolveKind::Refresh), &good)
+            .with_state_json(Some(r#"{"signature":"s"}"#.to_owned()));
         let state: serde_json::Value = input
             .state()
             .expect("should decode the state")
@@ -889,9 +898,9 @@ mod tests {
             "should not record a good state as a failure"
         );
 
-        let mut bad = signals();
-        bad.state_json = Some(r#""a bare string""#.to_owned());
-        let input = ResolveInput::new(&descriptor, kinds(&descriptor, ResolveKind::Refresh), &bad);
+        let bad = signals();
+        let input = ResolveInput::new(&descriptor, kinds(&descriptor, ResolveKind::Refresh), &bad)
+            .with_state_json(Some(r#""a bare string""#.to_owned()));
         let error = input
             .state::<TypedState>()
             .expect_err("should not decode a bare string");

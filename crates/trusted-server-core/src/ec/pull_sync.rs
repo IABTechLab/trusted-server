@@ -413,7 +413,8 @@ fn extract_pull_uid(response: PlatformResponse, source_domain: &str) -> Option<S
         return None;
     }
 
-    let (_, body) = buffered_body(response, MAX_PULL_RESPONSE_BYTES, source_domain)?;
+    let label = format!("Pull sync partner {source_domain}");
+    let (_, body) = buffered_body(response, MAX_PULL_RESPONSE_BYTES, &label)?;
     let payload = match serde_json::from_slice::<PullSyncResponse>(&body) {
         Ok(payload) => payload,
         Err(err) => {
