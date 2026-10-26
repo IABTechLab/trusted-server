@@ -8,6 +8,7 @@
 use error_stack::Report;
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 use std::path::{Component, Path};
 
 use crate::documents::{self, Role};
@@ -33,6 +34,81 @@ impl Observation {
     pub(crate) fn value(&self) -> &Value {
         &self.value
     }
+}
+
+/// Final-byte equality of an ordinary pair, without controlled-recipe authority.
+pub(crate) struct Equality {
+    canonical: Observation,
+    reproduction: Observation,
+    sha256: String,
+    size: u64,
+}
+
+impl Equality {
+    /// SHA-256 of the complete equal final bytes.
+    pub(crate) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    /// Size of the complete equal final bytes.
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+/// Compares complete ordinary final bytes after checking their input pairing.
+pub(crate) fn compare(
+    canonical: Observation,
+    reproduction: Observation,
+    left: &[u8],
+    right: &[u8],
+) -> Result<Equality, Report<ReleaseError>> {
+    pair(&canonical, &reproduction)?;
+    let mut digests = Vec::new();
+    for (observed, bytes) in [(&canonical, left), (&reproduction, right)] {
+        let size = u64::try_from(bytes.len())
+            .map_err(|_| Report::new(ReleaseError::Document).attach("ordinary size overflow"))?;
+        require(
+            size > 0 && size <= Role::Executable.limit(),
+            "ordinary executable byte bound rejected",
+        )?;
+        let digest = hex::encode(Sha256::digest(bytes));
+        require(
+            size == observed.facts.artifact.size && digest == observed.facts.artifact.sha256,
+            "ordinary executable changed after observation",
+        )?;
+        digests.push(digest);
+    }
+    if left != right {
+        let offset = left
+            .iter()
+            .zip(right)
+            .position(|(left, right)| left != right)
+            .unwrap_or(left.len().min(right.len()));
+        let window = |bytes: &[u8]| {
+            let start = offset.saturating_sub(8).min(bytes.len());
+            let end = start.saturating_add(16).min(bytes.len());
+            hex::encode(&bytes[start..end])
+        };
+        return Err(Report::new(ReleaseError::Document).attach(format!(
+            "ordinary final-byte mismatch: canonical_size={}, reproduction_size={}, \
+             canonical_sha256={}, reproduction_sha256={}, first_offset={}, \
+             canonical_window={}, reproduction_window={}",
+            left.len(),
+            right.len(),
+            digests[0],
+            digests[1],
+            offset,
+            window(left),
+            window(right),
+        )));
+    }
+    Ok(Equality {
+        sha256: canonical.facts.artifact.sha256.clone(),
+        size: canonical.facts.artifact.size,
+        canonical,
+        reproduction,
+    })
 }
 
 /// Checks the narrower ordinary input/environment pairing, never qualification.

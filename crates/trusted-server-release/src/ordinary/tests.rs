@@ -1,6 +1,9 @@
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 
-use super::{Observation, observation, pair};
+use super::{Observation, compare, observation, pair};
+
+const WASM: &[u8] = b"\0asm\x01\0\0\0";
 
 fn fixture() -> Value {
     json!({
@@ -31,7 +34,7 @@ fn fixture() -> Value {
             "timezone": "UTC",
             "uid": 1001
         },
-        "artifact": {"size": 8, "sha256": "2".repeat(64)},
+        "artifact": {"size": WASM.len(), "sha256": hex::encode(Sha256::digest(WASM))},
         "gaps": [
             "alternate-user-unqualified",
             "boundary-unqualified",
@@ -61,6 +64,82 @@ fn reproduction() -> Value {
 fn accepts_matching_inputs_with_observed_environment_variation() {
     pair(&parse(&fixture()), &parse(&reproduction()))
         .expect("should accept matching ordinary inputs with measured variation");
+}
+
+#[test]
+fn compares_complete_final_bytes_for_an_ordinary_pair() {
+    let matched = compare(parse(&fixture()), parse(&reproduction()), WASM, WASM)
+        .expect("should compare the complete identical ordinary final bytes");
+    assert_eq!(
+        matched.sha256(),
+        hex::encode(Sha256::digest(WASM)),
+        "should retain the actual compared digest"
+    );
+    assert_eq!(
+        matched.size(),
+        8,
+        "should retain the complete compared size"
+    );
+}
+
+fn with_bytes(mut value: Value, bytes: &[u8]) -> Observation {
+    value["artifact"] = json!({
+        "size": bytes.len(),
+        "sha256": hex::encode(Sha256::digest(bytes)),
+    });
+    parse(&value)
+}
+
+#[test]
+fn rejects_custom_section_differences_with_bounded_exact_diagnostics() {
+    let left = [WASM, b"\0\x03\x01x\0"].concat();
+    let right = [WASM, b"\0\x03\x01x\x01"].concat();
+    let error = compare(
+        with_bytes(fixture(), &left),
+        with_bytes(reproduction(), &right),
+        &left,
+        &right,
+    )
+    .err()
+    .expect("should reject changed custom-section bytes without exclusions");
+    let diagnostic = format!("{error:?}");
+    assert!(
+        diagnostic.len() < 2048
+            && diagnostic.contains("final-byte mismatch")
+            && diagnostic.contains("first_offset=12")
+            && diagnostic.contains(&hex::encode(Sha256::digest(&left)))
+            && diagnostic.contains(&hex::encode(Sha256::digest(&right))),
+        "should retain bounded exact-byte mismatch evidence"
+    );
+}
+
+#[test]
+fn rejects_final_bytes_changed_since_the_observation() {
+    let changed = [WASM, &[0]].concat();
+    let error = compare(parse(&fixture()), parse(&reproduction()), WASM, &changed)
+        .err()
+        .expect("should reject mutation after measurement");
+    assert!(
+        format!("{error:?}").contains("executable changed after observation"),
+        "should fail the retained measurement binding before comparison"
+    );
+}
+
+#[test]
+fn rejects_size_only_differences_without_a_prefix_match_fallback() {
+    let longer = [WASM, b"\0\x02\x01x"].concat();
+    let error = compare(
+        with_bytes(fixture(), WASM),
+        with_bytes(reproduction(), &longer),
+        WASM,
+        &longer,
+    )
+    .err()
+    .expect("should reject equal prefix with a longer final file");
+    assert!(
+        format!("{error:?}").contains("first_offset=8"),
+        "should identify the exact end-of-file difference"
+    );
 }
 
 #[test]
