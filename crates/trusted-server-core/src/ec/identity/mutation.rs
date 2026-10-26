@@ -139,7 +139,23 @@ impl IdentityMutation {
     }
 
     /// Adds a provider call's result.
+    ///
+    /// A removal in `result.ids` is a provider-side mistake: removals go
+    /// through `partner_ids` and `provider_state`. It is logged by provider
+    /// and source, never by UID.
     pub(crate) fn add_result(&mut self, result: ProviderResult) {
+        for change in result.ids.iter().filter(|change| change.is_removal()) {
+            let (PartnerIdChange::OwnerRemove { source, .. }
+            | PartnerIdChange::WriterRemove { source, .. }) = change
+            else {
+                continue;
+            };
+            log::warn!(
+                "Identity provider '{}' put a removal for source '{}' in its result IDs; removals belong in partner_ids",
+                result.provider,
+                source.as_str(),
+            );
+        }
         self.results.push(result);
     }
 
@@ -183,6 +199,34 @@ impl IdentityMutation {
                 .values()
                 .any(ProviderStateChange::has_removal)
             || self.results.iter().any(|result| result.state.has_removal())
+    }
+
+    /// The provider and source of every removal, opt-out and clear, sorted and
+    /// de-duplicated. An opt-out or clear has no source. Holds no UID, so it
+    /// is safe to log.
+    #[must_use]
+    pub(crate) fn removal_labels(&self) -> Vec<(IdentityProviderId, Option<SourceDomain>)> {
+        let mut labels: Vec<_> = self
+            .partner_ids
+            .iter()
+            .filter_map(|change| match change {
+                PartnerIdChange::OwnerRemove {
+                    source, provider, ..
+                } => Some((provider.clone(), Some(source.clone()))),
+                PartnerIdChange::WriterRemove { source, writer } => {
+                    Some((writer.clone(), Some(source.clone())))
+                }
+                _ => None,
+            })
+            .collect();
+        labels.extend(
+            self.all_states()
+                .filter(|(_, state)| state.has_removal())
+                .map(|(provider, _)| (provider.clone(), None)),
+        );
+        labels.sort();
+        labels.dedup();
+        labels
     }
 
     /// A copy holding only the removals, opt-outs and clears, for the
@@ -242,6 +286,8 @@ pub(crate) struct Applied {
 }
 
 /// Merges `mutation` into `live` (spec 5.4).
+///
+/// A `ps` entry holding only default values is dropped during cleanup.
 ///
 /// Apply order:
 ///
@@ -1574,6 +1620,154 @@ mod tests {
         assert!(
             !run_removals(&nothing, &live).expect("should apply").changed,
             "should report no change"
+        );
+    }
+
+    fn writer_remove(source: &str, writer: &str) -> IdentityMutation {
+        let mut mutation = IdentityMutation::default();
+        mutation.add_change(PartnerIdChange::WriterRemove {
+            source: src(source),
+            writer: pid(writer),
+        });
+        mutation
+    }
+
+    #[test]
+    fn a_writer_remove_removes_a_record_the_writer_owns() {
+        let mut live = KvEntry::minimal("e.example.com", "browser", 1);
+        live.ids.insert(
+            "a.example.com".to_owned(),
+            written("owner", "v1", "1111111111111111"),
+        );
+
+        let applied =
+            run_removals(&writer_remove("a.example.com", "owner"), &live).expect("should apply");
+
+        assert!(
+            !applied.entry.ids.contains_key("a.example.com"),
+            "should remove the record the writer wrote"
+        );
+        assert_eq!(
+            applied.entry.ps["owner"].ov,
+            vec![uid_hash("v1")],
+            "should hash the removed UID into ov"
+        );
+    }
+
+    #[test]
+    fn a_capture_only_writer_remove_removes_a_browser_record() {
+        let mut live = KvEntry::minimal("e.example.com", "other", 1);
+        live.ids
+            .insert("c.example.com".to_owned(), KvPartnerId::new("browser-c"));
+
+        let applied =
+            run_removals(&writer_remove("c.example.com", "cap"), &live).expect("should apply");
+
+        assert!(
+            !applied.entry.ids.contains_key("c.example.com"),
+            "should remove the browser record of a capture-only source"
+        );
+        assert_eq!(
+            applied.entry.ps["cap"].ov,
+            vec![uid_hash("browser-c")],
+            "should hash the removed UID into ov"
+        );
+    }
+
+    #[test]
+    fn a_writer_remove_keeps_another_writers_record() {
+        let mut live = KvEntry::minimal("e.example.com", "browser", 1);
+        live.ids.insert(
+            "a.example.com".to_owned(),
+            written("other", "v1", "1111111111111111"),
+        );
+
+        let applied =
+            run_removals(&writer_remove("a.example.com", "owner"), &live).expect("should apply");
+
+        assert!(
+            applied.entry.ids.contains_key("a.example.com"),
+            "should keep a record another writer wrote"
+        );
+        assert!(!applied.changed, "should report no change");
+    }
+
+    #[test]
+    fn removals_and_has_removals_round_trip() {
+        let mut mutation = writer_remove("a.example.com", "owner");
+        mutation.add_change(fill("b.example.com", KvPartnerId::browser("u", Some(NOW))));
+        mutation.merge_state(pid("other"), opt_out(NOW));
+        mutation.merge_state(
+            pid("cap"),
+            ProviderStateChange {
+                n: Some(3),
+                ..ProviderStateChange::default()
+            },
+        );
+
+        assert!(mutation.has_removals(), "should see the removals");
+        let removals = mutation.removals();
+        assert!(removals.has_removals(), "should keep the removals");
+        assert_eq!(
+            removals.removal_labels(),
+            mutation.removal_labels(),
+            "should keep every removal label"
+        );
+        assert!(
+            removals.partner_ids.iter().all(PartnerIdChange::is_removal),
+            "should drop the positive changes"
+        );
+        assert!(
+            !removals.provider_state.contains_key(&pid("cap")),
+            "should drop a state change that holds no removal"
+        );
+        assert!(
+            !IdentityMutation::default().has_removals(),
+            "should see no removals in an empty mutation"
+        );
+    }
+
+    #[test]
+    fn removal_labels_are_sorted_and_deduplicated() {
+        let mut mutation = IdentityMutation::default();
+        mutation.add_change(PartnerIdChange::OwnerRemove {
+            source: src("a.example.com"),
+            provider: pid("owner"),
+            expected: rev("1111111111111111"),
+        });
+        mutation.add_change(PartnerIdChange::OwnerRemove {
+            source: src("a.example.com"),
+            provider: pid("owner"),
+            expected: rev("2222222222222222"),
+        });
+        mutation.add_change(PartnerIdChange::WriterRemove {
+            source: src("b.example.com"),
+            writer: pid("cap"),
+        });
+        mutation.merge_state(pid("owner"), opt_out(NOW));
+        mutation.merge_state(
+            pid("other"),
+            ProviderStateChange {
+                opt_out_clear: Some(NOW),
+                ..ProviderStateChange::default()
+            },
+        );
+        mutation.add_result(ProviderResult {
+            provider: pid("owner"),
+            ids: Vec::new(),
+            state: opt_out(NOW),
+            expected_state: None,
+        });
+
+        assert_eq!(
+            mutation.removal_labels(),
+            vec![
+                (pid("cap"), Some(src("b.example.com"))),
+                (pid("other"), None),
+                (pid("owner"), None),
+                (pid("owner"), Some(src("a.example.com"))),
+            ],
+            "should list each provider and source once, sorted, with no UID"
         );
     }
 }

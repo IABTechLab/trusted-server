@@ -25,7 +25,7 @@ use super::kv_types::{KvEntry, KvMetadata, KvNetwork};
 use super::{EcKvSnapshot, checked_current_timestamp, current_timestamp, log_id};
 
 /// Maximum number of CAS retry attempts before giving up.
-const MAX_CAS_RETRIES: u32 = 5;
+pub(crate) const MAX_CAS_RETRIES: u32 = 5;
 
 /// Maximum number of keys to request when counting hash-prefix matches
 /// for cluster size evaluation. Anything above this is clearly a large
@@ -859,6 +859,34 @@ impl KvIdentityGraph {
         EcKvSnapshot::Failed {
             ec_id: ec_id.to_owned(),
         }
+    }
+
+    /// Writes `entry` only if the row is still at `generation`.
+    ///
+    /// The identity removal write and the phase 4 flush share this path, so
+    /// every identity write is validated and generation-checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `entry` does not serialize or validate, or the
+    /// store write fails for a reason other than a generation mismatch.
+    // Temporary: the removal write and the flush are its first callers, in
+    // later identity tasks. Remove this when they land.
+    #[allow(dead_code)]
+    pub(crate) fn write_if_generation(
+        &self,
+        ec_id: &str,
+        entry: &KvEntry,
+        generation: u64,
+    ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+        let (body, metadata) = Self::serialize_entry(entry, self.store_name())?;
+        self.write_entry(
+            ec_id,
+            &body,
+            &metadata,
+            ENTRY_TTL,
+            EcKvWriteMode::IfGenerationMatch(generation),
+        )
     }
 
     /// Returns `proven` instead of a read outcome that cannot disprove it.

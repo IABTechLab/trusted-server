@@ -15,6 +15,7 @@ pub(crate) mod mirror;
 pub(crate) mod mutation;
 pub(crate) mod policy;
 pub mod provider;
+pub(crate) mod removal;
 pub mod resolution;
 pub(crate) mod revision;
 pub(crate) mod servable;

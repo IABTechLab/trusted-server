@@ -115,6 +115,10 @@ fn checked_sources() -> &'static [(&'static str, &'static str)] {
             include_str!("ec/identity/provider.rs"),
         ),
         (
+            "ec/identity/removal.rs",
+            include_str!("ec/identity/removal.rs"),
+        ),
+        (
             "ec/identity/resolution.rs",
             include_str!("ec/identity/resolution.rs"),
         ),
