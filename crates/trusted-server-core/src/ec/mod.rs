@@ -620,13 +620,26 @@ impl EcContext {
         &self.kv_snapshot
     }
 
-    /// Returns the withdrawn EC IDs whose before-send tombstone failed.
+    /// Returns the withdrawn EC IDs whose tombstone has failed and not yet
+    /// succeeded.
     ///
-    /// The after-send retry reads these, and the failure counters read them
-    /// after the retry, so the retry does not clear them.
+    /// Before the after-send retry these are the before-send failures. After
+    /// it, only the IDs that failed a second time remain, which is what the
+    /// failure counters count.
     #[must_use]
-    pub fn failed_withdrawals(&self) -> &[String] {
+    pub(crate) fn failed_withdrawals(&self) -> &[String] {
         &self.failed_withdrawals
+    }
+
+    /// Whether any withdrawn EC ID's tombstone is still unwritten.
+    #[must_use]
+    pub fn has_failed_withdrawals(&self) -> bool {
+        !self.failed_withdrawals.is_empty()
+    }
+
+    /// Forgets a withdrawn EC ID whose retried tombstone was written.
+    pub(crate) fn clear_failed_withdrawal(&mut self, ec_id: &str) {
+        self.failed_withdrawals.retain(|id| id != ec_id);
     }
 
     /// Records a withdrawn EC ID whose before-send tombstone failed.

@@ -591,13 +591,16 @@ fn tombstone_withdrawn_id(
 ///
 /// Each failed ID re-reads its row (a [`EcKvSnapshot::NotRead`] start) and runs
 /// the same tombstone path as before send, with its own CAS attempts and
-/// completion marker. This is the last attempt: a second failure is logged and
-/// the ID stays in [`EcContext::failed_withdrawals`] for the failure counters.
+/// completion marker. This is the last attempt: a success clears the ID from
+/// the context's failed list, and a second failure is logged and leaves it
+/// there for the failure counters.
 /// An ID that was never recorded as failed is not touched.
 pub fn retry_failed_withdrawals(ec_context: &mut EcContext, graph: &KvIdentityGraph) {
     let failed = ec_context.failed_withdrawals().to_vec();
     for ec_id in &failed {
-        if !tombstone_withdrawn_id(ec_context, graph, ec_id) {
+        if tombstone_withdrawn_id(ec_context, graph, ec_id) {
+            ec_context.clear_failed_withdrawal(ec_id);
+        } else {
             log::warn!(
                 "EC withdrawal tombstone failed again after send for '{}': the identity-graph \
                  row may still be live with consent granted",
@@ -3140,6 +3143,10 @@ mod tests {
             retry_failed_withdrawals(&mut context, &graph);
 
             assert!(is_tombstone(&graph, &ec_id), "should read as a tombstone");
+            assert!(
+                context.failed_withdrawals().is_empty(),
+                "should clear an ID whose retry succeeded"
+            );
             let writes = store.writes();
             assert_eq!(
                 writes.if_generation_match, 1,
@@ -3188,6 +3195,41 @@ mod tests {
         }
 
         #[test]
+        fn only_the_id_that_fails_twice_remains_after_the_retry() {
+            let (graph, store) = KvIdentityGraph::write_counting("ec-store");
+            let active = sample_ec_id("activ5");
+            let cookie = sample_ec_id("cook5e");
+            seed(&graph, &active);
+            seed(&graph, &cookie);
+            store.refuse_conditional_writes(&cookie, MAX_CAS_RETRIES as usize);
+            store.refuse_conditional_writes(&active, usize::MAX);
+            let mut context = withdrawn_context(&active, &cookie);
+            context.set_kv_snapshot(graph.load_snapshot(&active));
+            finalize(&mut context, &graph);
+            assert_eq!(
+                context.failed_withdrawals().len(),
+                2,
+                "should record both IDs before send"
+            );
+
+            retry_failed_withdrawals(&mut context, &graph);
+
+            assert_eq!(
+                context.failed_withdrawals(),
+                std::slice::from_ref(&active),
+                "should keep only the ID that failed twice"
+            );
+            assert!(
+                is_tombstone(&graph, &cookie),
+                "should withdraw the cookie row"
+            );
+            assert!(
+                !is_tombstone(&graph, &active),
+                "the active row should be live"
+            );
+        }
+
+        #[test]
         fn withdrawal_of_two_ids_retries_only_the_failed_one() {
             let (graph, store) = KvIdentityGraph::write_counting("ec-store");
             let active = sample_ec_id("activ4");
@@ -3215,6 +3257,10 @@ mod tests {
             assert!(
                 is_tombstone(&graph, &cookie),
                 "should withdraw the cookie row"
+            );
+            assert!(
+                context.failed_withdrawals().is_empty(),
+                "should hold no ID once the only failed one succeeds"
             );
             assert_eq!(
                 graph.get(&active).expect("should read").map(|row| row.1),

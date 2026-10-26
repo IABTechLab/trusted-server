@@ -630,7 +630,7 @@ fn run_edgezero_after_send(
 ) {
     run_after_send_in_order(
         ec_state,
-        |state| !state.ec_context.failed_withdrawals().is_empty(),
+        |state| state.ec_context.has_failed_withdrawals(),
         |state| match require_identity_graph(settings) {
             Ok(graph) => retry_failed_withdrawals(&mut state.ec_context, &graph),
             Err(err) => {
