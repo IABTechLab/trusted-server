@@ -307,6 +307,161 @@ pub fn provider_from(descriptor: ProviderDescriptor) -> Arc<dyn IdentityProvider
     Arc::new(DescriptorOnly(descriptor))
 }
 
+/// The source [`MultiEntryTestProvider`] writes.
+pub const MULTI_ENTRY_SOURCE: &str = "exampleid.example.com";
+
+/// The endpoint [`MultiEntryTestProvider`] calls.
+pub const MULTI_ENTRY_ENDPOINT: &str = "https://api.exampleid.example.com/v1/resolve";
+
+/// A resolver for [`MULTI_ENTRY_SOURCE`] that returns a complete set, for
+/// request-level tests of a registered provider.
+///
+/// The JSON body of the endpoint's reply picks the answer through its
+/// `entries` member:
+///
+/// - `"full"`, or a body without the member: two entries. The first holds
+///   `uid-a` (`atype` 1, a UID-level `ext`) and `uid-b`, with `inserter`,
+///   `matcher` and `mm`. The second holds `uid-c` and an EID-level `ext`, and
+///   sets none of `inserter`, `matcher` and `mm`.
+/// - `"first"`: the first entry alone.
+/// - `"single"`: `uid-a` with `atype` 1 and its UID-level `ext`, and no
+///   EID-level field.
+/// - `"oversized"`: a set over `MAX_ENTRY_SET_BYTES`, which also invalidates
+///   the source.
+/// - `"none"`: no match.
+///
+/// The descriptor declares a `with_provenance` default of an `inserter` and a
+/// `matcher`. [`stateful`](Self::stateful) is the same provider declared
+/// `with_private_state()`; it keeps `{"seen": true}` in every answer that
+/// finds an ID.
+pub struct MultiEntryTestProvider {
+    descriptor: ProviderDescriptor,
+    stateful: bool,
+}
+
+impl MultiEntryTestProvider {
+    /// The stateless provider.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed descriptor does not build.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::build(false)
+    }
+
+    /// The same provider, declared `with_private_state()`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed descriptor does not build.
+    #[must_use]
+    pub fn stateful() -> Self {
+        Self::build(true)
+    }
+
+    fn build(stateful: bool) -> Self {
+        let mut resolves = Resolves::new().with_endpoint(MULTI_ENTRY_ENDPOINT);
+        if stateful {
+            resolves = resolves.with_private_state();
+        }
+        let descriptor =
+            ProviderDescriptor::builder("exampleid".parse().expect("should parse the provider ID"))
+                .with_source(source(MULTI_ENTRY_SOURCE))
+                .with_resolves(resolves)
+                .with_consent_policy(ConsentPolicy::strict())
+                .with_provenance(
+                    &source(MULTI_ENTRY_SOURCE),
+                    EidProvenance::new()
+                        .with_inserter("default-inserter.example.com")
+                        .with_matcher("default-matcher.example.com"),
+                )
+                .build()
+                .expect("should build the descriptor");
+        Self {
+            descriptor,
+            stateful,
+        }
+    }
+
+    fn first_entry(source: &SourceDomain) -> ResolvedEid {
+        ResolvedEid::new(
+            source,
+            ResolvedUid::new("uid-a")
+                .with_atype(1)
+                .with_ext(json!({ "rtiPartner": "example" })),
+        )
+        .with_uid(ResolvedUid::new("uid-b"))
+        .with_inserter("inserter-a.example.com")
+        .with_matcher("matcher-a.example.com")
+        .with_mm(2)
+    }
+}
+
+impl Default for MultiEntryTestProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IdentityProvider for MultiEntryTestProvider {
+    fn descriptor(&self) -> &ProviderDescriptor {
+        &self.descriptor
+    }
+
+    fn request(
+        &self,
+        input: &ResolveInput<'_>,
+    ) -> Result<Option<ProviderRequest>, Report<IdentityProviderError>> {
+        Ok(Some(ProviderRequest::get(input.endpoint()?)))
+    }
+
+    fn response(
+        &self,
+        response: &ProviderResponse,
+        _input: &ResolveInput<'_>,
+    ) -> Result<Resolution, Report<IdentityProviderError>> {
+        let body: serde_json::Value = response.success_json()?;
+        let source = source(MULTI_ENTRY_SOURCE);
+        let resolution = match body["entries"].as_str() {
+            Some("none") => Resolution::no_match(),
+            Some("first") => Resolution::found([Self::first_entry(&source)]),
+            Some("single") => Resolution::found([ResolvedEid::new(
+                &source,
+                ResolvedUid::new("uid-a")
+                    .with_atype(1)
+                    .with_ext(json!({ "rtiPartner": "example" })),
+            )]),
+            Some("oversized") => {
+                let entries = (0..8).map(|index| {
+                    ResolvedEid::new(
+                        &source,
+                        ResolvedUid::new(format!("uid-{index}"))
+                            .with_ext(json!({ "pad": "x".repeat(1_000) })),
+                    )
+                });
+                return Ok(self.with_state(Resolution::found(entries).also_invalidate(&source)));
+            }
+            _ => Resolution::found([
+                Self::first_entry(&source),
+                ResolvedEid::new(&source, ResolvedUid::new("uid-c"))
+                    .with_ext(json!({ "segments": ["example"] })),
+            ]),
+        };
+        Ok(self.with_state(resolution))
+    }
+}
+
+impl MultiEntryTestProvider {
+    fn with_state(&self, resolution: Resolution) -> Resolution {
+        if self.stateful {
+            resolution.replacing_state(&json!({ "seen": true }))
+        } else {
+            resolution
+        }
+    }
+}
+
 /// A `fixed_provider` declared `with_private_state()`.
 ///
 /// # Panics

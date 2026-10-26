@@ -1042,6 +1042,23 @@ mod tests {
         request
     }
 
+    /// Polls `future` to completion on this thread without entering an
+    /// executor, so code under test that blocks on its own futures, such as
+    /// the hold dispatch of an auction navigation, can run inside it. The
+    /// scripted network is ready at once, so a future that stays pending is a
+    /// test bug.
+    fn poll_ready<F: core::future::Future>(future: F) -> F::Output {
+        let waker = futures::task::noop_waker();
+        let mut context = core::task::Context::from_waker(&waker);
+        let mut future = core::pin::pin!(future);
+        for _ in 0..10_000 {
+            if let core::task::Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                return output;
+            }
+        }
+        unreachable!("the future should complete against the scripted network")
+    }
+
     /// Routes `request`, then finalizes, sends and flushes it as
     /// `edgezero_main` does, keeping the sent response.
     fn drive_request_for_test(
@@ -1060,8 +1077,7 @@ mod tests {
         prepare: impl FnOnce(&mut EcFinalizeState),
     ) -> (HttpResponse, Option<FlushOutcome>) {
         let router = TrustedServerApp::routes_for_state(state);
-        let mut response =
-            futures::executor::block_on(router.oneshot(request)).expect("should route the request");
+        let mut response = poll_ready(router.oneshot(request)).expect("should route the request");
         let Some(mut ec_state) = response.extensions_mut().remove::<EcFinalizeState>() else {
             return (response, None);
         };
@@ -1761,15 +1777,20 @@ mod tests {
         use std::collections::BTreeMap;
         use std::sync::Mutex;
 
+        use trusted_server_core::ec::identity::IdentityProviderError;
         use trusted_server_core::ec::identity::test_support::{
-            WriteCountingEcKv, allowing_consent,
+            MULTI_ENTRY_SOURCE, MultiEntryTestProvider, WriteCountingEcKv, allowing_consent,
         };
         use trusted_server_core::ec::kv_backend::EcKvStore as _;
-        use trusted_server_core::ec::kv_types::{KvEntry, KvNetwork, KvPartnerId};
+        use trusted_server_core::ec::kv_types::{
+            KvEid, KvEntry, KvNetwork, KvOptOut, KvPartnerId, KvProviderState, KvUid,
+        };
+        use trusted_server_core::integrations::IntegrationRegistration;
         use trusted_server_core::platform::{
             GeoInfo, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
             PlatformPendingRequest, PlatformResponse, PlatformSelectResult,
         };
+        use trusted_server_core::settings::{EcPartner, ProviderMode, ProviderSettings};
 
         /// The host the publisher origin answers on.
         const ORIGIN_HOST: &str = "origin.test-publisher.com";
@@ -1839,6 +1860,14 @@ mod tests {
                             body: body.as_bytes().to_vec(),
                         },
                     );
+            }
+
+            /// Forgets the answer for `host`, so a call to it fails in transport.
+            fn clear_reply(&self, host: &str) {
+                self.replies
+                    .lock()
+                    .expect("should lock the replies")
+                    .remove(host);
             }
 
             /// Every request that went to `host`, in order.
@@ -4354,6 +4383,890 @@ mod tests {
                     && forwarded.to_string().contains("other.example.com"),
                 "control: the golden should hold UID-level and EID-level fields"
             );
+
+            scenario.drive(auction_request(
+                Some(&ec_cookie()),
+                &auction_body(Some(&eids)),
+            ));
+
+            assert_eq!(
+                bidder_eids(&bidder_body(&scenario)),
+                forwarded,
+                "user.ext.eids should equal what the code before this spec forwarded"
+            );
+            assert_no_writes(&scenario.store, "/auction");
+        }
+
+        // ---- A registered provider's complete set, end to end (Task 39b) ----
+
+        /// The provider `MultiEntryTestProvider` registers as.
+        const MULTI_PROVIDER: &str = "exampleid";
+
+        /// The host `MultiEntryTestProvider` calls.
+        const MULTI_HOST: &str = "api.exampleid.example.com";
+
+        /// The registration `exampleid` makes for `provider`.
+        fn multi_registration(provider: MultiEntryTestProvider) -> IntegrationRegistration {
+            IntegrationRegistration::builder("exampleid")
+                .try_with_identity_provider(Ok::<_, Report<IdentityProviderError>>(provider))
+                .expect("should register the provider")
+                .build()
+        }
+
+        /// A scenario with the auction, the `exampleid` source registered for
+        /// the bidstream, and `registrations` contributing providers.
+        /// `exampleid` owns [`MULTI_ENTRY_SOURCE`] and runs in `mode`.
+        fn registered_scenario(
+            registrations: Vec<IntegrationRegistration>,
+            mode: ProviderMode,
+        ) -> Scenario {
+            let Scenario {
+                mut state,
+                store,
+                network,
+            } = Scenario::with_settings(&format!(
+                "{AUCTION_TOML}{}",
+                partner_toml(MULTI_ENTRY_SOURCE)
+            ));
+            let owned = Arc::get_mut(&mut state).expect("should own the fresh state");
+            Arc::make_mut(&mut owned.settings)
+                .ec
+                .identity
+                .providers
+                .insert(
+                    MULTI_PROVIDER.to_owned(),
+                    ProviderSettings {
+                        mode,
+                        ..ProviderSettings::default()
+                    },
+                );
+            let providers = registrations
+                .into_iter()
+                .flat_map(|registration| registration.identity_providers)
+                .collect();
+            let runtime = IdentityRuntime::from_settings_with_providers(
+                &state.settings,
+                providers,
+                BTreeMap::from([(
+                    MULTI_ENTRY_SOURCE.parse().expect("should parse the source"),
+                    MULTI_PROVIDER
+                        .parse()
+                        .expect("should parse the provider ID"),
+                )]),
+            )
+            .expect("should build the identity runtime");
+            let scenario = Scenario {
+                state: crate::app::app_state_with_identity_for_test(state, runtime),
+                store,
+                network,
+            };
+            scenario.network.respond(
+                BIDDER_HOST,
+                200,
+                "application/json",
+                r#"{"id":"response","seatbid":[]}"#,
+            );
+            answer_with(&scenario, "full");
+            scenario
+        }
+
+        /// A scenario whose one provider is `MultiEntryTestProvider`.
+        fn multi_scenario(provider: MultiEntryTestProvider, mode: ProviderMode) -> Scenario {
+            registered_scenario(vec![multi_registration(provider)], mode)
+        }
+
+        /// Makes the provider's endpoint answer with the `entries` shape.
+        fn answer_with(scenario: &Scenario, entries: &str) {
+            scenario.network.respond(
+                MULTI_HOST,
+                200,
+                "application/json",
+                &serde_json::json!({ "entries": entries }).to_string(),
+            );
+        }
+
+        fn kv_uid(id: &str, atype: Option<i32>, ext: Option<serde_json::Value>) -> KvUid {
+            KvUid {
+                id: id.to_owned(),
+                atype,
+                ext,
+            }
+        }
+
+        /// What the provider's `full` answer stores.
+        fn multi_full_set() -> Vec<KvEid> {
+            vec![
+                KvEid {
+                    uids: vec![
+                        kv_uid(
+                            "uid-a",
+                            Some(1),
+                            Some(serde_json::json!({ "rtiPartner": "example" })),
+                        ),
+                        kv_uid("uid-b", None, None),
+                    ],
+                    inserter: Some("inserter-a.example.com".to_owned()),
+                    matcher: Some("matcher-a.example.com".to_owned()),
+                    mm: Some(2),
+                    ext: None,
+                },
+                KvEid {
+                    uids: vec![kv_uid("uid-c", None, None)],
+                    inserter: None,
+                    matcher: None,
+                    mm: None,
+                    ext: Some(serde_json::json!({ "segments": ["example"] })),
+                },
+            ]
+        }
+
+        /// The first entry of the `full` answer, which the `first` answer
+        /// returns alone.
+        fn multi_first_set() -> Vec<KvEid> {
+            multi_full_set().into_iter().take(1).collect()
+        }
+
+        /// The first entry as bidders see it.
+        fn multi_first_eid() -> serde_json::Value {
+            serde_json::json!({
+                "source": MULTI_ENTRY_SOURCE,
+                "inserter": "inserter-a.example.com",
+                "matcher": "matcher-a.example.com",
+                "mm": 2,
+                "uids": [
+                    { "id": "uid-a", "atype": 1, "ext": { "rtiPartner": "example" } },
+                    { "id": "uid-b", "atype": EcPartner::default_openrtb_atype() }
+                ]
+            })
+        }
+
+        /// The second entry as bidders see it, with the provenance default.
+        fn multi_second_eid() -> serde_json::Value {
+            serde_json::json!({
+                "source": MULTI_ENTRY_SOURCE,
+                "inserter": "default-inserter.example.com",
+                "matcher": "default-matcher.example.com",
+                "ext": { "segments": ["example"] },
+                "uids": [{ "id": "uid-c", "atype": EcPartner::default_openrtb_atype() }]
+            })
+        }
+
+        /// A row holding `eids` for [`MULTI_ENTRY_SOURCE`], written by the
+        /// provider and due for a refresh.
+        fn multi_row(eids: Vec<KvEid>) -> KvEntry {
+            let mut entry = live_entry();
+            entry.ids.insert(
+                MULTI_ENTRY_SOURCE.to_owned(),
+                KvPartnerId {
+                    w: Some(MULTI_PROVIDER.to_owned()),
+                    rv: Some("0123456789abcdef".to_owned()),
+                    at: Some(1_000),
+                    ra: Some(1_500),
+                    eids,
+                    ..KvPartnerId::default()
+                },
+            );
+            entry
+        }
+
+        /// The record under [`MULTI_ENTRY_SOURCE`], with its fresh `rv` and `at`
+        /// checked and copied into the expectation of the caller.
+        fn fresh_record(row: &KvEntry) -> KvPartnerId {
+            let record = row
+                .ids
+                .get(MULTI_ENTRY_SOURCE)
+                .expect("should hold the provider's record")
+                .clone();
+            let revision = record.rv.as_deref().expect("should carry a revision");
+            assert!(
+                revision.len() == 16
+                    && revision
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "should carry a 16 digit lowercase hex rv"
+            );
+            assert_ne!(
+                revision, "0123456789abcdef",
+                "should carry a fresh rv, not the seeded one"
+            );
+            assert!(record.at.is_some(), "should record when it was acquired");
+            record
+        }
+
+        #[test]
+        fn registered_provider_full_set_reaches_kv_mirror_and_bidstream_in_order() {
+            let scenario = multi_scenario(MultiEntryTestProvider::new(), ProviderMode::Hold);
+            scenario.seed_live();
+
+            let (_, outcome) = scenario.drive(navigation(Some(&ec_cookie())));
+
+            assert_eq!(outcome, Some(FlushOutcome::Written), "should flush");
+            assert_eq!(
+                scenario.network.requests_to(MULTI_HOST).len(),
+                1,
+                "should call the registered provider once"
+            );
+            assert_writes(&scenario.store, (0, 1, 0), "one flush holds the whole set");
+            let record = fresh_record(&scenario.row());
+            assert_eq!(
+                record,
+                KvPartnerId {
+                    w: Some(MULTI_PROVIDER.to_owned()),
+                    rv: record.rv.clone(),
+                    at: record.at,
+                    exp: None,
+                    ra: None,
+                    ru: None,
+                    eids: multi_full_set(),
+                },
+                "should store both entries as returned, written by the provider"
+            );
+
+            scenario.store.reset_counts();
+            let body = auction_body(Some(&serde_json::json!([browser_entry()])));
+            let (response, _) = scenario.drive(auction_request(Some(&ec_cookie()), &body));
+
+            let expected =
+                serde_json::json!([browser_entry(), multi_first_eid(), multi_second_eid()]);
+            assert_eq!(
+                bidder_eids(&bidder_body(&scenario)),
+                expected,
+                "user.ext.eids should carry the browser entry, then both entries in order"
+            );
+            assert_eq!(
+                header_eids(&response),
+                expected,
+                "x-ts-eids should carry the same"
+            );
+            assert_eq!(
+                mirror_of(&json_of(response)),
+                serde_json::json!({ "v": 1, "eids": [multi_first_eid(), multi_second_eid()] }),
+                "the mirror should decode to the same two entries, defaults included"
+            );
+            assert_eq!(
+                scenario.network.requests_to(MULTI_HOST).len(),
+                1,
+                "control: the /auction should serve from KV without calling the provider"
+            );
+            assert_no_writes(&scenario.store, "/auction");
+        }
+
+        #[test]
+        fn one_entry_one_uid_result_is_written_as_one_entry() {
+            let scenario = multi_scenario(MultiEntryTestProvider::new(), ProviderMode::Hold);
+            scenario.seed_live();
+            answer_with(&scenario, "single");
+
+            scenario.drive(navigation(Some(&ec_cookie())));
+
+            assert_writes(&scenario.store, (0, 1, 0), "one flush");
+            let record = fresh_record(&scenario.row());
+            assert_eq!(
+                record,
+                KvPartnerId {
+                    w: Some(MULTI_PROVIDER.to_owned()),
+                    rv: record.rv.clone(),
+                    at: record.at,
+                    exp: None,
+                    ra: None,
+                    ru: None,
+                    eids: vec![KvEid {
+                        uids: vec![kv_uid(
+                            "uid-a",
+                            Some(1),
+                            Some(serde_json::json!({ "rtiPartner": "example" }))
+                        )],
+                        inserter: None,
+                        matcher: None,
+                        mm: None,
+                        ext: None,
+                    }],
+                },
+                "should store one entry holding one UID"
+            );
+            let stored = stored_body(&scenario);
+            assert_eq!(
+                stored["ids"][MULTI_ENTRY_SOURCE],
+                serde_json::json!({
+                    "w": MULTI_PROVIDER,
+                    "rv": record.rv,
+                    "at": record.at,
+                    "eids": [{
+                        "uids": [{
+                            "id": "uid-a",
+                            "atype": 1,
+                            "ext": { "rtiPartner": "example" }
+                        }]
+                    }]
+                }),
+                "should write the one shape of spec 6.1"
+            );
+        }
+
+        #[test]
+        fn later_result_without_an_entry_removes_it() {
+            let scenario = multi_scenario(MultiEntryTestProvider::new(), ProviderMode::Hold);
+            let mut row = multi_row(multi_full_set());
+            row.ids.insert(
+                "id5-sync.com".to_owned(),
+                KvPartnerId::browser("id5-uid", Some(1_500)),
+            );
+            scenario.seed(&row);
+            answer_with(&scenario, "first");
+
+            let (_, outcome) = scenario.drive(navigation(Some(&ec_cookie())));
+
+            assert_eq!(outcome, Some(FlushOutcome::Written), "should flush");
+            assert_eq!(
+                scenario.network.requests_to(MULTI_HOST).len(),
+                1,
+                "control: the due record should have been refreshed"
+            );
+            let after = scenario.row();
+            let record = fresh_record(&after);
+            assert_eq!(
+                record,
+                KvPartnerId {
+                    w: Some(MULTI_PROVIDER.to_owned()),
+                    rv: record.rv.clone(),
+                    at: record.at,
+                    exp: None,
+                    ra: None,
+                    ru: None,
+                    eids: multi_first_set(),
+                },
+                "should leave exactly the returned entry in KV"
+            );
+            assert_eq!(
+                after.ids.get("id5-sync.com"),
+                row.ids.get("id5-sync.com"),
+                "should keep the record of a source the result does not name"
+            );
+
+            let (_, _) = scenario.drive(auction_request(Some(&ec_cookie()), &auction_body(None)));
+            assert_eq!(
+                bidder_eids(&bidder_body(&scenario)),
+                serde_json::json!([
+                    multi_first_eid(),
+                    { "source": "id5-sync.com", "uids": [{ "id": "id5-uid", "atype": 3 }] }
+                ]),
+                "should serve exactly the remaining entry, and the other source's record"
+            );
+        }
+
+        #[test]
+        fn stateful_result_with_an_oversized_set_keeps_only_its_removals() {
+            let scenario = multi_scenario(MultiEntryTestProvider::stateful(), ProviderMode::Hold);
+            let mut row = multi_row(multi_first_set());
+            row.ps.insert(
+                MULTI_PROVIDER.to_owned(),
+                KvProviderState {
+                    st: Some(serde_json::json!({ "seen": false })),
+                    ..KvProviderState::default()
+                },
+            );
+            scenario.seed(&row);
+            answer_with(&scenario, "oversized");
+
+            scenario.drive(navigation(Some(&ec_cookie())));
+
+            assert_eq!(
+                scenario.network.requests_to(MULTI_HOST).len(),
+                1,
+                "control: the provider should have been called"
+            );
+            let after = scenario.row();
+            assert!(
+                !after.ids.contains_key(MULTI_ENTRY_SOURCE),
+                "should apply the also_invalidate removal and store none of the oversized set"
+            );
+            let state = after
+                .ps
+                .get(MULTI_PROVIDER)
+                .expect("should keep the provider's row state");
+            assert!(
+                state.n.is_some_and(|wait_until| wait_until > 1_700_000_000),
+                "should back off the rejected answer"
+            );
+            assert_eq!(
+                state,
+                &KvProviderState {
+                    n: state.n,
+                    f: 1,
+                    o: None,
+                    oc: None,
+                    iv: state.iv.clone(),
+                    ov: Vec::new(),
+                    st: Some(serde_json::json!({ "seen": false })),
+                },
+                "should keep the old state, not the rejected replacement, and count one failure"
+            );
+            assert_eq!(
+                state.iv.len(),
+                2,
+                "should record the two invalidated UIDs, so the removal is not undone"
+            );
+        }
+
+        #[test]
+        fn identify_returns_the_first_uid_of_a_full_record() {
+            let scenario = multi_scenario(MultiEntryTestProvider::new(), ProviderMode::Hold);
+            let mut row = multi_row(multi_full_set());
+            row.ids
+                .get_mut(MULTI_ENTRY_SOURCE)
+                .expect("should hold the record")
+                .ra = None;
+            row.ids.insert(
+                "id5-sync.com".to_owned(),
+                KvPartnerId::browser("id5-uid", Some(1_500)),
+            );
+            scenario.seed(&row);
+            let atype = EcPartner::default_openrtb_atype();
+
+            let full = json_of(
+                scenario
+                    .drive(identify_request(&ec_cookie(), MULTI_ENTRY_SOURCE))
+                    .0,
+            );
+            let one_uid = json_of(
+                scenario
+                    .drive(identify_request(&ec_cookie(), "id5-sync.com"))
+                    .0,
+            );
+
+            assert_eq!(full["uid"], "uid-a", "should return the first UID");
+            assert_eq!(
+                full["eid"],
+                serde_json::json!({
+                    "source": MULTI_ENTRY_SOURCE,
+                    "uids": [{ "id": "uid-a", "atype": atype }]
+                }),
+                "should return the first UID with the partner's openrtb_atype"
+            );
+            assert_eq!(
+                one_uid["eid"],
+                serde_json::json!({
+                    "source": "id5-sync.com",
+                    "uids": [{ "id": "id5-uid", "atype": atype }]
+                }),
+                "control: a one-UID record should have the same shape"
+            );
+            let keys = |body: &serde_json::Value| {
+                body.as_object()
+                    .expect("should be an object")
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                keys(&full),
+                keys(&one_uid),
+                "should answer in the same shape"
+            );
+        }
+
+        #[test]
+        fn rollback_to_part_1_config_keeps_the_owners_opt_out() {
+            let scenario = Scenario::with_settings(&format!(
+                "{AUCTION_TOML}{}",
+                partner_toml(MULTI_ENTRY_SOURCE)
+            ));
+            scenario.network.respond(
+                BIDDER_HOST,
+                200,
+                "application/json",
+                r#"{"id":"response","seatbid":[]}"#,
+            );
+            let mut row = multi_row(multi_full_set());
+            row.ps.insert(
+                MULTI_PROVIDER.to_owned(),
+                KvProviderState {
+                    n: Some(FAR_FUTURE),
+                    f: 2,
+                    o: Some(KvOptOut {
+                        at: 1_200,
+                        fp: "0".to_owned(),
+                    }),
+                    oc: Some(1_100),
+                    iv: vec!["00112233445566ff".to_owned()],
+                    ov: vec!["8899aabbccddeeff".to_owned()],
+                    st: Some(serde_json::json!({ "seen": true })),
+                },
+            );
+            scenario.seed(&row);
+
+            let (_, outcome) = scenario.drive(navigation(Some(&returning_with_shared_id())));
+
+            assert_eq!(outcome, Some(FlushOutcome::Written), "should flush");
+            let after = scenario.row();
+            assert_eq!(
+                after.ps.get(MULTI_PROVIDER),
+                Some(&KvProviderState {
+                    n: None,
+                    f: 0,
+                    o: Some(KvOptOut {
+                        at: 1_200,
+                        fp: "0".to_owned(),
+                    }),
+                    oc: Some(1_100),
+                    iv: Vec::new(),
+                    ov: vec!["8899aabbccddeeff".to_owned()],
+                    st: None,
+                }),
+                "should keep o, oc and ov and lose n, f, iv and st"
+            );
+            assert_eq!(
+                after.ids.get(MULTI_ENTRY_SOURCE),
+                row.ids.get(MULTI_ENTRY_SOURCE),
+                "should keep the multi-entry record readable"
+            );
+            assert_eq!(
+                stored_uid(&after, "sharedid.org").as_deref(),
+                Some(SHARED_ID),
+                "control: the flush should have written the ingest"
+            );
+
+            scenario.drive(auction_request(Some(&ec_cookie()), &auction_body(None)));
+            let sent = bidder_eids(&bidder_body(&scenario));
+            assert!(
+                !sent.to_string().contains(MULTI_ENTRY_SOURCE),
+                "should not serve a record whose provider the catalog no longer has: {sent}"
+            );
+            assert!(
+                sent.to_string().contains("sharedid.org"),
+                "control: should still serve the browser record: {sent}"
+            );
+        }
+
+        /// A scenario whose Didomi proxy answers `body`, with a capture-only
+        /// provider registered through an `IntegrationRegistration`, and a
+        /// row holding a browser-written `ssp.example.com` ID.
+        fn registered_capture_scenario(body: &str, global: bool) -> Scenario {
+            let Scenario {
+                mut state,
+                store,
+                network,
+            } = Scenario::with_settings(DIDOMI_TOML);
+            if global {
+                let owned = Arc::get_mut(&mut state).expect("should own the fresh state");
+                Arc::make_mut(&mut owned.settings)
+                    .ec
+                    .identity
+                    .providers
+                    .insert(
+                        "didomi".to_owned(),
+                        ProviderSettings {
+                            revoke_scope: Some(trusted_server_core::settings::RevokeScope::Global),
+                            ..ProviderSettings::default()
+                        },
+                    );
+            }
+            let registration = IntegrationRegistration::builder("didomi")
+                .with_identity_provider(
+                    trusted_server_core::ec::identity::test_support::answering_capture_provider(
+                        "didomi",
+                        &["ssp.example.com"],
+                        None,
+                    ),
+                )
+                .build();
+            let runtime = IdentityRuntime::from_settings_with_providers(
+                &state.settings,
+                registration.identity_providers,
+                BTreeMap::new(),
+            )
+            .expect("should build the identity runtime");
+            let scenario = Scenario {
+                state: crate::app::app_state_with_identity_for_test(state, runtime),
+                store,
+                network,
+            };
+            scenario
+                .network
+                .respond("sdk.example.com", 200, "application/json", body);
+            let mut entry = live_entry();
+            entry.ids.insert(
+                "ssp.example.com".to_owned(),
+                KvPartnerId {
+                    rv: Some("0123456789abcdef".to_owned()),
+                    at: Some(1_000),
+                    ..KvPartnerId::new("probe-uid")
+                },
+            );
+            scenario.seed(&entry);
+            scenario
+        }
+
+        #[test]
+        fn captured_revocation_writes_with_cas() {
+            let clean = registered_capture_scenario(CAPTURE_INVALIDATION, false);
+            clean.drive(didomi_navigation(Some(&returning_with_shared_id())));
+            assert_writes(
+                &clean.store,
+                (0, 2, 0),
+                "one CAS write for the removal before send, then the writer's flush",
+            );
+            assert_eq!(
+                stored_uid(&clean.row(), "ssp.example.com"),
+                None,
+                "should remove the captured ID"
+            );
+
+            let fifth = registered_capture_scenario(CAPTURE_INVALIDATION, false);
+            fifth.store.refuse_conditional_writes(EC_ID, 4);
+            fifth.drive(didomi_navigation(Some(&returning_with_shared_id())));
+            assert_writes(
+                &fifth.store,
+                (0, 6, 0),
+                "four refused attempts and the fifth before send, no retry after send, the flush",
+            );
+            assert_eq!(
+                stored_uid(&fifth.row(), "ssp.example.com"),
+                None,
+                "should remove the ID on the fifth attempt"
+            );
+
+            let retried = registered_capture_scenario(CAPTURE_INVALIDATION, false);
+            retried.store.refuse_conditional_writes(EC_ID, 5);
+            retried.drive(didomi_navigation(Some(&returning_with_shared_id())));
+            assert_writes(
+                &retried.store,
+                (0, 7, 0),
+                "five refused attempts before send, one more after send, the flush",
+            );
+            assert_eq!(
+                stored_uid(&retried.row(), "ssp.example.com"),
+                None,
+                "should remove the ID on the attempt after send"
+            );
+        }
+
+        #[test]
+        fn global_revoke_from_real_browser_writes_as_withdrawal() {
+            let withdrawn = Scenario::new();
+            withdrawn.seed_live();
+            drive_with_runtime(
+                &withdrawn.state,
+                navigation(Some(&ec_cookie())),
+                Some(&withdrawn.state.identity),
+                withdraw,
+            );
+            let withdrawal_writes = withdrawn.store.writes();
+
+            let scenario = registered_capture_scenario(r#"{"opted_out":true}"#, true);
+
+            let (response, _) =
+                scenario.drive(didomi_navigation(Some(&returning_with_shared_id())));
+
+            let row = scenario.row();
+            assert!(!row.consent.ok, "should tombstone the row");
+            assert!(row.ids.is_empty(), "should remove every ID");
+            assert_eq!(
+                scenario.row().consent.ok,
+                withdrawn.row().consent.ok,
+                "should end as a consent withdrawal does"
+            );
+            let writes = scenario.store.writes();
+            assert_eq!(
+                (writes.add, writes.if_generation_match, writes.overwrite),
+                (
+                    withdrawal_writes.add,
+                    withdrawal_writes.if_generation_match,
+                    withdrawal_writes.overwrite
+                ),
+                "should write the tombstone and its marker as a withdrawal does"
+            );
+            assert!(
+                set_cookies(&response).iter().any(|cookie| {
+                    cookie_name(cookie) == "ts-ec" && cookie.contains("Max-Age=0")
+                }),
+                "should expire the EC cookie"
+            );
+        }
+
+        #[test]
+        fn non_browser_capture_writes_nothing() {
+            for body in [CAPTURE_INVALIDATION, r#"{"opted_out":true}"#] {
+                let scenario = registered_capture_scenario(body, true);
+                let before = scenario.row();
+                let mut request = didomi_navigation(Some(&returning_with_shared_id()));
+                request.extensions_mut().clear();
+                request.headers_mut().remove("sec-fetch-dest");
+                request
+                    .headers_mut()
+                    .insert("user-agent", HeaderValue::from_static("curl/8.0"));
+
+                let (response, _) = scenario.drive(request);
+
+                assert_eq!(response.status(), 200, "should serve the proxied answer");
+                assert_no_writes(
+                    &scenario.store,
+                    "a capture from a client that is no browser",
+                );
+                assert_eq!(
+                    scenario.row(),
+                    before,
+                    "should leave the row as it was, whatever the body asks: {body}"
+                );
+                assert!(
+                    !set_cookies(&response).iter().any(
+                        |cookie| cookie_name(cookie) == "ts-ec" && cookie.contains("Max-Age=0")
+                    ),
+                    "should not expire the EC cookie"
+                );
+            }
+        }
+
+        #[test]
+        fn returning_navigation_answered_404_flushes_only_hold_removals_and_backoff() {
+            let removal_row = || multi_row(multi_first_set());
+            let drive_home = |scenario: &Scenario, status: u16| {
+                scenario.network.respond(
+                    ORIGIN_HOST,
+                    status,
+                    "text/html",
+                    "<html><head></head><body>page</body></html>",
+                );
+                let mut request = navigation(Some(&ec_cookie()));
+                *request.uri_mut() = "https://test-publisher.com/"
+                    .parse()
+                    .expect("should parse the home page URI");
+                scenario.drive(request)
+            };
+
+            let ok = multi_scenario(MultiEntryTestProvider::stateful(), ProviderMode::Hold);
+            ok.seed(&removal_row());
+            answer_with(&ok, "oversized");
+            drive_home(&ok, 200);
+            assert!(
+                !ok.row().ids.contains_key(MULTI_ENTRY_SOURCE),
+                "control: a 200 should flush the removal"
+            );
+
+            let not_found = multi_scenario(MultiEntryTestProvider::stateful(), ProviderMode::Hold);
+            not_found.seed(&removal_row());
+            answer_with(&not_found, "oversized");
+            drive_home(&not_found, 404);
+
+            assert_eq!(
+                not_found.network.requests_to(MULTI_HOST).len(),
+                1,
+                "should still have run the hold call"
+            );
+            let after = not_found.row();
+            assert!(
+                !after.ids.contains_key(MULTI_ENTRY_SOURCE),
+                "should flush the hold answer's removal on a 404"
+            );
+            assert_eq!(
+                after.ps.get(MULTI_PROVIDER).map(|state| state.iv.len()),
+                Some(2),
+                "should flush the removal's record of the two invalidated UIDs"
+            );
+
+            let backoff = multi_scenario(MultiEntryTestProvider::new(), ProviderMode::Hold);
+            backoff.seed_live();
+            answer_with(&backoff, "none");
+            drive_home(&backoff, 404);
+            assert!(
+                backoff
+                    .row()
+                    .ps
+                    .get(MULTI_PROVIDER)
+                    .and_then(|state| state.n)
+                    .is_some_and(|wait_until| wait_until > 1_700_000_000),
+                "should flush the no_match backoff on a 404"
+            );
+
+            let positive = multi_scenario(MultiEntryTestProvider::new(), ProviderMode::Hold);
+            positive.seed_live();
+            answer_with(&positive, "full");
+            drive_home(&positive, 404);
+            assert!(
+                !positive.row().ids.contains_key(MULTI_ENTRY_SOURCE),
+                "should store no positive hold answer on a 404"
+            );
+        }
+
+        /// A scenario like [`Scenario::new`] with `MultiEntryTestProvider`
+        /// registered on its own source, and its endpoint left unanswered so
+        /// the provider writes nothing the golden tests would see.
+        fn golden_registered_scenario() -> Scenario {
+            let scenario = registered_scenario(
+                vec![multi_registration(MultiEntryTestProvider::new())],
+                ProviderMode::AfterSend,
+            );
+            scenario.network.clear_reply(MULTI_HOST);
+            scenario
+        }
+
+        #[test]
+        fn golden_browser_ingest_with_a_registered_provider_writes_the_first_uid() {
+            let cookie = format!("ts-eids={GOLDEN_INGEST_COOKIE}; sharedId=shared-1");
+
+            let returning = golden_registered_scenario();
+            returning.seed_live();
+            let (_, outcome) =
+                returning.drive(navigation(Some(&format!("ts-ec={EC_ID}; {cookie}"))));
+            assert_eq!(outcome, Some(FlushOutcome::Written), "should flush");
+            assert_writes(&returning.store, (0, 1, 0), "one flush");
+            assert_eq!(
+                assert_one_uid_records(&returning.row()),
+                golden_expected_ingest(),
+                "the flushed row should hold the UIDs the code before this spec stored"
+            );
+
+            let new_visitor = golden_registered_scenario();
+            let (response, _) = new_visitor.drive(navigation(Some(&cookie)));
+            let minted = set_cookie_value(&response, "ts-ec").expect("should mint an EC");
+            assert_writes(&new_visitor.store, (1, 0, 0), "one create");
+            assert_eq!(
+                assert_one_uid_records(&new_visitor.row_of(&minted)),
+                golden_expected_ingest(),
+                "the created row should hold the same UIDs"
+            );
+        }
+
+        #[test]
+        fn golden_one_uid_row_with_a_registered_provider_goes_out_unchanged() {
+            let scenario = golden_registered_scenario();
+            let mut entry = live_entry();
+            for (source, uid) in [("id5-sync.com", "id5-uid"), ("sharedid.org", "shared-uid")] {
+                entry
+                    .ids
+                    .insert(source.to_owned(), KvPartnerId::browser(uid, Some(1_500)));
+            }
+            scenario.seed(&entry);
+
+            let (response, _) =
+                scenario.drive(auction_request(Some(&ec_cookie()), &auction_body(None)));
+
+            assert_eq!(
+                bidder_eids(&bidder_body(&scenario)),
+                serde_json::json!([
+                    { "source": "id5-sync.com", "uids": [{ "id": "id5-uid", "atype": 3 }] },
+                    { "source": "sharedid.org", "uids": [{ "id": "shared-uid", "atype": 3 }] }
+                ]),
+                "user.ext.eids should equal what the code before this spec sent"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-ts-eids")
+                    .and_then(|value| value.to_str().ok()),
+                Some(GOLDEN_ROW_HEADER),
+                "x-ts-eids should equal what the code before this spec built, byte for byte"
+            );
+        }
+
+        #[test]
+        fn golden_auction_body_forwarding_with_a_registered_provider_is_unchanged() {
+            let scenario = golden_registered_scenario();
+            scenario.seed_live();
+            let eids: serde_json::Value =
+                serde_json::from_str(GOLDEN_BODY_EIDS).expect("should parse the body EIDs");
+            let forwarded: serde_json::Value = serde_json::from_str(GOLDEN_BODY_FORWARDED)
+                .expect("should parse the forwarded EIDs");
 
             scenario.drive(auction_request(
                 Some(&ec_cookie()),
