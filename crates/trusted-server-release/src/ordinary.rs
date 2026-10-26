@@ -14,6 +14,8 @@ use std::path::{Component, Path};
 use crate::documents::{self, Role};
 use crate::error::ReleaseError;
 
+mod archive;
+
 const PROFILE: &str = "ordinary-release-fastly-byte-equality-v1";
 const ASSET: &str = "trusted-server-fastly.wasm";
 const GAPS: [&str; 4] = [
