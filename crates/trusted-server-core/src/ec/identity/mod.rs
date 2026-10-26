@@ -10,6 +10,9 @@ pub mod descriptor;
 pub mod ids;
 pub mod resolution;
 
-pub use descriptor::{Access, Input};
+pub use descriptor::{
+    Access, Captures, ConsentPolicy, EidProvenance, Input, ProviderDescriptor,
+    ProviderDescriptorBuilder, ResolveKind, Resolves, UsOptOut,
+};
 pub use ids::{IdentityProviderId, SourceDomain, UnixTime};
 pub use resolution::IdentityProviderError;
