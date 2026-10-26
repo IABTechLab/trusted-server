@@ -730,6 +730,9 @@ pub enum Access {
     /// Private state, without `with_private_state()`.
     #[display("private_state")]
     PrivateState,
+    /// The full EC ID, without `with_ec_id()`. Only generic pull declares it.
+    #[display("ec_id")]
+    EcId,
 }
 
 #[cfg(test)]
