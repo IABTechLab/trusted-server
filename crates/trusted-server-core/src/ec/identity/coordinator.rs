@@ -26,16 +26,18 @@ use super::mutation::{
 };
 use super::policy::{FP_US_OPT_OUT_MASK, PolicySignals, fingerprint_bits, policy_allows};
 use super::provider::IdentityProvider;
-use super::removal::{RemovalWriteOutcome, write_removals};
+use super::removal::{RemovalWriteOutcome, log_removal_lost, write_removals_counted};
 use super::resolution::{
     EntrySet, EntrySets, IdentityProviderError, Resolution, ResolvedEid, StateChange, entry_sets,
 };
-use super::revision::{IdentityKeys, StateRevision, record_revision, uid_hash, visitor_key};
+use super::revision::{
+    IdentityKeys, Revision, StateRevision, record_revision, uid_hash, visitor_key,
+};
 use crate::consent::{ConsentContext, effective_tcf};
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::kv_types::{KvEid, KvEntry, KvOptOut, KvPartnerId};
 use crate::ec::rate_limiter::RateLimiter;
-use crate::ec::{EcContext, EcKvSnapshot, current_timestamp, log_id};
+use crate::ec::{EcContext, EcKvSnapshot, current_timestamp};
 use crate::platform::{
     PlatformBackendSpec, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
     RuntimeServices,
@@ -1804,32 +1806,84 @@ pub(crate) fn has_capture_rule(
     })
 }
 
+/// What a capture reads of the row.
+struct CaptureView {
+    view: EligibilityView,
+    /// The row could not be read, so no removal can be built.
+    unreadable: bool,
+    /// Reads this view made.
+    reads: u32,
+}
+
 /// The row a capture reads its view from: the request's own snapshot when it
-/// holds one for this EC ID, else one read. Empty when the row is missing,
-/// unreadable or not a live row.
+/// holds one for this EC ID, else one read. Empty when the row is missing or
+/// not a live row.
 fn capture_view(
     graph: Option<&KvIdentityGraph>,
     context: &EcContext,
     ec_id: Option<&str>,
-) -> EligibilityView {
-    let (Some(graph), Some(ec_id)) = (graph, ec_id) else {
-        return EligibilityView::empty();
+) -> CaptureView {
+    let empty = |unreadable, reads| CaptureView {
+        view: EligibilityView::empty(),
+        unreadable,
+        reads,
     };
-    let snapshot = if context.kv_snapshot().belongs_to(ec_id) {
-        context.kv_snapshot().clone()
+    let (Some(graph), Some(ec_id)) = (graph, ec_id) else {
+        return empty(false, 0);
+    };
+    let (snapshot, reads) = if context.kv_snapshot().belongs_to(ec_id) {
+        (context.kv_snapshot().clone(), 0)
     } else {
-        graph.load_snapshot(ec_id)
+        (graph.load_snapshot(ec_id), 1)
     };
     match snapshot {
-        EcKvSnapshot::Present { entry, .. } if entry.consent.ok => EligibilityView::from_kv(&entry),
-        EcKvSnapshot::Failed { .. } => {
-            log::warn!(
-                "Identity capture for '{}' could not read the row, so its removals cannot be built",
-                log_id(ec_id)
-            );
-            EligibilityView::empty()
-        }
-        _ => EligibilityView::empty(),
+        EcKvSnapshot::Present { entry, .. } if entry.consent.ok => CaptureView {
+            view: EligibilityView::from_kv(&entry),
+            unreadable: false,
+            reads,
+        },
+        EcKvSnapshot::Failed { .. } => empty(true, reads),
+        _ => empty(false, reads),
+    }
+}
+
+/// Counts and logs the removals a capture result asked for when the row could
+/// not be read, so they cannot be built or retried (spec 5.3). Holds no value.
+fn lose_unbuildable_removals(
+    context: &mut EcContext,
+    ec_id: Option<&str>,
+    provider: &IdentityProviderId,
+    resolution: &Resolution,
+    catalog: &ProviderCatalog,
+) {
+    let claimed = catalog.sources_of(provider);
+    let mut lost = IdentityMutation::default();
+    for source in resolution
+        .invalidated()
+        .iter()
+        .filter(|source| claimed.contains(source))
+    {
+        lost.add_change(PartnerIdChange::OwnerRemove {
+            source: source.clone(),
+            provider: provider.clone(),
+            expected: Revision::Unset,
+        });
+    }
+    if resolution.is_opted_out() {
+        lost.merge_state(
+            provider.clone(),
+            ProviderStateChange {
+                opt_out: Some(KvOptOut {
+                    at: 0,
+                    fp: String::new(),
+                }),
+                ..ProviderStateChange::default()
+            },
+        );
+    }
+    log_removal_lost(ec_id.unwrap_or_default(), &lost);
+    for _ in lost.removal_labels() {
+        context.identity_mut().record_removal_lost();
     }
 }
 
@@ -1961,11 +2015,20 @@ pub(crate) fn run_capture(
         return;
     }
     let ec_id = context.ec_value().map(str::to_owned);
-    let view = if call.is_real_browser {
+    let CaptureView {
+        view,
+        unreadable,
+        reads: view_reads,
+    } = if call.is_real_browser {
         capture_view(graph, context, ec_id.as_deref())
     } else {
-        EligibilityView::empty()
+        CaptureView {
+            view: EligibilityView::empty(),
+            unreadable: false,
+            reads: 0,
+        }
     };
+    context.identity_mut().record_capture_kv(view_reads, 0);
     let response =
         ProviderResponse::new(call.status, call.headers.clone(), call.body.to_vec(), None);
     let consent = ProviderConsent::from_context(context.consent());
@@ -2030,6 +2093,10 @@ pub(crate) fn run_capture(
             continue;
         }
 
+        if unreadable {
+            lose_unbuildable_removals(context, ec_id.as_deref(), id, &resolution, deps.catalog);
+            continue;
+        }
         let ask = capture_ask(
             deps,
             context,
@@ -2044,7 +2111,8 @@ pub(crate) fn run_capture(
         mutation.merge_state(id.clone(), ask.state);
     }
 
-    if !mutation.has_removals() {
+    // The tombstone the finalize step writes supersedes every other removal.
+    if context.global_revoke_requested() || !mutation.has_removals() {
         return;
     }
     let (Some(graph), Some(ec_id)) = (graph, ec_id.as_deref()) else {
@@ -2056,7 +2124,11 @@ pub(crate) fn run_capture(
         random: deps.random,
         catalog: deps.catalog,
     };
-    if write_removals(graph, ec_id, &mutation, &apply_context) == RemovalWriteOutcome::Failed {
+    let (outcome, cost) = write_removals_counted(graph, ec_id, &mutation, &apply_context);
+    context
+        .identity_mut()
+        .record_capture_kv(cost.reads, cost.writes);
+    if outcome == RemovalWriteOutcome::Failed {
         if let Some(earlier) = context.identity().pending_removals().cloned() {
             mutation.absorb(earlier);
         }
@@ -6143,6 +6215,126 @@ mod tests {
                 assert_eq!(state.n, Some(9_999_999_999), "should keep n for {body}");
                 assert_eq!(state.f, 2, "should keep f for {body}");
             }
+        }
+
+        #[test]
+        fn capture_removal_lost_when_the_row_cannot_be_read() {
+            install_capturing_logger();
+            let provider = answering_capture_provider("unreadcap", &[FIRST], None);
+            let seeded = row_with(&[(FIRST, "secret-uid-unread-5521", None)]);
+            for (body, expected_lost) in [
+                (json!({"invalidate": [FIRST]}), 1),
+                (json!({"opted_out": true}), 1),
+                (json!({}), 0),
+            ] {
+                let mut fixture = CaptureFixture::new(vec![provider.clone()], Some(&seeded));
+                fixture.context.set_kv_snapshot(EcKvSnapshot::Failed {
+                    ec_id: TEST_EC_ID.to_owned(),
+                });
+
+                fixture.capture(&capture_path("unreadcap"), &body);
+
+                assert_eq!(
+                    fixture.context.identity().removal_lost(),
+                    expected_lost,
+                    "should count the removals it could not build for {body}"
+                );
+                assert!(
+                    fixture.context.identity().pending_removals().is_none(),
+                    "should keep nothing to retry for {body}"
+                );
+            }
+            let logs = captured_logs();
+            assert!(
+                logs.iter().any(|line| line.contains("removal lost")
+                    && line.contains("unreadcap")
+                    && line.contains(FIRST)),
+                "should log the provider and source: {logs:?}"
+            );
+            assert!(
+                !logs
+                    .iter()
+                    .any(|line| line.contains("secret-uid-unread-5521")),
+                "should log no value"
+            );
+        }
+
+        #[test]
+        fn capture_counts_its_kv_operations_in_the_measurement() {
+            use crate::ec::identity::measurement::MeasurementInput;
+
+            let seeded = row_with(&[(FIRST, "secret-uid-a", None)]);
+            let mut fixture = CaptureFixture::new(vec![lockr()], Some(&seeded));
+            fixture.context.set_kv_snapshot(EcKvSnapshot::NotRead);
+            fixture.store.refuse_conditional_writes(TEST_EC_ID, 2);
+
+            fixture.capture(&lockr_path(), &json!({"invalidate": [FIRST]}));
+
+            let measurement = fixture.context.identity_measurement(&MeasurementInput {
+                phase_one_read: false,
+                kv_reads: 0,
+                kv_writes: 0,
+                flush: None,
+                withdrawal_after_send: false,
+                withdrawal_after_send_failed: false,
+            });
+            assert_eq!(
+                measurement.kv_reads(),
+                4,
+                "should count the view read and three removal-write reads"
+            );
+            assert_eq!(
+                measurement.kv_writes(),
+                3,
+                "should count each removal-write attempt"
+            );
+            assert_eq!(
+                fixture.store.writes().if_generation_match,
+                3,
+                "control: the store saw the same writes"
+            );
+        }
+
+        #[test]
+        fn capture_global_revoke_skips_the_other_providers_removals() {
+            let shared = "/integrations/shared/";
+            let global = crate::ec::identity::test_support::answering_capture_provider_at(
+                "lockr",
+                &[FIRST],
+                None,
+                shared,
+            );
+            let local = crate::ec::identity::test_support::answering_capture_provider_at(
+                "localcap",
+                &[SECOND],
+                None,
+                shared,
+            );
+            let seeded = row_with(&[
+                (FIRST, "secret-uid-a", Some("lockr")),
+                (SECOND, "secret-uid-b", None),
+            ]);
+            let mut fixture =
+                CaptureFixture::with_scopes(vec![global, local], Some(&seeded), &["lockr"]);
+
+            fixture.capture(
+                "/integrations/shared/api",
+                &json!({"opted_out": true, "invalidate": [SECOND]}),
+            );
+
+            assert!(
+                fixture.context.global_revoke_requested(),
+                "should request the global revoke"
+            );
+            assert_eq!(
+                fixture.store.writes().total(),
+                0,
+                "should leave every removal to the tombstone"
+            );
+            assert!(
+                fixture.context.identity().pending_removals().is_none(),
+                "should keep nothing to retry"
+            );
         }
 
         #[test]

@@ -21,6 +21,13 @@ pub enum RemovalWriteOutcome {
     Failed,
 }
 
+/// The KV operations one removal write made.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RemovalCost {
+    pub(crate) reads: u32,
+    pub(crate) writes: u32,
+}
+
 /// Reads the row, applies only `removals` and writes them with a CAS,
 /// retrying only a generation mismatch.
 ///
@@ -33,30 +40,45 @@ pub(crate) fn write_removals(
     removals: &IdentityMutation,
     context: &ApplyContext<'_>,
 ) -> RemovalWriteOutcome {
+    write_removals_counted(graph, ec_id, removals, context).0
+}
+
+/// As [`write_removals`], also returning the reads and writes it made, for
+/// the request's measurement.
+#[must_use]
+pub(crate) fn write_removals_counted(
+    graph: &KvIdentityGraph,
+    ec_id: &str,
+    removals: &IdentityMutation,
+    context: &ApplyContext<'_>,
+) -> (RemovalWriteOutcome, RemovalCost) {
+    let mut cost = RemovalCost::default();
     for _attempt in 0..REMOVAL_WRITE_ATTEMPTS {
+        cost.reads = cost.reads.saturating_add(1);
         let (entry, generation) = match graph.load_snapshot(ec_id) {
             EcKvSnapshot::Present {
                 entry,
                 generation: Some(generation),
                 ..
             } => (entry, generation),
-            EcKvSnapshot::Missing { .. } => return RemovalWriteOutcome::NothingToWrite,
-            _ => return RemovalWriteOutcome::Failed,
+            EcKvSnapshot::Missing { .. } => return (RemovalWriteOutcome::NothingToWrite, cost),
+            _ => return (RemovalWriteOutcome::Failed, cost),
         };
         let Some(applied) =
             apply_removals_only(removals, &entry, context).filter(|applied| applied.changed)
         else {
-            return RemovalWriteOutcome::NothingToWrite;
+            return (RemovalWriteOutcome::NothingToWrite, cost);
         };
+        cost.writes = cost.writes.saturating_add(1);
         match graph.write_if_generation(ec_id, &applied.entry, generation) {
-            Ok(EcKvWriteOutcome::Written) => return RemovalWriteOutcome::Written,
+            Ok(EcKvWriteOutcome::Written) => return (RemovalWriteOutcome::Written, cost),
             Ok(EcKvWriteOutcome::PreconditionFailed) => {}
             Err(error) => {
                 log::warn!(
                     "Identity removal write failed for '{}': {error:?}",
                     log_id(ec_id)
                 );
-                return RemovalWriteOutcome::Failed;
+                return (RemovalWriteOutcome::Failed, cost);
             }
         }
     }
@@ -64,7 +86,7 @@ pub(crate) fn write_removals(
         "Identity removal write for '{}': CAS conflict after {REMOVAL_WRITE_ATTEMPTS} attempts",
         log_id(ec_id)
     );
-    RemovalWriteOutcome::Failed
+    (RemovalWriteOutcome::Failed, cost)
 }
 
 /// Logs a removal that every attempt failed to write. Names providers and

@@ -545,12 +545,18 @@ impl EcContext {
             route,
             // A snapshot that came from the new-EC create read nothing, and
             // each create attempt is one write made before routing.
-            kv_reads: input.kv_reads.saturating_add(u32::from(
-                input.phase_one_read && self.identity.create_attempts() == 0,
-            )),
+            kv_reads: input
+                .kv_reads
+                .saturating_add(u32::from(
+                    input.phase_one_read && self.identity.create_attempts() == 0,
+                ))
+                .saturating_add(self.identity.capture_kv_reads()),
+            // The capture's pre-send reads and writes go through the
+            // request-state graph, which the adapter's counters do not see.
             kv_writes: input
                 .kv_writes
-                .saturating_add(self.identity.create_attempts()),
+                .saturating_add(self.identity.create_attempts())
+                .saturating_add(self.identity.capture_kv_writes()),
             flush: input.flush.copied(),
             removal_lost: self.identity.removal_lost(),
             withdrawal_after_send: input.withdrawal_after_send,

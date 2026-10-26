@@ -3842,11 +3842,33 @@ mod tests {
         /// provider listening on that proxy's path and a row holding a
         /// browser-written `ssp.example.com` ID for it to invalidate.
         fn capture_scenario(body: &str) -> Scenario {
+            capture_scenario_with(body, false)
+        }
+
+        /// As [`capture_scenario`], with the provider's `revoke_scope` set to
+        /// `"global"` when `global`. The settings are changed after the app
+        /// state is built, as config validation knows no capture-only
+        /// provider.
+        fn capture_scenario_with(body: &str, global: bool) -> Scenario {
             let Scenario {
-                state,
+                mut state,
                 store,
                 network,
             } = Scenario::with_settings(DIDOMI_TOML);
+            if global {
+                let owned = Arc::get_mut(&mut state).expect("should own the fresh state");
+                Arc::make_mut(&mut owned.settings)
+                    .ec
+                    .identity
+                    .providers
+                    .insert(
+                        "didomi".to_owned(),
+                        trusted_server_core::settings::ProviderSettings {
+                            revoke_scope: Some(trusted_server_core::settings::RevokeScope::Global),
+                            ..trusted_server_core::settings::ProviderSettings::default()
+                        },
+                    );
+            }
             let provider =
                 trusted_server_core::ec::identity::test_support::answering_capture_provider(
                     "didomi",
@@ -3918,6 +3940,31 @@ mod tests {
                 stored_uid(&row, "sharedid.org").as_deref(),
                 Some(SHARED_ID),
                 "should keep the writer's own ingest in its flush"
+            );
+        }
+
+        #[test]
+        fn capture_global_revoke_tombstones_the_row_and_expires_the_ec_cookie() {
+            let scenario = capture_scenario_with(r#"{"opted_out":true}"#, true);
+
+            let (response, _) =
+                scenario.drive(didomi_navigation(Some(&returning_with_shared_id())));
+
+            assert_eq!(response.status(), 200, "should serve the proxied answer");
+            let row = scenario.row();
+            assert!(!row.consent.ok, "should tombstone the row");
+            assert!(row.ids.is_empty(), "should remove every ID");
+            assert!(
+                set_cookies(&response).iter().any(|cookie| {
+                    cookie_name(cookie) == "ts-ec" && cookie.contains("Max-Age=0")
+                }),
+                "should expire the EC cookie"
+            );
+            let writes = scenario.store.writes();
+            assert_eq!(
+                (writes.if_generation_match, writes.overwrite),
+                (1, 0),
+                "should write one tombstone and no flush"
             );
         }
 

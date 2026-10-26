@@ -251,8 +251,6 @@ impl IdentityMutation {
 
     /// Whether any removal, opt-out or clear is present.
     #[must_use]
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn has_removals(&self) -> bool {
         self.partner_ids.iter().any(PartnerIdChange::is_removal)
             || self
@@ -266,8 +264,6 @@ impl IdentityMutation {
     /// de-duplicated. An opt-out or clear has no source. Holds no UID, so it
     /// is safe to log.
     #[must_use]
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn removal_labels(&self) -> Vec<(IdentityProviderId, Option<SourceDomain>)> {
         let mut labels: Vec<_> = self
             .partner_ids

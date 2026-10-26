@@ -48,6 +48,8 @@ pub(crate) struct RequestIdentity {
     create_attempts: u32,
     capture_unpersisted: BTreeMap<(IdentityProviderId, SourceDomain), u32>,
     global_revoke: bool,
+    capture_kv_reads: u32,
+    capture_kv_writes: u32,
 }
 
 impl core::fmt::Debug for RequestIdentity {
@@ -211,6 +213,24 @@ impl RequestIdentity {
             .entry((provider, source))
             .or_insert(0);
         *count = count.saturating_add(1);
+    }
+
+    /// KV reads the capture made (its view read and the removal write's).
+    #[must_use]
+    pub(crate) fn capture_kv_reads(&self) -> u32 {
+        self.capture_kv_reads
+    }
+
+    /// KV writes the capture removal write attempted.
+    #[must_use]
+    pub(crate) fn capture_kv_writes(&self) -> u32 {
+        self.capture_kv_writes
+    }
+
+    /// Counts KV operations the capture made before send.
+    pub(crate) fn record_capture_kv(&mut self, reads: u32, writes: u32) {
+        self.capture_kv_reads = self.capture_kv_reads.saturating_add(reads);
+        self.capture_kv_writes = self.capture_kv_writes.saturating_add(writes);
     }
 
     /// Whether a real browser's capture asked for a global revoke (spec 8).

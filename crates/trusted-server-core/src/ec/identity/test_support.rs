@@ -240,13 +240,28 @@ pub fn answering_capture_provider(
     sources: &[&str],
     gvl_id: Option<u16>,
 ) -> Arc<dyn IdentityProvider> {
+    answering_capture_provider_at(id, sources, gvl_id, &format!("/integrations/{id}/"))
+}
+
+/// As [`answering_capture_provider`], with the capture rule on `prefix`.
+///
+/// # Panics
+///
+/// Panics when `id` or a source is not valid.
+#[must_use]
+pub fn answering_capture_provider_at(
+    id: &str,
+    sources: &[&str],
+    gvl_id: Option<u16>,
+    prefix: &str,
+) -> Arc<dyn IdentityProvider> {
     let policy = match gvl_id {
         Some(vendor) => ConsentPolicy::strict().with_tcf_vendor(vendor),
         None => ConsentPolicy::eid_persistence_only(),
     };
     let mut builder =
         ProviderDescriptor::builder(id.parse().expect("should parse the provider ID"))
-            .with_captures(Captures::new().with_path_prefix(&format!("/integrations/{id}/")))
+            .with_captures(Captures::new().with_path_prefix(prefix))
             .with_consent_policy(policy);
     for source in sources {
         builder = builder.with_source(source.parse().expect("should parse the source"));
