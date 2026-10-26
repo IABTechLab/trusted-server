@@ -199,6 +199,10 @@ url = "2.5.8"
 urlencoding = "2.1"
 uuid = { version = "1.18", features = ["v4"] }
 validator = { version = "0.20", features = ["derive"] }
+# The Encypher provenance module's probe host: an interpreter with no JIT,
+# so the signed probe release runs on every edge target.
+wasmi = { version = "2.0", default-features = false, features = ["std", "validate", "auto-dispatch"] }
+wat = "1.247"
 web-time = "1"
 webpki-roots = "1"
 which = "8"

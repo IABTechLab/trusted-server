@@ -38,6 +38,7 @@ use trusted_server_core::settings::{IntegrationConfig, Settings};
 mod api;
 mod boundary;
 mod embed;
+mod prepared_probe;
 mod processor;
 mod text;
 
