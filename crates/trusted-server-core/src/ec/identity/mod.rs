@@ -7,6 +7,7 @@
 //! write. See `docs/superpowers/specs/2026-10-20-server-side-identity-providers-design.md`.
 
 pub mod descriptor;
+pub mod exchange;
 pub mod ids;
 pub mod input;
 pub mod resolution;
@@ -15,6 +16,9 @@ pub use descriptor::{
     Access, Captures, ConsentPolicy, EidProvenance, Input, ProviderDescriptor,
     ProviderDescriptorBuilder, ResolveKind, Resolves, UsOptOut,
 };
+pub use exchange::{ProviderRequest, ProviderResponse};
 pub use ids::{IdentityProviderId, SourceDomain, UnixTime};
-pub use input::{HashedEmail, ProviderConsent, Region, ResolveInput, StoredId};
-pub use resolution::IdentityProviderError;
+pub use input::{CaptureInput, HashedEmail, ProviderConsent, Region, ResolveInput, StoredId};
+pub use resolution::{
+    IdentityProviderError, Resolution, ResolvedEid, ResolvedUid, StateChange, When,
+};

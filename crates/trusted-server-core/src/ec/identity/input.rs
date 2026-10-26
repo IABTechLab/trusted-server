@@ -17,6 +17,7 @@ use serde::de::DeserializeOwned;
 use url::Url;
 
 use super::descriptor::{Access, Input, ProviderDescriptor, ResolveKind, Resolves};
+use super::exchange::ProviderResponse;
 use super::ids::{IdentityProviderId, SourceDomain, UnixTime};
 use super::resolution::IdentityProviderError;
 use crate::consent::ConsentContext;
@@ -615,13 +616,108 @@ impl<'a> ResolveInput<'a> {
     }
 }
 
+/// What a capture may read from one proxied response.
+pub struct CaptureInput<'a> {
+    descriptor: &'a ProviderDescriptor,
+    path: &'a str,
+    response: &'a ProviderResponse,
+    stored: &'a BTreeMap<SourceDomain, StoredId>,
+    consent: &'a ProviderConsent,
+    publisher_domain: &'a str,
+    now: UnixTime,
+}
+
+impl fmt::Debug for CaptureInput<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CaptureInput")
+            .field("provider", self.descriptor.id())
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> CaptureInput<'a> {
+    /// The input for one capture.
+    #[must_use]
+    pub(crate) fn new(
+        descriptor: &'a ProviderDescriptor,
+        path: &'a str,
+        response: &'a ProviderResponse,
+        stored: &'a BTreeMap<SourceDomain, StoredId>,
+        consent: &'a ProviderConsent,
+        publisher_domain: &'a str,
+        now: UnixTime,
+    ) -> Self {
+        Self {
+            descriptor,
+            path,
+            response,
+            stored,
+            consent,
+            publisher_domain,
+            now,
+        }
+    }
+
+    /// The proxied request path, without query string.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        self.path
+    }
+
+    /// The proxied response, decoded.
+    #[must_use]
+    pub fn response(&self) -> &ProviderResponse {
+        self.response
+    }
+
+    /// The descriptor's primary source.
+    #[must_use]
+    pub fn primary_source(&self) -> &SourceDomain {
+        self.descriptor.primary_source()
+    }
+
+    /// Finds a declared source by a vendor's spelling.
+    #[must_use]
+    pub fn source_named(&self, name: &str) -> Option<&SourceDomain> {
+        self.descriptor.source_named(name)
+    }
+
+    /// The stored record for a source.
+    #[must_use]
+    pub fn stored(&self, source: &SourceDomain) -> Option<&StoredId> {
+        self.stored.get(source)
+    }
+
+    /// The request's consent, from its cookies and headers. The request
+    /// body is never read (spec 4.7).
+    #[must_use]
+    pub fn consent(&self) -> &ProviderConsent {
+        self.consent
+    }
+
+    /// The publisher's domain.
+    #[must_use]
+    pub fn publisher_domain(&self) -> &str {
+        self.publisher_domain
+    }
+
+    /// The request's time.
+    #[must_use]
+    pub fn now(&self) -> UnixTime {
+        self.now
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::net::IpAddr;
 
     use super::*;
-    use crate::ec::identity::descriptor::{ProviderDescriptor, Resolves};
+    use crate::ec::identity::descriptor::{Captures, ProviderDescriptor, Resolves};
+    use crate::ec::identity::exchange::ProviderResponse;
     use crate::ec::kv_types::{KvEid, KvPartnerId, KvUid};
 
     fn descriptor(resolves: Resolves) -> ProviderDescriptor {
@@ -1011,6 +1107,38 @@ mod tests {
             format!("{email:?}"),
             "HashedEmail([redacted])",
             "should redact Debug"
+        );
+    }
+
+    #[test]
+    fn capture_input_exposes_path_and_never_the_request_body() {
+        let descriptor =
+            ProviderDescriptor::builder("c".parse().expect("should parse the provider id"))
+                .with_source("example.com".parse().expect("should parse the source"))
+                .with_captures(Captures::new().with_path(http::Method::POST, "/integrations/c/api"))
+                .build()
+                .expect("should build");
+        let response = ProviderResponse::for_test(http::StatusCode::OK, b"{}");
+        let consent = ProviderConsent::default();
+        let stored = BTreeMap::new();
+        let input = CaptureInput::new(
+            &descriptor,
+            "/integrations/c/api",
+            &response,
+            &stored,
+            &consent,
+            "www.example.com",
+            UnixTime::from_secs(1),
+        );
+        assert_eq!(
+            input.path(),
+            "/integrations/c/api",
+            "should expose the proxied path"
+        );
+        assert_eq!(
+            input.primary_source().as_str(),
+            "example.com",
+            "should expose the primary source"
         );
     }
 
