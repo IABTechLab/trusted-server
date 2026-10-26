@@ -462,8 +462,11 @@ hand-written slot fields will be discarded appears before the question. The
 preview, warning, and prompt all go to stderr, so stdout carries only the final
 `Wrote ...` line. Page-supplied text in the preview is shown with control and
 bidirectional-override characters escaped, so they cannot reorder or hide lines
-of the diff you are approving. The `{section}` deploy-order note is printed
-only once such a config is written (or previewed with `--dry-run`).
+of the diff you are approving. When the candidate introduces a `{section}`
+template, the preview warns before the question that a template-aware binary
+must be deployed before the config is pushed. The note saying the config now
+uses a template is printed only once such a config is written, previewed with
+`--dry-run`, or already in place.
 
 | Situation                                       | Result                                                                                   |
 | ----------------------------------------------- | ---------------------------------------------------------------------------------------- |
@@ -484,6 +487,11 @@ ts audit ad-templates generate https://publisher.example/ --yes
 
 The second run crawls again, so its result can differ from the preview when the
 live site changes in between; its own stderr preview shows what was written.
+
+Unlike the prompt's preview, the `--dry-run` diff on stdout is printed verbatim
+so it stays usable as a diff, and page-supplied control or bidirectional
+characters are not escaped. Review it through a viewer that shows them, such as
+`cat -v`, or rely on the escaped preview at the prompt.
 
 ### Bounding and steering the crawl
 

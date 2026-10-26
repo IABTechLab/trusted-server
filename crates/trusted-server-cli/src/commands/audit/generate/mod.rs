@@ -847,14 +847,18 @@ const MAX_EMPTY_PAGE_SHARE: f64 = 0.25;
 
 /// Runs `ts audit ad-templates generate`: crawl the site's sections, reconcile
 /// what each slot looked like across them, infer a `{section}` ad-unit template
-/// where the evidence proves one, and rewrite the config's slot array in place.
+/// where the evidence proves one, preview the managed-field diff, and rewrite
+/// the config's slot array in place once the change is approved.
 ///
 /// # Errors
 ///
 /// Returns an error when the config cannot be read, the root page cannot be
 /// collected, no slots are discovered, too many pages came back empty, the
 /// pages disagree about the GAM network id, or the resulting config would not
-/// load.
+/// load. A changed candidate also fails without being written when the
+/// operator declines it (including an empty line, EOF, or an answer that is
+/// not UTF-8), when the run is not interactive and `--yes` was not given, or
+/// when the config changed during the crawl or while the prompt was open.
 pub(crate) fn run_update_slots(
     request: &UpdateSlotsRequest<'_>,
     collectors: &[(&str, &dyn AuditCollector)],
@@ -1165,7 +1169,7 @@ pub(crate) fn run_update_slots(
     // Checked before asking too, so the operator is not asked to approve a
     // write that is already certain to be refused.
     ensure_config_unchanged(request.config_path, &existing)?;
-    confirm_config_write(request, &diff, err, input)?;
+    confirm_config_write(request, &diff, uses_template, err, input)?;
     ensure_config_unchanged(request.config_path, &existing)?;
     // A writer could still land between this check and the rename below. That
     // window is microseconds against a browser crawl's minutes, and the rename
@@ -1244,6 +1248,11 @@ fn ensure_config_unchanged(config_path: &Path, existing: &str) -> CliResult<()> 
     Ok(())
 }
 
+/// Deploy-order warning shown in the preview of a `{section}` candidate,
+/// worded for a write that has not happened yet.
+const PREVIEW_TEMPLATE_NOTE: &str = "note: applying this introduces a {section} ad-unit \
+     template; deploy a template-aware binary BEFORE pushing the config.";
+
 /// Previews a changed candidate on `err` and requires approval to write it.
 ///
 /// `--yes` approves without reading `input`. Otherwise an operator at a
@@ -1259,6 +1268,7 @@ fn ensure_config_unchanged(config_path: &Path, existing: &str) -> CliResult<()> 
 fn confirm_config_write(
     request: &UpdateSlotsRequest<'_>,
     diff: &str,
+    uses_template: bool,
     err: &mut dyn Write,
     input: &mut dyn BufRead,
 ) -> CliResult<()> {
@@ -1280,6 +1290,11 @@ fn confirm_config_write(
             crate::ad_templates::output::escape_terminal_text(line)
         )
         .map_err(write_error)?;
+    }
+    // Shown before the question rather than only after the write, because the
+    // deploy order is what the operator has to weigh before approving.
+    if uses_template {
+        writeln!(err, "{PREVIEW_TEMPLATE_NOTE}").map_err(write_error)?;
     }
     if request.replace {
         writeln!(
@@ -1313,10 +1328,12 @@ fn confirm_config_write(
 }
 
 /// Renders only fields managed by ad-template generation, excluding secrets and
-/// unrelated operator configuration from dry-run output.
+/// unrelated operator configuration from the previewed diff.
 fn managed_creative_projection(document: &str) -> CliResult<String> {
     let value = toml::from_str::<toml::Value>(document).map_err(|error| {
-        report_error(format!("failed to parse config for dry-run diff: {error}"))
+        report_error(format!(
+            "failed to parse config for the managed-field diff: {error}"
+        ))
     })?;
     let creative = value
         .get("creative_opportunities")
@@ -4772,7 +4789,7 @@ mod tests {
 
             let run = run_write_gate(&config_path, &interactive_gate(), &mut input);
 
-            assert_declined(&run, "a declined update");
+            assert_declined(&run, &format!("answer {answer:?}"));
             assert_eq!(
                 read_config(&config_path),
                 original,
@@ -5098,13 +5115,68 @@ mod tests {
             .result
             .expect_err("should refuse an update confirmed against a stale file");
         assert!(
-            format!("{error:?}").contains("changed"),
+            format!("{error:?}").contains("refusing to overwrite"),
             "the refusal should say the file changed, got {error:?}"
         );
         assert_eq!(
             read_config(&config_path),
             replacement,
             "the edit made during the prompt must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn update_slots_does_not_ask_to_apply_a_config_changed_during_the_crawl() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let (config_path, original) = write_changing_config(&temp);
+        let replacement = format!("{original}\n# edited while the browser was running\n");
+        let collector = MutatingCollector {
+            collected: collected_page_with_header_slot(),
+            config_path: config_path.clone(),
+            replacement: replacement.clone(),
+        };
+        let mut input = io::Cursor::new(b"yes\n".to_vec());
+        let mut err = Vec::new();
+
+        let result = run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                yes: false,
+                interactive: true,
+                scroll: false,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &collector)],
+            &mut io::sink(),
+            &mut err,
+            &mut input,
+        );
+
+        let stderr = String::from_utf8(err).expect("should decode stderr as UTF-8");
+        let error = result.expect_err("should refuse an update built from a stale file");
+        assert!(
+            format!("{error:?}").contains("refusing to overwrite"),
+            "the refusal should say the file changed, got {error:?}"
+        );
+        assert!(
+            !stderr.contains(APPLY_PROMPT),
+            "a write already certain to be refused must not be offered, got {stderr:?}"
+        );
+        assert_eq!(
+            input.position(),
+            0,
+            "a stale file should be refused before an answer is read"
+        );
+        assert_eq!(
+            read_config(&config_path),
+            replacement,
+            "the edit made during the crawl must not be overwritten"
         );
     }
 
@@ -5204,11 +5276,21 @@ mod tests {
         let stderr = String::from_utf8(err).expect("should decode stderr as UTF-8");
         result.expect_err("should fail a declined update");
         assert!(
-            stderr.contains("{section}"),
+            stderr.contains("+section_root = "),
             "the preview should show the templated candidate, got {stderr:?}"
         );
+        let note = stderr
+            .find(PREVIEW_TEMPLATE_NOTE)
+            .expect("the preview should warn about deploy order before asking");
+        let prompt = stderr
+            .find(APPLY_PROMPT)
+            .expect("the run should reach the prompt");
         assert!(
-            !stderr.contains("template-aware binary"),
+            note < prompt,
+            "the deploy-order warning should precede the question, got {stderr:?}"
+        );
+        assert!(
+            !stderr.contains("this config now uses"),
             "a declined write must not claim the config now uses a template, got {stderr:?}"
         );
         assert_eq!(
