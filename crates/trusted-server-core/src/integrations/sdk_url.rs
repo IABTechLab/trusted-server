@@ -4,19 +4,28 @@ use url::Url;
 
 /// Parse an HTTP(S) SDK URL with an explicit authority, or a protocol-relative URL.
 ///
-/// Trims ASCII whitespace and rejects relative paths and shorthand schemes.
-/// Browser/Rust ownership cases live in test/fixtures/sdk-url-ownership.json.
+/// Applies browser C0/space trimming, removes tab/CR/LF, and accepts backslash
+/// authority separators. Literal NULs, relative paths, and base-dependent shorthand
+/// stay unowned; HTML replaces NULs rather than treating them as URL whitespace.
+/// Browser/Rust ownership cases live in crates/trusted-server-js/lib/test/fixtures/sdk-url-ownership.json.
 pub(super) fn parse_sdk_network_url(url: &str) -> Option<Url> {
-    let value = url.trim_matches([' ', '\t', '\n', '\r', '\x0c', '\x0b']);
-    let parsed = if value.starts_with("//") {
+    if url.contains('\0') {
+        return None;
+    }
+    let value = url
+        .trim_matches(|character| character <= '\u{20}')
+        .replace(['\t', '\n', '\r'], "");
+    let has_authority = |value: &str| matches!(value.as_bytes(), [b'/' | b'\\', b'/' | b'\\', ..]);
+    let parsed = if has_authority(&value) {
         Url::parse(&format!("https:{value}"))
     } else {
-        if !value.split_once("://").is_some_and(|(scheme, _)| {
-            scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
-        }) {
+        let (scheme, remainder) = value.split_once(':')?;
+        if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+            || !has_authority(remainder)
+        {
             return None;
         }
-        Url::parse(value)
+        Url::parse(&value)
     };
     parsed.ok()
 }

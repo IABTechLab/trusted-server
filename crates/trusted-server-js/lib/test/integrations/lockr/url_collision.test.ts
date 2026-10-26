@@ -57,7 +57,8 @@ function dispatcherState(): { orderedHandlers: DomInsertionHandler[] } {
 }
 
 function expectedSrc({ url, owner, insertionOwner }: UrlCase): string {
-  // The DOM normalizes shorthand schemes before insertion, unlike raw matchers.
+  // jsdom's http: page resolves https: shorthand to an absolute vendor URL before insertion;
+  // on an https: page the same input would resolve to a same-origin path and stay unowned.
   const actualOwner = insertionOwner ?? owner;
   if (!actualOwner) return url;
   const origin = window.location.origin;
