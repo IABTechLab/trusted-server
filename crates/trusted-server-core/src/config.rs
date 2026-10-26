@@ -268,6 +268,11 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     PartnerRegistry::validate_config_for_deploy(&settings.ec.partners)?;
     validate_identity_settings(&settings.ec.identity)?;
     validate_removed_keys(settings)?;
+    crate::ec::identity::catalog::validate_identity_catalog(
+        &crate::ec::identity::generic_pull::generic_pull_descriptors(&settings.ec.partners)?,
+        &settings.ec.partners,
+        &settings.ec.identity,
+    )?;
     Ok(())
 }
 
@@ -288,6 +293,11 @@ pub fn validate_settings_for_runtime(
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
     validate_identity_settings(&settings.ec.identity)?;
     validate_removed_keys(settings)?;
+    crate::ec::identity::catalog::validate_identity_catalog(
+        &crate::ec::identity::generic_pull::generic_pull_descriptors(&settings.ec.partners)?,
+        &settings.ec.partners,
+        &settings.ec.identity,
+    )?;
     Ok(())
 }
 
@@ -356,6 +366,21 @@ pub(crate) fn validate_removed_keys(settings: &Settings) -> Result<(), Report<Tr
             "ec.pull_sync_concurrency was removed; set [ec.identity].max_concurrency instead"
                 .to_owned(),
         ));
+    }
+    for partner in &settings.ec.partners {
+        let id = crate::ec::identity::generic_pull::generic_pull_id(&partner.source_domain);
+        if partner.removed_pull_sync_ttl_sec.is_some() {
+            return Err(identity_configuration_error(format!(
+                "ec.partners `{}`: pull_sync_ttl_sec was removed; set refresh_after_sec in [ec.identity.providers.{id}] instead",
+                partner.source_domain
+            )));
+        }
+        if partner.removed_pull_sync_rate_limit.is_some() {
+            return Err(identity_configuration_error(format!(
+                "ec.partners `{}`: pull_sync_rate_limit was removed; set max_calls_per_minute = ceil(N / 60) in [ec.identity.providers.{id}] instead",
+                partner.source_domain
+            )));
+        }
     }
     Ok(())
 }
@@ -1720,6 +1745,44 @@ password = "production-admin-password-32-bytes"
             .replace("[ec]\n", "[ec.identity]\nmax_concurrency = 3\n\n[ec]\n");
         let mut control = Settings::from_toml(&control).expect("should parse the replacement key");
         control.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
+        validate_settings_for_deploy(&control).expect("control: should pass at deploy");
+    }
+
+    #[test]
+    fn removed_partner_pull_keys_are_rejected_with_their_replacements() {
+        let base = crate_test_settings_str();
+        let partner = |extra: &str| {
+            format!(
+                "{base}\n[[ec.partners]]\nname = \"Example SSP\"\nsource_domain = \"ssp.example.com\"\npull_sync_enabled = true\npull_sync_url = \"https://sync.ssp.example.com/pull\"\npull_sync_allowed_domains = [\"sync.ssp.example.com\"]\nts_pull_token = \"example-token-value-0123456789abcdef\"\n{extra}\n"
+            )
+        };
+        let parse = |toml: &str| {
+            let mut settings = Settings::from_toml(toml).expect("should parse the settings");
+            settings.proxy.allowed_domains =
+                vec!["*.example".to_string(), "*.example.com".to_string()];
+            settings
+        };
+
+        for (key, replacement) in [
+            ("pull_sync_ttl_sec = 3600", "refresh_after_sec"),
+            ("pull_sync_rate_limit = 20", "max_calls_per_minute"),
+        ] {
+            let settings = parse(&partner(key));
+            let deploy =
+                validate_settings_for_deploy(&settings).expect_err("should reject at deploy");
+            assert!(
+                format!("{deploy:?}").contains(replacement),
+                "should name {replacement} at deploy, got: {deploy:?}"
+            );
+            let runtime =
+                validate_settings_for_runtime(&settings).expect_err("should reject at runtime");
+            assert!(
+                format!("{runtime:?}").contains(replacement),
+                "should name {replacement} at runtime, got: {runtime:?}"
+            );
+        }
+
+        let control = parse(&partner(""));
         validate_settings_for_deploy(&control).expect("control: should pass at deploy");
     }
 }

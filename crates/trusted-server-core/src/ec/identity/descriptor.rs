@@ -371,8 +371,6 @@ impl Resolves {
 
     /// Gives the provider the full EC ID. Only generic pull may use this.
     #[must_use]
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(in crate::ec::identity) fn with_ec_id(mut self) -> Self {
         self.ec_id = true;
         self

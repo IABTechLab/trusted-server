@@ -8,10 +8,17 @@
     )
 )]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use error_stack::Report;
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::json;
+use url::Url;
 
 use crate::consent::ConsentContext;
 use crate::consent::jurisdiction::Jurisdiction;
@@ -19,15 +26,23 @@ use crate::consent::types::TcfConsent;
 use crate::ec::identity::catalog::ProviderCatalog;
 use crate::ec::identity::coordinator::{OutcomeContext, RequestFacts};
 use crate::ec::identity::descriptor::{
-    Captures, ConsentPolicy, Input, ProviderDescriptor, Resolves,
+    Captures, ConsentPolicy, Input, ProviderDescriptor, ResolveKind, Resolves,
 };
+use crate::ec::identity::exchange::{ProviderRequest, ProviderResponse};
 use crate::ec::identity::ids::{IdentityProviderId, SourceDomain, UnixTime};
-use crate::ec::identity::input::SeededRandom;
+use crate::ec::identity::input::{
+    HashedEmail, ProviderConsent, Region, ResolveInput, ResolveSignals, SeededRandom, StoredId,
+};
 use crate::ec::identity::policy::PolicySignals;
 use crate::ec::identity::provider::IdentityProvider;
+use crate::ec::identity::resolution::{IdentityProviderError, Resolution, When};
 use crate::ec::identity::revision::{StateRevision, new_revision};
+use crate::ec::kv_backend::in_memory::InMemoryEcKv;
+use crate::ec::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
 use crate::ec::kv_types::{KvEid, KvPartnerId, KvUid};
-use crate::settings::{IdentitySettings, ProviderSettings};
+use crate::error::TrustedServerError;
+use crate::redacted::Redacted;
+use crate::settings::{EcPartner, IdentitySettings, ProviderSettings};
 
 /// A request with no consent signal and no regulated jurisdiction.
 #[must_use]
@@ -304,6 +319,444 @@ impl OutcomeFixture {
     }
 }
 
+/// A valid EC ID in `{64-hex}.{6-alnum}` format.
+pub const TEST_EC_ID: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000.ABC123";
+
+/// A partner with pull sync enabled, calling `pull_sync_url` with `token`.
+///
+/// The URL's host is the only allowed domain.
+///
+/// # Panics
+///
+/// Panics when `source` is not a domain or `pull_sync_url` is not a URL with a host.
+#[must_use]
+pub fn ec_partner(source: &str, pull_sync_url: &str, token: &str) -> EcPartner {
+    let host = Url::parse(pull_sync_url)
+        .expect("should parse the pull URL")
+        .host_str()
+        .expect("should have a pull URL host")
+        .to_owned();
+    EcPartner {
+        name: format!("Partner {source}"),
+        source_domain: source.to_owned(),
+        openrtb_atype: EcPartner::default_openrtb_atype(),
+        bidstream_enabled: true,
+        api_token: None,
+        batch_rate_limit: EcPartner::default_batch_rate_limit(),
+        pull_sync_enabled: true,
+        pull_sync_url: Some(pull_sync_url.to_owned()),
+        pull_sync_allowed_domains: vec![host],
+        removed_pull_sync_ttl_sec: None,
+        removed_pull_sync_rate_limit: None,
+        ts_pull_token: Some(Redacted::new(token.to_owned())),
+    }
+}
+
+/// A stored one-UID record of `source`, as a provider reads it.
+///
+/// # Panics
+///
+/// Panics when the record is not valid.
+#[must_use]
+pub(crate) fn stored_for_test(source: &SourceDomain, uid: &str) -> StoredId {
+    StoredId::from_record(source, &KvPartnerId::new(uid))
+        .expect("should build a stored ID from a record with a UID")
+}
+
+/// Write and lookup counts of a [`WriteCountingEcKv`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriteCounts {
+    /// Writes in [`EcKvWriteMode::Add`] mode.
+    pub add: usize,
+    /// Writes in [`EcKvWriteMode::IfGenerationMatch`] mode.
+    pub if_generation_match: usize,
+    /// Writes in [`EcKvWriteMode::Overwrite`] mode.
+    pub overwrite: usize,
+    /// Point reads.
+    pub lookups: usize,
+}
+
+impl WriteCounts {
+    /// Every write, whatever its mode.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.add + self.if_generation_match + self.overwrite
+    }
+}
+
+/// An in-memory KV store that counts lookups and writes by mode.
+///
+/// Every write is applied or refused as the in-memory store does, so a
+/// write that loses its precondition is still counted and reports
+/// [`EcKvWriteOutcome::PreconditionFailed`].
+pub struct WriteCountingEcKv {
+    inner: InMemoryEcKv,
+    add: AtomicUsize,
+    if_generation_match: AtomicUsize,
+    overwrite: AtomicUsize,
+    lookups: AtomicUsize,
+}
+
+impl WriteCountingEcKv {
+    /// An empty store named `name`.
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            inner: InMemoryEcKv::new(name),
+            add: AtomicUsize::new(0),
+            if_generation_match: AtomicUsize::new(0),
+            overwrite: AtomicUsize::new(0),
+            lookups: AtomicUsize::new(0),
+        }
+    }
+
+    /// The counts so far, seeding included.
+    #[must_use]
+    pub fn writes(&self) -> WriteCounts {
+        WriteCounts {
+            add: self.add.load(Ordering::SeqCst),
+            if_generation_match: self.if_generation_match.load(Ordering::SeqCst),
+            overwrite: self.overwrite.load(Ordering::SeqCst),
+            lookups: self.lookups.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Zeroes the counts, to count only what follows the seeding.
+    pub fn reset_counts(&self) {
+        for count in [
+            &self.add,
+            &self.if_generation_match,
+            &self.overwrite,
+            &self.lookups,
+        ] {
+            count.store(0, Ordering::SeqCst);
+        }
+    }
+}
+
+impl EcKvStore for WriteCountingEcKv {
+    fn store_name(&self) -> &str {
+        self.inner.store_name()
+    }
+
+    fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+        self.lookups.fetch_add(1, Ordering::SeqCst);
+        self.inner.lookup(key)
+    }
+
+    fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+        self.inner.key_exists(key)
+    }
+
+    fn insert(
+        &self,
+        key: &str,
+        write: EcKvWrite<'_>,
+    ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+        let count = match write.mode {
+            EcKvWriteMode::Add => &self.add,
+            EcKvWriteMode::IfGenerationMatch(_) => &self.if_generation_match,
+            EcKvWriteMode::Overwrite => &self.overwrite,
+        };
+        count.fetch_add(1, Ordering::SeqCst);
+        self.inner.insert(key, write)
+    }
+
+    fn list_keys_with_prefix(
+        &self,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<String>, Report<TrustedServerError>> {
+        self.inner.list_keys_with_prefix(prefix, limit)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+        self.inner.delete(key)
+    }
+}
+
+/// Drives one provider the way the coordinator does, so a vendor's tests
+/// stay short.
+///
+/// A source with a [`with_stored`](Self::with_stored) record is a `Refresh`,
+/// any other an `Initial`. Sources whose kind needs an input the harness
+/// does not hold are left out, and with none left
+/// [`request`](Self::request) returns `Ok(None)` without calling the
+/// provider.
+pub struct ProviderHarness<'provider> {
+    provider: &'provider dyn IdentityProvider,
+    client_ip: Option<IpAddr>,
+    user_agent: Option<String>,
+    page_url: Option<Url>,
+    region: Option<Region>,
+    hashed_email: Option<HashedEmail>,
+    stored: BTreeMap<SourceDomain, StoredId>,
+    state_json: Option<String>,
+    now: UnixTime,
+    random: SeededRandom,
+    ec_id: Option<String>,
+    last_request: Option<ProviderRequest>,
+}
+
+impl<'provider> ProviderHarness<'provider> {
+    /// A harness for `provider` with no inputs, the clock at 1,760,000,000
+    /// and random seed 1.
+    #[must_use]
+    pub fn new(provider: &'provider dyn IdentityProvider) -> Self {
+        Self {
+            provider,
+            client_ip: None,
+            user_agent: None,
+            page_url: None,
+            region: None,
+            hashed_email: None,
+            stored: BTreeMap::new(),
+            state_json: None,
+            now: UnixTime::from_secs(1_760_000_000),
+            random: SeededRandom::new(1),
+            ec_id: None,
+            last_request: None,
+        }
+    }
+
+    /// Sets the client IP.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `ip` is not an IP address.
+    #[must_use]
+    pub fn with_client_ip(mut self, ip: &str) -> Self {
+        self.client_ip = Some(ip.parse().expect("should parse the client IP"));
+        self
+    }
+
+    /// Sets the `User-Agent`.
+    #[must_use]
+    pub fn with_user_agent(mut self, user_agent: &str) -> Self {
+        self.user_agent = Some(user_agent.to_owned());
+        self
+    }
+
+    /// Sets the page URL.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `url` is not a URL.
+    #[must_use]
+    pub fn with_page_url(mut self, url: &str) -> Self {
+        self.page_url = Some(Url::parse(url).expect("should parse the page URL"));
+        self
+    }
+
+    /// Sets the region.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `country` is not a country code.
+    #[must_use]
+    pub fn with_region(mut self, country: &str, subdivision: Option<&str>) -> Self {
+        self.region =
+            Some(Region::from_geo(country, subdivision).expect("should accept the country"));
+        self
+    }
+
+    /// Sets the hashed email.
+    #[must_use]
+    pub fn with_hashed_email(mut self, email: HashedEmail) -> Self {
+        self.hashed_email = Some(email);
+        self
+    }
+
+    /// Gives the provider a stored record, valid or expired. Its source is
+    /// the one its first entry names, or the provider's primary source.
+    #[must_use]
+    pub fn with_stored(mut self, stored: StoredId) -> Self {
+        let source = stored
+            .eids()
+            .first()
+            .and_then(|eid| eid.source.parse().ok())
+            .unwrap_or_else(|| self.provider.descriptor().primary_source().clone());
+        self.stored.insert(source, stored);
+        self
+    }
+
+    /// Gives the provider its private state, as stored.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `state` does not serialize.
+    #[must_use]
+    pub fn with_state(mut self, state: &impl Serialize) -> Self {
+        self.state_json = Some(serde_json::to_string(state).expect("should serialize the state"));
+        self
+    }
+
+    /// Sets the fixed clock.
+    #[must_use]
+    pub fn with_now(mut self, now: UnixTime) -> Self {
+        self.now = now;
+        self
+    }
+
+    /// Reseeds the random source.
+    #[must_use]
+    pub fn with_random_seed(mut self, seed: u64) -> Self {
+        self.random = SeededRandom::new(seed);
+        self
+    }
+
+    /// Gives the provider the EC ID. Only generic pull reads it.
+    #[must_use]
+    pub(crate) fn with_ec_id(mut self, ec_id: &str) -> Self {
+        self.ec_id = Some(ec_id.to_owned());
+        self
+    }
+
+    /// Calls `request` and keeps the built request and its call context.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the provider returns.
+    pub fn request(&mut self) -> Result<Option<ProviderRequest>, Report<IdentityProviderError>> {
+        let kinds = self.kinds();
+        let request = if kinds.is_empty() {
+            None
+        } else {
+            let signals = self.signals();
+            let input = ResolveInput::new(self.provider.descriptor(), kinds, &signals)
+                .with_state_json(self.state_json.clone());
+            self.provider.request(&input)?
+        };
+        self.last_request.clone_from(&request);
+        Ok(request)
+    }
+
+    /// Decodes the last built request's JSON body.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no request was built or its body is not a `T`.
+    #[must_use]
+    pub fn request_json<T: DeserializeOwned>(&self) -> T {
+        let request = self
+            .last_request
+            .as_ref()
+            .expect("should have built a request");
+        serde_json::from_slice(request.body()).expect("should decode the request body")
+    }
+
+    /// Calls `response` with the kept call context.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the provider returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `body` does not serialize.
+    pub fn respond(
+        &mut self,
+        status: StatusCode,
+        body: &serde_json::Value,
+    ) -> Result<Resolution, Report<IdentityProviderError>> {
+        let bytes = serde_json::to_vec(body).expect("should serialize the response body");
+        self.respond_raw(status, &[], &bytes)
+    }
+
+    /// Calls `response` with `headers` and a raw `body`, such as an empty 204.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the provider returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a header is not valid.
+    pub fn respond_raw(
+        &mut self,
+        status: StatusCode,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Result<Resolution, Report<IdentityProviderError>> {
+        let mut header_map = HeaderMap::new();
+        for (name, value) in headers {
+            header_map.insert(
+                HeaderName::from_bytes(name.as_bytes()).expect("should be a header name"),
+                HeaderValue::from_str(value).expect("should be a header value"),
+            );
+        }
+        let call_context = self
+            .last_request
+            .as_ref()
+            .and_then(|request| request.call_context_json().map(str::to_owned));
+        let response = ProviderResponse::new(status, header_map, body.to_vec(), call_context);
+        let signals = self.signals();
+        let input = ResolveInput::new(self.provider.descriptor(), self.kinds(), &signals)
+            .with_state_json(self.state_json.clone());
+        self.provider.response(&response, &input)
+    }
+
+    /// Resolves an expiry or refresh against the fixed clock.
+    #[must_use]
+    pub fn resolve(&self, when: When) -> UnixTime {
+        when.resolve(self.now)
+    }
+
+    fn available_inputs(&self) -> BTreeSet<Input> {
+        let mut available = BTreeSet::new();
+        for (input, present) in [
+            (Input::ClientIp, self.client_ip.is_some()),
+            (Input::UserAgent, self.user_agent.is_some()),
+            (Input::PageUrl, self.page_url.is_some()),
+            (Input::Region, self.region.is_some()),
+            (Input::HashedEmail, self.hashed_email.is_some()),
+        ] {
+            if present {
+                available.insert(input);
+            }
+        }
+        available
+    }
+
+    fn kinds(&self) -> BTreeMap<SourceDomain, ResolveKind> {
+        let descriptor = self.provider.descriptor();
+        let Some(resolves) = descriptor.resolves() else {
+            return BTreeMap::new();
+        };
+        let available = self.available_inputs();
+        descriptor
+            .sources()
+            .iter()
+            .filter_map(|source| {
+                let kind = if self.stored.contains_key(source) {
+                    ResolveKind::Refresh
+                } else {
+                    ResolveKind::Initial
+                };
+                (resolves.kinds().contains(&kind) && resolves.needs(kind).is_subset(&available))
+                    .then(|| (source.clone(), kind))
+            })
+            .collect()
+    }
+
+    fn signals(&self) -> ResolveSignals<'_> {
+        ResolveSignals {
+            client_ip: self.client_ip,
+            user_agent: self.user_agent.as_deref(),
+            page_url: self.page_url.clone(),
+            region: self.region.clone(),
+            hashed_email: self.hashed_email.clone(),
+            consent: ProviderConsent::default(),
+            publisher_domain: "www.example.com",
+            now: self.now,
+            random: &self.random,
+            ec_id: self.ec_id.clone(),
+            stored: self.stored.clone(),
+        }
+    }
+}
+
 struct DescriptorOnly(ProviderDescriptor);
 
 impl IdentityProvider for DescriptorOnly {
@@ -313,8 +766,13 @@ impl IdentityProvider for DescriptorOnly {
 }
 
 /// A fake HTTP client, backend and provider for dispatch tests.
-#[cfg(test)]
-pub(crate) mod fake_http {
+#[cfg(any(test, feature = "test-utils"))]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::new_without_default,
+    reason = "test doubles lock their own mutexes and are built with new"
+)]
+pub mod fake_http {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -326,12 +784,15 @@ pub(crate) mod fake_http {
     use crate::ec::identity::input::ResolveInput;
     use crate::ec::identity::provider::IdentityProvider;
     use crate::ec::identity::resolution::{IdentityProviderError, Resolution};
+    #[cfg(test)]
     use crate::platform::test_support::{NoopConfigStore, NoopGeo, NoopSecretStore};
     use crate::platform::{
-        BackendNamingPolicy, ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformError,
+        BackendNamingPolicy, PlatformBackend, PlatformBackendSpec, PlatformError,
         PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
-        PlatformSelectResult, RuntimeServices,
+        PlatformSelectResult,
     };
+    #[cfg(test)]
+    use crate::platform::{ClientInfo, RuntimeServices};
 
     /// What the fake does for one host.
     #[derive(Clone)]
@@ -351,7 +812,7 @@ pub(crate) mod fake_http {
     }
 
     /// An HTTP client that answers per host, and records what it was sent.
-    pub(crate) struct FakeHttpClient {
+    pub struct FakeHttpClient {
         routes: Mutex<BTreeMap<String, Route>>,
         delays: Mutex<BTreeMap<String, Duration>>,
         sent: Mutex<Vec<String>>,
@@ -359,7 +820,9 @@ pub(crate) mod fake_http {
     }
 
     impl FakeHttpClient {
-        pub(crate) fn new() -> Self {
+        /// A client with no routes.
+        #[must_use]
+        pub fn new() -> Self {
             Self {
                 routes: Mutex::new(BTreeMap::new()),
                 delays: Mutex::new(BTreeMap::new()),
@@ -369,12 +832,12 @@ pub(crate) mod fake_http {
         }
 
         /// Answers `host` with `status` and `body`.
-        pub(crate) fn respond(&self, host: &str, status: u16, body: &[u8]) {
+        pub fn respond(&self, host: &str, status: u16, body: &[u8]) {
             self.respond_with_headers(host, status, body, &[]);
         }
 
         /// Answers `host` with `status`, `headers` and `body`.
-        pub(crate) fn respond_with_headers(
+        pub fn respond_with_headers(
             &self,
             host: &str,
             status: u16,
@@ -396,7 +859,7 @@ pub(crate) mod fake_http {
         }
 
         /// Makes the wait for `host` fail, as a first-byte timeout does.
-        pub(crate) fn time_out(&self, host: &str) {
+        pub fn time_out(&self, host: &str) {
             self.routes
                 .lock()
                 .expect("should lock the routes")
@@ -404,7 +867,7 @@ pub(crate) mod fake_http {
         }
 
         /// Makes the wait for `host` take `delay` of wall-clock time.
-        pub(crate) fn delay(&self, host: &str, delay: Duration) {
+        pub fn delay(&self, host: &str, delay: Duration) {
             self.delays
                 .lock()
                 .expect("should lock the delays")
@@ -412,12 +875,12 @@ pub(crate) mod fake_http {
         }
 
         /// The URIs requests were sent to, in order.
-        pub(crate) fn sent_uris(&self) -> Vec<String> {
+        pub fn sent_uris(&self) -> Vec<String> {
             self.uris.lock().expect("should lock the sent URIs").clone()
         }
 
         /// The hosts requests were sent to, in order.
-        pub(crate) fn sent_hosts(&self) -> Vec<String> {
+        pub fn sent_hosts(&self) -> Vec<String> {
             self.sent
                 .lock()
                 .expect("should lock the sent hosts")
@@ -515,19 +978,21 @@ pub(crate) mod fake_http {
     }
 
     /// A backend named after its host, that records each spec it is given.
-    pub(crate) struct FakeBackend {
+    pub struct FakeBackend {
         specs: Mutex<Vec<PlatformBackendSpec>>,
     }
 
     impl FakeBackend {
-        pub(crate) fn new() -> Self {
+        /// A backend that has registered nothing.
+        #[must_use]
+        pub fn new() -> Self {
             Self {
                 specs: Mutex::new(Vec::new()),
             }
         }
 
         /// The first-byte timeouts the backends were registered with, in order.
-        pub(crate) fn first_byte_timeouts(&self) -> Vec<Duration> {
+        pub fn first_byte_timeouts(&self) -> Vec<Duration> {
             self.specs
                 .lock()
                 .expect("should lock the specs")
@@ -559,6 +1024,7 @@ pub(crate) mod fake_http {
     }
 
     /// Services that send through `client` and register backends in `backend`.
+    #[cfg(test)]
     pub(crate) fn fake_services(
         client: &Arc<FakeHttpClient>,
         backend: &Arc<FakeBackend>,

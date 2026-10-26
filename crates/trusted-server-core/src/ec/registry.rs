@@ -38,13 +38,6 @@ pub struct PartnerConfig {
     pub pull_sync_url: Option<String>,
     /// Allowlist of domains TS may call for this partner's pull sync.
     pub pull_sync_allowed_domains: Vec<String>,
-    /// Legacy seconds between pull sync refreshes retained for config compatibility.
-    ///
-    /// Pull sync currently fills missing partner UIDs only, so this value is
-    /// not used to refresh existing UIDs.
-    pub pull_sync_ttl_sec: u64,
-    /// Max pull sync calls per EC hash per partner per hour.
-    pub pull_sync_rate_limit: u32,
     /// Outbound bearer token for pull sync requests.
     pub ts_pull_token: Option<Redacted<String>>,
 }
@@ -103,14 +96,13 @@ impl PartnerRegistry {
                 }));
             }
 
-            validate_rate_limits_values(partner.batch_rate_limit, partner.pull_sync_rate_limit)
-                .map_err(|error| {
-                    Report::new(TrustedServerError::Configuration {
-                        message: format!(
-                            "ec.partners: invalid rate limits for '{normalized_source}': {error}"
-                        ),
-                    })
-                })?;
+            validate_rate_limits_values(partner.batch_rate_limit).map_err(|error| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "ec.partners: invalid rate limits for '{normalized_source}': {error}"
+                    ),
+                })
+            })?;
 
             if partner.pull_sync_enabled {
                 validate_pull_sync_fields(
@@ -302,32 +294,21 @@ fn build_partner_config(
         pull_sync_enabled: partner.pull_sync_enabled,
         pull_sync_url: partner.pull_sync_url.clone(),
         pull_sync_allowed_domains: partner.pull_sync_allowed_domains.clone(),
-        pull_sync_ttl_sec: partner.pull_sync_ttl_sec,
-        pull_sync_rate_limit: partner.pull_sync_rate_limit,
         ts_pull_token: partner.ts_pull_token.clone(),
     }
 }
 
 fn validate_rate_limits(config: &PartnerConfig) -> Result<(), Report<TrustedServerError>> {
-    validate_rate_limits_values(config.batch_rate_limit, config.pull_sync_rate_limit).map_err(
-        |message| {
-            Report::new(TrustedServerError::Configuration {
-                message: message.to_owned(),
-            })
-        },
-    )
+    validate_rate_limits_values(config.batch_rate_limit).map_err(|message| {
+        Report::new(TrustedServerError::Configuration {
+            message: message.to_owned(),
+        })
+    })
 }
 
-fn validate_rate_limits_values(
-    batch_rate_limit: u32,
-    pull_sync_rate_limit: u32,
-) -> Result<(), &'static str> {
+fn validate_rate_limits_values(batch_rate_limit: u32) -> Result<(), &'static str> {
     if batch_rate_limit == 0 {
         return Err("batch_rate_limit must be greater than 0");
-    }
-
-    if pull_sync_rate_limit == 0 {
-        return Err("pull_sync_rate_limit must be greater than 0");
     }
 
     Ok(())
@@ -429,8 +410,8 @@ mod tests {
             pull_sync_enabled: false,
             pull_sync_url: None,
             pull_sync_allowed_domains: vec![],
-            pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
-            pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            removed_pull_sync_ttl_sec: None,
+            removed_pull_sync_rate_limit: None,
             ts_pull_token: None,
         }
     }
@@ -668,18 +649,5 @@ mod tests {
 
         let result = PartnerRegistry::from_config(&[partner]);
         assert!(result.is_err(), "should reject zero batch_rate_limit");
-    }
-
-    #[test]
-    fn zero_pull_sync_rate_limit_is_rejected() {
-        let mut partner = make_partner("pull.example.com", &valid_api_token("token-p"));
-        partner.pull_sync_enabled = true;
-        partner.pull_sync_url = Some("https://pull.example.com/sync".to_owned());
-        partner.pull_sync_allowed_domains = vec!["pull.example.com".to_owned()];
-        partner.pull_sync_rate_limit = 0;
-        partner.ts_pull_token = Some(Redacted::new("outbound-token".to_owned()));
-
-        let result = PartnerRegistry::from_config(&[partner]);
-        assert!(result.is_err(), "should reject zero pull_sync_rate_limit");
     }
 }

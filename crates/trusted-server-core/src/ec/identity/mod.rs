@@ -10,6 +10,7 @@ pub(crate) mod catalog;
 pub(crate) mod coordinator;
 pub mod descriptor;
 pub mod exchange;
+pub(crate) mod generic_pull;
 pub mod ids;
 pub mod input;
 pub(crate) mod mirror;

@@ -422,22 +422,21 @@ pub struct EcPartner {
     /// Allowlist of domains TS may call for this partner's pull sync.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub pull_sync_allowed_domains: Vec<String>,
-    /// Legacy pull-sync refresh interval retained for config compatibility.
+    /// Catches the removed `pull_sync_ttl_sec` key.
     ///
-    /// EC identity entries no longer store per-partner sync timestamps, so
-    /// this value is not used by the current fill-missing-only pull sync
-    /// behavior.
-    #[serde(
-        default = "EcPartner::default_pull_sync_ttl_sec",
-        deserialize_with = "from_value_or_str"
-    )]
-    pub pull_sync_ttl_sec: u64,
-    /// Max pull sync calls per EC hash per partner per hour.
-    #[serde(
-        default = "EcPartner::default_pull_sync_rate_limit",
-        deserialize_with = "from_value_or_str"
-    )]
-    pub pull_sync_rate_limit: u32,
+    /// The key was replaced by `refresh_after_sec` in
+    /// `[ec.identity.providers.<pull-id>]`. It is parsed only so validation
+    /// can name its replacement instead of failing with a generic
+    /// unknown-field message, and it is never serialized.
+    #[serde(default, rename = "pull_sync_ttl_sec", skip_serializing)]
+    pub removed_pull_sync_ttl_sec: Option<serde_json::Value>,
+    /// Catches the removed `pull_sync_rate_limit` key.
+    ///
+    /// The key was replaced by `max_calls_per_minute` in
+    /// `[ec.identity.providers.<pull-id>]`. It is parsed only so validation
+    /// can name its replacement, and it is never serialized.
+    #[serde(default, rename = "pull_sync_rate_limit", skip_serializing)]
+    pub removed_pull_sync_rate_limit: Option<serde_json::Value>,
     /// Outbound bearer token for pull sync requests.
     #[serde(default)]
     pub ts_pull_token: Option<Redacted<String>>,
@@ -521,16 +520,6 @@ impl EcPartner {
     #[must_use]
     pub const fn default_batch_rate_limit() -> u32 {
         60
-    }
-
-    #[must_use]
-    pub const fn default_pull_sync_ttl_sec() -> u64 {
-        86400
-    }
-
-    #[must_use]
-    pub const fn default_pull_sync_rate_limit() -> u32 {
-        10
     }
 }
 
@@ -4237,8 +4226,8 @@ mod tests {
             pull_sync_enabled: false,
             pull_sync_url: None,
             pull_sync_allowed_domains: Vec::new(),
-            pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
-            pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            removed_pull_sync_ttl_sec: None,
+            removed_pull_sync_rate_limit: None,
             ts_pull_token: Some(Redacted::new(CANARY_EC_PARTNER_TS_PULL_TOKEN.to_string())),
         }];
 
@@ -6049,8 +6038,8 @@ source_domain = "partner.example.com"
             pull_sync_enabled: true,
             pull_sync_url: Some("https://partner.example.com/sync".to_owned()),
             pull_sync_allowed_domains: vec!["partner.example.com".to_owned()],
-            pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
-            pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            removed_pull_sync_ttl_sec: None,
+            removed_pull_sync_rate_limit: None,
             ts_pull_token: Some(Redacted::new(ts_pull_token.to_owned())),
         }
     }

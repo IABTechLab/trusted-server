@@ -338,8 +338,8 @@ mod tests {
             pull_sync_enabled: false,
             pull_sync_url: None,
             pull_sync_allowed_domains: vec![],
-            pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
-            pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            removed_pull_sync_ttl_sec: None,
+            removed_pull_sync_rate_limit: None,
             ts_pull_token: None,
         }
     }

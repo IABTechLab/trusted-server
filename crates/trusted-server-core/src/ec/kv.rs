@@ -1612,6 +1612,31 @@ impl KvIdentityGraph {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+impl KvIdentityGraph {
+    /// Test helper: a graph backed by an in-memory store that counts lookups
+    /// and writes by mode, with the store to read the counts from.
+    ///
+    /// Counts include any seeding, so call
+    /// [`WriteCountingEcKv::reset_counts`](crate::ec::identity::test_support::WriteCountingEcKv::reset_counts)
+    /// after seeding to count only what the code under test does.
+    #[must_use]
+    pub fn write_counting(
+        store_name: impl Into<String>,
+    ) -> (
+        Self,
+        Arc<crate::ec::identity::test_support::WriteCountingEcKv>,
+    ) {
+        let store = Arc::new(crate::ec::identity::test_support::WriteCountingEcKv::new(
+            store_name,
+        ));
+        let graph = Self {
+            store: store.clone(),
+        };
+        (graph, store)
+    }
+}
+
 #[cfg(test)]
 impl KvIdentityGraph {
     /// Test helper: a graph whose every store operation fails, mimicking a

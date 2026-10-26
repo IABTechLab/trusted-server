@@ -22,6 +22,7 @@ use crate::settings::Settings;
 
 use super::generation::{ec_hash, is_valid_ec_id};
 use super::identity::coordinator::{Waited, buffered_body, drain_in_flight};
+use super::identity::generic_pull::generic_pull_id;
 use super::kv::{KvIdentityGraph, PartnerIdUpdate};
 use super::kv_types::KvEntry;
 use super::rate_limiter::RateLimiter;
@@ -188,12 +189,19 @@ pub fn dispatch_pull_sync(
             continue;
         }
 
-        let Some(url) = validated_pull_sync_url(partner) else {
+        let Some(url) = validated_pull_sync_url(
+            partner.pull_sync_url.as_deref(),
+            &partner.pull_sync_allowed_domains,
+        ) else {
             continue;
         };
 
         let rate_key = pull_rate_limit_key(&partner.source_domain, context.ec_id());
-        match rate_limiter.exceeded(&rate_key, partner.pull_sync_rate_limit) {
+        let provider_settings = settings
+            .ec
+            .identity
+            .provider(&generic_pull_id(&partner.source_domain));
+        match rate_limiter.exceeded_per_minute(&rate_key, provider_settings.max_calls_per_minute) {
             Ok(true) => {
                 log::debug!(
                     "Pull sync: rate-limited partner '{}' for ec_id '{}'",
@@ -308,57 +316,53 @@ fn is_partner_pull_eligible(partner: &PartnerConfig, kv_entry: Option<&KvEntry>)
         .is_none()
 }
 
-fn validated_pull_sync_url(partner: &PartnerConfig) -> Option<Url> {
-    let pull_sync_url = partner.pull_sync_url.as_deref()?;
+/// Returns the pull URL when it is HTTPS and its host is allowlisted.
+///
+/// The host comparison ignores case and a trailing dot on both sides.
+/// Returns `None`, with a log line that names no partner, for a missing,
+/// invalid or non-HTTPS URL and for a host outside `allowed_domains`.
+pub(crate) fn validated_pull_sync_url(
+    pull_sync_url: Option<&str>,
+    allowed_domains: &[String],
+) -> Option<Url> {
+    let pull_sync_url = pull_sync_url?;
     let parsed = match Url::parse(pull_sync_url) {
         Ok(url) => url,
         Err(err) => {
-            log::error!(
-                "Pull sync: partner '{}' has invalid pull_sync_url '{}': {err}",
-                partner.source_domain,
-                pull_sync_url
-            );
+            log::error!("Pull sync: invalid pull_sync_url '{pull_sync_url}': {err}");
             return None;
         }
     };
 
     if parsed.scheme() != "https" {
         log::error!(
-            "Pull sync: partner '{}' pull_sync_url must use HTTPS, got scheme '{}'",
-            partner.source_domain,
+            "Pull sync: pull_sync_url must use HTTPS, got scheme '{}'",
             parsed.scheme()
         );
         return None;
     }
 
     let Some(hostname) = parsed.host_str() else {
-        log::error!(
-            "Pull sync: partner '{}' pull_sync_url has no hostname: {}",
-            partner.source_domain,
-            pull_sync_url
-        );
+        log::error!("Pull sync: pull_sync_url has no hostname: {pull_sync_url}");
         return None;
     };
 
     let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
-    if !partner.pull_sync_allowed_domains.iter().any(|domain| {
+    if !allowed_domains.iter().any(|domain| {
         domain
             .trim()
             .trim_end_matches('.')
             .eq_ignore_ascii_case(&hostname)
     }) {
-        log::error!(
-            "Pull sync: partner '{}' URL host '{}' not in pull_sync_allowed_domains",
-            partner.source_domain,
-            hostname
-        );
+        log::error!("Pull sync: URL host '{hostname}' not in pull_sync_allowed_domains");
         return None;
     }
 
     Some(parsed)
 }
 
-fn build_pull_request_url(mut base_url: Url, ec_id: &str) -> Url {
+/// Appends the `ec_id` query parameter to a validated pull URL.
+pub(crate) fn build_pull_request_url(mut base_url: Url, ec_id: &str) -> Url {
     base_url.query_pairs_mut().append_pair("ec_id", ec_id);
     base_url
 }
@@ -483,7 +487,7 @@ mod tests {
         )
     }
 
-    fn pull_partner(ttl_sec: u64) -> PartnerConfig {
+    fn pull_partner() -> PartnerConfig {
         PartnerConfig {
             name: "SSP X".to_owned(),
             api_key_hash: Some("deadbeef".to_owned()),
@@ -494,8 +498,6 @@ mod tests {
             pull_sync_enabled: true,
             pull_sync_url: Some("https://sync.partner.test/pull".to_owned()),
             pull_sync_allowed_domains: vec!["sync.partner.test".to_owned()],
-            pull_sync_ttl_sec: ttl_sec,
-            pull_sync_rate_limit: 20,
             ts_pull_token: Some(Redacted::new("token".to_owned())),
         }
     }
@@ -601,7 +603,7 @@ mod tests {
 
     #[test]
     fn partner_is_eligible_when_missing_from_entry() {
-        let partner = pull_partner(3600);
+        let partner = pull_partner();
         let entry = KvEntry::minimal("other_partner", "uid-1", 100);
 
         assert!(
@@ -612,7 +614,7 @@ mod tests {
 
     #[test]
     fn partner_is_not_eligible_when_already_present() {
-        let partner = pull_partner(3600);
+        let partner = pull_partner();
         let entry = KvEntry::minimal("ssp.example.com", "uid-1", 1000);
 
         assert!(
@@ -648,10 +650,13 @@ mod tests {
 
     #[test]
     fn validated_pull_sync_url_rejects_http_scheme() {
-        let mut partner = pull_partner(3600);
+        let mut partner = pull_partner();
         partner.pull_sync_url = Some("http://sync.partner.test/pull".to_owned());
 
-        let validated = validated_pull_sync_url(&partner);
+        let validated = validated_pull_sync_url(
+            partner.pull_sync_url.as_deref(),
+            &partner.pull_sync_allowed_domains,
+        );
         assert!(
             validated.is_none(),
             "should reject pull_sync_url with HTTP scheme"
@@ -660,10 +665,13 @@ mod tests {
 
     #[test]
     fn validated_pull_sync_url_rejects_non_allowlisted_host() {
-        let mut partner = pull_partner(3600);
+        let mut partner = pull_partner();
         partner.pull_sync_url = Some("https://evil.test/pull".to_owned());
 
-        let validated = validated_pull_sync_url(&partner);
+        let validated = validated_pull_sync_url(
+            partner.pull_sync_url.as_deref(),
+            &partner.pull_sync_allowed_domains,
+        );
         assert!(
             validated.is_none(),
             "should reject runtime pull_sync_url host outside allowlist"
@@ -672,11 +680,14 @@ mod tests {
 
     #[test]
     fn validated_pull_sync_url_accepts_normalized_allowlist_match() {
-        let mut partner = pull_partner(3600);
+        let mut partner = pull_partner();
         partner.pull_sync_url = Some("https://SYNC.PARTNER.TEST./pull".to_owned());
         partner.pull_sync_allowed_domains = vec!["sync.partner.test".to_owned()];
 
-        let validated = validated_pull_sync_url(&partner);
+        let validated = validated_pull_sync_url(
+            partner.pull_sync_url.as_deref(),
+            &partner.pull_sync_allowed_domains,
+        );
         assert!(
             validated.is_some(),
             "should accept allowlist match after hostname normalization"
@@ -859,8 +870,8 @@ mod tests {
             pull_sync_enabled: true,
             pull_sync_url: Some(format!("https://{source_domain}/sync")),
             pull_sync_allowed_domains: vec![source_domain.to_owned()],
-            pull_sync_ttl_sec: 3600,
-            pull_sync_rate_limit: 100,
+            removed_pull_sync_ttl_sec: None,
+            removed_pull_sync_rate_limit: None,
             ts_pull_token: Some(Redacted::new("outbound-token".to_owned())),
         }
     }

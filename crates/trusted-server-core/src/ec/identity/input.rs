@@ -375,8 +375,6 @@ pub(crate) struct ResolveSignals<'a> {
     pub(crate) publisher_domain: &'a str,
     pub(crate) now: UnixTime,
     pub(crate) random: &'a dyn RandomSource,
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) ec_id: Option<String>,
     pub(crate) stored: BTreeMap<SourceDomain, StoredId>,
 }
@@ -622,8 +620,6 @@ impl<'a> ResolveInput<'a> {
     /// `UndeclaredInput { access: EcId }` otherwise. `Config` when the
     /// request has no EC ID, which the coordinator never allows: it does not
     /// dispatch generic pull without one.
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(in crate::ec::identity) fn ec_id(&self) -> Result<&str, Report<IdentityProviderError>> {
         if !self.descriptor.resolves().is_some_and(Resolves::gets_ec_id) {
             return Err(self.record(Access::EcId));
