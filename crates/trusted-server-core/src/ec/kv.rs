@@ -801,6 +801,28 @@ impl KvIdentityGraph {
         partner_id: &str,
         uid: &str,
     ) -> Result<UpsertResult, Report<TrustedServerError>> {
+        self.upsert_partner_id_if_exists_policy(ec_id, partner_id, uid, false)
+    }
+
+    /// Like [`Self::upsert_partner_id_if_exists`], with the replacement rule
+    /// chosen by the caller.
+    ///
+    /// With `only_when_absent`, a source that already holds a value is left
+    /// untouched and the call returns [`UpsertResult::Unchanged`] without a
+    /// write. Batch sync sets it for a source an identity provider owns, so a
+    /// provider's entry set is never replaced.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::KvStore`] on store I/O or CAS
+    /// exhaustion errors.
+    pub fn upsert_partner_id_if_exists_policy(
+        &self,
+        ec_id: &str,
+        partner_id: &str,
+        uid: &str,
+        only_when_absent: bool,
+    ) -> Result<UpsertResult, Report<TrustedServerError>> {
         for attempt in 0..MAX_CAS_RETRIES {
             let (mut entry, generation) = match self.get(ec_id)? {
                 Some(pair) => pair,
@@ -809,6 +831,10 @@ impl KvIdentityGraph {
 
             if !entry.consent.ok {
                 return Ok(UpsertResult::ConsentWithdrawn);
+            }
+
+            if only_when_absent && entry.ids.contains_key(partner_id) {
+                return Ok(UpsertResult::Unchanged);
             }
 
             if entry

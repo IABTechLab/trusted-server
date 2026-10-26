@@ -912,7 +912,7 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
     let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
         let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
         let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-        handle_batch_sync(&kv, &partner_registry, &limiter, req)
+        handle_batch_sync(&kv, &partner_registry, &limiter, &state.identity, req)
     });
 
     let mut response = result.unwrap_or_else(|e| http_error(&e));

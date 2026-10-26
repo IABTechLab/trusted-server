@@ -24,6 +24,8 @@ use crate::error::TrustedServerError;
 
 use super::auth::authenticate_bearer;
 use super::generation::{is_valid_ec_id, normalize_ec_id_for_kv};
+use super::identity::ids::SourceDomain;
+use super::identity::runtime::IdentityRuntime;
 use super::kv::{KvIdentityGraph, UpsertResult};
 use super::log_id;
 use super::rate_limiter::RateLimiter;
@@ -45,6 +47,7 @@ trait BatchSyncWriter {
         ec_id: &str,
         partner_id: &str,
         uid: &str,
+        only_when_absent: bool,
     ) -> Result<UpsertResult, Report<TrustedServerError>>;
 }
 
@@ -54,8 +57,15 @@ impl BatchSyncWriter for KvIdentityGraph {
         ec_id: &str,
         partner_id: &str,
         uid: &str,
+        only_when_absent: bool,
     ) -> Result<UpsertResult, Report<TrustedServerError>> {
-        KvIdentityGraph::upsert_partner_id_if_exists(self, ec_id, partner_id, uid)
+        KvIdentityGraph::upsert_partner_id_if_exists_policy(
+            self,
+            ec_id,
+            partner_id,
+            uid,
+            only_when_absent,
+        )
     }
 }
 
@@ -108,6 +118,10 @@ struct MappingGroup {
 
 /// Handles `POST /_ts/api/v1/batch-sync`.
 ///
+/// A source an identity provider owns is written only when the row holds no
+/// value for it; a stored value, including a provider's entry set, is never
+/// replaced.
+///
 /// # Errors
 ///
 /// Returns [`TrustedServerError`] on serialization or KV store failures.
@@ -115,15 +129,17 @@ pub fn handle_batch_sync(
     kv: &KvIdentityGraph,
     registry: &PartnerRegistry,
     rate_limiter: &dyn RateLimiter,
+    identity: &IdentityRuntime,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    handle_batch_sync_with_writer(kv, registry, rate_limiter, req)
+    handle_batch_sync_with_writer(kv, registry, rate_limiter, identity, req)
 }
 
 fn handle_batch_sync_with_writer(
     writer: &dyn BatchSyncWriter,
     registry: &PartnerRegistry,
     rate_limiter: &dyn RateLimiter,
+    identity: &IdentityRuntime,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     // 1. Authenticate
@@ -167,7 +183,13 @@ fn handle_batch_sync_with_writer(
     }
 
     // 4. Process mappings with per-item validation and rejection reasons.
-    let (accepted, errors) = process_mappings(writer, &partner.source_domain, &body.mappings);
+    let owned = partner
+        .source_domain
+        .parse::<SourceDomain>()
+        .ok()
+        .is_some_and(|source| identity.catalog().owner_of(&source).is_some());
+    let (accepted, errors) =
+        process_mappings(writer, &partner.source_domain, owned, &body.mappings);
 
     let rejected = errors.len();
     let status = if rejected > 0 {
@@ -202,6 +224,7 @@ fn content_length_exceeds_limit(req: &Request<EdgeBody>, max_body_size: usize) -
 fn process_mappings(
     writer: &dyn BatchSyncWriter,
     partner_id: &str,
+    owned: bool,
     mappings: &[SyncMapping],
 ) -> (usize, Vec<MappingError>) {
     let mut errors = Vec::new();
@@ -244,7 +267,12 @@ fn process_mappings(
 
     let mut accepted = 0;
     for (group_index, group) in groups.iter().enumerate() {
-        match writer.upsert_partner_id_if_exists(&group.ec_id, partner_id, &group.partner_uid) {
+        match writer.upsert_partner_id_if_exists(
+            &group.ec_id,
+            partner_id,
+            &group.partner_uid,
+            owned,
+        ) {
             Ok(UpsertResult::Written | UpsertResult::Unchanged) => {
                 accepted += group.indexes.len();
             }
@@ -308,6 +336,10 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
+    use crate::ec::identity::test_support::{
+        example_entry_set, fixed_provider, full_record, pid, source as source_domain,
+    };
+    use crate::ec::kv_types::{KvEntry, KvPartnerId};
     use crate::error::TrustedServerError;
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
@@ -382,6 +414,7 @@ mod tests {
             ec_id: &str,
             partner_id: &str,
             uid: &str,
+            _only_when_absent: bool,
         ) -> Result<UpsertResult, Report<TrustedServerError>> {
             self.calls.borrow_mut().push(WriterCall {
                 ec_id: ec_id.to_owned(),
@@ -436,6 +469,136 @@ mod tests {
             .into_bytes()
             .expect("should contain batch-sync response");
         serde_json::from_slice(&body).expect("should deserialize batch-sync response")
+    }
+
+    fn identity_with_owner(owned: &[(&str, &str)]) -> IdentityRuntime {
+        let settings = crate::test_support::tests::create_test_settings();
+        let providers = owned
+            .iter()
+            .map(|(id, source)| fixed_provider(id, &[source]))
+            .collect();
+        let owners = owned
+            .iter()
+            .map(|(id, source)| (source_domain(source), pid(id)))
+            .collect();
+        IdentityRuntime::from_settings_with_providers(&settings, providers, owners)
+            .expect("should build the identity runtime")
+    }
+
+    fn empty_identity() -> IdentityRuntime {
+        identity_with_owner(&[])
+    }
+
+    fn batch_body(ec_id: &str, uid: &str) -> String {
+        serde_json::json!({
+            "mappings": [{ "ec_id": ec_id, "partner_uid": uid, "timestamp": 1 }]
+        })
+        .to_string()
+    }
+
+    fn seeded_graph(ec_id: &str, record: Option<KvPartnerId>) -> KvIdentityGraph {
+        let graph = KvIdentityGraph::in_memory("batch-store");
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        if let Some(record) = record {
+            entry.ids.insert("ssp.example.com".to_owned(), record);
+        }
+        graph.create(ec_id, &entry).expect("should seed the row");
+        graph
+    }
+
+    fn stored_record(graph: &KvIdentityGraph, ec_id: &str) -> Option<KvPartnerId> {
+        let (entry, _) = graph
+            .get(ec_id)
+            .expect("should read the row")
+            .expect("should hold the row");
+        entry.ids.get("ssp.example.com").cloned()
+    }
+
+    fn run_batch(
+        graph: &KvIdentityGraph,
+        identity: &IdentityRuntime,
+        ec_id: &str,
+        uid: &str,
+    ) -> serde_json::Value {
+        let limiter = MockRateLimiter {
+            should_exceed: false,
+        };
+        let response = handle_batch_sync(
+            graph,
+            &test_registry(),
+            &limiter,
+            identity,
+            authorized_batch_request(&batch_body(ec_id, uid)),
+        )
+        .expect("should handle the batch");
+        response_json(response)
+    }
+
+    #[test]
+    fn batch_sync_update_to_owned_source_applies_only_when_absent() {
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let owned = identity_with_owner(&[("example-provider", "ssp.example.com")]);
+
+        let absent = seeded_graph(&ec_id, None);
+        let summary = run_batch(&absent, &owned, &ec_id, "batch-uid");
+        assert_eq!(summary["accepted"], 1, "should accept the absent write");
+        assert_eq!(
+            stored_record(&absent, &ec_id),
+            Some(KvPartnerId::new("batch-uid")),
+            "should write an owned source that holds no value"
+        );
+
+        let present = seeded_graph(&ec_id, Some(KvPartnerId::new("existing-uid")));
+        let summary = run_batch(&present, &owned, &ec_id, "batch-uid");
+        assert_eq!(summary["accepted"], 1, "should report the skip as accepted");
+        assert_eq!(
+            stored_record(&present, &ec_id),
+            Some(KvPartnerId::new("existing-uid")),
+            "should keep the value an owned source already holds"
+        );
+
+        let control = seeded_graph(&ec_id, Some(KvPartnerId::new("existing-uid")));
+        let summary = run_batch(&control, &empty_identity(), &ec_id, "batch-uid");
+        assert_eq!(summary["accepted"], 1, "should accept the unowned update");
+        assert_eq!(
+            stored_record(&control, &ec_id),
+            Some(KvPartnerId::new("batch-uid")),
+            "should keep replacing the value of an unowned source"
+        );
+    }
+
+    #[test]
+    fn batch_sync_never_touches_an_owners_entry_set() {
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let owned = identity_with_owner(&[("example-provider", "ssp.example.com")]);
+        let owners_record = full_record(Some("example-provider"), example_entry_set());
+        let graph = seeded_graph(&ec_id, Some(owners_record.clone()));
+
+        let before = serde_json::to_vec(&owners_record.eids).expect("should serialize");
+        let summary = run_batch(&graph, &owned, &ec_id, "batch-uid");
+        let after = stored_record(&graph, &ec_id).expect("should keep the record");
+
+        assert_eq!(summary["accepted"], 1, "should report the skip as accepted");
+        assert_eq!(
+            serde_json::to_vec(&after.eids).expect("should serialize"),
+            before,
+            "should leave the owner's eids byte-equal"
+        );
+        assert_eq!(after.eids.len(), 2, "should keep both entries");
+        assert_eq!(
+            after.w.as_deref(),
+            Some("example-provider"),
+            "should keep the owner's writer"
+        );
+
+        let unowned = seeded_graph(&ec_id, Some(owners_record));
+        run_batch(&unowned, &empty_identity(), &ec_id, "batch-uid");
+        assert_eq!(
+            stored_record(&unowned, &ec_id),
+            Some(KvPartnerId::new("batch-uid")),
+            "should write a one-entry, one-UID record without w or rv for an unowned source"
+        );
     }
 
     fn test_registry() -> PartnerRegistry {
@@ -498,8 +661,9 @@ mod tests {
             .body(EdgeBody::from("not-json"))
             .expect("should build test request");
 
-        let response = handle_batch_sync_with_writer(&writer, &registry, &limiter, req)
-            .expect("should return oversized response");
+        let response =
+            handle_batch_sync_with_writer(&writer, &registry, &limiter, &empty_identity(), req)
+                .expect("should return oversized response");
 
         assert_eq!(
             response.status(),
@@ -524,8 +688,9 @@ mod tests {
             .body(EdgeBody::from(oversized_body))
             .expect("should build test request");
 
-        let response = handle_batch_sync_with_writer(&writer, &registry, &limiter, req)
-            .expect("should return oversized response");
+        let response =
+            handle_batch_sync_with_writer(&writer, &registry, &limiter, &empty_identity(), req)
+                .expect("should return oversized response");
 
         assert_eq!(
             response.status(),
@@ -543,7 +708,7 @@ mod tests {
             mapping(&format!("{}.ABC123", "a".repeat(64)), "u3", 1),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", false, &mappings);
 
         assert_eq!(accepted, 1, "should count successful writes as accepted");
         assert_eq!(errors.len(), 2, "should reject invalid mappings only");
@@ -569,7 +734,7 @@ mod tests {
             mapping(&format!("{}.ABC123", "c".repeat(64)), "u3", 1),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", false, &mappings);
 
         assert_eq!(accepted, 1, "should keep accepted count before failure");
         assert_eq!(
@@ -601,8 +766,8 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build test request");
 
-        let response =
-            handle_batch_sync(&kv, &registry, &limiter, req).expect("should return response");
+        let response = handle_batch_sync(&kv, &registry, &limiter, &empty_identity(), req)
+            .expect("should return response");
         assert_eq!(
             response.status(),
             StatusCode::UNAUTHORIZED,
@@ -666,7 +831,7 @@ mod tests {
             mapping(&withdrawn_ec_id, "uid-2", 101),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", false, &mappings);
 
         assert_eq!(accepted, 0, "should not accept ineligible mappings");
         assert_eq!(errors.len(), 2, "should report both errors");
@@ -683,7 +848,7 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mappings = vec![mapping(&ec_id, "uid-1", 100), mapping(&ec_id, "uid-1", 101)];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", false, &mappings);
 
         assert_eq!(accepted, 2, "should accept every unchanged group member");
         assert!(
@@ -702,7 +867,7 @@ mod tests {
             mapping(&ec_id, "uid-old", 100),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", false, &mappings);
 
         assert_eq!(
             accepted, 2,
@@ -732,7 +897,7 @@ mod tests {
             mapping(&ec_id_a_upper, "a-last", 3),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", false, &mappings);
 
         assert_eq!(accepted, 3, "should accept every valid group member");
         assert!(errors.is_empty(), "should report no errors");
@@ -762,7 +927,7 @@ mod tests {
             .map(|index| mapping(&ec_id, &format!("uid-{index}"), index as u64))
             .collect::<Vec<_>>();
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", false, &mappings);
 
         assert_eq!(
             accepted, MAX_BATCH_SIZE,
@@ -790,7 +955,7 @@ mod tests {
             mapping(&mixed_suffix, "mixed", 2),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", false, &mappings);
 
         assert_eq!(accepted, 2, "should accept both distinct EC IDs");
         assert!(errors.is_empty(), "should report no errors");
@@ -822,7 +987,7 @@ mod tests {
             mapping(&ec_id, "   ", 3),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", false, &mappings);
 
         assert_eq!(accepted, 2, "should accept valid group members");
         assert_eq!(errors.len(), 1, "should retain the invalid UID error");
@@ -850,7 +1015,7 @@ mod tests {
             mapping(&ec_id_b, "b-2", 4),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", false, &mappings);
 
         assert_eq!(accepted, 0, "should reject all ineligible group members");
         assert_eq!(
@@ -891,7 +1056,7 @@ mod tests {
             mapping(&ec_id_c, "", 6),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(&writer, "partner", false, &mappings);
 
         assert_eq!(
             accepted, 2,
@@ -938,6 +1103,7 @@ mod tests {
             &writer,
             &registry,
             &limiter,
+            &empty_identity(),
             authorized_batch_request(&body),
         )
         .expect("should return success response");
@@ -968,6 +1134,7 @@ mod tests {
             &writer,
             &registry,
             &limiter,
+            &empty_identity(),
             authorized_batch_request(&body),
         )
         .expect("should return multi-status response");
@@ -1006,6 +1173,7 @@ mod tests {
             &writer,
             &registry,
             &limiter,
+            &empty_identity(),
             authorized_batch_request(&body),
         )
         .expect("should return validation response");
@@ -1051,6 +1219,7 @@ mod tests {
             &writer,
             &registry,
             &limiter,
+            &empty_identity(),
             authorized_batch_request(&body),
         )
         .expect("should return infrastructure failure response");
