@@ -11,6 +11,7 @@ pub(crate) mod coordinator;
 pub(crate) mod denials;
 pub mod descriptor;
 pub mod exchange;
+pub mod flush;
 pub(crate) mod generic_pull;
 pub mod ids;
 pub mod input;

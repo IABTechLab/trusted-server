@@ -288,6 +288,22 @@ impl IdentityMutation {
         copy
     }
 
+    /// Cuts the mutation down for a navigation whose origin status was not
+    /// 2xx or 304 (spec 5.1).
+    ///
+    /// Keeps every removal, opt-out and clear, the stand-alone state changes
+    /// (the `n` and `f` of every outcome other than `found`) and the cluster
+    /// size. Drops browser ingest and every other positive change, and each
+    /// provider result whole, keeping only its opt-out and clear.
+    pub(crate) fn retain_for_error_status(&mut self) {
+        self.partner_ids.retain(PartnerIdChange::is_removal);
+        for result in core::mem::take(&mut self.results) {
+            if result.state.has_removal() {
+                self.merge_state(result.provider, result.state.removals());
+            }
+        }
+    }
+
     /// Every provider state change that applies regardless of its result:
     /// the standalone ones, and each result's.
     // Temporary: first used by a later identity task.
@@ -913,6 +929,38 @@ mod tests {
             source: src(source),
             record,
         }
+    }
+
+    #[test]
+    fn retain_for_error_status_keeps_removals_and_backoff() {
+        let removal = PartnerIdChange::OwnerRemove {
+            source: src("a.example.com"),
+            provider: pid("owner"),
+            expected: Revision::Unset,
+        };
+        let backoff = ProviderStateChange {
+            n: Some(NOW + 86_400),
+            ..ProviderStateChange::default()
+        };
+        let mut mutation = IdentityMutation::default();
+        mutation.add_change(fill("b.example.com", KvPartnerId::browser("u", Some(NOW))));
+        mutation.add_change(PartnerIdChange::OwnerWrite {
+            source: src("a.example.com"),
+            record: written("owner", "found-uid", "1111111111111111"),
+            expected: None,
+        });
+        mutation.add_change(removal.clone());
+        mutation.merge_state(pid("other"), backoff.clone());
+
+        mutation.retain_for_error_status();
+
+        let mut expected = IdentityMutation::default();
+        expected.add_change(removal);
+        expected.merge_state(pid("other"), backoff);
+        assert_eq!(
+            mutation, expected,
+            "should keep only the removal and the no_match backoff"
+        );
     }
 
     #[test]

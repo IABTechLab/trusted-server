@@ -1,10 +1,6 @@
 //! The shared removal write: a removal-only mutation written with the
 //! withdrawal path's CAS loop (spec 5.2 phase 4, 5.3).
 
-// Temporary: the capture removal write and the flush retry first use this in
-// later identity tasks. Remove this when they land.
-#![allow(dead_code)]
-
 use super::ids::SourceDomain;
 use super::mutation::{ApplyContext, IdentityMutation, apply_removals_only};
 use crate::ec::kv::{KvIdentityGraph, MAX_CAS_RETRIES};

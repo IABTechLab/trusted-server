@@ -70,7 +70,10 @@ pub enum EcKvWriteOutcome {
 /// Infrastructure failures are reported as [`TrustedServerError::KvStore`];
 /// write precondition failures are part of the normal control flow and are
 /// returned as [`EcKvWriteOutcome::PreconditionFailed`] instead of errors.
-pub trait EcKvStore {
+///
+/// `Send + Sync` so a [`super::kv::KvIdentityGraph`] can be built once and
+/// held in shared application state.
+pub trait EcKvStore: Send + Sync {
     /// Returns the platform store name, used in log and error messages.
     fn store_name(&self) -> &str;
 

@@ -15,10 +15,12 @@ use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_h
 use trusted_server_core::constants::HEADER_X_TS_VERSION;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::{ec_finalize_response, retry_failed_withdrawals};
-use trusted_server_core::ec::kv::KvIdentityGraph;
-use trusted_server_core::ec::pull_sync::{
-    PullSyncContext, build_pull_sync_context, dispatch_pull_sync,
+use trusted_server_core::ec::identity::IdentityRuntime;
+use trusted_server_core::ec::identity::flush::{
+    AfterSendInput, FlushOutcome, may_flush, run_after_send,
 };
+use trusted_server_core::ec::kv::KvIdentityGraph;
+use trusted_server_core::ec::rate_limiter::RateLimiter;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::RequestFilterEffects;
@@ -506,57 +508,56 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
     }
 
     if let Some(mut ec_state) = ec_state {
-        if let Some(settings) = settings_snapshot.as_deref() {
-            match apply_edgezero_ec_finalize(settings, &mut ec_state, &mut response) {
-                Ok(partner_registry) => {
-                    send_edgezero_response(
+        let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
+        let mut send = |response: HttpResponse| {
+            send_edgezero_response(response, request_filter_effects.as_ref(), counters.as_ref());
+        };
+        if let Some(state) = app_state.as_deref() {
+            let graph = || state.identity_graph.clone();
+            finalize_send_and_flush(
+                PostRouteInput {
+                    runtime: &state.identity,
+                    settings: &state.settings,
+                    ec_state: &mut ec_state,
+                    graph: &graph,
+                    rate_limiter: &limiter,
+                },
+                response,
+                &mut send,
+            );
+            return;
+        }
+        match load_settings_from_config_store(&runtime_stores) {
+            Ok(settings) => match build_identity_runtime(&settings) {
+                Ok(identity) => {
+                    // No application state was built, so the identity runtime
+                    // comes from the reloaded settings.
+                    ec_state
+                        .ec_context
+                        .set_identity_runtime(Arc::clone(&identity));
+                    let graph = || maybe_identity_graph(&settings);
+                    finalize_send_and_flush(
+                        PostRouteInput {
+                            runtime: &identity,
+                            settings: &settings,
+                            ec_state: &mut ec_state,
+                            graph: &graph,
+                            rate_limiter: &limiter,
+                        },
                         response,
-                        request_filter_effects.as_ref(),
-                        counters.as_ref(),
+                        &mut send,
                     );
-                    run_edgezero_after_send(settings, &partner_registry, &mut ec_state);
                     return;
                 }
                 Err(e) => {
-                    log::error!(
-                        "EdgeZero EC finalize skipped: failed to build partner registry: {e:?}"
+                    log::warn!(
+                        "EdgeZero EC finalize skipped: identity runtime unavailable after settings reload: {}",
+                        e.current_context()
                     );
                 }
-            }
-        } else {
-            match load_settings_from_config_store(&runtime_stores) {
-                Ok(settings) => {
-                    // No application state was built, so build the identity
-                    // runtime from the reloaded settings.
-                    match build_identity_runtime(&settings) {
-                        Ok(identity) => ec_state.ec_context.set_identity_runtime(identity),
-                        Err(e) => {
-                            log::warn!(
-                                "identity runtime unavailable after settings reload: {}",
-                                e.current_context()
-                            );
-                        }
-                    }
-                    match apply_edgezero_ec_finalize(&settings, &mut ec_state, &mut response) {
-                        Ok(partner_registry) => {
-                            send_edgezero_response(
-                                response,
-                                request_filter_effects.as_ref(),
-                                counters.as_ref(),
-                            );
-                            run_edgezero_after_send(&settings, &partner_registry, &mut ec_state);
-                            return;
-                        }
-                        Err(e) => {
-                            log::error!(
-                                "EdgeZero EC finalize skipped: failed to build partner registry: {e:?}"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!("EdgeZero EC finalize skipped: failed to reload settings: {e:?}");
-                }
+            },
+            Err(e) => {
+                log::warn!("EdgeZero EC finalize skipped: failed to reload settings: {e:?}");
             }
         }
     }
@@ -599,14 +600,48 @@ fn apply_entry_point_finalize_headers(
     apply_finalize_headers(settings, geo_info.as_ref(), response);
 }
 
-fn apply_edgezero_ec_finalize(
-    settings: &Settings,
-    ec_state: &mut EcFinalizeState,
-    response: &mut HttpResponse,
-) -> Result<PartnerRegistry, Report<TrustedServerError>> {
-    let partner_registry = PartnerRegistry::from_config(&settings.ec.partners)?;
+/// What the post-route work reads. It takes the runtime and settings rather
+/// than [`AppState`], because the settings-reload branch has none.
+struct PostRouteInput<'a> {
+    runtime: &'a IdentityRuntime,
+    settings: &'a Settings,
+    ec_state: &'a mut EcFinalizeState,
+    /// Builds the identity graph. Called only when finalize or the after-send
+    /// work needs one, and at most once.
+    graph: &'a dyn Fn() -> Option<KvIdentityGraph>,
+    rate_limiter: &'a dyn RateLimiter,
+}
+
+/// Finalizes the response, hands it to `send`, then runs the after-send work:
+/// the withdrawal retry first, then phase 4's one flush (spec 5.2).
+///
+/// `send` is a callback so phase 4 runs only after the response is sent.
+/// Returns phase 4's outcome, or `None` when finalize could not run.
+fn finalize_send_and_flush(
+    input: PostRouteInput<'_>,
+    mut response: HttpResponse,
+    send: &mut dyn FnMut(HttpResponse),
+) -> Option<FlushOutcome> {
+    let PostRouteInput {
+        runtime,
+        settings,
+        ec_state,
+        graph,
+        rate_limiter,
+    } = input;
+    let partner_registry = match PartnerRegistry::from_config(&settings.ec.partners) {
+        Ok(registry) => registry,
+        Err(e) => {
+            log::error!("EdgeZero EC finalize skipped: failed to build partner registry: {e:?}");
+            send(response);
+            return None;
+        }
+    };
+    let mut built: Option<Option<KvIdentityGraph>> = None;
+    let mut graph_once = || built.get_or_insert_with(graph).clone();
+
     let finalize_kv_graph = if ec_state.use_finalize_kv {
-        maybe_identity_graph(settings)
+        graph_once()
     } else {
         None
     };
@@ -617,92 +652,33 @@ fn apply_edgezero_ec_finalize(
         &partner_registry,
         ec_state.eids_cookie.as_deref(),
         ec_state.sharedid_cookie.as_deref(),
-        response,
+        &mut response,
     );
-    Ok(partner_registry)
-}
+    let status = response.status();
+    send(response);
 
-/// Runs the work that follows the response: the withdrawal retry, then pull sync.
-fn run_edgezero_after_send(
-    settings: &Settings,
-    partner_registry: &PartnerRegistry,
-    ec_state: &mut EcFinalizeState,
-) {
-    run_after_send_in_order(
-        ec_state,
-        |state| state.ec_context.has_failed_withdrawals(),
-        |state| match require_identity_graph(settings) {
-            Ok(graph) => retry_failed_withdrawals(&mut state.ec_context, &graph),
-            Err(err) => {
-                log::warn!(
-                    "withdrawal retry skipped: identity graph unavailable: {}",
-                    err.current_context()
-                );
-            }
-        },
-        |state| run_edgezero_pull_sync_after_send(settings, partner_registry, state),
-    );
-}
-
-/// Runs the withdrawal retry, when one is due, before any identity work.
-///
-/// A withdrawal request runs no provider dispatch or mutation flush, so the
-/// order only keeps the retry's log lines ahead of the identity work's.
-fn run_after_send_in_order<S>(
-    state: &mut S,
-    has_failed_withdrawal: impl FnOnce(&S) -> bool,
-    retry_withdrawals: impl FnOnce(&mut S),
-    identity_work: impl FnOnce(&S),
-) {
-    if has_failed_withdrawal(state) {
-        retry_withdrawals(state);
-    }
-    identity_work(state);
-}
-
-fn run_edgezero_pull_sync_after_send(
-    settings: &Settings,
-    partner_registry: &PartnerRegistry,
-    ec_state: &EcFinalizeState,
-) {
-    if !ec_state.is_real_browser {
-        return;
-    }
-
-    let prepared_context = build_pull_sync_context(&ec_state.ec_context, partner_registry);
-    let Some((context, kv)) =
-        prepare_pull_sync_after_send(prepared_context, || require_identity_graph(settings))
-    else {
-        return;
-    };
-
-    let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-    dispatch_pull_sync(
-        settings,
-        &kv,
-        partner_registry,
-        &limiter,
-        &context,
-        &ec_state.services,
-    );
-}
-
-fn prepare_pull_sync_after_send<F>(
-    context: Option<PullSyncContext>,
-    graph_factory: F,
-) -> Option<(PullSyncContext, KvIdentityGraph)>
-where
-    F: FnOnce() -> Result<KvIdentityGraph, Report<TrustedServerError>>,
-{
-    let context = context?;
-    let kv = match graph_factory() {
-        Ok(kv) => kv,
-        Err(err) => {
-            log::debug!("Pull sync: identity graph unavailable, skipping: {err:?}");
-            return None;
+    if ec_state.ec_context.has_failed_withdrawals() {
+        match graph_once() {
+            Some(graph) => retry_failed_withdrawals(&mut ec_state.ec_context, &graph),
+            None => log::warn!("withdrawal retry skipped: identity graph unavailable"),
         }
+    }
+    if !ec_state.is_real_browser || !may_flush(&ec_state.ec_context) {
+        return Some(FlushOutcome::Skipped);
+    }
+    let Some(graph) = graph_once() else {
+        log::debug!("identity flush skipped: identity graph unavailable");
+        return Some(FlushOutcome::Skipped);
     };
-    Some((context, kv))
+    Some(run_after_send(AfterSendInput {
+        runtime,
+        settings,
+        services: &ec_state.services,
+        graph: &graph,
+        context: &mut ec_state.ec_context,
+        status,
+        rate_limiter,
+    }))
 }
 
 /// Sends a finalized `EdgeZero` response to the client.
@@ -890,6 +866,7 @@ pub(crate) fn derive_device_signals(req: &FastlyRequest) -> DeviceSignals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::TrustedServerApp;
     use edgezero_core::body::Body as EdgeBody;
     use edgezero_core::http::HeaderValue;
     use edgezero_core::http::response_builder;
@@ -922,63 +899,199 @@ mod tests {
         .expect("should parse test settings")
     }
 
-    #[test]
-    fn after_send_runs_the_withdrawal_retry_before_identity_work() {
-        let log_cell = std::cell::RefCell::new(Vec::<&str>::new());
-        let mut state = true;
+    const EC_ID: &str = "0000000000000000000000000000000000000000000000000000000000000000.ABC123";
 
-        run_after_send_in_order(
-            &mut state,
-            |failed| *failed,
-            |failed| {
-                log_cell.borrow_mut().push("retry");
-                *failed = false;
+    /// Allows every call.
+    struct AllowAll;
+
+    impl RateLimiter for AllowAll {
+        fn exceeded(&self, _key: &str, _limit: u32) -> Result<bool, Report<TrustedServerError>> {
+            Ok(false)
+        }
+    }
+
+    /// A browser document navigation carrying `cookie`.
+    fn navigation(cookie: Option<&str>) -> HttpRequest {
+        let mut builder = edgezero_core::http::request_builder()
+            .method(edgezero_core::http::Method::GET)
+            .uri("https://test-publisher.com/some-page")
+            .header("sec-fetch-dest", "document");
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        let mut request = builder
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        request.extensions_mut().insert(DeviceSignals::derive(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        ));
+        request
+    }
+
+    /// Routes `request`, then finalizes, sends and flushes it as
+    /// `edgezero_main` does, keeping the sent response.
+    fn drive_request_for_test(
+        state: &Arc<AppState>,
+        request: HttpRequest,
+    ) -> (HttpResponse, Option<FlushOutcome>) {
+        let router = TrustedServerApp::routes_for_state(state);
+        let mut response =
+            futures::executor::block_on(router.oneshot(request)).expect("should route the request");
+        let Some(mut ec_state) = response.extensions_mut().remove::<EcFinalizeState>() else {
+            return (response, None);
+        };
+        let mut sent = None;
+        let graph = || state.identity_graph.clone();
+        let outcome = finalize_send_and_flush(
+            PostRouteInput {
+                runtime: &state.identity,
+                settings: &state.settings,
+                ec_state: &mut ec_state,
+                graph: &graph,
+                rate_limiter: &AllowAll,
             },
-            |failed| {
-                assert!(!failed, "should see the state the retry left");
-                log_cell.borrow_mut().push("identity");
+            response,
+            &mut |response| sent = Some(response),
+        );
+        (sent.expect("should send the response"), outcome)
+    }
+
+    /// A returning visitor's live row, without a cluster size so the flush
+    /// has one change to write.
+    fn seeded_state() -> (
+        Arc<AppState>,
+        Arc<trusted_server_core::ec::identity::test_support::WriteCountingEcKv>,
+    ) {
+        let (graph, store) = KvIdentityGraph::write_counting("drive-store");
+        let consent = trusted_server_core::ec::identity::test_support::allowing_consent();
+        let entry = trusted_server_core::ec::kv_types::KvEntry::new(
+            &consent,
+            None,
+            1_000,
+            "test-publisher.com",
+        );
+        graph.create(EC_ID, &entry).expect("should seed the row");
+        store.reset_counts();
+        let state = crate::app::app_state_with_graph_for_test(test_settings(), graph);
+        (state, store)
+    }
+
+    #[test]
+    fn drive_request_for_test_counts_routing_finalize_and_flush_against_one_store() {
+        let (state, store) = seeded_state();
+
+        let (_, outcome) =
+            drive_request_for_test(&state, navigation(Some(&format!("ts-ec={EC_ID}"))));
+
+        assert_eq!(outcome, Some(FlushOutcome::Written), "should flush once");
+        let writes = store.writes();
+        assert_eq!(writes.lookups, 1, "should read the row once, in phase 1");
+        assert_eq!(
+            writes.if_generation_match, 1,
+            "should write once with a CAS"
+        );
+        assert_eq!(writes.total(), 1, "should make no other write");
+    }
+
+    #[test]
+    fn finalize_send_and_flush_sends_before_it_flushes() {
+        let (state, store) = seeded_state();
+        let router = TrustedServerApp::routes_for_state(&state);
+        let mut response = futures::executor::block_on(
+            router.oneshot(navigation(Some(&format!("ts-ec={EC_ID}")))),
+        )
+        .expect("should route the request");
+        let mut ec_state = response
+            .extensions_mut()
+            .remove::<EcFinalizeState>()
+            .expect("should carry EC state");
+        let writes_at_send = std::cell::Cell::new(None);
+        let graph = || state.identity_graph.clone();
+
+        let outcome = finalize_send_and_flush(
+            PostRouteInput {
+                runtime: &state.identity,
+                settings: &state.settings,
+                ec_state: &mut ec_state,
+                graph: &graph,
+                rate_limiter: &AllowAll,
             },
+            response,
+            &mut |_| writes_at_send.set(Some(store.writes().total())),
         );
 
         assert_eq!(
-            *log_cell.borrow(),
-            ["retry", "identity"],
-            "should retry the withdrawal before identity work"
+            writes_at_send.get(),
+            Some(0),
+            "should send before any write"
         );
+        assert_eq!(outcome, Some(FlushOutcome::Written), "should then flush");
+        assert_eq!(store.writes().total(), 1, "should write once");
     }
 
     #[test]
-    fn after_send_skips_the_retry_without_a_failed_withdrawal() {
-        let retried = std::cell::Cell::new(false);
-        let worked = std::cell::Cell::new(false);
-        let mut state = false;
-
-        run_after_send_in_order(
-            &mut state,
-            |failed| *failed,
-            |_| retried.set(true),
-            |_| worked.set(true),
-        );
-
-        assert!(!retried.get(), "should not retry when nothing failed");
-        assert!(worked.get(), "should still run identity work");
-    }
-
-    #[test]
-    fn pull_sync_noop_states_skip_post_send_graph_factory() {
+    fn after_send_noop_states_skip_post_send_graph_factory() {
+        let (state, _) = seeded_state();
+        let router = TrustedServerApp::routes_for_state(&state);
+        // A named route is never the writer, so phase 4 has nothing to do.
+        let request = edgezero_core::http::request_builder()
+            .method(edgezero_core::http::Method::GET)
+            .uri("https://test-publisher.com/.well-known/trusted-server.json")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let mut response =
+            futures::executor::block_on(router.oneshot(request)).expect("should route");
+        let mut ec_state = response
+            .extensions_mut()
+            .remove::<EcFinalizeState>()
+            .expect("should carry EC state");
+        ec_state.use_finalize_kv = false;
         let calls = std::cell::Cell::new(0);
-        let result = prepare_pull_sync_after_send(None, || {
+        let graph = || {
             calls.set(calls.get() + 1);
-            Err(Report::new(TrustedServerError::KvStore {
-                store_name: "unexpected".to_owned(),
-                message: "graph factory should not run".to_owned(),
-            }))
-        });
-        assert!(
-            result.is_none(),
-            "a skipped pull-sync plan should return none"
+            None
+        };
+
+        let outcome = finalize_send_and_flush(
+            PostRouteInput {
+                runtime: &state.identity,
+                settings: &state.settings,
+                ec_state: &mut ec_state,
+                graph: &graph,
+                rate_limiter: &AllowAll,
+            },
+            response,
+            &mut drop,
         );
-        assert_eq!(calls.get(), 0, "should not invoke the graph factory");
+
+        assert_eq!(outcome, Some(FlushOutcome::Skipped), "should skip phase 4");
+        assert_eq!(calls.get(), 0, "should not build the graph");
+    }
+
+    #[test]
+    fn no_response_sets_or_reads_the_pull_complete_cookie() {
+        let (state, store) = seeded_state();
+        let cookie = format!("ts-ec={EC_ID}; ts-ec-pull-complete=v1.example");
+
+        let (response, _) = drive_request_for_test(&state, navigation(Some(&cookie)));
+
+        assert!(
+            response
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .all(|value| !value.starts_with("ts-ec-pull-complete")),
+            "should set no pull-complete cookie"
+        );
+        assert_eq!(
+            store.writes().lookups,
+            1,
+            "should read the row whatever the old marker cookie says"
+        );
     }
 
     #[test]

@@ -193,6 +193,9 @@ pub(crate) struct AppState {
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
     /// Identity providers, keys and policy, built once per settings load.
     pub(crate) identity: Arc<IdentityRuntime>,
+    /// The identity graph over `ec.ec_store`, built once. `None` when no
+    /// store is configured.
+    pub(crate) identity_graph: Option<KvIdentityGraph>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -243,15 +246,31 @@ pub(crate) fn build_state_from_settings(
 
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
+    let identity_graph = crate::maybe_identity_graph(&settings);
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
         default_kv_store,
+        identity_graph,
         auction_telemetry_sink,
         identity,
     }))
+}
+
+/// Builds application state from `settings` with `graph` as its identity
+/// graph, so routing, finalize and the after-send flush all use one store.
+#[cfg(test)]
+pub(crate) fn app_state_with_graph_for_test(
+    settings: Settings,
+    graph: KvIdentityGraph,
+) -> Arc<AppState> {
+    let state = build_state_from_settings(settings).expect("should build app state from settings");
+    let mut state = Arc::try_unwrap(state)
+        .unwrap_or_else(|_| unreachable!("a freshly built state should have one owner"));
+    state.identity_graph = Some(graph);
+    Arc::new(state)
 }
 
 fn warn_if_certificate_check_disabled(settings: &Settings) {
@@ -330,21 +349,20 @@ fn uses_dynamic_tsjs_fallback(method: &Method, path: &str) -> bool {
 ///
 /// `edgezero_main` pops this from the response after dispatch and runs
 /// [`trusted_server_core::ec::finalize::ec_finalize_response`] plus the
-/// pull-sync hook on the converted fastly response — the same EC response
+/// after-send identity flush on the converted fastly response — the same EC response
 /// lifecycle the legacy path drives through `RouteResult`.
 #[derive(Clone)]
 pub(crate) struct EcFinalizeState {
     pub(crate) ec_context: EcContext,
     /// Whether EC finalization may write to the KV identity graph.
-    /// `KvIdentityGraph` wraps a non-`Sync` `dyn EcKvStore` and cannot ride
-    /// in response extensions, so `edgezero_main` rebuilds the graph from
-    /// settings when this is set.
+    /// `edgezero_main` takes the graph from application state when this is
+    /// set.
     pub(crate) use_finalize_kv: bool,
     pub(crate) eids_cookie: Option<String>,
     pub(crate) sharedid_cookie: Option<String>,
     pub(crate) is_real_browser: bool,
-    /// Per-request services carried to the entry point so the pull-sync
-    /// dispatcher can reuse the same platform HTTP client.
+    /// Per-request services carried to the entry point so the after-send
+    /// providers reuse the same platform HTTP client.
     pub(crate) services: RuntimeServices,
 }
 
@@ -491,7 +509,7 @@ fn build_ec_request_state(
     // Bot gate: suppress KV-backed EC writes for unrecognized clients, except
     // consent withdrawals. Revocations keep the write path so tombstones stay
     // authoritative even for privacy-extension-heavy clients.
-    let kv_graph = crate::maybe_identity_graph(settings);
+    let kv_graph = state.identity_graph.clone();
     let finalize_kv_graph = if setup_error.is_none()
         && (is_real_browser || ec_consent_withdrawn(ec_context.consent()))
     {
@@ -626,7 +644,7 @@ async fn execute_named(
                     // Deliberately do not use an EC request-state graph: that
                     // copy is bot-gated, while operators use curl for this
                     // authenticated diagnostic.
-                    let kv = crate::maybe_identity_graph(&state.settings);
+                    let kv = state.identity_graph.clone();
                     handle_admin_ec_lookup(
                         kv.as_ref(),
                         &registry,
@@ -784,8 +802,7 @@ async fn run_named_route(
 /// graph + partner registry + rate limiter, with a default EC context for
 /// response finalization.
 fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
-    let device_signals = device_signals_for(&req);
-    let is_real_browser = device_signals.looks_like_browser();
+    let is_real_browser = device_signals_for(&req).looks_like_browser();
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
@@ -1348,7 +1365,7 @@ impl TrustedServerApp {
         (Self::routes_for_state(&state), Some(state))
     }
 
-    fn routes_for_state(state: &Arc<AppState>) -> RouterService {
+    pub(crate) fn routes_for_state(state: &Arc<AppState>) -> RouterService {
         let mut router = RouterService::builder()
             .middleware(FinalizeResponseMiddleware::new(
                 Arc::clone(&state.settings),
@@ -1642,6 +1659,7 @@ mod tests {
             registry: Arc::new(registry),
             default_kv_store,
             identity,
+            identity_graph: None,
         });
         TrustedServerApp::routes_for_state(&state)
     }
