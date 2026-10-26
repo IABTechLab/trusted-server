@@ -102,7 +102,10 @@ fn rejects_custom_section_differences_with_bounded_exact_diagnostics() {
     )
     .err()
     .expect("should reject changed custom-section bytes without exclusions");
-    let diagnostic = format!("{error:?}");
+    // The owned mismatch evidence is bounded independently of optional backtraces.
+    let diagnostic = error
+        .downcast_ref::<String>()
+        .expect("should retain bounded mismatch evidence");
     assert!(
         diagnostic.len() < 2048
             && diagnostic.contains("final-byte mismatch")
@@ -282,9 +285,16 @@ fn invalid_observation_diagnostics_do_not_echo_arbitrary_field_names() {
     let error = observation(&serde_json::to_vec(&input).expect("should encode fixture"))
         .err()
         .expect("should reject the unapproved field");
-    let diagnostic = format!("{error:?}");
+    // Caller-enabled backtraces are separate from the fixed sanitized payload.
+    let diagnostic = error
+        .downcast_ref::<&str>()
+        .expect("should retain the fixed diagnostic");
+    assert_eq!(
+        *diagnostic, "ordinary observation fields or types rejected",
+        "should discard the original parser diagnostic"
+    );
     assert!(
-        diagnostic.len() < 2048 && !diagnostic.contains("unexpected_observation_key"),
+        diagnostic.len() < 2048 && !format!("{error:?}").contains("unexpected_observation_key"),
         "should keep diagnostics bounded without echoing untrusted field names"
     );
 }

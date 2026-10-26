@@ -337,10 +337,19 @@ fn malformed_capture_errors_never_echo_untrusted_keys() {
     let bytes = format!("{{\"{key}\":0,\"{key}\":1}}");
     let error = match capture(bytes.as_bytes()) {
         Ok(_) => panic!("should reject duplicate capture keys"),
-        Err(error) => format!("{error:?}"),
+        Err(error) => error,
     };
+    // Caller-enabled backtraces may expand Report's debug rendering. Bound the
+    // owned diagnostic itself and independently reject input in the full rendering.
+    let diagnostic = error
+        .downcast_ref::<&str>()
+        .expect("should retain the fixed diagnostic");
+    assert_eq!(
+        *diagnostic, "ordinary measurement inputs or tool pins are invalid",
+        "should discard the original parser diagnostic"
+    );
     assert!(
-        error.len() < 512 && !error.contains("example-key"),
+        diagnostic.len() < 512 && !format!("{error:?}").contains("example-key"),
         "should retain a bounded fixed diagnostic for malformed captures"
     );
 }
