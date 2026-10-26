@@ -968,10 +968,10 @@ Before `validate_publisher_domain`:
 /// `invalid_rewrite_include_domain`. A non-ASCII (IDN) name is rejected with
 /// `non_ascii_rewrite_include_domain`; write it in punycode (`xn--`) form.
 fn validate_include_domains(patterns: &[String]) -> Result<(), ValidationError> {
-    for pattern in patterns {
+    for (index, pattern) in patterns.iter().enumerate() {
         if !pattern.is_ascii() {
             let mut err = ValidationError::new("non_ascii_rewrite_include_domain");
-            err.add_param("value".into(), pattern);
+            err.add_param("index".into(), &index);
             err.message = Some(
                 "rewrite.include_domains entries must be ASCII; write internationalized domain names in punycode (xn--) form"
                     .into(),
@@ -980,7 +980,7 @@ fn validate_include_domains(patterns: &[String]) -> Result<(), ValidationError> 
         }
         if let Err(reason) = check_include_domain(pattern) {
             let mut err = ValidationError::new("invalid_rewrite_include_domain");
-            err.add_param("value".into(), pattern);
+            err.add_param("index".into(), &index);
             err.add_param("reason".into(), &reason);
             err.message = Some(
                 "rewrite.include_domains entries must be a host name, an optional leading `*.`, a dotted-quad IPv4 address or a bracketed IPv6 address"
@@ -1047,7 +1047,7 @@ fn check_host_round_trip(host: &str) -> Result<(), &'static str> {
 
 The `validator` derive passes `&Vec<String>`, which coerces to `&[String]`, so no `clippy::ptr_arg` allowance is needed.
 
-`validation_error_summary` reports only each error's code, so the code carries the distinction an operator needs. `non_ascii_rewrite_include_domain` says to use punycode, and `invalid_rewrite_include_domain` covers everything else. The `message` and `value`/`reason` params give the detail to anyone reading `ValidationErrors` directly. The checks are exact on purpose. Patterns are compared with `Url::host_str()`, so an entry with a scheme, a port, a path, a non-canonical IPv6 form (including dotted IPv4-mapped forms such as `[::ffff:192.0.2.1]`), an invalid `xn--` label or a non-ASCII name would load fine and then never match. The operator would see a silently empty allowlist instead of an error at `ts config push`.
+`validation_error_summary` reports only each error's code, so the code carries the distinction an operator needs. `non_ascii_rewrite_include_domain` says to use punycode, and `invalid_rewrite_include_domain` covers everything else. The `message` and `index`/`reason` params give the detail, naming the entry by position so a pasted URL's credentials never reach a log to anyone reading `ValidationErrors` directly. The checks are exact on purpose. Patterns are compared with `Url::host_str()`, so an entry with a scheme, a port, a path, a non-canonical IPv6 form (including dotted IPv4-mapped forms such as `[::ffff:192.0.2.1]`), an invalid `xn--` label or a non-ASCII name would load fine and then never match. The operator would see a silently empty allowlist instead of an error at `ts config push`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 

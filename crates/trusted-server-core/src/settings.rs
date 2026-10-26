@@ -730,31 +730,47 @@ impl Rewrite {
     ///
     /// Empty and bare `*` entries in `exclude_domains` are dropped with a
     /// warning: neither can match a host, so dropping them changes no behavior.
+    /// Other entries that no URL host can match are kept and reported by
+    /// position, counted before that drop; see
+    /// [`Self::inert_exclude_domain_warnings`]. `ts config push` stores the
+    /// normalized list, so positions logged at the edge can sit lower than the
+    /// ones `ts config validate` prints when empty or `*` entries came first.
     fn normalize(&mut self) {
-        // An `exclude_domains` entry that can never equal a URL host keeps its
-        // host proxied and receiving `ts-ec`. Rejecting it would stop existing
-        // blobs from loading, so warn once per entry and keep it.
-        let inert_warnings = Self::inert_exclude_domain_warnings(&self.exclude_domains);
-        let before = self.exclude_domains.len();
-        self.exclude_domains = self
-            .exclude_domains
-            .iter()
-            .map(|pattern| pattern.trim().to_ascii_lowercase())
-            .filter(|pattern| !pattern.is_empty() && pattern != "*")
-            .collect();
-        if self.exclude_domains.len() < before {
-            log::warn!(
-                "rewrite.exclude_domains: removed empty or bare \"*\" entries, which never match a host"
-            );
-        }
+        let (exclude_domains, warnings) = Self::normalized_exclude_domains(&self.exclude_domains);
+        self.exclude_domains = exclude_domains;
         self.include_domains = self
             .include_domains
             .iter()
             .map(|pattern| pattern.trim().to_ascii_lowercase())
             .collect();
-        for warning in &inert_warnings {
+        for warning in &warnings {
             log::warn!("{warning}");
         }
+    }
+
+    /// Returns the trimmed, lowercased `exclude_domains` entries without empty
+    /// and bare `*` entries, plus the warnings [`Self::normalize`] logs.
+    ///
+    /// Inert-entry warnings are built from `patterns` before the drop, so
+    /// their positions match the configured list.
+    fn normalized_exclude_domains(patterns: &[String]) -> (Vec<String>, Vec<String>) {
+        // An `exclude_domains` entry that can never equal a URL host keeps its
+        // host proxied and receiving `ts-ec`. Rejecting it would stop existing
+        // blobs from loading, so warn once per entry and keep it.
+        let mut warnings = Self::inert_exclude_domain_warnings(patterns);
+        let normalized: Vec<String> = patterns
+            .iter()
+            .map(|pattern| pattern.trim().to_ascii_lowercase())
+            .filter(|pattern| !pattern.is_empty() && pattern != "*")
+            .collect();
+        if normalized.len() < patterns.len() {
+            warnings.insert(
+                0,
+                "rewrite.exclude_domains: removed empty or bare \"*\" entries, which never match a host"
+                    .to_owned(),
+            );
+        }
+        (normalized, warnings)
     }
 
     /// Returns one warning per `exclude_domains` entry that never matches a URL
@@ -3632,14 +3648,18 @@ impl Settings {
 /// IP address or unbracketed IPv6 address is rejected with
 /// `invalid_rewrite_include_domain`. A non-ASCII (IDN) name is rejected with
 /// `non_ascii_rewrite_include_domain`; write it in punycode (`xn--`) form.
+///
+/// Errors name the entry by its index, never its raw value, which may be a
+/// pasted URL carrying credentials. [`Rewrite::normalize`] drops no
+/// `include_domains` entries, so the index matches the operator's TOML.
 fn validate_include_domains(patterns: &[String]) -> Result<(), ValidationError> {
-    for pattern in patterns {
+    for (index, pattern) in patterns.iter().enumerate() {
         if !pattern.is_ascii() {
             let mut err = ValidationError::new("non_ascii_rewrite_include_domain");
-            err.add_param("value".into(), pattern);
+            err.add_param("index".into(), &index);
             err.message = Some(
                 format!(
-                    "rewrite.include_domains entry `{pattern}` is not ASCII; write internationalized domain names in punycode (xn--) form"
+                    "rewrite.include_domains[{index}] is not ASCII; write internationalized domain names in punycode (xn--) form"
                 )
                 .into(),
             );
@@ -3647,11 +3667,11 @@ fn validate_include_domains(patterns: &[String]) -> Result<(), ValidationError> 
         }
         if let Err(reason) = check_include_domain(pattern) {
             let mut err = ValidationError::new("invalid_rewrite_include_domain");
-            err.add_param("value".into(), pattern);
+            err.add_param("index".into(), &index);
             err.add_param("reason".into(), &reason);
             err.message = Some(
                 format!(
-                    "rewrite.include_domains entry `{pattern}` must be a host name with an optional leading `*.`, a dotted-quad IPv4 address or a bracketed IPv6 address ({reason})"
+                    "rewrite.include_domains[{index}] must be a host name with an optional leading `*.`, a dotted-quad IPv4 address or a bracketed IPv6 address ({reason})"
                 )
                 .into(),
             );
@@ -7177,17 +7197,24 @@ source_domain = "partner.example.com"
             malformed.clone(),
         ];
 
-        let warnings = Rewrite::inert_exclude_domain_warnings(&configured);
+        let (normalized, warnings) = Rewrite::normalized_exclude_domains(&configured);
         let settings = Settings::from_toml(&toml_str)
             .expect("should load a malformed exclude_domains entry with a warning");
 
         assert_eq!(
             warnings,
             vec![
+                "rewrite.exclude_domains: removed empty or bare \"*\" entries, which never match a host"
+                    .to_owned(),
                 "rewrite.exclude_domains[2] never matches a URL host (not a valid URL host); the entry is kept"
-                    .to_owned()
+                    .to_owned(),
             ],
-            "should name the malformed entry by its configured index and a static reason"
+            "should name the malformed entry by its index counted before the empty entry is dropped"
+        );
+        assert_eq!(
+            normalized,
+            vec!["cdn.example.com".to_owned(), malformed.to_ascii_lowercase()],
+            "should drop the empty entry and keep the malformed one"
         );
         assert!(
             warnings
@@ -7233,14 +7260,41 @@ source_domain = "partner.example.com"
 
     #[test]
     fn rewrite_include_domains_report_the_bad_entry_and_reason() {
-        let err = validate_include_domains(&["cdn.example.com:443".to_owned()])
-            .expect_err("should reject an entry with a port");
+        let err = validate_include_domains(&[
+            "assets.example.com".to_owned(),
+            "https://example-user:example-secret@cdn.example.com/path".to_owned(),
+        ])
+        .expect_err("should reject an entry with a scheme and credentials");
 
+        let params = format!("{:?}", err.params);
         let message = err.message.expect("should set a message").into_owned();
         assert!(
-            message.contains("entry `cdn.example.com:443`")
-                && message.contains("character outside"),
-            "should name the bad entry and the reason: {message}"
+            message.contains("rewrite.include_domains[1]") && message.contains("character outside"),
+            "should name the bad entry by index and give the reason: {message}"
+        );
+        assert!(
+            !message.contains("example-secret") && !params.contains("example-secret"),
+            "should keep the raw value out of the message and params: {message} {params}"
+        );
+    }
+
+    #[test]
+    fn rewrite_include_domains_report_non_ascii_entries_by_index() {
+        let err = validate_include_domains(&[
+            "assets.example.com".to_owned(),
+            "bücher.example".to_owned(),
+        ])
+        .expect_err("should reject a non-ASCII entry");
+
+        let params = format!("{:?}", err.params);
+        let message = err.message.expect("should set a message").into_owned();
+        assert!(
+            message.contains("rewrite.include_domains[1] is not ASCII"),
+            "should name the non-ASCII entry by index: {message}"
+        );
+        assert!(
+            !message.contains("bücher") && !params.contains("bücher"),
+            "should keep the raw value out of the message and params: {message} {params}"
         );
     }
 
