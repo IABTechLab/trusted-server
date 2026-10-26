@@ -582,3 +582,11 @@ The JS build-script port preserves ordinary fresh npm/private-output builds. Onl
 The mapped new source files, staged JS preparation, residual prose and formatting hunks are ported. Shared manifests, command/workflow support and changelog remain staged for the approved Gate 1 integration; the ordinary runtime recorder, authenticated archive acquisition, atomic companion writer, signing/publication wiring and rehearsal are not complete. `c8ea09d6b` adds canonical source/lock/private-JS identities; it enables no command. Local checks now include 238 audited pure producer cases and 19 audited pure JS cases. The 39-test native JS fixture harness compiles and lists its tests; its subprocess cases remain CI-only.
 
 The release scripts pass shellcheck. The Cloudflare script retains exactly its four baseline SC1090/SC1091/SC2164 findings; its port changes only the locked-install explanation and equivalent flag order. No new warning is claimed resolved.
+
+### Ordinary adapter progress at `4ede699b4`
+
+The separately reviewed Gate 1 group now includes the source-pinned runtime recorder, fresh atomic observation/companion writers, explicit ordinary measurement/download-plan/comparison commands, and bounded authenticated archive acquisition. Comparison binds the direct upload outputs to service records and complete archive bytes, checks the recipe/lock identities and tool versions against its independent checkout, and writes only a real matched, unqualified result. The transport preserves raw service JSON, obtains the Rust binding before downloading any ZIP, and never forwards the API token to the signed blob URL or the planner process.
+
+Local checks pass for 258 audited pure producer cases with CI's backtrace setting and eight mocked transport cases. The native command process fixtures compile locally and remain CI-only. The current CI correction bounds owned diagnostic payloads separately from caller-enabled backtraces; production error handling is unchanged.
+
+Actual A/B build capture, workflow dependencies, the additive provenance subject, publication membership and the fork rehearsal remain pending. No release gate is activated by these unwired commands/helpers, no qualified selector is inhabited, and no Phase 2 rehearsal is claimed.
