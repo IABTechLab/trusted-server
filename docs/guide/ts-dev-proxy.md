@@ -287,12 +287,26 @@ certificate is imported until the subject check succeeds.
 ## Host header behavior
 
 The proxy always sends `X-Forwarded-Host: <FROM>` (the production hostname) — the
-standard "original host" header for a forward proxy. Trusted Server core anchors
-all HTML/URL rewriting to it (it prefers `X-Forwarded-Host`, then `Host`), so
+standard "original host" header for a forward proxy. Trusted Server core selects
+its effective host from `Forwarded`'s `host=` parameter, then `X-Forwarded-Host`,
+then nonempty `Host`, then URI authority (excluding userinfo). Without a
+higher-priority `Forwarded` host,
 **first-party URLs stay on the production domain regardless of the `Host` header —
 as long as the upstream preserves `X-Forwarded-Host`**. That decouples routing
-(`Host`) from the first-party host. (Real Trusted Server adapters strip inbound
-`X-Forwarded-Host`; the caveat below covers what that means with `--rewrite-host`.)
+(`Host`) from the first-party host. (Fastly and Spin strip inbound forwarded
+headers; the caveat below covers what that means with `--rewrite-host`.)
+
+The selected host is syntax-validated before publisher processing, including
+requests for assets that never reach a script rewriter. A malformed selected host
+or explicitly empty forwarded host returns **400**, without falling back to a
+lower-priority source or reflecting the rejected value. An empty `Host` instead
+uses URI authority, and that fallback host is also validated. A non-text host
+header, including a non-text `Forwarded` value, is also rejected. Requests with no
+host metadata retain
+the existing empty-host behavior. Valid ports, bracketed IPv6, local hostnames,
+and ASCII underscores in host labels are retained. This validation does not
+establish whether a forwarded header came from a trusted proxy; configure that
+trust boundary in the adapter/deployment.
 
 By default `Host: <FROM>` too. Fastly routes by SNI (`= TO`) and passes `Host`
 through unchanged, so `Host: <FROM>` reaches the upstream — but the upstream still
