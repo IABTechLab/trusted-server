@@ -204,7 +204,7 @@ pub fn pid(id: &str) -> IdentityProviderId {
 
 /// A one-UID record with a fresh `rv`, written by `writer` at `at`.
 #[must_use]
-pub(crate) fn record_for_test(uid: &str, writer: Option<&str>, at: u64) -> KvPartnerId {
+pub fn record_for_test(uid: &str, writer: Option<&str>, at: u64) -> KvPartnerId {
     KvPartnerId {
         w: writer.map(str::to_owned),
         rv: Some(new_revision(&SeededRandom::new(at)).as_str().to_owned()),

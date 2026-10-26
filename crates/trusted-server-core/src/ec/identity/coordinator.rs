@@ -634,13 +634,13 @@ fn resolved_changes(
     let now = context.now.as_secs();
     let stateful = keeps_private_state(descriptor);
 
-    let kept = drop_unclaimed(id, resolution.eids(), context.catalog);
+    let (kept, dropped_unclaimed) = drop_unclaimed(id, resolution.eids(), context.catalog);
     let mut sets = entry_sets(&kept, context.now);
     log_entry_sets(id, &sets);
     let discarded = discarded_sets(descriptor, &mut sets, view);
     let malformed = resolution.state_rejected()
         || reject_positive_part(stateful, &discarded)
-        || all_sets_discarded(&sets, &discarded);
+        || all_sets_discarded(&sets, &discarded, dropped_unclaimed);
     if malformed {
         log::warn!("Identity provider '{id}' returned a result the coordinator rejects");
     }
@@ -718,17 +718,21 @@ fn resolved_changes(
 }
 
 /// Step 1: drops the entries of sources the provider does not claim after
-/// narrowing. Logs each source with the provider ID only.
+/// narrowing. Logs each source with the provider ID only. Also reports
+/// whether it dropped anything, which step 5 needs.
 fn drop_unclaimed(
     provider: &IdentityProviderId,
     eids: &[ResolvedEid],
     catalog: &ProviderCatalog,
-) -> Vec<ResolvedEid> {
+) -> (Vec<ResolvedEid>, bool) {
     let claimed = catalog.sources_of(provider);
-    eids.iter()
+    let mut dropped = false;
+    let kept = eids
+        .iter()
         .filter(|eid| {
             let keep = claimed.contains(eid.source());
             if !keep {
+                dropped = true;
                 log::debug!(
                     "Dropping an entry of identity provider '{provider}' for unclaimed source '{}'",
                     eid.source()
@@ -737,7 +741,8 @@ fn drop_unclaimed(
             keep
         })
         .cloned()
-        .collect()
+        .collect();
+    (kept, dropped)
 }
 
 /// Step 2: logs each dropped part and oversized source, never a value.
@@ -793,9 +798,15 @@ fn reject_positive_part(stateful: bool, discarded: &BTreeSet<SourceDomain>) -> b
     stateful && !discarded.is_empty()
 }
 
-/// Step 5: whether the result named a source and every set is discarded.
-fn all_sets_discarded(sets: &EntrySets, discarded: &BTreeSet<SourceDomain>) -> bool {
+/// Step 5: whether the result named a source and every set is discarded,
+/// including by dropping entries of unclaimed sources (spec 4.5).
+fn all_sets_discarded(
+    sets: &EntrySets,
+    discarded: &BTreeSet<SourceDomain>,
+    dropped_unclaimed: bool,
+) -> bool {
     sets.all_discarded()
+        || (sets.sets.is_empty() && dropped_unclaimed)
         || (!sets.sets.is_empty() && sets.sets.keys().all(|source| discarded.contains(source)))
 }
 
@@ -2568,7 +2579,7 @@ mod tests {
     }
 
     #[test]
-    fn found_naming_only_unclaimed_sources_stores_nothing_and_resets_failures() {
+    fn found_naming_only_unclaimed_sources_is_malformed() {
         let provider = fixed_provider("p", &["a.example.com"]);
         let c = source("c.example.com");
         let mut view = EligibilityView::empty();
@@ -2586,7 +2597,35 @@ mod tests {
         );
 
         assert!(changes.changes.is_empty(), "should store nothing");
-        assert_eq!(changes.state.f, Some(0), "should still reset f on found");
+        assert_eq!(changes.state.f, Some(4), "should count a failure");
+        assert_eq!(
+            changes.state.n,
+            Some(1_000 + 28_800),
+            "should back off min(1 h x 2^3, 24 h)"
+        );
+    }
+
+    #[test]
+    fn one_claimed_and_one_unclaimed_source_still_resets_failures() {
+        let provider = fixed_provider("p", &["a.example.com"]);
+        let a = source("a.example.com");
+        let c = source("c.example.com");
+        let mut view = EligibilityView::empty();
+        view.set_failures_for_test("p", 3);
+        let fixture = OutcomeFixture::new();
+
+        let changes = outcome_to_changes(
+            provider.as_ref(),
+            CallOutcome::Resolved(Resolution::found([
+                ResolvedEid::new(&a, ResolvedUid::new("example-a")),
+                ResolvedEid::new(&c, ResolvedUid::new("example-c")),
+            ])),
+            &view,
+            &fixture.context_at(1_000),
+        );
+
+        assert_eq!(changes.changes.len(), 1, "should store the claimed source");
+        assert_eq!(changes.state.f, Some(0), "should reset f on found");
     }
 
     #[test]
