@@ -8,11 +8,15 @@
     )
 )]
 
+use std::sync::Arc;
+
 use serde_json::json;
 
 use crate::consent::ConsentContext;
 use crate::consent::jurisdiction::Jurisdiction;
 use crate::consent::types::TcfConsent;
+use crate::ec::identity::descriptor::{Captures, ConsentPolicy, ProviderDescriptor, Resolves};
+use crate::ec::identity::provider::IdentityProvider;
 use crate::ec::kv_types::{KvEid, KvPartnerId, KvUid};
 
 /// A request with no consent signal and no regulated jurisdiction.
@@ -92,5 +96,52 @@ pub fn full_record(writer: Option<&str>, set: Vec<KvEid>) -> KvPartnerId {
         w: writer.map(str::to_owned),
         eids: set,
         ..KvPartnerId::default()
+    }
+}
+
+/// A descriptor-only resolver for `id`, declaring `sources`, with a dummy
+/// endpoint and the `eid_persistence_only` policy.
+///
+/// # Panics
+///
+/// Panics when `id` or a source is not valid.
+#[must_use]
+pub fn fixed_provider(id: &str, sources: &[&str]) -> Arc<dyn IdentityProvider> {
+    let mut builder =
+        ProviderDescriptor::builder(id.parse().expect("should parse the provider ID"))
+            .with_resolves(Resolves::new().with_endpoint("https://api.example.com"))
+            .with_consent_policy(ConsentPolicy::eid_persistence_only());
+    for source in sources {
+        builder = builder.with_source(source.parse().expect("should parse the source"));
+    }
+    Arc::new(DescriptorOnly(
+        builder.build().expect("should build the descriptor"),
+    ))
+}
+
+/// A descriptor-only capture-only provider for `id`, declaring `sources`.
+///
+/// # Panics
+///
+/// Panics when `id` or a source is not valid.
+#[must_use]
+pub fn fixed_capture_provider(id: &str, sources: &[&str]) -> Arc<dyn IdentityProvider> {
+    let mut builder =
+        ProviderDescriptor::builder(id.parse().expect("should parse the provider ID"))
+            .with_captures(Captures::new().with_path_prefix(&format!("/integrations/{id}/")))
+            .with_consent_policy(ConsentPolicy::eid_persistence_only());
+    for source in sources {
+        builder = builder.with_source(source.parse().expect("should parse the source"));
+    }
+    Arc::new(DescriptorOnly(
+        builder.build().expect("should build the descriptor"),
+    ))
+}
+
+struct DescriptorOnly(ProviderDescriptor);
+
+impl IdentityProvider for DescriptorOnly {
+    fn descriptor(&self) -> &ProviderDescriptor {
+        &self.0
     }
 }

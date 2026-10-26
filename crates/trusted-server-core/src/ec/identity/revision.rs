@@ -48,23 +48,17 @@ fn hex16(digest: &[u8]) -> String {
 
 /// A record's stored revision: 16 lowercase hex digits.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-// Temporary: first used by a later identity task.
-#[allow(dead_code)]
 pub(crate) struct RecordRevision(String);
 
 impl RecordRevision {
     /// Wraps a stored `rv`. `KvEntry::validate` has checked the format.
     #[must_use]
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn from_stored(value: &str) -> Self {
         Self(value.to_owned())
     }
 
     /// The hex digits.
     #[must_use]
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
@@ -73,8 +67,6 @@ impl RecordRevision {
 /// A record's revision (spec 5.4). `Unset` for a record without `rv`, which
 /// only a schema version 1 row holds, until its next write gives it one.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-// Temporary: first used by a later identity task.
-#[allow(dead_code)]
 pub(crate) enum Revision {
     /// The record has no `rv`.
     Unset,
@@ -84,8 +76,6 @@ pub(crate) enum Revision {
 
 /// A fresh random revision, drawn on every write of a record.
 #[must_use]
-// Temporary: first used by a later identity task.
-#[allow(dead_code)]
 pub(crate) fn new_revision(random: &dyn RandomSource) -> RecordRevision {
     let mut bytes = [0u8; RECORD_REVISION_HEX_LEN / 2];
     random.fill(&mut bytes);
@@ -95,8 +85,6 @@ pub(crate) fn new_revision(random: &dyn RandomSource) -> RecordRevision {
 /// The revision of a stored record. One revision covers the source's whole
 /// entry set.
 #[must_use]
-// Temporary: first used by a later identity task.
-#[allow(dead_code)]
 pub(crate) fn record_revision(record: &KvPartnerId) -> Revision {
     record.rv.as_deref().map_or(Revision::Unset, |rv| {
         Revision::Set(RecordRevision::from_stored(rv))
@@ -106,8 +94,6 @@ pub(crate) fn record_revision(record: &KvPartnerId) -> Revision {
 /// The hash of a provider's `ps.st` a call read, so a later apply can tell
 /// whether another writer changed it since.
 #[derive(Debug, Clone, PartialEq, Eq)]
-// Temporary: first used by a later identity task.
-#[allow(dead_code)]
 pub(crate) struct StateRevision(String);
 
 impl StateRevision {
@@ -115,8 +101,6 @@ impl StateRevision {
     /// the empty string when there is none. Compact JSON is never empty, so
     /// absent and present state never share a revision.
     #[must_use]
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn of(st: Option<&serde_json::Value>) -> Self {
         let bytes = st
             .and_then(|value| serde_json::to_vec(value).ok())
@@ -128,16 +112,12 @@ impl StateRevision {
 /// The hash stored in `ps.iv` or `ps.ov` for a removed UID: the first 16 hex
 /// digits of its unkeyed SHA-256 (spec 6.1).
 #[must_use]
-// Temporary: first used by a later identity task.
-#[allow(dead_code)]
 pub(crate) fn uid_hash(uid: &str) -> String {
     hex16(&Sha256::digest(uid.as_bytes()))
 }
 
 /// One hash per UID of a removed set, in set order, without duplicates.
 #[must_use]
-// Temporary: first used by a later identity task.
-#[allow(dead_code)]
 pub(crate) fn set_hashes(set: &[KvEid]) -> Vec<String> {
     let mut hashes = Vec::new();
     for uid in set.iter().flat_map(|entry| &entry.uids) {
@@ -151,8 +131,6 @@ pub(crate) fn set_hashes(set: &[KvEid]) -> Vec<String> {
 
 /// Appends hashes to a `ps.iv` or `ps.ov` list, oldest first. A hash
 /// already present moves to the end. The caller truncates.
-// Temporary: first used by a later identity task.
-#[allow(dead_code)]
 pub(crate) fn push_hashes(list: &mut Vec<String>, hashes: Vec<String>) {
     for hash in hashes {
         list.retain(|existing| *existing != hash);
