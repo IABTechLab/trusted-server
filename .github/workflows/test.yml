@@ -20,12 +20,12 @@ jobs:
         id: viceroy-version
         # `.tool-versions` is the single source of truth so this workflow and
         # `.github/actions/setup-integration-test-env/action.yml` can't drift.
-        run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Retrieve Node.js version
         id: node-version
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust toolchain
@@ -103,6 +103,9 @@ jobs:
 
       - name: Run host-target CLI tests
         run: ./scripts/test-cli.sh
+
+      - name: Run release producer primitive and process tests
+        run: cargo test --package trusted-server-release --target x86_64-unknown-linux-gnu --locked
 
       # The codegen crate is not a default member and no adapter alias builds it,
       # so its tests only run if invoked explicitly on the host target.
@@ -268,7 +271,7 @@ jobs:
       - name: Retrieve Node.js version
         id: node-version
         working-directory: .
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Use Node.js

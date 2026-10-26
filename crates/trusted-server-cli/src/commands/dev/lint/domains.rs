@@ -106,6 +106,10 @@ pub const REFERENCE_HOSTS: &[&str] = &[
     // Web / W3C standards
     "www.w3.org",
     "schema.org",
+    // Canonical JSON Schema draft identifiers in the carried release schemas.
+    "json-schema.org",
+    // Canonical SPDX schema identity and license identifiers in the carried schema.
+    "spdx.org",
     // Versioning / changelogs
     "semver.org",
     "keepachangelog.com",
@@ -361,6 +365,27 @@ mod allow_check_tests {
             assert!(
                 !is_allowed(host, &nothing_suppressed()),
                 "should reject Actions host subdomains and lookalikes"
+            );
+        }
+    }
+
+    #[test]
+    fn release_schema_reference_hosts_are_exact() {
+        for host in ["json-schema.org", "spdx.org"] {
+            assert!(
+                is_allowed(host, &nothing_suppressed()),
+                "should allow the approved canonical schema reference host"
+            );
+        }
+        for host in [
+            "unapproved.json-schema.org",
+            "json-schema.org.invalid-host.com",
+            "unapproved.spdx.org",
+            "spdx.org.invalid-host.com",
+        ] {
+            assert!(
+                !is_allowed(host, &nothing_suppressed()),
+                "should reject schema host subdomains and lookalikes"
             );
         }
     }

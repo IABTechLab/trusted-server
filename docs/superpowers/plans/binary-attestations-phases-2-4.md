@@ -90,6 +90,8 @@ The local unpublished GNU masking commit `b91c7450a4f617d5ec879f612b295a532c7d7e
 
 ## Execution checkpoints
 
+Gate 1's [ordinary-release design](binary-attestations-phase2-fastly-integration.md) was approved on 2026-10-26, subject to an independently reviewed implementation plan. Merging Phase 2 activates the gate on the next real tag: one additional Fastly build plus comparison, and no release on mismatch. A real mismatch is reported with bounded diagnostics; exclusions or weaker comparison are not authorized.
+
 - [x] Re-read source/map, independently investigate capture dependencies and carried build facts.
 - [x] Assemble Phase 2 and Phase 3 scratch trees; run host check and strict clippy; correct prerequisite ownership.
 - [x] Commit this assignment and [tracking-issue draft](binary-attestations-phases-2-4-tracking-issue.md) on Phase 2 (`26d69ce95`).
@@ -106,6 +108,18 @@ The first implementation unit ports `crates/trusted-server-cli/src/prebid_bundle
 Verification selects each of the three new tests by its exact full name, requires exactly one listed test and one passing/non-ignored result, and requires a total of three executed tests. The default configuration passes; the release-build configuration also passes. CLI target-matched clippy, workspace Rust formatting, domain lint and independent review pass. CLI documentation generation completes with existing warnings. No process-spawning or ignored tests are selected. The larger producer port and seven-artifact adaptations remain pending; these initial checks do not establish phase-wide CI or release readiness.
 
 ## Full path ledger
+
+### Producer foundation chunk
+
+This unit carries strict documents, Git object verification and process supervision: 18 original source/schema/license files remain byte-for-byte equal to the frozen source. Manifest dependencies, error variants and the binary entrypoint are staged for this subset. The entrypoint always fails with the original closed-execution diagnostic; no release command, policy/qualified selector or live process caller is exposed. Workspace membership is added and the source Rust floor is adapted to 1.98.
+
+Local all-target check and strict clippy pass. Exact-name selection executes 49 audited pure document/Git-object/environment tests with a nonzero count guard; process-spawning tests remain CI-only. Existing test/format jobs gain Linux producer tests and clippy without new triggers or permissions. Six existing workflow output-file redirections are quoted so actionlint and its shellcheck pass. These shared CI hunks land now; later candidate validation wiring remains Phase 3.
+
+The reviewed JSON Schema dependency requires three shared lock upgrades: `num-bigint` 0.4.6 → 0.4.8 (`fraction` requires ^0.4.8), `regex-automata` 0.4.14 → 0.4.18 (`fancy-regex` requires ^0.4.16), and `zmij` 1.0.21 → 1.0.23 (`jsonschema-value` requires ^1.0.23). Attempts to retain old versions failed those constraints. Hosted adapter/CLI tests must cover the shared-lock impact. No dependency version constraint is loosened.
+
+The user approved exact `json-schema.org` and `spdx.org` reference-host entries to preserve carried schemas unchanged. Justification comments and pure allow/subdomain/lookalike rejection coverage accompany them; list both entries for maintainer allowlist review in the PR. This prerequisite hunk lands in Phase 2; later consumer-related hunks of the shared domain file remain Phase 4.
+
+### Ledger
 
 The landing phase below is exclusive file ownership. Shared files receive later integration hunks as listed above. Phase 1 rows are retained, not re-ported. Landing PRs for phases 2–4 are not created yet; their exact branch/base and intended titles are recorded above.
 

@@ -1,0 +1,23 @@
+[package]
+name = "trusted-server-release"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+rust-version = "1.98"
+
+[dependencies]
+derive_more.workspace = true
+error-stack.workspace = true
+flate2.workspace = true
+hex.workspace = true
+libc.workspace = true
+jsonschema = { version = "=0.58.6", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+sha1-checked = { version = "=0.10.0", default-features = false }
+sha2.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
