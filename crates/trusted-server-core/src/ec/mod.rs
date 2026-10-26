@@ -286,6 +286,9 @@ pub struct EcContext {
     eid_sync_source: Option<EidSyncSource>,
     /// Identity state this request decides and collects.
     identity: RequestIdentity,
+    /// Withdrawn EC IDs whose before-send tombstone returned
+    /// [`EcKvSnapshot::Failed`], for the after-send retry.
+    failed_withdrawals: Vec<String>,
 }
 
 impl EcContext {
@@ -368,6 +371,7 @@ impl EcContext {
             pull_sync_marker: PullSyncMarkerState::from_cookie(parsed.pull_sync_marker),
             eid_sync_source: None,
             identity: RequestIdentity::default(),
+            failed_withdrawals: Vec::new(),
         })
     }
 
@@ -616,6 +620,22 @@ impl EcContext {
         &self.kv_snapshot
     }
 
+    /// Returns the withdrawn EC IDs whose before-send tombstone failed.
+    ///
+    /// The after-send retry reads these, and the failure counters read them
+    /// after the retry, so the retry does not clear them.
+    #[must_use]
+    pub fn failed_withdrawals(&self) -> &[String] {
+        &self.failed_withdrawals
+    }
+
+    /// Records a withdrawn EC ID whose before-send tombstone failed.
+    pub(crate) fn record_failed_withdrawal(&mut self, ec_id: &str) {
+        if !self.failed_withdrawals.iter().any(|id| id == ec_id) {
+            self.failed_withdrawals.push(ec_id.to_owned());
+        }
+    }
+
     /// Replaces the request-scoped identity-graph snapshot.
     pub fn set_kv_snapshot(&mut self, snapshot: EcKvSnapshot) {
         self.kv_snapshot = snapshot;
@@ -732,6 +752,7 @@ impl EcContext {
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
             identity: RequestIdentity::default(),
+            failed_withdrawals: Vec::new(),
         }
     }
 
@@ -757,6 +778,7 @@ impl EcContext {
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
             identity: RequestIdentity::default(),
+            failed_withdrawals: Vec::new(),
         }
     }
 
@@ -785,6 +807,7 @@ impl EcContext {
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
             identity: RequestIdentity::default(),
+            failed_withdrawals: Vec::new(),
         }
     }
 }

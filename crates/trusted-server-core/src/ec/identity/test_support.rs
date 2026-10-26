@@ -10,8 +10,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use error_stack::Report;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -396,6 +396,7 @@ pub struct WriteCountingEcKv {
     if_generation_match: AtomicUsize,
     overwrite: AtomicUsize,
     lookups: AtomicUsize,
+    refusals: Mutex<BTreeMap<String, usize>>,
 }
 
 impl WriteCountingEcKv {
@@ -408,7 +409,22 @@ impl WriteCountingEcKv {
             if_generation_match: AtomicUsize::new(0),
             overwrite: AtomicUsize::new(0),
             lookups: AtomicUsize::new(0),
+            refusals: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Refuses the next `count` generation-checked writes to `key` with
+    /// [`EcKvWriteOutcome::PreconditionFailed`], the retryable refusal. A
+    /// refused write is still counted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the refusal table is poisoned.
+    pub fn refuse_conditional_writes(&self, key: &str, count: usize) {
+        self.refusals
+            .lock()
+            .expect("should lock the refusals")
+            .insert(key.to_owned(), count);
     }
 
     /// The counts so far, seeding included.
@@ -460,6 +476,15 @@ impl EcKvStore for WriteCountingEcKv {
             EcKvWriteMode::Overwrite => &self.overwrite,
         };
         count.fetch_add(1, Ordering::SeqCst);
+        if matches!(write.mode, EcKvWriteMode::IfGenerationMatch(_)) {
+            let mut refusals = self.refusals.lock().expect("should lock the refusals");
+            if let Some(remaining) = refusals.get_mut(key)
+                && *remaining > 0
+            {
+                *remaining -= 1;
+                return Ok(EcKvWriteOutcome::PreconditionFailed);
+            }
+        }
         self.inner.insert(key, write)
     }
 

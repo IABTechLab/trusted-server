@@ -14,7 +14,7 @@ use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
 use trusted_server_core::constants::HEADER_X_TS_VERSION;
 use trusted_server_core::ec::device::DeviceSignals;
-use trusted_server_core::ec::finalize::ec_finalize_response;
+use trusted_server_core::ec::finalize::{ec_finalize_response, retry_failed_withdrawals};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::pull_sync::{
     PullSyncContext, build_pull_sync_context, dispatch_pull_sync,
@@ -514,7 +514,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
                         request_filter_effects.as_ref(),
                         counters.as_ref(),
                     );
-                    run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
+                    run_edgezero_after_send(settings, &partner_registry, &mut ec_state);
                     return;
                 }
                 Err(e) => {
@@ -544,11 +544,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
                                 request_filter_effects.as_ref(),
                                 counters.as_ref(),
                             );
-                            run_edgezero_pull_sync_after_send(
-                                &settings,
-                                &partner_registry,
-                                &ec_state,
-                            );
+                            run_edgezero_after_send(&settings, &partner_registry, &mut ec_state);
                             return;
                         }
                         Err(e) => {
@@ -624,6 +620,44 @@ fn apply_edgezero_ec_finalize(
         response,
     );
     Ok(partner_registry)
+}
+
+/// Runs the work that follows the response: the withdrawal retry, then pull sync.
+fn run_edgezero_after_send(
+    settings: &Settings,
+    partner_registry: &PartnerRegistry,
+    ec_state: &mut EcFinalizeState,
+) {
+    run_after_send_in_order(
+        ec_state,
+        |state| !state.ec_context.failed_withdrawals().is_empty(),
+        |state| match require_identity_graph(settings) {
+            Ok(graph) => retry_failed_withdrawals(&mut state.ec_context, &graph),
+            Err(err) => {
+                log::warn!(
+                    "withdrawal retry skipped: identity graph unavailable: {}",
+                    err.current_context()
+                );
+            }
+        },
+        |state| run_edgezero_pull_sync_after_send(settings, partner_registry, state),
+    );
+}
+
+/// Runs the withdrawal retry, when one is due, before any identity work.
+///
+/// A withdrawal request runs no provider dispatch or mutation flush, so the
+/// order only keeps the retry's log lines ahead of the identity work's.
+fn run_after_send_in_order<S>(
+    state: &mut S,
+    has_failed_withdrawal: impl FnOnce(&S) -> bool,
+    retry_withdrawals: impl FnOnce(&mut S),
+    identity_work: impl FnOnce(&S),
+) {
+    if has_failed_withdrawal(state) {
+        retry_withdrawals(state);
+    }
+    identity_work(state);
 }
 
 fn run_edgezero_pull_sync_after_send(
@@ -886,6 +920,48 @@ mod tests {
             "#,
         )
         .expect("should parse test settings")
+    }
+
+    #[test]
+    fn after_send_runs_the_withdrawal_retry_before_identity_work() {
+        let log_cell = std::cell::RefCell::new(Vec::<&str>::new());
+        let mut state = true;
+
+        run_after_send_in_order(
+            &mut state,
+            |failed| *failed,
+            |failed| {
+                log_cell.borrow_mut().push("retry");
+                *failed = false;
+            },
+            |failed| {
+                assert!(!failed, "should see the state the retry left");
+                log_cell.borrow_mut().push("identity");
+            },
+        );
+
+        assert_eq!(
+            *log_cell.borrow(),
+            ["retry", "identity"],
+            "should retry the withdrawal before identity work"
+        );
+    }
+
+    #[test]
+    fn after_send_skips_the_retry_without_a_failed_withdrawal() {
+        let retried = std::cell::Cell::new(false);
+        let worked = std::cell::Cell::new(false);
+        let mut state = false;
+
+        run_after_send_in_order(
+            &mut state,
+            |failed| *failed,
+            |_| retried.set(true),
+            |_| worked.set(true),
+        );
+
+        assert!(!retried.get(), "should not retry when nothing failed");
+        assert!(worked.get(), "should still run identity work");
     }
 
     #[test]

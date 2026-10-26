@@ -547,32 +547,63 @@ fn finalize_unusable_consent(
     // for subsequent EC behavior.
     if let Some(graph) = kv {
         apply_withdrawal_tombstones(&ids_to_withdraw, |ec_id| {
-            // The graph hands back the post-withdrawal snapshot rather than
-            // leaving the caller to rebuild it, so post-send work that reads
-            // the context — pull sync discloses the raw EC ID to partners —
-            // sees the tombstone that was just written. Only the active ID has
-            // a snapshot in the context to correct.
-            let initial = if ec_context.kv_snapshot().belongs_to(ec_id) {
-                ec_context.kv_snapshot().clone()
-            } else {
-                EcKvSnapshot::NotRead
-            };
-            let outcome = graph.tombstone_existing_from_snapshot(ec_id, initial);
             // The browser cookie is already cleared, so a failed tombstone
             // leaves a live row that server-side consumers still read as
             // consented. Report every failure, including the non-active cookie
             // ID whose outcome is not retained on the request context.
-            if matches!(outcome, EcKvSnapshot::Failed { .. }) {
+            if !tombstone_withdrawn_id(ec_context, graph, ec_id) {
                 log::warn!(
                     "EC withdrawal tombstone failed for '{}': the identity-graph row may \
                      still be live with consent granted",
                     log_id(ec_id)
                 );
-            }
-            if ec_context.ec_value() == Some(ec_id) {
-                ec_context.set_kv_snapshot(outcome);
+                ec_context.record_failed_withdrawal(ec_id);
             }
         });
+    }
+}
+
+/// Runs the tombstone path once for `ec_id` and returns whether it succeeded.
+///
+/// The graph hands back the post-withdrawal snapshot rather than leaving the
+/// caller to rebuild it, so post-send work that reads the context — pull sync
+/// discloses the raw EC ID to partners — sees the tombstone that was just
+/// written. Only the active ID has a snapshot in the context to correct.
+fn tombstone_withdrawn_id(
+    ec_context: &mut EcContext,
+    graph: &KvIdentityGraph,
+    ec_id: &str,
+) -> bool {
+    let initial = if ec_context.kv_snapshot().belongs_to(ec_id) {
+        ec_context.kv_snapshot().clone()
+    } else {
+        EcKvSnapshot::NotRead
+    };
+    let outcome = graph.tombstone_existing_from_snapshot(ec_id, initial);
+    let succeeded = !matches!(outcome, EcKvSnapshot::Failed { .. });
+    if ec_context.ec_value() == Some(ec_id) {
+        ec_context.set_kv_snapshot(outcome);
+    }
+    succeeded
+}
+
+/// Retries each withdrawal tombstone that failed before send, once, after send.
+///
+/// Each failed ID re-reads its row (a [`EcKvSnapshot::NotRead`] start) and runs
+/// the same tombstone path as before send, with its own CAS attempts and
+/// completion marker. This is the last attempt: a second failure is logged and
+/// the ID stays in [`EcContext::failed_withdrawals`] for the failure counters.
+/// An ID that was never recorded as failed is not touched.
+pub fn retry_failed_withdrawals(ec_context: &mut EcContext, graph: &KvIdentityGraph) {
+    let failed = ec_context.failed_withdrawals().to_vec();
+    for ec_id in &failed {
+        if !tombstone_withdrawn_id(ec_context, graph, ec_id) {
+            log::warn!(
+                "EC withdrawal tombstone failed again after send for '{}': the identity-graph \
+                 row may still be live with consent granted",
+                log_id(ec_id)
+            );
+        }
     }
 }
 
@@ -2989,6 +3020,211 @@ mod tests {
                 set_cookie_names(&response),
                 vec!["ts-ec".to_owned()],
                 "should set the ts-ec cookie as today"
+            );
+        }
+    }
+
+    mod after_send_withdrawal_retry {
+        use super::*;
+        use crate::ec::kv::MAX_CAS_RETRIES;
+
+        fn withdrawn_context(active: &str, cookie: &str) -> EcContext {
+            let consent = ConsentContext {
+                jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+                gpc: true,
+                source: ConsentSource::Cookie,
+                ..Default::default()
+            };
+            make_context_with_consent(Some(active), Some(cookie), true, false, consent)
+        }
+
+        fn seed(graph: &KvIdentityGraph, ec_id: &str) {
+            graph
+                .create(ec_id, &KvEntry::minimal("p.example.com", "uid", 1_000))
+                .expect("should seed the row");
+        }
+
+        fn finalize(context: &mut EcContext, graph: &KvIdentityGraph) {
+            let mut response = empty_response();
+            ec_finalize_response(
+                &create_test_settings(),
+                context,
+                Some(graph),
+                &PartnerRegistry::empty(),
+                None,
+                None,
+                &mut response,
+            );
+        }
+
+        fn is_tombstone(graph: &KvIdentityGraph, ec_id: &str) -> bool {
+            graph
+                .get(ec_id)
+                .expect("should read the row")
+                .is_some_and(|(entry, _)| !entry.consent.ok)
+        }
+
+        #[test]
+        fn failed_withdrawal_is_recorded_for_after_send() {
+            let (graph, store) = KvIdentityGraph::write_counting("ec-store");
+            let ec_id = sample_ec_id("fail01");
+            seed(&graph, &ec_id);
+            store.refuse_conditional_writes(&ec_id, usize::MAX);
+            let mut context = withdrawn_context(&ec_id, &ec_id);
+            context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+
+            finalize(&mut context, &graph);
+
+            assert_eq!(
+                context.failed_withdrawals(),
+                std::slice::from_ref(&ec_id),
+                "should record the active ID whose tombstone failed"
+            );
+            assert!(
+                !is_tombstone(&graph, &ec_id),
+                "the row should still be live"
+            );
+        }
+
+        #[test]
+        fn successful_withdrawal_records_nothing() {
+            let (graph, _store) = KvIdentityGraph::write_counting("ec-store");
+            let ec_id = sample_ec_id("good01");
+            seed(&graph, &ec_id);
+            let mut context = withdrawn_context(&ec_id, &ec_id);
+            context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+
+            finalize(&mut context, &graph);
+
+            assert!(
+                context.failed_withdrawals().is_empty(),
+                "should record nothing for a tombstone that was written"
+            );
+            assert!(is_tombstone(&graph, &ec_id), "should tombstone the row");
+        }
+
+        #[test]
+        fn nothing_failed_means_the_retry_touches_nothing() {
+            let (graph, store) = KvIdentityGraph::write_counting("ec-store");
+            let ec_id = sample_ec_id("none01");
+            seed(&graph, &ec_id);
+            store.reset_counts();
+            let mut context = withdrawn_context(&ec_id, &ec_id);
+
+            retry_failed_withdrawals(&mut context, &graph);
+
+            assert_eq!(
+                store.writes().total(),
+                0,
+                "should write nothing of any mode"
+            );
+            assert_eq!(store.writes().lookups, 0, "should read nothing");
+        }
+
+        #[test]
+        fn after_send_retry_writes_the_tombstone_once() {
+            let (graph, store) = KvIdentityGraph::write_counting("ec-store");
+            let ec_id = sample_ec_id("retry1");
+            seed(&graph, &ec_id);
+            store.refuse_conditional_writes(&ec_id, MAX_CAS_RETRIES as usize);
+            let mut context = withdrawn_context(&ec_id, &ec_id);
+            context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+            finalize(&mut context, &graph);
+            assert_eq!(
+                context.failed_withdrawals(),
+                std::slice::from_ref(&ec_id),
+                "should record the failure before send"
+            );
+            store.reset_counts();
+
+            retry_failed_withdrawals(&mut context, &graph);
+
+            assert!(is_tombstone(&graph, &ec_id), "should read as a tombstone");
+            let writes = store.writes();
+            assert_eq!(
+                writes.if_generation_match, 1,
+                "should write the tombstone once"
+            );
+            assert_eq!(writes.add, 1, "should write the completion marker once");
+            assert_eq!(writes.overwrite, 0, "should not overwrite");
+            assert!(
+                context
+                    .kv_snapshot()
+                    .entry_for(&ec_id)
+                    .is_some_and(|entry| !entry.consent.ok),
+                "should update the active snapshot to the tombstone"
+            );
+        }
+
+        #[test]
+        fn after_send_retry_is_the_last_attempt() {
+            let (graph, store) = KvIdentityGraph::write_counting("ec-store");
+            let ec_id = sample_ec_id("last01");
+            seed(&graph, &ec_id);
+            store.refuse_conditional_writes(&ec_id, usize::MAX);
+            let mut context = withdrawn_context(&ec_id, &ec_id);
+            context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+            finalize(&mut context, &graph);
+            store.reset_counts();
+
+            retry_failed_withdrawals(&mut context, &graph);
+
+            let writes = store.writes();
+            assert_eq!(
+                writes.if_generation_match, MAX_CAS_RETRIES as usize,
+                "should make one run of the CAS attempts, never a second retry"
+            );
+            assert_eq!(writes.add, 0, "should write no completion marker");
+            assert_eq!(writes.overwrite, 0, "should not overwrite");
+            assert_eq!(
+                context.failed_withdrawals(),
+                std::slice::from_ref(&ec_id),
+                "should leave the failure recorded for the counters"
+            );
+            assert!(
+                !is_tombstone(&graph, &ec_id),
+                "the row should still be live"
+            );
+        }
+
+        #[test]
+        fn withdrawal_of_two_ids_retries_only_the_failed_one() {
+            let (graph, store) = KvIdentityGraph::write_counting("ec-store");
+            let active = sample_ec_id("activ4");
+            let cookie = sample_ec_id("cook4e");
+            seed(&graph, &active);
+            seed(&graph, &cookie);
+            store.refuse_conditional_writes(&cookie, MAX_CAS_RETRIES as usize);
+            let mut context = withdrawn_context(&active, &cookie);
+            context.set_kv_snapshot(graph.load_snapshot(&active));
+            finalize(&mut context, &graph);
+            assert_eq!(
+                context.failed_withdrawals(),
+                std::slice::from_ref(&cookie),
+                "should record only the cookie ID"
+            );
+            assert!(
+                is_tombstone(&graph, &active),
+                "the active row should be withdrawn"
+            );
+            let active_generation = graph.get(&active).expect("should read").map(|row| row.1);
+            store.reset_counts();
+
+            retry_failed_withdrawals(&mut context, &graph);
+
+            assert!(
+                is_tombstone(&graph, &cookie),
+                "should withdraw the cookie row"
+            );
+            assert_eq!(
+                graph.get(&active).expect("should read").map(|row| row.1),
+                active_generation,
+                "should not rewrite the active row"
+            );
+            assert_eq!(
+                store.writes().if_generation_match,
+                1,
+                "should write one tombstone, for the cookie ID only"
             );
         }
     }
