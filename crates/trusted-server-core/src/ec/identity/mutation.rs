@@ -1,7 +1,7 @@
 //! One request's identity changes as a single mutation, and its merge into
 //! the live KV row (spec 5.4).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::catalog::ProviderCatalog;
 use super::ids::{IdentityProviderId, SourceDomain};
@@ -136,6 +136,8 @@ pub(crate) struct IdentityMutation {
     provider_state: BTreeMap<IdentityProviderId, ProviderStateChange>,
     results: Vec<ProviderResult>,
     cluster_size: Option<u32>,
+    /// Providers whose stand-alone state change comes from a `found` outcome.
+    found_states: BTreeSet<IdentityProviderId>,
 }
 
 impl IdentityMutation {
@@ -181,6 +183,37 @@ impl IdentityMutation {
             .entry(provider)
             .or_default()
             .merge(change);
+    }
+
+    /// Merges the state change of a `found` outcome and tags it, so
+    /// [`retain_for_error_status`](Self::retain_for_error_status) can drop
+    /// its `n` and `f` with the positive answer it belongs to.
+    pub(crate) fn merge_found_state(
+        &mut self,
+        provider: IdentityProviderId,
+        change: ProviderStateChange,
+    ) {
+        self.found_states.insert(provider.clone());
+        self.merge_state(provider, change);
+    }
+
+    /// Adds everything `other` holds, as if it had been staged here after
+    /// the changes already present.
+    pub(crate) fn absorb(&mut self, other: Self) {
+        let Self {
+            partner_ids,
+            provider_state,
+            results,
+            cluster_size,
+            found_states,
+        } = other;
+        self.partner_ids.extend(partner_ids);
+        for (provider, change) in provider_state {
+            self.merge_state(provider, change);
+        }
+        self.results.extend(results);
+        self.cluster_size = cluster_size.or(self.cluster_size);
+        self.found_states.extend(found_states);
     }
 
     /// Sets the cluster size to write.
@@ -292,20 +325,24 @@ impl IdentityMutation {
     /// 2xx or 304 (spec 5.1).
     ///
     /// Keeps every removal, opt-out and clear, the `n` and `f` of each
-    /// stand-alone state change, and the cluster size. Drops browser ingest,
-    /// every other positive change, any stand-alone `st`, and each provider
-    /// result whole, keeping only its opt-out and clear.
+    /// stand-alone state change that does not come from a `found` outcome,
+    /// and the cluster size. Drops browser ingest, every other positive
+    /// change, any stand-alone `st`, the `n` and `f` of a `found` outcome, and
+    /// each provider result whole, keeping only its opt-out and clear.
     ///
     /// A stand-alone state change carries the `n` and `f` of an outcome other
     /// than a stateful `found`, whose scheduling rides in its result. A
-    /// stateless provider's `found` also lands here, so its `f = 0` is kept;
-    /// Part 1 dispatches no provider before the status is known, so no such
-    /// change reaches this cut yet.
+    /// stateless provider's `found` lands here too, and its tag
+    /// ([`merge_found_state`](Self::merge_found_state)) marks it for the cut.
     pub(crate) fn retain_for_error_status(&mut self) {
         self.partner_ids.retain(PartnerIdChange::is_removal);
-        for state in self.provider_state.values_mut() {
+        for (provider, state) in &mut self.provider_state {
+            if self.found_states.contains(provider) {
+                *state = state.removals();
+            }
             state.st = StateUpdate::Keep;
         }
+        self.found_states.clear();
         for result in core::mem::take(&mut self.results) {
             if result.state.has_removal() {
                 self.merge_state(result.provider, result.state.removals());
@@ -969,6 +1006,85 @@ mod tests {
         assert_eq!(
             mutation, expected,
             "should keep only the removal and the no_match backoff"
+        );
+    }
+
+    #[test]
+    fn retain_for_error_status_drops_the_scheduling_of_a_found_and_keeps_its_opt_out() {
+        let opt_out = KvOptOut {
+            at: NOW,
+            fp: "1".to_owned(),
+        };
+        let found = ProviderStateChange {
+            n: Some(NOW + 60),
+            f: Some(0),
+            opt_out: Some(opt_out.clone()),
+            ..ProviderStateChange::default()
+        };
+        let backoff = ProviderStateChange {
+            n: Some(NOW + 86_400),
+            f: Some(3),
+            ..ProviderStateChange::default()
+        };
+        let mut mutation = IdentityMutation::default();
+        mutation.merge_found_state(pid("found"), found);
+        mutation.merge_state(pid("other"), backoff.clone());
+
+        mutation.retain_for_error_status();
+
+        let mut expected = IdentityMutation::default();
+        expected.merge_state(
+            pid("found"),
+            ProviderStateChange {
+                opt_out: Some(opt_out),
+                ..ProviderStateChange::default()
+            },
+        );
+        expected.merge_state(pid("other"), backoff);
+        assert_eq!(
+            mutation, expected,
+            "should keep the found's opt-out and the other outcome's n and f, and drop the found's n and f"
+        );
+    }
+
+    #[test]
+    fn absorb_adds_changes_states_and_found_tags_after_the_existing_ones() {
+        let mut base = IdentityMutation::default();
+        base.add_change(fill("a.example.com", KvPartnerId::browser("u", Some(NOW))));
+        base.merge_state(
+            pid("p"),
+            ProviderStateChange {
+                n: Some(10),
+                ..ProviderStateChange::default()
+            },
+        );
+        let mut other = IdentityMutation::default();
+        other.add_change(fill("b.example.com", KvPartnerId::browser("v", Some(NOW))));
+        other.merge_found_state(
+            pid("p"),
+            ProviderStateChange {
+                n: Some(20),
+                f: Some(0),
+                ..ProviderStateChange::default()
+            },
+        );
+
+        base.absorb(other);
+
+        let mut expected = IdentityMutation::default();
+        expected.add_change(fill("a.example.com", KvPartnerId::browser("u", Some(NOW))));
+        expected.add_change(fill("b.example.com", KvPartnerId::browser("v", Some(NOW))));
+        expected.merge_found_state(
+            pid("p"),
+            ProviderStateChange {
+                n: Some(20),
+                f: Some(0),
+                ..ProviderStateChange::default()
+            },
+        );
+        assert_eq!(
+            base, expected,
+            "should hold both mutations, the found tag included"
         );
     }
 

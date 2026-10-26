@@ -577,6 +577,8 @@ fn build_ec_request_state(
                 context.set_device_signals(device_signals);
                 context.set_real_browser(is_real_browser);
                 context.set_identity_runtime(Arc::clone(&state.identity));
+                context
+                    .set_identity_rate_limiter(Arc::new(FastlyRateLimiter::new(RATE_COUNTER_NAME)));
                 // Orphan-recovery eligibility is intentionally left false here.
                 // Authorizing it during generic pre-routing would let named
                 // routes and request-filter short circuits (e.g. a DataDome

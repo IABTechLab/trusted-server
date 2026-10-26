@@ -8,12 +8,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
+use std::time::Duration;
 
 use http::StatusCode;
 
 use super::coordinator::{
-    Call, Eligibility, EligibilityInput, EligibilityView, OutcomeChanges, OutcomeContext, Phase,
-    RequestFacts, dispatch, eligibility, opt_out_clears, outcome_to_changes,
+    Call, Eligibility, EligibilityInput, EligibilityView, IdentityDeps, OutcomeChanges,
+    OutcomeContext, Phase, RequestFacts, dispatch, eligibility, opt_out_clears, outcome_to_changes,
 };
 use super::descriptor::{Input, Resolves};
 use super::ids::{IdentityProviderId, SourceDomain, UnixTime};
@@ -176,20 +177,22 @@ pub fn run_after_send(input: AfterSendInput<'_>) -> FlushOutcome {
         .filter_map(|id| live_call(runtime, settings, context, &live_view, &facts, id))
         .collect();
     if !calls.is_empty() {
+        let random = ThreadRandom;
+        let deps = runtime.deps(settings, services, &random, Some(rate_limiter));
         add_dispatch_results(
             &mut mutation,
+            &deps,
             &DispatchInput {
-                runtime,
-                settings,
-                services,
                 context,
-                rate_limiter,
                 ec_id: &ec_id,
                 live: &live,
                 view: &live_view,
                 facts: &facts,
             },
-            calls,
+            DispatchRun {
+                calls,
+                budget: None,
+            },
         );
     }
 
@@ -290,7 +293,7 @@ fn write_failed(
 }
 
 /// What eligibility reads about the request itself.
-fn request_facts(context: &EcContext, now: u64) -> RequestFacts {
+pub(super) fn request_facts(context: &EcContext, now: u64) -> RequestFacts {
     let identity = context.identity();
     let mut available_inputs = BTreeSet::new();
     for (input, present) in [
@@ -311,20 +314,20 @@ fn request_facts(context: &EcContext, now: u64) -> RequestFacts {
         },
         writer: identity.writer(),
         new_visitor: context.ec_generated(),
-        // Hold dispatch before the auction is not wired yet, so no hold-mode
-        // provider has run before phase 4: each runs here, as on a navigation
-        // that runs no auction (spec 4.7 step 7).
-        runs_auction: false,
+        // A navigation that ran an auction dispatched its hold-mode providers
+        // before it, so phase 4 runs them only for one that ran none
+        // (spec 4.7 step 7).
+        runs_auction: identity.runs_auction(),
         now: UnixTime::from_secs(now),
         available_inputs,
     }
 }
 
-fn client_ip(context: &EcContext) -> Option<IpAddr> {
+pub(super) fn client_ip(context: &EcContext) -> Option<IpAddr> {
     context.client_ip().and_then(|ip| ip.parse().ok())
 }
 
-fn region(context: &EcContext) -> Option<Region> {
+pub(super) fn region(context: &EcContext) -> Option<Region> {
     context
         .geo_info()
         .and_then(|geo| Region::from_geo(&geo.country, geo.region.as_deref()))
@@ -400,25 +403,29 @@ fn live_call(
 }
 
 /// What dispatching the due providers reads.
-struct DispatchInput<'a> {
-    runtime: &'a IdentityRuntime,
-    settings: &'a Settings,
-    services: &'a RuntimeServices,
-    context: &'a EcContext,
-    rate_limiter: &'a dyn RateLimiter,
-    ec_id: &'a str,
-    live: &'a KvEntry,
-    view: &'a EligibilityView,
-    facts: &'a RequestFacts,
+pub(super) struct DispatchInput<'a> {
+    pub(super) context: &'a EcContext,
+    pub(super) ec_id: &'a str,
+    pub(super) live: &'a KvEntry,
+    pub(super) view: &'a EligibilityView,
+    pub(super) facts: &'a RequestFacts,
 }
 
-/// Dispatches `calls` after send and adds their outcomes to `mutation`.
-fn add_dispatch_results(
+/// The calls to send and, for a hold dispatch before the auction, the budget
+/// they share.
+pub(super) struct DispatchRun {
+    pub(super) calls: Vec<Call>,
+    pub(super) budget: Option<Duration>,
+}
+
+/// Dispatches `run.calls` and adds their outcomes to `mutation`.
+pub(super) fn add_dispatch_results(
     mutation: &mut IdentityMutation,
+    deps: &IdentityDeps<'_>,
     input: &DispatchInput<'_>,
-    calls: Vec<Call>,
+    run: DispatchRun,
 ) {
-    let random = ThreadRandom;
+    let DispatchRun { calls, budget } = run;
     let resolving: BTreeSet<&SourceDomain> =
         calls.iter().flat_map(|call| call.kinds.keys()).collect();
     let stored: BTreeMap<SourceDomain, StoredId> = input
@@ -437,26 +444,20 @@ fn add_dispatch_results(
         region: region(input.context),
         hashed_email: None,
         consent: ProviderConsent::from_context(input.context.consent()),
-        publisher_domain: &input.settings.publisher.domain,
+        publisher_domain: &deps.settings.publisher.domain,
         now: input.facts.now,
-        random: &random,
+        random: deps.random,
         ec_id: Some(input.ec_id.to_owned()),
         stored,
     };
-    let deps = input.runtime.deps(
-        input.settings,
-        input.services,
-        &random,
-        Some(input.rate_limiter),
-    );
-    let catalog = input.runtime.catalog();
-    for (id, outcome) in dispatch(&deps, calls, &signals, None) {
+    let catalog = deps.catalog;
+    for (id, outcome) in dispatch(deps, calls, &signals, budget) {
         let Some(provider) = catalog.get(&id) else {
             continue;
         };
         let provider: &dyn IdentityProvider = provider.as_ref();
         let descriptor = provider.descriptor();
-        let provider_settings = input.settings.ec.identity.provider(&id);
+        let provider_settings = deps.settings.ec.identity.provider(&id);
         let fingerprint = fingerprint_bits(
             descriptor.consent_policy(),
             input.context.consent(),
@@ -469,7 +470,7 @@ fn add_dispatch_results(
             now: input.facts.now,
             catalog,
             settings: &provider_settings,
-            identity: &input.settings.ec.identity,
+            identity: &deps.settings.ec.identity,
             expected_state: stateful.then(|| {
                 StateRevision::of(
                     input
@@ -481,13 +482,22 @@ fn add_dispatch_results(
             }),
             fingerprint: &fingerprint,
         };
+        let found = outcome.is_found();
         let changes = outcome_to_changes(provider, outcome, input.view, &outcome_context);
-        add_outcome(mutation, &id, changes);
+        add_outcome(mutation, &id, changes, found);
     }
 }
 
 /// Adds one outcome's changes to the mutation.
-fn add_outcome(mutation: &mut IdentityMutation, id: &IdentityProviderId, changes: OutcomeChanges) {
+///
+/// A `found` outcome's state change is tagged, so an error status drops its
+/// `n` and `f` with its positive answer (spec 5.1).
+fn add_outcome(
+    mutation: &mut IdentityMutation,
+    id: &IdentityProviderId,
+    changes: OutcomeChanges,
+    found: bool,
+) {
     let OutcomeChanges {
         changes,
         result,
@@ -499,7 +509,11 @@ fn add_outcome(mutation: &mut IdentityMutation, id: &IdentityProviderId, changes
     if let Some(result) = result {
         mutation.add_result(result);
     }
-    mutation.merge_state(id.clone(), state);
+    if found {
+        mutation.merge_found_state(id.clone(), state);
+    } else {
+        mutation.merge_state(id.clone(), state);
+    }
 }
 
 #[cfg(test)]

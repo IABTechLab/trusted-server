@@ -13,6 +13,7 @@ use crate::error::TrustedServerError;
 use crate::openrtb::{Eid, Uid};
 
 use super::identity::catalog::ProviderCatalog;
+use super::identity::coordinator::HoldResults;
 use super::identity::servable::{ServeContext, is_servable};
 use super::identity::{IdentityProviderId, SourceDomain};
 use super::kv_types::{KvEid, KvEntry};
@@ -182,6 +183,70 @@ impl ServerSet {
                     eids: vec![eid],
                 })
                 .collect(),
+        }
+    }
+}
+
+impl ServerSet {
+    /// Overlays the answers of this navigation's hold dispatch (spec 4.7),
+    /// replacing the stored value of each source they name.
+    ///
+    /// Each source gets one `Eid` per entry, in the order the provider
+    /// returned them, with the writer's provenance default applied
+    /// ([`fill_provenance`]). A source the partner registry does not list for
+    /// the bidstream is left out, as a stored record would be.
+    pub(crate) fn with_hold_results(
+        &mut self,
+        results: HoldResults,
+        registry: &PartnerRegistry,
+        catalog: &ProviderCatalog,
+    ) {
+        let HoldResults {
+            additions,
+            mut writer,
+        } = results;
+        for (source, entries) in additions {
+            let Some(partner) = registry
+                .get(source.as_str())
+                .filter(|partner| partner.bidstream_enabled)
+            else {
+                continue;
+            };
+            let writer = writer.remove(&source);
+            let mut eids: Vec<Eid> = entries
+                .iter()
+                .map(|entry| Eid {
+                    source: partner.source_domain.clone(),
+                    uids: entry
+                        .uids
+                        .iter()
+                        .map(|uid| Uid {
+                            id: uid.id.clone(),
+                            atype: Some(uid.atype.unwrap_or(partner.openrtb_atype)),
+                            ext: uid.ext.clone(),
+                        })
+                        .collect(),
+                    inserter: entry.inserter.clone(),
+                    matcher: entry.matcher.clone(),
+                    mm: entry.mm,
+                    ext: entry.ext.clone(),
+                })
+                .collect();
+            fill_provenance(&mut eids, writer.as_ref(), &source, catalog);
+            let held = ServerSource {
+                source_domain: partner.source_domain.clone(),
+                owned: writer.is_some() && catalog.owner_of(&source) == writer.as_ref(),
+                writer,
+                expires_at: None,
+                eids,
+            };
+            match self
+                .sources
+                .binary_search_by(|stored| stored.source_domain.cmp(&held.source_domain))
+            {
+                Ok(index) => self.sources[index] = held,
+                Err(index) => self.sources.insert(index, held),
+            }
         }
     }
 }

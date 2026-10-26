@@ -14,9 +14,13 @@ use web_time::Instant;
 use super::catalog::ProviderCatalog;
 use super::descriptor::{Input, ProviderDescriptor, ResolveKind, Resolves};
 use super::exchange::{ProviderRequest, ProviderResponse};
+use super::flush::{DispatchInput, DispatchRun, add_dispatch_results, may_flush, request_facts};
 use super::ids::{IdentityProviderId, SourceDomain, UnixTime};
-use super::input::{RandomSource, ResolveInput, ResolveSignals};
-use super::mutation::{PartnerIdChange, ProviderResult, ProviderStateChange, StateUpdate};
+use super::input::{RandomSource, ResolveInput, ResolveSignals, ThreadRandom};
+use super::mutation::{
+    ApplyContext, IdentityMutation, PartnerIdChange, ProviderResult, ProviderStateChange,
+    StateUpdate, apply,
+};
 use super::policy::{FP_US_OPT_OUT_MASK, PolicySignals, fingerprint_bits, policy_allows};
 use super::provider::IdentityProvider;
 use super::resolution::{
@@ -24,8 +28,9 @@ use super::resolution::{
 };
 use super::revision::{IdentityKeys, StateRevision, record_revision, uid_hash, visitor_key};
 use crate::consent::{ConsentContext, effective_tcf};
-use crate::ec::kv_types::{KvEntry, KvOptOut, KvPartnerId};
+use crate::ec::kv_types::{KvEid, KvEntry, KvOptOut, KvPartnerId};
 use crate::ec::rate_limiter::RateLimiter;
+use crate::ec::{EcContext, current_timestamp};
 use crate::platform::{
     PlatformBackendSpec, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
     RuntimeServices,
@@ -477,6 +482,19 @@ pub(crate) enum CallOutcome {
     BurstCapped,
     /// A limiter error meant nothing was sent.
     NotDispatched,
+}
+
+impl CallOutcome {
+    /// Whether the call produced a positive answer: a resolution that carries
+    /// at least one ID.
+    #[must_use]
+    pub(crate) fn is_found(&self) -> bool {
+        matches!(
+            self,
+            Self::Resolved(resolution) | Self::InvalidState(Some(resolution))
+                if !resolution.eids().is_empty()
+        )
+    }
 }
 
 /// What an outcome needs besides the provider and the view.
@@ -1594,6 +1612,153 @@ pub(crate) fn opt_out_clears(
             .then(|| descriptor.id().clone())
         })
         .collect()
+}
+
+/// Runs [`run_hold`] with the request's runtime and limiter. `None` when the
+/// adapter set no identity runtime, so no provider is configured.
+pub(crate) fn hold_before_auction(
+    settings: &Settings,
+    services: &RuntimeServices,
+    context: &mut EcContext,
+) -> Option<HoldResults> {
+    let runtime = context.identity().runtime().cloned()?;
+    let limiter = context.identity().rate_limiter();
+    let random = ThreadRandom;
+    let deps = runtime.deps(
+        settings,
+        services,
+        &random,
+        limiter
+            .as_deref()
+            .map(|limiter| -> &dyn RateLimiter { limiter }),
+    );
+    Some(run_hold(&deps, context))
+}
+
+/// What the hold dispatch before a navigation's auction learned (spec 4.7).
+///
+/// The answers this auction's server set adds, per source, and the provider
+/// that wrote each, so the output rules can apply that provider's provenance
+/// default. Nothing here is stored: the same answers ride the writer's one
+/// flush.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct HoldResults {
+    /// The entry set each source now holds, in the order the provider
+    /// returned it.
+    pub(crate) additions: BTreeMap<SourceDomain, Vec<KvEid>>,
+    /// The provider that wrote each source in `additions`.
+    pub(crate) writer: BTreeMap<SourceDomain, IdentityProviderId>,
+}
+
+/// Dispatches the hold-mode providers of a returning writer navigation that
+/// runs an auction (spec 4.7).
+///
+/// Every provider that [`eligibility`] passes in [`Phase::Hold`] on the phase 1
+/// view is called within `hold_budget_ms`, measured from the first dispatch,
+/// each waiting at most `min(hold_timeout_ms, remaining budget)`. The phase 1
+/// read has already confirmed a live, consenting row, so no EC ID is
+/// disclosed before consent is confirmed. Each outcome joins the writer's
+/// mutation, and every answer that mutation would store is returned for this
+/// auction. No answer goes into a cookie.
+///
+/// A request that is not a returning writer, runs no auction, or whose phase 1
+/// read is not a live, consenting row dispatches nothing.
+pub(crate) fn run_hold(deps: &IdentityDeps<'_>, context: &mut EcContext) -> HoldResults {
+    let mut results = HoldResults::default();
+    if !context.identity().runs_auction() || !may_flush(context) {
+        return results;
+    }
+    let Some(ec_id) = context.ec_value().map(str::to_owned) else {
+        return results;
+    };
+    let Some(entry) = context
+        .kv_snapshot()
+        .entry_for(&ec_id)
+        .filter(|entry| entry.consent.ok)
+        .cloned()
+    else {
+        return results;
+    };
+
+    let now = current_timestamp();
+    let facts = request_facts(context, now);
+    let view = EligibilityView::from_kv(&entry);
+    let calls: Vec<Call> = deps
+        .catalog
+        .providers()
+        .filter_map(|provider| {
+            let id = provider.descriptor().id();
+            let provider_settings = deps.settings.ec.identity.provider(id);
+            let Eligibility::Eligible { kinds } = eligibility(
+                &EligibilityInput {
+                    provider: provider.as_ref(),
+                    settings: &provider_settings,
+                    identity: &deps.settings.ec.identity,
+                    catalog: deps.catalog,
+                    consent: context.consent(),
+                },
+                &view,
+                &facts,
+                Phase::Hold,
+            ) else {
+                return None;
+            };
+            Some(Call {
+                provider: id.clone(),
+                kinds,
+                state_json: view
+                    .state(id)
+                    .and_then(|state| serde_json::to_string(state).ok()),
+            })
+        })
+        .collect();
+    if calls.is_empty() {
+        return results;
+    }
+
+    let mut held = IdentityMutation::default();
+    add_dispatch_results(
+        &mut held,
+        deps,
+        &DispatchInput {
+            context,
+            ec_id: &ec_id,
+            live: &entry,
+            view: &view,
+            facts: &facts,
+        },
+        DispatchRun {
+            calls,
+            budget: Some(Duration::from_millis(
+                deps.settings.ec.identity.hold_budget_ms,
+            )),
+        },
+    );
+
+    let apply_context = ApplyContext {
+        now,
+        random: deps.random,
+        catalog: deps.catalog,
+    };
+    if let Some(applied) = apply(&held, &entry, &apply_context) {
+        for (source, record) in &applied.entry.ids {
+            if entry.ids.get(source) == Some(record) {
+                continue;
+            }
+            let (Ok(source), Some(writer)) = (
+                source.parse::<SourceDomain>(),
+                record.w.as_deref().and_then(|writer| writer.parse().ok()),
+            ) else {
+                continue;
+            };
+            results
+                .additions
+                .insert(source.clone(), record.eids.clone());
+            results.writer.insert(source, writer);
+        }
+    }
+    context.identity_mut().mutation_mut().absorb(held);
+    results
 }
 
 #[cfg(test)]
@@ -4620,5 +4785,496 @@ mod tests {
             ),
             "should judge only the opt-outs the fingerprint recorded, not a new one"
         );
+    }
+
+    /// Hold dispatch before a writer navigation's auction (spec 4.7).
+    mod hold_mode {
+        use http::StatusCode;
+
+        use super::*;
+        use crate::ec::identity::flush::FlushOutcome;
+        use crate::ec::identity::request::WriterDecision;
+        use crate::ec::identity::test_support::TEST_EC_ID;
+        use crate::ec::identity::test_support::fake_http::AnsweringProvider;
+        use crate::ec::identity::test_support::hold_fixture::{HoldFixture, live_row};
+        use crate::ec::kv_types::{KvOptOut, KvProviderState, KvUid};
+
+        const HOLD_HOST: &str = "p.example.com";
+        const HOLD_SOURCE: &str = "ids.example.com";
+
+        fn hold_provider(
+            id: &str,
+            host: &str,
+            source: &str,
+        ) -> (Arc<dyn IdentityProvider>, ProviderMode) {
+            (
+                AnsweringProvider::new(id, host, source, None).into_provider(),
+                ProviderMode::Hold,
+            )
+        }
+
+        fn found_body(uid: &str) -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({
+                "answer": "found",
+                "entries": [{ "uids": [{ "id": uid, "atype": 1 }] }],
+            }))
+            .expect("should serialize the answer")
+        }
+
+        fn single_entry(uid: &str) -> Vec<KvEid> {
+            vec![KvEid {
+                uids: vec![KvUid {
+                    id: uid.to_owned(),
+                    atype: Some(1),
+                    ext: None,
+                }],
+                ..KvEid::default()
+            }]
+        }
+
+        #[test]
+        fn hold_answer_feeds_this_auction_and_joins_the_mutation() {
+            let mut fixture = HoldFixture::new(
+                vec![hold_provider("p", HOLD_HOST, HOLD_SOURCE)],
+                &live_row(),
+                true,
+            );
+            fixture
+                .client
+                .respond(HOLD_HOST, 200, &found_body("held-uid"));
+
+            let results = fixture.run_hold();
+
+            assert_eq!(
+                results,
+                HoldResults {
+                    additions: BTreeMap::from([(source(HOLD_SOURCE), single_entry("held-uid"))]),
+                    writer: BTreeMap::from([(source(HOLD_SOURCE), pid("p"))]),
+                },
+                "should hand this auction the answer and its writer"
+            );
+            let staged = fixture.context.identity().mutation().positive_changes();
+            assert!(
+                matches!(
+                    staged,
+                    [PartnerIdChange::FillMissing { source: staged_source, record }]
+                        if *staged_source == source(HOLD_SOURCE)
+                            && record.w.as_deref() == Some("p")
+                            && record.eids == single_entry("held-uid")
+                ),
+                "should stage the answer in the writer's mutation: {staged:?}"
+            );
+
+            let outcome = fixture.flush(StatusCode::OK);
+
+            assert_eq!(outcome, FlushOutcome::Written, "should write the answer");
+            assert_eq!(
+                fixture.row().ids[HOLD_SOURCE].eids,
+                single_entry("held-uid"),
+                "should store the answer"
+            );
+            assert_eq!(
+                fixture.client.sent_hosts(),
+                [HOLD_HOST],
+                "should not dispatch the provider again after send"
+            );
+            let writes = fixture.store.writes();
+            assert_eq!(
+                (writes.if_generation_match, writes.total()),
+                (1, 1),
+                "should make the one flush write and no other"
+            );
+        }
+
+        #[test]
+        fn auction_starts_at_the_hold_budget_when_a_provider_is_slow() {
+            let mut fixture = HoldFixture::new(
+                vec![
+                    hold_provider("a", "a.example.com", "a.example.com"),
+                    hold_provider("b", "b.example.com", "b.example.com"),
+                ],
+                &live_row(),
+                true,
+            );
+            fixture.settings.ec.identity.hold_budget_ms = 50;
+            fixture
+                .client
+                .respond("a.example.com", 200, &found_body("slow-uid"));
+            fixture
+                .client
+                .respond("b.example.com", 200, &found_body("late-uid"));
+            fixture
+                .client
+                .delay("a.example.com", Duration::from_millis(120));
+
+            let started = Instant::now();
+            let results = fixture.run_hold();
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed >= Duration::from_millis(50),
+                "should wait out the budget before the auction starts: {elapsed:?}"
+            );
+            assert!(
+                elapsed < Duration::from_millis(1_000),
+                "should not wait past the slow provider: {elapsed:?}"
+            );
+            assert_eq!(
+                results.additions.keys().collect::<Vec<_>>(),
+                [&source("a.example.com")],
+                "should keep the answer that arrived and drop the one the budget cut off"
+            );
+            assert_eq!(
+                fixture.client.sent_hosts().len(),
+                2,
+                "control: should have sent both calls up front"
+            );
+        }
+
+        #[test]
+        fn cut_off_hold_call_sets_hold_retry_without_counting_a_failure() {
+            let mut row = live_row();
+            row.ps.insert(
+                "p".to_owned(),
+                KvProviderState {
+                    f: 2,
+                    ..KvProviderState::default()
+                },
+            );
+            let mut fixture =
+                HoldFixture::new(vec![hold_provider("p", HOLD_HOST, HOLD_SOURCE)], &row, true);
+            fixture.settings.ec.identity.hold_budget_ms = 0;
+            fixture.client.respond(HOLD_HOST, 200, &found_body("never"));
+
+            let before = current_timestamp();
+            let results = fixture.run_hold();
+            let outcome = fixture.flush(StatusCode::OK);
+
+            assert_eq!(results, HoldResults::default(), "should add nothing");
+            assert_eq!(
+                outcome,
+                FlushOutcome::Written,
+                "should write the retry wait"
+            );
+            let state = fixture.row().ps["p"].clone();
+            let retry = fixture.settings.ec.identity.hold_retry_sec;
+            assert!(
+                state
+                    .n
+                    .is_some_and(|n| n >= before + retry && n <= before + retry + 5),
+                "should wait hold_retry_sec: {state:?}"
+            );
+            assert_eq!(state.f, 2, "should leave the failure count as it was");
+            assert_eq!(
+                fixture.limiter.count_of("identity-fail:p"),
+                0,
+                "should not feed the breaker"
+            );
+        }
+
+        #[test]
+        fn hold_kv_opt_out_blocks_dispatch() {
+            let mut opted_out = live_row();
+            opted_out.ps.insert(
+                "p".to_owned(),
+                KvProviderState {
+                    o: Some(KvOptOut {
+                        at: 900,
+                        fp: "0".to_owned(),
+                    }),
+                    ..KvProviderState::default()
+                },
+            );
+            let mut blocked = HoldFixture::new(
+                vec![hold_provider("p", HOLD_HOST, HOLD_SOURCE)],
+                &opted_out,
+                true,
+            );
+            blocked
+                .client
+                .respond(HOLD_HOST, 200, &found_body("blocked"));
+            let mut control = HoldFixture::new(
+                vec![hold_provider("p", HOLD_HOST, HOLD_SOURCE)],
+                &live_row(),
+                true,
+            );
+            control
+                .client
+                .respond(HOLD_HOST, 200, &found_body("allowed"));
+
+            let blocked_results = blocked.run_hold();
+            let control_results = control.run_hold();
+
+            assert_eq!(
+                (blocked_results, blocked.client.sent_hosts()),
+                (HoldResults::default(), Vec::<String>::new()),
+                "should call no provider the row opted out of"
+            );
+            assert_eq!(
+                (control_results.additions.len(), control.client.sent_hosts()),
+                (1, vec![HOLD_HOST.to_owned()]),
+                "control: should call the provider with no opt-out"
+            );
+        }
+
+        #[test]
+        fn no_hold_on_a_stager() {
+            let mut stager = HoldFixture::new(
+                vec![hold_provider("p", HOLD_HOST, HOLD_SOURCE)],
+                &live_row(),
+                true,
+            );
+            stager.client.respond(HOLD_HOST, 200, &found_body("stager"));
+            stager
+                .context
+                .identity_mut()
+                .set_writer_decision(WriterDecision {
+                    writer: false,
+                    is_real_browser: true,
+                    user_agent: Some("ExampleBrowser/1.0".to_owned()),
+                    dnt: false,
+                    page_url: None,
+                });
+            let mut writer = HoldFixture::new(
+                vec![hold_provider("p", HOLD_HOST, HOLD_SOURCE)],
+                &live_row(),
+                true,
+            );
+            writer.client.respond(HOLD_HOST, 200, &found_body("writer"));
+
+            let stager_results = stager.run_hold();
+            let writer_results = writer.run_hold();
+
+            assert_eq!(
+                (stager_results, stager.client.sent_hosts()),
+                (HoldResults::default(), Vec::<String>::new()),
+                "should make no provider call on a request that is not the writer"
+            );
+            assert_eq!(
+                (writer_results.additions.len(), writer.client.sent_hosts()),
+                (1, vec![HOLD_HOST.to_owned()]),
+                "control: should call the provider on the writer"
+            );
+        }
+
+        #[test]
+        fn hold_no_match_on_a_writer_stops_recalls_from_the_spa_session() {
+            let mut fixture = HoldFixture::new(
+                vec![hold_provider("p", HOLD_HOST, HOLD_SOURCE)],
+                &live_row(),
+                true,
+            );
+            fixture
+                .client
+                .respond(HOLD_HOST, 200, br#"{"answer":"no_match"}"#);
+            fixture.run_hold();
+            assert_eq!(
+                fixture.flush(StatusCode::OK),
+                FlushOutcome::Written,
+                "should write the no_match wait"
+            );
+            assert_eq!(
+                fixture.client.sent_hosts(),
+                [HOLD_HOST],
+                "control: the writer navigation called the provider once"
+            );
+            assert!(
+                fixture.row().ps["p"]
+                    .n
+                    .is_some_and(|n| n > current_timestamp()),
+                "should hold the provider back with ps.n"
+            );
+
+            // The SPA session's stagers (`/auction`, `/_ts/page-bids`) read
+            // the stored row and are never the writer.
+            for _ in 0..3 {
+                fixture
+                    .context
+                    .set_kv_snapshot(fixture.graph.load_snapshot(TEST_EC_ID));
+                fixture
+                    .context
+                    .identity_mut()
+                    .set_writer_decision(WriterDecision {
+                        writer: false,
+                        is_real_browser: true,
+                        user_agent: Some("ExampleBrowser/1.0".to_owned()),
+                        dnt: false,
+                        page_url: None,
+                    });
+                fixture.run_hold();
+            }
+            // A second writer navigation inside ps.n is held back too.
+            fixture
+                .context
+                .identity_mut()
+                .set_writer_decision(WriterDecision {
+                    writer: true,
+                    is_real_browser: true,
+                    user_agent: Some("ExampleBrowser/1.0".to_owned()),
+                    dnt: false,
+                    page_url: None,
+                });
+            fixture.run_hold();
+
+            assert_eq!(
+                fixture.client.sent_hosts(),
+                [HOLD_HOST],
+                "should never call the provider again before ps.n"
+            );
+        }
+
+        #[test]
+        fn hold_provider_moves_after_send_on_a_navigation_without_an_auction() {
+            let mut fixture = HoldFixture::new(
+                vec![hold_provider("p", HOLD_HOST, HOLD_SOURCE)],
+                &live_row(),
+                false,
+            );
+            fixture.client.time_out(HOLD_HOST);
+
+            let held = fixture.run_hold();
+            let before_send = fixture.client.sent_hosts();
+            let outcome = fixture.flush(StatusCode::OK);
+
+            assert_eq!(
+                (held, before_send),
+                (HoldResults::default(), Vec::<String>::new()),
+                "should dispatch nothing before the response"
+            );
+            assert_eq!(outcome, FlushOutcome::Written, "should write the failure");
+            assert_eq!(
+                fixture.client.sent_hosts(),
+                [HOLD_HOST],
+                "should dispatch after send"
+            );
+            assert_eq!(
+                fixture.backend.first_byte_timeouts(),
+                [Duration::from_millis(
+                    fixture
+                        .settings
+                        .ec
+                        .identity
+                        .provider(&pid("p"))
+                        .after_send_timeout_ms
+                )],
+                "should wait the after-send timeout, not the hold budget"
+            );
+            assert_eq!(
+                fixture.row().ps["p"].f,
+                1,
+                "should count a miss as a transport failure"
+            );
+            assert_eq!(
+                fixture.limiter.count_of("identity-fail:p"),
+                1,
+                "should feed the breaker, which a cut-off never does"
+            );
+        }
+
+        #[test]
+        fn stateful_hold_answer_flushes_its_state_with_its_ids() {
+            let mut fixture = HoldFixture::new(
+                vec![(
+                    AnsweringProvider::stateful("p", HOLD_HOST, HOLD_SOURCE).into_provider(),
+                    ProviderMode::Hold,
+                )],
+                &live_row(),
+                true,
+            );
+            fixture
+                .client
+                .respond(HOLD_HOST, 200, &found_body("stateful-uid"));
+
+            let results = fixture.run_hold();
+            let outcome = fixture.flush(StatusCode::OK);
+
+            assert_eq!(
+                results.additions.get(&source(HOLD_SOURCE)),
+                Some(&single_entry("stateful-uid")),
+                "should feed this auction"
+            );
+            assert_eq!(outcome, FlushOutcome::Written, "should write once");
+            let row = fixture.row();
+            assert_eq!(
+                row.ids[HOLD_SOURCE].eids,
+                single_entry("stateful-uid"),
+                "should store the IDs"
+            );
+            assert_eq!(
+                row.ps["p"].st,
+                Some(serde_json::json!({ "seen": true })),
+                "should store the state with its IDs"
+            );
+            assert_eq!(fixture.store.writes().total(), 1, "should make one write");
+        }
+
+        #[test]
+        fn writer_navigation_with_non_2xx_status_flushes_hold_removals_and_backoff_only() {
+            let mut row = live_row();
+            row.ids.insert(
+                "i.example.com".to_owned(),
+                KvPartnerId {
+                    exp: Some(600),
+                    ..record_for_test("old-uid", Some("i"), 500)
+                },
+            );
+            row.ps.insert(
+                "f".to_owned(),
+                KvProviderState {
+                    f: 2,
+                    ..KvProviderState::default()
+                },
+            );
+            let mut fixture = HoldFixture::new(
+                vec![
+                    hold_provider("f", "f.example.com", "f.example.com"),
+                    hold_provider("n", "n.example.com", "n.example.com"),
+                    hold_provider("i", "i.example.com", "i.example.com"),
+                ],
+                &row,
+                true,
+            );
+            fixture
+                .client
+                .respond("f.example.com", 200, &found_body("found-uid"));
+            fixture
+                .client
+                .respond("n.example.com", 200, br#"{"answer":"no_match"}"#);
+            fixture
+                .client
+                .respond("i.example.com", 200, br#"{"answer":"invalidate"}"#);
+
+            let results = fixture.run_hold();
+            let outcome = fixture.flush(StatusCode::NOT_FOUND);
+
+            assert_eq!(
+                results.additions.keys().collect::<Vec<_>>(),
+                [&source("f.example.com")],
+                "should still feed this auction the found answer"
+            );
+            assert_eq!(
+                outcome,
+                FlushOutcome::Written,
+                "should write the cut mutation"
+            );
+            let stored = fixture.row();
+            assert!(
+                !stored.ids.contains_key("f.example.com"),
+                "should store no ID from the found"
+            );
+            assert!(
+                !stored.ids.contains_key("i.example.com"),
+                "should store the invalidate's removal"
+            );
+            assert!(
+                stored.ps["n"].n.is_some_and(|n| n > current_timestamp()),
+                "should store the no_match backoff"
+            );
+            assert_eq!(
+                stored.ps["f"].f, 2,
+                "should leave the found's failure count alone"
+            );
+            assert_eq!(fixture.store.writes().total(), 1, "should make one write");
+        }
     }
 }

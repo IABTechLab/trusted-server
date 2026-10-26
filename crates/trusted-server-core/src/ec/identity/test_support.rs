@@ -951,11 +951,15 @@ pub mod fake_http {
 
     use error_stack::Report;
 
+    use crate::ec::identity::descriptor::EidProvenance;
     use crate::ec::identity::descriptor::{ConsentPolicy, ProviderDescriptor, Resolves};
     use crate::ec::identity::exchange::{ProviderRequest, ProviderResponse};
+    use crate::ec::identity::ids::SourceDomain;
     use crate::ec::identity::input::ResolveInput;
     use crate::ec::identity::provider::IdentityProvider;
-    use crate::ec::identity::resolution::{IdentityProviderError, Resolution};
+    use crate::ec::identity::resolution::{
+        IdentityProviderError, Resolution, ResolvedEid, ResolvedUid,
+    };
     #[cfg(test)]
     use crate::platform::test_support::{NoopConfigStore, NoopGeo, NoopSecretStore};
     use crate::platform::{
@@ -965,6 +969,7 @@ pub mod fake_http {
     };
     #[cfg(test)]
     use crate::platform::{ClientInfo, RuntimeServices};
+    use serde_json::json;
 
     /// What the fake does for one host.
     #[derive(Clone)]
@@ -1302,6 +1307,275 @@ pub mod fake_http {
             _input: &ResolveInput<'_>,
         ) -> Result<Resolution, Report<IdentityProviderError>> {
             response.success_text().map(|_| Resolution::no_match())
+        }
+    }
+
+    /// A resolver that calls its endpoint and answers as the 2xx JSON body
+    /// says: `{"answer":"found","entries":[{"uids":[{"id":"x","atype":1}],
+    /// "inserter":"example.com"}]}`, `{"answer":"invalidate"}` or anything
+    /// else for `no_match`.
+    pub(crate) struct AnsweringProvider {
+        descriptor: ProviderDescriptor,
+        stateful: bool,
+    }
+
+    impl AnsweringProvider {
+        /// A provider `id` calling `host`, claiming `source`, with `default`
+        /// as its provenance default for the source when given.
+        pub(crate) fn new(
+            id: &str,
+            host: &str,
+            source: &str,
+            default: Option<EidProvenance>,
+        ) -> Self {
+            Self::build(id, host, source, default, false)
+        }
+
+        /// As [`Self::new`], declaring private state that a `found` replaces.
+        pub(crate) fn stateful(id: &str, host: &str, source: &str) -> Self {
+            Self::build(id, host, source, None, true)
+        }
+
+        fn build(
+            id: &str,
+            host: &str,
+            source: &str,
+            default: Option<EidProvenance>,
+            stateful: bool,
+        ) -> Self {
+            let mut resolves = Resolves::new().with_endpoint(&format!("https://{host}/resolve"));
+            if stateful {
+                resolves = resolves.with_private_state();
+            }
+            let source: SourceDomain = source.parse().expect("should parse the source");
+            let mut builder =
+                ProviderDescriptor::builder(id.parse().expect("should parse the provider ID"))
+                    .with_source(source.clone())
+                    .with_resolves(resolves)
+                    .with_consent_policy(ConsentPolicy::eid_persistence_only());
+            if let Some(default) = default {
+                builder = builder.with_provenance(&source, default);
+            }
+            Self {
+                descriptor: builder.build().expect("should build the descriptor"),
+                stateful,
+            }
+        }
+
+        pub(crate) fn into_provider(self) -> Arc<dyn IdentityProvider> {
+            Arc::new(self)
+        }
+    }
+
+    impl IdentityProvider for AnsweringProvider {
+        fn descriptor(&self) -> &ProviderDescriptor {
+            &self.descriptor
+        }
+
+        fn request(
+            &self,
+            input: &ResolveInput<'_>,
+        ) -> Result<Option<ProviderRequest>, Report<IdentityProviderError>> {
+            if self.stateful {
+                input.state::<serde_json::Value>()?;
+            }
+            Ok(Some(ProviderRequest::get(input.endpoint()?)))
+        }
+
+        fn response(
+            &self,
+            response: &ProviderResponse,
+            _input: &ResolveInput<'_>,
+        ) -> Result<Resolution, Report<IdentityProviderError>> {
+            let body: serde_json::Value = response.success_json()?;
+            let source = self.descriptor.primary_source();
+            match body["answer"].as_str() {
+                Some("found") => {
+                    let eids = body["entries"]
+                        .as_array()
+                        .map(Vec::as_slice)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|entry| {
+                            let mut uids =
+                                entry["uids"].as_array().into_iter().flatten().map(|uid| {
+                                    let mut resolved = ResolvedUid::new(
+                                        uid["id"].as_str().expect("should have a UID"),
+                                    );
+                                    if let Some(atype) = uid["atype"].as_i64() {
+                                        resolved = resolved.with_atype(
+                                            i32::try_from(atype).expect("should fit an atype"),
+                                        );
+                                    }
+                                    resolved
+                                });
+                            let mut eid = ResolvedEid::new(
+                                source,
+                                uids.next().expect("should have a first UID"),
+                            );
+                            for uid in uids {
+                                eid = eid.with_uid(uid);
+                            }
+                            if let Some(inserter) = entry["inserter"].as_str() {
+                                eid = eid.with_inserter(inserter);
+                            }
+                            eid
+                        });
+                    let mut resolution = Resolution::found(eids);
+                    if self.stateful {
+                        resolution = resolution.replacing_state(&json!({ "seen": true }));
+                    }
+                    Ok(resolution)
+                }
+                Some("invalidate") => Ok(Resolution::invalidate(source)),
+                _ => Ok(Resolution::no_match()),
+            }
+        }
+    }
+}
+
+/// A returning writer navigation with a live row, hold-mode providers and a
+/// fake client, for the tests of hold dispatch and the flush that follows.
+#[cfg(test)]
+pub(crate) mod hold_fixture {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use http::StatusCode;
+
+    use super::fake_http::{FakeBackend, FakeHttpClient, fake_services};
+    use super::{FakeRateLimiter, TEST_EC_ID, WriteCountingEcKv, allowing_consent};
+    use crate::ec::EcContext;
+    use crate::ec::identity::coordinator::{HoldResults, run_hold};
+    use crate::ec::identity::flush::{AfterSendInput, FlushOutcome, run_after_send};
+    use crate::ec::identity::ids::{IdentityProviderId, SourceDomain};
+    use crate::ec::identity::input::ThreadRandom;
+    use crate::ec::identity::provider::IdentityProvider;
+    use crate::ec::identity::request::WriterDecision;
+    use crate::ec::identity::runtime::IdentityRuntime;
+    use crate::ec::kv::KvIdentityGraph;
+    use crate::ec::kv_types::KvEntry;
+    use crate::platform::RuntimeServices;
+    use crate::settings::{ProviderMode, ProviderSettings, Settings};
+    use crate::test_support::tests::create_test_settings;
+
+    /// A live, consenting row sized for the flush, with no IDs.
+    pub(crate) fn live_row() -> KvEntry {
+        let mut entry = KvEntry::new(&allowing_consent(), None, 1_000, "test-publisher.com");
+        entry.network = Some(crate::ec::kv_types::KvNetwork {
+            cluster_size: Some(1),
+        });
+        entry
+    }
+
+    /// Everything one hold navigation reads.
+    pub(crate) struct HoldFixture {
+        pub(crate) settings: Settings,
+        pub(crate) runtime: Arc<IdentityRuntime>,
+        pub(crate) client: Arc<FakeHttpClient>,
+        pub(crate) backend: Arc<FakeBackend>,
+        pub(crate) services: RuntimeServices,
+        pub(crate) graph: KvIdentityGraph,
+        pub(crate) store: Arc<WriteCountingEcKv>,
+        pub(crate) context: EcContext,
+        pub(crate) limiter: Arc<FakeRateLimiter>,
+    }
+
+    impl HoldFixture {
+        /// A writer navigation with `row` read in phase 1. Each provider runs
+        /// in the given mode. With `runs_auction` the navigation runs one.
+        pub(crate) fn new(
+            providers: Vec<(Arc<dyn IdentityProvider>, ProviderMode)>,
+            row: &KvEntry,
+            runs_auction: bool,
+        ) -> Self {
+            let mut settings = create_test_settings();
+            for (provider, mode) in &providers {
+                settings.ec.identity.providers.insert(
+                    provider.descriptor().id().to_string(),
+                    ProviderSettings {
+                        mode: *mode,
+                        ..ProviderSettings::default()
+                    },
+                );
+            }
+            let runtime = Arc::new(
+                IdentityRuntime::from_settings_with_providers(
+                    &settings,
+                    providers
+                        .into_iter()
+                        .map(|(provider, _)| provider)
+                        .collect(),
+                    BTreeMap::<SourceDomain, IdentityProviderId>::new(),
+                )
+                .expect("should build the runtime"),
+            );
+            let client = Arc::new(FakeHttpClient::new());
+            let backend = Arc::new(FakeBackend::new());
+            let services = fake_services(&client, &backend);
+            let (graph, store) = KvIdentityGraph::write_counting("hold-store");
+            graph.create(TEST_EC_ID, row).expect("should seed the row");
+            let mut context = EcContext::new_for_test_with_ip(
+                Some(TEST_EC_ID.to_owned()),
+                allowing_consent(),
+                Some("192.0.2.10".to_owned()),
+            );
+            context.set_identity_runtime(Arc::clone(&runtime));
+            context.identity_mut().set_writer_decision(WriterDecision {
+                writer: true,
+                is_real_browser: true,
+                user_agent: Some("ExampleBrowser/1.0".to_owned()),
+                dnt: false,
+                page_url: None,
+            });
+            context.identity_mut().set_runs_auction(runs_auction);
+            context.set_kv_snapshot(graph.load_snapshot(TEST_EC_ID));
+            store.reset_counts();
+            Self {
+                settings,
+                runtime,
+                client,
+                backend,
+                services,
+                graph,
+                store,
+                context,
+                limiter: Arc::new(FakeRateLimiter::new()),
+            }
+        }
+
+        /// Runs the hold dispatch before the auction.
+        pub(crate) fn run_hold(&mut self) -> HoldResults {
+            let random = ThreadRandom;
+            let deps = self.runtime.deps(
+                &self.settings,
+                &self.services,
+                &random,
+                Some(self.limiter.as_ref()),
+            );
+            run_hold(&deps, &mut self.context)
+        }
+
+        /// Runs phase 4 for a response with `status`.
+        pub(crate) fn flush(&mut self, status: StatusCode) -> FlushOutcome {
+            run_after_send(AfterSendInput {
+                runtime: &self.runtime,
+                settings: &self.settings,
+                services: &self.services,
+                graph: &self.graph,
+                context: &mut self.context,
+                status,
+                rate_limiter: self.limiter.as_ref(),
+            })
+        }
+
+        /// The row as KV holds it.
+        pub(crate) fn row(&self) -> KvEntry {
+            self.graph
+                .get(TEST_EC_ID)
+                .expect("should read the row")
+                .expect("should hold the row")
+                .0
         }
     }
 }

@@ -9,6 +9,7 @@ use super::ids::{IdentityProviderId, SourceDomain};
 use super::mutation::{IdentityMutation, is_opted_out};
 use super::runtime::IdentityRuntime;
 use crate::ec::kv_types::KvEntry;
+use crate::ec::rate_limiter::RateLimiter;
 
 /// The providers with a sticky opt-out (`ps.o`) in `entry`, unless a later
 /// `oc` clears it (spec 7.1).
@@ -37,6 +38,8 @@ pub(crate) struct RequestIdentity {
     dnt: bool,
     page_url: Option<Url>,
     runtime: Option<Arc<IdentityRuntime>>,
+    rate_limiter: Option<Arc<dyn RateLimiter + Send + Sync>>,
+    runs_auction: bool,
     mutation: IdentityMutation,
     pending_removals: Option<IdentityMutation>,
     removal_lost: u32,
@@ -96,6 +99,30 @@ impl RequestIdentity {
     #[must_use]
     pub(crate) fn runtime(&self) -> Option<&Arc<IdentityRuntime>> {
         self.runtime.as_ref()
+    }
+
+    /// The limiter the provider burst cap and circuit breaker count in, when
+    /// the adapter set one.
+    #[must_use]
+    pub(crate) fn rate_limiter(&self) -> Option<Arc<dyn RateLimiter + Send + Sync>> {
+        self.rate_limiter.clone()
+    }
+
+    /// Sets the limiter the hold dispatch counts in.
+    pub(crate) fn set_rate_limiter(&mut self, limiter: Arc<dyn RateLimiter + Send + Sync>) {
+        self.rate_limiter = Some(limiter);
+    }
+
+    /// Whether this navigation runs an auction, so hold-mode providers were
+    /// dispatched before it (or not at all) and phase 4 must not run them.
+    #[must_use]
+    pub(crate) fn runs_auction(&self) -> bool {
+        self.runs_auction
+    }
+
+    /// Records that this navigation runs an auction (spec 4.7 step 7).
+    pub(crate) fn set_runs_auction(&mut self, runs_auction: bool) {
+        self.runs_auction = runs_auction;
     }
 
     /// The writer's one flush.

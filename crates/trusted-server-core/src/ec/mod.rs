@@ -93,6 +93,7 @@ use self::identity::request::{RequestIdentity, WriterDecision};
 use self::identity::runtime::IdentityRuntime;
 use self::kv::{CreateIfAbsentOutcome, KvIdentityGraph, apply_partner_id_updates};
 use self::kv_types::KvEntry;
+use self::rate_limiter::RateLimiter;
 
 /// Bounded request classifications that may stage browser EID cookies.
 ///
@@ -573,6 +574,12 @@ impl EcContext {
     /// The adapter calls this where it builds the request's EC state.
     pub fn set_identity_runtime(&mut self, runtime: Arc<IdentityRuntime>) {
         self.identity.set_runtime(runtime);
+    }
+
+    /// Gives the request the limiter that counts provider calls for the burst
+    /// cap and the circuit breaker before the response is sent.
+    pub fn set_identity_rate_limiter(&mut self, limiter: Arc<dyn RateLimiter + Send + Sync>) {
+        self.identity.set_rate_limiter(limiter);
     }
 
     /// The identity runtime, when the adapter set one.

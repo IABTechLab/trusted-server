@@ -66,6 +66,7 @@ use crate::creative_opportunities::{
     AdStackGateInput, AssemblyMode, CreativeOpportunitiesConfig, RuntimeAdStackExpected,
     evaluate_ad_stack_gate,
 };
+use crate::ec::identity::coordinator::{HoldResults, hold_before_auction};
 use crate::ec::identity::mirror::MirrorPayload;
 use crate::ec::identity::policy::PolicySignals;
 use crate::ec::kv::KvIdentityGraph;
@@ -4902,6 +4903,10 @@ pub async fn handle_publisher_request(
         observation.set_origin_cache_shareable(origin_response_is_shareable && request_is_document);
 
         if should_run_auction {
+            // This navigation runs an auction: hold-mode providers run now,
+            // within their budget, and phase 4 leaves them alone (spec 4.7).
+            ec_context.identity_mut().set_runs_auction(true);
+            let hold = hold_before_auction(settings, services, ec_context);
             let slots_ctx = MatchedSlotsContext {
                 matched_slots: &matched_slots,
                 request_path: &request_path,
@@ -4925,6 +4930,7 @@ pub async fn handle_publisher_request(
                     signals: PolicySignals::from_headers(auction_client_request.headers()),
                     services,
                     geo: geo.as_ref(),
+                    hold: hold.as_ref(),
                     path_label: "Server-side",
                 },
             );
@@ -5524,6 +5530,9 @@ struct AuctionEidTargeting<'a> {
     signals: PolicySignals,
     services: &'a RuntimeServices,
     geo: Option<&'a GeoInfo>,
+    /// What the hold dispatch before this auction learned, on a writer
+    /// navigation that dispatched one. Page-bids and the tests pass `None`.
+    hold: Option<&'a HoldResults>,
     /// Prefix for the consent-stripped warning (e.g. `"Server-side"`).
     path_label: &'a str,
 }
@@ -5548,12 +5557,19 @@ fn apply_auction_eids_and_device(
     } else {
         None
     };
-    let identity = auction_identity(
+    let mut identity = auction_identity(
         targeting.kv_snapshot,
         targeting.partner_registry,
         targeting.ec_context,
         targeting.signals,
     );
+    if let (Some(hold), Some(registry), Some(runtime)) = (
+        targeting.hold,
+        targeting.partner_registry,
+        targeting.ec_context.identity_runtime(),
+    ) {
+        identity.add_hold_results(hold.clone(), registry, runtime.catalog());
+    }
     let merged_eids = identity.merge(client_eids.as_deref());
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
     auction_request.user.eids =
@@ -7110,6 +7126,7 @@ pub async fn handle_page_bids(
                     signals: PolicySignals::from_headers(req.headers()),
                     services,
                     geo: geo.as_ref(),
+                    hold: None,
                     path_label: "Page-bids",
                 },
             );
@@ -8007,6 +8024,7 @@ mod tests {
                 signals: PolicySignals::default(),
                 services: &services,
                 geo: None,
+                hold: None,
                 path_label: "Test",
             },
         );
@@ -8026,6 +8044,405 @@ mod tests {
                 }
             ]),
             "navigation and page-bids auctions should forward the cookie entry as sent, then KV-only sources"
+        );
+    }
+
+    /// Sends the origin's requests to a [`StubHttpClient`] and a hold
+    /// provider's to a [`FakeHttpClient`], so one navigation can reach both.
+    struct HoldRoutingClient {
+        origin: Arc<StubHttpClient>,
+        providers: Arc<crate::ec::identity::test_support::fake_http::FakeHttpClient>,
+        provider_hosts: Vec<String>,
+    }
+
+    struct RoutedPending {
+        provider: bool,
+        inner: crate::platform::PlatformPendingRequest,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::platform::PlatformHttpClient for HoldRoutingClient {
+        fn supports_concurrent_fanout(&self) -> bool {
+            false
+        }
+
+        async fn send(
+            &self,
+            request: crate::platform::PlatformHttpRequest,
+        ) -> Result<crate::platform::PlatformResponse, Report<crate::platform::PlatformError>>
+        {
+            self.origin.send(request).await
+        }
+
+        async fn send_async(
+            &self,
+            request: crate::platform::PlatformHttpRequest,
+        ) -> Result<crate::platform::PlatformPendingRequest, Report<crate::platform::PlatformError>>
+        {
+            let host = request.request.uri().host().unwrap_or_default().to_owned();
+            let provider = self.provider_hosts.contains(&host);
+            let inner = if provider {
+                self.providers.send_async(request).await?
+            } else {
+                self.origin.send_async(request).await?
+            };
+            Ok(crate::platform::PlatformPendingRequest::new(
+                RoutedPending { provider, inner },
+            ))
+        }
+
+        async fn select(
+            &self,
+            mut pending_requests: Vec<crate::platform::PlatformPendingRequest>,
+        ) -> Result<crate::platform::PlatformSelectResult, Report<crate::platform::PlatformError>>
+        {
+            let first = pending_requests.remove(0);
+            let ready = self.wait(first).await;
+            Ok(crate::platform::PlatformSelectResult {
+                ready,
+                remaining: pending_requests,
+                failed_backend_name: None,
+            })
+        }
+
+        async fn wait(
+            &self,
+            pending: crate::platform::PlatformPendingRequest,
+        ) -> Result<crate::platform::PlatformResponse, Report<crate::platform::PlatformError>>
+        {
+            let routed = pending
+                .downcast::<RoutedPending>()
+                .map_err(|_| Report::new(crate::platform::PlatformError::HttpClient))?;
+            if routed.provider {
+                self.providers.wait(routed.inner).await
+            } else {
+                self.origin.wait(routed.inner).await
+            }
+        }
+    }
+
+    /// What one writer navigation with a hold provider did.
+    struct HoldNavigation {
+        provider_hosts: Vec<String>,
+        auction_eids: serde_json::Value,
+        set_cookies: Vec<String>,
+        runs_auction: bool,
+        staged_sources: Vec<String>,
+    }
+
+    /// Drives a returning writer navigation that runs an auction, with one
+    /// hold-mode provider that answers `found` for `ids.example.com`.
+    async fn run_hold_navigation() -> HoldNavigation {
+        use crate::ec::identity::test_support::fake_http::{
+            AnsweringProvider, FakeBackend, FakeHttpClient,
+        };
+
+        let mut settings = scheduling_settings();
+        settings.ec.identity.providers.insert(
+            "hold-provider".to_owned(),
+            crate::settings::ProviderSettings {
+                mode: crate::settings::ProviderMode::Hold,
+                ..crate::settings::ProviderSettings::default()
+            },
+        );
+        let origin = Arc::new(StubHttpClient::new());
+        origin.push_response_with_headers(
+            200,
+            b"<html><body>ok</body></html>".to_vec(),
+            vec![("content-type", "text/html; charset=utf-8")],
+        );
+        let providers = Arc::new(FakeHttpClient::new());
+        providers.respond(
+            "hold.example.com",
+            200,
+            &serde_json::to_vec(&serde_json::json!({
+                "answer": "found",
+                "entries": [{ "uids": [{ "id": "nav-uid", "atype": 1 }] }]
+            }))
+            .expect("should serialize the answer"),
+        );
+        let client = Arc::new(HoldRoutingClient {
+            origin: Arc::clone(&origin),
+            providers: Arc::clone(&providers),
+            provider_hosts: vec!["hold.example.com".to_owned()],
+        });
+        let services = crate::platform::RuntimeServices::builder()
+            .config_store(Arc::new(crate::platform::test_support::NoopConfigStore))
+            .secret_store(Arc::new(NoopSecretStore))
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+            .backend(Arc::new(FakeBackend::new()))
+            .http_client(client)
+            .geo(Arc::new(crate::platform::test_support::NoopGeo))
+            .client_info(crate::platform::ClientInfo::default())
+            .build();
+
+        let ec_id = format!("{}.CkId01", "b".repeat(64));
+        let (graph, _store) = KvIdentityGraph::write_counting("hold-navigation-store");
+        graph
+            .create(
+                &ec_id,
+                &KvEntry::new(&scheduling_consent(), None, 1_000, "test-publisher.com"),
+            )
+            .expect("should seed the row");
+        let mut ec_context = EcContext::new_writer_for_test_with_ip(
+            Some(ec_id),
+            scheduling_consent(),
+            Some("203.0.113.7".to_owned()),
+        );
+        ec_context.identity_mut().set_writer_decision(
+            crate::ec::identity::request::WriterDecision {
+                writer: true,
+                is_real_browser: true,
+                user_agent: None,
+                dnt: false,
+                page_url: None,
+            },
+        );
+        ec_context.set_identity_runtime(Arc::new(
+            crate::ec::identity::IdentityRuntime::from_settings_with_providers(
+                &settings,
+                vec![
+                    AnsweringProvider::new(
+                        "hold-provider",
+                        "hold.example.com",
+                        "ids.example.com",
+                        None,
+                    )
+                    .into_provider(),
+                ],
+                std::collections::BTreeMap::new(),
+            )
+            .expect("should build the runtime"),
+        ));
+        let registry = PartnerRegistry::from_config(&[pull_partner_config("ids.example.com")])
+            .expect("should build partner registry");
+        let captured = Arc::new(Mutex::new(None));
+        let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        orchestrator.register_provider(Arc::new(SchedulingCaptureProvider {
+            captured: Arc::clone(&captured),
+            http: Arc::clone(&origin),
+            lookups: Arc::new(AtomicUsize::new(0)),
+        }));
+        let slots = [scheduling_slot()];
+
+        let response = handle_publisher_request(
+            &settings,
+            &services,
+            Some(&graph),
+            &mut ec_context,
+            AuctionDispatch {
+                orchestrator: &orchestrator,
+                slots: &slots,
+                registry: Some(&registry),
+            },
+            navigation_request(),
+            EdgeCacheHeader::SurrogateControl,
+        )
+        .await
+        .expect("should proxy the origin response");
+
+        let headers = match &response {
+            PublisherResponse::PassThrough { response, .. }
+            | PublisherResponse::Stream { response, .. }
+            | PublisherResponse::AssembleTemplate { response, .. }
+            | PublisherResponse::Buffered(response) => response.headers().clone(),
+        };
+        let auction_eids = captured
+            .lock()
+            .expect("should lock captured auction")
+            .take()
+            .map(|captured| {
+                serde_json::to_value(&captured.request.user.eids)
+                    .expect("should serialize the EIDs")
+            })
+            .expect("should have dispatched the auction");
+        HoldNavigation {
+            provider_hosts: providers.sent_hosts(),
+            auction_eids,
+            set_cookies: headers
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .map(|value| value.to_str().unwrap_or_default().to_owned())
+                .collect(),
+            runs_auction: ec_context.identity().runs_auction(),
+            staged_sources: ec_context
+                .identity()
+                .mutation()
+                .positive_changes()
+                .iter()
+                .filter_map(|change| match change {
+                    crate::ec::identity::mutation::PartnerIdChange::FillMissing {
+                        source, ..
+                    } => Some(source.to_string()),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn hold_answer_reaches_the_navigation_auction_and_the_writer_mutation() {
+        let navigation = run_hold_navigation().await;
+
+        assert_eq!(
+            navigation.provider_hosts,
+            ["hold.example.com"],
+            "should call the hold provider once, before the auction"
+        );
+        assert_eq!(
+            navigation.auction_eids,
+            serde_json::json!([
+                { "source": "ids.example.com", "uids": [{ "id": "nav-uid", "atype": 1 }] }
+            ]),
+            "should send the hold answer in this navigation's auction"
+        );
+        assert!(
+            navigation.runs_auction,
+            "should record that the navigation ran an auction, so phase 4 skips hold providers"
+        );
+        assert_eq!(
+            navigation.staged_sources,
+            ["ids.example.com"],
+            "should stage the answer in the writer's mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn hold_sets_no_cookie() {
+        let navigation = run_hold_navigation().await;
+
+        assert_eq!(
+            navigation.provider_hosts,
+            ["hold.example.com"],
+            "control: should have run the hold provider"
+        );
+        assert!(
+            navigation.set_cookies.is_empty(),
+            "should set no cookie from a hold answer: {:?}",
+            navigation.set_cookies
+        );
+    }
+
+    #[test]
+    fn full_set_hold_answer_is_sent_in_order_and_flushed_whole() {
+        use crate::ec::identity::descriptor::EidProvenance;
+        use crate::ec::identity::test_support::fake_http::AnsweringProvider;
+        use crate::ec::identity::test_support::hold_fixture::{HoldFixture, live_row};
+        use crate::ec::kv_types::{KvEid, KvUid};
+
+        let provider = AnsweringProvider::new(
+            "hold-provider",
+            "hold.example.com",
+            "ids.example.com",
+            Some(
+                EidProvenance::new()
+                    .with_inserter("default.example.com")
+                    .with_mm(2),
+            ),
+        )
+        .into_provider();
+        let mut fixture = HoldFixture::new(
+            vec![(provider, crate::settings::ProviderMode::Hold)],
+            &live_row(),
+            true,
+        );
+        fixture.client.respond(
+            "hold.example.com",
+            200,
+            &serde_json::to_vec(&serde_json::json!({
+                "answer": "found",
+                "entries": [
+                    {
+                        "uids": [{ "id": "uid-a", "atype": 1 }, { "id": "uid-b", "atype": 3 }],
+                        "inserter": "vendor.example.com"
+                    },
+                    { "uids": [{ "id": "uid-c", "atype": 1 }] }
+                ]
+            }))
+            .expect("should serialize the answer"),
+        );
+        let snapshot = fixture.context.kv_snapshot().clone();
+        let ec_id = fixture
+            .context
+            .ec_value()
+            .expect("should hold an EC ID")
+            .to_owned();
+        let registry = PartnerRegistry::from_config(&[pull_partner_config("ids.example.com")])
+            .expect("should build partner registry");
+
+        let hold = fixture.run_hold();
+        let services = noop_services();
+        let mut auction_request = canonical_parity_auction_request();
+        auction_request.user.consent = None;
+        auction_request.user.eids = None;
+        apply_auction_eids_and_device(
+            &mut auction_request,
+            &AuctionEidTargeting {
+                cookie_jar: None,
+                ec_id: Some(ec_id.as_str()),
+                kv_snapshot: &snapshot,
+                partner_registry: Some(&registry),
+                ec_context: &fixture.context,
+                signals: PolicySignals::default(),
+                services: &services,
+                geo: None,
+                hold: Some(&hold),
+                path_label: "Test",
+            },
+        );
+        let outcome = fixture.flush(http::StatusCode::OK);
+
+        assert_eq!(
+            serde_json::to_value(&auction_request.user.eids).expect("should serialize EIDs"),
+            serde_json::json!([
+                {
+                    "source": "ids.example.com",
+                    "inserter": "vendor.example.com",
+                    "uids": [{ "id": "uid-a", "atype": 1 }, { "id": "uid-b", "atype": 3 }]
+                },
+                {
+                    "source": "ids.example.com",
+                    "inserter": "default.example.com",
+                    "mm": 2,
+                    "uids": [{ "id": "uid-c", "atype": 1 }]
+                }
+            ]),
+            "should send both entries in order, the first as returned and the second with the provenance default"
+        );
+        assert_eq!(
+            outcome,
+            crate::ec::identity::flush::FlushOutcome::Written,
+            "should flush the answer"
+        );
+        let uid = |id: &str, atype: i32| KvUid {
+            id: id.to_owned(),
+            atype: Some(atype),
+            ext: None,
+        };
+        assert_eq!(
+            fixture.row().ids["ids.example.com"].eids,
+            vec![
+                KvEid {
+                    uids: vec![uid("uid-a", 1), uid("uid-b", 3)],
+                    inserter: Some("vendor.example.com".to_owned()),
+                    matcher: None,
+                    mm: None,
+                    ext: None,
+                },
+                KvEid {
+                    uids: vec![uid("uid-c", 1)],
+                    inserter: None,
+                    matcher: None,
+                    mm: None,
+                    ext: None,
+                },
+            ],
+            "should store the set as returned, without the default"
+        );
+        assert_eq!(
+            fixture.store.writes().total(),
+            1,
+            "should make the one flush write"
         );
     }
 
@@ -8061,6 +8478,7 @@ mod tests {
                 signals: PolicySignals::default(),
                 services: &services,
                 geo: None,
+                hold: None,
                 path_label: "Test",
             },
         );

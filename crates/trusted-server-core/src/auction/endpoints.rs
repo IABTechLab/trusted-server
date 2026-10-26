@@ -23,6 +23,7 @@ use crate::ec::eids::{ServerSet, server_set};
 use crate::ec::identity::IdentityRuntime;
 use crate::ec::identity::UnixTime;
 use crate::ec::identity::catalog::ProviderCatalog;
+use crate::ec::identity::coordinator::HoldResults;
 use crate::ec::identity::denials::{Denials, denials, filter_browser_candidates};
 use crate::ec::identity::mirror::{MirrorPayload, MirrorRead, MirrorSource, mirror_payload};
 use crate::ec::identity::policy::PolicySignals;
@@ -487,6 +488,20 @@ impl AuctionIdentity {
     #[must_use]
     pub(crate) fn server_eids(&self) -> Option<Vec<Eid>> {
         self.server.as_ref().map(ServerSet::eids)
+    }
+
+    /// Overlays the answers of the hold dispatch before this navigation's
+    /// auction onto the server set. A request that may not use KV IDs stays
+    /// without a set.
+    pub(crate) fn add_hold_results(
+        &mut self,
+        results: HoldResults,
+        registry: &PartnerRegistry,
+        catalog: &ProviderCatalog,
+    ) {
+        if let Some(server) = self.server.as_mut() {
+            server.with_hold_results(results, registry, catalog);
+        }
     }
 
     /// The request's bidstream EIDs before consent gating: the browser's
