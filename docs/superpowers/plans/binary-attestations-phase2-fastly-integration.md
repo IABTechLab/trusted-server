@@ -1,6 +1,6 @@
 # Phase 2 Fastly release integration — Gate 1
 
-**Status:** Proposed for user approval. This document authorizes no implementation. Continue the approved frozen-source port while this gate is pending.
+**Status:** Approved on 2026-10-26 for the ordinary-release adapter, writer, transfer binding and additive provenance subject, subject to the conditions below. Write and independently review the concrete implementation plan before implementation. Continue the frozen-source port meanwhile.
 
 **Goal:** Require a fresh Fastly A/B build comparison in the existing release path, publish an authenticated `trusted-server-fastly.wasm.rebuild-check.json`, and preserve the Phase 1 verification commands and identities.
 
@@ -8,7 +8,7 @@
 
 Approve or revise the ordinary-release comparison adapter below, including its explicitly narrower claim, receipt fields, transfer binding and additive signing inputs. This is a real equality gate for the existing ordinary release builds. It is **not** qualification of #1262's controlled recipes, sandbox, materials or alternate-user environment. If Phase 2 must ship the full controlled-recipe profile instead, defer wiring until its bootstrap/material/tool acquisition and unqualified execution authority have a separately approved design; do not open the existing qualified selectors to satisfy a deadline.
 
-Gate 1 approval authorizes writing/reviewing the concrete implementation plan and then implementing this ordinary adapter within the approved design; a material design change requires renewed approval. No adapter code may land before that approval. Approval of this design alone does not approve a new trigger, IAB setting change, production/qualified selection or qualification resource. The eventual integration must first be implemented and rehearsed in the fork; activating a new gate for IAB releases remains a separate maintainer decision. The port can land independently with current release behavior intact.
+Gate 1 approval authorizes writing/reviewing the concrete implementation plan and then implementing this ordinary adapter within the approved design; a material design change requires renewed approval. No adapter code may land before that approval. Approval of this design alone does not approve a new trigger, IAB setting change, production/qualified selection or qualification resource. The integration must first be implemented and rehearsed in the fork. **Merging Phase 2 is the maintainer activation decision:** the next real tag enforces the Fastly gate, without a separate switch. Each release costs one additional fresh Fastly build plus comparison, and signing/publication waits for both builds. Budget up to the 90-minute build ceiling plus ten-minute comparison ceiling; observed added wall time must be reported from rehearsal. A mismatch means no release.
 
 ## Source findings and alternatives
 
@@ -92,7 +92,13 @@ Preserve single-shot listing/refusal, draft creation, uploads and publication by
 
 ## Approval checklist
 
-- [ ] User accepts the ordinary-release adapter's narrower equality claim for this Phase 2 slice, or selects the controlled-recipe prerequisite alternative.
-- [ ] User approves the concrete informational writer/measurement/transfer contract and additive Fastly provenance subject.
-- [ ] User approves implementation after a concrete plan is written and independently reviewed within this design; qualification types/selectors and new triggers remain closed.
-- [ ] Before activation for IAB tags, maintainers separately accept the rehearsed gate and required runner/resource costs. This document changes no setting or release behavior.
+- [x] User accepts the ordinary-release adapter's narrower equality claim for this Phase 2 slice.
+- [x] User approves the concrete informational writer/measurement/transfer contract and additive Fastly provenance subject.
+- [x] User approves implementation after a concrete plan is written and independently reviewed within this design; qualification types/selectors and new triggers remain closed.
+- [ ] Rehearse the exact reviewed head and report time/cost and unchanged Phase 1 verification before merge. Merging Phase 2 activates the gate on the next real tag; no separate switch.
+
+## Approved forward-compatibility and mismatch conditions
+
+The filename `trusted-server-fastly.wasm.rebuild-check.json` is permanent. Phase 3 indexes and digests these exact bytes as a rebuild-check companion. A later controlled-recipe implementation supersedes the `ordinary-release-fastly-byte-equality-v1` profile in the same asset, using a distinct profile value while retaining version-1 shared identity/outcome/digest fields where compatible. Consumers must check the profile before interpreting assurance; an ordinary profile never proves controlled-recipe qualification. Any incompatible informational format change needs a separately reviewed version change, not an implicit reinterpretation.
+
+Rehearsal must verify the rebuild-check file itself against its SLSA provenance subject using the same reusable signer/source pins as the binary, then verify release membership and its checksum. It must also run the existing binary provenance/SPDX commands unchanged after adding the subject. A real nondeterministic mismatch is a stop-and-report event: retain bounded diagnostics and ask for a decision. Never weaken byte comparison, normalize regions or add exclusions to obtain a match.

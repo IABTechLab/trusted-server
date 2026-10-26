@@ -303,3 +303,11 @@ Post-publish downloads use fresh temporary directories and bounded transient rea
 ### Follow-ups
 
 - Axum invalid-port diagnostics: `PORT=0` is correctly refused, but the forwarded EdgeZero warning names `EDGEZERO__ADAPTER__PORT="0"` and says “falling back.” Reword the error to name the actual supplied variable and state that startup is refused. This changes the binary and requires a fresh rehearsal; it is not part of this docs-only update.
+
+## Approved Phase 2 rebuild-check compatibility
+
+Gate 1's ordinary-release Fastly adapter was approved on 2026-10-26; implementation follows a separately reviewed concrete plan. The asset name `trusted-server-fastly.wasm.rebuild-check.json` stays fixed. Its version-1 `ordinary-release-fastly-byte-equality-v1` profile proves only the documented ordinary A/B comparison, with `release_qualification:false`. Consumers must check `profile`; matching digests do not imply controlled-recipe qualification.
+
+Phase 3 will index and digest this same companion. Later controlled-recipe evidence may supersede the ordinary profile in the same filename using a distinct profile value while preserving compatible version-1 source, outcome and digest joins. Incompatible informational changes need an explicit reviewed version change; neither a filename change nor silently stronger interpretation is allowed.
+
+The Fastly provenance attestation adds the rebuild-check subject while retaining the existing reusable signer identity and bundle name. Rehearsal must prove that existing binary verification commands pass unchanged and separately verify the rebuild-check's provenance, release membership and checksum. Merging Phase 2 activates the gate on the next real tag, adding a second Fastly build and comparison before signing. A mismatch prevents release; retain bounded diagnostics and ask for a decision without exclusions or weaker comparison.
