@@ -89,7 +89,8 @@ fn known_child_without_consent(consent: &ConsentContext) -> bool {
 ///
 /// - bits 0 to 9: TCF purposes 1 to 10, set when consent grants the purpose
 /// - bit 10: the policy's vendor, set when consent grants it
-/// - bit 11: the US sale opt-out, from `us_privacy` or GPP
+/// - bit 11: the US sale opt-out, from `us_privacy`, a GPP US section or GPP
+///   section 6
 /// - bit 12: GPC
 /// - bit 13: DNT
 /// - bit 14: the US sharing opt-out
@@ -167,9 +168,14 @@ pub(crate) fn policy_allows(
     {
         return false;
     }
-    // A known child without consent blocks every provider, whatever the
-    // policy relaxes.
-    if known_child_without_consent(consent) {
+    // A known child, or a US section whose opt-outs could not be read, blocks
+    // every provider whatever the policy relaxes.
+    if known_child_without_consent(consent)
+        || consent
+            .gpp
+            .as_ref()
+            .is_some_and(|gpp| gpp.us_section_decode_failed)
+    {
         return false;
     }
     if tcf_applies(consent) {
@@ -465,6 +471,42 @@ mod tests {
                 PolicySignals { dnt: false }
             ),
             "should fail closed on a GPP string that has no decoded form"
+        );
+    }
+
+    #[test]
+    fn corrupt_us_section_blocks_strict_and_ignores_relaxations() {
+        let corrupt = decode_gpp_string("DBABL~not-a-valid-usnat-section")
+            .expect("should decode the GPP header with a raw section");
+        assert!(
+            corrupt.us_section_decode_failed,
+            "should flag the undecodable US section"
+        );
+        let mut consent = consent_with(Signals::default());
+        consent.raw_gpp_string = Some("corrupt".to_owned());
+        consent.gpp = Some(corrupt);
+        let relaxed = ConsentPolicy::strict()
+            .allowing_gpc()
+            .allowing_dnt()
+            .allowing_us_opt_out(UsOptOut::Sale)
+            .allowing_us_opt_out(UsOptOut::Sharing)
+            .allowing_us_opt_out(UsOptOut::TargetedAdvertising);
+        assert!(
+            !allows(&ConsentPolicy::strict(), &consent),
+            "should block strict on an undecodable US section"
+        );
+        assert!(
+            !allows(&relaxed, &consent),
+            "should block whatever the policy relaxes"
+        );
+        assert!(
+            allows(&ConsentPolicy::eid_persistence_only(), &consent),
+            "should leave generic pull's parity policy at the global gates"
+        );
+        let control = consent_with_gpp(|_| {});
+        assert!(
+            allows(&ConsentPolicy::strict(), &control),
+            "should allow a decodable GPP string under the same policy"
         );
     }
 

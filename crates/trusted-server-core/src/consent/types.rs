@@ -353,6 +353,10 @@ pub struct GppConsent {
     /// The US Privacy string carried as GPP section 6, read through the
     /// standalone US Privacy decoder. `None` when absent or undecodable.
     pub us_privacy_section: Option<UsPrivacy>,
+    /// Whether a US section (IDs 7–23) or section 6 was present but failed to
+    /// decode, so its opt-outs are unknown. Strict identity policies fail
+    /// closed on it.
+    pub us_section_decode_failed: bool,
 }
 
 // ---------------------------------------------------------------------------

@@ -791,6 +791,7 @@ mod tests {
                 us_gpc: None,
                 us_known_child: None,
                 us_privacy_section: None,
+                us_section_decode_failed: false,
             }),
             ..ConsentContext::default()
         }
@@ -808,6 +809,7 @@ mod tests {
             us_gpc: None,
             us_known_child: None,
             us_privacy_section: None,
+            us_section_decode_failed: false,
         };
         let cases = [
             (
@@ -973,6 +975,7 @@ mod tests {
                 us_gpc: None,
                 us_known_child: None,
                 us_privacy_section: None,
+                us_section_decode_failed: false,
             }),
             ..ConsentContext::default()
         };
@@ -1139,6 +1142,7 @@ mod tests {
                 us_gpc: None,
                 us_known_child: None,
                 us_privacy_section: None,
+                us_section_decode_failed: false,
             }),
             ..ConsentContext::default()
         };
@@ -1257,6 +1261,7 @@ mod tests {
                 us_gpc: None,
                 us_known_child: None,
                 us_privacy_section: None,
+                us_section_decode_failed: false,
             }),
             gdpr_applies: true,
             ..ConsentContext::default()
@@ -1477,6 +1482,7 @@ mod tests {
                 us_gpc: None,
                 us_known_child: None,
                 us_privacy_section: None,
+                us_section_decode_failed: false,
             }),
             ..ConsentContext::default()
         };
@@ -1500,6 +1506,7 @@ mod tests {
                 us_gpc: None,
                 us_known_child: None,
                 us_privacy_section: None,
+                us_section_decode_failed: false,
             }),
             ..ConsentContext::default()
         };
@@ -1528,6 +1535,7 @@ mod tests {
                 us_gpc: None,
                 us_known_child: None,
                 us_privacy_section: None,
+                us_section_decode_failed: false,
             }),
             ..ConsentContext::default()
         };
@@ -1552,6 +1560,7 @@ mod tests {
                 us_gpc: None,
                 us_known_child: None,
                 us_privacy_section: None,
+                us_section_decode_failed: false,
             }),
             ..ConsentContext::default()
         };
@@ -1579,6 +1588,7 @@ mod tests {
                 us_gpc: None,
                 us_known_child: None,
                 us_privacy_section: None,
+                us_section_decode_failed: false,
             }),
             us_privacy: Some(UsPrivacy {
                 version: 1,
@@ -1612,6 +1622,7 @@ mod tests {
                 us_gpc: None,
                 us_known_child: None,
                 us_privacy_section: None,
+                us_section_decode_failed: false,
             }),
             us_privacy: Some(UsPrivacy {
                 version: 1,

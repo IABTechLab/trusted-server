@@ -71,7 +71,8 @@ pub fn decode_gpp_string(gpp_string: &str) -> Result<GppConsent, Report<ConsentD
     // Section ID 2 = TcfEuV2 in the GPP spec.
     let eu_tcf = decode_tcf_from_gpp(&parsed);
 
-    let us_sections = decode_us_sections(&parsed);
+    let (us_sections, us_sections_failed) = decode_us_sections(&parsed);
+    let us_privacy_section = decode_us_privacy_section(&parsed);
     let us_sale_opt_out = aggregate_us_signal(&us_sections, us_sale_opt_out_from_section);
 
     Ok(GppConsent {
@@ -87,7 +88,8 @@ pub fn decode_gpp_string(gpp_string: &str) -> Result<GppConsent, Report<ConsentD
         ),
         us_gpc: aggregate_us_signal(&us_sections, us_gpc_from_section),
         us_known_child: aggregate_us_signal(&us_sections, us_known_child_from_section),
-        us_privacy_section: decode_us_privacy_section(&parsed),
+        us_privacy_section: us_privacy_section.clone().unwrap_or(None),
+        us_section_decode_failed: us_sections_failed || us_privacy_section.is_err(),
     })
 }
 
@@ -123,9 +125,11 @@ const US_SECTION_ID_RANGE: std::ops::RangeInclusive<u16> = 7..=23;
 /// Decodes every US section (IDs 7–23) in a parsed GPP string.
 ///
 /// A section that fails to decode is logged and skipped, so one malformed
-/// section never hides a valid one.
-fn decode_us_sections(parsed: &iab_gpp::v1::GPPString) -> Vec<iab_gpp::sections::Section> {
-    parsed
+/// section never hides a valid one. The flag is `true` when any US section
+/// failed to decode, so its opt-outs are unknown.
+fn decode_us_sections(parsed: &iab_gpp::v1::GPPString) -> (Vec<iab_gpp::sections::Section>, bool) {
+    let mut failed = false;
+    let sections = parsed
         .section_ids()
         .filter(|id| US_SECTION_ID_RANGE.contains(&(**id as u16)))
         .filter_map(
@@ -133,11 +137,13 @@ fn decode_us_sections(parsed: &iab_gpp::v1::GPPString) -> Vec<iab_gpp::sections:
                 Ok(section) => Some(section),
                 Err(e) => {
                     log::warn!("Failed to decode US GPP section {us_section_id}: {e}");
+                    failed = true;
                     None
                 }
             },
         )
-        .collect()
+        .collect();
+    (sections, failed)
 }
 
 /// Aggregates one boolean signal across decoded US sections, conservatively:
@@ -283,14 +289,17 @@ fn us_known_child_from_section(section: &iab_gpp::sections::Section) -> Option<b
 }
 
 /// Reads GPP section 6, the US Privacy string, through the standalone
-/// decoder. Returns `None` when absent or undecodable.
-fn decode_us_privacy_section(parsed: &iab_gpp::v1::GPPString) -> Option<UsPrivacy> {
-    let raw = parsed.section(iab_gpp::sections::SectionId::UspV1)?;
+/// decoder. Returns `None` when absent, and `Err` when present but
+/// undecodable.
+fn decode_us_privacy_section(parsed: &iab_gpp::v1::GPPString) -> Result<Option<UsPrivacy>, ()> {
+    let Some(raw) = parsed.section(iab_gpp::sections::SectionId::UspV1) else {
+        return Ok(None);
+    };
     match super::us_privacy::decode_us_privacy(raw) {
-        Ok(us_privacy) => Some(us_privacy),
+        Ok(us_privacy) => Ok(Some(us_privacy)),
         Err(e) => {
             log::warn!("GPP contains a US Privacy section but decoding failed: {e}");
-            None
+            Err(())
         }
     }
 }
@@ -864,5 +873,26 @@ mod tests {
             "should leave section 6 unset"
         );
         assert!(result.eu_tcf.is_none(), "should carry no TCF section");
+    }
+
+    #[test]
+    fn flags_a_us_section_or_section_6_that_fails_to_decode() {
+        let corrupt_us = decode_gpp_string(&gpp_with_sections(&[(7, "not-a-valid-usnat-section")]))
+            .expect("should decode the header");
+        assert!(
+            corrupt_us.us_section_decode_failed,
+            "should flag an undecodable US section"
+        );
+        let corrupt_usp = decode_gpp_string(&gpp_with_sections(&[(6, "garbage")]))
+            .expect("should decode the header");
+        assert!(
+            corrupt_usp.us_section_decode_failed,
+            "should flag an undecodable section 6"
+        );
+        let valid = decode_gpp_string(GPP_USP_ONLY).expect("should decode USP only");
+        assert!(
+            !valid.us_section_decode_failed,
+            "should not flag a decodable string"
+        );
     }
 }

@@ -1446,7 +1446,6 @@ pub(crate) fn dispatch(
 
 #[cfg(test)]
 mod tests {
-    use crate::ec::identity::policy::fingerprint_bits;
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1462,6 +1461,7 @@ mod tests {
         ConsentPolicy, Input, ProviderDescriptor, ResolveKind, Resolves, UsOptOut,
     };
     use crate::ec::identity::input::{ProviderConsent, SeededRandom, ThreadRandom};
+    use crate::ec::identity::policy::fingerprint_bits;
     use crate::ec::identity::resolution::{ResolvedEid, ResolvedUid};
     use crate::ec::identity::revision::{record_revision, uid_hash};
     use crate::ec::identity::test_support::fake_http::{
@@ -2287,6 +2287,7 @@ mod tests {
             us_gpc: None,
             us_known_child: None,
             us_privacy_section: None,
+            us_section_decode_failed: false,
         });
         assert_eq!(
             bits(&gpp_sale, signals),

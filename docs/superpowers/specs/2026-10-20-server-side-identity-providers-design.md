@@ -2677,7 +2677,10 @@ Rules:
   - GPP section 6, the US Privacy string inside GPP, which the decoder skips
     today (`consent/gpp.rs:112`), and the US National section's GPC and
     known-child fields. This work decodes them too. A known child without
-    consent blocks every provider.
+    consent blocks every provider, except generic pull's parity policy
+    (`eid_persistence_only`), which keeps only the global gates so pull sync
+    behaves as it does today. A US section or section 6 that is present but
+    fails to decode blocks every provider the same way (fail closed).
   - `Sec-GPC` (`consent/extraction.rs:25-50`).
   - DNT, captured in phase 1 (section 4.4). TS reads it today only for the
     auction (`auction/routing.rs:336`).
