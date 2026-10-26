@@ -99,6 +99,10 @@ fn checked_sources() -> &'static [(&'static str, &'static str)] {
         ("ec/identity/input.rs", include_str!("ec/identity/input.rs")),
         ("ec/identity/mod.rs", include_str!("ec/identity/mod.rs")),
         (
+            "ec/identity/mirror.rs",
+            include_str!("ec/identity/mirror.rs"),
+        ),
+        (
             "ec/identity/mutation.rs",
             include_str!("ec/identity/mutation.rs"),
         ),
