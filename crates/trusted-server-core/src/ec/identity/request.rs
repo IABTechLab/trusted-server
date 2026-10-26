@@ -41,6 +41,7 @@ pub(crate) struct RequestIdentity {
     pending_removals: Option<IdentityMutation>,
     removal_lost: u32,
     cookie_header_bytes: usize,
+    create_attempts: u32,
     capture_unpersisted: BTreeMap<(IdentityProviderId, SourceDomain), u32>,
 }
 
@@ -123,6 +124,17 @@ impl RequestIdentity {
     #[must_use]
     pub(crate) fn removal_lost(&self) -> u32 {
         self.removal_lost
+    }
+
+    /// Create writes the new-EC path attempted before routing.
+    #[must_use]
+    pub(crate) fn create_attempts(&self) -> u32 {
+        self.create_attempts
+    }
+
+    /// Counts one create write of the new-EC path.
+    pub(crate) fn record_create_attempt(&mut self) {
+        self.create_attempts = self.create_attempts.saturating_add(1);
     }
 
     /// The inbound `Cookie` header size in bytes.

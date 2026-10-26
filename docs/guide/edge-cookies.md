@@ -270,9 +270,9 @@ The relevant OpenRTB structure forwarded to Prebid Server and downstream partner
 
 Browser EIDs are forwarded as sent; KV adds EIDs only for registered sources the browser did not send. Browser-supplied EIDs, from the `/auction` request body, the `ts-eids` cookie, or the `sharedId` cookie, only fill partner UIDs that are missing from KV; a different stored UID is kept, as described in [Prebid EID Flow](#prebid-eid-flow).
 
-### One KV Write per Page Load
+### One KV Write per EC-Bearing Request
 
-Only one request per page view writes browser-driven identity changes to KV: a full page navigation from a returning visitor (a request that already carries a valid `ts-ec`). Every other route reads KV and stages its changes but never writes them:
+At most one request per page view writes browser-driven identity changes to KV: a full page navigation from a returning visitor (a request that already carries a valid `ts-ec`). Every other route reads KV and stages its changes but never writes them:
 
 - `/auction`, `/_ts/page-bids` and `/_ts/api/v1/identify` no longer write KV.
 - The writer request collects every change from the page load: browser EIDs from the `ts-eids` and `sharedId` cookies, pull partner results and the cluster size. It sends the response first, then writes everything once, after send, with a generation check. A failed write is not retried as a whole.

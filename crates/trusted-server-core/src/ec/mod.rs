@@ -88,7 +88,7 @@ use crate::settings::Settings;
 use device::DeviceSignals;
 
 use self::finalize::BrowserSeed;
-use self::identity::measurement::{IdentityMeasurement, MeasurementInput, RouteKind, flush_label};
+use self::identity::measurement::{IdentityMeasurement, MeasurementInput, RouteKind};
 use self::identity::request::{RequestIdentity, WriterDecision};
 use self::identity::runtime::IdentityRuntime;
 use self::kv::{CreateIfAbsentOutcome, KvIdentityGraph, apply_partner_id_updates};
@@ -432,6 +432,7 @@ impl EcContext {
             apply_partner_id_updates(&mut entry, seed.updates());
 
             if let Some(graph) = kv {
+                self.identity.record_create_attempt();
                 match graph.create_if_absent(&ec_id, &entry) {
                     Ok(CreateIfAbsentOutcome::Written) => {
                         self.kv_snapshot = EcKvSnapshot::Present {
@@ -541,11 +542,15 @@ impl EcContext {
         IdentityMeasurement {
             cookie_header_bytes: self.identity.cookie_header_bytes(),
             route,
-            kv_reads: input
-                .kv_reads
-                .saturating_add(u32::from(input.phase_one_read)),
-            kv_writes: input.kv_writes,
-            flush: flush_label(input.flush),
+            // A snapshot that came from the new-EC create read nothing, and
+            // each create attempt is one write made before routing.
+            kv_reads: input.kv_reads.saturating_add(u32::from(
+                input.phase_one_read && self.identity.create_attempts() == 0,
+            )),
+            kv_writes: input
+                .kv_writes
+                .saturating_add(self.identity.create_attempts()),
+            flush: input.flush.copied(),
             removal_lost: self.identity.removal_lost(),
             withdrawal_after_send: input.withdrawal_after_send,
             withdrawal_after_send_failed: input.withdrawal_after_send_failed,

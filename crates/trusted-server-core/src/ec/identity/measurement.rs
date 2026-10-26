@@ -3,6 +3,8 @@
 //! It carries sizes, counts and labels only: no EC ID, no UID and no cookie
 //! value can reach it (spec 9.3).
 
+use core::fmt::Write as _;
+
 use super::flush::FlushOutcome;
 
 /// What kind of identity route the request was.
@@ -43,7 +45,7 @@ pub struct IdentityMeasurement {
     pub(crate) route: RouteKind,
     pub(crate) kv_reads: u32,
     pub(crate) kv_writes: u32,
-    pub(crate) flush: String,
+    pub(crate) flush: Option<FlushOutcome>,
     pub(crate) removal_lost: u32,
     pub(crate) withdrawal_after_send: bool,
     pub(crate) withdrawal_after_send_failed: bool,
@@ -74,10 +76,10 @@ impl IdentityMeasurement {
         self.kv_writes
     }
 
-    /// The phase 4 outcome label.
+    /// How phase 4 ended, or `None` when it did not run.
     #[must_use]
-    pub fn flush(&self) -> &str {
-        &self.flush
+    pub fn flush(&self) -> Option<FlushOutcome> {
+        self.flush
     }
 
     /// Removals every attempt failed to write.
@@ -114,7 +116,7 @@ impl core::fmt::Display for IdentityMeasurement {
             self.route,
             self.kv_reads,
             self.kv_writes,
-            self.flush,
+            FlushLabel(self.flush),
             self.removal_lost,
             u8::from(self.withdrawal_after_send),
             u8::from(self.withdrawal_after_send_failed),
@@ -122,41 +124,58 @@ impl core::fmt::Display for IdentityMeasurement {
     }
 }
 
-/// The label for a phase 4 outcome: lower snake case, with a drop reason
+/// A phase 4 outcome as a lower snake case label, with a drop reason
 /// appended.
-pub(crate) fn flush_label(flush: Option<&FlushOutcome>) -> String {
-    match flush {
-        None => "not_run".to_owned(),
-        Some(FlushOutcome::Skipped) => "skipped".to_owned(),
-        Some(FlushOutcome::NoChange) => "no_change".to_owned(),
-        Some(FlushOutcome::Written) => "written".to_owned(),
-        Some(FlushOutcome::Dropped(reason)) => {
-            format!("dropped_{}", reason.replace(' ', "_"))
+pub(crate) struct FlushLabel(pub(crate) Option<FlushOutcome>);
+
+impl core::fmt::Display for FlushLabel {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            None => formatter.write_str("not_run"),
+            Some(FlushOutcome::Skipped) => formatter.write_str("skipped"),
+            Some(FlushOutcome::NoChange) => formatter.write_str("no_change"),
+            Some(FlushOutcome::Written) => formatter.write_str("written"),
+            Some(FlushOutcome::Dropped(reason)) => {
+                formatter.write_str("dropped_")?;
+                reason.chars().try_for_each(|character| {
+                    formatter.write_char(if character == ' ' { '_' } else { character })
+                })
+            }
+            Some(FlushOutcome::WriteFailed { .. }) => formatter.write_str("write_failed"),
         }
-        Some(FlushOutcome::WriteFailed { .. }) => "write_failed".to_owned(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ec::identity::removal::RemovalWriteOutcome;
 
     #[test]
     fn flush_label_covers_every_outcome() {
-        assert_eq!(
-            flush_label(None),
-            "not_run",
-            "should label a skipped phase 4"
-        );
-        assert_eq!(
-            flush_label(Some(&FlushOutcome::Dropped("read failed"))),
-            "dropped_read_failed",
-            "should join a drop reason with underscores"
-        );
-        assert_eq!(
-            flush_label(Some(&FlushOutcome::Written)),
-            "written",
-            "should label a landed write"
-        );
+        let cases = [
+            (None, "not_run"),
+            (Some(FlushOutcome::Skipped), "skipped"),
+            (Some(FlushOutcome::NoChange), "no_change"),
+            (Some(FlushOutcome::Written), "written"),
+            (
+                Some(FlushOutcome::Dropped("read failed")),
+                "dropped_read_failed",
+            ),
+            (
+                Some(FlushOutcome::WriteFailed {
+                    removals: RemovalWriteOutcome::Failed,
+                }),
+                "write_failed",
+            ),
+        ];
+
+        for (outcome, expected) in cases {
+            assert_eq!(
+                FlushLabel(outcome).to_string(),
+                expected,
+                "should label {outcome:?}"
+            );
+        }
     }
 }

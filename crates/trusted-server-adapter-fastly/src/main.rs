@@ -1134,7 +1134,7 @@ mod tests {
         );
         assert_eq!(
             measurement.flush(),
-            "written",
+            Some(FlushOutcome::Written),
             "should hold the phase 4 outcome"
         );
         assert_eq!(measurement.removal_lost(), 0, "should lose no removal");
@@ -2223,6 +2223,36 @@ mod tests {
             value: &str,
         ) -> HttpRequest {
             with_header(navigation(cookie), name, value)
+        }
+
+        #[test]
+        fn identity_measurement_counts_the_create_write_of_a_new_ec_navigation() {
+            let scenario = Scenario::new();
+            let cookie = format!("sharedId={SHARED_ID}");
+
+            let (outcome, measurement) =
+                drive_measured_for_test(&scenario.state, navigation(Some(&cookie)));
+
+            assert_eq!(
+                measurement.route(),
+                RouteKind::NewEc,
+                "should label a first visit as a new EC"
+            );
+            assert_eq!(
+                measurement.kv_writes(),
+                1,
+                "should count the create write and no other"
+            );
+            assert_eq!(
+                measurement.kv_reads(),
+                0,
+                "should count no read: the create reads nothing"
+            );
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::Skipped),
+                "should not flush a new visitor"
+            );
         }
 
         #[test]
