@@ -4,6 +4,8 @@ mod documents;
 mod error;
 #[allow(dead_code, reason = "source closure caller is staged in Phase 2")]
 mod git_objects;
+#[allow(dead_code, reason = "ordinary adapter command assembly is pending")]
+mod ordinary;
 #[allow(dead_code, reason = "confined execution callers are staged in Phase 2")]
 mod process;
 
