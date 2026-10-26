@@ -63,9 +63,13 @@ const OPT_OUT_FINGERPRINT_MAX_HEX_LEN: usize = 16;
 /// Full KV entry stored as the body of an EC identity graph record.
 ///
 /// **KV key:** Full EC ID (`{64hex}.{6alnum}`).
-/// **KV value:** JSON-serialized `KvEntry`. Typically a few hundred bytes to
-/// 2KB; with every cap of spec 6.1 reached (32 sources of 4KB entry sets, plus
-/// provider state) it can approach 150KB, which is far below the store limit.
+/// **KV value:** JSON-serialized `KvEntry`. This is a documented estimate, not
+/// an enforced limit (spec 6.1): a one-UID record is about 120 bytes, and a
+/// record at every cap is about 4.2 KB. With every cap reached, eight owned
+/// sources come to about 34 KB, plus 1 KB for each provider with state, and
+/// `ps.iv` and `ps.ov` add up to 2.4 KB each per provider. A row with two full
+/// sets and two stateful providers at every cap is about 15 KB, and typical
+/// sets are far smaller.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct KvEntry {
     /// Schema version — always [`SCHEMA_VERSION`].
