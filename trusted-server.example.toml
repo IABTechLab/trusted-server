@@ -79,11 +79,31 @@ passphrase = "ec_passphrase"
 # bound per adapter (e.g. `ec_identity_store` in fastly.toml); edgezero.toml's
 # logical KV id is `trusted_server_kv`.
 ec_store = "ec_identity_store"
-# Max concurrent partner pull-sync requests.
-pull_sync_concurrency = 3
 # Optional cluster-heuristic tuning (defaults shown):
 # cluster_trust_threshold = 10    # entries with cluster_size <= this are individual users
 # cluster_recheck_secs = 3600     # re-evaluate cluster_size after this many seconds
+
+# Server-side identity provider policy (defaults shown except max_concurrency).
+[ec.identity]
+# Max identity providers dispatched at once.
+max_concurrency = 3
+# Total time a navigation may wait for hold-mode providers (at most 1000).
+# hold_budget_ms = 100
+# Seconds before a provider that timed out in hold mode is held again.
+# hold_retry_sec = 300
+# Largest provider response body accepted, in bytes.
+# max_response_bytes = 65536
+
+# Per-provider policy; the table name is the identity provider ID.
+# [ec.identity.providers.example-provider]
+# mode = "after_send"             # or "hold"
+# timeout_ms = 100                # hold mode only; at most hold_budget_ms
+# after_send_timeout_ms = 1000    # 1..=10000
+# refresh_after_sec = 86400
+# max_calls_per_minute = 1
+# breaker_failures_per_minute = 50
+# cookie_priority = 0
+# revoke_scope = "provider"       # or "global"
 
 # Example partner configuration. Provision referenced keys in
 # trusted_server_secrets before validating/pushing.

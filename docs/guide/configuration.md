@@ -634,6 +634,31 @@ The legacy `[consent].consent_store` setting has been removed. Trusted Server us
 
 Legacy consent-store records are not read or migrated into `ec.ec_store`. Their payload schema is not authoritative EC lifecycle state, so do not copy those records into the identity store. You may retain the old store unchanged for a defined rollback window, then unlink its platform resource binding and delete it. No browser-cookie or EC identity-store migration is required.
 
+### Identity Providers (`[ec.identity]`)
+
+Policy for server-side identity providers. The table is optional; every key has a default. `ec.pull_sync_concurrency` was removed: a config that sets it fails validation. Use `max_concurrency` instead.
+
+| Field                | Type    | Default | Description                                                             |
+| -------------------- | ------- | ------- | ----------------------------------------------------------------------- |
+| `max_concurrency`    | Integer | `4`     | Maximum providers dispatched at once (at least 1)                       |
+| `hold_budget_ms`     | Integer | `100`   | Total time a navigation may wait for hold-mode providers (at most 1000) |
+| `hold_retry_sec`     | Integer | `300`   | Seconds before a provider that timed out in hold mode is held again     |
+| `max_response_bytes` | Integer | `65536` | Largest provider response body accepted                                 |
+
+Each provider can have an `[ec.identity.providers.<id>]` table:
+
+| Field                         | Type    | Default      | Description                                                        |
+| ----------------------------- | ------- | ------------ | ------------------------------------------------------------------ |
+| `mode`                        | String  | `after_send` | `hold` or `after_send`                                             |
+| `timeout_ms`                  | Integer | none         | Hold-mode timeout, at most `hold_budget_ms`; the budget when unset |
+| `after_send_timeout_ms`       | Integer | `1000`       | Timeout for any dispatch after send, `1` to `10000`                |
+| `sources`                     | Array   | none         | Source domains the provider may write                              |
+| `refresh_after_sec`           | Integer | `86400`      | Seconds before a stored ID is refreshed (greater than 0)           |
+| `max_calls_per_minute`        | Integer | `1`          | Provider calls allowed per minute                                  |
+| `breaker_failures_per_minute` | Integer | `50`         | Failures per minute that open the circuit breaker                  |
+| `cookie_priority`             | Integer | `0`          | Ordering of the provider's ID when the cookie is trimmed           |
+| `revoke_scope`                | String  | `provider`   | `provider` or `global`                                             |
+
 ### `[ec]`
 
 `passphrase` is a key name in `trusted_server_secrets`; the resolved value must
@@ -643,7 +668,6 @@ be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 | ------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
 | `passphrase`              | String         | Yes      | Publisher passphrase used as HMAC key                                   |
 | `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
-| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response              |
 | `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                     |
 | `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
 | `partners`                | Array          | No       | Static partner registry entries                                         |

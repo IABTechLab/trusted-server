@@ -291,7 +291,7 @@ mod tests {
             "should preserve publisher domain"
         );
         assert_eq!(
-            reconstructed.ec.pull_sync_concurrency, original.ec.pull_sync_concurrency,
+            reconstructed.ec.identity.max_concurrency, original.ec.identity.max_concurrency,
             "should preserve numeric fields"
         );
         assert_eq!(

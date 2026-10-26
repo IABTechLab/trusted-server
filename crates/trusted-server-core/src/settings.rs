@@ -6,7 +6,7 @@ use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
 use sha2::{Digest as _, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -20,6 +20,7 @@ use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
 use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
+use crate::ec::identity::IdentityProviderId;
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
@@ -548,9 +549,17 @@ pub struct Ec {
     #[serde(default)]
     pub ec_store: Option<String>,
 
-    /// Maximum number of concurrent pull-sync requests.
-    #[serde(default = "Ec::default_pull_sync_concurrency")]
-    pub pull_sync_concurrency: usize,
+    /// Server-side identity provider policy (`[ec.identity]`).
+    #[serde(default)]
+    pub identity: IdentitySettings,
+
+    /// Catches the removed `pull_sync_concurrency` key.
+    ///
+    /// The key was replaced by `[ec.identity].max_concurrency`. It is parsed
+    /// only so validation can name its replacement instead of failing with a
+    /// generic unknown-field message, and it is never serialized.
+    #[serde(default, rename = "pull_sync_concurrency", skip_serializing)]
+    pub removed_pull_sync_concurrency: Option<serde_json::Value>,
 
     /// Entries with `cluster_size` at or below this value are treated as
     /// individual users for identity resolution. B2B publishers should
@@ -581,12 +590,6 @@ impl Ec {
         "trusted-server-placeholder-secret",
         "replace-with-random-ec-passphrase",
     ];
-
-    /// Default maximum concurrent pull-sync requests.
-    #[must_use]
-    pub const fn default_pull_sync_concurrency() -> usize {
-        3
-    }
 
     /// Default cluster trust threshold.
     #[must_use]
@@ -630,6 +633,195 @@ impl Ec {
             return Err(ValidationError::new("short_passphrase"));
         }
         Ok(())
+    }
+}
+
+/// Server-side identity provider policy.
+///
+/// Mapped from the `[ec.identity]` TOML section. Unlike the rest of the
+/// settings, this table and its provider tables accept unknown keys, so a
+/// rollback to an earlier release still loads a config written for a later one.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IdentitySettings {
+    /// Maximum providers dispatched at once.
+    #[serde(default = "IdentitySettings::default_max_concurrency")]
+    pub max_concurrency: usize,
+
+    /// Total time a navigation may wait for hold-mode providers.
+    #[serde(default = "IdentitySettings::default_hold_budget_ms")]
+    pub hold_budget_ms: u64,
+
+    /// Seconds before a provider that timed out in hold mode is held again.
+    #[serde(default = "IdentitySettings::default_hold_retry_sec")]
+    pub hold_retry_sec: u64,
+
+    /// Largest provider response body accepted, in bytes.
+    #[serde(default = "IdentitySettings::default_max_response_bytes")]
+    pub max_response_bytes: usize,
+
+    /// Per-provider policy, keyed by identity provider ID.
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderSettings>,
+}
+
+impl IdentitySettings {
+    /// Default maximum concurrent providers.
+    #[must_use]
+    pub const fn default_max_concurrency() -> usize {
+        4
+    }
+
+    /// Default hold budget in milliseconds.
+    #[must_use]
+    pub const fn default_hold_budget_ms() -> u64 {
+        100
+    }
+
+    /// Default hold retry interval in seconds.
+    #[must_use]
+    pub const fn default_hold_retry_sec() -> u64 {
+        300
+    }
+
+    /// Default provider response cap in bytes.
+    #[must_use]
+    pub const fn default_max_response_bytes() -> usize {
+        65_536
+    }
+
+    /// Returns the policy for `id`, or the defaults when it has no table.
+    #[must_use]
+    pub fn provider(&self, id: &IdentityProviderId) -> ProviderSettings {
+        self.providers.get(id.as_str()).cloned().unwrap_or_default()
+    }
+}
+
+impl Default for IdentitySettings {
+    fn default() -> Self {
+        Self {
+            max_concurrency: Self::default_max_concurrency(),
+            hold_budget_ms: Self::default_hold_budget_ms(),
+            hold_retry_sec: Self::default_hold_retry_sec(),
+            max_response_bytes: Self::default_max_response_bytes(),
+            providers: BTreeMap::new(),
+        }
+    }
+}
+
+/// How a provider's lookup interacts with the navigation response.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderMode {
+    /// Wait for the provider, within the hold budget, before responding.
+    Hold,
+    /// Dispatch after the response is sent.
+    #[default]
+    AfterSend,
+}
+
+/// How far a revoke signal from a provider reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevokeScope {
+    /// Revoke only the signalling provider's identifiers.
+    Provider,
+    /// Revoke every identifier of the user.
+    Global,
+}
+
+/// Policy for one identity provider (`[ec.identity.providers.<id>]`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProviderSettings {
+    /// Hold or after-send dispatch.
+    #[serde(default)]
+    pub mode: ProviderMode,
+
+    /// Hold-mode timeout; the hold budget when unset.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+
+    /// Timeout for any dispatch after the response is sent.
+    #[serde(default = "ProviderSettings::default_after_send_timeout_ms")]
+    pub after_send_timeout_ms: u64,
+
+    /// Source domains this provider may write; the descriptor's when unset.
+    #[serde(default)]
+    pub sources: Option<Vec<String>>,
+
+    /// Seconds before a stored ID is refreshed.
+    #[serde(default = "ProviderSettings::default_refresh_after_sec")]
+    pub refresh_after_sec: u64,
+
+    /// Provider calls allowed per minute.
+    #[serde(default = "ProviderSettings::default_max_calls_per_minute")]
+    pub max_calls_per_minute: u32,
+
+    /// Failures per minute that open the circuit breaker.
+    #[serde(default = "ProviderSettings::default_breaker_failures_per_minute")]
+    pub breaker_failures_per_minute: u32,
+
+    /// Ordering of this provider's ID in the cookie when it must be trimmed.
+    #[serde(default)]
+    pub cookie_priority: i32,
+
+    /// Scope of this provider's revoke signals; `Provider` when unset.
+    #[serde(default)]
+    pub revoke_scope: Option<RevokeScope>,
+}
+
+impl ProviderSettings {
+    /// Default after-send timeout in milliseconds.
+    #[must_use]
+    pub const fn default_after_send_timeout_ms() -> u64 {
+        1000
+    }
+
+    /// Default refresh interval in seconds.
+    #[must_use]
+    pub const fn default_refresh_after_sec() -> u64 {
+        86_400
+    }
+
+    /// Default provider calls per minute.
+    #[must_use]
+    pub const fn default_max_calls_per_minute() -> u32 {
+        1
+    }
+
+    /// Default breaker failures per minute.
+    #[must_use]
+    pub const fn default_breaker_failures_per_minute() -> u32 {
+        50
+    }
+
+    /// Hold-mode timeout: `timeout_ms`, else the hold budget.
+    ///
+    /// The coordinator caps it at the remaining hold budget.
+    #[must_use]
+    pub fn hold_timeout_ms(&self, identity: &IdentitySettings) -> u64 {
+        self.timeout_ms.unwrap_or(identity.hold_budget_ms)
+    }
+
+    /// The revoke scope, defaulting to [`RevokeScope::Provider`].
+    #[must_use]
+    pub fn revoke_scope(&self) -> RevokeScope {
+        self.revoke_scope.unwrap_or(RevokeScope::Provider)
+    }
+}
+
+impl Default for ProviderSettings {
+    fn default() -> Self {
+        Self {
+            mode: ProviderMode::default(),
+            timeout_ms: None,
+            after_send_timeout_ms: Self::default_after_send_timeout_ms(),
+            sources: None,
+            refresh_after_sec: Self::default_refresh_after_sec(),
+            max_calls_per_minute: Self::default_max_calls_per_minute(),
+            breaker_failures_per_minute: Self::default_breaker_failures_per_minute(),
+            cookie_priority: 0,
+            revoke_scope: None,
+        }
     }
 }
 
@@ -3813,6 +4005,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::validate_identity_settings;
     use regex::Regex;
     use serde_json::json;
     use std::collections::BTreeSet;
@@ -8510,5 +8703,161 @@ formats = [{{ width = 300, height = 250 }}]
                  Settings::ADMIN_ENDPOINTS — add it to ensure auth coverage"
             );
         }
+    }
+
+    #[test]
+    fn identity_settings_defaults_without_any_table() {
+        let settings: IdentitySettings = toml::from_str("").expect("should parse an empty table");
+        assert_eq!(
+            settings.max_concurrency, 4,
+            "should default the concurrency to 4"
+        );
+        assert_eq!(
+            settings.hold_budget_ms, 100,
+            "should default the hold budget to 100 ms"
+        );
+        assert_eq!(
+            settings.hold_retry_sec, 300,
+            "should default the hold retry to 300 s"
+        );
+        assert_eq!(
+            settings.max_response_bytes, 65_536,
+            "should default the response cap to 64 KiB"
+        );
+        let provider =
+            settings.provider(&"anything".parse().expect("should parse the provider id"));
+        assert_eq!(
+            provider.mode,
+            ProviderMode::AfterSend,
+            "should default to after-send mode"
+        );
+        assert_eq!(
+            provider.after_send_timeout_ms, 1000,
+            "should default the after-send timeout to 1 s"
+        );
+        assert_eq!(
+            provider.hold_timeout_ms(&settings),
+            100,
+            "should default the hold timeout to the budget"
+        );
+        assert_eq!(
+            (
+                provider.refresh_after_sec,
+                provider.max_calls_per_minute,
+                provider.breaker_failures_per_minute,
+                provider.cookie_priority
+            ),
+            (86_400, 1, 50, 0),
+            "should use the spec 10.1 provider defaults"
+        );
+        assert_eq!(
+            provider.revoke_scope(),
+            RevokeScope::Provider,
+            "should scope revokes to the provider by default"
+        );
+        validate_identity_settings(&settings).expect("should accept the defaults");
+    }
+
+    #[test]
+    fn identity_settings_default_matches_an_empty_table() {
+        let parsed: IdentitySettings = toml::from_str("").expect("should parse an empty table");
+        assert_eq!(
+            serde_json::to_value(IdentitySettings::default())
+                .expect("should serialize the default"),
+            serde_json::to_value(parsed).expect("should serialize the parsed value"),
+            "should give Default the serde defaults, not zeros"
+        );
+        let provider: ProviderSettings =
+            toml::from_str("").expect("should parse an empty provider table");
+        assert_eq!(
+            serde_json::to_value(ProviderSettings::default())
+                .expect("should serialize the default"),
+            serde_json::to_value(provider).expect("should serialize the parsed value"),
+            "should give the provider Default the serde defaults"
+        );
+    }
+
+    #[test]
+    fn identity_settings_timeouts_and_bounds_are_enforced() {
+        let settings: IdentitySettings = toml::from_str(
+            "hold_budget_ms = 120\n[providers.id5]\nmode = \"hold\"\nafter_send_timeout_ms = 2500\n",
+        )
+        .expect("should parse a hold-mode table");
+        let provider = settings.provider(&"id5".parse().expect("should parse the provider id"));
+        assert_eq!(
+            provider.hold_timeout_ms(&settings),
+            120,
+            "should use the budget as the hold timeout"
+        );
+        assert_eq!(
+            provider.after_send_timeout_ms, 2500,
+            "should read the after-send timeout"
+        );
+        validate_identity_settings(&settings).expect("should accept a 2.5 s after-send timeout");
+
+        for (name, toml_text) in [
+            ("budget over 1000", "hold_budget_ms = 1001"),
+            ("zero concurrency", "max_concurrency = 0"),
+            ("zero refresh", "[providers.p]\nrefresh_after_sec = 0"),
+            (
+                "zero after-send timeout",
+                "[providers.p]\nafter_send_timeout_ms = 0",
+            ),
+            (
+                "after-send timeout over 10 s",
+                "[providers.p]\nafter_send_timeout_ms = 10001",
+            ),
+            (
+                "hold timeout over budget",
+                "[providers.p]\nmode = \"hold\"\ntimeout_ms = 101",
+            ),
+        ] {
+            let settings: IdentitySettings =
+                toml::from_str(toml_text).expect("should parse before validation");
+            assert!(
+                validate_identity_settings(&settings).is_err(),
+                "should reject {name}"
+            );
+        }
+        let edge: IdentitySettings = toml::from_str("[providers.p]\nafter_send_timeout_ms = 10000")
+            .expect("should parse the upper bound");
+        validate_identity_settings(&edge).expect("control: should accept exactly 10 s");
+        toml::from_str::<IdentitySettings>("[providers.p]\nmode = \"sometimes\"")
+            .expect_err("should reject an unknown mode");
+        toml::from_str::<IdentitySettings>("[providers.p]\nrevoke_scope = \"everyone\"")
+            .expect_err("should reject an unknown revoke scope");
+    }
+
+    #[test]
+    fn identity_settings_revoke_scope_parses_and_keeps_its_default_when_unset() {
+        let settings: IdentitySettings =
+            toml::from_str("[providers.lockr]\nrevoke_scope = \"global\"\n")
+                .expect("should parse the revoke scope");
+        let lockr = settings.provider(&"lockr".parse().expect("should parse the provider id"));
+        assert_eq!(
+            lockr.revoke_scope(),
+            RevokeScope::Global,
+            "should read a global revoke scope"
+        );
+        let other = settings.provider(&"other".parse().expect("should parse the provider id"));
+        assert_eq!(
+            other.revoke_scope(),
+            RevokeScope::Provider,
+            "control: another provider should keep the provider scope"
+        );
+        toml::from_str::<IdentitySettings>("[providers.lockr]\ncapture_enabled = true\n")
+            .expect("should still load a key this build does not know");
+    }
+
+    #[test]
+    fn identity_settings_ec_without_identity_table_parses() {
+        let settings = Settings::from_toml(&crate::test_support::tests::crate_test_settings_str())
+            .expect("should parse settings without an identity table");
+        assert_eq!(
+            serde_json::to_value(&settings.ec.identity).expect("should serialize the parsed table"),
+            serde_json::to_value(IdentitySettings::default())
+                .expect("should serialize the default"),
+            "should give an Ec without [ec.identity] the defaults"
+        );
     }
 }

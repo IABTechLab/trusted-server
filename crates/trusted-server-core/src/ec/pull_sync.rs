@@ -181,7 +181,7 @@ pub fn dispatch_pull_sync(
         return;
     }
 
-    let max_concurrency = settings.ec.pull_sync_concurrency.max(1);
+    let max_concurrency = settings.ec.identity.max_concurrency.max(1);
     let mut in_flight: Vec<InFlightPull> = Vec::new();
     let mut updates = Vec::new();
 
@@ -943,7 +943,7 @@ mod tests {
     fn dispatch_pull_sync_aggregates_batches_into_one_bulk_write() {
         let mut settings = create_test_settings();
         // Force one partner per concurrency batch so responses span batches.
-        settings.ec.pull_sync_concurrency = 1;
+        settings.ec.identity.max_concurrency = 1;
         let registry = PartnerRegistry::from_config(&[
             pull_enabled_ec_partner("alpha.example.com"),
             pull_enabled_ec_partner("beta.example.com"),
@@ -1002,7 +1002,7 @@ mod tests {
     #[test]
     fn dispatch_pull_sync_calls_and_persists_only_missing_partner() {
         let mut settings = create_test_settings();
-        settings.ec.pull_sync_concurrency = 4;
+        settings.ec.identity.max_concurrency = 4;
         let registry = PartnerRegistry::from_config(&[
             pull_enabled_ec_partner("alpha.example.com"),
             pull_enabled_ec_partner("beta.example.com"),
@@ -1065,7 +1065,7 @@ mod tests {
     #[test]
     fn dispatch_pull_sync_skips_non_present_snapshots() {
         let mut settings = create_test_settings();
-        settings.ec.pull_sync_concurrency = 4;
+        settings.ec.identity.max_concurrency = 4;
         let registry =
             PartnerRegistry::from_config(&[pull_enabled_ec_partner("alpha.example.com")])
                 .expect("should build registry");
@@ -1110,7 +1110,7 @@ mod tests {
     #[test]
     fn dispatch_pull_sync_skips_tombstone_snapshot() {
         let mut settings = create_test_settings();
-        settings.ec.pull_sync_concurrency = 4;
+        settings.ec.identity.max_concurrency = 4;
         let registry =
             PartnerRegistry::from_config(&[pull_enabled_ec_partner("alpha.example.com")])
                 .expect("should build registry");
@@ -1150,7 +1150,7 @@ mod tests {
         // it must revalidate the live row and cancel rather than leak an
         // identity the user just withdrew.
         let mut settings = create_test_settings();
-        settings.ec.pull_sync_concurrency = 4;
+        settings.ec.identity.max_concurrency = 4;
         let registry =
             PartnerRegistry::from_config(&[pull_enabled_ec_partner("alpha.example.com")])
                 .expect("should build registry");
@@ -1205,7 +1205,7 @@ mod tests {
         // authorize outbound calls; with no calls to authorize it must not cost
         // a KV operation.
         let mut settings = create_test_settings();
-        settings.ec.pull_sync_concurrency = 4;
+        settings.ec.identity.max_concurrency = 4;
         let registry =
             PartnerRegistry::from_config(&[pull_enabled_ec_partner("alpha.example.com")])
                 .expect("should build registry");

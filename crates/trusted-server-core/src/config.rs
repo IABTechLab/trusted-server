@@ -32,7 +32,15 @@ use crate::integrations::{
     sourcepoint::SourcepointConfig,
     testlight::TestlightConfig,
 };
-use crate::settings::{AssetOriginAuth, IntegrationConfig, Settings};
+use crate::settings::{
+    AssetOriginAuth, IdentitySettings, IntegrationConfig, ProviderMode, Settings,
+};
+
+/// Largest `[ec.identity].hold_budget_ms`.
+const MAX_HOLD_BUDGET_MS: u64 = 1000;
+
+/// Largest `after_send_timeout_ms` of a provider.
+const MAX_AFTER_SEND_TIMEOUT_MS: u64 = 10_000;
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
 #[cfg(test)]
@@ -258,6 +266,8 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, false)?;
     PartnerRegistry::validate_config_for_deploy(&settings.ec.partners)?;
+    validate_identity_settings(&settings.ec.identity)?;
+    validate_removed_keys(settings)?;
     Ok(())
 }
 
@@ -276,6 +286,77 @@ pub fn validate_settings_for_runtime(
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, true)?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
+    validate_identity_settings(&settings.ec.identity)?;
+    validate_removed_keys(settings)?;
+    Ok(())
+}
+
+fn identity_configuration_error(message: String) -> Report<TrustedServerError> {
+    Report::new(TrustedServerError::Configuration { message })
+}
+
+/// Validates the numeric rules of `[ec.identity]`.
+///
+/// Rules that need provider descriptors live in the identity catalog
+/// validation instead.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] naming the first key that is
+/// out of range.
+pub(crate) fn validate_identity_settings(
+    settings: &IdentitySettings,
+) -> Result<(), Report<TrustedServerError>> {
+    if settings.hold_budget_ms > MAX_HOLD_BUDGET_MS {
+        return Err(identity_configuration_error(format!(
+            "ec.identity.hold_budget_ms must be at most {MAX_HOLD_BUDGET_MS}, got {}",
+            settings.hold_budget_ms
+        )));
+    }
+    if settings.max_concurrency == 0 {
+        return Err(identity_configuration_error(
+            "ec.identity.max_concurrency must be at least 1".to_owned(),
+        ));
+    }
+    for (id, provider) in &settings.providers {
+        if provider.refresh_after_sec == 0 {
+            return Err(identity_configuration_error(format!(
+                "ec.identity.providers.{id}.refresh_after_sec must be greater than 0"
+            )));
+        }
+        if !(1..=MAX_AFTER_SEND_TIMEOUT_MS).contains(&provider.after_send_timeout_ms) {
+            return Err(identity_configuration_error(format!(
+                "ec.identity.providers.{id}.after_send_timeout_ms must be between 1 and {MAX_AFTER_SEND_TIMEOUT_MS}, got {}",
+                provider.after_send_timeout_ms
+            )));
+        }
+        if provider.mode == ProviderMode::Hold
+            && provider
+                .timeout_ms
+                .is_some_and(|timeout| timeout > settings.hold_budget_ms)
+        {
+            return Err(identity_configuration_error(format!(
+                "ec.identity.providers.{id}.timeout_ms must not exceed hold_budget_ms ({})",
+                settings.hold_budget_ms
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Rejects config keys that were removed instead of deprecated.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] naming the replacement of the
+/// first removed key that is set.
+pub(crate) fn validate_removed_keys(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    if settings.ec.removed_pull_sync_concurrency.is_some() {
+        return Err(identity_configuration_error(
+            "ec.pull_sync_concurrency was removed; set [ec.identity].max_concurrency instead"
+                .to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -1615,5 +1696,30 @@ password = "production-admin-password-32-bytes"
             err.to_string().contains("missing-provider"),
             "validation error should mention invalid provider"
         );
+    }
+
+    #[test]
+    fn removed_pull_sync_concurrency_is_rejected_with_its_replacement() {
+        let toml = crate_test_settings_str().replace("[ec]\n", "[ec]\npull_sync_concurrency = 3\n");
+        let mut settings = Settings::from_toml(&toml).expect("should parse the removed key");
+        settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
+
+        let deploy = validate_settings_for_deploy(&settings).expect_err("should reject at deploy");
+        assert!(
+            format!("{deploy:?}").contains("[ec.identity].max_concurrency"),
+            "should name the replacement at deploy, got: {deploy:?}"
+        );
+        let runtime =
+            validate_settings_for_runtime(&settings).expect_err("should reject at runtime");
+        assert!(
+            format!("{runtime:?}").contains("[ec.identity].max_concurrency"),
+            "should name the replacement at runtime, got: {runtime:?}"
+        );
+
+        let control = crate_test_settings_str()
+            .replace("[ec]\n", "[ec.identity]\nmax_concurrency = 3\n\n[ec]\n");
+        let mut control = Settings::from_toml(&control).expect("should parse the replacement key");
+        control.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
+        validate_settings_for_deploy(&control).expect("control: should pass at deploy");
     }
 }
