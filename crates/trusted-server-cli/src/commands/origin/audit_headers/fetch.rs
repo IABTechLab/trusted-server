@@ -131,11 +131,19 @@ impl OriginClient for ReqwestOriginClient {
 
 /// Pulls the cache-relevant headers out of a `reqwest` header map.
 fn extract_headers(headers: &reqwest::header::HeaderMap) -> ResponseHeaders {
+    // A field may appear more than once; `get` returns only the first, which
+    // can hide a later `no-store` on `Cache-Control` or a later high-cardinality
+    // token on `Vary`. Combine every field value so evaluation sees the whole
+    // policy. `Surrogate-Key` is a space-separated token list; the directive
+    // lists are comma-separated.
     let value = |name: &str| {
-        headers
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned)
+        let values: Vec<&str> = headers
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        let separator = if name == "surrogate-key" { " " } else { ", " };
+        (!values.is_empty()).then(|| values.join(separator))
     };
     ResponseHeaders {
         content_type: value("content-type"),

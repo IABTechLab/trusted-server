@@ -212,6 +212,41 @@ fn accumulate(current: &mut Option<u64>, conflict: &mut bool, incoming: Option<u
     }
 }
 
+/// Splits a `Cache-Control` / `Surrogate-Control` value on commas that are
+/// outside double-quoted strings, so a quoted directive argument such as
+/// `private="Set-Cookie, X"` is not mistaken for two directives. Backslash
+/// escapes inside a quoted string are honoured (RFC 9110 §5.6.4 quoted-pair),
+/// so an escaped quote does not prematurely close the string. Without this a
+/// comma inside `private="x,no-store,y"` would surface a bare `no-store` token
+/// and let a qualified `private` pass the HTML body-safety check.
+fn split_top_level_commas(value: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_quotes => {
+                current.push(ch);
+                escaped = true;
+            }
+            '"' => {
+                in_quotes = !in_quotes;
+                current.push(ch);
+            }
+            ',' if !in_quotes => parts.push(std::mem::take(&mut current)),
+            _ => current.push(ch),
+        }
+    }
+    parts.push(current);
+    parts
+}
+
 impl CacheDirectives {
     fn parse(value: &str) -> Self {
         let mut tokens = BTreeSet::new();
@@ -221,7 +256,7 @@ impl CacheDirectives {
         let mut s_maxage = None;
         let mut s_maxage_conflict = false;
 
-        for raw in value.split(',') {
+        for raw in split_top_level_commas(value) {
             let token = raw.trim().to_ascii_lowercase();
             if token.is_empty() {
                 continue;
@@ -385,25 +420,41 @@ fn evaluate_immutable(
     match headers.cache_control.as_deref() {
         Some(value) => {
             let directives = CacheDirectives::parse(value);
-            let immutable = directives.has("public")
-                && directives.has("immutable")
-                && directives
-                    .max_age
-                    .is_some_and(|age| age >= IMMUTABLE_MAX_AGE);
-            if immutable {
-                verdicts.push(HeaderVerdict::pass(
-                    "Cache-Control",
-                    Some(value.to_owned()),
-                    expected,
-                ));
-            } else {
+            // A restrictive directive (no-store / no-cache / unqualified
+            // private) overrides the positive long-lived tokens: the asset is
+            // not cached as advertised, so a contradictory policy must not pass
+            // (the restrictive directive wins at the cache).
+            if directives.forbids_caching() {
                 verdicts.push(HeaderVerdict::flagged(
                     "Cache-Control",
-                    Verdict::Warn,
+                    Verdict::Fail,
                     Some(value.to_owned()),
                     expected,
-                    &format!("Hashed {noun} should use long-lived immutable caching"),
+                    &format!(
+                        "Hashed {noun} advertise long-lived caching but also a restrictive directive (no-store/no-cache/private), which wins — the asset is not cached as advertised"
+                    ),
                 ));
+            } else {
+                let immutable = directives.has("public")
+                    && directives.has("immutable")
+                    && directives
+                        .max_age
+                        .is_some_and(|age| age >= IMMUTABLE_MAX_AGE);
+                if immutable {
+                    verdicts.push(HeaderVerdict::pass(
+                        "Cache-Control",
+                        Some(value.to_owned()),
+                        expected,
+                    ));
+                } else {
+                    verdicts.push(HeaderVerdict::flagged(
+                        "Cache-Control",
+                        Verdict::Warn,
+                        Some(value.to_owned()),
+                        expected,
+                        &format!("Hashed {noun} should use long-lived immutable caching"),
+                    ));
+                }
             }
         }
         None => verdicts.push(HeaderVerdict::flagged(
@@ -435,24 +486,37 @@ fn evaluate_image(headers: &ResponseHeaders) -> Vec<HeaderVerdict> {
     match headers.cache_control.as_deref() {
         Some(value) => {
             let directives = CacheDirectives::parse(value);
-            let cacheable = directives.has("public")
-                && directives
-                    .max_age
-                    .is_some_and(|age| age >= IMAGE_MIN_MAX_AGE);
-            if cacheable {
-                verdicts.push(HeaderVerdict::pass(
-                    "Cache-Control",
-                    Some(value.to_owned()),
-                    expected,
-                ));
-            } else {
+            // A restrictive directive (no-store / no-cache / unqualified
+            // private) overrides the positive caching tokens: the image is not
+            // cached as advertised, so a contradictory policy must not pass.
+            if directives.forbids_caching() {
                 verdicts.push(HeaderVerdict::flagged(
                     "Cache-Control",
-                    Verdict::Warn,
+                    Verdict::Fail,
                     Some(value.to_owned()),
                     expected,
-                    "Images re-fetched too frequently; set `public, max-age=86400` or longer",
+                    "Image advertises public caching but also a restrictive directive (no-store/no-cache/private), which wins — the image is not cached as advertised",
                 ));
+            } else {
+                let cacheable = directives.has("public")
+                    && directives
+                        .max_age
+                        .is_some_and(|age| age >= IMAGE_MIN_MAX_AGE);
+                if cacheable {
+                    verdicts.push(HeaderVerdict::pass(
+                        "Cache-Control",
+                        Some(value.to_owned()),
+                        expected,
+                    ));
+                } else {
+                    verdicts.push(HeaderVerdict::flagged(
+                        "Cache-Control",
+                        Verdict::Warn,
+                        Some(value.to_owned()),
+                        expected,
+                        "Images re-fetched too frequently; set `public, max-age=86400` or longer",
+                    ));
+                }
             }
         }
         None => verdicts.push(HeaderVerdict::flagged(
@@ -1349,5 +1413,55 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- round-4 (prk-Jr) regression tests ---
+
+    #[test]
+    fn html_quoted_comma_in_private_does_not_leak_bare_no_store() {
+        // P1: a comma inside a quoted directive argument must not be split into
+        // a separate directive. `private="x,no-store,y"` is a qualified private
+        // (RFC 9111 §5.2.2.7) that leaves the body shareable; the inner
+        // `no-store` must not surface as a bare token and body-safe the HTML.
+        let verdicts = evaluate(
+            ContentTypeGroup::Html,
+            &headers_with(Some(r#"public, max-age=600, private="x,no-store,y""#)),
+        );
+        assert_eq!(
+            verdict_for(&verdicts, "Cache-Control"),
+            Verdict::Fail,
+            "a quoted comma must not leak a bare no-store that body-safes personalized HTML"
+        );
+    }
+
+    #[test]
+    fn immutable_js_with_no_store_fails() {
+        // P2: a restrictive directive overrides the positive long-lived tokens.
+        // `immutable, no-store` is not cached as advertised and must fail rather
+        // than pass on the positive tokens alone.
+        let verdicts = evaluate(
+            ContentTypeGroup::JavaScript,
+            &headers_with(Some("public, max-age=31536000, immutable, no-store")),
+        );
+        assert_eq!(
+            verdict_for(&verdicts, "Cache-Control"),
+            Verdict::Fail,
+            "immutable + no-store contradicts itself and must not pass"
+        );
+    }
+
+    #[test]
+    fn image_with_no_cache_fails() {
+        // P2: same precedence for images -- public caching contradicted by a
+        // restrictive directive must not pass.
+        let verdicts = evaluate(
+            ContentTypeGroup::Image,
+            &headers_with(Some("public, max-age=86400, no-cache")),
+        );
+        assert_eq!(
+            verdict_for(&verdicts, "Cache-Control"),
+            Verdict::Fail,
+            "public image caching contradicted by no-cache must not pass"
+        );
     }
 }
