@@ -6,7 +6,7 @@ fn encoded(value: &Value) -> Vec<u8> {
     serde_json::to_vec(value).expect("should encode fixture")
 }
 
-fn request() -> Value {
+pub(in crate::ordinary) fn request() -> Value {
     json!({
         "repository": "example-owner/example-server",
         "repository_id": 17,
@@ -29,7 +29,7 @@ fn request() -> Value {
     })
 }
 
-fn jobs() -> Value {
+pub(in crate::ordinary) fn jobs() -> Value {
     let jobs: Vec<_> = [
         (100, "Build trusted-server-fastly.wasm", "canonical", "2023-11-14T22:13:10Z", "2023-11-14T22:13:30Z"),
         (101, "Reproduce trusted-server-fastly.wasm", "reproduction", "2023-11-14T22:28:10Z", "2023-11-14T22:28:30Z"),
@@ -50,7 +50,7 @@ fn jobs() -> Value {
     json!({"total_count": jobs.len(), "jobs": jobs})
 }
 
-fn artifacts() -> Value {
+pub(in crate::ordinary) fn artifacts() -> Value {
     let artifacts: Vec<_> = [
         (200, "release-trusted-server-fastly.wasm", "b", "2023-11-14T22:13:25Z"),
         (201, "fastly-observation-canonical", "c", "2023-11-14T22:13:26Z"),

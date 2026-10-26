@@ -5,7 +5,7 @@ use super::{Observation, compare, observation, pair};
 
 const WASM: &[u8] = b"\0asm\x01\0\0\0";
 
-fn fixture() -> Value {
+pub(super) fn fixture() -> Value {
     json!({
         "version": 1,
         "profile": "ordinary-release-fastly-byte-equality-v1",
@@ -49,7 +49,7 @@ fn parse(value: &Value) -> Observation {
         .expect("should validate the observation fixture")
 }
 
-fn reproduction() -> Value {
+pub(super) fn reproduction() -> Value {
     let mut value = fixture();
     value["role"] = json!("reproduction");
     value["environment"]["checkout_root"] = json!("/example/reproduction/source");

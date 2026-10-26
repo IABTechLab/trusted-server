@@ -331,4 +331,4 @@ pub(super) fn bind(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

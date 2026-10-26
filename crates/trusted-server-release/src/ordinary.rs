@@ -16,6 +16,7 @@ use crate::error::ReleaseError;
 
 mod archive;
 mod run;
+mod transfer;
 
 const PROFILE: &str = "ordinary-release-fastly-byte-equality-v1";
 const ASSET: &str = "trusted-server-fastly.wasm";
@@ -307,4 +308,4 @@ pub(crate) fn observation(bytes: &[u8]) -> Result<Observation, Report<ReleaseErr
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

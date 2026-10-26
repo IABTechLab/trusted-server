@@ -5,7 +5,7 @@ use flate2::Crc;
 
 use super::{Profile, contents};
 
-pub(super) fn zip(members: &[(&str, &[u8])], descriptor: bool) -> Vec<u8> {
+pub(in crate::ordinary) fn zip(members: &[(&str, &[u8])], descriptor: bool) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut central = Vec::new();
     for (name, body) in members {

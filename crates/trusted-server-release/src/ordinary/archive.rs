@@ -377,4 +377,4 @@ pub(super) fn contents(bytes: &[u8], profile: Profile) -> Result<BTreeMap<String
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
