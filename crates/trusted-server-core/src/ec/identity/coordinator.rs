@@ -17,13 +17,13 @@ use super::exchange::{ProviderRequest, ProviderResponse};
 use super::ids::{IdentityProviderId, SourceDomain, UnixTime};
 use super::input::{RandomSource, ResolveInput, ResolveSignals};
 use super::mutation::{PartnerIdChange, ProviderResult, ProviderStateChange, StateUpdate};
-use super::policy::{PolicySignals, policy_allows};
+use super::policy::{FP_US_OPT_OUT_MASK, PolicySignals, fingerprint_bits, policy_allows};
 use super::provider::IdentityProvider;
 use super::resolution::{
     EntrySet, EntrySets, IdentityProviderError, Resolution, ResolvedEid, StateChange, entry_sets,
 };
 use super::revision::{IdentityKeys, StateRevision, record_revision, uid_hash, visitor_key};
-use crate::consent::ConsentContext;
+use crate::consent::{ConsentContext, effective_tcf};
 use crate::ec::kv_types::{KvEntry, KvOptOut, KvPartnerId};
 use crate::ec::rate_limiter::RateLimiter;
 use crate::platform::{
@@ -33,6 +33,8 @@ use crate::platform::{
 use crate::settings::{IdentitySettings, ProviderMode, ProviderSettings, Settings};
 use crate::streaming_processor::{BodyStreamDecoder, Compression};
 
+/// Deciseconds in a second: `LastUpdated` of a TC string counts deciseconds.
+const DECISECONDS_PER_SECOND: u64 = 10;
 /// How long a burst-capped provider waits: one limiter window.
 const BURST_WAIT_SECS: u64 = 60;
 /// The wait after a `no_match` that gives no `retry_in`.
@@ -1495,6 +1497,103 @@ pub(crate) fn dispatch(
     }
     drain(&mut in_flight, &mut sent, &mut outcomes);
     outcomes
+}
+
+/// Whether the visitor's consent now re-grants `descriptor`'s provider after
+/// the sticky opt-out `opt_out` (spec 8).
+///
+/// - A provider with a GVL ID: a TC string whose `LastUpdated` is after
+///   `opt_out.at` and that grants the vendor and every purpose.
+/// - Any provider, under a GPP string with a readable US section: `fp` records
+///   at least one US opt-out bit and the current fingerprint holds none of
+///   the US opt-out bits `fp` recorded. Other bits may differ.
+///
+/// A jurisdiction change, a newly present GPP string without a US section, a
+/// relaxed signal or an `fp` that does not parse never clears.
+#[must_use]
+pub(crate) fn regrant_clears_opt_out(
+    descriptor: &ProviderDescriptor,
+    opt_out: &KvOptOut,
+    consent: &ConsentContext,
+    signals: PolicySignals,
+) -> bool {
+    tcf_regrants(descriptor, opt_out, consent)
+        || gpp_regrants(descriptor, opt_out, consent, signals)
+}
+
+/// Whether a TC string newer than the opt-out grants the provider's GVL
+/// vendor and every purpose its policy requires.
+fn tcf_regrants(
+    descriptor: &ProviderDescriptor,
+    opt_out: &KvOptOut,
+    consent: &ConsentContext,
+) -> bool {
+    let policy = descriptor.consent_policy();
+    let (Some(vendor), Some(tcf)) = (policy.tcf_vendor(), effective_tcf(consent)) else {
+        return false;
+    };
+    tcf.last_updated_ds / DECISECONDS_PER_SECOND > opt_out.at
+        && tcf.has_vendor_consent(vendor)
+        && policy
+            .tcf_purposes()
+            .iter()
+            .all(|purpose| tcf.has_purpose_consent(usize::from(*purpose)))
+}
+
+/// Whether the GPP US section now shows none of the US opt-outs `fp`
+/// recorded. GPP carries no creation time, so this is judged by section
+/// values; without a readable US section nothing is judged.
+fn gpp_regrants(
+    descriptor: &ProviderDescriptor,
+    opt_out: &KvOptOut,
+    consent: &ConsentContext,
+    signals: PolicySignals,
+) -> bool {
+    let Some(gpp) = consent.gpp.as_ref() else {
+        return false;
+    };
+    let has_us_section = gpp.us_sale_opt_out.is_some()
+        || gpp.us_sharing_opt_out.is_some()
+        || gpp.us_targeted_advertising_opt_out.is_some()
+        || gpp.us_privacy_section.is_some();
+    if gpp.us_section_decode_failed || !has_us_section {
+        return false;
+    }
+    let Ok(recorded) = u64::from_str_radix(&opt_out.fp, 16) else {
+        return false;
+    };
+    if recorded & FP_US_OPT_OUT_MASK == 0 {
+        return false;
+    }
+    let Ok(current) = u64::from_str_radix(
+        &fingerprint_bits(descriptor.consent_policy(), consent, signals),
+        16,
+    ) else {
+        return false;
+    };
+    current & recorded & FP_US_OPT_OUT_MASK == 0
+}
+
+/// The providers whose sticky opt-out the request's consent re-grants, each
+/// to be cleared at `now`.
+#[must_use]
+pub(crate) fn opt_out_clears(
+    view: &EligibilityView,
+    catalog: &ProviderCatalog,
+    consent: &ConsentContext,
+    signals: PolicySignals,
+) -> Vec<IdentityProviderId> {
+    catalog
+        .providers()
+        .filter_map(|provider| {
+            let descriptor = provider.descriptor();
+            let state = view.providers.get(descriptor.id())?;
+            let opt_out = state.o.as_ref()?;
+            (view.is_opted_out(descriptor.id())
+                && regrant_clears_opt_out(descriptor, opt_out, consent, signals))
+            .then(|| descriptor.id().clone())
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -4373,6 +4472,153 @@ mod tests {
                 "other.example.com",
             ],
             "should sort generic pull by source, rotate the start each hour, and send other providers after"
+        );
+    }
+
+    fn regrant_descriptor(policy: ConsentPolicy) -> ProviderDescriptor {
+        custom_provider("regrant", &["a.example.com"], Resolves::new(), policy)
+            .descriptor()
+            .clone()
+    }
+
+    fn stored_opt_out(at: u64, fp: &str) -> KvOptOut {
+        KvOptOut {
+            at,
+            fp: fp.to_owned(),
+        }
+    }
+
+    fn gpp_consent(sale: Option<bool>, targeted: Option<bool>) -> ConsentContext {
+        let mut consent = allowing_consent();
+        consent.gpp = Some(GppConsent {
+            version: 1,
+            section_ids: vec![7],
+            eu_tcf: None,
+            us_sale_opt_out: sale,
+            us_sharing_opt_out: None,
+            us_targeted_advertising_opt_out: targeted,
+            us_gpc: None,
+            us_known_child: None,
+            us_privacy_section: None,
+            us_section_decode_failed: false,
+        });
+        consent
+    }
+
+    #[test]
+    fn tcf_regrant_after_opt_out_clears_it() {
+        let descriptor = regrant_descriptor(ConsentPolicy::strict().with_tcf_vendor(5));
+        let opt_out = stored_opt_out(1_000, "0");
+        let regranted = |last_updated_ds: u64, vendor: u16| {
+            let mut consent = test_consent_gdpr_without_vendor(vendor);
+            consent
+                .tcf
+                .as_mut()
+                .expect("should carry a TC string")
+                .last_updated_ds = last_updated_ds;
+            regrant_clears_opt_out(&descriptor, &opt_out, &consent, PolicySignals::default())
+        };
+
+        assert!(
+            regranted(10_010, 99),
+            "should clear on a newer TC string that grants the vendor and purposes"
+        );
+        assert!(
+            !regranted(10_000, 99),
+            "control: a TC string not after the opt-out should not clear"
+        );
+        assert!(
+            !regranted(10_010, 5),
+            "control: a newer TC string without the vendor should not clear"
+        );
+    }
+
+    #[test]
+    fn jurisdiction_change_never_clears_it() {
+        let descriptor = regrant_descriptor(ConsentPolicy::strict());
+        let signals = PolicySignals::default();
+        let sale = stored_opt_out(1_000, "800");
+
+        let mut eu_without_gpp = allowing_consent();
+        eu_without_gpp.jurisdiction = crate::consent::jurisdiction::Jurisdiction::Gdpr;
+        let mut header_only = allowing_consent();
+        header_only.gpp = Some(GppConsent {
+            version: 1,
+            section_ids: vec![2],
+            eu_tcf: None,
+            us_sale_opt_out: None,
+            us_sharing_opt_out: None,
+            us_targeted_advertising_opt_out: None,
+            us_gpc: None,
+            us_known_child: None,
+            us_privacy_section: None,
+            us_section_decode_failed: false,
+        });
+
+        assert!(
+            !regrant_clears_opt_out(&descriptor, &sale, &eu_without_gpp, signals),
+            "should not clear when the visitor moved to a jurisdiction with no GPP string"
+        );
+        assert!(
+            !regrant_clears_opt_out(&descriptor, &sale, &header_only, signals),
+            "should not clear on a newly present GPP string with no US section"
+        );
+        assert!(
+            regrant_clears_opt_out(&descriptor, &sale, &gpp_consent(Some(false), None), signals),
+            "control: a US section showing no opt-out should clear"
+        );
+    }
+
+    #[test]
+    fn gpp_regrant_clears_when_none_of_the_recorded_opt_outs_remain() {
+        let descriptor = regrant_descriptor(ConsentPolicy::strict());
+        let signals = PolicySignals::default();
+        let sale_opt_out = gpp_consent(Some(true), None);
+        let stored = fingerprint_bits(descriptor.consent_policy(), &sale_opt_out, signals);
+        assert_eq!(stored, "800", "should record the sale opt-out bit");
+        // Purpose 4 was also granted when the opt-out was stored (bit 3).
+        let with_purpose_four = format!("{:x}", 0x800_u64 | 0x8);
+        let opt_out = stored_opt_out(1_000, &with_purpose_four);
+
+        assert!(
+            regrant_clears_opt_out(
+                &descriptor,
+                &opt_out,
+                &gpp_consent(Some(false), None),
+                signals
+            ),
+            "should clear when the section shows no opt-out, even with purpose 4 changed"
+        );
+        assert!(
+            !regrant_clears_opt_out(&descriptor, &opt_out, &sale_opt_out, signals),
+            "control: a section that still shows the sale opt-out should not clear"
+        );
+        assert!(
+            !regrant_clears_opt_out(
+                &descriptor,
+                &stored_opt_out(1_000, "8"),
+                &gpp_consent(Some(false), None),
+                signals
+            ),
+            "control: an fp with no US opt-out bit should never clear by GPP"
+        );
+        assert!(
+            !regrant_clears_opt_out(
+                &descriptor,
+                &stored_opt_out(1_000, "not-hex"),
+                &gpp_consent(Some(false), None),
+                signals
+            ),
+            "control: an fp that does not parse should never clear"
+        );
+        assert!(
+            regrant_clears_opt_out(
+                &descriptor,
+                &opt_out,
+                &gpp_consent(Some(false), Some(true)),
+                signals
+            ),
+            "should judge only the opt-outs the fingerprint recorded, not a new one"
         );
     }
 }

@@ -328,7 +328,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 17] {
+fn named_routes() -> [NamedRoute; 18] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -372,6 +372,13 @@ fn named_routes() -> [NamedRoute; 17] {
         NamedRoute {
             path: "/_ts/admin/ec/{id}",
             primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::AdminEcNotSupported,
+        },
+        // The provider opt-out clear writes the EC identity graph, so it
+        // answers like the lookup: not available on this adapter.
+        NamedRoute {
+            path: "/_ts/admin/ec/{id}/providers/{provider}/opt-out",
+            primary_methods: &[Method::DELETE],
             handler: NamedRouteHandler::AdminEcNotSupported,
         },
         // Admin EIDs echo: pure request inspection (no KV), so the dev

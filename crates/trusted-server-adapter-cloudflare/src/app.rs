@@ -646,6 +646,14 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .get("/_ts/admin/ec/{id}", |_ctx: RequestContext| async {
                 Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
             })
+            // The provider opt-out clear writes the EC identity graph, so it
+            // answers like the lookup.
+            .delete(
+                "/_ts/admin/ec/{id}/providers/{provider}/opt-out",
+                |_ctx: RequestContext| async {
+                    Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
+                },
+            )
             // Admin EIDs echo: pure request inspection (no KV), so this
             // adapter serves the real handler.
             .get(

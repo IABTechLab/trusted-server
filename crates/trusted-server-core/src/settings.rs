@@ -3535,6 +3535,7 @@ impl Settings {
         "/_ts/admin/keys/deactivate",
         "/_ts/admin/ec",
         "/_ts/admin/ec/{id}",
+        "/_ts/admin/ec/{id}/providers/{provider}/opt-out",
         "/_ts/admin/eids",
         "/_ts/admin/cache/purge",
     ];
@@ -3562,9 +3563,28 @@ impl Settings {
         ),
     ];
 
+    /// Probes for the dynamic provider opt-out route: two concrete IDs and
+    /// providers, so a handler anchored to one shape does not count as
+    /// covering the route.
+    const ADMIN_OPT_OUT_AUTH_PROBES: [&str; 2] = [
+        concat!(
+            "/_ts/admin/ec/",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ".Ab12Z9",
+            "/providers/pull-ssp-example-com/opt-out",
+        ),
+        concat!(
+            "/_ts/admin/ec/",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ".Zz09aB",
+            "/providers/other_provider-2/opt-out",
+        ),
+    ];
+
     fn admin_auth_probes(path: &'static str) -> [&'static str; 2] {
         match path {
             "/_ts/admin/ec/{id}" => Self::ADMIN_EC_ID_AUTH_PROBES,
+            "/_ts/admin/ec/{id}/providers/{provider}/opt-out" => Self::ADMIN_OPT_OUT_AUTH_PROBES,
             path => [path, path],
         }
     }
@@ -8088,10 +8108,41 @@ source_domain = "partner.example.com"
                 "/_ts/admin/keys/deactivate",
                 "/_ts/admin/ec",
                 "/_ts/admin/ec/{id}",
+                "/_ts/admin/ec/{id}/providers/{provider}/opt-out",
                 "/_ts/admin/eids",
                 "/_ts/admin/cache/purge",
             ],
             "should report every admin endpoint as uncovered"
+        );
+    }
+
+    #[test]
+    fn admin_opt_out_route_is_in_admin_endpoints() {
+        assert!(
+            Settings::ADMIN_ENDPOINTS.contains(&"/_ts/admin/ec/{id}/providers/{provider}/opt-out"),
+            "should list the provider opt-out clear route"
+        );
+        let narrow = settings_str_without_admin_handler()
+            + r#"
+            [[handlers]]
+            path = "^/_ts/admin/ec/[^/]+$"
+            username = "admin"
+            password = "secret"
+            "#;
+        let settings: Settings = toml::from_str(&narrow).expect("should deserialize TOML");
+        let uncovered = settings
+            .uncovered_admin_endpoints()
+            .expect("should check admin coverage");
+        assert!(
+            uncovered.contains(&"/_ts/admin/ec/{id}/providers/{provider}/opt-out"),
+            "should require auth coverage of the opt-out route"
+        );
+        assert!(
+            create_test_settings()
+                .uncovered_admin_endpoints()
+                .expect("should check admin coverage")
+                .is_empty(),
+            "control: the admin prefix handler should cover the opt-out route"
         );
     }
 
@@ -8128,6 +8179,7 @@ source_domain = "partner.example.com"
                 "/_ts/admin/keys/deactivate",
                 "/_ts/admin/ec",
                 "/_ts/admin/ec/{id}",
+                "/_ts/admin/ec/{id}/providers/{provider}/opt-out",
                 "/_ts/admin/eids",
                 "/_ts/admin/cache/purge",
             ],

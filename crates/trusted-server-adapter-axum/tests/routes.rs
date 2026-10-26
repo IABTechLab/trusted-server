@@ -114,6 +114,7 @@ fn all_explicit_routes_are_registered() {
         ("POST", "/_ts/admin/keys/deactivate"),
         ("GET", "/_ts/admin/ec"),
         ("GET", "/_ts/admin/ec/{id}"),
+        ("DELETE", "/_ts/admin/ec/{id}/providers/{provider}/opt-out"),
         ("GET", "/_ts/admin/eids"),
         ("POST", "/admin/keys/rotate"),
         ("POST", "/admin/keys/deactivate"),
@@ -386,6 +387,55 @@ async fn authenticated_admin_ec_routes_return_501() {
             Some("no-store")
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_admin_opt_out_clear_route_returns_501() {
+    // The clear writes the EC identity graph, which is Fastly KV backed, so
+    // the Axum dev server answers the DELETE locally with 501 like the EC
+    // lookup.
+    let path = format!(
+        "/_ts/admin/ec/{}.abc123/providers/pull-ssp-example-com/opt-out",
+        "a".repeat(64)
+    );
+    let send = |method: &'static str| {
+        let path = path.clone();
+        async move {
+            let req = Request::builder()
+                .method(method)
+                .uri(&path)
+                .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                .body(AxumBody::empty())
+                .expect("should build request");
+            make_service()
+                .ready()
+                .await
+                .expect("should be ready")
+                .call(req)
+                .await
+                .expect("should respond")
+        }
+    };
+
+    let deleted = send("DELETE").await;
+    assert_eq!(
+        deleted.status().as_u16(),
+        501,
+        "DELETE {path} should report that the opt-out clear is unsupported"
+    );
+    assert_eq!(
+        deleted
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/json"),
+        "should answer with the same JSON as the EC lookup"
+    );
+    assert_eq!(
+        send("GET").await.status().as_u16(),
+        404,
+        "control: GET {path} should be denied locally as an unknown admin route"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -8177,6 +8177,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn merge_publisher_owner_value_beats_the_browser_cookie_value() {
+        let mut entry = KvEntry::minimal("other.example.com", "kv-other", 1000);
+        entry.ids.insert(
+            "ids.example.com".to_owned(),
+            crate::ec::kv_types::KvPartnerId {
+                w: Some("owner".to_owned()),
+                ..crate::ec::kv_types::KvPartnerId::new("owner-uid")
+            },
+        );
+        let (snapshot, registry, mut ec_context) = publisher_merge_fixture(entry);
+        let owner =
+            crate::ec::identity::test_support::fixed_provider("owner", &["ids.example.com"]);
+        ec_context.set_identity_runtime(Arc::new(
+            crate::ec::identity::IdentityRuntime::from_settings_with_providers(
+                &create_test_settings(),
+                vec![owner],
+                std::collections::BTreeMap::from([(
+                    crate::ec::identity::test_support::source("ids.example.com"),
+                    crate::ec::identity::test_support::pid("owner"),
+                )]),
+            )
+            .expect("should build the runtime"),
+        ));
+        let cookie_entries = serde_json::json!([
+            { "source": "ids.example.com", "uids": [{ "id": "browser-uid", "atype": 1 }] },
+            { "source": "other.example.com", "uids": [{ "id": "browser-other", "atype": 1 }] }
+        ]);
+
+        let merged = publisher_merge(&snapshot, &registry, &ec_context, &cookie_entries, None);
+
+        let atype = crate::settings::EcPartner::default_openrtb_atype();
+        assert_eq!(
+            merged,
+            Some(vec![
+                publisher_eid("other.example.com", "browser-other", 1),
+                publisher_eid("ids.example.com", "owner-uid", atype),
+            ]),
+            "the owner's value should replace the browser's, and the unowned browser value should still win"
+        );
+    }
+
     fn pull_partner_config(source_domain: &str) -> crate::settings::EcPartner {
         crate::settings::EcPartner {
             name: format!("Partner {source_domain}"),

@@ -134,6 +134,9 @@ pub(crate) struct ServerSource {
     pub(crate) writer: Option<IdentityProviderId>,
     /// Unix seconds at which the record stops being servable.
     pub(crate) expires_at: Option<u64>,
+    /// Whether the record is the source owner's valid value: the source has
+    /// an owner and the record's writer is that owner (spec 7.1).
+    pub(crate) owned: bool,
     /// One EID per stored entry, in stored order, provenance defaults filled.
     pub(crate) eids: Vec<Eid>,
 }
@@ -175,6 +178,7 @@ impl ServerSet {
                     source_domain: eid.source.clone(),
                     writer: None,
                     expires_at: None,
+                    owned: false,
                     eids: vec![eid],
                 })
                 .collect(),
@@ -200,13 +204,17 @@ pub(crate) fn server_set(
         .into_iter()
         .map(|record| {
             let mut eids = to_eids(core::slice::from_ref(&record));
+            let mut owned = false;
             if let Ok(source) = record.source_domain.parse::<SourceDomain>() {
                 fill_provenance(&mut eids, record.writer.as_ref(), &source, serve.catalog);
+                owned = record.writer.is_some()
+                    && serve.catalog.owner_of(&source) == record.writer.as_ref();
             }
             ServerSource {
                 source_domain: record.source_domain,
                 writer: record.writer,
                 expires_at: record.expires_at,
+                owned,
                 eids,
             }
         })

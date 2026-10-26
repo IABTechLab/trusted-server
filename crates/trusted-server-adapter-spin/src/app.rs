@@ -222,7 +222,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 17] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 18] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
@@ -230,6 +230,10 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 17] {
         ("/_ts/admin/keys/deactivate", &[Method::POST]),
         ("/_ts/admin/ec", &[Method::GET]),
         ("/_ts/admin/ec/{id}", &[Method::GET]),
+        (
+            "/_ts/admin/ec/{id}/providers/{provider}/opt-out",
+            &[Method::DELETE],
+        ),
         ("/_ts/admin/eids", &[Method::GET]),
         ("/_ts/admin/cache/purge", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
@@ -922,6 +926,12 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // adapter has no store to read.
             .get("/_ts/admin/ec", admin_ec_not_supported_handler)
             .get("/_ts/admin/ec/{id}", admin_ec_not_supported_handler)
+            // The provider opt-out clear writes the EC identity graph, so it
+            // answers like the lookup.
+            .delete(
+                "/_ts/admin/ec/{id}/providers/{provider}/opt-out",
+                admin_ec_not_supported_handler,
+            )
             .get("/_ts/admin/eids", admin_eids_handler)
             .post("/auction", auction_handler)
             .get(PAGE_BIDS_PATH, page_bids_handler.clone())

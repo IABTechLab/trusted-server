@@ -24,6 +24,7 @@
 //! | POST | `/_ts/admin/keys/deactivate` | [`handle_deactivate_key`] |
 //! | GET | `/_ts/admin/ec` | [`handle_admin_ec_lookup`] |
 //! | GET | `/_ts/admin/ec/{id}` | [`handle_admin_ec_lookup`] |
+//! | DELETE | `/_ts/admin/ec/{id}/providers/{provider}/opt-out` | [`handle_admin_opt_out_clear`] |
 //! | GET | `/_ts/admin/eids` | [`handle_admin_eids_lookup`] |
 //! | POST | `/_ts/api/v1/batch-sync` | [`handle_batch_sync`] |
 //! | GET | `/_ts/api/v1/identify` | [`handle_identify`] |
@@ -108,6 +109,7 @@ use trusted_server_core::config_payload::DEFAULT_SECRET_STORE_ID;
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::admin::{
     deny_admin_diagnostic_fallback, handle_admin_ec_lookup, handle_admin_eids_lookup,
+    handle_admin_opt_out_clear,
 };
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
@@ -715,6 +717,15 @@ async fn execute_named(
     // These diagnostics are read-only. Running the normal EC lifecycle would
     // attach finalization state and could ingest request cookies into KV after
     // the handler returns, violating that contract.
+    // The opt-out clear writes one KV row through the removal write, never the
+    // request's cookies, so it skips the EC lifecycle for the same reason.
+    if matches!(handler, NamedRouteHandler::AdminOptOutClear) {
+        return Ok(handle_admin_opt_out_clear(
+            state.identity_graph.as_ref(),
+            &req,
+        ));
+    }
+
     if matches!(
         handler,
         NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup
@@ -794,6 +805,9 @@ async fn run_named_route(
         }
         NamedRouteHandler::AdminCachePurge => {
             unreachable!("cache purge should be handled before EC setup")
+        }
+        NamedRouteHandler::AdminOptOutClear => {
+            unreachable!("opt-out clear should be handled before EC setup")
         }
         NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
         NamedRouteHandler::BatchSync => {
@@ -1235,6 +1249,7 @@ enum NamedRouteHandler {
     DeactivateKey,
     AdminEcLookup,
     AdminEidsLookup,
+    AdminOptOutClear,
     AdminCachePurge,
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
@@ -1313,6 +1328,14 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/_ts/admin/ec/{id}",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::AdminEcLookup,
+    },
+    // Operator clear of a provider's sticky opt-out (`ps.o`). Only DELETE is
+    // claimed: any other method reaches the publisher fallback, which denies
+    // the reserved admin namespace locally.
+    NamedRoute {
+        path: "/_ts/admin/ec/{id}/providers/{provider}/opt-out",
+        primary_methods: &[Method::DELETE],
+        handler: NamedRouteHandler::AdminOptOutClear,
     },
     // Admin EIDs echo: decodes the request's ts-eids/sharedId cookies with
     // an ingestion preview. Pure request inspection — no KV access.
@@ -2121,6 +2144,35 @@ mod tests {
             eids_route.primary_methods,
             &[Method::GET],
             "/_ts/admin/eids must have GET as its only primary method"
+        );
+    }
+
+    #[test]
+    fn admin_opt_out_clear_route_is_registered() {
+        // The operator clear is a DELETE on its own route. The route must call
+        // the core handler, and `/_ts/admin/ec/{id}` must stay GET-only so the
+        // clear is reachable only through the dedicated path.
+        let route = NAMED_ROUTES
+            .iter()
+            .find(|route| route.path == "/_ts/admin/ec/{id}/providers/{provider}/opt-out")
+            .expect("should register the provider opt-out clear route");
+        assert!(
+            matches!(route.handler, NamedRouteHandler::AdminOptOutClear),
+            "the route must map to the opt-out clear handler"
+        );
+        assert_eq!(
+            route.primary_methods,
+            &[Method::DELETE],
+            "the route must have DELETE as its only primary method"
+        );
+        let lookup = NAMED_ROUTES
+            .iter()
+            .find(|route| route.path == "/_ts/admin/ec/{id}")
+            .expect("should register the lookup route");
+        assert_eq!(
+            lookup.primary_methods,
+            &[Method::GET],
+            "control: the lookup route must stay GET-only"
         );
     }
 

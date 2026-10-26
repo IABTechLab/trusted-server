@@ -13,12 +13,12 @@ use http::StatusCode;
 
 use super::coordinator::{
     Call, Eligibility, EligibilityInput, EligibilityView, OutcomeChanges, OutcomeContext, Phase,
-    RequestFacts, dispatch, eligibility, outcome_to_changes,
+    RequestFacts, dispatch, eligibility, opt_out_clears, outcome_to_changes,
 };
 use super::descriptor::{Input, Resolves};
 use super::ids::{IdentityProviderId, SourceDomain, UnixTime};
 use super::input::{ProviderConsent, Region, ResolveSignals, StoredId, ThreadRandom};
-use super::mutation::{ApplyContext, IdentityMutation, apply};
+use super::mutation::{ApplyContext, IdentityMutation, ProviderStateChange, apply};
 use super::policy::{PolicySignals, fingerprint_bits};
 use super::provider::IdentityProvider;
 use super::removal::{log_removal_lost, write_removals};
@@ -123,8 +123,15 @@ pub fn run_after_send(input: AfterSendInput<'_>) -> FlushOutcome {
         Vec::new()
     };
     let needs_cluster_size = phase_one_entry.is_some_and(lacks_cluster_size);
+    // A re-grant clears a sticky opt-out on the writer's one flush (spec 8).
+    let regranted = opt_out_clears(
+        &phase_one_view,
+        runtime.catalog(),
+        context.consent(),
+        facts.policy_signals,
+    );
 
-    if mutation.is_empty() && due.is_empty() && !needs_cluster_size {
+    if mutation.is_empty() && due.is_empty() && !needs_cluster_size && regranted.is_empty() {
         return FlushOutcome::Skipped;
     }
 
@@ -183,6 +190,16 @@ pub fn run_after_send(input: AfterSendInput<'_>) -> FlushOutcome {
                 facts: &facts,
             },
             calls,
+        );
+    }
+
+    for provider in regranted {
+        mutation.merge_state(
+            provider,
+            ProviderStateChange {
+                opt_out_clear: Some(now),
+                ..ProviderStateChange::default()
+            },
         );
     }
 
@@ -493,9 +510,11 @@ mod tests {
     use error_stack::Report;
 
     use super::*;
-    use crate::ec::identity::mutation::{PartnerIdChange, ProviderStateChange};
+    use crate::consent::types::GppConsent;
+    use crate::ec::identity::denials::{denials, filter_browser_candidates};
+    use crate::ec::identity::mutation::PartnerIdChange;
     use crate::ec::identity::request::WriterDecision;
-    use crate::ec::identity::revision::{record_revision, visitor_key};
+    use crate::ec::identity::revision::{record_revision, uid_hash, visitor_key};
     use crate::ec::identity::test_support::fake_http::{
         FakeBackend, FakeHttpClient, fake_services,
     };
@@ -503,8 +522,9 @@ mod tests {
         TEST_EC_ID, WriteCountingEcKv, allowing_consent, ec_partner, example_entry_set,
         full_record, pid, record_for_test, source,
     };
-    use crate::ec::kv_types::{KvNetwork, KvOptOut, KvPartnerId};
+    use crate::ec::kv_types::{KvNetwork, KvOptOut, KvPartnerId, KvProviderState};
     use crate::error::TrustedServerError;
+    use crate::openrtb::{Eid, Uid};
     use crate::settings::{ProviderMode, ProviderSettings};
     use crate::test_support::tests::create_test_settings;
 
@@ -1237,5 +1257,79 @@ mod tests {
             "should call no partner"
         );
         assert_eq!(fixture.store.writes().lookups, 0, "should not re-read");
+    }
+
+    #[test]
+    fn regrant_clear_empties_ov() {
+        let held = "browser-held-uid";
+        let mut row = live_row(true);
+        row.ps.insert(
+            PULL_ID.to_owned(),
+            KvProviderState {
+                o: Some(KvOptOut {
+                    at: 1_000,
+                    fp: "800".to_owned(),
+                }),
+                ov: vec![uid_hash(held)],
+                ..KvProviderState::default()
+            },
+        );
+        let browser = Eid {
+            source: PULL_SOURCE.to_owned(),
+            uids: vec![Uid {
+                id: held.to_owned(),
+                atype: Some(1),
+                ext: None,
+            }],
+            inserter: None,
+            matcher: None,
+            mm: None,
+            ext: None,
+        };
+        let mut fixture = Fixture::new(Some(&row), true);
+        let before = denials(&row, fixture.runtime.catalog());
+        let mut consent = allowing_consent();
+        consent.gpp = Some(GppConsent {
+            version: 1,
+            section_ids: vec![7],
+            eu_tcf: None,
+            us_sale_opt_out: Some(false),
+            us_sharing_opt_out: None,
+            us_targeted_advertising_opt_out: None,
+            us_gpc: None,
+            us_known_child: None,
+            us_privacy_section: None,
+            us_section_decode_failed: false,
+        });
+        *fixture.context.consent_mut() = consent;
+
+        let outcome = fixture.run(&ScriptedLimiter::allowing());
+
+        assert_eq!(outcome, FlushOutcome::Written, "should flush the clear");
+        assert_eq!(
+            fixture.store.writes().if_generation_match,
+            1,
+            "should ride the one write"
+        );
+        let stored = fixture.row();
+        let state = stored
+            .ps
+            .get(PULL_ID)
+            .expect("should keep the provider state");
+        assert!(
+            state.oc.is_some_and(|clear| clear > 1_000),
+            "should store the clear as oc"
+        );
+        assert!(state.ov.is_empty(), "should empty ps.ov");
+        assert!(
+            filter_browser_candidates(core::slice::from_ref(&browser), &before).is_empty(),
+            "control: before the clear the browser UID should be denied"
+        );
+        let after = denials(&stored, fixture.runtime.catalog());
+        assert_eq!(
+            filter_browser_candidates(core::slice::from_ref(&browser), &after),
+            vec![browser],
+            "should send the browser UID again after the clear"
+        );
     }
 }

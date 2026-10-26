@@ -39,8 +39,6 @@ pub(crate) const FP_US_SHARING: u32 = 14;
 /// Fingerprint bit of the US targeted-advertising opt-out.
 pub(crate) const FP_US_TARGETED: u32 = 15;
 /// The US opt-out bits: sale, sharing, targeted advertising and GPC.
-// Temporary: Task 36's consent re-gate, the first non-test reader, arrives later.
-#[allow(dead_code)]
 pub(crate) const FP_US_OPT_OUT_MASK: u64 =
     (1 << FP_US_SALE) | (1 << FP_US_SHARING) | (1 << FP_US_TARGETED) | (1 << FP_GPC);
 

@@ -6,6 +6,9 @@
 //! attach, so operators can debug KV-to-auction propagation without KV
 //! console access.
 //!
+//! Also serves `DELETE /_ts/admin/ec/{id}/providers/{provider}/opt-out`,
+//! which clears a provider's sticky opt-out.
+//!
 //! Also serves `GET /_ts/admin/eids`, which echoes the request's `ts-eids`
 //! and `sharedId` cookies with an ingestion preview — the client-side half
 //! of EID propagation that is never stored server-side.
@@ -36,10 +39,14 @@ use crate::openrtb::Eid;
 use super::checked_current_timestamp;
 use super::eids::{resolve_partner_ids, to_eids};
 use super::generation::is_valid_ec_id;
+use super::identity::IdentityProviderId;
 use super::identity::IdentityRuntime;
 use super::identity::UnixTime;
 use super::identity::catalog::ProviderCatalog;
+use super::identity::input::ThreadRandom;
+use super::identity::mutation::{ApplyContext, IdentityMutation, ProviderStateChange};
 use super::identity::policy::PolicySignals;
+use super::identity::removal::{RemovalWriteOutcome, write_removals};
 use super::identity::request::opted_out;
 use super::identity::servable::ServeContext;
 use super::kv::KvIdentityGraph;
@@ -313,6 +320,104 @@ pub fn handle_admin_ec_lookup(
             message: "failed to serialize admin EC lookup response".to_owned(),
         })?;
     Ok(json_response(StatusCode::OK, body))
+}
+
+/// Handles `DELETE /_ts/admin/ec/{id}/providers/{provider}/opt-out`.
+///
+/// Clears the provider's sticky opt-out `ps.o` by writing `oc = now`, which
+/// also empties `ps.ov` (spec 8). It runs the removal write's CAS loop and
+/// never reads the request's cookies or consent. Responds:
+///
+/// - `200 OK` with `{"cleared": true}` when the clear was written;
+/// - `400 Bad Request` for an invalid EC ID or provider ID;
+/// - `404 Not Found` when the row is missing or the provider holds no opt-out;
+/// - `405 Method Not Allowed` for any method but `DELETE`;
+/// - `501 Not Implemented` when no EC identity graph is configured;
+/// - `503 Service Unavailable` when the write did not land.
+#[must_use]
+pub fn handle_admin_opt_out_clear(
+    kv: Option<&KvIdentityGraph>,
+    req: &Request<EdgeBody>,
+) -> Response<EdgeBody> {
+    if req.method() != Method::DELETE {
+        let mut response = json_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+        response
+            .headers_mut()
+            .insert(header::ALLOW, HeaderValue::from_static("DELETE"));
+        return response;
+    }
+    let Some(kv) = kv else {
+        return admin_ec_lookup_not_supported();
+    };
+    let Some((ec_id, provider)) = opt_out_path_parts(req.uri().path()) else {
+        return json_error(StatusCode::NOT_FOUND, "admin diagnostic route not found");
+    };
+    if !is_valid_ec_id(ec_id) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid EC ID format (expected {64hex}.{6alnum})",
+        );
+    }
+    let Ok(provider) = provider.parse::<IdentityProviderId>() else {
+        return json_error(StatusCode::BAD_REQUEST, "invalid identity provider ID");
+    };
+
+    let Some(now) = checked_current_timestamp() else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the clock is unavailable, so the opt-out was not cleared",
+        );
+    };
+    let mut clear = IdentityMutation::default();
+    clear.merge_state(
+        provider.clone(),
+        ProviderStateChange {
+            opt_out_clear: Some(now),
+            ..ProviderStateChange::default()
+        },
+    );
+    let catalog = ProviderCatalog::empty();
+    let context = ApplyContext {
+        now,
+        random: &ThreadRandom,
+        catalog: &catalog,
+    };
+    match write_removals(kv, ec_id, &clear, &context) {
+        RemovalWriteOutcome::Written => {
+            log::info!(
+                "Admin cleared the opt-out of identity provider '{provider}' for '{}'",
+                log_id(ec_id)
+            );
+            json_response(StatusCode::OK, r#"{"cleared":true}"#.to_owned())
+        }
+        RemovalWriteOutcome::NothingToWrite => json_error(
+            StatusCode::NOT_FOUND,
+            "no EC entry, or the provider holds no opt-out to clear",
+        ),
+        RemovalWriteOutcome::Failed => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the opt-out clear could not be written; retry",
+        ),
+    }
+}
+
+/// Splits `/_ts/admin/ec/{id}/providers/{provider}/opt-out` into its EC ID
+/// and provider ID, or `None` for any other shape.
+fn opt_out_path_parts(path: &str) -> Option<(&str, &str)> {
+    let mut segments = path
+        .strip_prefix(ADMIN_EC_PATH)?
+        .strip_prefix('/')?
+        .split('/');
+    let ec_id = segments.next()?;
+    let (Some("providers"), Some(provider), Some("opt-out"), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return None;
+    };
+    Some((ec_id, provider))
 }
 
 /// Returns the portable response used when an adapter has no EC KV backend.
@@ -1773,5 +1878,138 @@ mod tests {
         assert_eq!(matched.len(), 1, "should match the sharedid partner");
         assert_eq!(matched[0]["source_domain"], "sharedid.org");
         assert_eq!(matched[0]["uid"], "shared-uid-123");
+    }
+
+    const OPT_OUT_PROVIDER: &str = "pull-ssp-example-com";
+
+    fn opt_out_path(ec_id: &str, provider: &str) -> String {
+        format!("/_ts/admin/ec/{ec_id}/providers/{provider}/opt-out")
+    }
+
+    fn opted_out_entry() -> KvEntry {
+        let mut entry = sample_entry();
+        entry.ps.insert(
+            OPT_OUT_PROVIDER.to_owned(),
+            KvProviderState {
+                o: Some(crate::ec::kv_types::KvOptOut {
+                    at: 1_000,
+                    fp: "800".to_owned(),
+                }),
+                ov: vec!["0123456789abcdef".to_owned()],
+                ..KvProviderState::default()
+            },
+        );
+        entry.ps.insert(
+            "other-provider".to_owned(),
+            KvProviderState {
+                ov: vec!["fedcba9876543210".to_owned()],
+                ..KvProviderState::default()
+            },
+        );
+        entry
+    }
+
+    #[test]
+    fn admin_clears_provider_opt_out() {
+        let ec_id = test_ec_id();
+        let kv = kv_with_entry(&ec_id, &opted_out_entry());
+
+        let response = handle_admin_opt_out_clear(
+            Some(&kv),
+            &request_with_method(
+                http::Method::DELETE,
+                &opt_out_path(&ec_id, OPT_OUT_PROVIDER),
+            ),
+        );
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "should clear the opt-out"
+        );
+        assert_eq!(
+            response_json(response),
+            serde_json::json!({ "cleared": true }),
+            "should report the clear"
+        );
+        let (stored, _) = kv
+            .get(&ec_id)
+            .expect("should read the row")
+            .expect("should hold the row");
+        let state = stored
+            .ps
+            .get(OPT_OUT_PROVIDER)
+            .expect("should keep the provider state");
+        assert!(
+            state.oc.is_some_and(|clear| clear > 1_000),
+            "should store the clear as oc"
+        );
+        assert!(state.ov.is_empty(), "should empty ps.ov");
+        assert_eq!(
+            stored
+                .ps
+                .get("other-provider")
+                .map(|other| other.ov.clone()),
+            Some(vec!["fedcba9876543210".to_owned()]),
+            "control: another provider's state should be untouched"
+        );
+    }
+
+    #[test]
+    fn admin_opt_out_clear_rejects_what_it_cannot_clear() {
+        let ec_id = test_ec_id();
+        let kv = kv_with_entry(&ec_id, &opted_out_entry());
+        let delete = |path: &str| {
+            handle_admin_opt_out_clear(Some(&kv), &request_with_method(http::Method::DELETE, path))
+                .status()
+        };
+
+        assert_eq!(
+            delete(&opt_out_path(&ec_id, "other-provider")),
+            StatusCode::NOT_FOUND,
+            "should not find an opt-out the provider does not hold"
+        );
+        assert_eq!(
+            delete(&opt_out_path("not-an-ec-id", OPT_OUT_PROVIDER)),
+            StatusCode::BAD_REQUEST,
+            "should reject an invalid EC ID"
+        );
+        assert_eq!(
+            delete(&opt_out_path(&ec_id, "Not_A_Provider")),
+            StatusCode::BAD_REQUEST,
+            "should reject an invalid provider ID"
+        );
+        let get = handle_admin_opt_out_clear(
+            Some(&kv),
+            &get_request(&opt_out_path(&ec_id, OPT_OUT_PROVIDER)),
+        );
+        assert_eq!(
+            get.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "should accept only DELETE"
+        );
+        let (stored, _) = kv
+            .get(&ec_id)
+            .expect("should read the row")
+            .expect("should hold the row");
+        assert!(
+            stored
+                .ps
+                .get(OPT_OUT_PROVIDER)
+                .is_some_and(|state| state.oc.is_none() && !state.ov.is_empty()),
+            "control: no rejected request should clear the opt-out"
+        );
+        assert_eq!(
+            handle_admin_opt_out_clear(
+                None,
+                &request_with_method(
+                    http::Method::DELETE,
+                    &opt_out_path(&ec_id, OPT_OUT_PROVIDER)
+                ),
+            )
+            .status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "should report an unconfigured identity graph"
+        );
     }
 }

@@ -706,32 +706,51 @@ fn parse_cookie_auction_eids(cookie_value: Option<&str>) -> Option<Vec<Eid>> {
 /// are forwarded as parsed, in wire order, never altered beyond a denied
 /// UID: they are what Prebid sent the `trustedServer` adapter, and a source
 /// may repeat with different EID-level fields. A server source's whole entry
-/// set is appended after them, only when no browser entry carries the source,
-/// so the two are never mixed. Sources are compared as the partner registry
-/// normalizes them (lowercase, trailing dot removed). Entries without UIDs are
-/// dropped.
+/// set is appended after them, and the two are never mixed:
+///
+/// - For a source whose owner wrote a valid value, the owner's set replaces
+///   every browser entry of the source, however often the browser repeated
+///   it.
+/// - For any other source, the server's set goes out only when no browser
+///   entry carries the source, so the browser's current value wins over a
+///   browser-seeded record and over any unowned record.
+///
+/// Sources are compared as the partner registry normalizes them (lowercase,
+/// trailing dot removed). Entries without UIDs are dropped.
 pub(crate) fn merge_auction_eids(
     client_eids: &[Eid],
     server: &ServerSet,
     denials: &Denials,
 ) -> Vec<Eid> {
+    let owned_sources: HashSet<String> = server
+        .sources()
+        .iter()
+        .filter(|source| source.owned && source.eids.iter().any(|eid| !eid.uids.is_empty()))
+        .filter_map(|source| normalize_partner_source_domain(&source.source_domain).ok())
+        .collect();
+    let is_owned = |eid: &Eid| {
+        normalize_partner_source_domain(&eid.source)
+            .is_ok_and(|source| owned_sources.contains(&source))
+    };
     let mut merged: Vec<Eid> = filter_browser_candidates(client_eids, denials)
         .into_iter()
-        .filter(|eid| !eid.uids.is_empty())
+        .filter(|eid| !eid.uids.is_empty() && !is_owned(eid))
         .collect();
     let browser_sources: HashSet<String> = merged
         .iter()
         .filter_map(|eid| normalize_partner_source_domain(&eid.source).ok())
         .collect();
 
-    for eid in server.sources().iter().flat_map(|source| &source.eids) {
-        if eid.uids.is_empty() {
-            continue;
-        }
-        let carried_by_browser = normalize_partner_source_domain(&eid.source)
-            .is_ok_and(|source| browser_sources.contains(&source));
-        if !carried_by_browser {
-            merged.push(eid.clone());
+    for source in server.sources() {
+        for eid in &source.eids {
+            if eid.uids.is_empty() {
+                continue;
+            }
+            let carried_by_browser = normalize_partner_source_domain(&eid.source)
+                .is_ok_and(|source| browser_sources.contains(&source));
+            if source.owned || !carried_by_browser {
+                merged.push(eid.clone());
+            }
         }
     }
     merged
@@ -746,8 +765,11 @@ mod tests {
     use crate::auction::types::{AuctionRequest, AuctionResponse};
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
+    use crate::ec::identity::descriptor::ConsentPolicy;
     use crate::ec::identity::revision::uid_hash;
-    use crate::ec::identity::test_support::{ec_partner, example_entry_set, full_record};
+    use crate::ec::identity::test_support::{
+        ec_partner, example_entry_set, full_record, pid, provider_from, source,
+    };
     use crate::ec::kv_types::{KvEid, KvEntry, KvPartnerId, KvProviderState, KvUid};
     use crate::error::IntoHttpResponse as _;
     use crate::openrtb::Uid;
@@ -761,6 +783,7 @@ mod tests {
     use base64::engine::general_purpose::STANDARD as BASE64;
     use serde_json::Value as JsonValue;
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
@@ -2519,6 +2542,342 @@ mod tests {
             merged,
             Some(vec![plain_eid(SOURCE_T, "kept", Some(1))]),
             "a browser UID the claiming provider invalidated should not be sent"
+        );
+    }
+
+    /// The request identity for `entry` when `provider` owns each of `owned`.
+    fn owned_identity(
+        entry: KvEntry,
+        registry: &PartnerRegistry,
+        provider: Arc<dyn crate::ec::identity::provider::IdentityProvider>,
+        owned: &[&str],
+        consent: ConsentContext,
+    ) -> (AuctionIdentity, EcContext) {
+        let owners = owned
+            .iter()
+            .map(|name| (source(name), provider.descriptor().id().clone()))
+            .collect();
+        let runtime = Arc::new(
+            IdentityRuntime::from_settings_with_providers(
+                &create_test_settings(),
+                vec![provider],
+                owners,
+            )
+            .expect("should build the runtime"),
+        );
+        let ec_id = merge_ec_id();
+        let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
+        ec_context.set_identity_runtime(runtime);
+        let snapshot = EcKvSnapshot::Present {
+            ec_id,
+            entry: Box::new(entry),
+            generation: None,
+        };
+        let identity = auction_identity(
+            &snapshot,
+            Some(registry),
+            &ec_context,
+            PolicySignals::default(),
+        );
+        (identity, ec_context)
+    }
+
+    fn non_regulated_consent() -> ConsentContext {
+        ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            ..ConsentContext::default()
+        }
+    }
+
+    fn owner_provider(expiring: bool) -> Arc<dyn crate::ec::identity::provider::IdentityProvider> {
+        let mut builder =
+            crate::ec::identity::descriptor::ProviderDescriptor::builder(pid("owner"))
+                .with_source(source(SOURCE_S))
+                .with_resolves(
+                    crate::ec::identity::descriptor::Resolves::new()
+                        .with_endpoint("https://api.example.com/fetch"),
+                )
+                .with_consent_policy(ConsentPolicy::strict());
+        if expiring {
+            builder = builder.with_expiring_ids();
+        }
+        provider_from(builder.build().expect("should build the descriptor"))
+    }
+
+    fn owner_record(uid: &str) -> KvPartnerId {
+        KvPartnerId {
+            w: Some("owner".to_owned()),
+            ..KvPartnerId::new(uid)
+        }
+    }
+
+    #[test]
+    fn owner_valid_value_beats_browser_value() {
+        let registry = merge_registry(&[SOURCE_S, SOURCE_T]);
+        let (identity, _) = owned_identity(
+            merge_entry(vec![(SOURCE_S, owner_record("owner-uid"))]),
+            &registry,
+            owner_provider(false),
+            &[SOURCE_S],
+            non_regulated_consent(),
+        );
+
+        let merged = identity.merge(Some(&[
+            plain_eid(SOURCE_S, "browser", Some(1)),
+            plain_eid(SOURCE_T, "other", Some(1)),
+        ]));
+
+        assert_eq!(
+            merged,
+            Some(vec![
+                plain_eid(SOURCE_T, "other", Some(1)),
+                plain_eid(SOURCE_S, "owner-uid", Some(default_atype())),
+            ]),
+            "the owner's value should replace the browser's, after the browser entries"
+        );
+    }
+
+    #[test]
+    fn owner_valid_set_replaces_every_repeated_browser_entry() {
+        let registry = merge_registry(&[SOURCE_S, SOURCE_T]);
+        let (identity, _) = owned_identity(
+            merge_entry(vec![(
+                SOURCE_S,
+                full_record(Some("owner"), example_entry_set()),
+            )]),
+            &registry,
+            owner_provider(false),
+            &[SOURCE_S],
+            non_regulated_consent(),
+        );
+
+        let merged = identity.merge(Some(&[
+            plain_eid(SOURCE_S, "browser-one", Some(1)),
+            plain_eid(SOURCE_T, "other", Some(1)),
+            Eid {
+                inserter: Some("inserter.example.com".to_owned()),
+                ..plain_eid(SOURCE_S, "browser-two", Some(3))
+            },
+        ]));
+
+        assert_eq!(
+            merged,
+            Some(vec![
+                plain_eid(SOURCE_T, "other", Some(1)),
+                Eid {
+                    source: SOURCE_S.to_owned(),
+                    uids: vec![
+                        Uid {
+                            id: "example-a".to_owned(),
+                            atype: Some(1),
+                            ext: None,
+                        },
+                        Uid {
+                            id: "example-b".to_owned(),
+                            atype: Some(3),
+                            ext: Some(json!({ "stype": "ppuid" })),
+                        },
+                    ],
+                    inserter: Some("example.com".to_owned()),
+                    matcher: None,
+                    mm: Some(3),
+                    ext: None,
+                },
+                Eid {
+                    source: SOURCE_S.to_owned(),
+                    uids: vec![Uid {
+                        id: "example-c".to_owned(),
+                        atype: Some(1),
+                        ext: None,
+                    }],
+                    inserter: None,
+                    matcher: Some("partner.example.com".to_owned()),
+                    mm: None,
+                    ext: None,
+                },
+            ]),
+            "exactly the owner's two entries should go out, in stored order, and no browser entry of the source"
+        );
+    }
+
+    #[test]
+    fn browser_seeded_value_never_beats_browser_current_value() {
+        let registry = merge_registry(&[SOURCE_S]);
+        let (identity, _) = owned_identity(
+            merge_entry(vec![(SOURCE_S, KvPartnerId::new("seeded"))]),
+            &registry,
+            owner_provider(false),
+            &[SOURCE_S],
+            non_regulated_consent(),
+        );
+
+        let sent = identity.merge(Some(&[plain_eid(SOURCE_S, "current", Some(1))]));
+        let silent = identity.merge(None);
+
+        assert_eq!(
+            sent,
+            Some(vec![plain_eid(SOURCE_S, "current", Some(1))]),
+            "the browser's current value should beat a browser-seeded record"
+        );
+        assert_eq!(
+            silent,
+            Some(vec![plain_eid(SOURCE_S, "seeded", Some(default_atype()))]),
+            "control: a seeded value of a source that does not expire should go out when the browser is silent"
+        );
+    }
+
+    #[test]
+    fn expiring_owned_source_never_serves_browser_seeded_value() {
+        let registry = merge_registry(&[SOURCE_S]);
+        let (expiring, _) = owned_identity(
+            merge_entry(vec![(SOURCE_S, KvPartnerId::new("seeded"))]),
+            &registry,
+            owner_provider(true),
+            &[SOURCE_S],
+            non_regulated_consent(),
+        );
+        let (owned_expiring, _) = owned_identity(
+            merge_entry(vec![(
+                SOURCE_S,
+                KvPartnerId {
+                    exp: Some(current_timestamp() + 1_000),
+                    ..owner_record("owner-uid")
+                },
+            )]),
+            &registry,
+            owner_provider(true),
+            &[SOURCE_S],
+            non_regulated_consent(),
+        );
+
+        assert_eq!(
+            expiring.merge(None),
+            None,
+            "should not serve a browser-seeded value of an expiring owned source"
+        );
+        assert_eq!(
+            owned_expiring.merge(None),
+            Some(vec![plain_eid(
+                SOURCE_S,
+                "owner-uid",
+                Some(default_atype())
+            )]),
+            "control: the owner's unexpired value should go out"
+        );
+    }
+
+    #[test]
+    fn unowned_source_keeps_the_browser_first_rule() {
+        let registry = merge_registry(&[SOURCE_S, SOURCE_T]);
+        let (identity, _) = owned_identity(
+            merge_entry(vec![
+                (SOURCE_S, owner_record("owner-uid")),
+                (SOURCE_T, owner_record("claimed-uid")),
+            ]),
+            &registry,
+            owner_provider(false),
+            &[SOURCE_S],
+            non_regulated_consent(),
+        );
+
+        let merged = identity.merge(Some(&[plain_eid(SOURCE_T, "browser", Some(1))]));
+
+        assert_eq!(
+            merged,
+            Some(vec![
+                plain_eid(SOURCE_T, "browser", Some(1)),
+                plain_eid(SOURCE_S, "owner-uid", Some(default_atype())),
+            ]),
+            "the browser should still win for a source with no owner"
+        );
+    }
+
+    #[test]
+    fn targeted_opt_out_blocks_server_ids_flush_and_mirror() {
+        let registry = merge_registry(&[SOURCE_S]);
+        let consent_with = |targeted: bool| ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            gpp: Some(crate::consent::types::GppConsent {
+                version: 1,
+                section_ids: vec![7],
+                eu_tcf: None,
+                us_sale_opt_out: Some(false),
+                us_sharing_opt_out: None,
+                us_targeted_advertising_opt_out: Some(targeted),
+                us_gpc: None,
+                us_known_child: None,
+                us_privacy_section: None,
+                us_section_decode_failed: false,
+            }),
+            ..ConsentContext::default()
+        };
+        let provider = owner_provider(false);
+        let entry = || merge_entry(vec![(SOURCE_S, owner_record("owner-uid"))]);
+        let (blocked, blocked_context) = owned_identity(
+            entry(),
+            &registry,
+            provider.clone(),
+            &[SOURCE_S],
+            consent_with(true),
+        );
+        let (allowed, allowed_context) = owned_identity(
+            entry(),
+            &registry,
+            provider.clone(),
+            &[SOURCE_S],
+            consent_with(false),
+        );
+
+        assert_eq!(
+            blocked.merge(None),
+            None,
+            "a targeted-advertising opt-out should leave no server-side ID in user.eids"
+        );
+        assert_eq!(
+            blocked.mirror_member(&blocked_context),
+            Some(json!({ "clear": true })),
+            "the ts-eids-s mirror should carry none of the provider's entries"
+        );
+        assert!(
+            allowed.merge(None).is_some()
+                && allowed
+                    .mirror_member(&allowed_context)
+                    .is_some_and(|member| member.get("value").is_some()),
+            "control: without the opt-out the ID should go out and be mirrored"
+        );
+
+        let catalog = ProviderCatalog::new(vec![provider.clone()], BTreeMap::new());
+        let settings = crate::settings::ProviderSettings::default();
+        let identity_settings = crate::settings::IdentitySettings::default();
+        let check = |consent: &ConsentContext| {
+            crate::ec::identity::coordinator::eligibility(
+                &crate::ec::identity::coordinator::EligibilityInput {
+                    provider: provider.as_ref(),
+                    settings: &settings,
+                    identity: &identity_settings,
+                    catalog: &catalog,
+                    consent,
+                },
+                &crate::ec::identity::coordinator::EligibilityView::empty(),
+                &crate::ec::identity::test_support::facts_for_writer(),
+                crate::ec::identity::coordinator::Phase::AfterSend,
+            )
+        };
+        assert!(
+            matches!(
+                check(&consent_with(true)),
+                crate::ec::identity::coordinator::Eligibility::Skip(
+                    crate::ec::identity::coordinator::SkipReason::ConsentPolicy
+                )
+            ),
+            "the provider should not be dispatched, so nothing of it is flushed"
+        );
+        assert!(
+            matches!(
+                check(&consent_with(false)),
+                crate::ec::identity::coordinator::Eligibility::Eligible { .. }
+            ),
+            "control: without the opt-out the provider should be eligible"
         );
     }
 
