@@ -610,6 +610,10 @@ mod tests {
                 "https://user:pass@[2001:db8::1]:8443/page",
                 "[2001:db8::1]:8443",
             ),
+            (
+                "https://a@b@publisher.example.com/page",
+                "publisher.example.com",
+            ),
         ] {
             let req = Request::builder()
                 .version(http::Version::HTTP_2)

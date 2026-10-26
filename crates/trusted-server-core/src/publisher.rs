@@ -20728,18 +20728,19 @@ mod tests {
                 .await
                 .expect("should buffer processed publisher response");
                 let html = response_body_string(response);
+                let case = format!("{version:?} {uri} (empty Host: {empty_host})");
 
                 assert!(
                     html.contains("href=\"https://publisher.example.com:8443/article\""),
-                    "should rewrite origin links using URI authority: {html}"
+                    "should rewrite origin links using URI authority for {case}: {html}"
                 );
                 assert!(
                     !html.contains("user:pass@"),
-                    "should omit URI userinfo from rewritten HTML: {html}"
+                    "should omit URI userinfo from rewritten HTML for {case}: {html}"
                 );
                 assert!(
                     html.contains("id=\"trustedserver-js\""),
-                    "should inject the Trusted Server script: {html}"
+                    "should inject the Trusted Server script for {case}: {html}"
                 );
             }
         }
