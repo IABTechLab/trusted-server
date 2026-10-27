@@ -21,19 +21,24 @@ use crate::error::TrustedServerError;
 use crate::integrations::{
     adserver_mock::AdServerMockConfig,
     aps::ApsConfig,
+    connectid::{CONNECTID_INTEGRATION_ID, ConnectIdConfig},
     datadome::DataDomeConfig,
     didomi::DidomiIntegrationConfig,
     google_tag_manager::GoogleTagManagerConfig,
     gpt::GptConfig,
     gpt_diagnostics::GptDiagnosticsConfig,
+    id5::{ID5_INTEGRATION_ID, Id5Config},
     js_asset_proxy::{JS_ASSET_PROXY_INTEGRATION_ID, JsAssetProxyConfig},
-    lockr::LockrConfig,
+    liveintent::{LIVEINTENT_INTEGRATION_ID, LiveIntentConfig},
+    liveramp::{LIVERAMP_INTEGRATION_ID, LiveRampConfig},
+    lockr::{LOCKR_INTEGRATION_ID, LockrConfig},
     nextjs::NextJsIntegrationConfig,
     osano::OsanoConfig,
     permutive::PermutiveConfig,
     prebid,
     sourcepoint::SourcepointConfig,
     testlight::TestlightConfig,
+    uid2::{UID2_INTEGRATION_ID, Uid2Config},
 };
 use crate::settings::{
     AssetOriginAuth, IdentitySettings, IntegrationConfig, ProviderMode, Settings,
@@ -62,6 +67,11 @@ const DEPLOY_VALIDATED_INTEGRATION_IDS: &[&str] = &[
     "datadome",
     "gpt",
     "gpt_diagnostics",
+    ID5_INTEGRATION_ID,
+    LIVEINTENT_INTEGRATION_ID,
+    LIVERAMP_INTEGRATION_ID,
+    UID2_INTEGRATION_ID,
+    CONNECTID_INTEGRATION_ID,
     JS_ASSET_PROXY_INTEGRATION_ID,
 ];
 
@@ -206,6 +216,22 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
             field(
                 vec![
                     optional_object("integrations"),
+                    optional_object("uid2"),
+                    object("api_key"),
+                ],
+                true,
+            ),
+            field(
+                vec![
+                    optional_object("integrations"),
+                    optional_object("uid2"),
+                    object("client_secret"),
+                ],
+                true,
+            ),
+            field(
+                vec![
+                    optional_object("integrations"),
                     optional_object("datadome"),
                     optional_object("protection_test_bypass"),
                     object("credential_secret_name"),
@@ -322,6 +348,37 @@ pub(crate) fn identity_descriptors_for_deploy(
     #[allow(unused_mut)]
     let mut descriptors =
         crate::ec::identity::generic_pull::generic_pull_descriptors(&settings.ec.partners)?;
+    descriptors.extend(validate_identity_integration::<Id5Config>(
+        settings,
+        ID5_INTEGRATION_ID,
+    )?);
+    descriptors.extend(validate_identity_integration::<LiveIntentConfig>(
+        settings,
+        LIVEINTENT_INTEGRATION_ID,
+    )?);
+    descriptors.extend(validate_identity_integration::<LiveRampConfig>(
+        settings,
+        LIVERAMP_INTEGRATION_ID,
+    )?);
+    descriptors.extend(validate_identity_integration::<Uid2Config>(
+        settings,
+        UID2_INTEGRATION_ID,
+    )?);
+    descriptors.extend(validate_identity_integration::<ConnectIdConfig>(
+        settings,
+        CONNECTID_INTEGRATION_ID,
+    )?);
+    if let Some(lockr) = settings.integration_config::<LockrConfig>(LOCKR_INTEGRATION_ID)?
+        && lockr.capture_identity
+    {
+        descriptors.push(lockr.build_descriptor().change_context(
+            TrustedServerError::Configuration {
+                message: format!(
+                    "integrations.{LOCKR_INTEGRATION_ID}: the identity provider cannot be described"
+                ),
+            },
+        )?);
+    }
     #[cfg(test)]
     descriptors.extend(validate_identity_integration::<
         crate::ec::identity::examples::ExampleIdConfig,
@@ -343,8 +400,6 @@ pub(crate) fn identity_descriptors_for_deploy(
 /// Returns [`TrustedServerError::Configuration`] when the integration's
 /// config does not parse or validate, or its descriptor cannot be built.
 /// Returns `Ok(None)` when the integration is absent or disabled.
-// Temporary: the first production identity integration adds the first caller.
-#[allow(dead_code)]
 pub(crate) fn validate_identity_integration<T: IdentityProviderConfig + DeserializeOwned>(
     settings: &Settings,
     id: &str,
@@ -477,6 +532,11 @@ fn validate_enabled_integrations(
     validate_integration::<NextJsIntegrationConfig>(settings, "nextjs")?;
     validate_integration::<PermutiveConfig>(settings, "permutive")?;
     validate_integration::<LockrConfig>(settings, "lockr")?;
+    validate_integration::<Id5Config>(settings, ID5_INTEGRATION_ID)?;
+    validate_integration::<LiveIntentConfig>(settings, LIVEINTENT_INTEGRATION_ID)?;
+    validate_integration::<LiveRampConfig>(settings, LIVERAMP_INTEGRATION_ID)?;
+    validate_integration::<Uid2Config>(settings, UID2_INTEGRATION_ID)?;
+    validate_integration::<ConnectIdConfig>(settings, CONNECTID_INTEGRATION_ID)?;
     validate_integration::<DidomiIntegrationConfig>(settings, "didomi")?;
     validate_integration::<SourcepointConfig>(settings, "sourcepoint")?;
     validate_integration::<OsanoConfig>(settings, "osano")?;
@@ -1084,6 +1144,8 @@ formats = [{ width = 300, height = 250 }]
                     "integrations.datadome.server_side_key_secret_name".to_owned(),
                     true,
                 ),
+                ("integrations.uid2.api_key".to_owned(), true),
+                ("integrations.uid2.client_secret".to_owned(), true),
                 (
                     "integrations.datadome.protection_test_bypass.credential_secret_name"
                         .to_owned(),

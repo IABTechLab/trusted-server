@@ -2,7 +2,7 @@
 
 This guide is for engineers who add a vendor to Trusted Server's server-side identity framework. Operators configuring a provider that already exists want the [Configuration Reference](/guide/configuration#identity-providers-ec-identity) and the [Edge Cookies](/guide/edge-cookies) guide instead.
 
-Every example uses a fictional provider, `exampleid`, that calls `api.exampleid.example.com`. No vendor ships with the framework. Vendors arrive in their own specs.
+Every example uses a fictional provider, `exampleid`, that calls `api.exampleid.example.com`. The vendor providers that ship with Trusted Server, listed in [Identity Vendors](/guide/integrations/identity-vendors), are worked examples of the same API.
 
 For the protocol, the storage layout and the reasoning behind each rule, see the [design spec](https://github.com/IABTechLab/trusted-server/blob/main/docs/superpowers/specs/2026-10-20-server-side-identity-providers-design.md). Section numbers below point into it.
 
@@ -78,6 +78,10 @@ An accessor fails in one of two ways:
 
 - `UndeclaredInput`: you read something the descriptor never declared. This is a provider bug. Even if you hide the error with `.ok()`, the read is recorded, the coordinator logs it as `Config`, and the harness fails your test.
 - `InputUnavailable`: the input was declared but is missing this time. This is a normal skip, handled like returning `None` from `request`.
+
+The hashed email (`Input::HashedEmail`) comes from the `ts-hem` cookie the page sets through the JS SDK, so it is present only for visitors who signed in. Treat it as wanted unless the vendor cannot work without it.
+
+A provider can also read a first-party cookie on the publisher's domain, such as the vendor's own ID cookie. Declare each name with `Resolves::with_cookie(name)` and read it with `input.cookie(name)?`, which returns `None` when the request lacks it. Trusted Server's own cookies and the consent cookies cannot be declared. Consent comes from `consent()`.
 
 Always available: `consent()`, `publisher_domain()`, `now()`, `random_bytes()`, `stored(source)` and the declared `endpoint()`. When the sources in one request have different kinds, use `input.is_initial(&source)` or `input.is_refresh(&source)` rather than matching on the kind.
 

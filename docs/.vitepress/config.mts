@@ -169,6 +169,10 @@ export default withMermaid(
               text: 'GPT Runtime Diagnostics',
               link: '/guide/integrations/gpt-diagnostics',
             },
+            {
+              text: 'Identity Vendors',
+              link: '/guide/integrations/identity-vendors',
+            },
             { text: 'Lockr', link: '/guide/integrations/lockr' },
             { text: 'Next.js', link: '/guide/integrations/nextjs' },
             { text: 'Osano', link: '/guide/integrations/osano' },

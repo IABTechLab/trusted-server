@@ -10,6 +10,10 @@ pub const COOKIE_TS_EIDS: &str = "ts-eids";
 /// Client-only mirror of the servable server-side EIDs, written by the shim
 /// and never read by the server (spec 6.2).
 pub const COOKIE_TS_EIDS_S: &str = "__Host-ts-eids-s";
+/// Cookie written by the Trusted Server JS SDK holding the lowercase hex
+/// SHA-256 of the visitor's normalized email address. Read per request as the
+/// identity providers' hashed-email input; never stored in KV.
+pub const COOKIE_TS_HEM: &str = "ts-hem";
 pub const COOKIE_TS_TESTER: &str = "ts-tester";
 pub const COOKIE_SHAREDID: &str = "sharedId";
 

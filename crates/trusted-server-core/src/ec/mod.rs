@@ -68,6 +68,7 @@ pub fn log_id(ec_id: &str) -> String {
     format!("{prefix}\u{2026}")
 }
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use cookie::CookieJar;
@@ -77,8 +78,8 @@ use http::{Request, header};
 use url::Url;
 
 use crate::consent::{self as consent_mod, ConsentContext, ConsentPipelineInput};
-use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_REVOKED};
-use crate::cookies::handle_request_cookies;
+use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_REVOKED, COOKIE_TS_HEM};
+use crate::cookies::{CONSENT_COOKIE_NAMES, TS_IDENTITY_COOKIE_NAMES, handle_request_cookies};
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
@@ -88,6 +89,7 @@ use crate::settings::Settings;
 use device::DeviceSignals;
 
 use self::finalize::BrowserSeed;
+use self::identity::input::HashedEmail;
 use self::identity::measurement::{IdentityMeasurement, MeasurementInput, RouteKind};
 use self::identity::request::{RequestIdentity, WriterDecision};
 use self::identity::runtime::IdentityRuntime;
@@ -214,6 +216,31 @@ fn parse_ec_from_request(req: &Request<EdgeBody>) -> Result<RequestEc, Report<Tr
         .map(cookie::Cookie::value)
         .and_then(|value| request_ec_id_if_allowed(value, "ts-ec cookie"));
     Ok(RequestEc { cookie_ec, jar })
+}
+
+/// The hashed email from the `ts-hem` cookie and the cookies identity
+/// providers may read: every first-party cookie except Trusted Server's own
+/// and the consent cookies. A malformed `Cookie` header gives neither.
+fn provider_cookie_signals(
+    req: &Request<EdgeBody>,
+) -> (Option<HashedEmail>, BTreeMap<String, String>) {
+    let Some(jar) = handle_request_cookies(req).ok().flatten() else {
+        return (None, BTreeMap::new());
+    };
+    let hashed_email = jar
+        .get(COOKIE_TS_HEM)
+        .and_then(|cookie| HashedEmail::from_cookie_hex(cookie.value()));
+    let cookies = jar
+        .iter()
+        .filter(|cookie| {
+            !TS_IDENTITY_COOKIE_NAMES
+                .iter()
+                .chain(CONSENT_COOKIE_NAMES)
+                .any(|reserved| reserved.eq_ignore_ascii_case(cookie.name()))
+        })
+        .map(|cookie| (cookie.name().to_owned(), cookie.value().to_owned()))
+        .collect();
+    (hashed_email, cookies)
 }
 
 fn request_ec_id_if_allowed(value: &str, source: &str) -> Option<String> {
@@ -773,8 +800,9 @@ impl EcContext {
     /// Decides whether this request is the one browser-driven identity writer.
     ///
     /// Only an organic real-browser top-level document navigation that is not
-    /// a prefetch writes (spec 5.1). Also captures the user agent, `DNT` and
-    /// the page URL without query or fragment.
+    /// a prefetch writes (spec 5.1). Also captures the user agent, `DNT`, the
+    /// page URL without query or fragment, the hashed email from the `ts-hem`
+    /// cookie, and the first-party cookies identity providers may declare.
     ///
     /// The page URL is read from the request URI, so it needs an absolute
     /// URI. The Fastly adapter gives one (`edgezero-adapter-fastly` builds the
@@ -806,12 +834,15 @@ impl EcContext {
             url.set_fragment(None);
             url
         });
+        let (hashed_email, cookies) = provider_cookie_signals(req);
         self.identity.set_writer_decision(WriterDecision {
             writer,
             is_real_browser,
             user_agent,
             dnt,
             page_url,
+            hashed_email,
+            cookies,
         });
     }
 
@@ -829,6 +860,7 @@ impl EcContext {
         if !(same_origin && interval_sec > 0 && self.identity.is_real_browser()) {
             return;
         }
+        let (hashed_email, cookies) = provider_cookie_signals(req);
         self.identity.set_writer_decision(WriterDecision {
             writer: true,
             is_real_browser: true,
@@ -843,6 +875,8 @@ impl EcContext {
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|value| value.trim() == "1"),
             page_url: None,
+            hashed_email,
+            cookies,
         });
         self.identity.set_spa_writer(true);
     }
@@ -1019,6 +1053,8 @@ impl EcContext {
             user_agent: None,
             dnt: false,
             page_url: None,
+            hashed_email: None,
+            cookies: BTreeMap::new(),
         });
         context
     }
@@ -1560,6 +1596,71 @@ mod tests {
         assert!(!ec.ec_was_present(), "should not detect EC from header");
         assert!(!ec.cookie_was_present(), "should not detect cookie");
         assert!(!ec.ec_generated(), "should not mark as generated");
+    }
+
+    #[test]
+    fn provider_cookie_signals_read_the_hem_and_hide_identity_and_consent_cookies() {
+        let hem = "ab".repeat(32);
+        let cookie = format!(
+            "ts-hem={hem}; ts-ec=ec-value; ts-eids=eids; euconsent-v2=tc; __gpp=gpp; \
+             us_privacy=1YNN; _lc2_fpi=fpi-example; other=value"
+        );
+        let req = create_test_request(&[("cookie", &cookie)]);
+
+        let (hashed_email, cookies) = provider_cookie_signals(&req);
+
+        assert_eq!(
+            hashed_email.map(|email| email.to_hex()),
+            Some(hem),
+            "should read the ts-hem digest"
+        );
+        let names: Vec<&str> = cookies.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            ["_lc2_fpi", "other"],
+            "should offer only first-party cookies that are not TS identity or consent cookies"
+        );
+        assert_eq!(cookies["_lc2_fpi"], "fpi-example", "should keep the value");
+    }
+
+    #[test]
+    fn provider_cookie_signals_hide_reserved_cookies_in_any_case() {
+        let req = create_test_request(&[("cookie", "TS-EC=x; Ts-Hem=y; EUCONSENT-V2=z; keep=1")]);
+
+        let (_, cookies) = provider_cookie_signals(&req);
+
+        let names: Vec<&str> = cookies.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            ["keep"],
+            "should match reserved names case-insensitively"
+        );
+    }
+
+    #[test]
+    fn provider_cookie_signals_ignore_a_hem_that_is_not_a_digest() {
+        for value in ["", "person@example.com", &"zz".repeat(32), &"ab".repeat(31)] {
+            let cookie = format!("ts-hem={value}");
+            let req = create_test_request(&[("cookie", &cookie)]);
+
+            let (hashed_email, cookies) = provider_cookie_signals(&req);
+
+            assert!(
+                hashed_email.is_none(),
+                "should not read `{value}` as a digest"
+            );
+            assert!(cookies.is_empty(), "should never offer ts-hem as a cookie");
+        }
+    }
+
+    #[test]
+    fn provider_cookie_signals_are_empty_without_a_cookie_header() {
+        let req = create_test_request(&[]);
+
+        let (hashed_email, cookies) = provider_cookie_signals(&req);
+
+        assert!(hashed_email.is_none(), "should have no HEM");
+        assert!(cookies.is_empty(), "should have no cookies");
     }
 
     #[test]

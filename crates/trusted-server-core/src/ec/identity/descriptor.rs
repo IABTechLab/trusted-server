@@ -9,6 +9,7 @@ use url::Url;
 
 use super::ids::{IdentityProviderId, SourceDomain};
 use super::resolution::IdentityProviderError;
+use crate::cookies::{CONSENT_COOKIE_NAMES, TS_IDENTITY_COOKIE_NAMES};
 use crate::ec::kv_types::{MAX_EID_FIELD_BYTES, is_valid_eid_field};
 use crate::ec::partner::normalize_partner_source_domain;
 
@@ -253,6 +254,16 @@ impl ProviderDescriptorBuilder {
                     )));
                 }
             }
+            for name in &resolves.cookies {
+                if !is_cookie_name(name) {
+                    return Err(fail(&format!("cookie `{name}` is not a valid cookie name")));
+                }
+                if is_reserved_cookie(name) {
+                    return Err(fail(&format!(
+                        "cookie `{name}` is a Trusted Server identity or consent cookie"
+                    )));
+                }
+            }
             if let Some(gap) = self.consent_policy.resolver_gap() {
                 return Err(fail(gap));
             }
@@ -275,6 +286,23 @@ impl ProviderDescriptorBuilder {
             expiring,
         })
     }
+}
+
+/// Whether `name` is an RFC 6265 cookie-name token.
+fn is_cookie_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && !b"()<>@,;:\\\"/[]?={}".contains(&byte))
+}
+
+/// Trusted Server's own identity cookies and the consent cookies, which no
+/// provider reads directly.
+fn is_reserved_cookie(name: &str) -> bool {
+    TS_IDENTITY_COOKIE_NAMES
+        .iter()
+        .chain(CONSENT_COOKIE_NAMES)
+        .any(|reserved| reserved.eq_ignore_ascii_case(name))
 }
 
 /// The kind of resolution one source needs.
@@ -301,6 +329,7 @@ pub struct Resolves {
     private_state: bool,
     refresh_grace: Option<Duration>,
     ec_id: bool,
+    cookies: BTreeSet<String>,
 }
 
 impl Default for Resolves {
@@ -323,6 +352,7 @@ impl Resolves {
             private_state: false,
             refresh_grace: None,
             ec_id: false,
+            cookies: BTreeSet::new(),
         }
     }
 
@@ -396,6 +426,17 @@ impl Resolves {
         self
     }
 
+    /// A first-party cookie the provider may read, such as the vendor's own
+    /// ID cookie on the publisher's domain. Repeatable. It is passed when the
+    /// request carries it and is never required. `build()` refuses Trusted
+    /// Server's identity cookies and the consent cookies, which providers
+    /// read through [`ResolveInput::consent`](super::input::ResolveInput::consent).
+    #[must_use]
+    pub fn with_cookie(mut self, name: &str) -> Self {
+        self.cookies.insert(name.to_owned());
+        self
+    }
+
     /// Gives the provider the full EC ID. Only generic pull may use this.
     #[must_use]
     pub(in crate::ec::identity) fn with_ec_id(mut self) -> Self {
@@ -459,6 +500,12 @@ impl Resolves {
     #[must_use]
     pub(crate) fn gets_ec_id(&self) -> bool {
         self.ec_id
+    }
+
+    /// The first-party cookies the provider may read.
+    #[must_use]
+    pub(crate) fn cookies(&self) -> &BTreeSet<String> {
+        &self.cookies
     }
 }
 
@@ -765,7 +812,8 @@ pub enum Input {
     /// Country and subdivision only.
     #[display("region")]
     Region,
-    /// A SHA-256 of a normalized email address. Never available in v1.
+    /// A SHA-256 of a normalized email address, from the `ts-hem` cookie the
+    /// JS SDK writes. Never stored.
     #[display("hashed_email")]
     HashedEmail,
 }
@@ -786,6 +834,9 @@ pub enum Access {
     /// The full EC ID, without `with_ec_id()`. Only generic pull declares it.
     #[display("ec_id")]
     EcId,
+    /// A first-party cookie, without `with_cookie()` for its name.
+    #[display("cookie")]
+    Cookie,
 }
 
 #[cfg(test)]
@@ -931,6 +982,30 @@ mod tests {
     }
 
     #[test]
+    fn keeps_declared_cookies() {
+        let descriptor = ProviderDescriptor::builder(id("p"))
+            .with_source(source("example.com"))
+            .with_resolves(
+                Resolves::new()
+                    .with_endpoint("https://a.example.com")
+                    .with_cookie("_vendor_fpid")
+                    .with_cookie("_vendor_fpid"),
+            )
+            .with_consent_policy(crate::ec::identity::test_support::resolver_policy())
+            .build()
+            .expect("should build");
+
+        let cookies: Vec<&str> = descriptor
+            .resolves()
+            .expect("should resolve")
+            .cookies()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(cookies, ["_vendor_fpid"], "should keep each name once");
+    }
+
+    #[test]
     fn build_rejects_invalid_descriptors() {
         let cases: Vec<(&str, ProviderDescriptorBuilder)> = vec![
             (
@@ -1034,6 +1109,46 @@ mod tests {
                     .with_source(source("example.com"))
                     .with_captures(Captures::new().with_path(Method::POST, "/integrations/p/api"))
                     .with_provenance(&source("example.com"), EidProvenance::new().with_mm(-1)),
+            ),
+            (
+                "cookie name with a separator",
+                ProviderDescriptor::builder(id("p"))
+                    .with_source(source("example.com"))
+                    .with_resolves(
+                        Resolves::new()
+                            .with_endpoint("https://a.example.com")
+                            .with_cookie("vendor;id"),
+                    ),
+            ),
+            (
+                "empty cookie name",
+                ProviderDescriptor::builder(id("p"))
+                    .with_source(source("example.com"))
+                    .with_resolves(
+                        Resolves::new()
+                            .with_endpoint("https://a.example.com")
+                            .with_cookie(""),
+                    ),
+            ),
+            (
+                "Trusted Server identity cookie",
+                ProviderDescriptor::builder(id("p"))
+                    .with_source(source("example.com"))
+                    .with_resolves(
+                        Resolves::new()
+                            .with_endpoint("https://a.example.com")
+                            .with_cookie("TS-HEM"),
+                    ),
+            ),
+            (
+                "consent cookie",
+                ProviderDescriptor::builder(id("p"))
+                    .with_source(source("example.com"))
+                    .with_resolves(
+                        Resolves::new()
+                            .with_endpoint("https://a.example.com")
+                            .with_cookie("euconsent-v2"),
+                    ),
             ),
         ];
         for (name, builder) in cases {

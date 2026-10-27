@@ -11,6 +11,7 @@ version = { workspace = true }
 workspace = true
 
 [dependencies]
+aes-gcm = { workspace = true }
 async-trait = { workspace = true }
 async-stream = { workspace = true }
 base64 = { workspace = true }

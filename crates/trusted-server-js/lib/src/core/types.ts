@@ -416,6 +416,16 @@ export interface TsjsApi {
     callback: () => void,
     opts?: { bidsBackHandler?: () => void; timeout?: number }
   ): void;
+  /**
+   * Normalizes and hashes the visitor's email in the browser and stores the
+   * SHA-256 in the first-party `ts-hem` cookie, the identity providers'
+   * hashed-email input. Resolves to whether a digest was stored.
+   */
+  setEmail?(email: string): Promise<boolean>;
+  /** Stores an already-computed SHA-256 (64 hex digits) in `ts-hem`. */
+  setHashedEmail?(hex: string): boolean;
+  /** Removes `ts-hem`, for example on sign-out. */
+  clearHashedEmail?(): void;
   log?: {
     setLevel(l: 'silent' | 'error' | 'warn' | 'info' | 'debug'): void;
     getLevel(): 'silent' | 'error' | 'warn' | 'info' | 'debug';

@@ -13,7 +13,7 @@ use http::header;
 
 use crate::constants::{
     COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_TS_EC, COOKIE_TS_EIDS,
-    COOKIE_TS_EIDS_S, COOKIE_US_PRIVACY,
+    COOKIE_TS_EIDS_S, COOKIE_TS_HEM, COOKIE_US_PRIVACY,
 };
 use crate::error::TrustedServerError;
 
@@ -33,18 +33,26 @@ pub const CONSENT_COOKIE_NAMES: &[&str] = &[
 ///
 /// Stripped from Prebid Server requests and never added to proxy or provider
 /// requests.
-pub const TS_IDENTITY_COOKIE_NAMES: &[&str] = &[COOKIE_TS_EC, COOKIE_TS_EIDS, COOKIE_TS_EIDS_S];
+pub const TS_IDENTITY_COOKIE_NAMES: &[&str] = &[
+    COOKIE_TS_EC,
+    COOKIE_TS_EIDS,
+    COOKIE_TS_EIDS_S,
+    COOKIE_TS_HEM,
+];
 
 /// Identity cookies removed from publisher-origin requests by default.
 ///
 /// `ts-ec` and `ts-eids` still reach the origin, as they did before the
 /// `ts-eids-s` mirror existed, so the origin's `Cookie` header stays at its
-/// earlier size. See [`TS_ORIGIN_STRIPPED_COOKIE_NAMES_WITH_EIDS`].
-pub const TS_ORIGIN_STRIPPED_COOKIE_NAMES: &[&str] = &[COOKIE_TS_EIDS_S];
+/// earlier size. The hashed email never leaves the edge. See
+/// [`TS_ORIGIN_STRIPPED_COOKIE_NAMES_WITH_EIDS`].
+pub const TS_ORIGIN_STRIPPED_COOKIE_NAMES: &[&str] = &[COOKIE_TS_EIDS_S, COOKIE_TS_HEM];
 
 /// Identity cookies removed from publisher-origin requests when the operator
-/// sets `ec.strip_eids_cookie_from_origin`: `ts-eids` as well as the mirror.
-pub const TS_ORIGIN_STRIPPED_COOKIE_NAMES_WITH_EIDS: &[&str] = &[COOKIE_TS_EIDS, COOKIE_TS_EIDS_S];
+/// sets `ec.strip_eids_cookie_from_origin`: `ts-eids` as well as the mirror
+/// and the hashed email.
+pub const TS_ORIGIN_STRIPPED_COOKIE_NAMES_WITH_EIDS: &[&str] =
+    &[COOKIE_TS_EIDS, COOKIE_TS_EIDS_S, COOKIE_TS_HEM];
 
 /// Parses a cookie string into a [`CookieJar`].
 ///
@@ -520,14 +528,15 @@ mod tests {
 
     #[test]
     fn strip_cookie_pairs_removes_exact_names_only() {
-        let header =
-            "ts-ec=abc; ts-eids=W10; __Host-ts-eids-s=eyJ2IjoxfQ; other=1; ts-eids-extra=keep";
+        let header = "ts-ec=abc; ts-eids=W10; __Host-ts-eids-s=eyJ2IjoxfQ; ts-hem=00ff; other=1; \
+             ts-eids-extra=keep";
 
         let stripped = strip_cookie_pairs(header, TS_ORIGIN_STRIPPED_COOKIE_NAMES_WITH_EIDS);
 
         assert_eq!(
             stripped, "ts-ec=abc; other=1; ts-eids-extra=keep",
-            "should drop the ID cookies and keep ts-ec and a cookie that only shares a prefix"
+            "should drop the ID and hashed-email cookies and keep ts-ec and a cookie that only \
+             shares a prefix"
         );
 
         assert_eq!(

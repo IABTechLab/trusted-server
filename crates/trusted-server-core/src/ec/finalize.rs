@@ -1939,6 +1939,8 @@ mod tests {
                 user_agent: None,
                 dnt: false,
                 page_url: None,
+                hashed_email: None,
+                cookies: std::collections::BTreeMap::new(),
             });
     }
 

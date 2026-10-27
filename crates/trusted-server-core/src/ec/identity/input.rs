@@ -162,8 +162,22 @@ impl fmt::Debug for HashedEmail {
 }
 
 impl HashedEmail {
-    /// From digest bytes. Test support only: v1 has no source of hashed
-    /// emails, so nothing else builds one.
+    /// From the `ts-hem` cookie value: 64 hex digits of the digest, in
+    /// either case. `None` for anything else, so a malformed cookie is
+    /// treated as absent.
+    #[must_use]
+    pub(crate) fn from_cookie_hex(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.len() != 64 {
+            return None;
+        }
+        let mut bytes = [0u8; 32];
+        hex::decode_to_slice(value, &mut bytes).ok()?;
+        Some(Self(bytes))
+    }
+
+    /// From digest bytes. Test support only: the one runtime source is the
+    /// `ts-hem` cookie, read with [`Self::from_cookie_hex`].
     #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
@@ -432,6 +446,9 @@ pub(crate) struct ResolveSignals<'a> {
     pub(crate) random: &'a dyn RandomSource,
     pub(crate) ec_id: Option<String>,
     pub(crate) stored: BTreeMap<SourceDomain, StoredId>,
+    /// The request's first-party cookies other than Trusted Server's own and
+    /// the consent cookies. A provider reads only the names it declared.
+    pub(crate) cookies: BTreeMap<String, String>,
 }
 
 /// What one provider may read for one call.
@@ -675,13 +692,32 @@ impl<'a> ResolveInput<'a> {
         self.declared(Input::Region, self.signals.region.as_ref())
     }
 
-    /// A hashed email. Never available in v1.
+    /// The hashed email from the `ts-hem` cookie.
     ///
     /// # Errors
     ///
     /// As [`Self::client_ip`].
     pub fn hashed_email(&self) -> Result<&HashedEmail, Report<IdentityProviderError>> {
         self.declared(Input::HashedEmail, self.signals.hashed_email.as_ref())
+    }
+
+    /// The value of the first-party cookie `name`, or `None` when the request
+    /// does not carry it.
+    ///
+    /// # Errors
+    ///
+    /// `UndeclaredInput { access: Cookie }` when the descriptor did not
+    /// declare `name` with
+    /// [`Resolves::with_cookie`](super::descriptor::Resolves::with_cookie).
+    pub fn cookie(&self, name: &str) -> Result<Option<&str>, Report<IdentityProviderError>> {
+        if !self
+            .descriptor
+            .resolves()
+            .is_some_and(|resolves| resolves.cookies().contains(name))
+        {
+            return Err(self.record(Access::Cookie));
+        }
+        Ok(self.signals.cookies.get(name).map(String::as_str))
     }
 
     /// The full EC ID. Only for a resolver declared `with_ec_id()`.
@@ -827,7 +863,56 @@ mod tests {
             random: &ThreadRandom,
             ec_id: Some("a".repeat(64) + ".ABC123"),
             stored: BTreeMap::new(),
+            cookies: BTreeMap::from([("_vendor_fpid".to_owned(), "fpid-value".to_owned())]),
         }
+    }
+
+    #[test]
+    fn declared_cookies_are_readable_and_undeclared_ones_are_recorded() {
+        let descriptor = descriptor(
+            Resolves::new()
+                .with_endpoint("https://a.example.com")
+                .with_cookie("_vendor_fpid")
+                .with_cookie("_vendor_other"),
+        );
+        let signals = signals();
+        let input = ResolveInput::new(
+            &descriptor,
+            kinds(&descriptor, ResolveKind::Initial),
+            &signals,
+        );
+
+        assert_eq!(
+            input
+                .cookie("_vendor_fpid")
+                .expect("should read a declared cookie"),
+            Some("fpid-value"),
+            "should return the cookie value"
+        );
+        assert_eq!(
+            input
+                .cookie("_vendor_other")
+                .expect("should read a declared cookie"),
+            None,
+            "should return None for a declared cookie the request lacks"
+        );
+        let error = input
+            .cookie("_undeclared")
+            .expect_err("should refuse an undeclared cookie");
+        assert!(
+            matches!(
+                error.current_context(),
+                IdentityProviderError::UndeclaredInput {
+                    access: Access::Cookie
+                }
+            ),
+            "should report UndeclaredInput"
+        );
+        assert_eq!(
+            input.recorded_errors(),
+            [Access::Cookie],
+            "should record the undeclared read"
+        );
     }
 
     #[test]
@@ -1193,6 +1278,31 @@ mod tests {
             "HashedEmail([redacted])",
             "should redact Debug"
         );
+    }
+
+    #[test]
+    fn hashed_email_parses_the_cookie_hex_in_either_case() {
+        let lower = HashedEmail::from_cookie_hex(&"ab".repeat(32)).expect("should parse lowercase");
+        let upper = HashedEmail::from_cookie_hex(&"AB".repeat(32)).expect("should parse uppercase");
+
+        assert_eq!(lower, upper, "should read both cases as one digest");
+        assert_eq!(lower.as_bytes(), &[0xab; 32], "should decode the digest");
+    }
+
+    #[test]
+    fn hashed_email_rejects_a_cookie_that_is_not_a_digest() {
+        for value in [
+            "",
+            "ab",
+            &"ab".repeat(31),
+            &"ab".repeat(33),
+            &"zz".repeat(32),
+        ] {
+            assert!(
+                HashedEmail::from_cookie_hex(value).is_none(),
+                "should reject `{value}`"
+            );
+        }
     }
 
     #[test]

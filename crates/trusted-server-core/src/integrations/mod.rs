@@ -13,13 +13,18 @@ use crate::settings::Settings;
 
 pub mod adserver_mock;
 pub mod aps;
+pub mod connectid;
 pub mod datadome;
 pub mod didomi;
 pub mod google_tag_manager;
 pub mod gpt;
 pub mod gpt_diagnostics;
+pub mod id5;
 pub mod js_asset_proxy;
+pub mod liveintent;
+pub mod liveramp;
 pub mod lockr;
+mod lockr_identity;
 pub mod nextjs;
 pub mod osano;
 pub mod permutive;
@@ -27,6 +32,9 @@ pub mod prebid;
 mod registry;
 pub mod sourcepoint;
 pub mod testlight;
+pub mod uid2;
+mod vendor_eid;
+mod vendor_request;
 
 pub use registry::{
     AttributeRewriteAction, AttributeRewriteOutcome, HeaderMutation, HeaderMutationMode,
@@ -312,6 +320,26 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
         IntegrationBuilder {
             id: "lockr",
             build: lockr::register,
+        },
+        IntegrationBuilder {
+            id: id5::ID5_INTEGRATION_ID,
+            build: id5::register,
+        },
+        IntegrationBuilder {
+            id: liveintent::LIVEINTENT_INTEGRATION_ID,
+            build: liveintent::register,
+        },
+        IntegrationBuilder {
+            id: liveramp::LIVERAMP_INTEGRATION_ID,
+            build: liveramp::register,
+        },
+        IntegrationBuilder {
+            id: uid2::UID2_INTEGRATION_ID,
+            build: uid2::register,
+        },
+        IntegrationBuilder {
+            id: connectid::CONNECTID_INTEGRATION_ID,
+            build: connectid::register,
         },
         IntegrationBuilder {
             id: "didomi",
