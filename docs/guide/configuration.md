@@ -1703,16 +1703,18 @@ verification off, and they log nothing about it.
 
 Asset routes proxy selected first-party paths to an alternate asset origin without requiring signed `/first-party/proxy` URLs.
 
-| Field             | Type   | Required | Description                                                       |
-| ----------------- | ------ | -------- | ----------------------------------------------------------------- |
-| `prefix`          | String | Yes      | Request path prefix to match                                      |
-| `source`          | Table  | Yes      | Where the route's content comes from, in the shape `[source]` has |
-| `path_pattern`    | String | No       | Regex matched against the incoming request path                   |
-| `target_path`     | String | No       | Replacement path used with `path_pattern`                         |
-| `image_optimizer` | Table  | No       | Optional route-level Image Optimizer settings                     |
+| Field                    | Type    | Required              | Description                                                               |
+| ------------------------ | ------- | --------------------- | ------------------------------------------------------------------------- |
+| `prefix`                 | String  | Yes                   | Request path prefix to match                                              |
+| `source`                 | Table   | Yes                   | Where the route's content comes from, in the shape `[source]` has         |
+| `path_pattern`           | String  | No                    | Regex matched against the incoming request path                           |
+| `target_path`            | String  | No                    | Replacement path used with `path_pattern`                                 |
+| `image_optimizer`        | Table   | No                    | Optional route-level Image Optimizer settings                             |
+| `rehost_page_references` | Boolean | No (default: `false`) | Serve a third party's files from this host and rewrite pages to name them |
 
-Write `prefix`, `path_pattern` and `target_path` before the route's source
-tables, because a table header ends the route's own keys.
+Write `prefix`, `path_pattern`, `target_path` and `rehost_page_references`
+before the route's source tables, because a table header ends the route's own
+keys.
 
 **Example**:
 
@@ -1749,6 +1751,10 @@ url = "https://assets-cdn.example.com"
 - The longest matching asset-route prefix wins.
 - `path_pattern` and `target_path` must be configured together.
 - Unsafe origin response headers such as `Set-Cookie` are stripped before the response reaches the browser.
+- A route with `rehost_page_references = true` serves the files of its `https` origin folder, and pages served through the publisher pipeline name the route's address for media and, where a `[[serve]]` entry for `text/css` covers the path, stylesheets in that folder. Its prefix must end in `/`, must not sit under `/_ts`, and must not overlap another route's. See [Rehosting third-party files](./asset-routes.md#rehosting-third-party-files) for the full contract.
+- With any rehosting route enabled, original HTML is decoded and buffered under `publisher.max_buffered_body_bytes` before rewriting, so its first effective `base[href]` resolves all references, including preceding ones, against the full fetched document URL. Exceeding the bound refuses the response before partial rewritten output. Applicable middleware source-protection policies also hold bounded original HTML, even without rehost routes: Encypher preserves original provenance-bearing inline SVG and all descendants before core, fetch or serve edits. Exact source slices are restored before template publication and protected again on warm reader copies. Invalid ranges or damaged/lost/duplicated protection markers refuse the pass. HTML with neither rehosting nor an applicable protection policy keeps its normal streaming behavior.
+- Shared-template admission structurally observes fully restored markup for nonce attributes and nonce-bearing meta CSP, including protected SVG and middleware-generated markup. A nonce or an observation error prevents shared storage; preservation never hides source bytes from this privacy gate.
+- Rehosting validates the complete outbound `Host` authority, including a non-default port. CSS-chain candidate paths bypass raw-copy caching. Moved CSS keeps browser `max-age` and shared `s-maxage` (fallback `max-age`) independent, subtracts received/apparent age and processing time before rebasing, and applies the corresponding route cap to each, even after middleware and adapter headers. See [Rehosting third-party files](./asset-routes.md#rehosting-third-party-files) for the collection and freshness bounds.
 
 ### `[proxy.asset_routes.source.origin]`
 
@@ -1825,12 +1831,13 @@ Effective `origin_query` precedence is auth-level `origin_query`, then enabled I
 
 Route-level Image Optimizer configuration selects a reusable profile set.
 
-| Field          | Type    | Required         | Default              | Description                                                                 |
-| -------------- | ------- | ---------------- | -------------------- | --------------------------------------------------------------------------- |
-| `enabled`      | Boolean | No               | `true`               | Enable Image Optimizer for the route                                        |
-| `region`       | String  | Yes when enabled | none                 | Fastly IO processing region, such as `us_east`                              |
-| `profile_set`  | String  | Yes when enabled | none                 | Name under `[image_optimizer.profile_sets.*]`                               |
-| `origin_query` | String  | No               | `strip` when enabled | `preserve` or `strip`; effective `preserve` is rejected while IO is enabled |
+| Field           | Type    | Required         | Default              | Description                                                                                                                                                                     |
+| --------------- | ------- | ---------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`       | Boolean | No               | `true`               | Enable Image Optimizer for the route                                                                                                                                            |
+| `region`        | String  | Yes when enabled | none                 | Fastly IO processing region, such as `us_east`                                                                                                                                  |
+| `profile_set`   | String  | Yes when enabled | none                 | Name under `[image_optimizer.profile_sets.*]`                                                                                                                                   |
+| `origin_query`  | String  | No               | `strip` when enabled | `preserve` or `strip`; effective `preserve` is rejected while IO is enabled                                                                                                     |
+| `signed_source` | Boolean | No               | `false`              | With a media signer, IO reads the route's own signed original on this host instead of the origin (see [Asset Routes](/guide/asset-routes#optimized-images-and-c2pa-provenance)) |
 
 **Example**:
 
@@ -2395,7 +2402,7 @@ generated configuration places it in.
 | `ad-tag.google.diagnostics`   | `[[serve]]` | For a request that activated diagnostics, writes the bootstrap ahead of the script bundle and the tag that loads the diagnostics module straight after it                                                                                                                                                                                                         |
 | `ads-txt.iabtl`               | `[[fetch]]` | Writes the lines `[ads-txt.iabtl]` gives at the end of the publisher's `ads.txt`, on `text/plain` alone                                                                                                                                                                                                                                                           |
 | `headers.geo`                 | `[[serve]]` | Writes the location the request resolved as the `x-geo-*` response headers, or `x-geo-info-available: false` where none is known. `[headers] modules = ["geo"]` selects it                                                                                                                                                                                        |
-| `provenance.encypher`         | `[[serve]]` | Signs the article of a `GET` of a `200` page on the configured domain whose origin did not mark it as one reader's, by holding the page and calling the Encypher API in the processor's asynchronous finish, and passes every other page, and every failure, through unchanged. `[provenance] module = "encypher"` selects it                                     |
+| `provenance.encypher`         | `[[serve]]` | Signs eligible articles and embedded media on admitted public pages. Shared policy failures leave the page unchanged; article and individual media failures leave only those items unchanged, so other eligible items may still be signed. `[provenance] module = "encypher"` selects it                                                                          |
 | `51degrees.client_hints`      | `[[serve]]` | Asks the 51Degrees service which client hints the reader's browser can send, writes `Accept-CH` and `Critical-CH` unless the browser already sends those hints, `Permissions-Policy` on the response and the `Delegate-CH` tag in the head for that list, and leaves the names in the request's state                                                             |
 | `robots_txt`                  | `[[fetch]]` | Makes the `robots.txt` that `[robots-txt]` describes, in place of whatever the origin answers, on `text/plain` and at `/robots.txt` alone                                                                                                                                                                                                                         |
 | `service_version`             | `[[serve]]` | Writes `X-TS-Version`, the git version the build compiled in, and `X-TS-Service-Version`, the platform's version number of the service, when each is known. Core supplies it, so no section selects it                                                                                                                                                            |
@@ -2410,6 +2417,63 @@ only where that content identity is correct for the publisher.
 inserted marker bytes and the escaped manifest meta element before allocating
 the rendered page; a plan that would cross the bound leaves the original page
 unchanged.
+
+Selecting Encypher also installs the media signer for eligible public binary
+responses delivered through publisher and asset routes. Response media type
+and verified bytes decide eligibility, including on extensionless paths.
+Images, audio, video and fonts are candidates; existing provenance and
+fragmented stream segments are preserved rather than signed again.
+`max_media_bytes` bounds each captured or decoded item, with a maximum of
+8,000,000 bytes.
+
+**Upgrade behavior:** an existing text-signing configuration also enables
+bounded media signing after this upgrade. The defaults are 5,000,000 bytes per
+item and 8 uncached embedded calls per document. There is no separate bounded
+media off switch; removing the module disables its article signing too.
+Deploy the matching API first and confirm media upload approval, API capacity
+and cold-page latency before upgrading an enabled edge. The complete settings,
+validation bounds and rollout contract are in the
+[module design](../superpowers/specs/2026-10-24-encypher-provenance-module-design#_3-configuration).
+
+`article_selector` accepts a single `.class`, exact `[attr=value]` (optionally
+quoted) or tag name, up to 91 characters. Unsupported or malformed syntax
+refuses settings admission. An empty selector, or a valid selector absent from
+the page, retains the normal article-boundary fallback.
+
+The HTML middleware signs eligible source `data:` URIs and inline SVG.
+For embedded data in CSS, place `provenance.encypher.stylesheet` in a
+`[[serve]]` entry with `media_type = "text/css"` and a path narrower than `/`.
+The publisher must know that those stylesheets are not loaded with
+subresource integrity. To move eligible external references onto configured
+asset routes, use the opt-in
+[rehosting contract](./asset-routes#rehosting-third-party-files).
+
+For pages with many embedded images, `[provenance.encypher]`
+`max_media_sign_calls_per_document` accepts `1..=128` and defaults to `8`.
+It bounds uncached embedded-media signing calls in each HTML or CSS document.
+Cache hits do not consume the budget. Once exhausted, remaining items stay
+unchanged without a negative cache entry. Raising this value does not increase
+`max_hold_ms`, body limits or API rate limits; verify the complete cold page
+under the deployed adapter before selecting a larger value.
+
+`max_large_media_bytes = 0` keeps prepared large-media signing off by default.
+Enabling it requires the matching prepared API and signed probe, a
+version-pinned source and a runtime timer that bounds the complete hashing and
+signing operation under `max_large_media_ms`. Fastly has no such total timer,
+so it refuses this lane even where the API supports the file. Its first-byte
+and between-byte timeouts are not substitutes. A refused large-media signing
+attempt delivers a fresh origin response without adding provenance.
+
+Coverage follows the delivered bytes through configured publisher and asset
+routes. A page can still load unsigned media directly from a third-party frame
+or a script, and scripts can create new inline SVG after the response leaves
+Trusted Server. Adding an asset route does not intercept those requests or
+establish provenance for those generated nodes. Private stylesheets and
+integrity-protected resources retain their refusal rules. Verify terminal
+browser responses and dynamic DOM media before claiming complete page coverage;
+successful signing of every routed response alone is not that proof. Detached
+formats also require retrieval of the emitted manifest URL through the public
+deployment, not only verification against a locally supplied sidecar.
 
 An entry that could not do what it says refuses the configuration, both when
 a deployment is validated and when the settings load. That is a media type

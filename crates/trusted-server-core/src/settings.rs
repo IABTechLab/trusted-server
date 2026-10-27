@@ -1908,6 +1908,21 @@ pub struct AssetImageOptimizerConfig {
     /// parameters as transformation inputs outside the configured profile table.
     #[serde(default)]
     pub origin_query: Option<OriginQueryPolicy>,
+    /// Whether the optimizer reads the original through this route's own
+    /// signed path rather than from the origin, where a media signer is
+    /// installed.
+    ///
+    /// The optimizer is sent to this host, at the reader's path with the
+    /// profile set's debug parameter set to `1`, which this route answers
+    /// unoptimized and signed: the exact origin bytes it captured, with a
+    /// manifest that opens them. The optimizer keeps that manifest and adds
+    /// its own record of what it did, so an origin without C2PA originals
+    /// still yields signed optimized images. Each such image costs this
+    /// service a second request. The embedded manifests are history: one
+    /// already in a cache outlives a policy revocation until that cache
+    /// expires it, while the answer signed under the current policy stops.
+    #[serde(default, deserialize_with = "bool_from_bool_or_str")]
+    pub signed_source: bool,
 }
 
 impl AssetImageOptimizerConfig {
@@ -2497,6 +2512,20 @@ pub struct ProxyAssetRoute {
     /// Optional Image Optimizer configuration.
     #[serde(default)]
     pub image_optimizer: Option<AssetImageOptimizerConfig>,
+    /// Whether the publisher's pages are pointed at this route for the
+    /// third-party addresses its source serves, see [`crate::rehost`].
+    ///
+    /// A stylesheet, image, font, audio or video address on the source's
+    /// origin, under its folder, is written as the address of this route on
+    /// the reader's host, so the media signer sees its bytes. A stylesheet is
+    /// pointed here only where a `[[serve]]` entry for `text/css` covers its
+    /// path, and its own addresses are moved with it. The route's source must
+    /// be core's `origin` over `https`, with no `auth`, `host_header` or
+    /// `directory_index`, and the route sets no `path_pattern`, `target_path`
+    /// or `image_optimizer`; the request path after `prefix` is the path
+    /// under the source's folder.
+    #[serde(default, deserialize_with = "bool_from_bool_or_str")]
+    pub rehost_page_references: bool,
     #[serde(skip, default)]
     compiled_pattern: OnceLock<Result<Regex, String>>,
 }
@@ -2571,11 +2600,18 @@ impl ProxyAssetRoute {
 
     /// Rewrite a matched request path to the configured upstream target path.
     ///
+    /// A route that sets [`Self::rehost_page_references`] maps the path
+    /// after its prefix under the source's folder, see
+    /// [`crate::rehost::target_path`].
+    ///
     /// # Errors
     ///
     /// Returns a proxy/configuration error if the rewrite is incomplete, does not
     /// match the request path, or produces a path that does not start with `/`.
     pub fn target_path_for(&self, path: &str) -> Result<String, Report<TrustedServerError>> {
+        if self.rehost_page_references {
+            return crate::rehost::target_path(&self.prefix, path);
+        }
         match (&self.path_pattern, &self.target_path) {
             (None, None) => Ok(path.to_string()),
             (Some(_), Some(target_path)) => {
@@ -2660,6 +2696,10 @@ impl ProxyAssetRoute {
                     self.prefix
                 ),
             }));
+        }
+
+        if self.rehost_page_references {
+            crate::rehost::check_route(self)?;
         }
 
         self.compiled_path_pattern().map(|_| ())
@@ -2832,6 +2872,7 @@ impl Proxy {
         for route in &self.asset_routes {
             route.prepare_runtime()?;
         }
+        crate::rehost::check_routes(&self.asset_routes)?;
 
         Ok(())
     }
@@ -2848,21 +2889,34 @@ impl Proxy {
     /// to [`IntegrationRegistry::route_source`](crate::integrations::IntegrationRegistry::route_source).
     #[must_use]
     pub fn asset_route_index_for_path(&self, path: &str) -> Option<usize> {
-        let mut best_match: Option<(usize, usize)> = None;
+        longest_prefix_index(
+            self.asset_routes.iter().map(|route| route.prefix.as_str()),
+            path,
+        )
+    }
+}
 
-        for (index, route) in self.asset_routes.iter().enumerate() {
-            if !path.starts_with(&route.prefix) {
-                continue;
-            }
+/// The position of the longest of `prefixes` that `path` begins with, the
+/// first written of equal ones, which is how a request is matched to an
+/// asset route.
+pub(crate) fn longest_prefix_index<'a>(
+    prefixes: impl IntoIterator<Item = &'a str>,
+    path: &str,
+) -> Option<usize> {
+    let mut best_match: Option<(usize, usize)> = None;
 
-            match best_match {
-                Some((_, length)) if length >= route.prefix.len() => {}
-                _ => best_match = Some((index, route.prefix.len())),
-            }
+    for (index, prefix) in prefixes.into_iter().enumerate() {
+        if !path.starts_with(prefix) {
+            continue;
         }
 
-        best_match.map(|(index, _)| index)
+        match best_match {
+            Some((_, length)) if length >= prefix.len() => {}
+            _ => best_match = Some((index, prefix.len())),
+        }
     }
+
+    best_match.map(|(index, _)| index)
 }
 
 /// Cache behavior configuration.
@@ -10331,6 +10385,7 @@ source_domain = "partner.example.com"
                 region: "us_east".to_string(),
                 profile_set: "default_images".to_string(),
                 origin_query: Some(OriginQueryPolicy::Strip),
+                signed_source: false,
             }),
             ..Default::default()
         };

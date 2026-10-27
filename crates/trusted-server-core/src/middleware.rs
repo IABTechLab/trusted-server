@@ -46,7 +46,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use http::{HeaderName, HeaderValue, StatusCode};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::attestation::PlatformIdentity;
@@ -58,6 +58,17 @@ use crate::streaming_processor::StreamProcessor;
 /// The media type a document is matched as, and the one a middleware runs on
 /// unless it says it handles another.
 pub const HTML_MEDIA_TYPE: &str = "text/html";
+
+/// A module's exact original byte ranges that no document transform may edit.
+/// Called on the complete, bounded document before core or middleware runs.
+/// Each classifier returns ordered, disjoint, nonempty ranges inside the input.
+/// An error refuses the document. Core treats ranges as opaque; classifications
+/// from different middleware are combined, including overlapping ranges.
+///
+/// Transforms see an opaque comment in place of each protected range. A
+/// middleware that signs or hashes raw whole HTML must not bind that intermediate
+/// view and assume its binding remains valid after original bytes are restored.
+pub type SourceProtection = fn(&[u8]) -> Result<Vec<std::ops::Range<usize>>, std::io::Error>;
 
 /// Whether a middleware may run on a response of `media_type`, written as a
 /// bare `type/subtype` in lower case.
@@ -154,6 +165,13 @@ pub struct MiddlewareContext<'a> {
     /// a reader's own page alone. A page from the store of shared templates
     /// was never one reader's.
     pub origin_private: bool,
+    /// The headers of the reader's response as core will send them, being
+    /// the origin's after core moved its addresses to the reader's host, for
+    /// a middleware whose change has to respect a header such as
+    /// `Content-Security-Policy`. `None` where core cannot say, being the
+    /// fetch phase of a page that may be stored and a page replayed from the
+    /// store, which a middleware treats as headers it does not know.
+    pub response_headers: Option<&'a HeaderMap>,
     /// What the adapter reports about the platform the deployment runs on,
     /// as the attestation evidence carries it.
     pub platform: &'a PlatformIdentity,
@@ -567,6 +585,13 @@ pub trait Middleware: Send + Sync {
         false
     }
 
+    /// Classifies source bytes that must survive all document transformations
+    /// unchanged. Default off. Only middleware in the applicable chains may
+    /// request this hold, including serve middleware before a template is built.
+    fn source_protection(&self) -> Option<SourceProtection> {
+        None
+    }
+
     /// Whether this middleware moves the origin's address to the reader's
     /// host itself, in a body of a media type it handles other than HTML.
     /// Core then leaves the addresses in such a body alone, whether or not
@@ -927,6 +952,15 @@ impl MiddlewareChain {
         self.middleware.is_empty()
     }
 
+    /// The original-source classifiers selected by this document's chain.
+    #[must_use]
+    pub fn source_protections(&self) -> Vec<SourceProtection> {
+        self.middleware
+            .iter()
+            .filter_map(|middleware| middleware.source_protection())
+            .collect()
+    }
+
     /// Whether a middleware in the chain writes the whole document, see
     /// [`Middleware::writes_whole_document`].
     #[must_use]
@@ -1115,6 +1149,7 @@ pub mod test_support {
             origin_host: ORIGIN_HOST,
             status: http::StatusCode::OK,
             origin_private: false,
+            response_headers: None,
             platform,
             document_state,
             max_buffered_script_bytes: 16 * 1024 * 1024,

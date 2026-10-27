@@ -684,7 +684,9 @@ mod tests {
             vec![Arc::new(ScriptAddress(integration))],
         );
         let config = HtmlProcessorConfig {
+            rehost: crate::rehost::PageRehost::default(),
             csp_nonce_observed: None,
+            response_headers: None,
             public_prefix: None,
             prepared: std::sync::Arc::new(crate::middleware::Prepared::default()),
             status: http::StatusCode::OK,

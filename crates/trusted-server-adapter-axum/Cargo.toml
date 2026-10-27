@@ -21,6 +21,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+# The dev server's own front end hands streamed bodies to Hyper (src/server.rs).
+axum = { workspace = true }
 bytes = { workspace = true }
 edgezero-adapter-axum = { workspace = true, features = ["axum"] }
 edgezero-core = { workspace = true }
@@ -29,7 +31,7 @@ futures = { workspace = true }
 log = { workspace = true }
 reqwest = { workspace = true }
 simple_logger = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 trusted-server-ad-server-iabtl = { workspace = true }
 trusted-server-ad-tag-google = { workspace = true }
 trusted-server-ads-txt-iabtl = { workspace = true }
@@ -63,7 +65,6 @@ trusted-server-testing-testlight = { workspace = true }
 
 [dev-dependencies]
 trusted-server-core = { workspace = true, features = ["test-utils"] }
-axum = { workspace = true }
 base64 = { workspace = true }
 serde_json = { workspace = true }
 temp-env = { workspace = true }

@@ -85,8 +85,11 @@ refused at startup. The modules' request filters and the device module
 classifies from the `User-Agent`, because Spin supplies no TLS or HTTP/2
 signals. An Edge Cookie module creates and writes its cookie with no identity
 graph behind it, and `POST /_ts/api/v1/ec/resolve` sets one the same way.
-`[[proxy.asset_routes]]` are served from each route's own source with the
-asset body held whole, up to 8 MiB, and a larger one answers `502`. Spin has
+`[[proxy.asset_routes]]` are served from each route's own source. The HTTP
+client passes a streamed origin body on one host chunk at a time, exactly as
+the origin encoded it and held to the caller's byte limit if it sets one, and
+the component sends a streamed response to the client as it is produced. A
+buffered body is held whole, up to 8 MiB, and a larger one answers `502`. Spin has
 no Image Optimizer, so the component warns about each route that enables one,
 once for each instance (see [Logging](#logging)), and each request such a
 route would optimize answers `502` (see [Asset Routes](./asset-routes)). Spin
@@ -100,8 +103,16 @@ Spin SDK 6's `IncomingBodyExt::stream()` rather than `bytes()`. It checks each
 host-created chunk before copying it into the buffered response and applies
 the same bound again to gzip or Brotli output. The host chunk already exists
 when guest code receives it, but the adapter does not collect the whole body
-before enforcing the bound. Spin still rejects callers that request a
-streaming platform response.
+before enforcing the bound. A streamed response reads the same stream one
+chunk at a time and decodes nothing, and a streamed body that ends short of
+its `Content-Length` ends with an error.
+
+The component's entry point dispatches through `EdgeZero`'s router itself,
+where it called `edgezero_adapter_spin::run_app`, because that wrapper
+collects a streamed response into one buffer, capped at 16 MiB, before the
+host sees it. It opens the declared KV stores as `run_app` does, with the
+same `EDGEZERO__STORES__KV__<ID>__NAME` and `MAX_LIST_KEYS` settings, and a
+store it cannot open fails the request.
 
 ### Retaining and removing Encypher cache entries
 

@@ -23,6 +23,9 @@ use trusted_server_core::platform::{
     PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, PlatformSelectResult,
 };
 
+#[cfg(any(target_arch = "wasm32", test))]
+mod response_stream;
+
 // ---------------------------------------------------------------------------
 // Noop stubs — used when a handle is absent (native CI, missing binding)
 // ---------------------------------------------------------------------------
@@ -215,6 +218,13 @@ struct CloudflarePendingResponse {
 
 /// [`worker::Fetch`]-backed HTTP client for the Cloudflare Workers runtime.
 ///
+/// [`send`](PlatformHttpClient::send) preserves the origin body as a
+/// `Body::Stream` when the request asks for it, reading the Workers
+/// `ReadableStream` one runtime chunk at a time, see
+/// [`response_stream::bounded_origin_stream`]. A streamed body honors the
+/// caller's exact `max_response_body_bytes`, if any, instead of the buffered
+/// path's 10 MiB ceiling.
+///
 /// # Multi-provider auction limitation
 ///
 /// `send_async` eagerly awaits each request before returning, so
@@ -223,6 +233,8 @@ struct CloudflarePendingResponse {
 /// request launches. `select` keeps a defense-in-depth rejection for more
 /// than one pending request. Configure a single auction provider for
 /// Cloudflare Workers, or use the Fastly adapter for parallel DSP fan-out.
+/// That path stays buffered, so it refuses a request that asks for a
+/// streamed response.
 ///
 /// Per-provider timeouts baked into the backend name are not enforced at the
 /// fetch layer; the Workers runtime's global CPU budget (~30 s on paid plans)
@@ -279,6 +291,17 @@ where
 #[cfg(target_arch = "wasm32")]
 fn response_carries_body(request_is_head: bool, status: u16) -> bool {
     !request_is_head && !(100..200).contains(&status) && !matches!(status, 204 | 205 | 304)
+}
+
+/// Decoded bodies have no usable wire length; HEAD and 304 keep the
+/// selected representation's length rather than advertising an empty asset.
+#[cfg(any(target_arch = "wasm32", test))]
+fn streamed_content_length(status: u16, unencoded: bool, claimed: Option<u64>) -> Option<u64> {
+    if unencoded && !(100..200).contains(&status) && !matches!(status, 204 | 205) {
+        claimed
+    } else {
+        None
+    }
 }
 
 /// Collect the lowercased tokens listed in the upstream `Connection:` header(s).
@@ -371,26 +394,27 @@ impl CloudflareHttpClient {
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         use worker::{CacheMode, Fetch, Headers, Method, Request};
 
-        // The Cloudflare fetch path cannot honor Image Optimizer metadata, and
-        // it always buffers the response body (see below). The
-        // `PlatformHttpRequest` contract requires adapters that cannot honor
-        // these to reject rather than silently drop the behavior, so surface a
-        // typed error instead of returning an untransformed or fully-buffered
-        // response. Only an asset route sets these fields. A route that
-        // enables the Image Optimizer answers with this error, and none asks
-        // for a stream, because this client reports that it cannot stream.
+        // The Cloudflare fetch path cannot honor Image Optimizer metadata.
+        // The `PlatformHttpRequest` contract requires adapters that cannot
+        // honor it to reject rather than silently drop the behavior, so
+        // surface a typed error instead of returning an untransformed
+        // response. Only an asset route sets it.
         if request.image_optimizer.is_some() {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("Image Optimizer is not supported on the Cloudflare Workers runtime"));
         }
-        if request.stream_response {
-            return Err(Report::new(PlatformError::HttpClient).attach(
-                "streaming response bodies are not supported on the Cloudflare Workers runtime",
-            ));
-        }
 
         let cache_mode = outbound_cache_mode(&request.cache_intent);
-        let response_limit = effective_response_body_limit(request.max_response_body_bytes);
+        let stream_response = request.stream_response;
+        // A streamed body holds one chunk at a time, so only the caller's own
+        // limit applies to it. A buffered body is also held to the ceiling.
+        let response_limit = if stream_response {
+            request.max_response_body_bytes
+        } else {
+            Some(effective_response_body_limit(
+                request.max_response_body_bytes,
+            ))
+        };
         let request_is_head = request.request.method() == edgezero_core::http::Method::HEAD;
 
         let uri = request.request.uri().to_string();
@@ -456,23 +480,36 @@ impl CloudflareHttpClient {
 
         let status = resp.status_code();
 
-        // Content-Length permits an early refusal, but the stream collector is
+        // Content-Length permits an early refusal, but the body reader is
         // authoritative for missing or dishonest lengths.
         let response_body_expected = response_carries_body(request_is_head, status);
+        let claimed_len = resp
+            .headers()
+            .get("content-length")
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse::<u64>().ok());
         if response_body_expected
-            && let Some(claimed_len) = resp
-                .headers()
-                .get("content-length")
-                .ok()
-                .flatten()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-            && claimed_len > response_limit
+            && let Some(limit) = response_limit
+            && let Some(claimed_len) = claimed_len
+            && u64::try_from(limit).is_ok_and(|limit| claimed_len > limit)
         {
             return Err(Report::new(PlatformError::HttpClient).attach(format!(
                 "origin Content-Length {claimed_len} exceeds \
-                 {response_limit}-byte response body limit"
+                 {limit}-byte response body limit"
             )));
         }
+        // The runtime decodes a content encoding, after which the declared
+        // length describes bytes the stream never yields.
+        let body_is_unencoded = resp
+            .headers()
+            .get("content-encoding")
+            .ok()
+            .flatten()
+            .is_none_or(|encoding| {
+                let encoding = encoding.trim();
+                encoding.is_empty() || encoding.eq_ignore_ascii_case("identity")
+            });
 
         let connection_tokens = response_connection_tokens(&resp);
         let mut edge_builder = edgezero_core::http::response_builder().status(status);
@@ -498,18 +535,29 @@ impl CloudflareHttpClient {
             }
             edge_builder = edge_builder.header(name.as_str(), value.as_bytes());
         }
-        let body_bytes = if response_body_expected {
+        if (stream_response || !response_body_expected)
+            && let Some(length) = streamed_content_length(status, body_is_unencoded, claimed_len)
+        {
+            edge_builder = edge_builder.header(edgezero_core::http::header::CONTENT_LENGTH, length);
+        }
+        let body = if !response_body_expected {
+            edgezero_core::body::Body::empty()
+        } else if stream_response {
             let stream = resp.stream().change_context(PlatformError::HttpClient)?;
-            collect_bounded_response_stream(stream, response_limit).await?
+            let expected_length = claimed_len.filter(|_| body_is_unencoded);
+            response_stream::bounded_origin_stream(stream, response_limit, expected_length)
         } else {
-            Vec::new()
+            let limit = response_limit.unwrap_or(MAX_PLATFORM_RESPONSE_BODY_BYTES);
+            let stream = resp.stream().change_context(PlatformError::HttpClient)?;
+            let body_bytes = collect_bounded_response_stream(stream, limit).await?;
+            edge_builder = edge_builder.header(
+                edgezero_core::http::header::CONTENT_LENGTH,
+                body_bytes.len(),
+            );
+            edgezero_core::body::Body::from(body_bytes)
         };
-        edge_builder = edge_builder.header(
-            edgezero_core::http::header::CONTENT_LENGTH,
-            body_bytes.len(),
-        );
         let edge_resp = edge_builder
-            .body(edgezero_core::body::Body::from(body_bytes))
+            .body(body)
             .change_context(PlatformError::HttpClient)?;
 
         Ok(PlatformResponse::new(edge_resp).with_backend_name(request.backend_name))
@@ -533,10 +581,15 @@ impl PlatformHttpClient for CloudflareHttpClient {
         false
     }
 
+    fn supports_streaming_responses(&self) -> bool {
+        true
+    }
+
     async fn send_async(
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+        reject_buffered_stream_request(request.stream_response)?;
         let backend_name = request.backend_name.clone();
         let response = self.execute(request).await?;
 
@@ -895,10 +948,40 @@ fn reject_multi_provider_fanout(len: usize) -> Result<(), Report<PlatformError>>
     Ok(())
 }
 
+/// Refuse a streamed response on the buffered `send_async` path.
+///
+/// `send_async` stores a completed, buffered response for `select`, so a
+/// request that asks for a stream must go through `send` instead of being
+/// silently buffered. The check runs before the fetch, so a refused request
+/// never reaches the origin.
+#[cfg(any(target_arch = "wasm32", test))]
+fn reject_buffered_stream_request(stream_response: bool) -> Result<(), Report<PlatformError>> {
+    if stream_response {
+        return Err(Report::new(PlatformError::HttpClient).attach(
+            "CloudflareHttpClient streams responses through send alone; send_async buffers",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use edgezero_core::context::RequestContext;
+
+    #[test]
+    fn streamed_lengths_describe_the_identity_representation() {
+        let large = 64 * 1024 * 1024;
+        assert_eq!(streamed_content_length(200, true, Some(large)), Some(large));
+        assert_eq!(streamed_content_length(206, true, Some(1024)), Some(1024));
+        assert_eq!(streamed_content_length(304, true, Some(large)), Some(large));
+        assert_eq!(streamed_content_length(200, false, Some(1024)), None);
+        assert_eq!(streamed_content_length(304, false, Some(1024)), None);
+        assert_eq!(streamed_content_length(200, true, None), None);
+        for status in [101, 204, 205] {
+            assert_eq!(streamed_content_length(status, true, Some(large)), None);
+        }
+    }
 
     #[cfg(target_arch = "wasm32")]
     #[test]
@@ -1203,6 +1286,18 @@ mod tests {
         assert!(
             reject_multi_provider_fanout(2).is_err(),
             "len=2 should be rejected"
+        );
+    }
+
+    #[test]
+    fn send_async_refuses_a_streamed_response_and_admits_a_buffered_one() {
+        assert!(
+            reject_buffered_stream_request(true).is_err(),
+            "the buffered send_async path must refuse a streamed response"
+        );
+        assert!(
+            reject_buffered_stream_request(false).is_ok(),
+            "a buffered request should still use send_async"
         );
     }
 

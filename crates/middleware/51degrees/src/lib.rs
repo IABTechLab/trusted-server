@@ -660,6 +660,7 @@ mod tests {
             origin_host: "origin.example.com",
             status: http::StatusCode::OK,
             origin_private: false,
+            response_headers: None,
             platform: test_support::platform(),
             document_state: state,
             max_buffered_script_bytes: 1 << 20,

@@ -17,8 +17,8 @@ use futures::executor::block_on;
 use serde_json::json;
 
 use super::{
-    MAX_ARTIFACT_BYTES, PRODUCTION_RELEASE_KEY, ProbeCallError, ProbeDescriptor, ProbeFailure,
-    ProbeLimits, ProbeModule, ProbeSource, ReleaseAuthority, ReleaseError,
+    MAX_ARTIFACT_BYTES, ProbeCallError, ProbeDescriptor, ProbeFailure, ProbeLimits, ProbeModule,
+    ProbeSource, ReleaseAuthority, ReleaseError,
 };
 use crate::media_api::sha256_hex;
 
@@ -34,12 +34,15 @@ const READ_AT: usize = 2048;
 const STATUS_AT: usize = 3072;
 const UNKNOWN_AT: usize = 4096;
 const READ_FAILED_AT: usize = 5120;
+/// WebAssembly page size, and the stand-in's initial linear memory.
+const PAGE_BYTES: usize = 64 * 1024;
+const INITIAL_PAGES: usize = 2;
 
 const STAND_IN: &str = r#"
 (module
   (import "env" "host_read" (func $host_read (param i64 i32 i32) (result i32)))
   @EXTRA_IMPORT@
-  (memory (export "memory") 2)
+  (memory (export "memory") @INITIAL_PAGES@)
   (global $heap (mut i32) (i32.const 16384))
   (global $result_ptr (mut i32) (i32.const 0))
   (global $result_len (mut i32) (i32.const 0))
@@ -96,9 +99,28 @@ const STAND_IN: &str = r#"
           (br_if $again (i32.eqz
             (call $host_read (i64.const 0) (i32.const 4) (i32.const @HEAD_SLOT@)))))
         (return (call $read_failed))))
-    ;; "Grow": 100 pages more memory; reports 0 when refused
+    ;; "Grow": memory to one page past the bound; reports 0 when refused
     (if (i32.eq (local.get $kind) (i32.const 71))
-      (then (return (call $report (i32.add (i32.const 1) (memory.grow (i32.const 100)))))))
+      (then (return (call $report
+        (i32.add (i32.const 1) (memory.grow (i32.const @OVER_PAGES@)))))))
+    ;; "allocate": memory up to exactly the bound; reports 0 when refused
+    (if (i32.eq (local.get $kind) (i32.const 97))
+      (then (return (call $report
+        (i32.add (i32.const 1) (memory.grow (i32.const @FIT_PAGES@)))))))
+    ;; "Beyond": one byte more than the per-read bound
+    (if (i32.eq (local.get $kind) (i32.const 66))
+      (then (return (call $report
+        (call $host_read (i64.const 0) (i32.const @READ_BOUND_PLUS_ONE@) (i32.const 0))))))
+    ;; "bound": exactly the per-read bound, into more than linear memory
+    (if (i32.eq (local.get $kind) (i32.const 98))
+      (then (return (call $report
+        (call $host_read (i64.const 0) (i32.const @READ_BOUND@) (i32.const 0))))))
+    ;; "flood": per-read-bound reads forever, ignoring every status
+    (if (i32.eq (local.get $kind) (i32.const 102))
+      (then
+        (loop $again
+          (drop (call $host_read (i64.const 0) (i32.const @READ_BOUND@) (i32.const 0)))
+          (br $again))))
     ;; "echo": the argument as received
     (if (i32.eq (local.get $kind) (i32.const 101))
       (then (return (call $answer (local.get $arg) (local.get $arg_len) (i32.const 0)))))
@@ -135,6 +157,9 @@ fn stand_in(abi: u32, planner: &str, extra_import: bool) -> Vec<u8> {
     } else {
         ""
     };
+    let edge = ProbeLimits::default();
+    let fit_pages = edge.memory_bytes / PAGE_BYTES - INITIAL_PAGES;
+    let read_bound = edge.max_read_bytes;
     let text = STAND_IN
         .replace("@EXTRA_IMPORT@", extra)
         .replace("@ABI@", &abi.to_string())
@@ -155,7 +180,12 @@ fn stand_in(abi: u32, planner: &str, extra_import: bool) -> Vec<u8> {
         .replace("@UNKNOWN_LEN@", &UNKNOWN_JSON.len().to_string())
         .replace("@READ_FAILED_AT@", &READ_FAILED_AT.to_string())
         .replace("@READ_FAILED_JSON@", &wat_string(READ_FAILED_JSON))
-        .replace("@READ_FAILED_LEN@", &READ_FAILED_JSON.len().to_string());
+        .replace("@READ_FAILED_LEN@", &READ_FAILED_JSON.len().to_string())
+        .replace("@INITIAL_PAGES@", &INITIAL_PAGES.to_string())
+        .replace("@FIT_PAGES@", &fit_pages.to_string())
+        .replace("@OVER_PAGES@", &(fit_pages + 1).to_string())
+        .replace("@READ_BOUND@", &read_bound.to_string())
+        .replace("@READ_BOUND_PLUS_ONE@", &(read_bound + 1).to_string());
     wat::parse_str(&text).expect("should assemble the stand-in release")
 }
 
@@ -163,7 +193,13 @@ fn release_key() -> SigningKey {
     SigningKey::from_bytes(&[7; 32])
 }
 
-fn signed(key: &SigningKey, abi: u64, release: u64, planner: &str, sha256: &str) -> ProbeDescriptor {
+fn signed(
+    key: &SigningKey,
+    abi: u64,
+    release: u64,
+    planner: &str,
+    sha256: &str,
+) -> ProbeDescriptor {
     let mut descriptor = ProbeDescriptor {
         abi,
         planner_id: planner.to_owned(),
@@ -184,8 +220,13 @@ fn authority(floor: u64, revoked: Vec<String>) -> ReleaseAuthority {
 fn loaded(limits: ProbeLimits) -> ProbeModule {
     let artifact = stand_in(1, &planner(), false);
     let descriptor = signed(&release_key(), 1, 3, &planner(), &sha256_hex(&artifact));
-    block_on(ProbeModule::load(&authority(1, Vec::new()), &descriptor, &artifact, limits))
-        .expect("should load the signed stand-in")
+    block_on(ProbeModule::load(
+        &authority(1, Vec::new()),
+        &descriptor,
+        &artifact,
+        limits,
+    ))
+    .expect("should load the signed stand-in")
 }
 
 fn load_error(artifact: &[u8], descriptor: &ProbeDescriptor) -> ReleaseError {
@@ -231,6 +272,7 @@ impl Future for YieldOnce {
 /// An in-memory source whose every read first suspends.
 struct AsyncSource {
     bytes: Vec<u8>,
+    size: u64,
     fail: bool,
     reads: RefCell<Vec<(u64, usize)>>,
     suspensions: Cell<usize>,
@@ -240,6 +282,7 @@ impl AsyncSource {
     fn new(bytes: &[u8]) -> Self {
         Self {
             bytes: bytes.to_vec(),
+            size: bytes.len() as u64,
             fail: false,
             reads: RefCell::new(Vec::new()),
             suspensions: Cell::new(0),
@@ -253,6 +296,15 @@ impl AsyncSource {
         }
     }
 
+    /// A source that claims `size` bytes and holds none, for reads the host
+    /// must refuse before asking it.
+    fn claiming(size: u64) -> Self {
+        Self {
+            size,
+            ..Self::new(&[])
+        }
+    }
+
     fn reads(&self) -> Vec<(u64, usize)> {
         self.reads.borrow().clone()
     }
@@ -262,10 +314,14 @@ impl ProbeSource for AsyncSource {
     type Error = VersionChanged;
 
     fn size(&self) -> u64 {
-        self.bytes.len() as u64
+        self.size
     }
 
-    async fn read_exact_at(&self, offset: u64, destination: &mut [u8]) -> Result<(), VersionChanged> {
+    async fn read_exact_at(
+        &self,
+        offset: u64,
+        destination: &mut [u8],
+    ) -> Result<(), VersionChanged> {
         self.suspensions.set(self.suspensions.get() + 1);
         YieldOnce::default().await;
         self.reads.borrow_mut().push((offset, destination.len()));
@@ -278,29 +334,57 @@ impl ProbeSource for AsyncSource {
     }
 }
 
+/// Release 8 as the production signing service advertised it, signed by
+/// Encypher's production release key. Only the public descriptor is kept;
+/// its artifact is not part of this repository.
+const PRODUCTION_RELEASE_8: &str = r#"{
+    "abi": 1,
+    "planner_id": "0685f74f2b47b171a62be7d8f38224c85b5fdc1fc849d316e8c93910406ece04",
+    "release": 8,
+    "sha256": "45c8e965b33e6763a52a9164392fb584f1dd6d993e9583a9f51945caa4ebed59",
+    "signature": "Mge6x1crHLQtuvn0eDjtapacOVTiEfU7/GOoxRd09e2bFGZaiSn9CvBlf/hSZs6Auvb2aRhWDVeOqnw+iTMMCw=="
+}"#;
+
 #[test]
-fn production_authority_pins_the_published_release_key() {
-    let hex: String = PRODUCTION_RELEASE_KEY
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    assert_eq!(
-        hex, "9ae0bf4aea5140008d2f48e6c08691360a7fe23e0d36f24522c770b7646b75d9",
-        "should pin the key the client contract publishes"
-    );
+fn production_authority_accepts_only_releases_encypher_signed() {
     let authority = ReleaseAuthority::production();
-    let descriptor = signed(&release_key(), 1, 3, &planner(), &"b".repeat(64));
+    let published: serde_json::Value =
+        serde_json::from_str(PRODUCTION_RELEASE_8).expect("should parse the fixture");
+    let published = ProbeDescriptor::parse(&published).expect("should be a descriptor");
     assert_eq!(
-        authority.verify(&descriptor),
-        Err(ReleaseError::Unsigned { release: 3 }),
-        "production should refuse a release signed by any other key"
+        authority.select(std::slice::from_ref(&published)),
+        Ok(&published),
+        "should accept the release Encypher published"
+    );
+
+    let mut retargeted = published.clone();
+    retargeted.sha256 = "b".repeat(64);
+    assert_eq!(
+        authority.verify(&retargeted),
+        Err(ReleaseError::Unsigned { release: 8 }),
+        "should refuse the published signature over another artifact"
+    );
+    let foreign = signed(
+        &release_key(),
+        1,
+        8,
+        &published.planner_id,
+        &published.sha256,
+    );
+    assert_eq!(
+        authority.verify(&foreign),
+        Err(ReleaseError::Unsigned { release: 8 }),
+        "should refuse the same release signed by any other key"
     );
 }
 
 #[test]
 fn descriptors_parse_only_in_the_contract_shape() {
     let descriptor = signed(&release_key(), 1, 3, &planner(), &"b".repeat(64));
-    assert_eq!(ProbeDescriptor::parse(&descriptor.to_json()), Some(descriptor.clone()));
+    assert_eq!(
+        ProbeDescriptor::parse(&descriptor.to_json()),
+        Some(descriptor.clone())
+    );
     assert_eq!(
         descriptor.canonical_json(),
         format!(
@@ -324,7 +408,11 @@ fn descriptors_parse_only_in_the_contract_shape() {
     let mut textual = descriptor.to_json();
     textual["release"] = json!("3");
     for malformed in [&upper, &short, &unsigned, &textual] {
-        assert_eq!(ProbeDescriptor::parse(malformed), None, "should refuse {malformed}");
+        assert_eq!(
+            ProbeDescriptor::parse(malformed),
+            None,
+            "should refuse {malformed}"
+        );
     }
     let list = json!([descriptor.to_json(), upper, "noise"]);
     assert_eq!(ProbeDescriptor::parse_list(Some(&list)), vec![descriptor]);
@@ -339,10 +427,22 @@ fn verification_refuses_every_tampered_descriptor() {
 
     let mut retargeted = good.clone();
     retargeted.sha256 = "d".repeat(64);
-    assert_eq!(authority.verify(&retargeted), Err(ReleaseError::Unsigned { release: 3 }));
+    assert_eq!(
+        authority.verify(&retargeted),
+        Err(ReleaseError::Unsigned { release: 3 })
+    );
 
-    let foreign = signed(&SigningKey::from_bytes(&[9; 32]), 1, 3, &planner(), &"b".repeat(64));
-    assert_eq!(authority.verify(&foreign), Err(ReleaseError::Unsigned { release: 3 }));
+    let foreign = signed(
+        &SigningKey::from_bytes(&[9; 32]),
+        1,
+        3,
+        &planner(),
+        &"b".repeat(64),
+    );
+    assert_eq!(
+        authority.verify(&foreign),
+        Err(ReleaseError::Unsigned { release: 3 })
+    );
 
     for signature in ["not base64!", "AAAA", &STANDARD.encode([0_u8; 63])] {
         let mut garbled = good.clone();
@@ -355,7 +455,10 @@ fn verification_refuses_every_tampered_descriptor() {
     }
 
     let future_abi = signed(&release_key(), 2, 3, &planner(), &"b".repeat(64));
-    assert_eq!(authority.verify(&future_abi), Err(ReleaseError::AbiUnsupported { abi: 2 }));
+    assert_eq!(
+        authority.verify(&future_abi),
+        Err(ReleaseError::AbiUnsupported { abi: 2 })
+    );
     assert_eq!(
         authority.verify(&future_abi).map_err(|error| error.code()),
         Err("PROBE_UPGRADE_REQUIRED")
@@ -364,11 +467,17 @@ fn verification_refuses_every_tampered_descriptor() {
     let old = signed(&release_key(), 1, 1, &planner(), &"b".repeat(64));
     assert_eq!(
         authority.verify(&old),
-        Err(ReleaseError::BelowFloor { release: 1, floor: 2 })
+        Err(ReleaseError::BelowFloor {
+            release: 1,
+            floor: 2
+        })
     );
 
     let withdrawn = signed(&release_key(), 1, 4, &planner(), &"C".repeat(64));
-    assert_eq!(authority.verify(&withdrawn), Err(ReleaseError::Revoked { release: 4 }));
+    assert_eq!(
+        authority.verify(&withdrawn),
+        Err(ReleaseError::Revoked { release: 4 })
+    );
 }
 
 #[test]
@@ -403,7 +512,10 @@ fn loading_refuses_artifacts_that_are_not_the_signed_release() {
     let mut tampered = artifact.clone();
     let last = tampered.len() - 1;
     tampered[last] ^= 1;
-    assert_eq!(load_error(&tampered, &descriptor), ReleaseError::DigestMismatch);
+    assert_eq!(
+        load_error(&tampered, &descriptor),
+        ReleaseError::DigestMismatch
+    );
 
     let oversized = vec![0_u8; MAX_ARTIFACT_BYTES + 1];
     let oversized_descriptor = signed(&release_key(), 1, 3, &planner(), &sha256_hex(&oversized));
@@ -433,7 +545,10 @@ fn loading_refuses_artifacts_that_are_not_the_signed_release() {
 fn loading_refuses_a_signed_release_that_breaks_the_abi() {
     let importing = stand_in(1, &planner(), true);
     let descriptor = signed(&release_key(), 1, 3, &planner(), &sha256_hex(&importing));
-    assert_eq!(load_error(&importing, &descriptor), ReleaseError::ImportsMismatch);
+    assert_eq!(
+        load_error(&importing, &descriptor),
+        ReleaseError::ImportsMismatch
+    );
 
     let misreporting = stand_in(2, &planner(), false);
     let descriptor = signed(&release_key(), 1, 3, &planner(), &sha256_hex(&misreporting));
@@ -443,7 +558,13 @@ fn loading_refuses_a_signed_release_that_breaks_the_abi() {
     );
 
     let other_planner = stand_in(1, &"f".repeat(64), false);
-    let descriptor = signed(&release_key(), 1, 3, &planner(), &sha256_hex(&other_planner));
+    let descriptor = signed(
+        &release_key(),
+        1,
+        3,
+        &planner(),
+        &sha256_hex(&other_planner),
+    );
     assert_eq!(
         load_error(&other_planner, &descriptor),
         ReleaseError::PlannerMismatch
@@ -464,10 +585,17 @@ fn reads_are_awaited_in_order_and_the_call_resumes_without_replay() {
         vec![(0, 4), (4, 4)],
         "each read should reach the source once, in order"
     );
-    assert_eq!(source.suspensions.get(), 2, "each read should suspend the call");
+    assert_eq!(
+        source.suspensions.get(),
+        2,
+        "each read should suspend the call"
+    );
 
     let again = block_on(probe.call("read", &json!({}), &source)).expect("should read again");
-    assert_eq!(again, value, "a second call should start from a fresh instance");
+    assert_eq!(
+        again, value,
+        "a second call should start from a fresh instance"
+    );
     assert_eq!(source.reads().len(), 4);
 }
 
@@ -476,8 +604,8 @@ fn the_argument_reaches_the_release_intact() {
     let probe = loaded(ProbeLimits::default());
     let arg = json!({"plan": {"items": [1, 2, 3]}, "text": "caf\u{e9} \"quoted\""});
 
-    let echoed = block_on(probe.call_without_source::<VersionChanged>("echo", &arg))
-        .expect("should echo");
+    let echoed =
+        block_on(probe.call_without_source::<VersionChanged>("echo", &arg)).expect("should echo");
 
     assert_eq!(echoed, arg);
 }
@@ -493,28 +621,55 @@ fn reads_outside_the_source_or_memory_are_refused_without_asking_the_source() {
     let memory = block_on(probe.call("memory", &json!({}), &source)).expect("should answer");
     assert_eq!(memory, json!({"status": 4}));
 
-    assert!(source.reads().is_empty(), "no refused read should reach the source");
+    assert!(
+        source.reads().is_empty(),
+        "no refused read should reach the source"
+    );
 }
 
 #[test]
-fn a_read_over_the_per_read_bound_is_refused_with_status_5() {
-    let probe = loaded(ProbeLimits {
-        max_read_bytes: 3,
-        ..ProbeLimits::default()
-    });
-    let source = AsyncSource::new(b"abcdefgh");
+fn the_edge_per_read_bound_admits_its_size_and_refuses_one_byte_more() {
+    let probe = loaded(ProbeLimits::default());
+    let bound = u64::from(ProbeLimits::default().max_read_bytes);
+    let source = AsyncSource::claiming(bound + 1);
 
-    let error = block_on(probe.call("read", &json!({}), &source)).expect_err("should refuse");
+    let beyond = block_on(probe.call("Beyond", &json!({}), &source)).expect("should answer");
+    assert_eq!(
+        beyond,
+        json!({"status": 5}),
+        "a read over the bound should be refused"
+    );
+
+    let at_bound = block_on(probe.call("bound", &json!({}), &source)).expect("should answer");
+    assert_eq!(
+        at_bound,
+        json!({"status": 4}),
+        "a read at the bound should pass the bound and stop only at linear memory"
+    );
+    assert!(
+        source.reads().is_empty(),
+        "neither read should reach the source"
+    );
+}
+
+#[test]
+fn the_edge_total_read_budget_stops_a_release_that_keeps_reading() {
+    let probe = loaded(ProbeLimits::default());
+    let source = AsyncSource::claiming(u64::from(ProbeLimits::default().max_read_bytes));
+
+    let error = block_on(probe.call("flood", &json!({}), &source)).expect_err("should stop");
 
     assert!(
-        matches!(&error, ProbeCallError::Refused(refusal) if refusal.code == "READ_FAILED"),
-        "the release should see the refusal: {error}"
+        matches!(
+            error,
+            ProbeCallError::Failed(ProbeFailure::ReadBudgetExceeded { .. })
+        ),
+        "the read budget, not fuel, should stop the release: {error}"
     );
-    assert!(source.reads().is_empty());
 }
 
 #[test]
-fn the_total_read_budget_abandons_the_call() {
+fn the_read_budget_counts_every_admitted_read() {
     let probe = loaded(ProbeLimits {
         max_total_read_bytes: 8,
         ..ProbeLimits::default()
@@ -538,34 +693,52 @@ fn a_failed_read_abandons_the_call_with_the_source_error() {
     let error = block_on(probe.call("read", &json!({}), &source)).expect_err("should fail");
 
     assert!(matches!(error, ProbeCallError::Source(VersionChanged)));
-    assert_eq!(source.reads(), vec![(0, 4)], "no read should follow the failure");
+    assert_eq!(
+        source.reads(),
+        vec![(0, 4)],
+        "no read should follow the failure"
+    );
 }
 
 #[test]
-fn fuel_memory_and_result_bounds_stop_the_release() {
-    let fuel_bound = loaded(ProbeLimits {
-        fuel_per_call: 1_000_000,
-        ..ProbeLimits::default()
-    });
-    let spin = block_on(fuel_bound.call_without_source::<VersionChanged>("spin", &json!({})));
+fn edge_fuel_stops_a_release_that_never_returns() {
+    let probe = loaded(ProbeLimits::default());
+
+    let spin = block_on(probe.call_without_source::<VersionChanged>("spin", &json!({})));
+
     assert!(matches!(
         spin,
         Err(ProbeCallError::Failed(ProbeFailure::FuelExhausted))
     ));
+}
 
-    let memory_bound = loaded(ProbeLimits {
-        memory_bytes: 1024 * 1024,
-        ..ProbeLimits::default()
-    });
-    let refused = block_on(memory_bound.call_without_source::<VersionChanged>("Grow", &json!({})))
-        .expect("should answer");
-    assert_eq!(refused, json!({"status": 0}), "growth past the bound should fail");
-    let unbounded = loaded(ProbeLimits::default());
-    let grown = block_on(unbounded.call_without_source::<VersionChanged>("Grow", &json!({})))
-        .expect("should answer");
-    assert_eq!(grown, json!({"status": 3}), "growth within the bound should succeed");
+#[test]
+fn edge_memory_grows_to_its_bound_and_no_further() {
+    let probe = loaded(ProbeLimits::default());
 
-    let huge = block_on(unbounded.call_without_source::<VersionChanged>("huge", &json!({})));
+    let to_bound = block_on(probe.call_without_source::<VersionChanged>("allocate", &json!({})))
+        .expect("should answer");
+    assert_eq!(
+        to_bound,
+        json!({"status": 3}),
+        "growth to exactly the bound should succeed"
+    );
+
+    let past_bound = block_on(probe.call_without_source::<VersionChanged>("Grow", &json!({})))
+        .expect("should answer");
+    assert_eq!(
+        past_bound,
+        json!({"status": 0}),
+        "growth one page past the bound should fail inside the release"
+    );
+}
+
+#[test]
+fn an_oversized_result_is_refused() {
+    let probe = loaded(ProbeLimits::default());
+
+    let huge = block_on(probe.call_without_source::<VersionChanged>("huge", &json!({})));
+
     assert!(matches!(
         huge,
         Err(ProbeCallError::Failed(ProbeFailure::ResultTooLarge { .. }))
@@ -577,7 +750,10 @@ fn traps_and_error_objects_are_reported_as_such() {
     let probe = loaded(ProbeLimits::default());
 
     let trap = block_on(probe.call_without_source::<VersionChanged>("x", &json!({})));
-    assert!(matches!(trap, Err(ProbeCallError::Failed(ProbeFailure::Trap(_)))));
+    assert!(matches!(
+        trap,
+        Err(ProbeCallError::Failed(ProbeFailure::Trap(_)))
+    ));
 
     let unknown = block_on(probe.call_without_source::<VersionChanged>("unknown", &json!({})))
         .expect_err("should refuse");

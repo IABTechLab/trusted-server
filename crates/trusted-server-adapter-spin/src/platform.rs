@@ -18,6 +18,8 @@ use trusted_server_core::platform::{
 #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
 use trusted_server_core::platform::UnavailableHttpClient;
 
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use spin_sdk::http::body::IncomingBodyExt as _;
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 use std::io::Read as _;
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
@@ -26,6 +28,9 @@ use trusted_server_core::platform::PlatformHttpRequest;
 use trusted_server_core::platform::{
     PlatformPendingRequest, PlatformResponse, PlatformSelectResult,
 };
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+mod response_stream;
 
 // 8 MiB ceiling: conservative for ad-server responses while leaving headroom in
 // the Spin WASM component heap. Larger responses from misbehaving origins are
@@ -399,9 +404,22 @@ fn reject_unsupported_request_contracts(
         return Err(Report::new(PlatformError::HttpClient)
             .attach("Spin outbound HTTP does not support Image Optimizer metadata"));
     }
+    Ok(())
+}
+
+/// Refuse a streamed response on the buffered `send_async` path.
+///
+/// `send_async` stores a completed, buffered response for `select`, so a
+/// request that asks for a stream must go through `send` instead of being
+/// silently buffered. The check runs before the outbound request is sent.
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+fn reject_buffered_stream_request(
+    request: &PlatformHttpRequest,
+) -> Result<(), Report<PlatformError>> {
     if request.stream_response {
-        return Err(Report::new(PlatformError::HttpClient)
-            .attach("Spin outbound HTTP does not support streaming responses"));
+        return Err(Report::new(PlatformError::HttpClient).attach(
+            "Spin outbound HTTP streams responses through send alone; send_async buffers",
+        ));
     }
     Ok(())
 }
@@ -527,6 +545,15 @@ struct SpinPendingResponse {
 
 /// `spin_sdk::http::send`-backed HTTP client for the Spin runtime.
 ///
+/// [`send`](PlatformHttpClient::send) preserves the origin body as a
+/// `Body::Stream` when the request asks for it, reading the WASI incoming
+/// body one host chunk at a time, see
+/// [`response_stream::bounded_origin_stream`]. A streamed body is the
+/// origin's bytes as sent, so it keeps its `Content-Encoding` and
+/// `Content-Length`, and it honors the caller's exact
+/// `max_response_body_bytes`, if any, instead of the buffered path's 8 MiB
+/// ceiling. The buffered path still decodes gzip and Brotli bodies.
+///
 /// `send_async` eagerly executes each request before returning, so
 /// [`PlatformHttpClient::supports_concurrent_fanout`] reports `false` and the
 /// auction orchestrator rejects multi-provider configurations before any
@@ -557,7 +584,9 @@ impl SpinPlatformHttpClient {
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         reject_unsupported_request_contracts(&request)?;
-        let response_limit = effective_response_body_limit(request.max_response_body_bytes);
+        let stream_response = request.stream_response;
+        let caller_limit = request.max_response_body_bytes;
+        let response_limit = effective_response_body_limit(caller_limit);
 
         let method = request.request.method().clone();
         let uri = request.request.uri().to_string();
@@ -616,34 +645,61 @@ impl SpinPlatformHttpClient {
             .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
             .collect();
         let response_has_body = !response_must_not_have_body(&method, status);
+        let claimed_len = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| std::str::from_utf8(value).ok())
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        // A streamed body holds one chunk at a time, so only the caller's own
+        // limit applies to it. A buffered body is also held to the ceiling.
+        let enforced_limit = if stream_response {
+            caller_limit
+        } else {
+            Some(response_limit)
+        };
         if response_has_body
-            && headers
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                .and_then(|(_, value)| std::str::from_utf8(value).ok())
-                .and_then(|value| value.trim().parse::<usize>().ok())
-                .is_some_and(|length| length > response_limit)
+            && let Some(limit) = enforced_limit
+            && let Some(claimed_len) = claimed_len
+            && u64::try_from(limit).is_ok_and(|limit| claimed_len > limit)
         {
             return Err(Report::new(PlatformError::HttpClient).attach(format!(
-                "origin Content-Length exceeds {response_limit}-byte response body limit"
+                "origin Content-Length exceeds {limit}-byte response body limit"
             )));
         }
-        let body = if response_has_body {
-            use spin_sdk::http::body::IncomingBodyExt as _;
-            collect_bounded_response_stream(spin_response.into_body().stream(), response_limit)
-                .await?
-        } else {
-            Vec::new()
-        };
 
-        let (headers, body) =
-            apply_spin_response_policy_with_limit(&method, status, headers, body, response_limit)?;
+        let (headers, body) = if stream_response {
+            let body = if response_has_body {
+                response_stream::bounded_origin_stream(
+                    spin_response.into_body().stream(),
+                    caller_limit,
+                    claimed_len,
+                )
+            } else {
+                edgezero_core::body::Body::empty()
+            };
+            (sanitize_response_headers(headers), body)
+        } else {
+            let body = if response_has_body {
+                collect_bounded_response_stream(spin_response.into_body().stream(), response_limit)
+                    .await?
+            } else {
+                Vec::new()
+            };
+            let (headers, body) = apply_spin_response_policy_with_limit(
+                &method,
+                status,
+                headers,
+                body,
+                response_limit,
+            )?;
+            (headers, edgezero_core::body::Body::from(body))
+        };
         let mut edge_builder = edgezero_core::http::response_builder().status(status);
         for (name, value) in headers {
             edge_builder = edge_builder.header(name.as_str(), value.as_slice());
         }
         let edge_resp = edge_builder
-            .body(edgezero_core::body::Body::from(body))
+            .body(body)
             .change_context(PlatformError::HttpClient)?;
 
         Ok(PlatformResponse::new(edge_resp).with_backend_name(request.backend_name))
@@ -660,6 +716,10 @@ impl PlatformHttpClient for SpinPlatformHttpClient {
         false
     }
 
+    fn supports_streaming_responses(&self) -> bool {
+        true
+    }
+
     async fn send(
         &self,
         request: PlatformHttpRequest,
@@ -671,6 +731,7 @@ impl PlatformHttpClient for SpinPlatformHttpClient {
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+        reject_buffered_stream_request(&request)?;
         let backend_name = request.backend_name.clone();
         let response = self.execute(request).await?;
 
@@ -1340,12 +1401,20 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_request_contracts_reject_stream_response() {
+    fn send_streams_a_response_and_send_async_refuses_to_buffer_one() {
         let request = platform_request().with_stream_response();
 
         assert!(
-            reject_unsupported_request_contracts(&request).is_err(),
-            "Spin must reject streaming-response requests instead of buffering silently"
+            reject_unsupported_request_contracts(&request).is_ok(),
+            "send should accept a streamed-response request"
+        );
+        assert!(
+            reject_buffered_stream_request(&request).is_err(),
+            "the buffered send_async path must refuse it rather than buffer silently"
+        );
+        assert!(
+            reject_buffered_stream_request(&platform_request()).is_ok(),
+            "a buffered request should still use send_async"
         );
     }
 

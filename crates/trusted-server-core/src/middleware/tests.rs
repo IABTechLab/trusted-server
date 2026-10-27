@@ -69,6 +69,7 @@ fn reader(request_state: &IntegrationRequestState) -> ReaderDocument<'_> {
         origin_host: ORIGIN_HOST,
         status: StatusCode::OK,
         origin_private: false,
+        response_headers: None,
         platform: test_support::platform(),
         request_state,
         max_buffered_script_bytes: 16 * 1024 * 1024,
@@ -2388,5 +2389,121 @@ fn an_html_entry_ahead_does_not_shadow_the_entry_that_makes_the_file() {
             .map(|entry| entry.media_type.as_str()),
         Some("text/plain"),
         "should make the file from the text/plain entry, not as HTML"
+    );
+}
+
+/// A format-agnostic source policy supplied by a test module. Core knows only
+/// its returned byte range, not why that subtree must remain unchanged.
+struct ProtectedFixture;
+
+const PROTECTED_FIXTURE: &str = "<section id='protected'><a class='edit' href='https://origin.example.com/protected'>keep</a><p class='edit'>keep</p></section>";
+
+impl Middleware for ProtectedFixture {
+    fn middleware_id(&self) -> &'static str {
+        "fixture.protected"
+    }
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &MiddlewarePhase::ALL
+    }
+    fn create(&self, _: &MiddlewareContext<'_>) -> MiddlewareAction {
+        MiddlewareAction::pass()
+    }
+    fn source_protection(&self) -> Option<SourceProtection> {
+        Some(|original| {
+            Ok(original
+                .windows(PROTECTED_FIXTURE.len())
+                .position(|bytes| bytes == PROTECTED_FIXTURE.as_bytes())
+                .map(|start| start..start + PROTECTED_FIXTURE.len())
+                .into_iter()
+                .collect())
+        })
+    }
+}
+
+#[test]
+fn source_policy_protects_before_core_fetch_and_warm_serve_descendant_handlers() {
+    use crate::html_processor::create_html_processor_with_source_protection;
+
+    let fetch = chain_of(vec![
+        element("fixture.fetch-attribute", "a.edit", "href", |_| {
+            AttributeRewriteAction::Replace("fetch-edited".to_owned())
+        }),
+        text("fixture.fetch-text", "p.edit", || {
+            |_, last| {
+                if last {
+                    ScriptRewriteAction::Replace("fetch-edited".to_owned())
+                } else {
+                    ScriptRewriteAction::remove_node()
+                }
+            }
+        }),
+    ]);
+    let serve = serve_chain_of(vec![
+        Arc::new(ProtectedFixture),
+        element("fixture.serve-attribute", "a.edit", "href", |_| {
+            AttributeRewriteAction::Replace("serve-edited".to_owned())
+        }),
+        text("fixture.serve-text", "p.edit", || {
+            |_, last| {
+                if last {
+                    ScriptRewriteAction::Replace("serve-edited".to_owned())
+                } else {
+                    ScriptRewriteAction::remove_node()
+                }
+            }
+        }),
+    ]);
+    let html = format!(
+        "<html><head></head><body>{PROTECTED_FIXTURE}\
+         <a class='edit' href='https://origin.example.com/outside'>outside</a>\
+         <p class='edit'>outside</p></body></html>"
+    );
+    // The source policy lives in serve, but must already cover fetch/template
+    // construction, without running any of serve's actions early.
+    let (mut processor, _) =
+        create_html_processor_with_source_protection(config(), &fetch, None, &[&fetch, &serve])
+            .expect("plan template");
+    for chunk in html.as_bytes().chunks(3) {
+        assert!(
+            processor
+                .process_chunk(chunk, false)
+                .expect("hold original")
+                .is_empty()
+        );
+    }
+    let template = String::from_utf8(processor.process_chunk(&[], true).expect("finish template"))
+        .expect("UTF-8");
+    assert!(template.contains(PROTECTED_FIXTURE));
+    assert!(template.contains("href=\"fetch-edited\""));
+    assert!(template.contains(">fetch-edited</p>"));
+    assert!(!template.contains("serve-edited"));
+    assert!(!template.contains("<!--ts-source-"));
+    let reader = served_with(&serve, &IntegrationRequestState::default(), &template, 1);
+    assert!(reader.contains(PROTECTED_FIXTURE));
+    assert!(reader.contains("href=\"serve-edited\""));
+    assert!(reader.contains(">serve-edited</p>"));
+    assert!(!reader.contains("<!--ts-source-"));
+}
+
+#[test]
+fn removing_a_protected_subtrees_parent_refuses_the_html_pass_before_output() {
+    let chain = chain_of(vec![
+        Arc::new(ProtectedFixture),
+        element("fixture.remove-parent", "body", "id", |_| {
+            AttributeRewriteAction::RemoveElement
+        }),
+    ]);
+    let html = format!("<html><body id='parent'>{PROTECTED_FIXTURE}</body></html>");
+    let (mut processor, _) =
+        create_html_processor_with_middleware(config(), &chain, None).expect("plan");
+    assert!(
+        processor
+            .process_chunk(html.as_bytes(), false)
+            .expect("hold")
+            .is_empty()
+    );
+    assert!(
+        processor.process_chunk(&[], true).is_err(),
+        "marker loss must refuse the whole pass"
     );
 }

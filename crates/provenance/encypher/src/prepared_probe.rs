@@ -69,7 +69,7 @@ const PRODUCTION_RELEASE_KEY: [u8; 32] = [
 
 /// The lowest probe release this build runs. Raise it when Encypher
 /// withdraws a release, so a compromised API cannot downgrade the edge to it.
-const PRODUCTION_RELEASE_FLOOR: u64 = 1;
+const PRODUCTION_RELEASE_FLOOR: u64 = 8;
 
 /// A release artifact is about 800 KB; anything over this is not one.
 const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
@@ -128,6 +128,7 @@ impl ProbeDescriptor {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
     /// The descriptor as the signing API receives it back.
     #[must_use]
     pub(crate) fn to_json(&self) -> Value {
@@ -332,7 +333,10 @@ impl fmt::Display for ReleaseError {
                 write!(formatter, "probe release {release} was withdrawn")
             }
             Self::MalformedSignature { release } => {
-                write!(formatter, "probe release {release} carries a malformed signature")
+                write!(
+                    formatter,
+                    "probe release {release} carries a malformed signature"
+                )
             }
             Self::Unsigned { release } => write!(
                 formatter,
@@ -368,15 +372,21 @@ impl fmt::Display for ReleaseError {
                 formatter,
                 "the probe release reports ABI {reported}, not its descriptor's"
             ),
-            Self::PlannerMismatch => formatter
-                .write_str("the probe release does not report its descriptor's planner"),
+            Self::PlannerMismatch => {
+                formatter.write_str("the probe release does not report its descriptor's planner")
+            }
         }
     }
 }
 
 impl std::error::Error for ReleaseError {}
 
-/// Bounds on one call. Exceeding any of them abandons the call.
+/// Bounds on one call.
+///
+/// Fuel, the total read and the result abandon the call when exceeded. A
+/// read over the per-read bound is answered with status 5, and growth past
+/// the memory bound fails inside the release, which then answers as it
+/// handles an allocation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProbeLimits {
     /// Linear memory one instance may grow to.
@@ -392,15 +402,16 @@ pub(crate) struct ProbeLimits {
 }
 
 impl Default for ProbeLimits {
-    /// The client contract's limits: 1 GiB of memory, 2x10^11 instructions,
-    /// 64 MiB per read and per result, and at most 1 GiB read per call.
+    /// Leave room for the host, parsed JSON and the signed module on
+    /// 128 MiB-class runtimes. Media payload hashing stays outside WASM.
+    /// Larger structure or result disclosures are refused explicitly.
     fn default() -> Self {
         Self {
-            memory_bytes: 1 << 30,
-            fuel_per_call: 200_000_000_000,
-            max_read_bytes: 64 * 1024 * 1024,
-            max_total_read_bytes: 1 << 30,
-            max_result_bytes: 64 * 1024 * 1024,
+            memory_bytes: 32 * 1024 * 1024,
+            fuel_per_call: 200_000_000,
+            max_read_bytes: 8 * 1024 * 1024,
+            max_total_read_bytes: 64 * 1024 * 1024,
+            max_result_bytes: 4 * 1024 * 1024,
         }
     }
 }
@@ -482,7 +493,11 @@ impl<E: fmt::Display> fmt::Display for ProbeCallError<E> {
         match self {
             Self::Source(error) => write!(formatter, "the probe's source failed a read: {error}"),
             Self::Refused(refusal) => {
-                write!(formatter, "the probe refused: {}: {}", refusal.code, refusal.message)
+                write!(
+                    formatter,
+                    "the probe refused: {}: {}",
+                    refusal.code, refusal.message
+                )
             }
             Self::Failed(failure) => failure.fmt(formatter),
         }
@@ -541,19 +556,28 @@ impl fmt::Display for ProbeFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Instantiate(error) => {
-                write!(formatter, "the probe release could not be instantiated: {error}")
+                write!(
+                    formatter,
+                    "the probe release could not be instantiated: {error}"
+                )
             }
             Self::ArgumentTooLarge => {
                 formatter.write_str("a probe argument exceeds a 32-bit length")
             }
-            Self::Trap(error) => write!(formatter, "the probe release stopped with an error: {error}"),
+            Self::Trap(error) => write!(
+                formatter,
+                "the probe release stopped with an error: {error}"
+            ),
             Self::FuelExhausted => formatter.write_str("the probe release ran out of fuel"),
             Self::ReadBudgetExceeded { budget } => write!(
                 formatter,
                 "the probe release read more than its {budget} byte budget"
             ),
             Self::UnknownStatus(status) => {
-                write!(formatter, "the probe release returned unknown status {status}")
+                write!(
+                    formatter,
+                    "the probe release returned unknown status {status}"
+                )
             }
             Self::ResultTooLarge { bytes, limit } => write!(
                 formatter,
@@ -563,7 +587,10 @@ impl fmt::Display for ProbeFailure {
                 formatter.write_str("the probe release's result lies outside its memory")
             }
             Self::MalformedResult(error) => {
-                write!(formatter, "the probe release returned a malformed result: {error}")
+                write!(
+                    formatter,
+                    "the probe release returned a malformed result: {error}"
+                )
             }
         }
     }
@@ -676,9 +703,9 @@ impl ProbeModule {
         arg: &Value,
         source: &S,
     ) -> Result<Value, ProbeCallError<S::Error>> {
-        let mut instance = self
-            .instantiate(source.size())
-            .map_err(|error| ProbeCallError::Failed(ProbeFailure::Instantiate(error.to_string())))?;
+        let mut instance = self.instantiate(source.size()).map_err(|error| {
+            ProbeCallError::Failed(ProbeFailure::Instantiate(error.to_string()))
+        })?;
         let (op_pointer, op_length) = instance
             .put(op.as_bytes())
             .map_err(ProbeCallError::Failed)?;
@@ -774,7 +801,9 @@ impl ProbeModule {
         );
         store.limiter(|state| &mut state.limits);
         store.set_fuel(self.limits.fuel_per_call)?;
-        let instance = self.linker.instantiate_and_start(&mut store, &self.module)?;
+        let instance = self
+            .linker
+            .instantiate_and_start(&mut store, &self.module)?;
         let memory = instance
             .get_memory(&store, "memory")
             .ok_or_else(|| wasmi::Error::new("the release exports no memory"))?;
@@ -832,6 +861,10 @@ fn refusal(value: &Value) -> Result<ProbeRefusal, ProbeFailure> {
 }
 
 /// A call stopped by the interpreter: out of fuel, or any other trap.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "used directly as a Result error mapper"
+)]
 fn stopped<E>(error: wasmi::Error) -> ProbeCallError<E> {
     ProbeCallError::Failed(ProbeFailure::stopped(&error))
 }
@@ -866,6 +899,10 @@ impl wasmi::errors::HostError for ReadRequest {}
 
 /// `env.host_read`. Refuses a read over the per-read bound or past the
 /// source with status 5, and suspends the call for any other.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "wasmi's host import ABI owns its Caller"
+)]
 fn host_read(
     caller: Caller<'_, HostState>,
     offset: u64,

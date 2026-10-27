@@ -1,4 +1,4 @@
-//! Encypher text provenance for article pages, `provenance.encypher`.
+//! Encypher provenance for article pages and their media, `provenance.encypher`.
 //!
 //! A serve middleware finds the article in each HTML page a `[[serve]]` entry
 //! names it for, sends its visible text to the Encypher signing API, and
@@ -6,16 +6,36 @@
 //! cached in the runtime KV store, bound to a short-lived server policy.
 //! Every failure passes the page through unchanged.
 //!
+//! Media is signed as its exact bytes through the Encypher media endpoint,
+//! under the same policy and worker token: images, audio, video and fonts
+//! core captures on the publisher and asset proxy paths, through the
+//! module's media signer; media `data:` URIs in the same pages, and their
+//! inline SVG as the standalone SVG document proven to parse to the tree the
+//! browser built, which is the original bytes where they already are one;
+//! and media `data:` URIs in the stylesheets under each `path` a
+//! `[[serve]]` entry names `provenance.encypher.stylesheet` for, which the
+//! publisher asserts no page loads with `integrity`. Stylesheets under no
+//! such path are left as they are. A media item that cannot be signed is
+//! delivered as it was and reported unsigned, never as signed.
+//!
 //! The middleware's preparation applies the request gates with no I/O: only
 //! a `GET` of a `200` page on the configured domain, whose origin did not
 //! mark it as one reader's, is held. The signing work runs in the stream
 //! processor's asynchronous finish, which core awaits at the end of the
 //! document. The module requires no permission and reads no gated value. It
-//! sends the visible text of the page's article and the page address without
-//! its query. A page whose origin set a cookie or forbade shared caching is
-//! never sent, but the module cannot tell a personalized article that carries
-//! neither, so a deployment places it only on public article routes and has
-//! its origin mark every personalized response private.
+//! sends the visible text of the page's article, the page address without
+//! its query, and the bytes of the media it signs. A page whose origin set a
+//! cookie or forbade shared caching is never sent, but the module cannot
+//! tell a personalized article that carries neither, so a deployment places
+//! it only on public article routes and has its origin mark every
+//! personalized response private.
+//!
+//! Independently of signing admission, the applicable page middleware protects
+//! original provenance-bearing or structurally uncertain inline SVG ranges.
+//! Core holds the bounded original before its own rewrites, keeps those ranges
+//! opaque through fetch/serve changes and restores their exact bytes before
+//! publishing a template or reader response. The same classifier decides both
+//! this protection and the module's descendant-edit refusals.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -37,12 +57,19 @@ use trusted_server_core::settings::{IntegrationConfig, Settings};
 
 mod api;
 mod boundary;
+mod data_uri;
 mod embed;
+mod embedded;
+mod media_api;
 mod prepared_probe;
 mod processor;
+mod svg_equivalence;
 mod text;
 
-use processor::{PageRequest, Signer, document_processor, is_excluded_path};
+use processor::{
+    EncypherMedia, PageRequest, Signer, document_processor, is_excluded_path, is_excluded_prefix,
+    stylesheet_processor,
+};
 
 /// The id the module's registration and its API backend carry.
 const INTEGRATION_ID: &str = "provenance_encypher";
@@ -50,6 +77,13 @@ const INTEGRATION_ID: &str = "provenance_encypher";
 /// The name `[provenance] module` selects the module by and a `[[serve]]`
 /// entry names its middleware by, from this crate's folder.
 pub const MODULE: &str = "provenance.encypher";
+
+/// The name a `[[serve]]` entry for stylesheets writes, which signs the media
+/// `data:` URIs a stylesheet embeds.
+pub const STYLESHEET_MIDDLEWARE: &str = "provenance.encypher.stylesheet";
+
+/// The media type [`STYLESHEET_MIDDLEWARE`] works on.
+const STYLESHEET_MEDIA_TYPE: &str = "text/css";
 
 /// `[provenance.encypher]`, the module's settings.
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -65,11 +99,13 @@ pub struct EncypherConfig {
     /// The name of the secret-store entry holding the `cwk_` worker
     /// credential, resolved to the credential itself when settings load.
     pub worker_token: Redacted<String>,
-    /// Optional article selector override: `.class`, `[attr=value]` or a tag
-    /// name. At most 91 characters, so `override:{selector}` fits the API's
-    /// 100-character `boundary_selector` limit.
+    /// Optional article selector override: one unescaped `.class`, an exact
+    /// `[attr=value]` (also single- or double-quoted), or an ASCII tag name.
+    /// Empty means no override; a valid selector absent from a page keeps
+    /// the detection fallback. At most 91 characters, so
+    /// `override:{selector}` fits the API's 100-character limit.
     #[serde(default)]
-    #[validate(length(max = 91))]
+    #[validate(length(max = 91), custom(function = validate_article_selector))]
     pub article_selector: String,
     /// Minimum visible article text, in Unicode scalars.
     #[serde(default = "default_min_text_length")]
@@ -102,7 +138,43 @@ pub struct EncypherConfig {
     #[serde(default = "default_negative_ttl_seconds")]
     #[validate(range(min = 60, max = 86_400))]
     pub negative_ttl_seconds: u64,
+    /// Largest media item signed, in bytes: a captured image or a decoded
+    /// embedded item. Larger media is delivered unsigned. Bounded by what the
+    /// endpoint embeds as source data when the source has no safe address.
+    #[serde(default = "default_max_media_bytes")]
+    #[validate(range(min = 1024, max = 8_000_000))]
+    pub max_media_bytes: usize,
+    /// Maximum uncached media-signing calls in one HTML or stylesheet pass.
+    /// Cached assets do not consume calls. The document's existing time and
+    /// output bounds still apply independently.
+    #[serde(default = "default_max_media_sign_calls_per_document")]
+    #[validate(range(min = 1, max = 128))]
+    pub max_media_sign_calls_per_document: usize,
+    /// Largest media signed through the prepared lane, in bytes: hashed in
+    /// bounded chunks where it is delivered, never uploaded or held whole,
+    /// and given a remote manifest its bytes are left unchanged by. `0`, the
+    /// default, keeps the lane off, so no deployment starts hashing large
+    /// files on its own; turning it on also needs the signed probe release
+    /// and the prepared endpoints. Otherwise at least 16 MiB, and at most the
+    /// prepared service's largest source. Media between `max_media_bytes`
+    /// and this is the lane's. A bounded example is `1073741824` (1 GiB)
+    /// with `max_large_media_ms = 60000`.
+    #[serde(default = "default_max_large_media_bytes")]
+    #[validate(custom(function = validate_max_large_media_bytes))]
+    pub max_large_media_bytes: u64,
+    /// Longest one large source may take, in milliseconds: core's hash of
+    /// the whole source and the module's probe and API calls together. A
+    /// source not signed in time is delivered unsigned.
+    #[serde(default = "default_max_large_media_ms")]
+    #[validate(range(min = 5_000, max = 600_000))]
+    pub max_large_media_ms: u64,
 }
+
+/// The prepared service's largest source, in bytes: the largest integer a
+/// JSON number carries exactly, less the room it keeps for a manifest.
+const MAX_PREPARED_SOURCE_BYTES: u64 = 9_007_199_246_352_383;
+/// The smallest non-zero `max_large_media_bytes`, above every captured size.
+const MIN_LARGE_MEDIA_BYTES: u64 = 16 * 1024 * 1024;
 
 impl IntegrationConfig for EncypherConfig {}
 
@@ -132,6 +204,38 @@ fn default_policy_ttl_seconds() -> u64 {
 
 fn default_negative_ttl_seconds() -> u64 {
     300
+}
+
+fn default_max_media_bytes() -> usize {
+    5_000_000
+}
+
+fn default_max_media_sign_calls_per_document() -> usize {
+    8
+}
+
+fn default_max_large_media_bytes() -> u64 {
+    0
+}
+
+fn default_max_large_media_ms() -> u64 {
+    60_000
+}
+
+fn validate_max_large_media_bytes(value: u64) -> Result<(), ValidationError> {
+    if value == 0 || (MIN_LARGE_MEDIA_BYTES..=MAX_PREPARED_SOURCE_BYTES).contains(&value) {
+        Ok(())
+    } else {
+        Err(ValidationError::new("encypher_max_large_media_bytes"))
+    }
+}
+
+fn validate_article_selector(value: &str) -> Result<(), ValidationError> {
+    if value.is_empty() || boundary::is_valid_selector(value) {
+        Ok(())
+    } else {
+        Err(ValidationError::new("encypher_article_selector"))
+    }
 }
 
 fn validate_api_base_url(value: &str) -> Result<(), ValidationError> {
@@ -187,9 +291,16 @@ fn always_in_use(_table: &serde_json::Map<String, serde_json::Value>) -> bool {
     true
 }
 
-/// The page change the module supplies, as a `[[serve]]` entry names it.
-const SUPPLIED_MIDDLEWARE: &[SuppliedMiddleware] =
-    &[SuppliedMiddleware::on_html(MODULE, MiddlewarePhase::Serve)];
+/// The changes the module supplies, as `[[serve]]` entries name them: the
+/// page's article and embedded media, and a stylesheet's embedded media.
+const SUPPLIED_MIDDLEWARE: &[SuppliedMiddleware] = &[
+    SuppliedMiddleware::on_html(MODULE, MiddlewarePhase::Serve),
+    SuppliedMiddleware::on(
+        STYLESHEET_MIDDLEWARE,
+        MiddlewarePhase::Serve,
+        STYLESHEET_MEDIA_TYPE,
+    ),
+];
 
 /// The builder a deployment installs to offer this module.
 #[must_use]
@@ -220,12 +331,47 @@ fn require_an_entry(settings: &Settings) -> Result<(), Report<TrustedServerError
     }))
 }
 
+/// Refuses a `[[serve]]` entry that names the stylesheet middleware without
+/// a `path` narrower than the whole site.
+///
+/// Signing a stylesheet's media changes its bytes, which breaks a page that
+/// loads it with a subresource integrity value, and the middleware cannot
+/// see the page that loads it. So it runs only on stylesheets the publisher
+/// names by path, asserting none of them is loaded with `integrity`; a bare
+/// `text/css` entry, or one for `/`, would rewrite every stylesheet.
+fn require_scoped_stylesheet_entries(
+    settings: &Settings,
+) -> Result<(), Report<TrustedServerError>> {
+    let unscoped = settings.serve.entries().iter().any(|entry| {
+        entry
+            .middleware
+            .iter()
+            .any(|name| name == STYLESHEET_MIDDLEWARE)
+            && entry
+                .path
+                .as_deref()
+                .is_none_or(|path| path.is_empty() || path == "/")
+    });
+    if !unscoped {
+        return Ok(());
+    }
+    Err(Report::new(TrustedServerError::Settings {
+        message: format!(
+            "a [[serve]] entry names `{STYLESHEET_MIDDLEWARE}` for every path. Signing a \
+             stylesheet's embedded media changes its bytes and breaks a page that loads it \
+             with `integrity`, so give the entry a `path` for the stylesheets no page loads \
+             with `integrity`"
+        ),
+    }))
+}
+
 /// The module's settings when a section selects it.
 fn config(settings: &Settings) -> Result<Option<EncypherConfig>, Report<TrustedServerError>> {
     let Some(config) = settings.module_config::<EncypherConfig>(MODULE)? else {
         return Ok(None);
     };
     require_an_entry(settings)?;
+    require_scoped_stylesheet_entries(settings)?;
     Ok(Some(config))
 }
 
@@ -240,8 +386,8 @@ pub fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>>
     Ok(config(settings)?.is_some())
 }
 
-/// Registers the middleware when a section selects the module and its worker
-/// token is not blank.
+/// Registers the middleware and the media signer when a section selects the
+/// module and its worker token is not blank.
 ///
 /// # Errors
 ///
@@ -260,17 +406,23 @@ pub fn register(
     let max_document_bytes = config
         .max_document_bytes
         .min(settings.publisher.max_buffered_body_bytes);
+    let signer = Arc::new(Signer::new(config, max_document_bytes));
     Ok(Some(
         IntegrationRegistration::builder(INTEGRATION_ID)
             .without_js()
             .with_middleware(Arc::new(Encypher {
-                signer: Arc::new(Signer::new(config, max_document_bytes)),
+                signer: Arc::clone(&signer),
             }))
+            .with_middleware(Arc::new(EncypherStylesheet {
+                signer: Arc::clone(&signer),
+            }))
+            .with_media_signer(Arc::new(EncypherMedia::new(signer)))
             .build(),
     ))
 }
 
-/// The middleware, which signs the article of each admitted page.
+/// The middleware, which signs the article and the embedded media of each
+/// admitted page.
 pub struct Encypher {
     signer: Arc<Signer>,
 }
@@ -293,6 +445,10 @@ impl Middleware for Encypher {
         media_type == HTML_MEDIA_TYPE
     }
 
+    fn source_protection(&self) -> Option<trusted_server_core::middleware::SourceProtection> {
+        Some(embedded::source_protection)
+    }
+
     /// Every path but an API, feed, admin or well-known path, or an asset,
     /// which is never an article.
     fn handles_path(&self, path: &str) -> bool {
@@ -311,38 +467,112 @@ impl Middleware for Encypher {
         call: ModuleCall<'a>,
         context: &'a MiddlewareContext<'a>,
     ) -> Option<Preparation<'a>> {
-        let admission = admit(&self.signer, &call, context);
+        let admission = admit(&call, context, |page| self.signer.admit(page));
+        Some(Box::pin(async move {
+            Ok(Box::new(admission) as Box<dyn Any + Send>)
+        }))
+    }
+
+    /// Holds the admitted page, with the security policies its response
+    /// carries, which decide whether inline style media may be edited.
+    fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        let Some(page) = context.take_prepared::<Admission>(MODULE).flatten() else {
+            return MiddlewareAction::pass();
+        };
+        let policies = context
+            .response_headers
+            .and_then(embedded::content_security_policies);
+        MiddlewareAction {
+            stream: Some(Box::new(document_processor(&self.signer, page, policies))),
+            ..MiddlewareAction::pass()
+        }
+    }
+}
+
+/// The stylesheet middleware, which signs the media `data:` URIs of each
+/// admitted stylesheet.
+pub struct EncypherStylesheet {
+    signer: Arc<Signer>,
+}
+
+impl std::fmt::Debug for EncypherStylesheet {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EncypherStylesheet")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Middleware for EncypherStylesheet {
+    fn middleware_id(&self) -> &'static str {
+        STYLESHEET_MIDDLEWARE
+    }
+
+    fn handles_media_type(&self, media_type: &str) -> bool {
+        media_type == STYLESHEET_MEDIA_TYPE
+    }
+
+    /// Every path but an API, feed, admin or well-known path. A `.css`
+    /// suffix is what a stylesheet has.
+    fn handles_path(&self, path: &str) -> bool {
+        !is_excluded_prefix(path)
+    }
+
+    /// Serve only, as for pages.
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Serve]
+    }
+
+    /// Applies the request gates, with no I/O, and keeps the stylesheet to
+    /// sign.
+    fn prepare<'a>(
+        &'a self,
+        call: ModuleCall<'a>,
+        context: &'a MiddlewareContext<'a>,
+    ) -> Option<Preparation<'a>> {
+        let admission = admit(&call, context, |page| self.signer.admit_stylesheet(page));
         Some(Box::pin(async move {
             Ok(Box::new(admission) as Box<dyn Any + Send>)
         }))
     }
 
     fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
-        let Some(page) = context.take_prepared::<Admission>(MODULE).flatten() else {
+        let Some(page) = context
+            .take_prepared::<Admission>(STYLESHEET_MIDDLEWARE)
+            .flatten()
+        else {
             return MiddlewareAction::pass();
         };
         MiddlewareAction {
-            stream: Some(Box::new(document_processor(&self.signer, page))),
+            stream: Some(Box::new(stylesheet_processor(&self.signer, page))),
             ..MiddlewareAction::pass()
         }
     }
 }
 
-/// The page a document is the body of, when the gates admit it.
-fn admit(signer: &Signer, call: &ModuleCall<'_>, context: &MiddlewareContext<'_>) -> Admission {
+/// The document a request is for, when `gate` admits it.
+fn admit(
+    call: &ModuleCall<'_>,
+    context: &MiddlewareContext<'_>,
+    gate: impl FnOnce(PageRequest) -> Result<PageRequest, processor::Gate>,
+) -> Admission {
     let request = ModuleRequest::from_module_context(call).ok()?;
+    let removed_prefix = request.removed_prefix().unwrap_or_default();
     let page = PageRequest {
         method: request.method().clone(),
+        // The address the reader asked for: a host that serves several
+        // publishers by path signs each page for its own address.
         page_url: format!(
-            "{}://{}{}",
+            "{}://{}{removed_prefix}{}",
             request.scheme(),
             request.host(),
             request.path()
         ),
+        removed_prefix: removed_prefix.to_owned(),
         response_status: context.status.as_u16(),
         origin_response_is_private: context.origin_private,
     };
-    match signer.admit(page) {
+    match gate(page) {
         Ok(page) => Some(page),
         Err(gate) => {
             log::debug!("encypher: document not held, gate={}", gate.code());

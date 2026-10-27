@@ -296,6 +296,16 @@ fn apply_fastly_image_optimizer_params(
     Ok(())
 }
 
+/// The Image Optimizer query parameter that names the metadata it keeps.
+/// Its `c2pa` filter keeps the input's C2PA manifest and adds the
+/// transformations the optimizer performed, and `copyright,c2pa` applies
+/// both filters. The SDK's `Metadata` options offer only `copyright`, so
+/// the filters are sent as the query parameter the optimizer reads beside
+/// its options. The optimizer removes the parameters it knows from its
+/// origin request, so an origin signature over the address without it
+/// still holds.
+const IMAGE_OPTIMIZER_METADATA_PARAM: &str = "metadata";
+
 fn apply_fastly_image_optimizer(
     req: &mut fastly::Request,
     options: PlatformImageOptimizerOptions,
@@ -305,6 +315,35 @@ fn apply_fastly_image_optimizer(
     fastly_options.preserve_query_string_on_origin_request =
         Some(options.preserve_query_string_on_origin_request);
     apply_fastly_image_optimizer_params(&mut fastly_options, options.params)?;
+    if options.preserve_c2pa {
+        // An option outranks a query parameter of the same name, so a
+        // copyright filter set as an option moves into the query beside
+        // `c2pa`, as does one the address already asks for. Every other
+        // parameter keeps its exact bytes.
+        let mut copyright = fastly_options.metadata.take().is_some();
+        let mut url = req.get_url_mut();
+        let mut pairs: Vec<String> = Vec::new();
+        for pair in url
+            .query()
+            .unwrap_or_default()
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+        {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            if key == IMAGE_OPTIMIZER_METADATA_PARAM {
+                copyright |= value
+                    .to_ascii_lowercase()
+                    .replace("%2c", ",")
+                    .split(',')
+                    .any(|filter| filter.trim() == "copyright");
+            } else {
+                pairs.push(pair.to_owned());
+            }
+        }
+        let filters = if copyright { "copyright,c2pa" } else { "c2pa" };
+        pairs.push(format!("{IMAGE_OPTIMIZER_METADATA_PARAM}={filters}"));
+        url.set_query(Some(&pairs.join("&")));
+    }
     req.set_image_optimizer(fastly_options);
     Ok(())
 }
@@ -1592,6 +1631,53 @@ mod tests {
             format!("{err:?}").contains("Image Optimizer"),
             "should explain unsupported async IO path: {err:?}"
         );
+    }
+
+    #[test]
+    fn image_optimizer_c2pa_preservation_is_asked_only_when_requested() {
+        let options = || {
+            PlatformImageOptimizerOptions::new(
+                "us_east",
+                PlatformImageOptimizerParams {
+                    width: Some(320),
+                    ..PlatformImageOptimizerParams::default()
+                },
+            )
+        };
+
+        let mut plain = fastly::Request::get("https://assets.example.com/photo.jpg");
+        apply_fastly_image_optimizer(&mut plain, options()).expect("should translate the options");
+        assert_eq!(
+            plain.get_query_str(),
+            None,
+            "an unsigned route should keep the optimizer's default metadata removal"
+        );
+
+        let mut preserved = fastly::Request::get("https://assets.example.com/photo.jpg?v=2");
+        apply_fastly_image_optimizer(&mut preserved, options().with_c2pa_preserved())
+            .expect("should translate the options");
+        assert_eq!(
+            preserved.get_query_str(),
+            Some("v=2&metadata=c2pa"),
+            "should ask for C2PA preservation and keep every other parameter as sent"
+        );
+
+        for asked in [
+            "metadata=copyright",
+            "metadata=Copyright%2Cc2pa",
+            "metadata=c2pa,copyright",
+        ] {
+            let mut with_copyright = fastly::Request::get(format!(
+                "https://assets.example.com/photo.jpg?v=2&{asked}&x-id=a%20b"
+            ));
+            apply_fastly_image_optimizer(&mut with_copyright, options().with_c2pa_preserved())
+                .expect("should translate the options");
+            assert_eq!(
+                with_copyright.get_query_str(),
+                Some("v=2&x-id=a%20b&metadata=copyright,c2pa"),
+                "{asked}: should apply both filters once, keeping the copyright filter"
+            );
+        }
     }
 
     #[test]

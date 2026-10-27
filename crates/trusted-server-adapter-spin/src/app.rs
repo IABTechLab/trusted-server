@@ -481,7 +481,9 @@ impl AppState {
         if let Some(module) = self.registry.device_module() {
             services = services.with_device_module(module);
         }
-        services = services.with_identifier_modules(self.registry.identifier_modules());
+        services = services
+            .with_identifier_modules(self.registry.identifier_modules())
+            .with_media_signer(self.registry.media_signer());
         // The publisher this request resolved to names every key in a shared
         // store and every name the browser holds.
         let prefixes = self.registry.prefixes(
@@ -1265,8 +1267,15 @@ async fn dispatch_asset_fallback(
     let asset_route = &state.settings.proxy.asset_routes[index];
     let answer = match state.registry.route_source(&state.settings, index) {
         Ok(source) => {
-            handle_asset_proxy_request(&state.settings, services, req, asset_route, source.as_ref())
-                .await
+            handle_asset_proxy_request(
+                &state.settings,
+                services,
+                &state.registry,
+                req,
+                asset_route,
+                source.as_ref(),
+            )
+            .await
         }
         Err(report) => Err(report),
     };

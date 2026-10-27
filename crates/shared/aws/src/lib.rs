@@ -371,6 +371,7 @@ mod tests {
             handle_asset_proxy_request(
                 &settings,
                 &services,
+                &registry,
                 request,
                 &settings.proxy.asset_routes[0],
                 source.as_ref(),

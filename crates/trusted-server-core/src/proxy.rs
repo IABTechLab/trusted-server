@@ -8,8 +8,9 @@ use futures::StreamExt as _;
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Write};
+use std::ops::ControlFlow;
 use std::time::Duration;
-use web_time::{SystemTime, UNIX_EPOCH};
+use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, NO_STORE_PRIVATE_CACHE_CONTROL,
@@ -23,9 +24,13 @@ use crate::constants::{
 use crate::creative::{CreativeCssProcessor, CreativeHtmlProcessor};
 use crate::edge_cookie::recognized_ec_id;
 use crate::error::TrustedServerError;
+use crate::media_signing::{
+    Answered, Delivery, MediaClaim, OriginFacts, PinnedOrigin, VariantIdentity,
+    strip_representation_preconditions,
+};
 use crate::platform::{
-    DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, PlatformHttpRequest, PlatformResponse,
-    RuntimeServices,
+    DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, PlatformHttpRequest,
+    PlatformImageOptimizerOptions, PlatformResponse, RuntimeServices,
 };
 use crate::settings::{OriginQueryPolicy, ProxyAssetRoute, Settings};
 use crate::source::{Source, SourceLocation, SourceRequest};
@@ -191,6 +196,30 @@ impl AssetProxyResponse {
 
     fn no_store_private(response: Response<EdgeBody>) -> Self {
         Self::new(response, None, AssetProxyCachePolicy::NoStorePrivate)
+    }
+
+    /// The answer to a claimed request, with its body kept apart where it
+    /// streams, under the cache policy the origin's answer was given.
+    fn delivered(response: Response<EdgeBody>, cache_policy: AssetProxyCachePolicy) -> Self {
+        let (parts, body) = response.into_parts();
+        match body {
+            stream_body @ EdgeBody::Stream(_) => Self::new(
+                Response::from_parts(parts, EdgeBody::empty()),
+                Some(stream_body),
+                cache_policy,
+            ),
+            once @ EdgeBody::Once(_) => {
+                Self::new(Response::from_parts(parts, once), None, cache_policy)
+            }
+        }
+    }
+
+    /// The response with its body in place, streaming or not.
+    fn into_whole_response(self) -> Response<EdgeBody> {
+        match self.stream_body {
+            Some(body) => Response::from_parts(self.response.into_parts().0, body),
+            None => self.response,
+        }
     }
 
     fn response(&self) -> &Response<EdgeBody> {
@@ -860,22 +889,37 @@ fn build_asset_proxy_target_url(
     path: &str,
     query: &str,
 ) -> Result<url::Url, Report<TrustedServerError>> {
-    let mut target_url = location.parsed().clone();
-    // A folder in the source's address comes before the route's target path,
-    // and a target path that could climb out of it is refused.
-    let folder = target_url.path().trim_end_matches('/').to_owned();
+    target_url_under(
+        location.parsed(),
+        route.target_path_for(path)?,
+        location.directory_index(),
+        query,
+    )
+}
 
-    let mut target_path = route.target_path_for(path)?;
+/// The address under `base`, a source's address, for `target_path`, a
+/// route's target path, with `query` as the reader sent it. A folder in
+/// `base` comes before the target path, and a target path that could climb
+/// out of it is refused.
+///
+/// # Errors
+///
+/// When `base` has a folder and `target_path` has a `.` or `..` segment.
+pub(crate) fn target_url_under(
+    base: &url::Url,
+    mut target_path: String,
+    directory_index: Option<&str>,
+    query: &str,
+) -> Result<url::Url, Report<TrustedServerError>> {
+    let mut target_url = base.clone();
+    let folder = target_url.path().trim_end_matches('/').to_owned();
     if !folder.is_empty() && crate::publisher::path_has_dot_segment(&target_path) {
         return Err(Report::new(TrustedServerError::BadRequest {
             message: "an asset path under a source folder must not have a `.` or `..` segment"
                 .to_string(),
         }));
     }
-    if let Some(index) = location
-        .directory_index()
-        .filter(|_| target_path.ends_with('/'))
-    {
+    if let Some(index) = directory_index.filter(|_| target_path.ends_with('/')) {
         target_path.push_str(index);
     }
     target_url.set_path(&format!("{folder}{target_path}"));
@@ -1065,6 +1109,19 @@ async fn preflight_signed_origin_for_image_optimizer(
 /// the exact URL sent to the asset origin. Image Optimizer metadata remains
 /// separate from the origin URL and is translated by the platform adapter.
 ///
+/// Where the services carry a [`MediaSigner`](crate::media_signing::MediaSigner),
+/// a signed representation kept for this address answers before the origin
+/// is asked, and an origin answer of a type the signer handles is signed on
+/// its way out, with a part or a `HEAD` asked for once more whole, see
+/// [`crate::media_signing`]. On a route that uses the Image Optimizer the
+/// optimizer is asked to keep its input's C2PA manifest and record what it
+/// did, and its answer is signed only where it carries that record, see
+/// [`crate::media_signing`]. Core never holds the optimizer's input, so an
+/// answer without that record goes out as the optimizer made it. A route
+/// that sets `signed_source` sends the optimizer to its own signed original
+/// on this host instead of the origin, and answers from the origin, as a
+/// route without the optimizer, where the optimizer fails.
+///
 /// # Errors
 ///
 /// Returns an error if the configured origin URL is invalid, backend
@@ -1073,6 +1130,7 @@ async fn preflight_signed_origin_for_image_optimizer(
 pub async fn handle_asset_proxy_request(
     settings: &Settings,
     services: &RuntimeServices,
+    integration_registry: &crate::integrations::IntegrationRegistry,
     req: Request<EdgeBody>,
     route: &ProxyAssetRoute,
     source: &dyn Source,
@@ -1103,6 +1161,53 @@ pub async fn handle_asset_proxy_request(
         None
     } else {
         crate::asset_image_optimizer::options_for_asset_request(settings, route, incoming_query)?
+    };
+    // A route sends its origin no cookie, see [`ASSET_PROXY_FORWARD_HEADERS`],
+    // and carries no module's request state, so its answer is the same for
+    // every reader the claim admits.
+    let media_claim = MediaClaim::of_request(
+        settings,
+        services,
+        req.method(),
+        incoming_path,
+        req.headers(),
+        true,
+    );
+    // The platform's image optimizer reads the origin itself, so core never
+    // holds its input. It is asked to keep its input's C2PA manifest and
+    // record what it did, and its answer is signed only where it did, see
+    // [`MediaClaim::answered_by_optimizer`].
+    let (image_optimizer, media_claim) = match (image_optimizer, media_claim) {
+        (Some(options), Some(claim)) => (
+            Some(options.with_c2pa_preserved()),
+            Some(claim.answered_by_optimizer()),
+        ),
+        pair => pair,
+    };
+    let media_reader_url = media_claim
+        .as_ref()
+        .map(|_| RequestInfo::from_request(&req, services.client_info()))
+        .filter(|reader| !reader.host.is_empty())
+        .map(|reader| {
+            // With any path prefix request addressing removed put back, so
+            // a host serving several publishers by path signs each asset for
+            // its own address and sends the optimizer back to it.
+            format!(
+                "{}://{}{}{incoming_path}",
+                reader.scheme,
+                reader.host,
+                removed_prefix.as_deref().unwrap_or_default()
+            )
+        });
+    let mut media_claim = media_claim.filter(|_| media_reader_url.is_some());
+    let media_origin_identity = media_claim
+        .as_ref()
+        .map(|_| route_origin_identity(route, &location));
+    // Where the route asks for it, the optimizer reads the original through
+    // this route's own signed path, see `AssetImageOptimizerConfig::signed_source`.
+    let signed_source = match (&image_optimizer, &media_claim, &media_reader_url) {
+        (Some(_), Some(_), Some(reader_url)) => signed_source_address(settings, route, reader_url)?,
+        _ => None,
     };
 
     if route.origin_query_policy_at(&location) == OriginQueryPolicy::Strip {
@@ -1138,6 +1243,37 @@ pub async fn handle_asset_proxy_request(
             outbound_headers.insert(header_name, value.clone());
         }
     }
+    // A rehosting route serves a third party's files for the publisher's
+    // pages, see `crate::rehost`: the reader's page is no business of the
+    // third party's, and only an identity-coded body is moved or signed. On
+    // a path a `[[serve]]` entry moves stylesheets on, the origin is asked
+    // for the whole representation, and the reader's own conditions are
+    // answered here against what is delivered.
+    let rehost = (route.rehost_page_references
+        && (*req.method() == Method::GET || *req.method() == Method::HEAD))
+        .then(|| RehostRequest {
+            stylesheets_moved: !integration_registry
+                .middleware_chain(
+                    settings.phase_entries(crate::middleware::MiddlewarePhase::Serve),
+                    crate::middleware::MiddlewarePhase::Serve,
+                    crate::rehost::STYLESHEET_MEDIA_TYPE,
+                    incoming_path,
+                )
+                .is_empty(),
+            method: req.method().clone(),
+            reader_headers: req.headers().clone(),
+            reader: RequestInfo::from_request(&req, services.client_info()),
+        });
+    if let Some(rehost) = rehost.as_ref() {
+        outbound_headers.remove(header::REFERER);
+        outbound_headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+        if rehost.stylesheets_moved {
+            strip_representation_preconditions(&mut outbound_headers);
+        }
+    }
     let host_header = match location.host_header_override() {
         Some(host) => HeaderValue::from_str(host).change_context(TrustedServerError::Proxy {
             message: "invalid source host header".to_string(),
@@ -1145,6 +1281,23 @@ pub async fn handle_asset_proxy_request(
         None => asset_origin_host_header(&target_url)?,
     };
     outbound_headers.insert(header::HOST, host_header);
+    if let Some(claim) = media_claim.as_ref() {
+        // A reader's range or tag naming signed bytes means nothing to the
+        // origin, so it is asked for the whole representation.
+        if claim.names_signed_bytes() {
+            strip_representation_preconditions(&mut outbound_headers);
+        }
+        // Only an identity-coded body is signed.
+        if claim.looks_like_media() {
+            outbound_headers.insert(
+                header::ACCEPT_ENCODING,
+                HeaderValue::from_static("identity"),
+            );
+        }
+    }
+    // What a whole, unconditional second fetch of a media representation is
+    // made from, taken before the request is signed, see `media_signing`.
+    let media_whole_headers = media_claim.as_ref().map(|_| outbound_headers.clone());
 
     if should_preflight_signed_origin(&location, image_optimizer.is_some(), req.method())
         && let Some(response) = preflight_signed_origin_for_image_optimizer(
@@ -1165,6 +1318,23 @@ pub async fn handle_asset_proxy_request(
         auth.sign(req.method(), &target_url, &mut outbound_headers)?;
     }
 
+    let media_identity = match (&media_reader_url, &media_origin_identity) {
+        (Some(reader_url), Some(origin_identity)) => Some(VariantIdentity {
+            reader_url,
+            origin_identity,
+            fetched_url: target_url.as_str(),
+            reader_query_free: incoming_query.is_empty(),
+        }),
+        _ => None,
+    };
+    // A signed representation kept for this address answers the request
+    // before the origin is asked.
+    let mut media_kept = None;
+    if let (Some(claim), Some(identity)) = (media_claim.as_ref(), media_identity.as_ref()) {
+        media_kept = claim.kept(services, identity).await;
+    }
+    let media_from_kept = media_kept.is_some();
+
     let stream_response = services.http_client().supports_streaming_responses();
 
     // The route's answer is looked for among the copies the loading cache
@@ -1172,8 +1342,17 @@ pub async fn handle_asset_proxy_request(
     // way the publisher path keeps an asset, under the same two caches. An
     // answer the platform's image optimizer makes is not kept, because the
     // platform holds it.
-    let copy_key = if image_optimizer.is_none() {
-        asset_route_copy_key(services, &req, route, &location, &target_url)
+    let copy_key = if image_optimizer.is_none() && !media_from_kept {
+        asset_route_copy_key(
+            services,
+            &req,
+            route,
+            &location,
+            &target_url,
+            rehost
+                .as_ref()
+                .is_some_and(|rehost| rehost.stylesheets_moved),
+        )
     } else {
         None
     };
@@ -1199,8 +1378,63 @@ pub async fn handle_asset_proxy_request(
     }
 
     // A load that failed asking the origin is this request's origin failure.
-    let origin_result = if let Some(answer) = from_asset_cache {
+    let origin_result = if let Some(kept) = media_kept {
+        Ok(PlatformResponse::new(kept))
+    } else if let Some(answer) = from_asset_cache {
         answer.map(PlatformResponse::new)
+    } else if let (Some(address), Some(options), Some(headers)) = (
+        signed_source.as_ref(),
+        image_optimizer.as_ref(),
+        media_whole_headers.as_ref(),
+    ) {
+        let optimized = send_through_signed_source(&SignedSourceRequest {
+            settings,
+            services,
+            method: req.method(),
+            address,
+            headers,
+            options,
+            stream_response,
+        })
+        .await;
+        match optimized {
+            Ok(answer) if answer.response.status().as_u16() < 400 => Ok(answer),
+            failed => {
+                // An optimizer that refused, could not read or could not
+                // transform the signed original, such as while signing is
+                // refused and the original goes out private, leaves the
+                // reader the origin's own answer, once, as a route without
+                // the optimizer gives it, so a real origin error still
+                // reaches the reader as the origin made it.
+                match failed {
+                    Ok(answer) => log::warn!(
+                        "media signing: signed source optimizer answered {}, answering from the origin",
+                        answer.response.status().as_u16()
+                    ),
+                    Err(error) => log::warn!(
+                        "media signing: signed source optimizer failed, answering from the origin: {error}"
+                    ),
+                }
+                media_claim = MediaClaim::of_request(
+                    settings,
+                    services,
+                    req.method(),
+                    incoming_path,
+                    req.headers(),
+                    true,
+                );
+                let mut platform_req = build_asset_platform_request(
+                    req.method(),
+                    &target_url,
+                    &outbound_headers,
+                    &backend_name,
+                )?;
+                if stream_response {
+                    platform_req = platform_req.with_stream_response();
+                }
+                services.http_client().send(platform_req).await
+            }
+        }
     } else {
         let mut platform_req = build_asset_platform_request(
             req.method(),
@@ -1225,16 +1459,527 @@ pub async fn handle_asset_proxy_request(
     } else {
         platform_response_to_buffered(platform_resp).map(AssetProxyResponse::origin_controlled)?
     };
+    if let Some(rehost) = rehost.as_ref() {
+        let page = crate::rehost::PageAddress {
+            scheme: &rehost.reader.scheme,
+            host: &rehost.reader.host,
+            removed_prefix: removed_prefix.as_deref().unwrap_or_default(),
+            base: None,
+        };
+        let answer = RehostAnswer {
+            settings,
+            services,
+            integration_registry,
+            rehost,
+            page,
+            upstream: &target_url,
+            route_path: incoming_path,
+            cache_policy: settings.asset_cache_policy_for_path(incoming_path)?,
+        };
+        // A redirect is answered before anything is read of its body, so its
+        // address resolves against the upstream request, as the browser would
+        // have resolved it there.
+        response = match answer.redirect(response) {
+            ControlFlow::Break(redirect) => return Ok(redirect),
+            ControlFlow::Continue(response) => response,
+        };
+        response = match answer.stylesheet(response).await {
+            ControlFlow::Break(stylesheet) => return Ok(stylesheet),
+            ControlFlow::Continue(response) => response,
+        };
+        // Anything else is media, delivered as any route's is below.
+    }
+    // Read before the headers a first-party answer may not carry are
+    // removed and before the route's cache policy replaces the origin's.
+    let origin_facts = OriginFacts::of(response.response().headers());
     strip_asset_proxy_response_headers(response.response_mut());
 
+    // An optimizer answer its origin marked as one reader's is never signed,
+    // and keeps the origin's own policy, so no shared cache holds it in
+    // place of a signed answer for longer than the origin allowed.
+    let keeps_origin_privacy = origin_facts.is_private()
+        && media_claim
+            .as_ref()
+            .is_some_and(MediaClaim::signs_optimizer_output);
     let status = response.response().status();
     if (status.is_success() || status == StatusCode::NOT_MODIFIED)
+        && !keeps_origin_privacy
         && let Some(policy) = settings.asset_cache_policy_for_path(incoming_path)?
     {
         response.apply_normalized_cache_policy(policy);
     }
 
-    Ok(response)
+    // Where the reader's conditions were not sent to the origin, they are
+    // answered against what is delivered.
+    let conditions_held_back = rehost.as_ref().filter(|rehost| rehost.stylesheets_moved);
+    let (Some(claim), Some(identity)) = (media_claim, media_identity) else {
+        let Some(rehost) = conditions_held_back else {
+            return Ok(response);
+        };
+        let cache_policy = response.cache_policy();
+        let answered = crate::media_signing::answer_whole(
+            &rehost.method,
+            &rehost.reader_headers,
+            response.into_whole_response(),
+        );
+        return Ok(AssetProxyResponse::delivered(answered, cache_policy));
+    };
+    let answered = if media_from_kept {
+        Answered::Kept
+    } else {
+        Answered::Origin(origin_facts)
+    };
+    let cache_policy = response.cache_policy();
+    let delivered = match claim
+        .deliver(
+            services,
+            &identity,
+            answered,
+            response.into_whole_response(),
+        )
+        .await
+    {
+        Delivery::Send(response) => response,
+        Delivery::FetchWhole(fallback) => {
+            let whole = fetch_whole_asset(&WholeAssetFetch {
+                services,
+                location: &location,
+                target_url: &target_url,
+                headers: media_whole_headers.unwrap_or_default(),
+                backend_name: &backend_name,
+                stream_response,
+            })
+            .await;
+            match whole {
+                Ok(whole) => {
+                    claim
+                        .deliver_whole(services, &identity, whole, fallback)
+                        .await
+                }
+                Err(error) => {
+                    log::warn!("media signing: whole fetch failed: {error}");
+                    fallback
+                }
+            }
+        }
+        Delivery::Large(answer) => {
+            let headers = media_whole_headers.unwrap_or_default();
+            let origin = PinnedOrigin {
+                url: &target_url,
+                headers: &headers,
+                backend_name: &backend_name,
+                auth: location.auth(),
+                unsigned_headers: &[],
+                response_header_rewrite: None,
+            };
+            claim
+                .deliver_large(services, &identity, origin, answer)
+                .await
+        }
+    };
+    let delivered = if conditions_held_back.is_some() {
+        claim.answer_unsigned(delivered)
+    } else {
+        delivered
+    };
+    Ok(AssetProxyResponse::delivered(delivered, cache_policy))
+}
+
+/// What a rehosting route keeps of the reader's request, see
+/// [`crate::rehost`].
+struct RehostRequest {
+    /// A `[[serve]]` entry moves stylesheets on the route path, so the origin
+    /// was asked for the whole representation and the reader's conditions are
+    /// answered against what is delivered.
+    stylesheets_moved: bool,
+    method: Method,
+    reader_headers: http::HeaderMap,
+    reader: RequestInfo,
+}
+
+/// Answers a rehosting route's request from the origin's answer where it is
+/// a redirect or a stylesheet.
+struct RehostAnswer<'a> {
+    settings: &'a Settings,
+    services: &'a RuntimeServices,
+    integration_registry: &'a crate::integrations::IntegrationRegistry,
+    rehost: &'a RehostRequest,
+    page: crate::rehost::PageAddress<'a>,
+    /// The address the origin was asked at.
+    upstream: &'a url::Url,
+    /// The route path the reader asked for.
+    route_path: &'a str,
+    cache_policy: Option<CachePolicy>,
+}
+
+impl RehostAnswer<'_> {
+    /// The reader's redirect where `response` is one. Its address is
+    /// resolved against the upstream request and written as a rehosting
+    /// route's address where one serves it, a stylesheet's only where its
+    /// route moves stylesheets, or as the absolute upstream address. Nothing
+    /// follows it here.
+    fn redirect(
+        &self,
+        response: AssetProxyResponse,
+    ) -> ControlFlow<AssetProxyResponse, AssetProxyResponse> {
+        let status = response.response().status();
+        if !matches!(status.as_u16(), 300..=303 | 307 | 308) {
+            return ControlFlow::Continue(response);
+        }
+        let Some(location) = response
+            .response()
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+        else {
+            return ControlFlow::Continue(response);
+        };
+        let reference = if self.rehost.stylesheets_moved {
+            crate::rehost::Reference::Style
+        } else {
+            crate::rehost::Reference::Media
+        };
+        let rewritten = match self.upstream.join(location.trim()) {
+            Ok(target) if matches!(target.scheme(), "http" | "https") => {
+                crate::rehost::RehostRoutes::of(self.settings)
+                    .rehosted(&target, reference, &self.page)
+                    .unwrap_or_else(|| target.to_string())
+            }
+            _ => location,
+        };
+        let (parts, _) = response.into_whole_response().into_parts();
+        let mut redirect = Response::from_parts(parts, EdgeBody::empty());
+        strip_asset_proxy_response_headers(&mut redirect);
+        crate::media_signing::remove_origin_representation_headers(redirect.headers_mut());
+        let Ok(value) = HeaderValue::from_str(&rewritten) else {
+            return ControlFlow::Break(self.to_upstream("redirect_location_unwritable"));
+        };
+        redirect.headers_mut().insert(header::LOCATION, value);
+        ControlFlow::Break(AssetProxyResponse::origin_controlled(redirect))
+    }
+
+    /// The reader's answer where `response` is a stylesheet: moved and run
+    /// through its `[[serve]]` entry, see [`crate::css_relocation`], or sent
+    /// to its upstream address where it cannot be moved.
+    async fn stylesheet(
+        &self,
+        response: AssetProxyResponse,
+    ) -> ControlFlow<AssetProxyResponse, AssetProxyResponse> {
+        let content_type = crate::middleware::media_type_of(
+            response
+                .response()
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default(),
+        );
+        if content_type != crate::rehost::STYLESHEET_MEDIA_TYPE {
+            return ControlFlow::Continue(response);
+        }
+        if !self.rehost.stylesheets_moved {
+            // Served from here unmoved, its addresses would name other files.
+            return ControlFlow::Break(self.to_upstream("stylesheet_not_moved_on_this_path"));
+        }
+        let received_at = Instant::now();
+        let facts = OriginFacts::of(response.response().headers());
+        let headers = response.response().headers();
+        let declared_type = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let encoding = headers
+            .get(header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let refusal = if response.response().status() != StatusCode::OK {
+            Some("stylesheet_status")
+        } else if !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity") {
+            Some("stylesheet_content_encoded")
+        } else if facts.is_private() {
+            Some("stylesheet_origin_private")
+        } else if facts.forbids_transform() {
+            Some("stylesheet_no_transform")
+        } else if !crate::middleware::is_utf8_or_undeclared_charset(&declared_type) {
+            Some("stylesheet_not_utf8")
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            return ControlFlow::Break(self.to_upstream(reason));
+        }
+
+        let (mut parts, body) = response.into_whole_response().into_parts();
+        crate::media_signing::remove_origin_representation_headers(&mut parts.headers);
+        if self.rehost.method == Method::HEAD {
+            // Only the moved stylesheet's metadata: no body is fetched,
+            // moved or signed for a `HEAD`.
+            let mut head = Response::from_parts(parts, EdgeBody::empty());
+            strip_asset_proxy_response_headers(&mut head);
+            let mut head = AssetProxyResponse::origin_controlled(head);
+            self.bound_stylesheet_freshness(&mut head, &facts, received_at.elapsed());
+            let cache_policy = head.cache_policy();
+            return ControlFlow::Break(AssetProxyResponse::delivered(
+                crate::media_signing::answer_whole(
+                    &self.rehost.method,
+                    &self.rehost.reader_headers,
+                    head.into_whole_response(),
+                ),
+                cache_policy,
+            ));
+        }
+        let Ok(bytes) = crate::css_relocation::collect_stylesheet(body).await else {
+            return ControlFlow::Break(self.to_upstream("stylesheet_too_large_or_unreadable"));
+        };
+        let stylesheet = crate::css_relocation::Stylesheet {
+            settings: self.settings,
+            services: self.services,
+            integration_registry: self.integration_registry,
+            upstream: self.upstream,
+            content_type: &declared_type,
+            route_path: self.route_path,
+            page: self.page,
+            response_headers: &parts.headers,
+        };
+        let (moved, middleware_headers) = match stylesheet.relocate(&bytes).await {
+            Ok(moved) => moved,
+            Err(reason) => return ControlFlow::Break(self.to_upstream(&reason.to_string())),
+        };
+        parts
+            .headers
+            .insert(header::CONTENT_LENGTH, HeaderValue::from(moved.len()));
+        parts
+            .headers
+            .insert(header::ACCEPT_RANGES, HeaderValue::from_static("none"));
+        let mut answer = Response::from_parts(parts, EdgeBody::from(moved));
+        strip_asset_proxy_response_headers(&mut answer);
+        crate::middleware::write_response_headers(&mut answer, middleware_headers);
+        let mut answer = AssetProxyResponse::origin_controlled(answer);
+        self.bound_stylesheet_freshness(&mut answer, &facts, received_at.elapsed());
+        let cache_policy = answer.cache_policy();
+        log::info!("rehost: stylesheet moved");
+        ControlFlow::Break(AssetProxyResponse::delivered(
+            crate::media_signing::answer_whole(
+                &self.rehost.method,
+                &self.rehost.reader_headers,
+                answer.into_whole_response(),
+            ),
+            cache_policy,
+        ))
+    }
+
+    /// Middleware cannot lengthen the original answer's remaining lifetime
+    /// or the configured route cap. The typed policy survives adapter headers.
+    fn bound_stylesheet_freshness(
+        &self,
+        answer: &mut AssetProxyResponse,
+        facts: &OriginFacts,
+        elapsed: Duration,
+    ) {
+        let headers = answer.response().headers();
+        if cache_control_headers_are_private_or_no_store(headers) {
+            answer.apply_no_store_private_policy();
+            return;
+        }
+        let origin = facts.remaining_freshness(elapsed);
+        let current = OriginFacts::of(headers).remaining_freshness(Duration::ZERO);
+        let remaining = crate::media_signing::OriginFreshness {
+            browser: origin.browser.min(current.browser),
+            shared: origin.shared.min(current.shared),
+        };
+        let policy = crate::css_relocation::bounded_cache_policy(remaining, self.cache_policy);
+        // Rebase onto this response's date. Old Age or apparent age from the
+        // origin Date would subtract the same age twice; Expires is obsolete.
+        answer.response_mut().headers_mut().remove(header::AGE);
+        answer.response_mut().headers_mut().remove(header::DATE);
+        answer.response_mut().headers_mut().remove(header::EXPIRES);
+        answer.apply_normalized_cache_policy(policy);
+    }
+
+    /// A redirect to the stylesheet's upstream address, held by no cache,
+    /// for one that cannot be served from the route. Its fragment, which no
+    /// request carries, stays the browser's.
+    fn to_upstream(&self, reason: &str) -> AssetProxyResponse {
+        log::info!("rehost: outcome=upstream reason={reason}");
+        let mut response = Response::new(EdgeBody::empty());
+        *response.status_mut() = StatusCode::TEMPORARY_REDIRECT;
+        if let Ok(location) = HeaderValue::from_str(self.upstream.as_str()) {
+            response.headers_mut().insert(header::LOCATION, location);
+        }
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+        AssetProxyResponse::new(response, None, AssetProxyCachePolicy::NoStorePrivate)
+    }
+}
+
+/// What [`fetch_whole_asset`] repeats.
+struct WholeAssetFetch<'a> {
+    services: &'a RuntimeServices,
+    location: &'a SourceLocation,
+    target_url: &'a url::Url,
+    /// The route's outbound headers as they stood before signing.
+    headers: http::HeaderMap,
+    backend_name: &'a str,
+    stream_response: bool,
+}
+
+/// Asks the asset origin once more, unconditionally and for every byte, for
+/// a media representation it answered with a part or a `HEAD`, so the
+/// signer signs the bytes this answer carries, see [`crate::media_signing`].
+///
+/// # Errors
+///
+/// When the request cannot be signed or built, or the origin cannot be
+/// reached.
+async fn fetch_whole_asset(
+    fetch: &WholeAssetFetch<'_>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let mut headers = fetch.headers.clone();
+    strip_representation_preconditions(&mut headers);
+    headers.insert(
+        header::ACCEPT_ENCODING,
+        HeaderValue::from_static("identity"),
+    );
+    if let Some(auth) = fetch.location.auth() {
+        auth.remove_namespace_headers(&mut headers);
+        auth.sign(&Method::GET, fetch.target_url, &mut headers)?;
+    }
+    let whole = send_asset_origin_request(
+        fetch.services,
+        fetch.backend_name,
+        &Method::GET,
+        fetch.target_url,
+        &headers,
+        fetch.stream_response,
+    )
+    .await?;
+    Ok(whole.into_whole_response())
+}
+
+/// The address the optimizer reads a route's original at when the route
+/// sets `signed_source`: the reader's path on this host with the profile
+/// set's debug parameter set to `1` and no other query, which this route
+/// answers with the signed original and without the optimizer, so the
+/// optimizer's own request ends there. `None` where the route does not ask
+/// for it.
+///
+/// Dropping the reader's other query loses nothing of the source's
+/// identity: an optimizer route never sends the reader's query to its
+/// origin, since a route that would preserve it is refused while the
+/// optimizer is enabled and the optimizer drops every query parameter from
+/// its own origin request, so this address reaches the same origin object
+/// the optimizer would read directly. Keeping it would hand the reader's
+/// query parameters to the optimizer, which reads its transformation
+/// parameters from this address.
+///
+/// # Errors
+///
+/// When the reader's address cannot be parsed.
+fn signed_source_address(
+    settings: &Settings,
+    route: &ProxyAssetRoute,
+    reader_url: &str,
+) -> Result<Option<url::Url>, Report<TrustedServerError>> {
+    let Some(config) = route
+        .image_optimizer
+        .as_ref()
+        .filter(|config| config.enabled && config.signed_source)
+    else {
+        return Ok(None);
+    };
+    // `options_for_asset_request` has already refused a route whose
+    // profile set is missing.
+    let Some(profile_set) = settings
+        .image_optimizer
+        .profile_sets
+        .get(&config.profile_set)
+    else {
+        return Ok(None);
+    };
+    let mut address = url::Url::parse(reader_url).change_context(TrustedServerError::Proxy {
+        message: "invalid reader address for the signed source".to_string(),
+    })?;
+    address
+        .query_pairs_mut()
+        .clear()
+        .append_pair(&profile_set.debug_param, "1");
+    Ok(Some(address))
+}
+
+/// What [`send_through_signed_source`] sends.
+struct SignedSourceRequest<'a> {
+    settings: &'a Settings,
+    services: &'a RuntimeServices,
+    method: &'a Method,
+    /// From [`signed_source_address`].
+    address: &'a url::Url,
+    /// The route's outbound headers as they stood before the origin signing,
+    /// so no origin credential reaches this host.
+    headers: &'a http::HeaderMap,
+    options: &'a PlatformImageOptimizerOptions,
+    stream_response: bool,
+}
+
+/// Asks the optimizer to transform the original this route signs, read at
+/// [`signed_source_address`] on this host. The optimizer keeps only query
+/// parameters it does not know on its own request, which is the debug
+/// parameter alone.
+///
+/// # Errors
+///
+/// When this host's backend cannot be registered, the request cannot be
+/// built, or the optimizer cannot be reached.
+async fn send_through_signed_source(
+    request: &SignedSourceRequest<'_>,
+) -> Result<PlatformResponse, Report<TrustedServerError>> {
+    let address = request.address;
+    let host = address.host_str().ok_or_else(|| {
+        Report::new(TrustedServerError::Proxy {
+            message: "missing host in the signed source address".to_string(),
+        })
+    })?;
+    let backend_name = request
+        .services
+        .backend()
+        .ensure(&PlatformBackendSpec {
+            scheme: address.scheme().to_string(),
+            host: host.to_string(),
+            port: address.port(),
+            host_header_override: None,
+            certificate_check: request.settings.proxy.certificate_check,
+            first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+            between_bytes_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+            discriminator: None,
+        })
+        .change_context(TrustedServerError::Proxy {
+            message: "signed source backend registration failed".to_string(),
+        })?;
+    let mut headers = request.headers.clone();
+    headers.insert(header::HOST, asset_origin_host_header(address)?);
+    let mut platform_req =
+        build_asset_platform_request(request.method, address, &headers, &backend_name)?
+            .with_image_optimizer(
+                request
+                    .options
+                    .clone()
+                    .with_preserve_query_string_on_origin_request(true),
+            );
+    if request.stream_response {
+        platform_req = platform_req.with_stream_response();
+    }
+    request
+        .services
+        .http_client()
+        .send(platform_req)
+        .await
+        .change_context(TrustedServerError::Proxy {
+            message: "signed source optimizer request failed".to_string(),
+        })
 }
 
 /// What tells one route's copies apart from another's: the address its
@@ -1256,14 +2001,18 @@ fn route_origin_identity(route: &ProxyAssetRoute, location: &SourceLocation) -> 
 /// part of the key, so two routes to one address keep their own copies. A
 /// route sends its origin no cookie, see [`ASSET_PROXY_FORWARD_HEADERS`], so
 /// a reader's cookies cannot shape the answer and do not keep it from a copy.
+/// A stylesheet-chain candidate bypasses raw copies before MIME dispatch,
+/// since the body must be fetched whole and processed under current policy.
 fn asset_route_copy_key(
     services: &RuntimeServices,
     req: &Request<EdgeBody>,
     route: &ProxyAssetRoute,
     location: &SourceLocation,
     target_url: &url::Url,
+    stylesheets_moved: bool,
 ) -> Option<crate::asset_cache::AssetCacheKey> {
-    if req.method() != Method::GET
+    if stylesheets_moved
+        || req.method() != Method::GET
         || req.headers().contains_key(header::AUTHORIZATION)
         || crate::publisher::request_bypasses_template_cache(req.headers())
     {
@@ -2353,12 +3102,13 @@ mod tests {
         handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
         handle_first_party_proxy_sign, is_host_allowed, is_host_permitted, proxy_request,
         rebuild_response_with_body, reconstruct_and_validate_signed_target, route_origin_identity,
-        stream_asset_body,
+        signed_source_address, stream_asset_body,
     };
     use crate::cache_policy::{CachePolicy, EdgeCacheHeader};
     use crate::constants::{HEADER_ACCEPT, HEADER_X_FORWARDED_FOR};
     use crate::creative;
     use crate::error::{IntoHttpResponse, TrustedServerError};
+    use crate::media_signing::test_support::{Behavior, SIGNED_SUFFIX, StubSigner};
     use crate::origin_auth::fixture;
     use crate::platform::RuntimeServices;
     use crate::platform::test_support::{
@@ -2383,6 +3133,7 @@ mod tests {
     use error_stack::Report;
     use http::Request;
     use http::{HeaderValue, Method, Request as HttpRequest, Response, StatusCode, header};
+    use web_time::UNIX_EPOCH;
 
     #[test]
     fn test_rebuild_response_with_body_preserves_multiple_headers() {
@@ -5274,6 +6025,7 @@ mod tests {
         handle_asset_proxy_request(
             &settings,
             services,
+            &crate::integrations::IntegrationRegistry::empty_for_tests(),
             request,
             &route,
             &origin_source_of(&route),
@@ -5490,6 +6242,7 @@ mod tests {
             let Err(error) = handle_asset_proxy_request(
                 &settings,
                 &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
                 request,
                 &route,
                 &origin_source_of(&route),
@@ -5581,6 +6334,7 @@ mod tests {
             let response = handle_asset_proxy_request(
                 &settings,
                 &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
                 req,
                 &route,
                 &origin_source_of(&route),
@@ -5677,6 +6431,7 @@ mod tests {
             handle_asset_proxy_request(
                 &settings,
                 &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
                 req,
                 &route,
                 &origin_source_of(&route),
@@ -5716,6 +6471,7 @@ mod tests {
             let response = handle_asset_proxy_request(
                 &settings,
                 &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
                 req,
                 &route,
                 &origin_source_of(&route),
@@ -5785,6 +6541,7 @@ mod tests {
             let asset_response = handle_asset_proxy_request(
                 &settings,
                 &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
                 req,
                 &route,
                 &origin_source_of(&route),
@@ -5893,6 +6650,7 @@ mod tests {
             let asset_response = handle_asset_proxy_request(
                 &settings,
                 &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
                 req,
                 &route,
                 &origin_source_of(&route),
@@ -5973,6 +6731,7 @@ mod tests {
             region: "us_east".to_string(),
             profile_set: "default_images".to_string(),
             origin_query: None,
+            signed_source: false,
         });
         route
     }
@@ -6006,6 +6765,7 @@ mod tests {
             handle_asset_proxy_request(
                 &settings,
                 &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
                 req,
                 &route,
                 &origin_source_of(&route),
@@ -6075,6 +6835,7 @@ mod tests {
             handle_asset_proxy_request(
                 &settings,
                 &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
                 req,
                 &route,
                 &origin_source_of(&route),
@@ -6125,11 +6886,13 @@ mod tests {
                 region: "us_east".to_string(),
                 profile_set: "default_images".to_string(),
                 origin_query: None,
+                signed_source: false,
             });
 
             handle_asset_proxy_request(
                 &settings,
                 &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
                 req,
                 &route,
                 &origin_source_of(&route),
@@ -6154,6 +6917,10 @@ mod tests {
                 .expect("should attach image optimizer metadata");
             assert_eq!(options.region, "us_east");
             assert!(!options.preserve_query_string_on_origin_request);
+            assert!(
+                !options.preserve_c2pa,
+                "without a media signer the optimizer keeps its default metadata removal"
+            );
             assert_eq!(options.params.quality, Some(70));
             assert_eq!(options.params.resize_filter.as_deref(), Some("bicubic"));
             assert_eq!(options.params.format.as_deref(), Some("auto"));
@@ -6162,6 +6929,829 @@ mod tests {
             assert_eq!((crop.width, crop.height), (1, 1));
             assert_eq!((crop.offset_x, crop.offset_y), (Some(70), Some(50)));
         });
+    }
+
+    fn sent_asset_header(stub: &StubHttpClient, name: &str) -> Option<String> {
+        stub.recorded_request_headers()
+            .first()
+            .expect("should send the asset origin a request")
+            .iter()
+            .find(|(sent, _)| sent.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_signs_a_claimed_asset_and_ranges_the_signed_bytes() {
+        futures::executor::block_on(async {
+            let source = b"asset-photo-bytes";
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                source.to_vec(),
+                vec![
+                    (header::CONTENT_TYPE.as_str(), "image/png"),
+                    (header::ETAG.as_str(), "\"origin-etag\""),
+                ],
+            );
+            let signer = StubSigner::new(Behavior::Sign, 1024);
+            let services = signer.installed_in(build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            ));
+            let settings = create_test_settings();
+            let mut req =
+                build_http_request(Method::GET, "https://www.example.com/.images/photo.png");
+            req.headers_mut()
+                .insert(header::RANGE, HeaderValue::from_static("bytes=0-3"));
+            req.headers_mut().insert(
+                header::IF_NONE_MATCH,
+                HeaderValue::from_static("\"origin-etag\""),
+            );
+            let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+
+            let (response, stream_body) = handle_asset_proxy_request(
+                &settings,
+                &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy the claimed asset")
+            .into_response_and_body();
+
+            assert_eq!(
+                sent_asset_header(&stub, "range").as_deref(),
+                Some("bytes=0-3"),
+                "should ask the origin as the reader asked"
+            );
+            assert_eq!(
+                sent_asset_header(&stub, "if-none-match").as_deref(),
+                Some("\"origin-etag\""),
+                "should forward the reader's validator"
+            );
+            let jobs = signer.jobs();
+            assert_eq!(jobs.len(), 1, "should hand the asset to the signer once");
+            assert_eq!(jobs[0].source, source, "should sign the exact origin bytes");
+            assert_eq!(
+                jobs[0].source_reference.as_deref(),
+                Some("https://assets.example.com/.images/photo.png"),
+                "should name the plain address it fetched"
+            );
+            assert!(stream_body.is_none(), "signed bytes are held whole");
+            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+            let mut signed = source.to_vec();
+            signed.extend_from_slice(SIGNED_SUFFIX);
+            assert_eq!(
+                response
+                    .body()
+                    .as_bytes()
+                    .expect("should carry a buffered body"),
+                &signed[0..=3],
+                "should range the signed bytes"
+            );
+            assert_ne!(
+                response_header(&response, header::ETAG),
+                Some("\"origin-etag\""),
+                "should never describe signed bytes with the origin's tag"
+            );
+        });
+    }
+
+    /// A later request for a signed asset is answered from the kept signed
+    /// representation, ranges and all, without the origin being asked.
+    #[test]
+    fn handle_asset_proxy_request_answers_a_later_range_from_the_kept_signed_asset() {
+        futures::executor::block_on(async {
+            let source = b"asset-photo-bytes";
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                source.to_vec(),
+                vec![
+                    (header::CONTENT_TYPE.as_str(), "image/png"),
+                    (header::CACHE_CONTROL.as_str(), "public, max-age=600"),
+                ],
+            );
+            let signer = StubSigner::new(Behavior::Sign, 1024);
+            let services = signer
+                .installed_in(build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                ))
+                .with_loading_cache(Arc::new(
+                    crate::platform::test_support::MemoryLoadingCache::default(),
+                ));
+            let settings = create_test_settings();
+            let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+
+            let mut first = build_http_request(Method::GET, "https://www.example.com/.images/hero");
+            first
+                .headers_mut()
+                .insert("sec-fetch-dest", HeaderValue::from_static("image"));
+            handle_asset_proxy_request(
+                &settings,
+                &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
+                first,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should sign the first request");
+            let mut later = build_http_request(Method::GET, "https://www.example.com/.images/hero");
+            later
+                .headers_mut()
+                .insert("sec-fetch-dest", HeaderValue::from_static("image"));
+            later
+                .headers_mut()
+                .insert(header::RANGE, HeaderValue::from_static("bytes=2-5"));
+            let response = handle_asset_proxy_request(
+                &settings,
+                &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
+                later,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should answer from the kept signed asset")
+            .into_response()
+            .expect("should hold the kept bytes whole");
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "should not ask the origin again"
+            );
+            assert_eq!(signer.jobs().len(), 1, "should not sign again");
+            let mut signed = source.to_vec();
+            signed.extend_from_slice(SIGNED_SUFFIX);
+            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(
+                response
+                    .body()
+                    .as_bytes()
+                    .expect("should carry a buffered body"),
+                &signed[2..=5],
+                "should range the kept signed bytes"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_never_signs_an_answer_the_origin_marked_as_one_readers() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                b"reader-photo".to_vec(),
+                vec![
+                    (header::CONTENT_TYPE.as_str(), "image/png"),
+                    (header::SET_COOKIE.as_str(), "reader=1; Path=/"),
+                ],
+            );
+            let signer = StubSigner::new(Behavior::Sign, 1024);
+            let services = signer.installed_in(build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            ));
+            let settings = create_test_settings();
+            let req = build_http_request(Method::GET, "https://www.example.com/.images/photo.png");
+            let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+
+            let response = handle_asset_proxy_request(
+                &settings,
+                &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy the asset")
+            .into_response()
+            .expect("should return a buffered asset response");
+
+            assert!(
+                signer.jobs().is_empty(),
+                "a cookie the route strips still marks the answer as one reader's"
+            );
+            assert_eq!(
+                response.body().as_bytes(),
+                Some(&b"reader-photo"[..]),
+                "should send the origin's bytes unchanged"
+            );
+            assert!(response.headers().get(header::SET_COOKIE).is_none());
+        });
+    }
+
+    /// A route whose profile set gives the optimizer its transformation.
+    fn optimized_route() -> ProxyAssetRoute {
+        let mut route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+        route.image_optimizer = Some(AssetImageOptimizerConfig {
+            enabled: true,
+            region: "us_east".to_string(),
+            profile_set: "default_images".to_string(),
+            origin_query: None,
+            signed_source: false,
+        });
+        route
+    }
+
+    fn optimized_settings() -> crate::settings::Settings {
+        let mut settings = create_test_settings();
+        settings.image_optimizer = ImageOptimizerSettings {
+            profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
+        };
+        settings
+    }
+
+    /// An optimizer's answer that carries the C2PA manifest store it wrote:
+    /// a JUMBF description box with the C2PA manifest store UUID.
+    fn optimizer_answer_with_manifest() -> Vec<u8> {
+        let mut body = b"RIFF-optimized-pixels-".to_vec();
+        body.extend_from_slice(b"jumd");
+        body.extend_from_slice(&[
+            0x63, 0x32, 0x70, 0x61, 0x00, 0x11, 0x00, 0x10, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38,
+            0x9B, 0x71,
+        ]);
+        body.extend_from_slice(b"\x03c2pa\0-manifest");
+        body
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_signs_an_optimizer_answer_that_records_what_it_did() {
+        futures::executor::block_on(async {
+            let answer = optimizer_answer_with_manifest();
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                answer.clone(),
+                vec![
+                    (header::CONTENT_TYPE.as_str(), "image/webp"),
+                    (header::CACHE_CONTROL.as_str(), "public, max-age=600"),
+                ],
+            );
+            let signer = StubSigner::new(Behavior::Sign, 1024);
+            let services = signer.installed_in(build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            ));
+            let route = optimized_route();
+            let req = build_http_request(
+                Method::GET,
+                "https://www.example.com/.images/photo.jpg?profile=medium",
+            );
+
+            let response = handle_asset_proxy_request(
+                &optimized_settings(),
+                &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy the optimized asset")
+            .into_response()
+            .expect("should return a buffered asset response");
+
+            let options = stub.recorded_image_optimizer_options();
+            assert!(
+                options[0]
+                    .as_ref()
+                    .expect("should still use the optimizer")
+                    .preserve_c2pa,
+                "should ask the optimizer to record what it did"
+            );
+            let jobs = signer.jobs();
+            assert_eq!(
+                jobs.len(),
+                1,
+                "should hand the optimizer's answer over once"
+            );
+            assert_eq!(
+                jobs[0].source, answer,
+                "should sign the exact bytes the optimizer answered"
+            );
+            assert!(
+                jobs[0].optimizer_output,
+                "should mark them as the optimizer's"
+            );
+            assert_eq!(
+                jobs[0].source_reference, None,
+                "no address serves the optimizer's answer"
+            );
+            assert_eq!(
+                jobs[0].source_origin_host.as_deref(),
+                Some("assets.example.com"),
+                "should name the origin the optimizer read"
+            );
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut signed = answer.clone();
+            signed.extend_from_slice(SIGNED_SUFFIX);
+            assert_eq!(
+                response
+                    .body()
+                    .as_bytes()
+                    .expect("should carry a buffered body"),
+                signed.as_slice(),
+                "should deliver the signed bytes"
+            );
+            assert!(
+                response
+                    .headers()
+                    .get_all(header::VARY)
+                    .iter()
+                    .any(|value| value.to_str().is_ok_and(|v| v.contains("Accept"))),
+                "a cache past core should know the format follows the reader's Accept"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_never_signs_an_optimizer_answer_without_its_record() {
+        futures::executor::block_on(async {
+            let answer = b"RIFF-optimized-pixels-without-a-manifest".to_vec();
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                answer.clone(),
+                vec![
+                    (header::CONTENT_TYPE.as_str(), "image/webp"),
+                    (header::CACHE_CONTROL.as_str(), "public, max-age=600"),
+                ],
+            );
+            let signer = StubSigner::new(Behavior::Sign, 1024);
+            let services = signer.installed_in(build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            ));
+            let route = optimized_route();
+            let req = build_http_request(Method::GET, "https://www.example.com/.images/photo.jpg");
+
+            let response = handle_asset_proxy_request(
+                &optimized_settings(),
+                &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy the optimized asset")
+            .into_response()
+            .expect("should return a buffered asset response");
+
+            assert!(
+                signer.jobs().is_empty(),
+                "an unsigned original's optimized answer records nothing, so it is not signed"
+            );
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .body()
+                    .as_bytes()
+                    .expect("should carry a buffered body"),
+                answer.as_slice(),
+                "should deliver the optimizer's bytes as it made them"
+            );
+            assert!(
+                response_header(&response, header::CACHE_CONTROL)
+                    .is_some_and(|value| !value.contains("private")),
+                "an answer core never meant to sign keeps a shareable policy"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_sends_an_optimizer_part_as_made() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                206,
+                b"part".to_vec(),
+                vec![(header::CONTENT_TYPE.as_str(), "image/png")],
+            );
+            let signer = StubSigner::new(Behavior::Sign, 1024);
+            let services = signer.installed_in(build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            ));
+            let mut req =
+                build_http_request(Method::GET, "https://www.example.com/.images/photo.png");
+            req.headers_mut()
+                .insert(header::RANGE, HeaderValue::from_static("bytes=0-3"));
+            let route = optimized_route();
+
+            let response = handle_asset_proxy_request(
+                &optimized_settings(),
+                &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy the optimized asset")
+            .into_response()
+            .expect("should return a buffered asset response");
+
+            assert!(
+                signer.jobs().is_empty(),
+                "a part of the optimizer's answer is never signed"
+            );
+            assert_eq!(
+                stub.recorded_request_methods().len(),
+                1,
+                "should never ask again past the optimizer"
+            );
+            assert_eq!(
+                sent_asset_header(&stub, "range").as_deref(),
+                Some("bytes=0-3"),
+                "should ask the optimizer as the reader asked"
+            );
+            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        });
+    }
+
+    fn signed_source_route() -> ProxyAssetRoute {
+        let mut route = optimized_route();
+        if let Some(config) = route.image_optimizer.as_mut() {
+            config.signed_source = true;
+        }
+        route
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_sends_the_optimizer_to_the_route_s_signed_original() {
+        futures::executor::block_on(async {
+            let answer = optimizer_answer_with_manifest();
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                answer.clone(),
+                vec![
+                    (header::CONTENT_TYPE.as_str(), "image/webp"),
+                    (header::CACHE_CONTROL.as_str(), "public, max-age=600"),
+                ],
+            );
+            let signer = StubSigner::new(Behavior::Sign, 1024);
+            let services = signer.installed_in(build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            ));
+            let route = signed_source_route();
+            let req = build_http_request(
+                Method::GET,
+                "https://www.example.com/.images/photo.jpg?profile=medium",
+            );
+
+            let response = handle_asset_proxy_request(
+                &optimized_settings(),
+                &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy the optimized asset")
+            .into_response()
+            .expect("should return a buffered asset response");
+
+            let uris = stub.recorded_request_uris();
+            assert_eq!(uris.len(), 1, "should ask the optimizer once");
+            let asked = url::Url::parse(&uris[0]).expect("should send an absolute address");
+            assert_eq!(
+                (asked.host_str(), asked.path(), asked.query()),
+                (
+                    Some("www.example.com"),
+                    "/.images/photo.jpg",
+                    Some("_io_debug=1")
+                ),
+                "should send the optimizer to this route's unoptimized, signed answer alone"
+            );
+            assert_eq!(
+                sent_asset_header(&stub, "host").as_deref(),
+                Some("www.example.com"),
+                "should ask this host"
+            );
+            let options = stub.recorded_image_optimizer_options();
+            let options = options[0].as_ref().expect("should still use the optimizer");
+            assert!(
+                options.preserve_query_string_on_origin_request,
+                "the optimizer must pass the debug parameter on to this host"
+            );
+            assert!(
+                options.preserve_c2pa,
+                "should ask for the optimizer's record"
+            );
+            assert_eq!(options.params.width, Some(828), "should keep the profile");
+            let jobs = signer.jobs();
+            assert_eq!(jobs.len(), 1, "should sign the optimizer's answer");
+            assert!(jobs[0].optimizer_output);
+            assert_eq!(jobs[0].source, answer);
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_answers_from_the_origin_when_the_signed_source_optimizer_fails() {
+        futures::executor::block_on(async {
+            let original = b"origin-photo-bytes";
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                503,
+                b"optimizer error".to_vec(),
+                vec![(header::CONTENT_TYPE.as_str(), "text/plain")],
+            );
+            stub.push_response_with_headers(
+                200,
+                original.to_vec(),
+                vec![
+                    (header::CONTENT_TYPE.as_str(), "image/png"),
+                    (header::CACHE_CONTROL.as_str(), "public, max-age=600"),
+                ],
+            );
+            let signer = StubSigner::new(Behavior::Sign, 1024);
+            let services = signer.installed_in(build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            ));
+            let route = signed_source_route();
+            let req = build_http_request(Method::GET, "https://www.example.com/.images/photo.jpg");
+
+            let response = handle_asset_proxy_request(
+                &optimized_settings(),
+                &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should answer from the origin")
+            .into_response()
+            .expect("should return a buffered asset response");
+
+            let uris = stub.recorded_request_uris();
+            assert_eq!(
+                uris.get(1).map(String::as_str),
+                Some("https://assets.example.com/.images/photo.jpg"),
+                "should ask the origin once after the optimizer failed"
+            );
+            assert_eq!(uris.len(), 2, "should not ask the optimizer again");
+            assert_eq!(
+                stub.recorded_image_optimizer_options()[1],
+                None,
+                "the origin is asked without the optimizer"
+            );
+            let jobs = signer.jobs();
+            assert_eq!(jobs.len(), 1, "should sign the origin's answer");
+            assert!(!jobs[0].optimizer_output, "the origin's bytes are its own");
+            assert_eq!(jobs[0].source, original);
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut signed = original.to_vec();
+            signed.extend_from_slice(SIGNED_SUFFIX);
+            assert_eq!(
+                response
+                    .body()
+                    .as_bytes()
+                    .expect("should carry a buffered body"),
+                signed.as_slice(),
+                "should deliver the signed original, unoptimized"
+            );
+        });
+    }
+
+    #[test]
+    fn the_signed_source_hop_reads_the_origin_object_the_optimizer_would_read_directly() {
+        futures::executor::block_on(async {
+            let origin_asked = |route: ProxyAssetRoute, uri: String| async move {
+                let stub = Arc::new(StubHttpClient::new());
+                stub.push_response_with_headers(
+                    200,
+                    b"origin-photo-bytes".to_vec(),
+                    vec![
+                        (header::CONTENT_TYPE.as_str(), "image/png"),
+                        (header::CACHE_CONTROL.as_str(), "public, max-age=600"),
+                    ],
+                );
+                let services = build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                );
+                handle_asset_proxy_request(
+                    &optimized_settings(),
+                    &services,
+                    &crate::integrations::IntegrationRegistry::empty_for_tests(),
+                    build_http_request(Method::GET, &uri),
+                    &route,
+                    &origin_source_of(&route),
+                )
+                .await
+                .expect("should proxy the asset");
+                (
+                    stub.recorded_request_uris(),
+                    stub.recorded_image_optimizer_options(),
+                )
+            };
+
+            // The optimizer read directly, for a reader's query with an
+            // identity-looking parameter beside the profile controls.
+            let (direct, direct_options) = origin_asked(
+                optimized_route(),
+                "https://www.example.com/.images/photo.jpg?profile=medium&versionId=7&x=70"
+                    .to_owned(),
+            )
+            .await;
+            // The hop the optimizer makes to this host on a signed_source
+            // route, at the address `signed_source_address` builds.
+            let address = signed_source_address(
+                &optimized_settings(),
+                &signed_source_route(),
+                "https://www.example.com/.images/photo.jpg",
+            )
+            .expect("should build the address")
+            .expect("the route asks for a signed source");
+            assert_eq!(address.query(), Some("_io_debug=1"));
+            let (through_hop, hop_options) =
+                origin_asked(signed_source_route(), address.to_string()).await;
+
+            assert_eq!(
+                direct,
+                vec!["https://assets.example.com/.images/photo.jpg"],
+                "an optimizer route never sends the reader's query to its origin"
+            );
+            assert!(
+                !direct_options[0]
+                    .as_ref()
+                    .expect("should use the optimizer")
+                    .preserve_query_string_on_origin_request,
+                "and the optimizer drops every query parameter from its origin request"
+            );
+            assert_eq!(
+                through_hop, direct,
+                "the signed source hop reads the same origin object"
+            );
+            assert_eq!(
+                hop_options,
+                vec![None],
+                "the hop is answered without the optimizer"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_answers_from_the_origin_when_the_signed_source_optimizer_refuses()
+    {
+        futures::executor::block_on(async {
+            let original = b"origin-photo-bytes";
+            let stub = Arc::new(StubHttpClient::new());
+            // What an optimizer may answer for an input it will not
+            // transform, such as a private original.
+            stub.push_response_with_headers(
+                403,
+                b"input not cacheable".to_vec(),
+                vec![(header::CONTENT_TYPE.as_str(), "text/plain")],
+            );
+            stub.push_response_with_headers(
+                200,
+                original.to_vec(),
+                vec![
+                    (header::CONTENT_TYPE.as_str(), "image/png"),
+                    (header::CACHE_CONTROL.as_str(), "public, max-age=600"),
+                ],
+            );
+            let signer = StubSigner::new(Behavior::Sign, 1024);
+            let services = signer.installed_in(build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            ));
+            let route = signed_source_route();
+            let req = build_http_request(Method::GET, "https://www.example.com/.images/photo.jpg");
+
+            let response = handle_asset_proxy_request(
+                &optimized_settings(),
+                &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should answer from the origin")
+            .into_response()
+            .expect("should return a buffered asset response");
+
+            let uris = stub.recorded_request_uris();
+            assert_eq!(
+                uris.len(),
+                2,
+                "should ask the origin once, and nothing more"
+            );
+            assert_eq!(
+                uris[1], "https://assets.example.com/.images/photo.jpg",
+                "should ask the origin after the optimizer refused"
+            );
+            assert_eq!(
+                stub.recorded_image_optimizer_options()[1],
+                None,
+                "the origin is asked without the optimizer"
+            );
+            let jobs = signer.jobs();
+            assert_eq!(jobs.len(), 1, "should sign the origin's answer");
+            assert!(!jobs[0].optimizer_output, "the origin's bytes are its own");
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "the optimizer's refusal should never reach the reader as a broken image"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_keeps_a_private_optimizer_answer_out_of_the_shared_route_policy()
+    {
+        let answer_with = |cache_control: &'static str| {
+            futures::executor::block_on(async move {
+                let answer = b"RIFF-optimized-pixels-without-a-manifest".to_vec();
+                let stub = Arc::new(StubHttpClient::new());
+                stub.push_response_with_headers(
+                    200,
+                    answer.clone(),
+                    vec![
+                        (header::CONTENT_TYPE.as_str(), "image/webp"),
+                        (header::CACHE_CONTROL.as_str(), cache_control),
+                    ],
+                );
+                let signer = StubSigner::new(Behavior::Sign, 1024);
+                let services = signer.installed_in(build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                ));
+                let mut settings = Settings::from_toml(&format!(
+                    r#"{}
+
+                    [[cache.asset_rules]]
+                    id = "fingerprinted-images"
+                    enabled = true
+                    path_globs = ["/.images/**/*.jpg"]
+                    fingerprint_style = "hex"
+                    visibility = "public"
+                    browser_ttl_seconds = 31536000
+                    edge_ttl_seconds = 31536000
+                    immutable = true
+                "#,
+                    crate_test_settings_str()
+                ))
+                .expect("should parse settings with an image asset rule");
+                settings.image_optimizer = optimized_settings().image_optimizer;
+                let route = optimized_route();
+                let req = build_http_request(
+                    Method::GET,
+                    "https://www.example.com/.images/photo.0123abcd.jpg",
+                );
+
+                let asset_response = handle_asset_proxy_request(
+                    &settings,
+                    &services,
+                    &crate::integrations::IntegrationRegistry::empty_for_tests(),
+                    req,
+                    &route,
+                    &origin_source_of(&route),
+                )
+                .await
+                .expect("should proxy the optimized asset");
+                assert!(signer.jobs().is_empty(), "should not sign: {cache_control}");
+                let policy = asset_response.cache_policy();
+                let response = asset_response
+                    .into_response()
+                    .expect("should return a buffered asset response");
+                assert_eq!(
+                    response
+                        .body()
+                        .as_bytes()
+                        .expect("should carry a buffered body"),
+                    answer.as_slice(),
+                    "should deliver the optimizer's bytes as it made them"
+                );
+                (
+                    policy,
+                    response_header(&response, header::CACHE_CONTROL).map(str::to_owned),
+                )
+            })
+        };
+
+        let (policy, cache_control) = answer_with("private, max-age=60");
+        assert_eq!(
+            policy,
+            AssetProxyCachePolicy::OriginControlled,
+            "a private optimizer answer should keep the origin's policy"
+        );
+        assert_eq!(
+            cache_control.as_deref(),
+            Some("private, max-age=60"),
+            "should not let a shared cache hold a private answer"
+        );
+
+        let (policy, _) = answer_with("public, max-age=600");
+        assert!(
+            matches!(policy, AssetProxyCachePolicy::Normalized(_)),
+            "a shareable optimizer answer still takes the route's policy"
+        );
     }
 
     #[test]
@@ -6188,11 +7778,13 @@ mod tests {
                 region: "us_east".to_string(),
                 profile_set: "default_images".to_string(),
                 origin_query: None,
+                signed_source: false,
             });
 
             handle_asset_proxy_request(
                 &settings,
                 &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
                 req,
                 &route,
                 &origin_source_of(&route),
@@ -6239,11 +7831,13 @@ mod tests {
                 region: "us_east".to_string(),
                 profile_set: "default_images".to_string(),
                 origin_query: None,
+                signed_source: false,
             });
 
             handle_asset_proxy_request(
                 &settings,
                 &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
                 req,
                 &route,
                 &origin_source_of(&route),
@@ -6288,11 +7882,13 @@ mod tests {
                 region: "us_east".to_string(),
                 profile_set: "default_images".to_string(),
                 origin_query: None,
+                signed_source: false,
             });
 
             handle_asset_proxy_request(
                 &settings,
                 &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
                 req,
                 &route,
                 &origin_source_of(&route),
@@ -6332,6 +7928,7 @@ mod tests {
             let response = handle_asset_proxy_request(
                 &settings,
                 &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
                 req,
                 &route,
                 &origin_source_of(&route),
@@ -6384,6 +7981,7 @@ mod tests {
             let (response, stream_body) = handle_asset_proxy_request(
                 &settings,
                 &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
                 req,
                 &route,
                 &origin_source_of(&route),
@@ -6483,6 +8081,7 @@ mod tests {
             let asset_response = handle_asset_proxy_request(
                 &settings,
                 &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
                 req,
                 &route,
                 &origin_source_of(&route),
@@ -6564,6 +8163,7 @@ mod tests {
             let (response, stream_body) = handle_asset_proxy_request(
                 &settings,
                 &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
                 req,
                 &route,
                 &origin_source_of(&route),
@@ -6621,11 +8221,13 @@ mod tests {
                 region: "us_east".to_string(),
                 profile_set: "default_images".to_string(),
                 origin_query: None,
+                signed_source: false,
             });
 
             handle_asset_proxy_request(
                 &settings,
                 &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
                 req,
                 &route,
                 &origin_source_of(&route),
@@ -6654,6 +8256,7 @@ mod tests {
             let (response, stream_body) = handle_asset_proxy_request(
                 &settings,
                 &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
                 req,
                 &route,
                 &origin_source_of(&route),
@@ -6793,6 +8396,7 @@ mod tests {
             let asset_response = handle_asset_proxy_request(
                 &settings,
                 &services,
+                &crate::integrations::IntegrationRegistry::empty_for_tests(),
                 req,
                 &route,
                 &origin_source_of(&route),
@@ -7158,5 +8762,738 @@ mod tests {
                 "should return 413 for oversized rebuild body"
             );
         });
+    }
+
+    mod rehost_route {
+        use super::*;
+        use crate::integrations::IntegrationRegistry;
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::middleware::{PhaseEntries, PhaseEntry};
+        use crate::platform::test_support::StubHttpClient;
+        use crate::proxy::{
+            AssetProxyResponse, OriginFacts, RehostAnswer, RehostRequest, RequestInfo,
+        };
+
+        const PREFIX: &str = "/_rehost/cdn.example.net/npm/";
+        const READER: &str = "https://www.example.com";
+
+        fn settings(moves_stylesheets: bool) -> Settings {
+            let mut settings = create_test_settings();
+            let mut route = ProxyAssetRoute::new(PREFIX, "https://cdn.example.net/npm");
+            route.rehost_page_references = true;
+            settings.proxy.asset_routes.push(route);
+            if moves_stylesheets {
+                settings
+                    .insert_module_config(
+                        "testing",
+                        fixture::MODULE,
+                        &serde_json::json!({ "label": "rehost" }),
+                    )
+                    .expect("should select the middleware stand-in");
+                settings.serve = PhaseEntries::new(vec![PhaseEntry {
+                    media_type: "text/css".to_owned(),
+                    path: Some(format!("{PREFIX}lib@1/")),
+                    middleware: vec![fixture::STYLESHEET.to_owned()],
+                }]);
+            }
+            settings
+        }
+
+        fn request(method: Method, path: &str) -> HttpRequest<EdgeBody> {
+            let mut req = build_http_request(method, format!("{READER}{path}"));
+            req.headers_mut().insert(
+                http::header::HeaderName::from_static("x-forwarded-proto"),
+                HeaderValue::from_static("https"),
+            );
+            req.headers_mut().insert(
+                header::REFERER,
+                HeaderValue::from_static("https://www.example.com/private-article"),
+            );
+            req.headers_mut().insert(
+                header::ACCEPT_ENCODING,
+                HeaderValue::from_static("gzip, br"),
+            );
+            req
+        }
+
+        async fn answer(
+            settings: &Settings,
+            stub: &Arc<StubHttpClient>,
+            req: HttpRequest<EdgeBody>,
+        ) -> http::Response<EdgeBody> {
+            let services = build_services_with_http_client(
+                Arc::clone(stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let registry = IntegrationRegistry::new(settings).expect("should build the registry");
+            let route = settings
+                .proxy
+                .asset_routes
+                .last()
+                .expect("should have the rehosting route")
+                .clone();
+            handle_asset_proxy_request(
+                settings,
+                &services,
+                &registry,
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should answer the rehosting route")
+            .into_response()
+            .expect("should answer with a buffered response")
+        }
+
+        fn stub() -> Arc<StubHttpClient> {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(false);
+            stub
+        }
+
+        fn header_of(
+            response: &http::Response<EdgeBody>,
+            name: header::HeaderName,
+        ) -> Option<&str> {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+        }
+
+        #[test]
+        fn fetches_the_upstream_file_without_the_reader_s_page() {
+            futures::executor::block_on(async {
+                let stub = stub();
+                stub.push_response_with_headers(
+                    200,
+                    b"png".to_vec(),
+                    vec![("content-type", "image/png")],
+                );
+                let response = answer(
+                    &settings(false),
+                    &stub,
+                    request(Method::GET, &format!("{PREFIX}lib@1/img/a.png?v=1&x")),
+                )
+                .await;
+
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    stub.recorded_request_uris(),
+                    vec!["https://cdn.example.net/npm/lib@1/img/a.png?v=1&x".to_owned()],
+                    "should fetch the upstream file with its query as written"
+                );
+                let sent = &stub.recorded_request_headers()[0];
+                let sent_value = |name: &str| {
+                    sent.iter()
+                        .find(|(sent_name, _)| sent_name == name)
+                        .map(|(_, value)| value.clone())
+                };
+                assert_eq!(
+                    sent_value("referer"),
+                    None,
+                    "should not tell the third party the page"
+                );
+                assert_eq!(
+                    sent_value("accept-encoding").as_deref(),
+                    Some("identity"),
+                    "should ask for an identity-coded body"
+                );
+            });
+        }
+
+        #[test]
+        fn sends_a_stylesheet_no_serve_entry_moves_to_its_upstream_address() {
+            futures::executor::block_on(async {
+                let stub = stub();
+                stub.push_response_with_headers(
+                    200,
+                    b".a{background:url(img/a.png)}".to_vec(),
+                    vec![("content-type", "text/css")],
+                );
+                let response = answer(
+                    &settings(false),
+                    &stub,
+                    request(Method::GET, &format!("{PREFIX}lib@1/site.css?v=2")),
+                )
+                .await;
+
+                assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+                assert_eq!(
+                    header_of(&response, header::LOCATION),
+                    Some("https://cdn.example.net/npm/lib@1/site.css?v=2"),
+                    "an unmoved stylesheet's addresses only work where it lives"
+                );
+                assert_eq!(
+                    header_of(&response, header::CACHE_CONTROL),
+                    Some("private, no-store")
+                );
+            });
+        }
+
+        #[test]
+        fn moves_a_stylesheet_its_serve_entry_covers() {
+            futures::executor::block_on(async {
+                let stub = stub();
+                stub.push_response_with_headers(
+                    200,
+                    b".a{background:url(img/a.png)}".to_vec(),
+                    vec![("content-type", "text/css"), ("etag", "\"origin\"")],
+                );
+                let mut req = request(Method::GET, &format!("{PREFIX}lib@1/site.css"));
+                req.headers_mut().insert(
+                    header::IF_NONE_MATCH,
+                    HeaderValue::from_static("\"origin\""),
+                );
+                let response = answer(&settings(true), &stub, req).await;
+
+                assert_eq!(response.status(), StatusCode::OK);
+                let sent = &stub.recorded_request_headers()[0];
+                assert!(
+                    !sent.iter().any(|(name, _)| name == "if-none-match"),
+                    "should ask the origin for the whole stylesheet"
+                );
+                assert_eq!(
+                    header_of(&response, header::ETAG),
+                    None,
+                    "the origin's validator names other bytes"
+                );
+                let length = header_of(&response, header::CONTENT_LENGTH)
+                    .map(str::to_owned)
+                    .expect("should state the moved stylesheet's length");
+                let body = response_body_string(response);
+                assert_eq!(length, body.len().to_string());
+                assert!(
+                    body.contains(&format!("url(\"{READER}{PREFIX}lib@1/img/a.png\")")),
+                    "should name the image at the route's address: {body}"
+                );
+                assert!(
+                    body.ends_with(fixture::STYLESHEET_LINE),
+                    "should run the stylesheet through its serve entry: {body}"
+                );
+            });
+        }
+
+        #[test]
+        fn answers_if_match_against_the_moved_stylesheet() {
+            futures::executor::block_on(async {
+                let stub = stub();
+                stub.push_response_with_headers(
+                    200,
+                    b".a{}".to_vec(),
+                    vec![("content-type", "text/css"), ("etag", "\"origin\"")],
+                );
+                let mut req = request(Method::GET, &format!("{PREFIX}lib@1/site.css"));
+                req.headers_mut()
+                    .insert(header::IF_MATCH, HeaderValue::from_static("\"origin\""));
+                let response = answer(&settings(true), &stub, req).await;
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::PRECONDITION_FAILED,
+                    "the moved stylesheet is not the representation the origin's tag names"
+                );
+            });
+        }
+
+        #[test]
+        fn answers_head_for_a_moved_stylesheet_with_metadata_only() {
+            futures::executor::block_on(async {
+                let stub = stub();
+                stub.push_response_with_headers(
+                    200,
+                    Vec::new(),
+                    vec![
+                        ("content-type", "text/css"),
+                        ("content-length", "40"),
+                        ("etag", "\"origin\""),
+                    ],
+                );
+                let response = answer(
+                    &settings(true),
+                    &stub,
+                    request(Method::HEAD, &format!("{PREFIX}lib@1/site.css")),
+                )
+                .await;
+
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(stub.recorded_request_methods(), vec!["HEAD".to_owned()]);
+                assert_eq!(header_of(&response, header::CONTENT_LENGTH), None);
+                assert_eq!(header_of(&response, header::ETAG), None);
+                assert_eq!(header_of(&response, header::CONTENT_TYPE), Some("text/css"));
+            });
+        }
+
+        #[test]
+        fn writes_an_upstream_redirect_at_the_route_s_address() {
+            futures::executor::block_on(async {
+                let stub = stub();
+                stub.push_response_with_headers(
+                    302,
+                    Vec::new(),
+                    vec![("location", "../../lib@2/img/b.png?v=3")],
+                );
+                stub.push_response_with_headers(
+                    301,
+                    Vec::new(),
+                    vec![("location", "https://elsewhere.example/b.png")],
+                );
+                let settings = settings(false);
+                let moved = answer(
+                    &settings,
+                    &stub,
+                    request(Method::GET, &format!("{PREFIX}lib@1/img/a.png")),
+                )
+                .await;
+                let away = answer(
+                    &settings,
+                    &stub,
+                    request(Method::GET, &format!("{PREFIX}lib@1/img/a.png")),
+                )
+                .await;
+
+                assert_eq!(moved.status(), StatusCode::FOUND);
+                assert_eq!(
+                    header_of(&moved, header::LOCATION),
+                    Some(format!("{READER}{PREFIX}lib@2/img/b.png?v=3").as_str()),
+                    "should send the reader to the route's address for the same file"
+                );
+                assert_eq!(away.status(), StatusCode::MOVED_PERMANENTLY);
+                assert_eq!(
+                    header_of(&away, header::LOCATION),
+                    Some("https://elsewhere.example/b.png"),
+                    "should keep an address no route serves absolute"
+                );
+            });
+        }
+
+        #[test]
+        fn rewritten_redirect_discards_origin_body_metadata_but_keeps_cache_and_location() {
+            futures::executor::block_on(async {
+                let stub = stub();
+                stub.push_response_with_headers(
+                    302,
+                    b"an origin redirect body".to_vec(),
+                    vec![
+                        ("location", "../lib@2/a.png?q=%2f#f"),
+                        ("content-encoding", "gzip"),
+                        ("content-length", "23"),
+                        ("etag", "\"origin-body\""),
+                        ("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT"),
+                        ("content-range", "bytes 0-22/23"),
+                        ("accept-ranges", "bytes"),
+                        ("repr-digest", "sha-256=:AAAA:"),
+                        ("content-digest", "sha-256=:AAAA:"),
+                        ("digest", "sha-256=AAAA"),
+                        ("content-md5", "AAAA"),
+                        ("cache-control", "private, max-age=30"),
+                        ("vary", "Accept"),
+                    ],
+                );
+                let response = answer(
+                    &settings(false),
+                    &stub,
+                    request(Method::GET, &format!("{PREFIX}lib@1/a.png")),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::FOUND);
+                assert_eq!(
+                    header_of(&response, header::LOCATION),
+                    Some(format!("{READER}{PREFIX}lib@2/a.png?q=%2f#f").as_str())
+                );
+                for name in [
+                    "content-encoding",
+                    "content-length",
+                    "etag",
+                    "last-modified",
+                    "content-range",
+                    "accept-ranges",
+                    "repr-digest",
+                    "content-digest",
+                    "digest",
+                    "content-md5",
+                    "transfer-encoding",
+                ] {
+                    assert!(!response.headers().contains_key(name), "retained {name}");
+                }
+                assert_eq!(
+                    header_of(&response, header::CACHE_CONTROL),
+                    Some("private, max-age=30")
+                );
+                assert_eq!(header_of(&response, header::VARY), Some("Accept"));
+                assert!(response_body_string(response).is_empty());
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    1,
+                    "redirects are never followed"
+                );
+            });
+        }
+
+        #[test]
+        fn css_chain_candidates_never_use_the_raw_asset_copy_cache() {
+            futures::executor::block_on(async {
+                for content_type in ["text/css", "image/png"] {
+                    let settings = settings(true);
+                    let stub = stub();
+                    for body in [b".first{}".to_vec(), b".second{}".to_vec()] {
+                        stub.push_response_with_headers(
+                            200,
+                            body,
+                            vec![
+                                ("content-type", content_type),
+                                ("cache-control", "public, max-age=300"),
+                            ],
+                        );
+                    }
+                    let cache =
+                        Arc::new(crate::platform::test_support::MemoryLoadingCache::default());
+                    let services = asset_route_services(&stub, &cache);
+                    let registry = IntegrationRegistry::new(&settings).expect("registry");
+                    let route = settings.proxy.asset_routes.last().expect("route");
+                    let mut bodies = Vec::new();
+                    for _ in 0..2 {
+                        let response = handle_asset_proxy_request(
+                            &settings,
+                            &services,
+                            &registry,
+                            request(Method::GET, &format!("{PREFIX}lib@1/a")),
+                            route,
+                            &origin_source_of(route),
+                        )
+                        .await
+                        .expect("route answer")
+                        .into_response()
+                        .expect("buffered");
+                        assert_eq!(response.status(), StatusCode::OK);
+                        bodies.push(response_body_string(response));
+                    }
+                    assert_ne!(
+                        bodies[0], bodies[1],
+                        "{content_type} must use the fresh origin answer"
+                    );
+                    assert_eq!(stub.recorded_request_uris().len(), 2, "{content_type}");
+                }
+            });
+        }
+
+        #[test]
+        fn stylesheet_freshness_uses_remaining_origin_age_and_route_cap_through_finalization() {
+            futures::executor::block_on(async {
+                let caps = Settings::from_toml(&format!(
+                    r#"{}
+                    [[cache.asset_rules]]
+                    id = "stylesheet-cap"
+                    enabled = true
+                    path_globs = ["{PREFIX}**"]
+                    visibility = "public"
+                    browser_ttl_seconds = 60
+                    edge_ttl_seconds = 600
+                    immutable = false
+                    "#,
+                    crate_test_settings_str(),
+                ))
+                .expect("cache cap settings");
+                let mut settings = settings(true);
+                settings.cache.asset_rules = caps.cache.asset_rules;
+                for (control, age, browser_cap, shared_cap) in [
+                    ("public, max-age=31536000", "0", 60, 600),
+                    ("public, max-age=60, s-maxage=3600", "0", 60, 600),
+                    ("public, max-age=90, s-maxage=600", "70", 20, 530),
+                    ("public, max-age=90", "100", 0, 0),
+                ] {
+                    for method in [Method::GET, Method::HEAD] {
+                        let stub = stub();
+                        stub.push_response_with_headers(
+                            200,
+                            b".a{}".to_vec(),
+                            vec![
+                                ("content-type", "text/css"),
+                                ("cache-control", control),
+                                ("age", age),
+                                ("date", "Wed, 21 Oct 2037 07:28:00 GMT"),
+                                ("expires", "Wed, 21 Oct 2037 07:28:00 GMT"),
+                            ],
+                        );
+                        let services = build_services_with_http_client(Arc::clone(&stub) as _);
+                        let registry = IntegrationRegistry::new(&settings).expect("registry");
+                        let route = settings.proxy.asset_routes.last().expect("route");
+                        let response = handle_asset_proxy_request(
+                            &settings,
+                            &services,
+                            &registry,
+                            request(method, &format!("{PREFIX}lib@1/a.css")),
+                            route,
+                            &origin_source_of(route),
+                        )
+                        .await
+                        .expect("route");
+                        let policy = response.cache_policy();
+                        let AssetProxyCachePolicy::Normalized(bounded) = policy else {
+                            panic!("relocated stylesheet must retain its bounded policy");
+                        };
+                        let browser = bounded.browser_ttl.expect("browser lifetime").as_secs();
+                        let shared = bounded.edge_ttl.expect("shared lifetime").as_secs();
+                        // The live clock may consume part of the last second.
+                        // Exact elapsed-time behavior is covered below with
+                        // explicit receipt and processing times.
+                        assert!(browser <= browser_cap && browser_cap - browser <= 1);
+                        assert!(shared <= shared_cap && shared_cap - shared <= 1);
+                        let mut response = response.into_response().expect("buffered");
+                        assert_eq!(
+                            header_of(&response, header::CACHE_CONTROL),
+                            Some(format!("public, max-age={browser}").as_str())
+                        );
+                        assert_eq!(header_of(&response, header::AGE), None);
+                        assert_eq!(header_of(&response, header::DATE), None);
+                        assert_eq!(header_of(&response, header::EXPIRES), None);
+                        // Route finalization cannot replace the bounded policy
+                        // with an operator header that authorizes a longer copy.
+                        response.headers_mut().insert(
+                            header::CACHE_CONTROL,
+                            HeaderValue::from_static("public, max-age=31536000"),
+                        );
+                        policy.apply_after_route_finalization(
+                            &mut response,
+                            EdgeCacheHeader::SurrogateControl,
+                        );
+                        assert_eq!(
+                            header_of(&response, header::CACHE_CONTROL),
+                            Some(format!("public, max-age={browser}").as_str())
+                        );
+                        assert_eq!(
+                            response
+                                .headers()
+                                .get("surrogate-control")
+                                .and_then(|v| v.to_str().ok()),
+                            Some(format!("max-age={shared}").as_str())
+                        );
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn oversized_stylesheet_bodies_redirect_before_relocation() {
+            futures::executor::block_on(async {
+                let settings = settings(true);
+                let services =
+                    build_services_with_http_client(Arc::new(StubHttpClient::new()) as _);
+                let registry = IntegrationRegistry::new(&settings).expect("registry");
+                let req = request(Method::GET, &format!("{PREFIX}lib@1/a.css"));
+                let rehost = RehostRequest {
+                    stylesheets_moved: true,
+                    method: Method::GET,
+                    reader_headers: req.headers().clone(),
+                    reader: RequestInfo::from_request(&req, services.client_info()),
+                };
+                let upstream =
+                    url::Url::parse("https://cdn.example.net/npm/lib@1/a.css").expect("URL");
+                let answer = RehostAnswer {
+                    settings: &settings,
+                    services: &services,
+                    integration_registry: &registry,
+                    rehost: &rehost,
+                    page: crate::rehost::PageAddress {
+                        scheme: "https",
+                        host: "www.example.com",
+                        removed_prefix: "",
+                        base: None,
+                    },
+                    upstream: &upstream,
+                    route_path: &format!("{PREFIX}lib@1/a.css"),
+                    cache_policy: None,
+                };
+                let oversized =
+                    Bytes::from(vec![b'a'; crate::css_relocation::MAX_STYLESHEET_BYTES + 1]);
+                let streamed_bytes = oversized.clone();
+                let stream = EdgeBody::from_stream(async_stream::stream! {
+                    yield Ok::<Bytes, io::Error>(streamed_bytes);
+                    panic!("the oversized chunk must be refused before polling again");
+                });
+                for body in [EdgeBody::Once(oversized), stream] {
+                    let response = Response::builder()
+                        .header(header::CONTENT_TYPE, "text/css")
+                        .header(header::CACHE_CONTROL, "public, max-age=3600")
+                        .body(body)
+                        .expect("stylesheet response");
+                    let response = answer
+                        .stylesheet(AssetProxyResponse::origin_controlled(response))
+                        .await
+                        .break_value()
+                        .expect("stylesheet must be handled");
+                    assert_eq!(
+                        response.cache_policy(),
+                        AssetProxyCachePolicy::NoStorePrivate
+                    );
+                    let response = response.into_response().expect("bounded redirect");
+                    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+                    assert_eq!(
+                        header_of(&response, header::LOCATION),
+                        Some(upstream.as_str())
+                    );
+                    assert_eq!(response_body_string(response), "");
+                }
+            });
+        }
+
+        #[test]
+        fn middleware_cache_headers_cannot_lengthen_stylesheet_freshness() {
+            let settings = settings(true);
+            let services = build_services_with_http_client(Arc::new(StubHttpClient::new()) as _);
+            let registry = IntegrationRegistry::new(&settings).expect("registry");
+            let req = request(Method::GET, &format!("{PREFIX}lib@1/a.css"));
+            let rehost = RehostRequest {
+                stylesheets_moved: true,
+                method: Method::GET,
+                reader_headers: req.headers().clone(),
+                reader: RequestInfo::from_request(&req, services.client_info()),
+            };
+            let upstream = url::Url::parse("https://cdn.example.net/npm/lib@1/a.css").expect("URL");
+            let answer = RehostAnswer {
+                settings: &settings,
+                services: &services,
+                integration_registry: &registry,
+                rehost: &rehost,
+                page: crate::rehost::PageAddress {
+                    scheme: "https",
+                    host: "www.example.com",
+                    removed_prefix: "",
+                    base: None,
+                },
+                upstream: &upstream,
+                route_path: &format!("{PREFIX}lib@1/a.css"),
+                cache_policy: Some(CachePolicy {
+                    browser_ttl: Some(Duration::from_secs(60)),
+                    edge_ttl: Some(Duration::from_secs(600)),
+                    ..CachePolicy::public_immutable(Duration::from_secs(60))
+                }),
+            };
+            let receipt = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+            for (control, age, date_age, elapsed, browser, shared) in [
+                ("public, max-age=60, s-maxage=3600", "0", None, 0, 60, 600),
+                (
+                    "public, max-age=60, s-maxage=360",
+                    "5",
+                    Some(120),
+                    5,
+                    0,
+                    235,
+                ),
+                ("public, max-age=90, s-maxage=180", "10", None, 40, 40, 130),
+                ("public, max-age=90, s-maxage=10", "15", None, 0, 60, 0),
+                ("public, max-age=60, s-maxage=bad", "0", None, 0, 60, 0),
+                ("public, max-age=90", "100", None, 0, 0, 0),
+            ] {
+                let mut original = http::HeaderMap::new();
+                original.insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_str(control).expect("control"),
+                );
+                original.insert(header::AGE, HeaderValue::from_static(age));
+                if let Some(date_age) = date_age {
+                    let date = httpdate::fmt_http_date(
+                        std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000 - date_age),
+                    );
+                    original.insert(header::DATE, HeaderValue::from_str(&date).expect("date"));
+                }
+                let facts = OriginFacts::of_at(&original, receipt);
+                // Even middleware that removes the source's dates and writes
+                // a fresh policy cannot renew either original lifetime.
+                let mut response = Response::new(EdgeBody::from(".a{}"));
+                crate::middleware::write_response_headers(
+                    &mut response,
+                    vec![(
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_static("public, max-age=31536000, s-maxage=31536000"),
+                    )],
+                );
+                let mut response = AssetProxyResponse::origin_controlled(response);
+                answer.bound_stylesheet_freshness(
+                    &mut response,
+                    &facts,
+                    Duration::from_secs(elapsed),
+                );
+                assert_eq!(
+                    header_of(response.response(), header::CACHE_CONTROL),
+                    Some(format!("public, max-age={browser}").as_str()),
+                    "{control}",
+                );
+                let policy = response.cache_policy();
+                assert_eq!(
+                    policy,
+                    AssetProxyCachePolicy::Normalized(CachePolicy {
+                        browser_ttl: Some(Duration::from_secs(browser)),
+                        edge_ttl: Some(Duration::from_secs(shared)),
+                        immutable: false,
+                        ..CachePolicy::public_immutable(Duration::ZERO)
+                    }),
+                );
+                response.response_mut().headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("public, max-age=31536000"),
+                );
+                policy.apply_after_route_finalization(
+                    response.response_mut(),
+                    EdgeCacheHeader::SurrogateControl,
+                );
+                assert_eq!(
+                    header_of(response.response(), header::CACHE_CONTROL),
+                    Some(format!("public, max-age={browser}").as_str()),
+                );
+                assert_eq!(
+                    response
+                        .response()
+                        .headers()
+                        .get("surrogate-control")
+                        .and_then(|value| value.to_str().ok()),
+                    Some(format!("max-age={shared}").as_str()),
+                );
+                response.response_mut().headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("private, no-store"),
+                );
+                answer.bound_stylesheet_freshness(&mut response, &facts, Duration::ZERO);
+                assert_eq!(
+                    response.cache_policy(),
+                    AssetProxyCachePolicy::NoStorePrivate
+                );
+            }
+        }
+
+        #[test]
+        fn a_validated_host_override_sends_the_origin_non_default_port() {
+            futures::executor::block_on(async {
+                let mut settings = settings(false);
+                let route = settings.proxy.asset_routes.last_mut().expect("route");
+                let mut origin =
+                    crate::source::OriginSettings::new("https://cdn.example.net:8443/npm");
+                origin.host_header = Some("cdn.example.net:8443".to_owned());
+                route.set_origin_source(&origin);
+                crate::rehost::check_route(route).expect("the complete authority is transparent");
+                let stub = stub();
+                stub.push_response_with_headers(
+                    200,
+                    b"png".to_vec(),
+                    vec![("content-type", "image/png")],
+                );
+                let response = answer(
+                    &settings,
+                    &stub,
+                    request(Method::GET, &format!("{PREFIX}a.png?q=%2f")),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    stub.recorded_request_uris(),
+                    vec!["https://cdn.example.net:8443/npm/a.png?q=%2f".to_owned()]
+                );
+                assert!(
+                    stub.recorded_request_headers()[0]
+                        .iter()
+                        .any(|(name, value)| name == "host" && value == "cdn.example.net:8443")
+                );
+            });
+        }
     }
 }

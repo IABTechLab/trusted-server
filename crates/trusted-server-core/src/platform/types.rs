@@ -13,6 +13,7 @@ use crate::ec::device::DeviceModule;
 use crate::ec::identifiers::IdentifierModule;
 use crate::ec::module::EdgeCookieModule;
 use crate::evidence::HostSignals;
+use crate::media_signing::MediaSigner;
 use crate::permission_signal::PermissionSignalModule;
 
 /// Geographic information extracted from a request.
@@ -233,6 +234,11 @@ pub struct RuntimeServices {
     /// [`crate::ec::identifiers`]. Empty when none is linked. Shared, as the
     /// permission signal modules are.
     pub(crate) identifier_modules: Arc<[Arc<dyn IdentifierModule>]>,
+    /// The media signer a running registration supplies, which signs the
+    /// binary responses it claims, see [`crate::media_signing`]. `None` when
+    /// no registration supplies one, which leaves every response as the
+    /// origin sent it.
+    pub(crate) media_signer: Option<Arc<dyn MediaSigner>>,
     /// The prefixes of the publisher this request was resolved to, from the
     /// selected prefix module, which start every name the browser holds and
     /// every key in a shared store. See [`crate::prefix`].
@@ -405,6 +411,12 @@ impl RuntimeServices {
         &self.identifier_modules
     }
 
+    /// The media signer a running registration supplies, if one does.
+    #[must_use]
+    pub fn media_signer(&self) -> Option<&Arc<dyn MediaSigner>> {
+        self.media_signer.as_ref()
+    }
+
     /// The device module a module supplied, when `[device] module` selected
     /// one. `None` leaves core's own device classification in place.
     #[must_use]
@@ -568,6 +580,17 @@ impl RuntimeServices {
     pub fn with_identifier_modules(self, modules: Arc<[Arc<dyn IdentifierModule>]>) -> Self {
         Self {
             identifier_modules: modules,
+            ..self
+        }
+    }
+
+    /// Returns a clone of this instance carrying the media signer the
+    /// running registrations supply, through
+    /// [`IntegrationRegistry::media_signer`](crate::integrations::IntegrationRegistry::media_signer).
+    #[must_use]
+    pub fn with_media_signer(self, signer: Option<Arc<dyn MediaSigner>>) -> Self {
+        Self {
+            media_signer: signer,
             ..self
         }
     }
@@ -897,6 +920,7 @@ impl RuntimeServicesBuilder {
             prefixes: self.prefixes.unwrap_or_default(),
             permission_signal_modules: self.permission_signal_modules,
             identifier_modules: self.identifier_modules,
+            media_signer: None,
         }
     }
 }

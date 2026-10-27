@@ -571,7 +571,7 @@ fn scan_html<'a>(
 
 /// Returns the offset just past the comment opening at `start`. As in browsers,
 /// `<!-->` and `<!--->` are whole comments, and `--!>` also ends one.
-fn comment_end(bytes: &[u8], start: usize) -> Option<usize> {
+pub(crate) fn comment_end(bytes: &[u8], start: usize) -> Option<usize> {
     let body = start + 4;
     if starts_with_at(bytes, body, b">") {
         return Some(body + 1);
@@ -600,7 +600,7 @@ enum TagState {
 
 /// Returns the offset of the `>` ending the tag whose name starts at `start`.
 /// As in the HTML tokenizer, a quote delimits only a value it begins.
-fn tag_end(bytes: &[u8], start: usize) -> Option<usize> {
+pub(crate) fn tag_end(bytes: &[u8], start: usize) -> Option<usize> {
     let mut state = TagState::Name;
     for (offset, byte) in bytes.get(start..)?.iter().copied().enumerate() {
         let space = byte.is_ascii_whitespace();
@@ -696,7 +696,7 @@ pub(crate) fn is_js_whitespace(ch: char) -> bool {
     )
 }
 
-fn find_byte(bytes: &[u8], needle: u8, start: usize) -> Option<usize> {
+pub(crate) fn find_byte(bytes: &[u8], needle: u8, start: usize) -> Option<usize> {
     let relative = bytes
         .get(start..)?
         .iter()
@@ -704,7 +704,7 @@ fn find_byte(bytes: &[u8], needle: u8, start: usize) -> Option<usize> {
     Some(start.saturating_add(relative))
 }
 
-fn find_bytes(bytes: &[u8], needle: &[u8], start: usize) -> Option<usize> {
+pub(crate) fn find_bytes(bytes: &[u8], needle: &[u8], start: usize) -> Option<usize> {
     if needle.is_empty() {
         return Some(start.min(bytes.len()));
     }
@@ -715,7 +715,7 @@ fn find_bytes(bytes: &[u8], needle: &[u8], start: usize) -> Option<usize> {
     Some(start.saturating_add(relative))
 }
 
-fn starts_with_at(bytes: &[u8], start: usize, needle: &[u8]) -> bool {
+pub(crate) fn starts_with_at(bytes: &[u8], start: usize, needle: &[u8]) -> bool {
     bytes
         .get(start..)
         .is_some_and(|tail| tail.starts_with(needle))
@@ -742,7 +742,7 @@ fn structural_tag<'a>(start: usize, token: &'a str, mode: ScanMode) -> Option<St
     })
 }
 
-fn is_structural_element_start(bytes: &[u8], start: usize) -> bool {
+pub(crate) fn is_structural_element_start(bytes: &[u8], start: usize) -> bool {
     match bytes.get(start + 1).copied() {
         Some(byte) if byte.is_ascii_alphabetic() => true,
         Some(b'/') => bytes.get(start + 2).is_some_and(u8::is_ascii_alphabetic),
@@ -750,7 +750,7 @@ fn is_structural_element_start(bytes: &[u8], start: usize) -> bool {
     }
 }
 
-fn raw_close_name_end(bytes: &[u8], start: usize, expected: &str) -> Option<usize> {
+pub(crate) fn raw_close_name_end(bytes: &[u8], start: usize, expected: &str) -> Option<usize> {
     if !starts_with_at(bytes, start, b"</") {
         return None;
     }
@@ -766,7 +766,7 @@ fn raw_close_name_end(bytes: &[u8], start: usize, expected: &str) -> Option<usiz
         .then_some(name_end)
 }
 
-fn take_tag_name(content: &str) -> Option<&str> {
+pub(crate) fn take_tag_name(content: &str) -> Option<&str> {
     let end = content
         .char_indices()
         .find(|(_, ch)| ch.is_ascii_whitespace() || matches!(*ch, '/' | '>'))

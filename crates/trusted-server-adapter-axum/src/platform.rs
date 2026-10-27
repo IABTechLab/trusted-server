@@ -311,10 +311,17 @@ impl Future for AxumPendingHandle {
 
 /// reqwest-backed HTTP client for the Axum dev server.
 ///
+/// [`send`](PlatformHttpClient::send) preserves the origin body as a
+/// `Body::Stream` when the request asks for it: each chunk is read from the
+/// connection only when the caller asks for the next one, so a large origin
+/// response never sits whole in memory. The client's 30 second timeout still
+/// covers the whole exchange, body included.
+///
 /// `send_async` buffers any `Body::Stream` in the calling context, then spawns
 /// a `tokio` task for each outbound request so that multiple `send_async` calls
 /// run concurrently. `select` uses [`futures::future::select_all`] to wait for
-/// the first completing handle, preserving fan-out semantics.
+/// the first completing handle, preserving fan-out semantics. That path stays
+/// buffered, so it refuses a request that asks for a streamed response.
 pub struct AxumPlatformHttpClient {
     client: reqwest::Client,
 }
@@ -436,12 +443,59 @@ impl AxumPlatformHttpClient {
         Ok(body)
     }
 
+    /// Yield the origin body chunk by chunk, enforcing `limit` before each
+    /// chunk is passed on.
+    ///
+    /// The chunk that would carry the total past `limit` becomes an error
+    /// and ends the stream, as does a failed read, so a truncated or
+    /// oversized origin body never reaches the caller as a complete one.
+    fn streamed_response_body(
+        response: reqwest::Response,
+        limit: Option<usize>,
+    ) -> edgezero_core::body::Body {
+        let stream = futures::stream::unfold(Some((response, 0usize)), move |state| async move {
+            let (mut response, received) = state?;
+            match response.chunk().await {
+                Ok(None) => None,
+                Ok(Some(chunk)) => {
+                    let Some(next_received) = received.checked_add(chunk.len()) else {
+                        return Some((
+                            Err(std::io::Error::other(
+                                "upstream response body byte count overflowed",
+                            )),
+                            None,
+                        ));
+                    };
+                    if let Some(limit) = limit
+                        && next_received > limit
+                    {
+                        return Some((
+                            Err(std::io::Error::other(format!(
+                                "upstream response body exceeded caller limit of {limit} bytes"
+                            ))),
+                            None,
+                        ));
+                    }
+                    Some((Ok(chunk), Some((response, next_received))))
+                }
+                Err(error) => Some((
+                    Err(std::io::Error::other(format!(
+                        "failed to read upstream response body: {error}"
+                    ))),
+                    None,
+                )),
+            }
+        });
+        edgezero_core::body::Body::from_stream(stream)
+    }
+
     async fn execute(
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         Self::refuse_image_optimizer_metadata(&request)?;
         let max_response_body_bytes = request.max_response_body_bytes;
+        let stream_response = request.stream_response;
         let request_is_head = request.request.method() == edgezero_core::http::Method::HEAD;
         let uri = request.request.uri().to_string();
         let method = reqwest::Method::from_bytes(request.request.method().as_str().as_bytes())
@@ -464,21 +518,40 @@ impl AxumPlatformHttpClient {
             .change_context(PlatformError::HttpClient)
             .attach(format!("outbound request to {uri} failed"))?;
 
-        let status = resp.status().as_u16();
-        let mut edge_builder = edgezero_core::http::response_builder().status(status);
+        let status = resp.status();
+        let mut edge_builder = edgezero_core::http::response_builder().status(status.as_u16());
         for (name, value) in sanitized_response_headers(resp.headers()) {
             edge_builder = edge_builder.header(name.as_str(), value.as_slice());
         }
-        let resp_bytes =
-            Self::response_body(resp, max_response_body_bytes, request_is_head).await?;
-        // A caller limit is enforced chunk by chunk before this Vec grows past it.
-        // Unbounded callers retain the dev server's previous whole-body behavior.
-        log::debug!(
-            "buffered {} upstream response bytes from {uri}",
-            resp_bytes.len()
-        );
+        let body = if !stream_response {
+            let resp_bytes =
+                Self::response_body(resp, max_response_body_bytes, request_is_head).await?;
+            // A caller limit is enforced chunk by chunk before this Vec grows past it.
+            // Unbounded callers retain the dev server's previous whole-body behavior.
+            log::debug!(
+                "buffered {} upstream response bytes from {uri}",
+                resp_bytes.len()
+            );
+            edgezero_core::body::Body::from(resp_bytes)
+        } else if !Self::response_carries_body(request_is_head, status) {
+            edgezero_core::body::Body::empty()
+        } else {
+            // Content-Length permits an early refusal. The stream enforces the
+            // same limit for missing or dishonest lengths.
+            if let Some(limit) = max_response_body_bytes
+                && resp
+                    .content_length()
+                    .is_some_and(|length| u64::try_from(limit).is_ok_and(|limit| length > limit))
+            {
+                return Err(Report::new(PlatformError::HttpClient).attach(format!(
+                    "upstream Content-Length exceeds caller response body limit of {limit} bytes"
+                )));
+            }
+            log::debug!("streaming upstream response body from {uri}");
+            Self::streamed_response_body(resp, max_response_body_bytes)
+        };
         let edge_resp = edge_builder
-            .body(edgezero_core::body::Body::from(resp_bytes))
+            .body(body)
             .change_context(PlatformError::HttpClient)?;
 
         Ok(PlatformResponse::new(edge_resp).with_backend_name(request.backend_name))
@@ -493,6 +566,10 @@ impl Default for AxumPlatformHttpClient {
 
 #[async_trait(?Send)]
 impl PlatformHttpClient for AxumPlatformHttpClient {
+    fn supports_streaming_responses(&self) -> bool {
+        true
+    }
+
     async fn send(
         &self,
         request: PlatformHttpRequest,
@@ -505,6 +582,11 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
         Self::refuse_image_optimizer_metadata(&request)?;
+        if request.stream_response {
+            return Err(Report::new(PlatformError::HttpClient).attach(
+                "the Axum dev server streams responses through send alone; send_async buffers",
+            ));
+        }
         let backend_name = request.backend_name.clone();
         let max_response_body_bytes = request.max_response_body_bytes;
 
@@ -900,6 +982,7 @@ mod tests {
             &Arc::default(),
         )
     }
+    use futures::StreamExt as _;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -1255,6 +1338,306 @@ mod tests {
                 "asynchronous={asynchronous}: a chunked body over the limit must be rejected"
             );
         }
+    }
+
+    /// Serve one connection: read the request through `request_end`, answer
+    /// `head_and_first`, wait for `release`, then send `rest`. The request
+    /// bytes the client sent come back through the returned receiver.
+    async fn serve_gated_response(
+        request_end: &'static [u8],
+        head_and_first: &'static [u8],
+        release: tokio::sync::oneshot::Receiver<()>,
+        rest: &'static [u8],
+    ) -> (String, tokio::sync::oneshot::Receiver<Vec<u8>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind gated HTTP test server");
+        let addr = listener.local_addr().expect("should read local address");
+        let (request_sender, request_receiver) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("should accept request");
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.ends_with(request_end) {
+                let read = stream.read(&mut buffer).await.expect("should read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            drop(request_sender.send(request));
+            stream
+                .write_all(head_and_first)
+                .await
+                .expect("should write the head and first chunk");
+            stream.flush().await.expect("should flush the first chunk");
+            if release.await.is_ok() {
+                stream
+                    .write_all(rest)
+                    .await
+                    .expect("should write the rest of the body");
+            }
+        });
+
+        (format!("http://{addr}/media"), request_receiver)
+    }
+
+    async fn next_chunk(
+        stream: &mut futures::stream::LocalBoxStream<'static, Result<Bytes, anyhow::Error>>,
+    ) -> Option<Result<Bytes, anyhow::Error>> {
+        tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("the next chunk or the end should arrive promptly")
+    }
+
+    #[test]
+    fn the_client_streams_through_send_and_not_through_send_async() {
+        let client = AxumPlatformHttpClient::new();
+        assert!(
+            client.supports_streaming_responses(),
+            "send should preserve origin bodies as streams"
+        );
+        assert!(
+            !client.supports_pending_streaming_responses(),
+            "send_async stays buffered"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_streamed_send_returns_before_the_origin_finishes_and_keeps_the_request() {
+        let (release, release_receiver) = tokio::sync::oneshot::channel();
+        let (url, request_bytes) = serve_gated_response(
+            b"payload",
+            b"HTTP/1.1 200 OK\r\n\
+              Content-Type: video/mp4\r\n\
+              Transfer-Encoding: chunked\r\n\
+              \r\n\
+              6\r\n\
+              first-\r\n",
+            release_receiver,
+            b"6\r\nsecond\r\n0\r\n\r\n",
+        )
+        .await;
+        let request = edgezero_core::http::request_builder()
+            .method("POST")
+            .uri(url)
+            .header(header::AUTHORIZATION, "Bearer example-token")
+            .body(EdgeBody::from(b"payload".to_vec()))
+            .expect("should build outbound request");
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            AxumPlatformHttpClient::new().send(
+                PlatformHttpRequest::new(request, "test_backend")
+                    .with_stream_response()
+                    .with_max_response_body_bytes(64),
+            ),
+        )
+        .await
+        .expect("send should return while the origin body is still open")
+        .expect("the streamed send should succeed")
+        .response;
+
+        let sent = String::from_utf8(request_bytes.await.expect("should capture the request"))
+            .expect("the request head should be text");
+        assert!(
+            sent.starts_with("POST /media "),
+            "should keep the method: {sent}"
+        );
+        assert!(
+            sent.to_ascii_lowercase()
+                .contains("authorization: bearer example-token"),
+            "should forward the authorization header: {sent}"
+        );
+        assert!(
+            sent.ends_with("payload"),
+            "should forward the request body: {sent}"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("video/mp4")
+        );
+        let mut stream = response
+            .into_body()
+            .into_stream()
+            .expect("a streamed send should return a streamed body");
+        let first = next_chunk(&mut stream)
+            .await
+            .expect("the first chunk should arrive before the origin finishes")
+            .expect("the first chunk should be readable");
+        assert_eq!(first.as_ref(), b"first-");
+
+        release
+            .send(())
+            .expect("should release the rest of the body");
+        let mut rest = Vec::new();
+        while let Some(chunk) = next_chunk(&mut stream).await {
+            rest.extend_from_slice(&chunk.expect("the rest of the body should be readable"));
+        }
+        assert_eq!(rest, b"second");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_streamed_send_ends_with_an_error_at_the_chunk_that_crosses_the_caller_limit() {
+        let url = serve_raw_response(
+            b"HTTP/1.1 200 OK\r\n\
+              Transfer-Encoding: chunked\r\n\
+              \r\n\
+              2\r\n\
+              ab\r\n\
+              2\r\n\
+              cd\r\n\
+              1\r\n\
+              e\r\n\
+              0\r\n\
+              \r\n",
+        )
+        .await;
+        let request = edgezero_core::http::request_builder()
+            .uri(url)
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        let mut stream = AxumPlatformHttpClient::new()
+            .send(
+                PlatformHttpRequest::new(request, "test_backend")
+                    .with_stream_response()
+                    .with_max_response_body_bytes(4),
+            )
+            .await
+            .expect("a chunked response has no length to refuse up front")
+            .response
+            .into_body()
+            .into_stream()
+            .expect("a streamed send should return a streamed body");
+
+        let mut delivered = Vec::new();
+        let error = loop {
+            match next_chunk(&mut stream).await {
+                Some(Ok(chunk)) => delivered.extend_from_slice(&chunk),
+                Some(Err(error)) => break Some(error),
+                None => break None,
+            }
+        }
+        .expect("a body over the limit must not end cleanly");
+        assert!(
+            delivered.len() <= 4 && b"abcde".starts_with(&delivered),
+            "should pass on only bytes within the limit: {delivered:?}"
+        );
+        assert!(
+            error.to_string().contains("limit of 4 bytes"),
+            "should report the enforced limit: {error}"
+        );
+        assert!(
+            next_chunk(&mut stream).await.is_none(),
+            "should end at the error"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_streamed_send_refuses_a_declared_length_over_the_caller_limit() {
+        let url =
+            serve_raw_response(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n0123456789").await;
+        let request = edgezero_core::http::request_builder()
+            .uri(url)
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        let result = AxumPlatformHttpClient::new()
+            .send(
+                PlatformHttpRequest::new(request, "test_backend")
+                    .with_stream_response()
+                    .with_max_response_body_bytes(4),
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a declared length over the limit should be refused before any byte is read"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_streamed_send_passes_on_an_origin_that_closes_mid_body() {
+        // The origin declares ten bytes, sends four, and closes.
+        let url = serve_raw_response(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabcd").await;
+        let request = edgezero_core::http::request_builder()
+            .uri(url)
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        let mut stream = AxumPlatformHttpClient::new()
+            .send(PlatformHttpRequest::new(request, "test_backend").with_stream_response())
+            .await
+            .expect("the head arrives before the origin closes")
+            .response
+            .into_body()
+            .into_stream()
+            .expect("a streamed send should return a streamed body");
+
+        let mut delivered = Vec::new();
+        let outcome = loop {
+            match next_chunk(&mut stream).await {
+                Some(Ok(chunk)) => delivered.extend_from_slice(&chunk),
+                Some(Err(error)) => break Err(error),
+                None => break Ok(()),
+            }
+        };
+        assert!(
+            outcome.is_err(),
+            "a truncated origin body must end with an error, after {delivered:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_streamed_head_request_has_an_empty_body_whatever_its_declared_length() {
+        let url = serve_raw_response(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n").await;
+        let request = edgezero_core::http::request_builder()
+            .method("HEAD")
+            .uri(url)
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        let response = AxumPlatformHttpClient::new()
+            .send(
+                PlatformHttpRequest::new(request, "test_backend")
+                    .with_stream_response()
+                    .with_max_response_body_bytes(4),
+            )
+            .await
+            .expect("a HEAD answer carries no body for the limit to refuse")
+            .response;
+
+        assert_eq!(
+            response
+                .into_body()
+                .into_bytes()
+                .expect("a bodiless answer should be an empty buffer")
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_async_refuses_a_streamed_response_rather_than_buffer_it() {
+        let url = serve_raw_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+        let request = edgezero_core::http::request_builder()
+            .uri(url)
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        let result = AxumPlatformHttpClient::new()
+            .send_async(PlatformHttpRequest::new(request, "test_backend").with_stream_response())
+            .await;
+
+        assert!(
+            result.is_err(),
+            "the buffered send_async path must refuse a streamed response"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

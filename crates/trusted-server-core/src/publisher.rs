@@ -74,6 +74,10 @@ use crate::http_util::{
     RequestInfo, is_navigation_request, remove_deployment_headers, serve_static_with_etag,
 };
 use crate::integrations::{IntegrationDocumentState, IntegrationRegistry, IntegrationRequestState};
+use crate::media_signing::{
+    Answered, Delivery, MediaClaim, OriginFacts, PinnedOrigin, VariantIdentity,
+    strip_representation_preconditions,
+};
 use crate::middleware::{
     MiddlewarePhase, Prepared, Refusal, ResponseHeader, media_type_of, write_response_headers,
 };
@@ -669,39 +673,60 @@ struct PublisherBodyProcessor {
 
 /// A response as the middleware the entries covering it are told of it:
 /// any document for its preparation, and one that is not HTML for the
-/// stream processors run on its body.
-struct TextResponse<'a> {
+/// stream processors run on its body. An asset route that rehosts a
+/// stylesheet builds one too, see [`crate::rehost`].
+pub(crate) struct TextResponse<'a> {
     /// The response's `Content-Type`, parameters and all.
-    content_type: &'a str,
-    status: StatusCode,
+    pub(crate) content_type: &'a str,
+    pub(crate) status: StatusCode,
     /// See [`MiddlewareContext::origin_private`](crate::middleware::MiddlewareContext::origin_private).
-    origin_private: bool,
-    request_path: &'a str,
-    request_host: &'a str,
-    request_scheme: &'a str,
-    origin_host: &'a str,
-    request_state: &'a IntegrationRequestState,
-    max_buffered_script_bytes: usize,
+    pub(crate) origin_private: bool,
+    /// The reader's response headers, see
+    /// [`MiddlewareContext::response_headers`](crate::middleware::MiddlewareContext::response_headers).
+    pub(crate) response_headers: Option<&'a http::HeaderMap>,
+    /// Whether the document may be stored for other readers, so its fetch
+    /// phase is told nothing of this reader's headers.
+    pub(crate) may_be_stored: bool,
+    pub(crate) request_path: &'a str,
+    pub(crate) request_host: &'a str,
+    pub(crate) request_scheme: &'a str,
+    pub(crate) origin_host: &'a str,
+    pub(crate) request_state: &'a IntegrationRequestState,
+    pub(crate) max_buffered_script_bytes: usize,
     /// What the middleware prepared for this document, see
     /// [`Middleware::prepare`](crate::middleware::Middleware::prepare).
-    prepared: &'a Prepared,
+    pub(crate) prepared: &'a Prepared,
 }
 
-/// The stream processors the entries covering a response that is not HTML
-/// run on its body, the fetch entry's and then the serve entry's, with the
+impl TextResponse<'_> {
+    /// The response headers `phase` is told, being none for the fetch phase
+    /// of a document that may be stored.
+    fn phase_headers(&self, phase: MiddlewarePhase) -> Option<&http::HeaderMap> {
+        if phase == MiddlewarePhase::Fetch && self.may_be_stored {
+            None
+        } else {
+            self.response_headers
+        }
+    }
+}
+
+/// The stream processors the entries of each of `phases` covering a
+/// response that is not HTML run on its body, in phase order, with the
 /// headers the serve entry's middleware write on the response, or none
 /// when [`text_entry_media_type`] gives no media type or no entry covers
-/// it. Both phases run here because the template cache stores HTML alone.
-/// The pass also says whether a registered middleware moves the origin's
-/// address in a body of this media type itself, which holds whatever the
-/// charset and status and whether or not an entry names that middleware.
+/// it. The publisher path runs both phases here because the template cache
+/// stores HTML alone. The pass also says whether a registered middleware
+/// moves the origin's address in a body of this media type itself, which
+/// holds whatever the charset and status and whether or not an entry names
+/// that middleware.
 ///
 /// # Errors
 ///
 /// When a middleware decides about HTML on a response that is not HTML, or
 /// asks for a selector that does not parse.
-fn middleware_stream_processors(
+pub(crate) fn middleware_stream_processors(
     response: &TextResponse<'_>,
+    phases: &[MiddlewarePhase],
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
 ) -> Result<TextPass, Report<TrustedServerError>> {
@@ -721,7 +746,7 @@ fn middleware_stream_processors(
     }
     let mut processors = Vec::new();
     let mut response_headers = Vec::new();
-    for phase in &MiddlewarePhase::ALL {
+    for phase in phases {
         let chain = integration_registry.middleware_chain(
             settings.phase_entries(*phase),
             *phase,
@@ -743,6 +768,7 @@ fn middleware_stream_processors(
                 origin_host: response.origin_host,
                 status: response.status,
                 origin_private: response.origin_private,
+                response_headers: response.phase_headers(*phase),
                 platform: integration_registry.platform(),
                 document_state: &document_state,
                 max_buffered_script_bytes: response.max_buffered_script_bytes,
@@ -817,7 +843,7 @@ fn apply_text_entry_cache_rules(
 /// its body, the headers the serve entry's middleware write, and whether
 /// the origin's address in the body is left to a middleware.
 #[derive(Default)]
-struct TextPass {
+pub(crate) struct TextPass {
     processors: Vec<Box<dyn StreamProcessor>>,
     response_headers: Vec<ResponseHeader>,
     /// Whether a registered middleware moves the origin's address in the
@@ -852,6 +878,19 @@ impl TextPass {
             self.response_headers,
         )
     }
+
+    /// The entries' processors alone, with the headers the serve entry's
+    /// middleware write, for a body whose addresses were already moved, as
+    /// an asset route that rehosts a stylesheet moves them.
+    pub(crate) fn into_middleware_processor(self) -> (WithStreamProcessors, Vec<ResponseHeader>) {
+        (
+            WithStreamProcessors {
+                inner: None,
+                processors: self.processors,
+            },
+            self.response_headers,
+        )
+    }
 }
 
 /// Runs the preparation of the middleware the entries of each phase in
@@ -863,7 +902,7 @@ impl TextPass {
 /// # Errors
 ///
 /// The first refusal, which ends the request.
-async fn prepare_document(
+pub(crate) async fn prepare_document(
     document: &TextResponse<'_>,
     phases: &[(MiddlewarePhase, &ModuleContext<'_>)],
     settings: &Settings,
@@ -899,6 +938,7 @@ async fn prepare_document(
                     origin_host: document.origin_host,
                     status: document.status,
                     origin_private: document.origin_private,
+                    response_headers: document.phase_headers(*phase),
                     platform: integration_registry.platform(),
                     document_state: &document_state,
                     max_buffered_script_bytes: document.max_buffered_script_bytes,
@@ -980,7 +1020,7 @@ fn refusal_response(refusal: &Refusal) -> Result<Response<EdgeBody>, Report<Trus
 /// Core's move of the origin's address, where no middleware moves it
 /// itself, followed by the processors the entries add, each handed what the
 /// one before produced.
-struct WithStreamProcessors {
+pub(crate) struct WithStreamProcessors {
     inner: Option<Box<dyn StreamProcessor>>,
     processors: Vec<Box<dyn StreamProcessor>>,
 }
@@ -1039,6 +1079,7 @@ impl PublisherBodyProcessor {
         params: &OwnedProcessResponseParams,
         settings: &Settings,
         integration_registry: &IntegrationRegistry,
+        document_base: Option<url::Url>,
     ) -> Result<(Self, Option<Vec<u8>>), Report<TrustedServerError>> {
         let is_html = is_html_content_type(&params.content_type);
         let inline_seam_token = deferred_inline_seam_token(
@@ -1050,6 +1091,7 @@ impl PublisherBodyProcessor {
         let (inner, response_headers): (Box<dyn StreamProcessor>, Vec<ResponseHeader>) = if is_html
         {
             let (processor, headers) = create_html_stream_processor(HtmlStreamProcessorParams {
+                document_base,
                 origin_host: &params.origin_host,
                 status: params.status,
                 origin_private: params.origin_private,
@@ -1064,8 +1106,10 @@ impl PublisherBodyProcessor {
                 request_state: params.request_state.clone(),
                 shared_template_authorized: params.template_cache_key.is_some(),
                 csp_nonce_observed: params.csp_nonce_observed.clone(),
+                response_headers: params.response_headers.clone(),
                 prepared: Arc::clone(&params.prepared),
                 public_prefix: &params.public_prefix,
+                removed_prefix: &params.removed_prefix,
                 deferred_inline_marker: inline_seam_token
                     .as_ref()
                     .map(|token| String::from_utf8_lossy(token).into_owned()),
@@ -1077,6 +1121,8 @@ impl PublisherBodyProcessor {
                     content_type: &params.content_type,
                     status: params.status,
                     origin_private: params.origin_private,
+                    response_headers: params.response_headers.as_deref(),
+                    may_be_stored: false,
                     request_path: &params.request_path,
                     request_host: &params.request_host,
                     request_scheme: &params.request_scheme,
@@ -1085,6 +1131,7 @@ impl PublisherBodyProcessor {
                     max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
                     prepared: &params.prepared,
                 },
+                &MiddlewarePhase::ALL,
                 settings,
                 integration_registry,
             )?
@@ -1150,18 +1197,20 @@ async fn process_response_streaming_async<W: Write>(
         params.content_encoding
     );
 
-    let input_compression = Compression::from_content_encoding(&params.content_encoding);
+    let origin_compression = Compression::from_content_encoding(&params.content_encoding);
     // A template-cache response is always identity bytes. Decode during the transform instead of
     // recompressing and immediately decoding the entire buffered result afterwards.
     let output_compression = if params.template_cache_key.is_some() {
         Compression::None
     } else {
-        input_compression
+        origin_compression
     };
+    let (body, input_compression, document_base) =
+        rehost_document_prepass(body, params, settings).await?;
     // This path has no seam controller, so it must never be reached with a
     // pending auction; `deferred_inline_seam_token` returns `None` for it.
     let (mut processor, inline_seam_token) =
-        PublisherBodyProcessor::new(params, settings, integration_registry)?;
+        PublisherBodyProcessor::new(params, settings, integration_registry, document_base)?;
     let response_headers = processor.take_response_headers();
     if inline_seam_token.is_some() {
         // A `debug_assert!` would be compiled out of the release wasm builds that
@@ -1183,6 +1232,65 @@ async fn process_response_streaming_async<W: Write>(
     )
     .await?;
     Ok(response_headers)
+}
+
+/// A rehost-enabled HTML document is resolved before any transformed byte
+/// can escape. Identity bodies reuse their owned bytes; compressed bodies
+/// use the same bounded decoder and writer as the publisher pipeline.
+fn rehosts_html(settings: &Settings, content_type: &str) -> bool {
+    is_html_content_type(content_type)
+        && settings
+            .proxy
+            .asset_routes
+            .iter()
+            .any(|route| route.rehost_page_references)
+}
+
+async fn rehost_document_prepass(
+    body: EdgeBody,
+    params: &OwnedProcessResponseParams,
+    settings: &Settings,
+) -> Result<(EdgeBody, Compression, Option<url::Url>), Report<TrustedServerError>> {
+    let compression = Compression::from_content_encoding(&params.content_encoding);
+    if !rehosts_html(settings, &params.content_type) {
+        return Ok((body, compression, None));
+    }
+    let document_url = params
+        .document_url
+        .as_deref()
+        .and_then(|value| url::Url::parse(value).ok())
+        .ok_or_else(|| {
+            Report::new(TrustedServerError::Proxy {
+                message: "rehosting HTML requires its full fetched document URL".to_owned(),
+            })
+        })?;
+    let limit = settings.publisher.max_buffered_body_bytes;
+    let original = if compression == Compression::None && !body.is_stream() {
+        body.into_bytes_bounded(limit)
+            .await
+            .change_context(TrustedServerError::Proxy {
+                message: "rehosting HTML exceeded its original body limit or could not be read"
+                    .to_owned(),
+            })?
+    } else {
+        let mut source = BodyChunkSource::new(body, STREAM_CHUNK_SIZE).with_max_bytes(limit);
+        let mut decoder = BodyStreamDecoder::new(compression, limit);
+        let mut original = BoundedWriter::new(limit);
+        while let Some(chunk) = source.next_chunk().await? {
+            write_encoded_segment(&mut original, &decoder.decode_chunk(chunk)?)?;
+        }
+        write_encoded_segment(&mut original, &decoder.finish()?)?;
+        bytes::Bytes::from(original.into_inner())
+    };
+    let base = crate::html_processor::effective_document_base(&original, &document_url)
+        .change_context(TrustedServerError::Proxy {
+            message: "could not resolve the original HTML document base".to_owned(),
+        })?;
+    Ok((
+        EdgeBody::from_bytes(original),
+        Compression::None,
+        Some(base),
+    ))
 }
 
 /// Pull, decode, process, and encode the next chunk of a no-hold pipeline.
@@ -1661,6 +1769,7 @@ struct HtmlStreamProcessorParams<'a> {
     request_scheme: &'a str,
     /// See [`OwnedProcessResponseParams::request_path`].
     request_path: &'a str,
+    document_base: Option<url::Url>,
     settings: &'a Settings,
     integration_registry: &'a IntegrationRegistry,
     /// Head script carrying this request's permission state, or [`None`] under a
@@ -1678,11 +1787,15 @@ struct HtmlStreamProcessorParams<'a> {
     shared_template_authorized: bool,
     /// Where the transform records a response-bound CSP nonce, when one matters.
     csp_nonce_observed: Option<Arc<AtomicBool>>,
+    /// See [`OwnedProcessResponseParams::response_headers`].
+    response_headers: Option<Arc<http::HeaderMap>>,
     /// Request-specific parser marker used by a pending inline auction.
     deferred_inline_marker: Option<String>,
     prepared: Arc<Prepared>,
     /// See [`OwnedProcessResponseParams::public_prefix`].
     public_prefix: &'a crate::prefix::PublicPrefix,
+    /// See [`OwnedProcessResponseParams::removed_prefix`].
+    removed_prefix: &'a str,
 }
 
 /// The marker emitted at the `</body>` seam under [`AssemblyMode::Esi`], reserving the
@@ -1841,7 +1954,9 @@ fn deferred_inline_seam_token(
 fn create_html_stream_processor(
     params: HtmlStreamProcessorParams<'_>,
 ) -> Result<(impl StreamProcessor + use<>, Vec<ResponseHeader>), Report<TrustedServerError>> {
-    use crate::html_processor::{HtmlProcessorConfig, create_html_processor_with_middleware};
+    use crate::html_processor::{
+        HtmlProcessorConfig, create_html_processor_with_source_protection,
+    };
     use crate::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
 
     let config = HtmlProcessorConfig::from_settings(
@@ -1851,6 +1966,10 @@ fn create_html_stream_processor(
         params.request_host,
         params.request_scheme,
     );
+    let config = match params.document_base {
+        Some(base) => config.with_document_base(base),
+        None => config,
+    };
 
     let assembly_mode = effective_assembly_mode(params.settings, params.shared_template_authorized);
     let body_close = match (assembly_mode, params.deferred_inline_marker) {
@@ -1874,8 +1993,10 @@ fn create_html_stream_processor(
         .with_body_close(body_close)
         .with_csp_nonce_observer(csp_nonce_observed)
         .with_public_prefix(params.public_prefix.clone())
+        .with_removed_prefix(params.removed_prefix)
         .with_prepared(params.prepared)
-        .with_response(params.status, params.origin_private);
+        .with_response(params.status, params.origin_private)
+        .with_response_headers(params.response_headers);
 
     // The middleware of the first [[fetch]] entry covering this path.
     let fetch = params.integration_registry.middleware_chain(
@@ -1887,16 +2008,19 @@ fn create_html_stream_processor(
     // A response that may be stored leaves this processor as the template
     // every reader shares, so its [[serve]] entry runs on each reader's copy
     // once that copy is assembled. See `run_serve_pass`.
-    let serve = (!params.shared_template_authorized).then(|| {
-        params.integration_registry.middleware_chain(
-            &params.settings.serve,
-            MiddlewarePhase::Serve,
-            HTML_MEDIA_TYPE,
-            params.request_path,
-        )
-    });
-    create_html_processor_with_middleware(config, &fetch, serve.as_ref())
-        .map_err(|message| Report::new(TrustedServerError::Configuration { message }))
+    let serve = params.integration_registry.middleware_chain(
+        &params.settings.serve,
+        MiddlewarePhase::Serve,
+        HTML_MEDIA_TYPE,
+        params.request_path,
+    );
+    create_html_processor_with_source_protection(
+        config,
+        &fetch,
+        (!params.shared_template_authorized).then_some(&serve),
+        &[&fetch, &serve],
+    )
+    .map_err(|message| Report::new(TrustedServerError::Configuration { message }))
 }
 
 /// What the `[[serve]]` entry covering this request does to a reader's copy
@@ -1911,7 +2035,7 @@ fn reader_serve_processor(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
 ) -> Result<ServePass, Report<TrustedServerError>> {
-    use crate::html_processor::{ReaderDocument, create_serve_processor};
+    use crate::html_processor::{ReaderDocument, create_serve_processor_with_source_protection};
     use crate::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
 
     if !is_html_content_type(&params.content_type) {
@@ -1923,8 +2047,14 @@ fn reader_serve_processor(
         HTML_MEDIA_TYPE,
         &params.request_path,
     );
+    let fetch = integration_registry.middleware_chain(
+        &settings.fetch,
+        MiddlewarePhase::Fetch,
+        HTML_MEDIA_TYPE,
+        &params.request_path,
+    );
     let origin_host = &params.origin_host;
-    create_serve_processor(
+    create_serve_processor_with_source_protection(
         &chain,
         &ReaderDocument {
             request_host: &params.request_host,
@@ -1932,11 +2062,13 @@ fn reader_serve_processor(
             origin_host,
             status: params.status,
             origin_private: params.origin_private,
+            response_headers: params.response_headers.as_deref(),
             platform: integration_registry.platform(),
             request_state: &params.request_state,
             max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
             prepared: &params.prepared,
         },
+        &[&fetch, &chain],
     )
     .map_err(|message| Report::new(TrustedServerError::Configuration { message }))
 }
@@ -2048,10 +2180,15 @@ pub enum PublisherResponse {
     /// `Content-Length` is preserved — the body is unmodified. Streaming
     /// adapters reattach the origin body directly so non-processable 2xx bodies
     /// can pass through without materializing in WASM memory.
+    ///
+    /// Where a [`MediaSigner`](crate::media_signing::MediaSigner) claimed the
+    /// request, the body is the signed representation or a part of it, and
+    /// the status, `Content-Length`, `Content-Range` and validators describe
+    /// what is sent, which may be a `206`, `304`, `412` or `416`.
     PassThrough {
         /// Response with all headers set but body not yet written.
         response: Response<EdgeBody>,
-        /// Origin body to stream directly to the client.
+        /// Body to stream directly to the client.
         body: EdgeBody,
     },
 }
@@ -2252,6 +2389,9 @@ pub struct OwnedProcessResponseParams {
     pub(crate) content_encoding: String,
     pub(crate) origin_host: String,
     pub(crate) origin_url: String,
+    /// Full URL of the fetched original HTML, including its path and query.
+    /// Absent for cached templates, which are already rewritten.
+    pub(crate) document_url: Option<String>,
     pub(crate) request_host: String,
     pub(crate) request_scheme: String,
     /// The path the reader asked for, which decides the `[[fetch]]` and
@@ -2285,12 +2425,22 @@ pub struct OwnedProcessResponseParams {
     /// rescanned from the output, which cannot tell a `nonce` attribute from the same
     /// word inside a script.
     pub(crate) csp_nonce_observed: Option<Arc<AtomicBool>>,
+    /// The reader's response headers as core sends them, for a serve
+    /// middleware that has to respect one such as `Content-Security-Policy`,
+    /// see [`MiddlewareContext::response_headers`](crate::middleware::MiddlewareContext::response_headers).
+    /// `None` for a page replayed from the store, and where no `[[serve]]`
+    /// entry covers the path, so nothing reads them.
+    pub(crate) response_headers: Option<Arc<http::HeaderMap>>,
     /// What the middleware prepared for this document, see
     /// [`Middleware::prepare`](crate::middleware::Middleware::prepare).
     pub(crate) prepared: Arc<Prepared>,
     /// The request's public prefix, from its services, which the page's
     /// bundle tag tells the client script.
     pub(crate) public_prefix: crate::prefix::PublicPrefix,
+    /// The path prefix request addressing removed from the reader's
+    /// address, or empty, which the page's rehosted addresses are written
+    /// under, see [`crate::rehost`].
+    pub(crate) removed_prefix: String,
 }
 
 /// Response-authorized template cache insert inputs. The key is built before origin lookup; the
@@ -2767,6 +2917,7 @@ fn build_template_assembly_params(
 ) -> OwnedProcessResponseParams {
     OwnedProcessResponseParams {
         csp_nonce_observed: None,
+        response_headers: None,
         prepared: Arc::new(Prepared::default()),
         // Already stored; storing again on a hit would be pointless work.
         template_cache_key: None,
@@ -2775,6 +2926,7 @@ fn build_template_assembly_params(
         content_encoding: entry.metadata.content_encoding.clone(),
         origin_host: location.host_header(),
         origin_url: location.url().to_owned(),
+        document_url: None,
         request_host: request_host.to_string(),
         request_scheme: request_scheme.to_string(),
         // Set by the caller, with the rest of what belongs to the request.
@@ -2796,6 +2948,8 @@ fn build_template_assembly_params(
         request_state: IntegrationRequestState::default(),
         // Set by the caller, from the request's services.
         public_prefix: crate::prefix::PublicPrefix::default(),
+        // Set by the caller, with the rest of what belongs to the request.
+        removed_prefix: String::new(),
     }
 }
 
@@ -2854,7 +3008,11 @@ fn shared_template_bypass_reason(
     if csp_nonce_observed.is_some_and(|observed| observed.load(Ordering::SeqCst)) {
         return Some("delivers a response-bound CSP nonce in its own markup");
     }
-    None
+    match crate::html_processor::restored_markup_has_nonce(bytes) {
+        Ok(true) => Some("delivers a response-bound CSP nonce in restored markup"),
+        Ok(false) => None,
+        Err(_) => Some("restored markup safety observation failed"),
+    }
 }
 
 /// Substitute `payload` for the transform-owned [`TEMPLATE_SEAM_PLACEHOLDER`].
@@ -3056,7 +3214,8 @@ pub async fn publisher_response_into_streaming_response(
     // hit, where there is no origin fetch to stream from in the first place.
     if matches!(
         &publisher_response,
-        PublisherResponse::Stream { params, .. } if params.template_cache_key.is_some()
+        PublisherResponse::Stream { params, .. }
+            if params.template_cache_key.is_some() || rehosts_html(&settings, &params.content_type)
     ) {
         return buffer_publisher_response_async(
             publisher_response,
@@ -3227,7 +3386,7 @@ pub async fn publisher_response_into_streaming_response(
             response.headers_mut().remove(header::CONTENT_LENGTH);
             let mut params = *params;
             let (mut processor, inline_seam_token) =
-                match PublisherBodyProcessor::new(&params, &settings, integration_registry) {
+                match PublisherBodyProcessor::new(&params, &settings, integration_registry, None) {
                     Ok(built) => built,
                     Err(err) => {
                         // Parity with the buffered finalizer: a processor
@@ -3628,6 +3787,21 @@ pub async fn stream_publisher_body_async<W: Write>(
         .await;
     }
 
+    let origin_compression = Compression::from_content_encoding(&params.content_encoding);
+    let (body, input_compression, document_base) =
+        match rehost_document_prepass(body, params, settings).await {
+            Ok(original) => original,
+            Err(error) => {
+                emit_abandoned_auction(
+                    services,
+                    telemetry.observation,
+                    dispatched,
+                    "processor_init_error",
+                )
+                .await;
+                return Err(error);
+            }
+        };
     // HTML: let lol_html mark the structural body end for the auction seam.
     let inline_seam_token = deferred_inline_seam_token(
         settings,
@@ -3637,8 +3811,10 @@ pub async fn stream_publisher_body_async<W: Write>(
     );
     let (mut processor, response_headers) =
         match create_html_stream_processor(HtmlStreamProcessorParams {
+            document_base,
             prepared: Arc::clone(&params.prepared),
             public_prefix: &params.public_prefix,
+            removed_prefix: &params.removed_prefix,
             origin_host: &params.origin_host,
             status: params.status,
             origin_private: params.origin_private,
@@ -3653,6 +3829,7 @@ pub async fn stream_publisher_body_async<W: Write>(
             request_state: params.request_state.clone(),
             shared_template_authorized: params.template_cache_key.is_some(),
             csp_nonce_observed: params.csp_nonce_observed.clone(),
+            response_headers: params.response_headers.clone(),
             deferred_inline_marker: inline_seam_token
                 .as_ref()
                 .map(|token| String::from_utf8_lossy(token).into_owned()),
@@ -3670,11 +3847,10 @@ pub async fn stream_publisher_body_async<W: Write>(
             }
         };
 
-    let input_compression = Compression::from_content_encoding(&params.content_encoding);
     let output_compression = if params.template_cache_key.is_some() {
         Compression::None
     } else {
-        input_compression
+        origin_compression
     };
     stream_html_with_auction_hold(
         body,
@@ -3849,6 +4025,7 @@ fn write_serve_middleware_headers(
         origin_host: reader.origin_host,
         status: response.status(),
         origin_private: reader.origin_private,
+        response_headers: Some(response.headers()),
         platform: reader.platform,
         document_state: &document_state,
         max_buffered_script_bytes: reader.max_buffered_script_bytes,
@@ -3960,6 +4137,130 @@ fn sign_publisher_origin_request(
         })?;
     let method = req.method().clone();
     auth.sign(&method, &target, req.headers_mut())
+}
+
+/// Asks the publisher origin once more, unconditionally and for every byte,
+/// for a media representation it answered with a part or a `HEAD`, so the
+/// signer signs the bytes this answer carries, see `media_signing`.
+///
+/// `request` is the origin request as it stood before it was signed, with
+/// the backend it went to.
+///
+/// # Errors
+///
+/// When there is no request to repeat, the request cannot be signed, or
+/// the origin cannot be reached.
+async fn fetch_whole_media(
+    services: &RuntimeServices,
+    request: Option<&(Uri, http::HeaderMap, String)>,
+    auth: Option<&crate::origin_auth::OriginSigning>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let (uri, headers, backend_name) = request.ok_or_else(|| {
+        Report::new(TrustedServerError::Proxy {
+            message: "media whole fetch has no origin request".to_string(),
+        })
+    })?;
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri(uri.clone())
+        .body(EdgeBody::empty())
+        .change_context(TrustedServerError::Proxy {
+            message: "failed to build media whole fetch".to_string(),
+        })?;
+    *req.headers_mut() = headers.clone();
+    strip_representation_preconditions(req.headers_mut());
+    req.headers_mut().insert(
+        header::ACCEPT_ENCODING,
+        HeaderValue::from_static("identity"),
+    );
+    if let Some(auth) = auth {
+        sign_publisher_origin_request(&mut req, auth)?;
+    }
+    let mut platform_request = PlatformHttpRequest::new(req, backend_name.clone());
+    if services.http_client().supports_streaming_responses() {
+        platform_request = platform_request.with_stream_response();
+    }
+    let mut platform_response = services
+        .http_client()
+        .send(platform_request)
+        .await
+        .change_context(TrustedServerError::Proxy {
+            message: "media whole fetch failed".to_string(),
+        })?;
+    remove_deployment_headers(&mut platform_response.response);
+    Ok(platform_response.response)
+}
+
+/// What a claimed media answer on the publisher path is delivered with, see
+/// [`deliver_claimed_media`].
+struct ClaimedMedia<'a> {
+    services: &'a RuntimeServices,
+    claim: &'a MediaClaim,
+    identity: &'a VariantIdentity<'a>,
+    /// The origin request as it stood before it was signed, with its
+    /// backend, for a whole second fetch.
+    whole_request: Option<&'a (Uri, http::HeaderMap, String)>,
+    auth: Option<&'a crate::origin_auth::OriginSigning>,
+    response_header_rewrite: OriginHeaderRewrite<'a>,
+}
+
+/// Answers a claimed request from `response`, asking the origin once more
+/// for the whole representation where the claim needs it, and sending the
+/// origin's answer where that second fetch fails.
+async fn deliver_claimed_media(
+    media: &ClaimedMedia<'_>,
+    answered: Answered,
+    response: Response<EdgeBody>,
+) -> Response<EdgeBody> {
+    match media
+        .claim
+        .deliver(media.services, media.identity, answered, response)
+        .await
+    {
+        Delivery::Send(response) => response,
+        Delivery::FetchWhole(fallback) => {
+            match fetch_whole_media(media.services, media.whole_request, media.auth).await {
+                Ok(whole) => {
+                    media
+                        .claim
+                        .deliver_whole(media.services, media.identity, whole, fallback)
+                        .await
+                }
+                Err(error) => {
+                    log::warn!("media signing: whole fetch failed: {error}");
+                    fallback
+                }
+            }
+        }
+        Delivery::Large(answer) => {
+            // Pinned reads are built from the request as it stood before
+            // it was signed; a signed read carries none of the reader's
+            // headers a signed read must not, only core's own conditions.
+            let target = media
+                .whole_request
+                .and_then(|(uri, headers, backend_name)| {
+                    url::Url::parse(&uri.to_string())
+                        .ok()
+                        .map(|url| (url, headers, backend_name))
+                });
+            let Some((url, headers, backend_name)) = target else {
+                log::warn!("media signing: outcome=unsigned lane=large reason=no_origin_request");
+                return answer.into_origin_response();
+            };
+            let origin = PinnedOrigin {
+                url: &url,
+                headers,
+                backend_name,
+                auth: media.auth,
+                unsigned_headers: &READER_HEADERS_NOT_SIGNED,
+                response_header_rewrite: Some(media.response_header_rewrite),
+            };
+            media
+                .claim
+                .deliver_large(media.services, media.identity, origin, answer)
+                .await
+        }
+    }
 }
 
 /// Build a minimal [`AuctionContext`] for the collect phase.
@@ -5423,6 +5724,9 @@ pub async fn handle_publisher_request(
     log::debug!("Proxying request to configured publisher backend");
 
     let request_path = req.uri().path().to_string();
+    // Whether the reader's address is whole without its query, the only
+    // case it may name a large media source.
+    let reader_query_free = req.uri().query().is_none_or(str::is_empty);
     let is_get = req.method() == http::Method::GET;
     let is_get_or_head = is_get || req.method() == http::Method::HEAD;
 
@@ -5573,6 +5877,34 @@ pub async fn handle_publisher_request(
         // injected tag, so retain their validators and ranges.
         strip_conditional_and_range_headers(&mut req);
     }
+    // A response of a media type the services' signer handles is signed on
+    // its way out, see `media_signing`. The origin is asked as the reader
+    // asked, so nothing changes for any other response. A kept signed copy
+    // is read and written only for a request whose answer the origin could
+    // not have made this reader's own: one sending it no cookie, carrying no
+    // module's request state and asking for no personalized delivery, the
+    // same conditions that let an asset copy be shared.
+    let media_shared = !req.headers().contains_key(header::COOKIE)
+        && request_state.is_empty()
+        && !personalization_requires_origin;
+    let media_claim = MediaClaim::of_request(
+        settings,
+        services,
+        req.method(),
+        &request_path,
+        req.headers(),
+        media_shared,
+    )
+    .filter(|_| !request_host.is_empty());
+    // A reader's range or tag naming signed bytes means nothing to the
+    // origin, so it is asked for the whole representation, and the reader's
+    // headers are answered against the signed bytes.
+    if media_claim
+        .as_ref()
+        .is_some_and(MediaClaim::names_signed_bytes)
+    {
+        strip_representation_preconditions(req.headers_mut());
+    }
 
     // Computed *after* the strip above, deliberately. These conditions ask whether the
     // origin's response can be shared, and the origin only ever sees the request as it
@@ -5625,6 +5957,17 @@ pub async fn handle_publisher_request(
     // remains unconditional when template cache negotiation fails: that request bypasses shared
     // assembly, but its origin response still needs to be processable for TSJS injection.
     restrict_accept_encoding(&mut req);
+    // Only an identity-coded body is signed, so a request that looks like
+    // media asks the origin for no other coding.
+    if media_claim
+        .as_ref()
+        .is_some_and(MediaClaim::looks_like_media)
+    {
+        req.headers_mut().insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+    }
     if matches!(assembly_mode, AssemblyMode::Esi) && !reader_supports_assembly {
         log::debug!("template_cache bypass: reader accepts no representation TS can assemble");
     }
@@ -5711,14 +6054,56 @@ pub async fn handle_publisher_request(
     });
     let mut template_cache_response_state = matches!(assembly_mode, AssemblyMode::Esi)
         .then_some(TemplateCacheResponseState::BypassRequest);
+    let request_method = req.method().clone();
+    let fetched_url = media_claim.as_ref().map(|_| target_uri.to_string());
+    let document_url = settings
+        .proxy
+        .asset_routes
+        .iter()
+        .any(|route| route.rehost_page_references)
+        .then(|| target_uri.to_string());
     rewrite_origin_request(&mut req, target_uri, &origin_host_header)?;
+    // What a whole, unconditional second fetch of a media representation is
+    // made from, taken before the request is signed, see `media_signing`.
+    let media_whole_request = media_claim.as_ref().map(|_| {
+        (
+            req.uri().clone(),
+            req.headers().clone(),
+            backend_name.clone(),
+        )
+    });
     // Signed last, once nothing else changes the request the origin is sent.
     if let Some(auth) = location.auth() {
         sign_publisher_origin_request(&mut req, auth)?;
     }
 
-    let request_method = req.method().clone();
     let mut origin_request = Some(req);
+    // The address the reader asked for, with any path prefix request
+    // addressing removed put back, so a host serving several publishers by
+    // path signs each asset for its own address.
+    let media_reader_url = media_claim.as_ref().map(|_| {
+        format!(
+            "{request_scheme}://{request_host}{}{request_path}",
+            removed_prefix.as_deref().unwrap_or_default()
+        )
+    });
+    let media_origin_identity = media_claim.as_ref().map(|_| location.identity());
+    let media_identity = match (&media_reader_url, &media_origin_identity, &fetched_url) {
+        (Some(reader_url), Some(origin_identity), Some(fetched_url)) => Some(VariantIdentity {
+            reader_url,
+            origin_identity,
+            fetched_url,
+            reader_query_free,
+        }),
+        _ => None,
+    };
+    // A signed representation kept for this address answers the request
+    // before the origin is asked, where the claim allows a lookup: a shared
+    // request that looks like media and asks for no revalidation.
+    let mut media_kept = None;
+    if let (Some(claim), Some(identity)) = (media_claim.as_ref(), media_identity.as_ref()) {
+        media_kept = claim.kept(services, identity).await;
+    }
     let eids_may_need_persistence = !ec_context.module_eids().is_empty()
         || cookie_jar
             .as_ref()
@@ -5749,6 +6134,7 @@ pub async fn handle_publisher_request(
     if should_preload_ec
         && template_cache_key.is_none()
         && asset_cache_key.is_none()
+        && media_kept.is_none()
         && services.http_client().supports_concurrent_fanout()
         && services
             .http_client()
@@ -6038,6 +6424,7 @@ pub async fn handle_publisher_request(
                     );
                     params.request_path.clone_from(&request_path);
                     params.public_prefix = services.public_prefix().clone();
+                    params.removed_prefix = removed_prefix.clone().unwrap_or_default();
                     params.seam_ad_slots = seam_ad_slots.clone();
                     params.dispatched_auction = dispatched_auction.take();
                     params.auction_observation = auction_observation.take();
@@ -6048,7 +6435,8 @@ pub async fn handle_publisher_request(
                         request_host,
                         request_scheme,
                         &request_path,
-                    );
+                    )
+                    .with_removed_prefix(removed_prefix.as_deref());
                     let module_context = ModuleContext::new(module_request)
                         .with_settings(settings)
                         .with_addressed_host(&addressed_host)
@@ -6058,6 +6446,8 @@ pub async fn handle_publisher_request(
                         content_type: crate::middleware::HTML_MEDIA_TYPE,
                         status: StatusCode::OK,
                         origin_private: false,
+                        response_headers: None,
+                        may_be_stored: true,
                         request_path: &request_path,
                         request_host,
                         request_scheme,
@@ -6124,7 +6514,9 @@ pub async fn handle_publisher_request(
     // fetched, and a copy found is served as the origin's response would be.
     // A load that failed asking the origin is this request's origin failure.
     let mut from_asset_cache = None;
-    if let Some(key) = asset_cache_key.as_ref() {
+    if media_kept.is_none()
+        && let Some(key) = asset_cache_key.as_ref()
+    {
         let prepared = origin_request.as_ref().ok_or_else(|| {
             Report::new(TrustedServerError::Proxy {
                 message: "publisher origin request was already consumed".to_owned(),
@@ -6141,7 +6533,10 @@ pub async fn handle_publisher_request(
         })
         .await;
     }
-    let origin_result = if let Some(answer) = from_asset_cache {
+    let media_from_kept = media_kept.is_some();
+    let origin_result = if let Some(kept) = media_kept.take() {
+        Ok(crate::platform::PlatformResponse::new(kept))
+    } else if let Some(answer) = from_asset_cache {
         answer.map(crate::platform::PlatformResponse::new)
     } else if let Some(pending) = pending_origin {
         services.http_client().wait(pending).await
@@ -6221,6 +6616,32 @@ pub async fn handle_publisher_request(
     // middleware is told what the origin declared.
     let origin_private = response.headers().contains_key(header::SET_COOKIE)
         || cache_control_forbids_shared_storage(response.headers());
+    // What the origin's own headers say about a claimed answer, before core
+    // writes a cache policy over them.
+    let media_facts = media_claim
+        .as_ref()
+        .map(|_| OriginFacts::of(response.headers()));
+    let origin_header_rewrite = OriginHeaderRewrite {
+        origin_host: &origin_host,
+        origin_host_header: &origin_host_header,
+        origin_path: parsed_origin.path(),
+        request_host,
+        request_scheme,
+        origin_scheme: &origin_scheme,
+        request_path_and_query: &request_path_and_query,
+        request_is_get_or_head: is_get_or_head,
+    };
+    let claimed_media = match (media_claim.as_ref(), media_identity.as_ref()) {
+        (Some(claim), Some(identity)) => Some(ClaimedMedia {
+            services,
+            claim,
+            identity,
+            whole_request: media_whole_request.as_ref(),
+            auth: location.auth(),
+            response_header_rewrite: origin_header_rewrite,
+        }),
+        _ => None,
+    };
 
     // Every serve middleware an entry names for this path is asked for the
     // headers it sets on the response that is sent, whatever it is, so a
@@ -6232,6 +6653,7 @@ pub async fn handle_publisher_request(
         origin_host: &origin_host_header,
         status: response.status(),
         origin_private,
+        response_headers: None,
         platform: integration_registry.platform(),
         request_state: &request_state,
         max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
@@ -6272,19 +6694,7 @@ pub async fn handle_publisher_request(
     // matching the body rewrite, on every route. Runs before the template-cache gate
     // so a stored template replays the rewritten policy headers; the cache key is
     // already scoped to the request host.
-    rewrite_origin_urls_in_headers(
-        response.headers_mut(),
-        &OriginHeaderRewrite {
-            origin_host: &origin_host,
-            origin_host_header: &origin_host_header,
-            origin_path: parsed_origin.path(),
-            request_host,
-            request_scheme,
-            origin_scheme: &origin_scheme,
-            request_path_and_query: &request_path_and_query,
-            request_is_get_or_head: is_get_or_head,
-        },
-    );
+    rewrite_origin_urls_in_headers(response.headers_mut(), &origin_header_rewrite);
     // Asked after the rewrite, so a serve middleware sees the headers the
     // reader receives and a header it sets is the one sent.
     write_serve_middleware_headers(
@@ -6471,7 +6881,10 @@ pub async fn handle_publisher_request(
             .is_some()
             .then(|| StoredDocumentServices::of(services));
         let (fetch_context, serve_context) = preparation_contexts(
-            || ModuleRequest::new(&request_method, request_host, request_scheme, &request_path),
+            || {
+                ModuleRequest::new(&request_method, request_host, request_scheme, &request_path)
+                    .with_removed_prefix(removed_prefix.as_deref())
+            },
             stored.as_ref(),
             settings,
             ec_context,
@@ -6483,6 +6896,8 @@ pub async fn handle_publisher_request(
             content_type: &content_type,
             status,
             origin_private,
+            response_headers: Some(response.headers()),
+            may_be_stored: template_cache_key.is_some(),
             request_path: &request_path,
             request_host,
             request_scheme,
@@ -6552,6 +6967,17 @@ pub async fn handle_publisher_request(
                 )
                 .await;
             }
+            if let (Some(media), Some(facts)) = (claimed_media.as_ref(), media_facts) {
+                let answered = if media_from_kept {
+                    Answered::Kept
+                } else {
+                    Answered::Origin(facts)
+                };
+                let delivered = deliver_claimed_media(media, answered, response).await;
+                let (parts, body) = delivered.into_parts();
+                let response = Response::from_parts(parts, EdgeBody::empty());
+                return Ok(PublisherResponse::PassThrough { response, body });
+            }
             let (parts, body) = response.into_parts();
             let response = Response::from_parts(parts, EdgeBody::empty());
             Ok(PublisherResponse::PassThrough { response, body })
@@ -6591,6 +7017,29 @@ pub async fn handle_publisher_request(
                 )
                 .await;
             }
+            // A claimed request whose range or `If-Match` may describe the
+            // longer signed representation is refused by the origin against
+            // its own; the claim asks for the signed bytes first.
+            if matches!(
+                status,
+                StatusCode::PRECONDITION_FAILED | StatusCode::RANGE_NOT_SATISFIABLE
+            ) && let (Some(media), Some(facts)) = (claimed_media.as_ref(), media_facts)
+            {
+                let delivered =
+                    deliver_claimed_media(media, Answered::Origin(facts), response).await;
+                let (parts, body) = delivered.into_parts();
+                let response = Response::from_parts(parts, EdgeBody::empty());
+                return Ok(PublisherResponse::PassThrough { response, body });
+            }
+            // A revalidated large version kept as signed is told of its
+            // manifest, as its `200` and `206` answers are.
+            if status == StatusCode::NOT_MODIFIED
+                && let (Some(media), Some(facts)) = (claimed_media.as_ref(), media_facts)
+            {
+                let delivered =
+                    deliver_claimed_media(media, Answered::Origin(facts), response).await;
+                return Ok(PublisherResponse::Buffered(delivered));
+            }
             Ok(PublisherResponse::Buffered(response))
         }
         ResponseRoute::Stream => {
@@ -6602,6 +7051,15 @@ pub async fn handle_publisher_request(
 
             let body = std::mem::replace(response.body_mut(), EdgeBody::empty());
             response.headers_mut().remove(header::CONTENT_LENGTH);
+            // A serve middleware is handed the reader's response headers, so
+            // they are copied only where an entry covering the path names one.
+            let reader_response_headers = (!integration_registry
+                .middleware_for_path(
+                    settings.phase_entries(MiddlewarePhase::Serve),
+                    &request_path,
+                )
+                .is_empty())
+            .then(|| Arc::new(response.headers().clone()));
 
             Ok(PublisherResponse::Stream {
                 response,
@@ -6611,12 +7069,14 @@ pub async fn handle_publisher_request(
                     // present on the live path so no future caller has to remember to
                     // supply it — the handlers themselves stay gated on authorization.
                     csp_nonce_observed: Some(Arc::new(AtomicBool::new(false))),
+                    response_headers: reader_response_headers,
                     template_cache_key,
                     seam_ad_slots,
                     policy_headers,
                     content_encoding,
                     origin_host: origin_host_header,
                     origin_url: location.url().to_owned(),
+                    document_url,
                     request_host: request_host.to_string(),
                     request_scheme: request_scheme.to_string(),
                     request_path: request_path.clone(),
@@ -6633,6 +7093,7 @@ pub async fn handle_publisher_request(
                     price_granularity,
                     prepared,
                     public_prefix: services.public_prefix().clone(),
+                    removed_prefix: removed_prefix.clone().unwrap_or_default(),
                 }),
             })
         }
@@ -7393,7 +7854,13 @@ pub(crate) fn request_bypasses_template_cache(headers: &edgezero_core::http::Hea
     {
         return true;
     }
+    request_asks_for_revalidation(headers)
+}
 
+/// Whether the request's `Cache-Control` or `Pragma` asks for an answer no
+/// stored copy may give: `no-cache`, `no-store`, a `max-age` other than
+/// zero, `min-fresh`, or a header that is not text.
+pub(crate) fn request_asks_for_revalidation(headers: &edgezero_core::http::HeaderMap) -> bool {
     for value in headers.get_all(header::CACHE_CONTROL) {
         let Ok(value) = value.to_str() else {
             return true;
@@ -8519,11 +8986,12 @@ fn mark_deprecated_alias(response: &mut Response<EdgeBody>, is_legacy_alias: boo
 
 /// The lifetimes `[cache.assets]` leaves unset. An asset's own lifetime ends
 /// each copy sooner than the store lifetime.
-const ASSET_DEFAULT_LIFETIMES: crate::platform::CacheLifetimes = crate::platform::CacheLifetimes {
-    memory: Duration::from_secs(5),
-    store: Duration::from_secs(60 * 60),
-    store_idle: Duration::from_secs(24 * 60 * 60),
-};
+pub(crate) const ASSET_DEFAULT_LIFETIMES: crate::platform::CacheLifetimes =
+    crate::platform::CacheLifetimes {
+        memory: Duration::from_secs(5),
+        store: Duration::from_secs(60 * 60),
+        store_idle: Duration::from_secs(24 * 60 * 60),
+    };
 
 /// How long an asset the origin says may not be shared is held as such, so
 /// the requests that follow fetch their own rather than waiting on a load.
@@ -11317,8 +11785,11 @@ mod tests {
         content_encoding: &str,
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            document_url: None,
             public_prefix: crate::prefix::PublicPrefix::default(),
+            removed_prefix: String::new(),
             csp_nonce_observed: None,
+            response_headers: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
@@ -11792,7 +12263,9 @@ mod tests {
                 })));
 
             let config = HtmlProcessorConfig {
+                rehost: crate::rehost::PageRehost::default(),
                 csp_nonce_observed: None,
+                response_headers: None,
                 public_prefix: None,
                 prepared: Arc::new(Prepared::default()),
                 status: StatusCode::OK,
@@ -19771,6 +20244,372 @@ mod tests {
         }
     }
 
+    mod media_signing_tests {
+        use std::sync::Arc;
+
+        use edgezero_core::body::Body as EdgeBody;
+        use http::{Method, Request as HttpRequest, StatusCode, header};
+        use sha2::{Digest as _, Sha256};
+
+        use super::{PublisherResponse, run_publisher_proxy};
+        use crate::media_signing::test_support::{Behavior, SIGNED_SUFFIX, StubSigner};
+        use crate::platform::PlatformHttpClient;
+        use crate::platform::test_support::{
+            MemoryLoadingCache, StubHttpClient, build_services_with_http_client,
+        };
+        use crate::test_support::tests::create_test_settings;
+
+        const SOURCE: &[u8] = b"publisher-photo-bytes";
+
+        fn origin_with_photo() -> Arc<StubHttpClient> {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                SOURCE.to_vec(),
+                vec![
+                    (header::CONTENT_TYPE.as_str(), "image/png"),
+                    (header::ETAG.as_str(), "\"origin-etag\""),
+                    (header::CACHE_CONTROL.as_str(), "public, max-age=60"),
+                ],
+            );
+            stub
+        }
+
+        fn request(
+            method: Method,
+            path: &str,
+            headers: &[(header::HeaderName, &str)],
+        ) -> HttpRequest<EdgeBody> {
+            let mut builder = HttpRequest::builder()
+                .method(method)
+                .uri(format!("https://publisher.example{path}"))
+                .header(header::HOST, "publisher.example");
+            for (name, value) in headers {
+                builder = builder.header(name.clone(), *value);
+            }
+            builder
+                .body(EdgeBody::empty())
+                .expect("should build request")
+        }
+
+        fn sent_header(stub: &StubHttpClient, index: usize, name: &str) -> Option<String> {
+            stub.recorded_request_headers()
+                .get(index)
+                .expect("should send the origin that request")
+                .iter()
+                .find(|(sent, _)| sent.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone())
+        }
+
+        fn pass_through(response: PublisherResponse) -> (http::Response<EdgeBody>, Vec<u8>) {
+            let PublisherResponse::PassThrough { response, body } = response else {
+                panic!("should pass a binary response through");
+            };
+            let bytes = body
+                .into_bytes()
+                .expect("should carry a buffered body")
+                .to_vec();
+            (response, bytes)
+        }
+
+        fn signed_bytes() -> Vec<u8> {
+            let mut bytes = SOURCE.to_vec();
+            bytes.extend_from_slice(SIGNED_SUFFIX);
+            bytes
+        }
+
+        /// On a host that serves several publishers by path, each asset is
+        /// signed for the address the reader asked for, prefix included.
+        #[tokio::test]
+        async fn media_on_a_publisher_addressed_by_path_is_signed_for_its_own_address() {
+            let stub = origin_with_photo();
+            let signer = StubSigner::new(Behavior::Sign, 1024);
+            let services = signer
+                .installed_in(build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn PlatformHttpClient>
+                ))
+                .with_client_info(crate::platform::ClientInfo {
+                    tls_protocol: Some("TLSv1.3".to_owned()),
+                    ..crate::platform::ClientInfo::default()
+                });
+            let settings = create_test_settings();
+            let mut reader = request(Method::GET, "/images/photo.png", &[]);
+            reader
+                .extensions_mut()
+                .insert(crate::addressing::RemovedPathPrefix::new(
+                    "/www.example.com".to_owned(),
+                ));
+
+            let response = run_publisher_proxy(&settings, &services, reader).await;
+
+            let jobs = signer.jobs();
+            assert_eq!(jobs.len(), 1, "should sign the photo");
+            assert_eq!(
+                jobs[0].reader_url, "https://publisher.example/www.example.com/images/photo.png",
+                "should sign the asset for the address the reader asked for"
+            );
+            let (response, body) = pass_through(response);
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body, signed_bytes(), "should deliver the signed bytes");
+        }
+
+        /// An extensionless media address the origin answers with a part
+        /// that can be kept: core asks once more for every byte, signs that
+        /// answer, and ranges the signed bytes for the reader.
+        #[tokio::test]
+        async fn a_part_of_extensionless_media_is_signed_from_a_whole_second_fetch() {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                206,
+                SOURCE[0..=3].to_vec(),
+                vec![
+                    (header::CONTENT_TYPE.as_str(), "image/png"),
+                    (header::CONTENT_RANGE.as_str(), "bytes 0-3/21"),
+                    (header::ETAG.as_str(), "\"origin-etag\""),
+                    (header::CACHE_CONTROL.as_str(), "public, max-age=60"),
+                ],
+            );
+            stub.push_response_with_headers(
+                200,
+                SOURCE.to_vec(),
+                vec![
+                    (header::CONTENT_TYPE.as_str(), "image/png"),
+                    (header::ETAG.as_str(), "\"origin-etag\""),
+                    (header::CACHE_CONTROL.as_str(), "public, max-age=60"),
+                ],
+            );
+            let signer = StubSigner::new(Behavior::Sign, 1024);
+            let services = signer
+                .installed_in(build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn PlatformHttpClient>
+                ))
+                .with_loading_cache(Arc::new(MemoryLoadingCache::default()));
+            let settings = create_test_settings();
+
+            let response = run_publisher_proxy(
+                &settings,
+                &services,
+                request(Method::GET, "/media/42", &[(header::RANGE, "bytes=0-3")]),
+            )
+            .await;
+
+            assert_eq!(
+                sent_header(&stub, 0, "range").as_deref(),
+                Some("bytes=0-3"),
+                "should ask the origin as the reader asked"
+            );
+            assert_eq!(
+                sent_header(&stub, 1, "range"),
+                None,
+                "should ask the second time for every byte"
+            );
+            let jobs = signer.jobs();
+            assert_eq!(
+                jobs.len(),
+                1,
+                "should hand the whole body to the signer once"
+            );
+            assert_eq!(
+                jobs[0].source, SOURCE,
+                "should sign the exact bytes of the whole answer"
+            );
+            assert!(
+                jobs[0]
+                    .reader_url
+                    .ends_with("://publisher.example/media/42"),
+                "should name the reader's address, got {}",
+                jobs[0].reader_url
+            );
+            let (response, body) = pass_through(response);
+            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(body, signed_bytes()[0..=3], "should range the signed bytes");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ETAG)
+                    .and_then(|value| value.to_str().ok()),
+                Some(format!("\"sig-{}\"", hex::encode(Sha256::digest(signed_bytes()))).as_str()),
+                "should carry the signed representation's tag"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_whole_answer_is_signed_and_the_readers_validator_answered_locally() {
+            let stub = origin_with_photo();
+            let signer = StubSigner::new(Behavior::Sign, 1024);
+            let services = signer.installed_in(build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn PlatformHttpClient>
+            ));
+            let settings = create_test_settings();
+            let signed_tag = format!("\"sig-{}\"", hex::encode(Sha256::digest(signed_bytes())));
+
+            let response = run_publisher_proxy(
+                &settings,
+                &services,
+                request(
+                    Method::GET,
+                    "/images/photo.png",
+                    &[(header::IF_NONE_MATCH, signed_tag.as_str())],
+                ),
+            )
+            .await;
+
+            assert_eq!(
+                sent_header(&stub, 0, "if-none-match").as_deref(),
+                Some(signed_tag.as_str()),
+                "should ask the origin as the reader asked"
+            );
+            assert_eq!(signer.jobs()[0].source, SOURCE);
+            let (response, body) = pass_through(response);
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_MODIFIED,
+                "the reader holds these signed bytes"
+            );
+            assert!(body.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_head_is_answered_from_the_signed_whole_with_no_body() {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                Vec::new(),
+                vec![
+                    (header::CONTENT_TYPE.as_str(), "image/png"),
+                    (header::CONTENT_LENGTH.as_str(), "21"),
+                    (header::CACHE_CONTROL.as_str(), "public, max-age=60"),
+                ],
+            );
+            stub.push_response_with_headers(
+                200,
+                SOURCE.to_vec(),
+                vec![
+                    (header::CONTENT_TYPE.as_str(), "image/png"),
+                    (header::CACHE_CONTROL.as_str(), "public, max-age=60"),
+                ],
+            );
+            let signer = StubSigner::new(Behavior::Sign, 1024);
+            let services = signer
+                .installed_in(build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn PlatformHttpClient>
+                ))
+                .with_loading_cache(Arc::new(MemoryLoadingCache::default()));
+            let settings = create_test_settings();
+
+            let response = run_publisher_proxy(
+                &settings,
+                &services,
+                request(Method::HEAD, "/images/photo.png", &[]),
+            )
+            .await;
+
+            assert_eq!(
+                stub.recorded_request_methods(),
+                vec!["HEAD".to_owned(), "GET".to_owned()],
+                "should send the reader's HEAD, then one GET for the bytes to sign"
+            );
+            let (response, body) = pass_through(response);
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(body.is_empty(), "a HEAD carries no body");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok()),
+                Some(signed_bytes().len().to_string().as_str()),
+                "a HEAD advertises the signed length"
+            );
+        }
+
+        #[tokio::test]
+        async fn unclaimed_pass_through_keeps_the_readers_range_for_the_origin() {
+            for (path, with_signer) in [("/images/photo.png", false), ("/video/clip.mp4", true)] {
+                let stub = Arc::new(StubHttpClient::new());
+                stub.push_response_with_headers(
+                    206,
+                    b"part".to_vec(),
+                    vec![
+                        (header::CONTENT_TYPE.as_str(), "video/mp4"),
+                        (header::CONTENT_RANGE.as_str(), "bytes 0-3/100"),
+                        (header::ETAG.as_str(), "\"origin-etag\""),
+                    ],
+                );
+                let signer = StubSigner::new(Behavior::Sign, 1024);
+                let base = build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn PlatformHttpClient>
+                );
+                let services = if with_signer {
+                    signer.installed_in(base)
+                } else {
+                    base
+                };
+                let settings = create_test_settings();
+
+                let response = run_publisher_proxy(
+                    &settings,
+                    &services,
+                    request(Method::GET, path, &[(header::RANGE, "bytes=0-3")]),
+                )
+                .await;
+
+                assert_eq!(
+                    sent_header(&stub, 0, "range").as_deref(),
+                    Some("bytes=0-3"),
+                    "{path} should keep the reader's range for the origin"
+                );
+                assert!(signer.jobs().is_empty(), "{path} should not be signed");
+                let (response, body) = pass_through(response);
+                assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+                assert_eq!(
+                    body, b"part",
+                    "{path} should pass the origin's part through"
+                );
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::ETAG)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("\"origin-etag\""),
+                    "{path} should keep the origin's validators"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn private_origin_photo_is_passed_through_unsigned() {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                SOURCE.to_vec(),
+                vec![
+                    (header::CONTENT_TYPE.as_str(), "image/png"),
+                    (header::SET_COOKIE.as_str(), "reader=1; Path=/"),
+                    (header::CACHE_CONTROL.as_str(), "private, max-age=60"),
+                ],
+            );
+            let signer = StubSigner::new(Behavior::Sign, 1024);
+            let services = signer.installed_in(build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn PlatformHttpClient>
+            ));
+            let settings = create_test_settings();
+
+            let response = run_publisher_proxy(
+                &settings,
+                &services,
+                request(Method::GET, "/images/photo.png", &[]),
+            )
+            .await;
+
+            assert!(
+                signer.jobs().is_empty(),
+                "a reader's own photo is never sent to the signer"
+            );
+            let (_, body) = pass_through(response);
+            assert_eq!(body, SOURCE, "should send the origin's bytes unchanged");
+        }
+    }
+
     #[tokio::test]
     async fn publisher_asset_cache_policy_applies_to_non_html_response() {
         let settings = settings_from_toml(&format!(
@@ -23750,8 +24589,11 @@ mod tests {
     ) -> String {
         let registry = IntegrationRegistry::new(settings).expect("should build a registry");
         let params = OwnedProcessResponseParams {
+            document_url: None,
             public_prefix: crate::prefix::PublicPrefix::default(),
+            removed_prefix: String::new(),
             csp_nonce_observed: None,
+            response_headers: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
@@ -23867,8 +24709,11 @@ mod tests {
         );
         let services = noop_services();
         let mut params = OwnedProcessResponseParams {
+            document_url: None,
             public_prefix: crate::prefix::PublicPrefix::default(),
+            removed_prefix: String::new(),
             csp_nonce_observed: None,
+            response_headers: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
@@ -23937,8 +24782,11 @@ mod tests {
         );
         let services = noop_services();
         let mut params = OwnedProcessResponseParams {
+            document_url: None,
             public_prefix: crate::prefix::PublicPrefix::default(),
+            removed_prefix: String::new(),
             csp_nonce_observed: None,
+            response_headers: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
@@ -23993,9 +24841,12 @@ mod tests {
     /// `content_type` says, for a reader of `proxy.example.com`.
     fn text_params(content_type: &str) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            document_url: None,
             csp_nonce_observed: None,
+            response_headers: None,
             prepared: Arc::new(Prepared::default()),
             public_prefix: crate::prefix::PublicPrefix::default(),
+            removed_prefix: String::new(),
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -26719,8 +27570,11 @@ mod tests {
 
         let body = EdgeBody::from(compressed);
         let params = OwnedProcessResponseParams {
+            document_url: None,
             public_prefix: crate::prefix::PublicPrefix::default(),
+            removed_prefix: String::new(),
             csp_nonce_observed: None,
+            response_headers: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
@@ -26786,8 +27640,11 @@ mod tests {
         let registry =
             IntegrationRegistry::new(&settings).expect("should create integration registry");
         let params = OwnedProcessResponseParams {
+            document_url: None,
             public_prefix: crate::prefix::PublicPrefix::default(),
+            removed_prefix: String::new(),
             csp_nonce_observed: None,
+            response_headers: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
@@ -26874,8 +27731,11 @@ mod tests {
                 b"<html><head></head><body><a href=\"/x\">x</a></body></html>".to_vec(),
             ),
             params: Box::new(OwnedProcessResponseParams {
+                document_url: None,
                 public_prefix: crate::prefix::PublicPrefix::default(),
+                removed_prefix: String::new(),
                 csp_nonce_observed: None,
+                response_headers: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
                 seam_ad_slots: None,
@@ -26971,8 +27831,11 @@ mod tests {
         };
         let params = || {
             Box::new(OwnedProcessResponseParams {
+                document_url: None,
                 public_prefix: crate::prefix::PublicPrefix::default(),
+                removed_prefix: String::new(),
                 csp_nonce_observed: None,
+                response_headers: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
                 seam_ad_slots: None,
@@ -27083,8 +27946,11 @@ mod tests {
         .expect("should create integration registry");
 
         let params = OwnedProcessResponseParams {
+            document_url: None,
             public_prefix: crate::prefix::PublicPrefix::default(),
+            removed_prefix: String::new(),
             csp_nonce_observed: None,
+            response_headers: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
@@ -27136,8 +28002,11 @@ mod tests {
         )
         .expect("should create integration registry");
         let params = OwnedProcessResponseParams {
+            document_url: None,
             public_prefix: crate::prefix::PublicPrefix::default(),
+            removed_prefix: String::new(),
             csp_nonce_observed: None,
+            response_headers: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
@@ -27356,8 +28225,11 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                document_url: None,
                 public_prefix: crate::prefix::PublicPrefix::default(),
+                removed_prefix: String::new(),
                 csp_nonce_observed: None,
+                response_headers: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
                 seam_ad_slots: None,
@@ -27427,8 +28299,11 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                document_url: None,
                 public_prefix: crate::prefix::PublicPrefix::default(),
+                removed_prefix: String::new(),
                 csp_nonce_observed: None,
+                response_headers: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
                 seam_ad_slots: None,
@@ -27501,8 +28376,11 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                document_url: None,
                 public_prefix: crate::prefix::PublicPrefix::default(),
+                removed_prefix: String::new(),
                 csp_nonce_observed: None,
+                response_headers: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
                 seam_ad_slots: None,
@@ -27575,8 +28453,11 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                document_url: None,
                 public_prefix: crate::prefix::PublicPrefix::default(),
+                removed_prefix: String::new(),
                 csp_nonce_observed: None,
+                response_headers: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
                 seam_ad_slots: None,
@@ -27649,8 +28530,11 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                document_url: None,
                 public_prefix: crate::prefix::PublicPrefix::default(),
+                removed_prefix: String::new(),
                 csp_nonce_observed: None,
+                response_headers: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
                 seam_ad_slots: None,
@@ -27703,8 +28587,11 @@ mod tests {
 
     fn non_html_stream_params(content_encoding: &str) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            document_url: None,
             public_prefix: crate::prefix::PublicPrefix::default(),
+            removed_prefix: String::new(),
             csp_nonce_observed: None,
+            response_headers: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
@@ -27933,8 +28820,11 @@ mod tests {
             let services = noop_services();
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
+                document_url: None,
                 public_prefix: crate::prefix::PublicPrefix::default(),
+                removed_prefix: String::new(),
                 csp_nonce_observed: None,
+                response_headers: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
                 seam_ad_slots: None,
@@ -28016,8 +28906,10 @@ mod tests {
             let ad_bids_state = AdBidsState::default();
             let inline_seam_token = deferred_inline_seam_token(&settings, false, true, true);
             let (html_processor, _) = create_html_stream_processor(HtmlStreamProcessorParams {
+                document_base: None,
                 prepared: Arc::new(Prepared::default()),
                 public_prefix: &crate::prefix::PublicPrefix::default(),
+                removed_prefix: "",
                 origin_host: "origin.example.com",
                 status: http::StatusCode::OK,
                 origin_private: false,
@@ -28035,6 +28927,7 @@ mod tests {
                 request_state: IntegrationRequestState::default(),
                 shared_template_authorized: false,
                 csp_nonce_observed: None,
+                response_headers: None,
                 deferred_inline_marker: inline_seam_token
                     .as_ref()
                     .map(|token| String::from_utf8_lossy(token).into_owned()),
@@ -28119,8 +29012,11 @@ mod tests {
             let services = noop_services();
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
+                document_url: None,
                 public_prefix: crate::prefix::PublicPrefix::default(),
+                removed_prefix: String::new(),
                 csp_nonce_observed: None,
+                response_headers: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
                 seam_ad_slots: None,
@@ -28203,8 +29099,11 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                document_url: None,
                 public_prefix: crate::prefix::PublicPrefix::default(),
+                removed_prefix: String::new(),
                 csp_nonce_observed: None,
+                response_headers: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
                 seam_ad_slots: None,
@@ -28281,8 +29180,11 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build response");
         let params = OwnedProcessResponseParams {
+            document_url: None,
             public_prefix: crate::prefix::PublicPrefix::default(),
+            removed_prefix: String::new(),
             csp_nonce_observed: None,
+            response_headers: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
@@ -28441,8 +29343,11 @@ mod tests {
         dispatched_auction: Option<DispatchedAuction>,
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            document_url: None,
             public_prefix: crate::prefix::PublicPrefix::default(),
+            removed_prefix: String::new(),
             csp_nonce_observed: None,
+            response_headers: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
@@ -29122,8 +30027,11 @@ mod tests {
             let ec_context =
                 EcContext::new_for_test(None, crate::consent::types::ConsentContext::default());
             OwnedProcessResponseParams {
+                document_url: None,
                 public_prefix: crate::prefix::PublicPrefix::default(),
+                removed_prefix: String::new(),
                 csp_nonce_observed: None,
+                response_headers: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
                 seam_ad_slots: None,
@@ -29324,8 +30232,11 @@ mod tests {
             .map(bytes::Bytes::copy_from_slice)
             .collect();
         let params = OwnedProcessResponseParams {
+            document_url: None,
             public_prefix: crate::prefix::PublicPrefix::default(),
+            removed_prefix: String::new(),
             csp_nonce_observed: None,
+            response_headers: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
@@ -29410,8 +30321,11 @@ mod tests {
             r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{}");</script>"#;
         let state = AdBidsState::with_script(bids_script);
         let params = OwnedProcessResponseParams {
+            document_url: None,
             public_prefix: crate::prefix::PublicPrefix::default(),
+            removed_prefix: String::new(),
             csp_nonce_observed: None,
+            response_headers: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
@@ -29479,8 +30393,11 @@ mod tests {
         // Claim gzip encoding but feed non-gzip bytes. The GzDecoder will
         // error as soon as it tries to read the gzip header.
         let params = OwnedProcessResponseParams {
+            document_url: None,
             public_prefix: crate::prefix::PublicPrefix::default(),
+            removed_prefix: String::new(),
             csp_nonce_observed: None,
+            response_headers: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
@@ -29603,8 +30520,11 @@ mod tests {
         let body = EdgeBody::from(html.to_vec());
 
         let params = OwnedProcessResponseParams {
+            document_url: None,
             public_prefix: crate::prefix::PublicPrefix::default(),
+            removed_prefix: String::new(),
             csp_nonce_observed: None,
+            response_headers: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
@@ -29667,8 +30587,11 @@ mod tests {
         // One small script whose payload is swapped for a placeholder.
         let html = br#"<html><body><script>fixture_payload("link=https://origin.example.com/page")</script></body></html>"#;
         let params = OwnedProcessResponseParams {
+            document_url: None,
             public_prefix: crate::prefix::PublicPrefix::default(),
+            removed_prefix: String::new(),
             csp_nonce_observed: None,
+            response_headers: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
@@ -33559,5 +34482,126 @@ mod tests {
                 "a request on the consent-denied path should not reach the device module"
             );
         }
+    }
+
+    #[test]
+    fn rehosting_html_resolves_late_base_from_original_decoded_bytes_before_streaming() {
+        let prefix = "/_rehost/cdn/";
+        let mut settings = create_test_settings();
+        let mut route =
+            crate::settings::ProxyAssetRoute::new(prefix, "https://cdn.example.net/npm");
+        route.rehost_page_references = true;
+        settings.proxy.asset_routes.push(route);
+        let source = concat!(
+            r#"<html><head></head><body><img src="i.png?q=%2f&amp;x=1#f">"#,
+            r#"<base href="../lib/"><base href="http://later.example/"></body></html>"#,
+        );
+        for coding in ["", "gzip"] {
+            let mut params = html_stream_params(coding, None);
+            params.document_url =
+                Some("https://cdn.example.net/npm/articles/page.html?raw=%2f".to_owned());
+            params.origin_url = "https://cdn.example.net/npm".to_owned();
+            params.removed_prefix = "/publisher.example".to_owned();
+            let bytes = if coding.is_empty() {
+                source.as_bytes().to_vec()
+            } else {
+                gzip_encode(source.as_bytes())
+            };
+            let body = streaming_finalize_response_with_settings(
+                params,
+                EdgeBody::from(bytes),
+                settings.clone(),
+            );
+            assert!(
+                !body.is_stream(),
+                "a late base must be resolved before committing a lazy response"
+            );
+            let bytes = body
+                .into_bytes()
+                .expect("the bounded HTML was materialized");
+            let bytes = if coding.is_empty() {
+                bytes.to_vec()
+            } else {
+                gzip_decode(&bytes)
+            };
+            let html = String::from_utf8(bytes).expect("HTML");
+            assert!(html.contains(&format!(
+                r#"src="https://proxy.example.com/publisher.example{prefix}lib/i.png?q=%2f&amp;x=1#f""#
+            )), "{html}");
+        }
+    }
+
+    #[test]
+    fn rehosting_without_a_base_uses_the_complete_fetched_document_path_and_query() {
+        let mut settings = create_test_settings();
+        let mut route =
+            crate::settings::ProxyAssetRoute::new("/_rehost/cdn/", "https://cdn.example.net/npm");
+        route.rehost_page_references = true;
+        settings.proxy.asset_routes.push(route);
+        let mut params = html_stream_params("", None);
+        params.document_url =
+            Some("https://cdn.example.net/npm/articles/page.html?raw=%2f&x=1".to_owned());
+        let registry = IntegrationRegistry::new(&settings).expect("registry");
+        let mut output = Vec::new();
+        stream_publisher_body(
+            EdgeBody::from(r##"<img src="#icon">"##),
+            &mut output,
+            &params,
+            &settings,
+            &registry,
+        )
+        .expect("document");
+        let html = String::from_utf8(output).expect("HTML");
+        assert!(html.contains(
+            r#"src="https://proxy.example.com/_rehost/cdn/articles/page.html?raw=%2f&amp;x=1#icon""#
+        ), "{html}");
+    }
+
+    #[test]
+    fn rehosting_refuses_oversized_originals_and_missing_document_urls_before_output() {
+        let mut settings = create_test_settings();
+        settings.publisher.max_buffered_body_bytes = 128;
+        let mut route =
+            crate::settings::ProxyAssetRoute::new("/_rehost/cdn/", "https://cdn.example.net/npm");
+        route.rehost_page_references = true;
+        settings.proxy.asset_routes.push(route);
+        let registry = IntegrationRegistry::new(&settings).expect("registry");
+        let original = format!("<html><body>{}</body></html>", " ".repeat(512));
+        for coding in ["", "gzip"] {
+            let mut params = html_stream_params(coding, None);
+            params.document_url = Some("https://cdn.example.net/npm/page.html".to_owned());
+            let body = if coding.is_empty() {
+                original.as_bytes().to_vec()
+            } else {
+                gzip_encode(original.as_bytes())
+            };
+            let mut output = Vec::new();
+            assert!(
+                stream_publisher_body(
+                    EdgeBody::from(body),
+                    &mut output,
+                    &params,
+                    &settings,
+                    &registry,
+                )
+                .is_err()
+            );
+            assert!(
+                output.is_empty(),
+                "no partial rehosted HTML may escape on limit refusal"
+            );
+        }
+        let params = html_stream_params("", None);
+        let mut output = Vec::new();
+        let error = stream_publisher_body(
+            EdgeBody::from("<img src=\"i.png\">"),
+            &mut output,
+            &params,
+            &settings,
+            &registry,
+        )
+        .expect_err("the fetched URL is required, never invented from the reader host");
+        assert!(format!("{error:?}").contains("full fetched document URL"));
+        assert!(output.is_empty());
     }
 }

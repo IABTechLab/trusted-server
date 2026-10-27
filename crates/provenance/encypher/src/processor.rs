@@ -1,19 +1,24 @@
-//! Per-document signing flow: gates, hold, KV cache, sign call, outcomes, logging.
+//! Per-document signing flow: gates, hold, KV cache, sign calls, outcomes, logging.
 //!
 //! A document moves through four phases:
 //!
 //! 1. **Admit** (the middleware's preparation, with no I/O): the request
 //!    gates decide whether the document is held at all.
 //! 2. **Extract** (synchronous): at end of input the held document's article
-//!    boundary, visible text and text hash are computed.
+//!    boundary, visible text and text hash are computed, and its embedded
+//!    media found.
 //! 3. **Resolve** (the asynchronous finish): policy and plan caches, the policy
-//!    and sign calls, and cache writes. On runtimes with a timer every call is
-//!    raced against `max_hold_ms`, keeping a reserve for the skip write.
+//!    and sign calls, and cache writes, then each embedded media item signed
+//!    through [`media`]. On runtimes with a timer every call is raced against
+//!    one `max_hold_ms` budget, keeping a reserve for the skip write.
 //! 4. **Render** (synchronous): the plan's markers and the manifest meta tag are
-//!    applied to the held document.
+//!    applied to the held document, then each signed media item replaces its
+//!    exact bytes.
 //!
-//! Every module failure emits the held document unchanged.
+//! Every module failure emits the held document unchanged, or, for one
+//! media item, leaves that item as written and reports it unsigned.
 
+use std::borrow::Cow;
 use std::io;
 use std::pin::pin;
 use std::sync::Arc;
@@ -29,12 +34,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::{self, ApiError, EmbeddingPlan, SignRequest};
 use crate::boundary::{self, Boundary};
+use crate::embedded;
 use crate::{EncypherConfig, INTEGRATION_ID, embed, text};
 use trusted_server_core::integrations::ensure_integration_backend_with_timeout;
 use trusted_server_core::platform::{
     KvError, PlatformHttpRequest, PlatformKvStore, PlatformTimer, RuntimeServices,
 };
 use trusted_server_core::streaming_processor::{AsyncFinish, StreamProcessor};
+
+mod media;
+mod prepared;
+
+pub(crate) use media::EncypherMedia;
 
 const SIGN_PATH: &str = "/api/v1/public/cdn/sign";
 const POLICY_PATH: &str = "/api/v1/public/cdn/trusted-server/policy";
@@ -63,7 +74,8 @@ const SKIP_PATH_PREFIXES: &[&str] = &[
     "/sitemap",
     "/.well-known/",
 ];
-/// Asset suffixes never signed (ported from the Fastly worker's `shouldSkipPath`).
+/// Asset suffixes the article path never signs (ported from the Fastly
+/// worker's `shouldSkipPath`). Media at these paths is signed by [`media`].
 const SKIP_PATH_SUFFIXES: &[&str] = &[
     ".xml", ".json", ".rss", ".atom", ".css", ".js", ".woff", ".woff2", ".png", ".jpg", ".gif",
     ".svg", ".ico",
@@ -103,19 +115,24 @@ pub(crate) struct PageRequest {
     /// The reader's request method.
     pub(crate) method: Method,
     /// The scheme, host and path the reader asked for, without the query,
-    /// which is the address the article is signed for.
+    /// which is the address the article is signed for. On a host that
+    /// serves several publishers by path it includes the publisher's prefix.
     pub(crate) page_url: String,
+    /// The path prefix request addressing removed, such as
+    /// `/www.example.com`, or empty. The path gates read the publisher's own
+    /// path, without it.
+    pub(crate) removed_prefix: String,
     /// The status of the response the document is the body of.
     pub(crate) response_status: u16,
     /// Whether the origin marked its response as one reader's.
     pub(crate) origin_response_is_private: bool,
 }
 
-/// Reason code for a held document's outcome. Sign failures are also stored
-/// as the reason of a negative (`skip`) cache entry.
+/// Reason code for a held document's or a media item's outcome. Sign
+/// failures are also stored as the reason of a negative (`skip`) cache entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Reason {
+pub(crate) enum Reason {
     Signed,
     CacheHit,
     DocumentTooLarge,
@@ -148,10 +165,62 @@ enum Reason {
     NoPlan,
     InvalidPlan,
     AlignmentFailed,
+    /// The media is over `max_media_bytes`.
+    MediaTooLarge,
+    /// The media is delivered outside the claimed domain.
+    OutsideClaim,
+    /// Core named no single hostname the source was fetched from.
+    InvalidOriginHost,
+    /// The captured bytes are not the bytes core hashed.
+    SourceDigestMismatch,
+    /// A `data:` URI's payload does not decode.
+    MalformedDataUri,
+    /// The endpoint answered `409` to a reused replay key.
+    IdempotencyConflict,
+    /// The endpoint no longer holds the result for the replay key.
+    ResultPurged,
+    /// The endpoint refused the request body's size.
+    PayloadTooLarge,
+    /// The signed bytes are of another media type than the source.
+    SignedTypeMismatch,
+    /// The signed bytes are not the bytes the answer names.
+    SignedDigestMismatch,
+    /// A signing header is missing, repeated or malformed.
+    InvalidSignedResponse,
+    /// The manifest is remote and needs a `Link` the delivery cannot carry.
+    ManifestUndeliverable,
+    /// The answer carries no manifest and no reference to one.
+    UnsignedResponse,
+    /// The response's policies are not visible to the module, so an inline
+    /// style edit could break a style hash.
+    CspUnknown,
+    /// A page policy admits the inline style by hash.
+    CspStyleHash,
+    /// The element carries a subresource integrity value.
+    IntegrityAttribute,
+    /// The URI is written with an HTML character reference.
+    CharacterReference,
+    /// The URI is written with a CSS escape.
+    CssEscape,
+    /// No standalone SVG document is proven to parse to the tree the browser
+    /// built from the inline SVG.
+    InlineSvgNotEquivalent,
+    /// The inline SVG carries provenance of its own and is not, as written,
+    /// a standalone SVG equivalent to the browser's tree, so it is never
+    /// rewritten.
+    SvgProvenanceNotEquivalent,
+    /// Original SVG provenance protects the entire range from inline edits
+    /// or replacement with a new, unchained signature.
+    SvgExistingProvenance,
+    /// The signer changed the inline SVG beyond adding its manifest.
+    InlineSvgAltered,
+    /// The document's media made its most endpoint calls; the item is signed
+    /// on a later view.
+    Deferred,
 }
 
 impl Reason {
-    fn code(self) -> &'static str {
+    pub(crate) fn code(self) -> &'static str {
         match self {
             Self::Signed => "signed",
             Self::CacheHit => "cache_hit",
@@ -185,6 +254,29 @@ impl Reason {
             Self::NoPlan => "no_plan",
             Self::InvalidPlan => "invalid_plan",
             Self::AlignmentFailed => "alignment_failed",
+            Self::MediaTooLarge => "media_too_large",
+            Self::OutsideClaim => "outside_claim",
+            Self::InvalidOriginHost => "invalid_origin_host",
+            Self::SourceDigestMismatch => "source_digest_mismatch",
+            Self::MalformedDataUri => "malformed_data_uri",
+            Self::IdempotencyConflict => "idempotency_conflict",
+            Self::ResultPurged => "result_purged",
+            Self::PayloadTooLarge => "payload_too_large",
+            Self::SignedTypeMismatch => "signed_type_mismatch",
+            Self::SignedDigestMismatch => "signed_digest_mismatch",
+            Self::InvalidSignedResponse => "invalid_signed_response",
+            Self::ManifestUndeliverable => "manifest_undeliverable",
+            Self::UnsignedResponse => "unsigned_response",
+            Self::CspUnknown => "csp_unknown",
+            Self::CspStyleHash => "csp_style_hash",
+            Self::IntegrityAttribute => "integrity_attribute",
+            Self::CharacterReference => "character_reference",
+            Self::CssEscape => "css_escape",
+            Self::InlineSvgNotEquivalent => "inline_svg_not_equivalent",
+            Self::SvgProvenanceNotEquivalent => "svg_provenance_not_equivalent",
+            Self::SvgExistingProvenance => "svg_existing_provenance",
+            Self::InlineSvgAltered => "inline_svg_altered",
+            Self::Deferred => "deferred",
         }
     }
 }
@@ -292,6 +384,7 @@ pub(crate) struct Signer {
     config: EncypherConfig,
     max_document_bytes: usize,
     sign_url: String,
+    media_sign_url: String,
     policy_url: String,
     policy_key: String,
     policy_skip_key: String,
@@ -308,6 +401,11 @@ impl Signer {
     /// document.
     pub(crate) fn new(config: EncypherConfig, max_document_bytes: usize) -> Self {
         let sign_url = format!("{}{SIGN_PATH}", config.api_base_url.trim_end_matches('/'));
+        let media_sign_url = format!(
+            "{}{}",
+            config.api_base_url.trim_end_matches('/'),
+            crate::media_api::MEDIA_SIGN_PATH
+        );
         let policy_url = format!("{}{POLICY_PATH}", config.api_base_url.trim_end_matches('/'));
         let context_hash = text::content_hash_hex(&format!(
             "{}\n{}\n{}",
@@ -323,6 +421,7 @@ impl Signer {
             config,
             max_document_bytes,
             sign_url,
+            media_sign_url,
             policy_url,
             policy_key: format!("{POLICY_KEY_PREFIX}:{cache_context}"),
             policy_skip_key: format!("{POLICY_SKIP_KEY_PREFIX}:{cache_context}"),
@@ -332,14 +431,56 @@ impl Signer {
     }
 }
 
-/// Holds the document of an admitted page until it ends.
-pub(crate) fn document_processor(signer: &Arc<Signer>, request: PageRequest) -> DocumentProcessor {
+/// What a held document is, which decides what in it is signed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Surface {
+    /// An HTML page: its article's text, then its embedded media.
+    Page,
+    /// A stylesheet: the media its `url()`s embed.
+    Stylesheet,
+}
+
+/// Holds the document of an admitted page until it ends. `policies` are the
+/// response's `Content-Security-Policy` values, `None` when core cannot
+/// show them, which decide whether inline style media may be edited.
+pub(crate) fn document_processor(
+    signer: &Arc<Signer>,
+    request: PageRequest,
+    policies: Option<Vec<String>>,
+) -> DocumentProcessor {
+    held_processor(signer, request, Surface::Page, policies)
+}
+
+/// Holds an admitted stylesheet until it ends.
+pub(crate) fn stylesheet_processor(
+    signer: &Arc<Signer>,
+    request: PageRequest,
+) -> DocumentProcessor {
+    held_processor(signer, request, Surface::Stylesheet, None)
+}
+
+fn held_processor(
+    signer: &Arc<Signer>,
+    request: PageRequest,
+    surface: Surface,
+    policies: Option<Vec<String>>,
+) -> DocumentProcessor {
     DocumentProcessor {
         signer: Arc::clone(signer),
         request,
+        surface,
+        policies,
         held: Vec::new(),
         state: DocumentState::Holding,
     }
+}
+
+/// What a held document's signing works for.
+struct Target<'a> {
+    request: &'a PageRequest,
+    surface: Surface,
+    /// The response's policy values, `None` when core cannot show them.
+    policies: Option<&'a [String]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,6 +499,8 @@ enum DocumentState {
 pub(crate) struct DocumentProcessor {
     signer: Arc<Signer>,
     request: PageRequest,
+    surface: Surface,
+    policies: Option<Vec<String>>,
     held: Vec<u8>,
     state: DocumentState,
 }
@@ -396,31 +539,40 @@ impl StreamProcessor for DocumentProcessor {
         if self.state != DocumentState::Complete {
             return None;
         }
-        let extracted = std::str::from_utf8(held)
-            .map_err(|_| Reason::NotUtf8)
-            .and_then(|html| Ok((html, self.signer.extract(html)?)));
-        let (html, article) = match extracted {
-            Ok(extracted) => extracted,
-            Err(reason) => {
-                log_outcome(false, reason);
-                return None;
-            }
+        let Ok(document) = std::str::from_utf8(held) else {
+            log_outcome(false, Reason::NotUtf8);
+            return None;
         };
+        let (article, media) = match self.surface {
+            Surface::Page => (
+                Some(self.signer.extract(document)),
+                embedded::scan_html(document, self.policies.as_deref()),
+            ),
+            Surface::Stylesheet => (None, embedded::scan_stylesheet(document)),
+        };
+        let article = match article {
+            Some(Ok(article)) => Some(article),
+            Some(Err(reason)) => {
+                log_outcome(false, reason);
+                None
+            }
+            None => None,
+        };
+        if article.is_none() && media.is_empty() {
+            return None;
+        }
         let signer = &*self.signer;
-        let request = &self.request;
+        let target = Target {
+            request: &self.request,
+            surface: self.surface,
+            policies: self.policies.as_deref(),
+        };
         let deadline =
             Duration::from_millis(signer.config.max_hold_ms).saturating_add(BACKSTOP_MARGIN);
         Some(AsyncFinish::new(deadline, async move {
-            match signer.resolve(request, services, html, &article).await {
-                Ok((signed, reason)) => {
-                    log_outcome(true, reason);
-                    signed.into_bytes()
-                }
-                Err(reason) => {
-                    log_outcome(false, reason);
-                    held.to_vec()
-                }
-            }
+            signer
+                .resolve_document(&target, services, document, article, media)
+                .await
         }))
     }
 }
@@ -497,21 +649,38 @@ fn log_outcome(signed: bool, reason: Reason) {
     );
 }
 
-/// Whether `path` is one this module never signs: an API, feed, admin or
-/// well-known path, or an asset.
+/// Whether `path` is one the article path never signs: an API, feed, admin
+/// or well-known path, or an asset.
 pub(crate) fn is_excluded_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    SKIP_PATH_PREFIXES
-        .iter()
-        .any(|prefix| lower.starts_with(prefix))
+    is_excluded_prefix(&lower)
         || SKIP_PATH_SUFFIXES
             .iter()
             .any(|suffix| lower.ends_with(suffix))
 }
 
+/// Whether `path` is an API, feed, admin or well-known path, where no media
+/// is signed either. Asset suffixes are not excluded: media is.
+pub(crate) fn is_excluded_prefix(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    SKIP_PATH_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
 impl Signer {
-    /// Apply the request gates. Only an admitted document is held.
+    /// Apply the request gates to a page. Only an admitted document is held.
     pub(crate) fn admit(&self, request: PageRequest) -> Result<PageRequest, Gate> {
+        self.gate(request, true)
+    }
+
+    /// Apply the request gates to a stylesheet, whose `.css` path the page
+    /// gates exclude.
+    pub(crate) fn admit_stylesheet(&self, request: PageRequest) -> Result<PageRequest, Gate> {
+        self.gate(request, false)
+    }
+
+    fn gate(&self, request: PageRequest, page: bool) -> Result<PageRequest, Gate> {
         if request.method != Method::GET {
             return Err(Gate::Method);
         }
@@ -523,13 +692,29 @@ impl Signer {
         }
         let page_url = url::Url::parse(&request.page_url).map_err(|_| Gate::InvalidPageUrl)?;
         let host = page_url.host_str().ok_or(Gate::InvalidPageUrl)?;
-        if host.strip_prefix("www.").unwrap_or(host) != self.config.domain {
+        if !self.claims_host(host) {
             return Err(Gate::HostMismatch);
         }
-        if is_excluded_path(page_url.path()) {
+        // The publisher's own path, as its site names it.
+        let path = page_url.path();
+        let path = path
+            .strip_prefix(request.removed_prefix.as_str())
+            .filter(|rest| rest.starts_with('/'))
+            .unwrap_or(path);
+        let excluded = if page {
+            is_excluded_path(path)
+        } else {
+            is_excluded_prefix(path)
+        };
+        if excluded {
             return Err(Gate::ExcludedPath);
         }
         Ok(request)
+    }
+
+    /// Whether `host` is the claimed domain or its `www.` name.
+    pub(crate) fn claims_host(&self, host: &str) -> bool {
+        host.strip_prefix("www.").unwrap_or(host) == self.config.domain
     }
 
     /// Find the article and its signable text, with no I/O.
@@ -569,22 +754,105 @@ impl Signer {
         Deadline::new(services.timer(), SKIP_WRITE_RESERVE)
     }
 
-    /// Resolve the plan for `article` and render it into `html`.
+    /// Sign what a held document carries: the article's text first, as the
+    /// page path always has, then each embedded media item, within one
+    /// `max_hold_ms` budget. Returns the bytes to emit.
+    async fn resolve_document(
+        &self,
+        target: &Target<'_>,
+        services: &RuntimeServices,
+        document: &str,
+        article: Option<Article>,
+        media: embedded::Scan,
+    ) -> Vec<u8> {
+        let request = target.request;
+        let mut work = Deadline::new(
+            services.timer(),
+            Duration::from_millis(self.config.max_hold_ms).saturating_sub(SKIP_WRITE_RESERVE),
+        );
+        work.start().await;
+        let policy_digest = match self
+            .policy_digest(&request.page_url, services, services.kv_store(), &mut work)
+            .await
+        {
+            Ok(policy_digest) => policy_digest,
+            Err(reason) => {
+                if article.is_some() {
+                    log_outcome(false, reason);
+                }
+                media::log_unsigned(&media, reason);
+                return document.as_bytes().to_vec();
+            }
+        };
+        let mut output = Cow::Borrowed(document);
+        if let Some(article) = &article {
+            match self
+                .resolve(
+                    request,
+                    services,
+                    document,
+                    article,
+                    &policy_digest,
+                    &mut work,
+                )
+                .await
+            {
+                Ok((signed, reason)) => {
+                    log_outcome(true, reason);
+                    output = Cow::Owned(signed);
+                }
+                Err(reason) => log_outcome(false, reason),
+            }
+        }
+        if media.is_empty() {
+            return output.into_owned().into_bytes();
+        }
+        // Markers go into text and the manifest meta tag into the head, never
+        // into an attribute, a style or an SVG, so a rescan finds the same
+        // media at its new offsets.
+        let media = match (&output, target.surface) {
+            (Cow::Owned(signed), Surface::Page) => embedded::scan_html(signed, target.policies),
+            _ => media,
+        };
+        // The text plan may come from the cached policy, but media is signed
+        // or reused only under the policy the service answers now, so a
+        // revoked credential cannot reuse a cached media result.
+        let media_policy = match self
+            .request_policy(&request.page_url, services, &mut work)
+            .await
+        {
+            Ok(policy_digest) => policy_digest,
+            Err(reason) => {
+                media::log_unsigned(&media, reason);
+                return output.into_owned().into_bytes();
+            }
+        };
+        let embedded = media::EmbeddedJob {
+            request,
+            surface: target.surface,
+            policy_digest: &media_policy,
+        };
+        match self
+            .sign_embedded(services, &embedded, &output, &media, &mut work)
+            .await
+        {
+            Some(signed) => signed.into_bytes(),
+            None => output.into_owned().into_bytes(),
+        }
+    }
+
+    /// Resolve the plan for `article` under `policy_digest` and render it
+    /// into `html`.
     async fn resolve(
         &self,
         request: &PageRequest,
         services: &RuntimeServices,
         html: &str,
         article: &Article,
+        policy_digest: &str,
+        work: &mut Deadline<'_>,
     ) -> Result<(String, Reason), Reason> {
         let kv = services.kv_store();
-        let mut work = Deadline::new(
-            services.timer(),
-            Duration::from_millis(self.config.max_hold_ms).saturating_sub(SKIP_WRITE_RESERVE),
-        );
-        work.start().await;
-
-        let policy_digest = self.policy_digest(request, services, kv, &mut work).await?;
         let suffix = format!(
             "{}:{policy_digest}:{}",
             self.cache_context,
@@ -592,12 +860,12 @@ impl Signer {
         );
         let plan_key = format!("{PLAN_KEY_PREFIX}:{suffix}");
         let skip_key = format!("{PLAN_SKIP_KEY_PREFIX}:{suffix}");
-        let outcome = match self.read::<CacheEntry>(kv, &plan_key, &mut work).await {
+        let outcome = match self.read::<CacheEntry>(kv, &plan_key, work).await {
             Ok(Some(CacheEntry::Plan {
                 plan, manifest_url, ..
             })) => {
                 if api::validate_plan(&plan, manifest_url.as_deref(), article.scalars).is_err() {
-                    self.delete_invalid_entry(kv, &plan_key, &mut work).await;
+                    self.delete_invalid_entry(kv, &plan_key, work).await;
                     return Err(Reason::CachedPlanInvalid);
                 }
                 return render(
@@ -611,21 +879,21 @@ impl Signer {
                 .map_err(render_reason);
             }
             Ok(Some(CacheEntry::Skip { .. })) => {
-                self.delete_invalid_entry(kv, &plan_key, &mut work).await;
+                self.delete_invalid_entry(kv, &plan_key, work).await;
                 return Err(Reason::CachedEntryInvalid);
             }
             Err(Reason::Timeout) => Err(Reason::Timeout),
             Err(reason) => return Err(reason),
-            Ok(None) => match self.read::<CacheEntry>(kv, &skip_key, &mut work).await {
+            Ok(None) => match self.read::<CacheEntry>(kv, &skip_key, work).await {
                 Ok(Some(CacheEntry::Skip { .. })) => return Err(Reason::CachedSkip),
                 Ok(Some(CacheEntry::Plan { .. })) => {
-                    self.delete_invalid_entry(kv, &skip_key, &mut work).await;
+                    self.delete_invalid_entry(kv, &skip_key, work).await;
                     return Err(Reason::CachedEntryInvalid);
                 }
                 Err(Reason::Timeout) => Err(Reason::Timeout),
                 Err(reason) => return Err(reason),
                 Ok(None) => self
-                    .request_plan(request, services, html, article, &policy_digest, &mut work)
+                    .request_plan(request, services, html, article, policy_digest, work)
                     .await
                     .and_then(|(plan, manifest_url)| {
                         api::validate_plan(&plan, manifest_url.as_deref(), article.scalars)
@@ -651,14 +919,8 @@ impl Signer {
                     expires_at: Self::expires_at(self.config.plan_ttl_seconds),
                     ttl_less: false,
                 };
-                self.write(
-                    kv,
-                    &plan_key,
-                    entry,
-                    self.config.plan_ttl_seconds,
-                    &mut work,
-                )
-                .await;
+                self.write(kv, &plan_key, entry, self.config.plan_ttl_seconds, work)
+                    .await;
                 Ok((signed, Reason::Signed))
             }
             Err(reason) => {
@@ -674,7 +936,7 @@ impl Signer {
 
     async fn policy_digest(
         &self,
-        request: &PageRequest,
+        page_url: &str,
         services: &RuntimeServices,
         kv: &dyn PlatformKvStore,
         work: &mut Deadline<'_>,
@@ -709,7 +971,7 @@ impl Signer {
             Ok(None) => {}
         }
 
-        let reason = match self.request_policy(request, services, work).await {
+        let reason = match self.request_policy(page_url, services, work).await {
             Ok(policy_digest) => {
                 let entry = PolicyEntry::Digest {
                     policy_digest: policy_digest.clone(),
@@ -758,13 +1020,12 @@ impl Signer {
 
     async fn request_policy(
         &self,
-        request: &PageRequest,
+        page_url: &str,
         services: &RuntimeServices,
         work: &mut Deadline<'_>,
     ) -> Result<String, Reason> {
         let mut url = url::Url::parse(&self.policy_url).map_err(|_| Reason::RequestBuild)?;
-        url.query_pairs_mut()
-            .append_pair("page_url", &request.page_url);
+        url.query_pairs_mut().append_pair("page_url", page_url);
         let body = self
             .fetch(
                 services,
@@ -834,7 +1095,15 @@ impl Signer {
         Ok((plan, parsed.manifest_url))
     }
 
-    /// One bounded HTTP call; never retried.
+    /// The worker token header value, marked sensitive so no log shows it.
+    fn worker_token(&self) -> Result<HeaderValue, Reason> {
+        let mut token = HeaderValue::from_str(self.config.worker_token.expose().trim())
+            .map_err(|_| Reason::RequestBuild)?;
+        token.set_sensitive(true);
+        Ok(token)
+    }
+
+    /// One bounded JSON HTTP call; never retried.
     async fn fetch(
         &self,
         services: &RuntimeServices,
@@ -844,36 +1113,17 @@ impl Signer {
         max_response_bytes: usize,
         work: &mut Deadline<'_>,
     ) -> Result<Bytes, Reason> {
-        let mut token = HeaderValue::from_str(self.config.worker_token.expose().trim())
-            .map_err(|_| Reason::RequestBuild)?;
-        token.set_sensitive(true);
         let http_request = Request::builder()
             .method(method)
             .uri(url)
             .header(header::CONTENT_TYPE, "application/json")
-            .header(WORKER_TOKEN_HEADER, token)
+            .header(WORKER_TOKEN_HEADER, self.worker_token()?)
             .body(body)
             .map_err(|_| Reason::RequestBuild)?;
-        let backend = ensure_integration_backend_with_timeout(
-            services,
-            &self.config.api_base_url,
-            INTEGRATION_ID,
-            Duration::from_millis(self.config.timeout_ms),
-        )
-        .map_err(|_| Reason::Backend)?;
-
         let response_limit = max_response_bytes.saturating_add(1);
-        let platform_request = PlatformHttpRequest::new(http_request, backend)
-            .with_cache_bypass()
-            .with_max_response_body_bytes(response_limit);
-        let response = match work
-            .race(services.http_client().send(platform_request))
-            .await
-        {
-            None => return Err(Reason::Timeout),
-            Some(Err(_)) => return Err(Reason::HttpError),
-            Some(Ok(response)) => response.response,
-        };
+        let response = self
+            .send_api(services, http_request, response_limit, work)
+            .await?;
         let status = response.status();
         if status != StatusCode::OK {
             return Err(match status.as_u16() {
@@ -893,6 +1143,35 @@ impl Signer {
             None => Err(Reason::Timeout),
             Some(Err(_)) => Err(Reason::ResponseTooLarge),
             Some(Ok(body)) => Ok(body),
+        }
+    }
+
+    /// Send one request to the API backend, bounded by the first-byte
+    /// timeout and `work`, reading at most `response_limit` body bytes.
+    async fn send_api(
+        &self,
+        services: &RuntimeServices,
+        http_request: Request<EdgeBody>,
+        response_limit: usize,
+        work: &mut Deadline<'_>,
+    ) -> Result<http::Response<EdgeBody>, Reason> {
+        let backend = ensure_integration_backend_with_timeout(
+            services,
+            &self.config.api_base_url,
+            INTEGRATION_ID,
+            Duration::from_millis(self.config.timeout_ms),
+        )
+        .map_err(|_| Reason::Backend)?;
+        let platform_request = PlatformHttpRequest::new(http_request, backend)
+            .with_cache_bypass()
+            .with_max_response_body_bytes(response_limit);
+        match work
+            .race(services.http_client().send(platform_request))
+            .await
+        {
+            None => Err(Reason::Timeout),
+            Some(Err(_)) => Err(Reason::HttpError),
+            Some(Ok(response)) => Ok(response.response),
         }
     }
 
@@ -1510,6 +1789,7 @@ mod tests {
         PageRequest {
             method: Method::GET,
             page_url: PAGE_URL.to_owned(),
+            removed_prefix: String::new(),
             response_status: 200,
             origin_response_is_private: false,
         }
@@ -1567,7 +1847,7 @@ mod tests {
             return html.to_owned();
         };
         futures::executor::block_on(async {
-            let mut processor = document_processor(factory, request);
+            let mut processor = document_processor(factory, request, None);
             let (first, second) = html.as_bytes().split_at(html.len() / 2);
             let mut output = processor
                 .process_chunk(first, false)
@@ -2327,8 +2607,19 @@ mod tests {
         let http = Arc::new(StubHttpClient::new());
         let services = services(http, &kv);
 
-        let result =
-            futures::executor::block_on(signer.resolve(&request(), &services, ARTICLE, &article));
+        let result = futures::executor::block_on(async {
+            let mut work = Deadline::Unbounded;
+            signer
+                .resolve(
+                    &request(),
+                    &services,
+                    ARTICLE,
+                    &article,
+                    POLICY_DIGEST,
+                    &mut work,
+                )
+                .await
+        });
 
         assert_eq!(
             result.expect_err("alignment should fail"),
@@ -2856,6 +3147,14 @@ mod tests {
             (
                 ("excluded path", &signer, |r| {
                     r.page_url = "https://publisher.example.com/WP-Admin/post".to_owned();
+                }),
+                Gate::ExcludedPath,
+            ),
+            (
+                ("excluded path under an addressing prefix", &signer, |r| {
+                    r.page_url =
+                        "https://publisher.example.com/www.site.example/wp-admin/post".to_owned();
+                    r.removed_prefix = "/www.site.example".to_owned();
                 }),
                 Gate::ExcludedPath,
             ),

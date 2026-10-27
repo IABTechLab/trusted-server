@@ -246,15 +246,46 @@ fn boundary(element: ElementMatch, selector: impl Into<String>) -> Boundary {
     }
 }
 
+/// Checks the same restricted selector grammar used for article matching.
+pub(super) fn is_valid_selector(selector: &str) -> bool {
+    parse_selector(selector).is_some()
+}
+
 fn parse_selector(selector: &str) -> Option<Selector<'_>> {
-    if let Some(class_name) = selector.strip_prefix('.').filter(|name| !name.is_empty()) {
-        return Some(Selector::Class(class_name));
+    if let Some(class_name) = selector.strip_prefix('.') {
+        return is_class_identifier(class_name).then_some(Selector::Class(class_name));
     }
     if selector.starts_with('[') {
         let (attribute, value) = parse_attribute_selector(selector)?;
         return Some(Selector::Attribute(attribute, value));
     }
-    Some(Selector::Tag(selector))
+    (selector
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphabetic)
+        && selector
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+    .then_some(Selector::Tag(selector))
+}
+
+fn is_identifier_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '_' | '-') || character >= '\u{80}'
+}
+
+fn is_class_identifier(name: &str) -> bool {
+    let mut characters = name.chars();
+    let Some(mut first) = characters.next() else {
+        return false;
+    };
+    if first == '-' {
+        let Some(next) = characters.next() else {
+            return false;
+        };
+        first = next;
+    }
+    (first.is_ascii_alphabetic() || matches!(first, '_' | '-') || first >= '\u{80}')
+        && characters.all(is_identifier_character)
 }
 
 fn parse_attribute_selector(selector: &str) -> Option<(&str, &str)> {
@@ -272,16 +303,17 @@ fn parse_attribute_selector(selector: &str) -> Option<(&str, &str)> {
         raw_value.as_bytes().last().copied(),
     ) {
         (Some(first @ (b'"' | b'\'')), Some(last)) if first == last => {
-            raw_value.get(1..raw_value.len().saturating_sub(1))?
+            let value = raw_value.get(1..raw_value.len().saturating_sub(1))?;
+            return (!value.is_empty()
+                && !value.chars().any(|character| {
+                    character.is_control() || matches!(character, '"' | '\'' | ']' | '\\')
+                }))
+            .then_some((attribute, value));
         }
         (Some(b'"' | b'\''), _) => return None,
         _ => raw_value,
     };
-    (!value.is_empty()
-        && !value
-            .bytes()
-            .any(|byte| matches!(byte, b'"' | b'\'' | b']')))
-    .then_some((attribute, value))
+    (!value.is_empty() && value.chars().all(is_identifier_character)).then_some((attribute, value))
 }
 
 fn attribute_matches(tag: &StructuralTag<'_>, attribute: &str, expected: &str) -> bool {

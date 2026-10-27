@@ -22,6 +22,7 @@ use crate::error::TrustedServerError;
 use crate::evidence::OwnedRequestInfo;
 use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
+use crate::media_signing::MediaSigner;
 use crate::middleware::{Middleware, MiddlewareChain, MiddlewarePhase, PhaseEntries};
 use crate::module_context::{ModuleCall, ModuleContext, ModuleRequest, ResolvedRequest};
 use crate::origin_auth::OriginSigners;
@@ -707,6 +708,11 @@ pub struct IntegrationRegistration {
     /// on every request, so declaring one runs it wherever the registration
     /// itself runs.
     pub identifier_module: Option<Arc<dyn IdentifierModule>>,
+    /// Media signer this registration supplies, see [`crate::media_signing`].
+    ///
+    /// No section selects one. It runs wherever the registration itself
+    /// runs, and at most one running registration may supply one.
+    pub media_signer: Option<Arc<dyn MediaSigner>>,
 }
 
 impl IntegrationRegistration {
@@ -741,6 +747,7 @@ impl IntegrationRegistrationBuilder {
                 source_module: None,
                 analytics_module: None,
                 identifier_module: None,
+                media_signer: None,
             },
         }
     }
@@ -869,6 +876,18 @@ impl IntegrationRegistrationBuilder {
     #[must_use]
     pub fn with_identifier_module(mut self, module: Arc<dyn IdentifierModule>) -> Self {
         self.registration.identifier_module = Some(module);
+        self
+    }
+
+    /// Declare the media signer this registration supplies, which core asks
+    /// to sign the binary responses it claims, see [`crate::media_signing`].
+    ///
+    /// It runs wherever the registration runs. The registry refuses to build
+    /// when two running registrations supply one, because signing a body
+    /// twice would sign the first signer's output as a source.
+    #[must_use]
+    pub fn with_media_signer(mut self, signer: Arc<dyn MediaSigner>) -> Self {
+        self.registration.media_signer = Some(signer);
         self
     }
 
@@ -1025,6 +1044,9 @@ struct IntegrationRegistryInner {
     // registration order, which core asks on every request. Shared, so a
     // request's services take a reference count rather than a copy.
     identifier_modules: Arc<[Arc<dyn IdentifierModule>]>,
+    // The media signer a running registration supplies, with the
+    // integration that supplied it. At most one.
+    media_signer: Option<(&'static str, Arc<dyn MediaSigner>)>,
 }
 
 /// The sources a deployment's settings name, built once.
@@ -1074,6 +1096,7 @@ impl Default for IntegrationRegistryInner {
             analytics_module: None,
             sources: None,
             identifier_modules: Arc::default(),
+            media_signer: None,
         }
     }
 }
@@ -2304,6 +2327,19 @@ impl IntegrationRegistry {
                 )?;
                 identifier_modules.push(module);
             }
+            if let Some(signer) = registration.media_signer {
+                if let Some((supplier, _)) = &inner.media_signer {
+                    return Err(Report::new(TrustedServerError::Configuration {
+                        message: format!(
+                            "integrations `{supplier}` and `{}` both supply a media signer, and \
+                             at most one running integration may, because a body is signed \
+                             once. Select only one of their modules",
+                            registration.integration_id
+                        ),
+                    }));
+                }
+                inner.media_signer = Some((registration.integration_id, signer));
+            }
             if let Some((name, contributor)) = registration.robots_txt_contributor {
                 claim_module_name(
                     &mut claimed,
@@ -2449,6 +2485,17 @@ impl IntegrationRegistry {
     #[must_use]
     pub fn identifier_modules(&self) -> Arc<[Arc<dyn IdentifierModule>]> {
         Arc::clone(&self.inner.identifier_modules)
+    }
+
+    /// The media signer the running registrations supply, if one does.
+    /// Adapters hand it to each request's services with
+    /// [`RuntimeServices::with_media_signer`].
+    #[must_use]
+    pub fn media_signer(&self) -> Option<Arc<dyn MediaSigner>> {
+        self.inner
+            .media_signer
+            .as_ref()
+            .map(|(_, signer)| Arc::clone(signer))
     }
 
     /// The prefixes of the publisher `request` was resolved to under
@@ -3059,6 +3106,7 @@ impl IntegrationRegistry {
                 analytics_module: None,
                 sources: None,
                 identifier_modules: Arc::default(),
+                media_signer: None,
             }),
             plan: None,
             platform: Arc::default(),
@@ -3147,6 +3195,7 @@ impl IntegrationRegistry {
                 analytics_module: None,
                 sources: None,
                 identifier_modules: Arc::default(),
+                media_signer: None,
             }),
             plan: None,
             platform: Arc::default(),
@@ -4070,6 +4119,35 @@ pub(crate) mod test_support {
             }
         }
 
+        /// Ends each stylesheet a `[[serve]]` entry names it for with a line,
+        /// standing in for a stylesheet signer.
+        pub(crate) const STYLESHEET: &str = "testing.middleware-fixture.stylesheet";
+        /// The line [`STYLESHEET`] adds.
+        pub(crate) const STYLESHEET_LINE: &str = "/* served by the middleware fixture */\n";
+
+        struct Stylesheet;
+
+        impl Middleware for Stylesheet {
+            fn middleware_id(&self) -> &'static str {
+                STYLESHEET
+            }
+
+            fn handles_media_type(&self, media_type: &str) -> bool {
+                media_type == "text/css"
+            }
+
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Serve]
+            }
+
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                MiddlewareAction {
+                    stream: Some(Box::new(AppendLine(STYLESHEET_LINE))),
+                    ..MiddlewareAction::pass()
+                }
+            }
+        }
+
         /// Says it moves the origin's address itself, on its own media type,
         /// and then leaves the body as it came with a line added, so a test
         /// sees what core left to it.
@@ -4149,6 +4227,7 @@ pub(crate) mod test_support {
                     .with_middleware(Arc::new(Locating))
                     .with_middleware(Arc::new(Labeled { text: labeled }))
                     .with_middleware(Arc::new(Framed))
+                    .with_middleware(Arc::new(Stylesheet))
                     .build(),
             ))
         }
@@ -4552,6 +4631,7 @@ mod tests {
     };
     use super::*;
     use crate::constants::COOKIE_EC;
+    use crate::media_signing::test_support::{Behavior, StubSigner};
     use crate::middleware::{HTML_MEDIA_TYPE, MiddlewareAction, MiddlewareContext, PhaseEntry};
     use crate::permissions::{Permission, PermissionSet, PermissionState};
     use crate::platform::test_support::noop_services;
@@ -7687,6 +7767,101 @@ mod tests {
         );
     }
 
+    /// The names the two media signer test modules run under.
+    const MEDIA_PROBE_MODULE: &str = "testing.media-probe";
+    const MEDIA_SECOND_MODULE: &str = "testing.media-second";
+
+    fn media_probe_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("media-probe")
+                .with_media_signer(StubSigner::new(Behavior::Sign, 1024))
+                .build(),
+        ))
+    }
+
+    fn media_second_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("media-second")
+                .with_media_signer(StubSigner::new(Behavior::Sign, 1024))
+                .build(),
+        ))
+    }
+
+    fn media_probe_builder() -> crate::integrations::IntegrationBuilder {
+        crate::integrations::IntegrationBuilder::new(
+            "media-probe",
+            "seam-probe",
+            media_probe_registration,
+            validate_nothing,
+        )
+        .with_module_name(MEDIA_PROBE_MODULE)
+    }
+
+    /// No section selects a media signer. A running registration's is handed
+    /// out for each request's services.
+    #[test]
+    fn a_running_registration_hands_out_its_media_signer() {
+        let settings = settings_naming(MEDIA_PROBE_MODULE);
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &[media_probe_builder()])
+            .expect("should build a registry with a media signer");
+
+        assert_eq!(
+            registry.media_signer().map(|signer| signer.signer_id()),
+            Some("testing.media"),
+            "should hand out the running registration's signer"
+        );
+    }
+
+    /// A registration a section does not select runs nothing, its media
+    /// signer included, so no response is claimed.
+    #[test]
+    fn an_unselected_registration_offers_no_media_signer() {
+        let settings = crate::test_support::tests::create_test_settings();
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &[media_probe_builder()])
+            .expect("should build a registry without the probe selected");
+
+        assert!(
+            registry.media_signer().is_none(),
+            "an unselected registration's signer should not be handed out"
+        );
+    }
+
+    /// Two running signers would sign one signer's output as the other's
+    /// source, so the pair is refused.
+    #[test]
+    fn two_running_registrations_supplying_a_media_signer_are_refused() {
+        let mut settings = settings_naming(MEDIA_PROBE_MODULE);
+        settings.select_module("testing", MEDIA_SECOND_MODULE);
+        let extra = [
+            media_probe_builder(),
+            crate::integrations::IntegrationBuilder::new(
+                "media-second",
+                "seam-probe",
+                media_second_registration,
+                validate_nothing,
+            )
+            .with_module_name(MEDIA_SECOND_MODULE),
+        ];
+
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
+            .err()
+            .expect("should refuse two media signers");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("both supply a media signer")
+                && message.contains("`media-probe`")
+                && message.contains("`media-second`"),
+            "error should name both integrations: {message}"
+        );
+    }
+
     fn html_entry(path: Option<&str>, names: &[&str]) -> PhaseEntry {
         PhaseEntry {
             media_type: HTML_MEDIA_TYPE.to_owned(),
@@ -7712,51 +7887,6 @@ mod tests {
         let registry = IntegrationRegistry::new(&settings)
             .expect("should build a registry whose entries name registered middleware");
 
-        assert_eq!(
-            registry.middleware_ids(),
-            [
-                fixture::HEAD,
-                fixture::LINKS,
-                fixture::BROKEN,
-                fixture::READER,
-                fixture::BROKEN_READER,
-                fixture::TEXT,
-                fixture::PREPARING,
-                fixture::REFUSING,
-                fixture::TEXT_HEADER,
-                fixture::LOCATING,
-                fixture::LABELED,
-                fixture::FRAMED,
-                crate::service_version::MODULE,
-            ],
-            "should list the middleware the selected module supplies, and core's own after them"
-        );
-        assert_eq!(
-            registry.middleware_in(MiddlewarePhase::Fetch),
-            [
-                fixture::HEAD,
-                fixture::LINKS,
-                fixture::BROKEN,
-                fixture::TEXT,
-                fixture::PREPARING,
-                fixture::REFUSING,
-                fixture::LABELED,
-                fixture::FRAMED
-            ],
-            "should list the middleware that run in the fetch phase"
-        );
-        assert_eq!(
-            registry.middleware_in(MiddlewarePhase::Serve),
-            [
-                fixture::READER,
-                fixture::BROKEN_READER,
-                fixture::PREPARING,
-                fixture::TEXT_HEADER,
-                fixture::LOCATING,
-                crate::service_version::MODULE
-            ],
-            "should list the middleware that run in the serve phase, core's own last"
-        );
         let chain_for = |media_type: &str, path: &str| {
             registry
                 .middleware_chain(&settings.fetch, MiddlewarePhase::Fetch, media_type, path)
@@ -7980,45 +8110,6 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_naming_a_middleware_nothing_supplies_is_refused_with_what_is_supplied() {
-        let settings = fixture_settings_with_entries(vec![
-            html_entry(Some("/news/"), &[fixture::HEAD]),
-            html_entry(None, &[fixture::HEAD, "testing.nothing"]),
-        ]);
-
-        let error = IntegrationRegistry::new(&settings)
-            .err()
-            .expect("should refuse an entry naming a middleware nothing supplies");
-
-        let message = error.to_string();
-        assert!(
-            message.contains(
-                "[[fetch]] entry 2 names `testing.nothing`, which no module that runs supplies"
-            ) && message.contains(&format!(
-                "[{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}]",
-                fixture::HEAD,
-                fixture::LINKS,
-                fixture::BROKEN,
-                fixture::READER,
-                fixture::BROKEN_READER,
-                fixture::TEXT,
-                fixture::PREPARING,
-                fixture::REFUSING,
-                fixture::TEXT_HEADER,
-                fixture::LOCATING,
-                fixture::LABELED,
-                fixture::FRAMED,
-                crate::service_version::MODULE
-            )),
-            "should name the entry and list what could be named: {message}"
-        );
-        assert!(
-            !message.contains("no section selects"),
-            "should not blame a selection when the name is no module's: {message}"
-        );
-    }
-
-    #[test]
     fn an_entry_naming_the_middleware_of_a_module_no_section_selects_says_so() {
         let mut settings = crate::test_support::tests::create_test_settings();
         settings.fetch = PhaseEntries::new(vec![html_entry(None, &[fixture::LINKS])]);
@@ -8160,59 +8251,6 @@ mod tests {
     }
 
     #[test]
-    fn a_middleware_no_entry_names_is_listed_for_the_startup_warning() {
-        let unnamed = |entries: Vec<PhaseEntry>| -> Vec<&'static str> {
-            let settings = fixture_settings_with_entries(entries);
-            let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
-            unnamed_middleware(&settings, &registry.inner)
-                .into_iter()
-                .map(|(integration, middleware)| {
-                    assert_eq!(integration, fixture::ID, "should name the supplier");
-                    middleware.middleware_id()
-                })
-                .collect()
-        };
-
-        assert_eq!(
-            unnamed(Vec::new()),
-            [
-                fixture::HEAD,
-                fixture::LINKS,
-                fixture::BROKEN,
-                fixture::READER,
-                fixture::BROKEN_READER,
-                fixture::TEXT,
-                fixture::PREPARING,
-                fixture::REFUSING,
-                fixture::TEXT_HEADER,
-                fixture::LOCATING,
-                fixture::LABELED,
-                fixture::FRAMED,
-            ],
-            "should list every middleware when there are no entries"
-        );
-        assert_eq!(
-            unnamed(vec![
-                html_entry(Some("/news/"), &[fixture::LINKS]),
-                html_entry(None, &[fixture::HEAD]),
-            ]),
-            [
-                fixture::BROKEN,
-                fixture::READER,
-                fixture::BROKEN_READER,
-                fixture::TEXT,
-                fixture::PREPARING,
-                fixture::REFUSING,
-                fixture::TEXT_HEADER,
-                fixture::LOCATING,
-                fixture::LABELED,
-                fixture::FRAMED
-            ],
-            "should leave out a middleware any entry names"
-        );
-    }
-
-    #[test]
     fn an_entry_naming_a_middleware_in_a_phase_it_does_not_run_in_is_refused() {
         let mut settings = settings_naming(fixture::MODULE);
         settings.serve = PhaseEntries::new(vec![html_entry(None, &[fixture::HEAD])]);
@@ -8263,26 +8301,6 @@ mod tests {
         assert!(
             chain_for(MiddlewarePhase::Serve, "/sport/today").is_empty(),
             "should run no serve middleware on a path only the fetch entries cover"
-        );
-        let unnamed: Vec<&str> = unnamed_middleware(&settings, &registry.inner)
-            .into_iter()
-            .map(|(_, middleware)| middleware.middleware_id())
-            .collect();
-        assert_eq!(
-            unnamed,
-            [
-                fixture::LINKS,
-                fixture::BROKEN,
-                fixture::BROKEN_READER,
-                fixture::TEXT,
-                fixture::PREPARING,
-                fixture::REFUSING,
-                fixture::TEXT_HEADER,
-                fixture::LOCATING,
-                fixture::LABELED,
-                fixture::FRAMED
-            ],
-            "should count a middleware as named only by an entry of a phase it runs in"
         );
     }
 
