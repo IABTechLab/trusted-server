@@ -7,6 +7,7 @@ import { GptDiagnosticsBindingManager } from './binding';
 import { GptDiagnosticsObserver } from './observer';
 import type { GptObserverWindow } from './observer';
 import { GptDiagnosticsOverlay } from './overlay';
+import { GptDiagnosticsPrebidRecorder } from './prebid';
 import { GptDiagnosticsSlotSizeObserver } from './slot_size_observer';
 import { GptDiagnosticsStore } from './store';
 
@@ -47,6 +48,7 @@ export function installGptDiagnosticsRuntime(
   let overlay: GptDiagnosticsOverlay | undefined;
   let slotSizeObserver: GptDiagnosticsSlotSizeObserver | undefined;
   let apiController: GptDiagnosticsApiController | undefined;
+  let prebidRecorder: GptDiagnosticsPrebidRecorder | undefined;
 
   try {
     if (!target.tsjs) throw new Error('TSJS core API unavailable');
@@ -78,6 +80,8 @@ export function installGptDiagnosticsRuntime(
     observer.install();
     const api = apiController.api;
     const recorder = apiController.recorder;
+    prebidRecorder = new GptDiagnosticsPrebidRecorder(target, recorder);
+    recorder.recordCompletedPrebidAuction = prebidRecorder.recordCompletedPrebidAuction;
     const runtime: GptDiagnosticsRuntime = {
       api,
       destroy: () => {
@@ -85,6 +89,7 @@ export function installGptDiagnosticsRuntime(
         if (target.tsjs?.gptDiagnosticsRecorder === recorder) {
           delete target.tsjs.gptDiagnosticsRecorder;
         }
+        prebidRecorder?.destroy();
         apiController?.destroy();
         overlay?.destroy();
         badges?.destroy();
@@ -98,6 +103,7 @@ export function installGptDiagnosticsRuntime(
     target.__tsjs_gpt_diagnostics_runtime = runtime;
     return api;
   } catch (error) {
+    prebidRecorder?.destroy();
     apiController?.destroy();
     overlay?.destroy();
     badges?.destroy();

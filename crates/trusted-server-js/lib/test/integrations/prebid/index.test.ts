@@ -362,6 +362,7 @@ import {
 import { log } from '../../../src/core/log';
 import type { TsjsApi } from '../../../src/core/types';
 import { GptDiagnosticsObserver } from '../../../src/integrations/gpt_diagnostics/observer';
+import { GptDiagnosticsPrebidRecorder } from '../../../src/integrations/gpt_diagnostics/prebid';
 import { GptDiagnosticsStore } from '../../../src/integrations/gpt_diagnostics/store';
 import envelope from '../../fixtures/aps-renderer-v1.json';
 
@@ -4485,7 +4486,18 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     document.body.replaceChildren();
   });
 
+  function attachPrebidDiagnostics() {
+    const recorder = testWindow.tsjs?.gptDiagnosticsRecorder;
+    if (recorder) {
+      recorder.recordCompletedPrebidAuction = new GptDiagnosticsPrebidRecorder(
+        window,
+        recorder
+      ).recordCompletedPrebidAuction;
+    }
+  }
+
   function installGpt(slots: Array<Record<string, unknown>>) {
+    attachPrebidDiagnostics();
     installedGptSlots = slots;
     for (const slot of slots) {
       if (!slot || typeof slot !== 'object') continue;
@@ -4545,6 +4557,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
               recordPrebidAuction: vi.fn(),
             } as unknown as TsjsApi['gptDiagnosticsRecorder'],
           };
+          attachPrebidDiagnostics();
           mockOnEvent.mockImplementation(() => {
             throw new Error('publisher onEvent failed');
           });

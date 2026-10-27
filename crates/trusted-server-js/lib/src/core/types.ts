@@ -378,6 +378,16 @@ export interface GptDiagnosticsRecorder {
   ): void;
   /** Mark slots whose next observed GPT request follows the Prebid refresh path. */
   recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
+  /** Observe the exact Prebid instance and slots after its targeting succeeds. */
+  recordCompletedPrebidAuction?(
+    prebid: {
+      onEvent?: (event: 'bidWon', listener: (bid: unknown) => void) => void;
+      offEvent?: (event: 'bidWon', listener: (bid: unknown) => void) => void;
+    },
+    rawAuctionId: unknown,
+    slots: Array<GptDiagnosticsSlotHandle & { getTargeting?: (key: string) => string[] }>,
+    adUnitCodes: string[]
+  ): void;
   /** Record a completed Prebid attempt at its targeting boundary for one exact GPT slot. */
   recordPrebidAuction(
     slot: GptDiagnosticsSlotHandle,

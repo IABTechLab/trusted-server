@@ -124,6 +124,7 @@ describe('GPT diagnostics integration composition', () => {
     // Evidence writers live on their own channel; the operator API stays read-only.
     expect(Object.keys(first!).sort()).toEqual(['export', 'hide', 'show', 'snapshot', 'subscribe']);
     expect(Object.keys(target.tsjs!.gptDiagnosticsRecorder!).sort()).toEqual([
+      'recordCompletedPrebidAuction',
       'recordPrebidAuction',
       'recordPrebidRefresh',
       'recordPrebidWin',
