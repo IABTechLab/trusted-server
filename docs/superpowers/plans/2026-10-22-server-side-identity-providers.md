@@ -119,7 +119,7 @@ Copied from the spec and `AGENTS.md`. Every task implicitly includes these.
 | `crates/trusted-server-core/src/integrations/registry.rs`                                                                                               | `BrowserSeed` and `is_real_browser` on `ProxyDispatchInput`; provider registration; capture-path check; capture plumbing                                                                                    | 23, 25, 32, 38                          |
 | `crates/trusted-server-core/src/integrations/gpt_diagnostics.rs`                                                                                        | `is_prefetch_request` caller                                                                                                                                                                                | 23                                      |
 | `crates/trusted-server-core/src/integrations/lockr.rs`                                                                                                  | Upstream log without the query string                                                                                                                                                                       | 38                                      |
-| `crates/trusted-server-js/lib/src/core/*.ts`, `src/integrations/prebid/*`, `test/**`                                                                    | The mirror writer; registered-first `ts-eids` trim; `ortb2` G10 test                                                                                                                                        | 26, 30, 31                              |
+| `crates/trusted-server-js/lib/src/core/*.ts`, `src/integrations/prebid/*`, `test/**`                                                                    | The mirror writer; registered-only, per-source `ts-eids` merge; `ortb2` G10 test                                                                                                                            | 26, 30, 31                              |
 | `crates/trusted-server-core/src/ec/rate_limiter.rs`                                                                                                     | `record` and `count`                                                                                                                                                                                        | 35                                      |
 | `crates/trusted-server-core/src/ec/batch_sync.rs` (and its adapter call site)                                                                           | Owned sources fill only when absent                                                                                                                                                                         | 40                                      |
 | `crates/trusted-server-core/src/ec/identity/examples.rs` (new, tests only)                                                                              | Spec 4.6 reference providers                                                                                                                                                                                | 32, 33, 39, 39b                         |
@@ -8170,7 +8170,7 @@ git commit --signoff -S -m "Add coordinator eligibility and outcome rules" -m "E
 - Produces:
   - `pub(crate) struct IdentityDeps<'a> { settings: &'a Settings, catalog: &'a ProviderCatalog, keys: &'a IdentityKeys, random: &'a dyn RandomSource, services: &'a RuntimeServices, rate_limiter: Option<&'a dyn RateLimiter> }`. This one struct keeps `handle_auction` and `handle_publisher_request` within 7 arguments. `keys` holds only the visitor key (Task 13). `random` draws record revisions when a mutation applies. Task 23 builds `IdentityDeps` from `IdentityRuntime`.
   - `pub(crate) struct Call { provider: IdentityProviderId, kinds: BTreeMap<SourceDomain, ResolveKind> }`
-  - `pub(crate) fn dispatch(deps: &IdentityDeps<'_>, calls: Vec<Call>, signals: &ResolveSignals<'_>, budget: Option<Duration>) -> Vec<(IdentityProviderId, CallOutcome)>`. `budget` is `Some(remaining hold budget)` for a hold dispatch before the auction and `None` after send.
+  - `pub(crate) async fn dispatch(deps: &IdentityDeps<'_>, calls: Vec<Call>, signals: &ResolveSignals<'_>, budget: Option<Duration>) -> Vec<(IdentityProviderId, CallOutcome)>`. `budget` is `Some(remaining hold budget)` for a hold dispatch before the auction and `None` after send. It awaits `send_async` and each pending response instead of calling `futures::executor::block_on`: the hold dispatch runs inside the publisher handler's executor, where a nested `block_on` panics. Only phase 4 (`run_after_send`, Task 29), which runs after send outside any executor, blocks on it.
   - `pub(crate) fn check_request(request: &ProviderRequest, descriptor: &ProviderDescriptor) -> Result<(), Report<IdentityProviderError>>`: `https` only, the host in `resolves.hosts()`, no `Cookie` header
   - `pub(crate) fn decode_body(encoding: Option<&str>, body: Vec<u8>, cap: usize) -> Option<Vec<u8>>`: identity, `gzip` or `br`, the cap applied to the decoded size, `None` when over the cap or for an unknown encoding
 
@@ -8802,7 +8802,7 @@ git commit --signoff -S -m "Queue browser ingest in the writer's mutation and st
 - Modify: `crates/trusted-server-core/src/ec/mod.rs` (`EcContext.client_eids` loses its ingest role)
 - Modify: `crates/trusted-server-core/src/integrations/prebid.rs` (the injected `window.__tsjs_prebid` config at about line 1485 gains `registeredSources`)
 - Create: `crates/trusted-server-js/lib/src/core/eids_mirror.ts` (writes `__Host-ts-eids-s` from a payload)
-- Modify: `crates/trusted-server-js/lib/src/integrations/prebid/eids.ts` (`fitEidCookie` at line 178 keeps registered sources first) and `prebid/index.ts` (reads the `/auction` payload)
+- Modify: `crates/trusted-server-js/lib/src/integrations/prebid/eids.ts` (the shim writes only registered sources into `ts-eids`, merged per source) and `prebid/index.ts` (reads the `/auction` payload)
 - Modify: `crates/trusted-server-js/lib/src/integrations/gpt/index.ts` (`PageBidsResponse` and its handler read the page-bids payload)
 - Test: `auction/endpoints.rs`, `publisher.rs`, `integrations/prebid.rs`, and the Vitest files next to each changed TS file
 
@@ -8814,7 +8814,7 @@ git commit --signoff -S -m "Queue browser ingest in the writer's mutation and st
   - `ResponseExt { orchestrator, ts_eids_s: Option<serde_json::Value> }`, with `#[serde(skip_serializing_if = "Option::is_none")]`, holding `MirrorPayload::to_json()`. The page-bids body gains a `ts_eids_s` member under the same rule.
   - `/auction`'s consent-denied early return still answers with `ts_eids_s = {"clear": true}`, so a withdrawal clears the mirror (spec 5.6).
   - TS: `writeEidsMirror(payload: unknown): void` in `core/eids_mirror.ts`. On `{value, max_age}` it writes `__Host-ts-eids-s=<value>; Path=/; Secure; SameSite=Lax; Max-Age=<max_age>`, skipping the write when the cookie already holds that value. On `{clear: true}` it expires the cookie. On anything else, absent included, it does nothing. It never reads the cookie for any other purpose and never copies it anywhere (spec 6.2, "No feedback").
-  - TS: `fitEidCookie(eids, registeredSources: ReadonlySet<string>)` drops unregistered sources before any registered one, keeping the EID fidelity trim order within each group (spec 5.3).
+  - TS: the shim keeps only entries whose source is in `registeredSources` and writes no `ts-eids` when no list is injected. It decodes the current cookie (`decodeEidCookie`), replaces its entries per source with the request's registered entries, keeps sources the request lacks, and then runs the EID fidelity trim on the merged set. A request with no EIDs leaves the cookie as it is; a TCF block still clears it (spec 5.3).
 
 What stops (spec 5.3, G10):
 
@@ -8867,7 +8867,7 @@ Expected: PASS.
 
 ```bash
 git add -A crates/trusted-server-core/src crates/trusted-server-js/lib/src
-git commit --signoff -S -m "Return the ts-eids-s mirror from /auction and stop stager ingest" -m "/auction and /_ts/page-bids no longer write browser EIDs to KV. Both return a ts_eids_s payload built from the servable server set, which the shim writes as the client-only __Host-ts-eids-s cookie, or a clear on denied consent, a tombstone or a missing row." -m "The shim's ts-eids trim keeps registered sources before unregistered ones, so the writer navigation's ingest still sees every registered source /auction used to ingest."
+git commit --signoff -S -m "Return the ts-eids-s mirror from /auction and stop stager ingest" -m "/auction and /_ts/page-bids no longer write browser EIDs to KV. Both return a ts_eids_s payload built from the servable server set, which the shim writes as the client-only __Host-ts-eids-s cookie, or a clear on denied consent, a tombstone or a missing row." -m "The shim writes only registered sources into ts-eids, merged per source, so the writer navigation's ingest still sees every registered source /auction used to ingest."
 ```
 
 ### Task 27: The withdrawal tombstone's after-send attempt
@@ -9096,7 +9096,7 @@ git commit --signoff -S -m "Flush identity changes once after send and run pull 
 **Files:**
 
 - Modify (tests only): `crates/trusted-server-adapter-fastly/src/main.rs`, a `#[cfg(test)] mod identity_writes` nested in its `mod tests`. The adapter is a binary crate with no `src/lib.rs`, so a `tests/` file could not import its items; every test here drives a request through Task 29's `drive_request_for_test`.
-- Modify (tests only): `crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts` or `eids.test.ts`, for the `ortb2` half of G10, the registered-first trim and the `ts-eids` golden
+- Modify (tests only): `crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts` or `eids.test.ts`, for the `ortb2` half of G10, the registered-only merge and the `ts-eids` golden
 - Test only
 
 **Interfaces:**
@@ -9190,7 +9190,7 @@ Add `identity_measurement_records_counts_for_a_writer_navigation` (a writer navi
 
 - [ ] **Step 2: Docs**
 
-- `edge-cookies.md`: add a section for `__Host-ts-eids-s`: a client-only mirror of the server IDs that the shim writes from `/auction` and `/_ts/page-bids` responses for page scripts, with `Path=/; Secure; SameSite=Lax`, not `HttpOnly`, a `Max-Age` of at most one day and never past the earliest ID expiry, and a 2,048-byte cap that leaves out whole sources by `cookie_priority`. The server never reads it, and it is stripped from origin and Prebid Server requests (Tasks 1 to 4). Note that `ts-ec-pull-complete` is gone. Describe the writer-request rule in plain words: only a full page navigation from a returning visitor writes KV, once, after the page is sent. Say that the shim's `ts-eids` trim now keeps registered sources first.
+- `edge-cookies.md`: add a section for `__Host-ts-eids-s`: a client-only mirror of the server IDs that the shim writes from `/auction` and `/_ts/page-bids` responses for page scripts, with `Path=/; Secure; SameSite=Lax`, not `HttpOnly`, a `Max-Age` of at most one day and never past the earliest ID expiry, and a 2,048-byte cap that leaves out whole sources by `cookie_priority`. The server never reads it, and it is stripped from origin and Prebid Server requests (Tasks 1 to 4). Note that `ts-ec-pull-complete` is gone. Describe the writer-request rule in plain words: only a full page navigation from a returning visitor writes KV, once, after the page is sent. Say that the shim now writes only registered sources into `ts-eids` and merges each auction's entries per source.
 - `configuration.md`: the `[ec.identity]` table, with every key, its default and its meaning, from spec 10.1. Name `revoke_scope` as applying from Part 2. Name the removed keys and their replacements: `ec.pull_sync_concurrency` becomes `[ec.identity].max_concurrency`; `pull_sync_ttl_sec` becomes `refresh_after_sec` and `pull_sync_rate_limit = N` becomes `max_calls_per_minute = ceil(N / 60)`, both in `[ec.identity.providers.<pull-id>]` (Tasks 19 and 22). Give the ID rule with examples: `ssp.example.com` is `pull-ssp-example-com`, and a domain that contains `-`, or an ID over 63 characters, also gets `-` and 8 hex digits of the domain's SHA-256 (spec 10.4). Validation rejects the old keys. The capture provider checklist lands with capture, in Task 41.
 - `ec-setup-guide.md`: pull partners now run from a visitor's second page load, back off on errors, and are paced by their provider table.
 - `api-reference.md`: `/_ts/api/v1/identify`, `/auction` and `/_ts/page-bids` no longer write KV, and `/identify` omits expired IDs. `/identify`'s response shape is unchanged: one UID per source, even for a record that holds several. Document `ext.ts_eids_s` in the `/auction` response and `ts_eids_s` in the page-bids body, with the `value`, `clear` and absent cases (spec 6.2).
@@ -9200,7 +9200,7 @@ Add `identity_measurement_records_counts_for_a_writer_navigation` (a writer navi
   - `/auction`, `/_ts/page-bids` and `/identify` no longer writing
   - pull partners from the second page load, paced by their provider table
   - the removed config keys and their replacements, and that validation now rejects the old ones
-  - the `ts-eids-s` mirror payload and the shim's registered-first trim
+  - the `ts-eids-s` mirror payload and the shim's registered-only `ts-eids` merge
   - the removed `ts-ec-pull-complete` cookie
   - KV schema version 2, and that rolling back past this release is unsupported
   - the removed `EID sync measurement: ...` log line for returning visitors and its replacement, the `identity request measurement: ...` line, because operator dashboards may read it
@@ -9531,7 +9531,7 @@ git commit --signoff -S -m "Apply owner precedence and clear provider opt-outs o
 - Consumes: `IdentityDeps` (Task 21), `eligibility` with `Phase::Hold` and `outcome_to_changes` (Task 20), `dispatch` with a budget (Task 21), the `ServerSet` (Task 28), and `IdentityMutation::retain_for_error_status` (Task 29)
 - Produces:
   - `pub(crate) struct HoldResults { additions: BTreeMap<SourceDomain, Vec<KvEid>>, writer: BTreeMap<SourceDomain, IdentityProviderId> }`: the answers this auction's server set adds, per source, with the provider that wrote each, so Task 28's output rules can apply that provider's provenance default. `ServerSet::with_hold_results(&mut self, results: HoldResults)` overlays them, replacing the stored value for each source they name.
-  - `pub(crate) fn run_hold(deps: &IdentityDeps<'_>, context: &mut EcContext) -> HoldResults`. On a returning writer navigation that runs an auction, it dispatches every provider `eligibility(.., Phase::Hold)` passes on the phase 1 view, within `hold_budget_ms` measured from the first dispatch, each waiting `min(hold_timeout_ms, remaining budget)` (spec 4.7). The phase 1 read already confirmed a live, consenting row, so no EC ID is disclosed before consent is confirmed.
+  - `pub(crate) async fn run_hold(deps: &IdentityDeps<'_>, context: &mut EcContext) -> HoldResults`, awaited by `hold_before_auction` in `handle_publisher_request` (see `dispatch`, Task 21, for why it must not block). On a returning writer navigation that runs an auction, it dispatches every provider `eligibility(.., Phase::Hold)` passes on the phase 1 view, within `hold_budget_ms` measured from the first dispatch, each waiting `min(hold_timeout_ms, remaining budget)` (spec 4.7). The phase 1 read already confirmed a live, consenting row, so no EC ID is disclosed before consent is confirmed.
     - Each outcome becomes changes through `outcome_to_changes` and joins the writer's mutation, stateful providers included. No answer goes into a cookie (spec 4.7, "Results").
     - Each `found` set also feeds this auction through `HoldResults`: one `Eid` per entry, in the order the provider returned it, after the browser entries, with the provider's provenance default applied (Task 28).
     - A cut-off call is `HoldCutOff`: `n = now + hold_retry_sec`, and no failure is counted.
@@ -9921,7 +9921,7 @@ Open the PR against `feat/1246-identity-single-write` with `pr-creator`. Title: 
 | 2.1 G7 (expiry, refresh)                                                                | 14, 15, 20, 36                                                                                 |
 | 2.1 G8 (pull sync on the trait)                                                         | 21 (hourly rotation), 22, 29                                                                   |
 | 2.1 G9 (HEM slot)                                                                       | 9 (always empty in v1)                                                                         |
-| 2.1 G10 (no lost EIDs; registered-first trim)                                           | 25, 26, 30 (including an `ortb2`-only EID)                                                     |
+| 2.1 G10 (no lost EIDs; registered-only merge)                                           | 25, 26, 30 (including an `ortb2`-only EID)                                                     |
 | 2.1 G12 (removals win)                                                                  | 15, 18, 27, 28 (denials), 29 (removal-only retry), 36, 38                                      |
 | 2.1 G13 (complete provider EIDs, nothing that predates the spec changes)                | 6, 7, 8, 9, 10, 13, 14, 15, 17, 22, 24, 25, 26, 28, 30, 36, 37, 39, 39b, 40                    |
 | 3.4 platform facts (status capture, real-browser gate, clock failure)                   | 14, 23, 29, 38                                                                                 |
@@ -9934,7 +9934,7 @@ Open the PR against `feat/1246-identity-single-write` with `pr-creator`. Title: 
 | 4.7 eligibility, dispatch, hold timing, breaker, revoke-only capture, real-browser gate | 20, 21, 35, 37, 38                                                                             |
 | 5.1 writer and stagers, status rule, withdrawal exception and its after-send run        | 23, 25, 27, 29, 38, 39b                                                                        |
 | 5.2 phases 1 to 4, phase 1 read on every writer, removal-only retry                     | 23, 25, 29                                                                                     |
-| 5.3 stagers, the capture removal write, the mirror payload, registered-first trim       | 18, 25, 26, 38                                                                                 |
+| 5.3 stagers, the capture removal write, the mirror payload, registered-only merge       | 18, 25, 26, 38                                                                                 |
 | 5.4 `IdentityMutation`, whole-set writes, `iv` and `ov` at apply, `ps` pruning          | 15                                                                                             |
 | 5.5 orphans, collisions, deletion                                                       | 25, 30 (the deletion framework itself is deferred; its tombstone rule is a note for that work) |
 | 5.6 rules that keep removals winning                                                    | 15, 18, 26, 29, 38                                                                             |

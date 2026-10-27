@@ -1539,7 +1539,10 @@ to `max_concurrency` at once, with a backend first-byte timeout of the
 provider's timeout (`after_send_timeout_ms` after send; before the auction,
 `min(timeout_ms, remaining budget)`,
 rounded to buckets as `auction/orchestrator.rs:453-473` does). It does not
-follow redirects. It reads at most `max_response_bytes`, checked against
+follow redirects. The dispatch is async. Before the auction it is awaited
+inside the request handler, which already runs on an executor, so it never
+blocks on a nested executor there; after send, outside any executor, phase 4
+blocks on it once. It reads at most `max_response_bytes`, checked against
 `Content-Length` first (`pull_sync.rs:412`) and against the buffered body
 (`pull_sync.rs:472-474`). It undoes `Content-Encoding` with the same cap
 applied to the decoded size, then passes the `ProviderResponse` to
