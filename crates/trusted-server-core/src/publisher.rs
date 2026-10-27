@@ -25147,6 +25147,16 @@ mod tests {
             .expect("should produce a no-bid response without providers");
 
             assert_eq!(response.status(), StatusCode::OK);
+            let body_bytes = response
+                .into_body()
+                .into_bytes()
+                .expect("should read zero-provider page-bids body");
+            let body: serde_json::Value = serde_json::from_slice(&body_bytes)
+                .expect("should parse zero-provider page-bids body");
+            assert!(
+                body.get("auctionDiagnostics").is_none(),
+                "should omit diagnostics when no provider launched"
+            );
             let snapshot = timings.snapshot();
             assert!(snapshot.auction_dispatched_ms.is_none());
             assert!(snapshot.auction_resolved_ms.is_none());
