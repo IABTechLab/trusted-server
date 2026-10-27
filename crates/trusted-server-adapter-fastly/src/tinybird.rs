@@ -257,31 +257,27 @@ fn build_access_events_request(
         })
 }
 
-/// Sends one post-send access-log row to the Tinybird Events API and waits
-/// for the response.
+/// Starts a best-effort POST of one post-send access-log row to Tinybird.
 ///
-/// Unlike [`FastlyTinybirdAuctionTelemetrySink::emit_auction_events`], which
-/// dispatches without awaiting the ingest reply, this waits after the client
-/// response has been handed to the transport. It does not extend that response's
-/// measured timing, but it occupies a reused sandbox and can delay its next
-/// request. A completed transport handoff does not confirm client receipt.
-/// `client` is the adapter's
-/// stateless platform HTTP client in production
+/// The pending handle is dropped without waiting for the ingest reply or
+/// retrying. Fastly SDK 0.12.1 documents that `Request::send_async` continues
+/// transmitting headers and body in the background even after the initiating
+/// Compute program exits, and permits discarding `PendingRequest` for side
+/// effects. This avoids holding a reused sandbox until the ingest reply.
+/// Dispatch success does not confirm remote ingest acceptance: later transport
+/// failures and non-2xx statuses are not observable here. Likewise, the earlier
+/// client-response transport handoff does not confirm client receipt.
+///
+/// `client` is the adapter's stateless platform HTTP client in production
 /// ([`crate::platform::FastlyPlatformHttpClient`]); accepting it as `&dyn
-/// PlatformHttpClient` here (rather than that concrete type) is what lets
-/// tests substitute a recording double instead of performing a real network
-/// send, matching how [`RuntimeServices::http_client`] is consumed
-/// elsewhere. `target` is derived from settings once at the post-send call
-/// site rather than threaded through any per-route state.
-///
-/// A non-2xx status is reported as `Err` naming the status; there is no
-/// retry — the caller logs exactly one warning and moves on.
+/// PlatformHttpClient` lets tests substitute a recording double.
+/// `target` is derived from settings once at the post-send call site.
 ///
 /// # Errors
 ///
 /// Returns `Err` when the row exceeds the configured request-body limit, the
-/// backend cannot be registered, the request cannot be built or sent, or the
-/// Tinybird Events API responds with a non-2xx status.
+/// authorization header is invalid, the backend cannot be registered, or the
+/// request cannot be built or started.
 pub(crate) async fn emit_access_event(
     client: &dyn PlatformHttpClient,
     target: &TinybirdEventsTarget,
@@ -318,26 +314,14 @@ pub(crate) async fn emit_access_event(
         backend_name
     );
 
-    // The response body is never consumed, so stream it: buffered
-    // conversion on Fastly materializes the body before the size limit is
-    // enforced, which a chunked response could abuse.
-    let response = client
-        .send(PlatformHttpRequest::new(request, backend_name).with_stream_response())
+    let pending = client
+        .send_async(PlatformHttpRequest::new(request, backend_name))
         .await
         .change_context(TrustedServerError::Proxy {
-            message: "failed to send Tinybird access telemetry request".to_owned(),
+            message: "failed to start Tinybird access telemetry request".to_owned(),
         })?;
-
-    if response.response.status().is_success() {
-        Ok(())
-    } else {
-        Err(Report::new(TrustedServerError::Proxy {
-            message: format!(
-                "Tinybird access telemetry request failed with status {}",
-                response.response.status()
-            ),
-        }))
-    }
+    drop(pending);
+    Ok(())
 }
 
 fn tinybird_backend_spec(api_host: &str) -> PlatformBackendSpec {
@@ -363,6 +347,7 @@ fn tinybird_events_uri(api_host: &str, dataset: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use error_stack::Report;
@@ -464,33 +449,48 @@ mod tests {
         uri: String,
         headers: Vec<(String, String)>,
         body: Vec<u8>,
-        stream_response: bool,
     }
 
-    /// Records outbound requests and, for [`PlatformHttpClient::send`] (the
-    /// blocking variant `emit_access_event` uses), returns a synthetic
-    /// response carrying `respond_status` instead of performing a real
-    /// network send.
+    struct RecordedPending(Arc<AtomicUsize>);
+
+    impl Drop for RecordedPending {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     #[derive(Default)]
     struct RecordingHttpClient {
         requests: Mutex<Vec<RecordedRequest>>,
+        send_calls: AtomicUsize,
+        send_async_calls: AtomicUsize,
+        wait_calls: AtomicUsize,
         select_calls: Mutex<usize>,
-        respond_status: Mutex<u16>,
+        fail_async_start: bool,
+        pending_drops: Arc<AtomicUsize>,
     }
 
     impl RecordingHttpClient {
-        /// Status [`PlatformHttpClient::send`] should reply with. Irrelevant
-        /// to auction-sink tests, which only exercise `send_async`.
-        fn respond_with(status: u16) -> Self {
-            Self {
-                respond_status: Mutex::new(status),
-                ..Self::default()
-            }
+        fn assert_no_response_wait(&self) {
+            assert_eq!(
+                self.send_calls.load(Ordering::SeqCst),
+                0,
+                "must not send synchronously"
+            );
+            assert_eq!(
+                self.wait_calls.load(Ordering::SeqCst),
+                0,
+                "must not wait on a pending request"
+            );
+            assert_eq!(
+                *self.select_calls.lock().expect("should lock select calls"),
+                0,
+                "must not select a response"
+            );
         }
 
         fn record(&self, request: PlatformHttpRequest) {
             let backend_name = request.backend_name;
-            let stream_response = request.stream_response;
             let (parts, body) = request.request.into_parts();
             let headers = parts
                 .headers
@@ -508,7 +508,6 @@ mod tests {
                 uri: parts.uri.to_string(),
                 headers,
                 body: body.into_bytes().unwrap_or_default().to_vec(),
-                stream_response,
             };
             self.requests
                 .lock()
@@ -521,29 +520,33 @@ mod tests {
     impl PlatformHttpClient for RecordingHttpClient {
         async fn send(
             &self,
-            request: PlatformHttpRequest,
+            _request: PlatformHttpRequest,
         ) -> Result<PlatformResponse, Report<PlatformError>> {
-            self.record(request);
-            let status = *self
-                .respond_status
-                .lock()
-                .expect("should lock configured response status");
-            let response = edgezero_core::http::response_builder()
-                .status(
-                    edgezero_core::http::StatusCode::from_u16(status)
-                        .expect("should build a valid test status code"),
-                )
-                .body(edgezero_core::body::Body::empty())
-                .expect("should build test response");
-            Ok(PlatformResponse::new(response))
+            self.send_calls.fetch_add(1, Ordering::SeqCst);
+            Err(Report::new(PlatformError::Unsupported))
         }
 
         async fn send_async(
             &self,
             request: PlatformHttpRequest,
         ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            self.send_async_calls.fetch_add(1, Ordering::SeqCst);
             self.record(request);
-            Ok(PlatformPendingRequest::new(()).with_backend_name("tinybird-backend"))
+            if self.fail_async_start {
+                return Err(Report::new(PlatformError::HttpClient));
+            }
+            Ok(
+                PlatformPendingRequest::new(RecordedPending(Arc::clone(&self.pending_drops)))
+                    .with_backend_name("tinybird-backend"),
+            )
+        }
+
+        async fn wait(
+            &self,
+            _pending: PlatformPendingRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            self.wait_calls.fetch_add(1, Ordering::SeqCst);
+            Err(Report::new(PlatformError::Unsupported))
         }
 
         async fn select(
@@ -873,7 +876,7 @@ mod tests {
         let mut config = enabled_config();
         config.max_body_bytes = 1024;
         let target = TinybirdEventsTarget::from_access_config(&config);
-        let http_client = RecordingHttpClient::respond_with(202);
+        let http_client = RecordingHttpClient::default();
         let row = "x".repeat(1025);
 
         let result = futures::executor::block_on(emit_access_event(&http_client, &target, row));
@@ -898,7 +901,7 @@ mod tests {
         let mut config = enabled_config();
         config.max_body_bytes = 1024;
         let target = TinybirdEventsTarget::from_access_config(&config);
-        let http_client = RecordingHttpClient::respond_with(202);
+        let http_client = RecordingHttpClient::default();
         let row = "x".repeat(1023);
 
         futures::executor::block_on(emit_access_event(&http_client, &target, row.clone()))
@@ -914,13 +917,13 @@ mod tests {
     }
 
     #[test]
-    fn access_emitter_posts_ndjson_and_validates_2xx() {
+    fn access_emitter_posts_ndjson_and_drops_pending_without_waiting() {
         let target = TinybirdEventsTarget::from_access_config(&enabled_config());
-        let http_client = RecordingHttpClient::respond_with(202);
+        let http_client = RecordingHttpClient::default();
         let row = r#"{"status":200}"#.to_owned();
 
         futures::executor::block_on(emit_access_event(&http_client, &target, row.clone()))
-            .expect("should accept a 202 response");
+            .expect("should start the access telemetry request");
 
         let requests = http_client
             .requests
@@ -933,6 +936,10 @@ mod tests {
         );
         assert_eq!(requests[0].method, Method::POST.to_string());
         assert_eq!(
+            header_value(&requests[0].headers, header::CONTENT_TYPE.as_str()),
+            Some(TINYBIRD_NDJSON_CONTENT_TYPE)
+        );
+        assert_eq!(
             header_value(&requests[0].headers, header::AUTHORIZATION.as_str()),
             Some("Bearer access-append-token")
         );
@@ -942,37 +949,104 @@ mod tests {
             format!("{row}\n"),
             "should send newline-delimited JSON, matching the auction sink's framing"
         );
-        assert!(
-            requests[0].stream_response,
-            "should stream the Tinybird response: the body is never consumed"
+        http_client.assert_no_response_wait();
+        assert_eq!(http_client.send_async_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            http_client.pending_drops.load(Ordering::SeqCst),
+            1,
+            "should drop the pending handle before returning"
         );
     }
 
     #[test]
-    fn access_emitter_warns_and_drops_on_non_2xx() {
+    fn access_emitter_surfaces_async_start_failure_without_retrying() {
         let target = TinybirdEventsTarget::from_access_config(&enabled_config());
-        let http_client = RecordingHttpClient::respond_with(422);
+        let http_client = RecordingHttpClient {
+            fail_async_start: true,
+            ..RecordingHttpClient::default()
+        };
 
-        let result = futures::executor::block_on(emit_access_event(
+        let error = futures::executor::block_on(emit_access_event(
             &http_client,
             &target,
-            r#"{"status":422}"#.to_owned(),
-        ));
+            r#"{"status":200}"#.to_owned(),
+        ))
+        .expect_err("should surface the dispatch failure");
 
-        let error = result.expect_err("a 422 response should be reported as an error");
         assert!(
-            error.to_string().contains("422"),
-            "error should name the failing status: {error}"
+            error
+                .to_string()
+                .contains("failed to start Tinybird access telemetry request")
         );
         assert_eq!(
-            http_client
-                .requests
-                .lock()
-                .expect("should lock recorded requests")
-                .len(),
+            http_client.send_async_calls.load(Ordering::SeqCst),
             1,
-            "should not retry after a non-2xx response"
+            "must not retry"
         );
+        assert_eq!(
+            http_client.pending_drops.load(Ordering::SeqCst),
+            0,
+            "failed dispatch must not create a pending handle"
+        );
+        http_client.assert_no_response_wait();
+    }
+
+    #[test]
+    fn access_emitter_preserves_existing_newline() {
+        let target = TinybirdEventsTarget::from_access_config(&enabled_config());
+        let http_client = RecordingHttpClient::default();
+        let row = "{\"status\":200}\n".to_owned();
+
+        futures::executor::block_on(emit_access_event(&http_client, &target, row.clone()))
+            .expect("should start the access telemetry request");
+
+        let requests = http_client
+            .requests
+            .lock()
+            .expect("should lock recorded requests");
+        assert_eq!(requests[0].body, row.as_bytes());
+    }
+
+    #[test]
+    fn access_emitter_counts_added_newline_against_body_limit() {
+        let mut config = enabled_config();
+        config.max_body_bytes = 1024;
+        let target = TinybirdEventsTarget::from_access_config(&config);
+        let http_client = RecordingHttpClient::default();
+
+        let error =
+            futures::executor::block_on(emit_access_event(&http_client, &target, "x".repeat(1024)))
+                .expect_err("should count the added newline toward the body limit");
+
+        assert!(
+            error
+                .to_string()
+                .contains("1025 bytes, exceeding 1024 byte limit"),
+            "error should count the added newline: {error}"
+        );
+        assert_eq!(http_client.send_async_calls.load(Ordering::SeqCst), 0);
+        http_client.assert_no_response_wait();
+    }
+
+    #[test]
+    fn access_emitter_rejects_invalid_authorization_before_dispatch() {
+        let mut config = enabled_config();
+        config.access_token_secret = Some(Redacted::new("invalid\ntoken".to_owned()));
+        let target = TinybirdEventsTarget::from_access_config(&config);
+        let http_client = RecordingHttpClient::default();
+
+        let error =
+            futures::executor::block_on(emit_access_event(&http_client, &target, "{}".to_owned()))
+                .expect_err("should reject an invalid authorization header");
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid Tinybird authorization header"),
+            "error should name the invalid authorization header: {error}"
+        );
+        assert_eq!(http_client.send_async_calls.load(Ordering::SeqCst), 0);
+        http_client.assert_no_response_wait();
     }
 
     #[test]
