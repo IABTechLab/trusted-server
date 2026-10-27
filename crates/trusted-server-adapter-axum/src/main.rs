@@ -33,7 +33,9 @@ fn main() {
     let adapter_port = std::env::var_os("EDGEZERO__ADAPTER__PORT");
     let addr = parse_bind_address(host.as_deref(), port.as_deref(), adapter_port.as_deref())
         .unwrap_or_else(|error| {
-            log::error!("Invalid runtime bind address: {error}");
+            // Write directly so the refusal stays visible when `RUST_LOG=off`
+            // or logger initialization failed.
+            eprintln!("error: invalid runtime bind address: {error}");
             std::process::exit(1);
         });
     let config = AxumDevServerConfig {

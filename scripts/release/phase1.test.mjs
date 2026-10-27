@@ -116,7 +116,11 @@ test('workflow signs only tags, separates privileged jobs, and never checks out 
     /cancel-in-progress:.*pull_request/
   )
   assert.doesNotMatch(workflow, /workflow_dispatch|--clobber/)
-  for (const line of workflow
+  for (const line of [
+    workflow,
+    readFileSync('.github/workflows/release.yml', 'utf8'),
+  ]
+    .join('\n')
     .split('\n')
     .filter((line) => /uses: .*@/.test(line))) {
     assert.match(line, /@[a-f0-9]{40} # v/)
@@ -190,7 +194,6 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'attestation-other-tag-before-current',
     'attestation-other-malformed',
     'attestation-other-unverifiable',
-    'attestation-other-transient',
     'attestation-substituted-bundle',
     'attestation-verification-failure',
   ]) {
@@ -201,7 +204,6 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     const waits = [],
       ignored = []
     let downloads = 0,
-      otherReads = 0,
       now = 0
     let polls = 0,
       observed = []
@@ -295,6 +297,11 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
       const fetch = async (url, options = {}) => {
         const u = new URL(url)
         const method = options.method ?? 'GET'
+        assert.equal(
+          Boolean(options.signal),
+          method === 'GET',
+          `should time-bound every read and only reads: ${method} ${u.pathname}`
+        )
         if (
           calls.some(([kind]) => kind === 'gh') &&
           (mode === 'post-read-error' ||
@@ -404,7 +411,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         console: {
           log: (...args) => {
             if (
-              args[0] === 'Ignored verified release attestation for other tag:'
+              args[0] === 'Ignored release attestation for other tag:'
             )
               ignored.push(args[1])
           },
@@ -478,12 +485,6 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
                   return Buffer.from('verified asset')
                 const tag = args[1].at(-1)
                 if (
-                  mode === 'attestation-other-transient' &&
-                  tag === 'v1.0.0-rc.1' &&
-                  ++otherReads === 1
-                )
-                  throw Object.assign(Error('timeout'), { code: 'ETIMEDOUT' })
-                if (
                   mode === 'attestation-verification-failure' ||
                   (mode === 'attestation-other-unverifiable' &&
                     tag === 'v1.0.0-rc.1')
@@ -515,11 +516,11 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         'idle-socket',
         'stable',
         'download-transient',
-        'attestation-other-transient',
         'attestation-404-then-present',
         'attestation-after-two-waits',
         'attestation-other-tag',
         'attestation-other-tag-before-current',
+        'attestation-other-unverifiable',
       ].includes(mode)
       if (successful) await execute()
       else
@@ -554,13 +555,16 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           calls.filter(
             ([method, args]) => method === 'gh' && args[1][1] !== 'download'
           ).length,
-          mode === 'attestation-other-transient'
-            ? 32
-            : mode === 'attestation-other-tag'
-              ? 31
-              : mode === 'attestation-other-tag-before-current'
-                ? 33
-                : 30
+          30
+        )
+        assert.ok(
+          !calls.some(
+            ([method, args]) =>
+              method === 'gh' &&
+              args[1][1] === 'verify' &&
+              args[1].at(-1) === 'v1.0.0-rc.1'
+          ),
+          'should not verify another tag release attestation'
         )
       }
       assert.equal(
@@ -588,10 +592,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         const expectedWaits =
           mode === 'attestation-404-never'
             ? [2000, 5000, 10000, 20000]
-            : [
-                  'attestation-404-then-present',
-                  'attestation-other-transient',
-                ].includes(mode)
+            : mode === 'attestation-404-then-present'
               ? [2000]
               : [
                     'attestation-after-two-waits',
@@ -600,11 +601,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
                 ? [2000, 5000]
                 : []
         assert.deepEqual(waits, expectedWaits, mode)
-        assert.equal(
-          polls,
-          mode === 'attestation-other-transient' ? 1 : expectedWaits.length + 1,
-          mode
-        )
+        assert.equal(polls, expectedWaits.length + 1, mode)
         assert.equal(
           calls.filter(
             ([method, path]) => method === 'POST' && path.endsWith('/releases')
@@ -626,7 +623,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         )
         assert.deepEqual(
           ignored,
-          ['attestation-other-tag', 'attestation-other-transient'].includes(
+          ['attestation-other-tag', 'attestation-other-unverifiable'].includes(
             mode
           )
             ? ['"v1.0.0-rc.1"']
@@ -905,10 +902,16 @@ test('workflows select exactly the descriptive cohort and restrict actual build 
     )
   const actualBuild = build.split('\n  build:')[1].split('\n  sign:')[0]
   assert.doesNotMatch(actualBuild, /id-token|attestations:/)
-  assert.match(release, /vars\.RELEASE_PUBLICATION_ENABLED == 'true'/)
-  assert.match(
-    build.split('\n  sign:')[1],
-    /vars\.RELEASE_PUBLICATION_ENABLED == 'true'/
+  // Signing and publication need a push of a `v*` tag and the enablement variable.
+  const gate =
+    "if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.RELEASE_PUBLICATION_ENABLED == 'true'\n"
+  assert.ok(
+    release.split('\n  release:')[1]?.includes(gate),
+    'should gate publication on a v* tag push and enablement'
+  )
+  assert.ok(
+    build.split('\n  sign:')[1]?.split('\n  release:')[0].includes(gate),
+    'should gate signing on a v* tag push and enablement'
   )
 })
 test('release preflight rejects inherited controls in an isolated script fixture', () => {

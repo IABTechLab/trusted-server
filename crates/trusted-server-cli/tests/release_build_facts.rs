@@ -192,16 +192,13 @@ fn actual_cli_version_reads_all_owning_facts_and_ignores_external_tags() {
         BuildVariant::Default,
         "should use CLI default variant"
     );
+    // CI compiles this test once in release mode; the supplied commit must
+    // reach the actual CLI unchanged.
     if cfg!(trusted_server_release_build) {
-        let source = BUILD_INFO
-            .source()
-            .expect("should compile release source into the actual CLI");
-        assert_eq!(source.len(), 40, "should preserve complete release source");
-        assert!(
-            source
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-            "should use lowercase source SHA in release facts"
+        assert_eq!(
+            BUILD_INFO.source(),
+            option_env!("TRUSTED_SERVER__GIT_VERSION"),
+            "should compile the exact supplied release source into the actual CLI"
         );
     }
     let directory = tempfile::tempdir().expect("should create outside-checkout fixture");
