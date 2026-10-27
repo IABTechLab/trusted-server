@@ -2028,7 +2028,7 @@ impl TinybirdSettings {
             let token = self.auction_token_secret.as_ref().ok_or_else(|| {
                 Report::new(TrustedServerError::Configuration {
                     message:
-                        "tinybird.auction_token_secret is required when Tinybird telemetry is enabled"
+                        "tinybird.auction_token_secret is required when tinybird.auction_enabled is true"
                             .to_owned(),
                 })
             })?;
@@ -2036,6 +2036,11 @@ impl TinybirdSettings {
         }
         if self.access_enabled {
             validate_tinybird_dataset(&self.access_dataset, "tinybird.access_dataset")?;
+            if self.access_dataset == "access_logs_raw" {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: "tinybird.access_dataset must not be access_logs_raw when access telemetry is enabled; use access_logs_v2 or a datasource with the v2 schema".to_owned(),
+                }));
+            }
             let token = self.access_token_secret.as_ref().ok_or_else(|| {
                 Report::new(TrustedServerError::Configuration {
                     message:
@@ -2863,10 +2868,10 @@ pub enum AuctionDebugCommentFormat {
 
 /// Request-observability toggles exposed to operators.
 ///
-/// The default table must stay omitted from serialized config blobs: this
-/// struct denies unknown fields, so an older binary loading a config blob
-/// carrying an `[observability]` table it does not know would reject it,
-/// breaking rollback. See [`Settings::observability`].
+/// The default table must stay omitted from serialized config blobs. Older
+/// binaries deny unknown fields on [`Settings`], so a blob carrying the new
+/// `[observability]` table would fail to load and break rollback. See
+/// [`Settings::observability`].
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservabilitySettings {
@@ -4969,6 +4974,40 @@ mod tests {
             settings.tinybird.access_enabled,
             "should enable access emission"
         );
+    }
+
+    #[test]
+    fn access_enabled_rejects_legacy_dataset_after_normalization() {
+        for dataset in ["access_logs_raw", " access_logs_raw "] {
+            let config = format!(
+                "[tinybird]\nenabled = true\napi_host = \"api.example.com\"\nauction_enabled = false\naccess_enabled = true\naccess_dataset = \"{dataset}\"\naccess_token_secret = \"test-access-token\"\naccess_sample_rate = 1.0\n"
+            );
+            let error = settings_from_toml_with(&config)
+                .expect_err("should reject v2 access rows targeting the legacy datasource");
+            assert!(
+                error.to_string().contains("tinybird.access_dataset"),
+                "should identify the invalid access dataset: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_access_accepts_legacy_dataset() {
+        let settings = settings_from_toml_with(
+            "[tinybird]\nenabled = true\napi_host = \"api.example.com\"\nauction_token_secret = \"test-auction-token\"\naccess_dataset = \"access_logs_raw\"\n",
+        )
+        .expect("should retain legacy dataset settings while access emission is disabled");
+        assert_eq!(settings.tinybird.access_dataset, "access_logs_raw");
+        assert!(!settings.tinybird.access_enabled);
+    }
+
+    #[test]
+    fn access_enabled_accepts_custom_versioned_dataset() {
+        let settings = settings_from_toml_with(
+            "[tinybird]\nenabled = true\napi_host = \"api.example.com\"\nauction_enabled = false\naccess_enabled = true\naccess_dataset = \"custom_access_v2\"\naccess_token_secret = \"test-access-token\"\naccess_sample_rate = 1.0\n",
+        )
+        .expect("should allow custom access datasource names");
+        assert_eq!(settings.tinybird.access_dataset, "custom_access_v2");
     }
 
     #[test]
