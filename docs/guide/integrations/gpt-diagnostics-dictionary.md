@@ -6,19 +6,22 @@ See [GPT Runtime Diagnostics](./gpt-diagnostics.md) for activation and operation
 
 ## Identity and controls
 
-| Label                         | Badge        | Source                                               | Meaning and limits                                                                                                                     |
-| ----------------------------- | ------------ | ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `Ad #N`                       | `Ad #N`      | `runtimeSlotNumber`                                  | Stable number assigned to a GPT slot object in this page. It is not a creative ID.                                                     |
-| `Request #M`                  | `Request #M` | `requestNumber`                                      | Monotonic request cycle for that slot, including refreshes. It does not imply fill.                                                    |
-| `GPT-reported creative`       | —            | `adManager.creativeId` or `sourceAgnosticCreativeId` | GAM's callback identifier. It is separate from Ad/Request identity and does not identify a demand source.                              |
-| `Filter`                      | —            | panel state                                          | Limits displayed rows. Activating a badge resets a hiding filter to `All`.                                                             |
-| `Export JSON`                 | —            | `gptDiagnostics.export()`                            | Downloads the allowlisted V1 snapshot. It issues no ad request.                                                                        |
-| `Label dictionary`            | —            | documentation link                                   | Opens this keyboard-accessible help page.                                                                                              |
-| `How to read this evidence`   | —            | inline help                                          | Expands a concise explanation that winner, candidate, render, and timing observations have separate meanings and clocks.               |
-| `Locate on page`              | —            | exact unique DOM binding                             | Scrolls only on activation and briefly draws a diagnostics-layer highlight. It never changes publisher attributes, classes, or styles. |
-| `Collapse`, `Expand`, `Close` | —            | panel state                                          | Presentation controls only. `show()` can reopen a closed panel.                                                                        |
-| `Request history`             | —            | retained cycles                                      | Earlier retained requests. At most ten cycles are retained per slot. An evicted selection is reported as no longer retained.           |
-| `Technical details`           | —            | allowlisted snapshot fields                          | Expands correlation IDs, coverage, failures, and other non-summary evidence.                                                           |
+| Label                         | Badge        | Source                      | Meaning and limits                                                                                                                     |
+| ----------------------------- | ------------ | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `Ad #N`                       | `Ad #N`      | `runtimeSlotNumber`         | Stable number assigned to a GPT slot object in this page. It is not a creative ID.                                                     |
+| `Request #M`                  | `Request #M` | `requestNumber`             | Monotonic request cycle for that slot, including refreshes. It does not imply fill.                                                    |
+| `Filter`                      | —            | panel state                 | Limits displayed rows. Activating a badge resets a hiding filter to `All`.                                                             |
+| `Export JSON`                 | —            | `gptDiagnostics.export()`   | Downloads the allowlisted V1 snapshot. It issues no ad request.                                                                        |
+| `Label dictionary`            | —            | documentation link          | Opens this keyboard-accessible help page.                                                                                              |
+| `How to read this evidence`   | —            | inline help                 | Expands a concise explanation that winner, candidate, render, and timing observations have separate meanings and clocks.               |
+| `Locate on page`              | —            | exact unique DOM binding    | Scrolls only on activation and briefly draws a diagnostics-layer highlight. It never changes publisher attributes, classes, or styles. |
+| `Collapse`, `Expand`, `Close` | —            | panel state                 | Presentation controls only. `show()` can reopen a closed panel.                                                                        |
+| `Request history`             | —            | retained cycles             | Earlier retained requests. At most ten cycles are retained per slot. An evicted selection is reported as no longer retained.           |
+| `Technical details`           | —            | allowlisted snapshot fields | Expands correlation IDs, coverage, failures, and other non-summary evidence.                                                           |
+
+Each page badge is a button over the slot's top-left area. While diagnostics are
+active, clicks within its bounds open the panel instead of reaching the creative.
+Activating a badge opens the selected request's history, including the latest request.
 
 The per-request panel groups are `Summary`, `Auction evidence`, `Delivery evidence`, `Timing`, and `Size and visibility`. Summary prefixes are `GPT result:` and `Observed auction path:`. Technical prefixes include `Ad unit`, `Request intent:`, `Trusted Server auction:`, and `Prebid auction:`. A fact appears in one detailed group; Technical details does not repeat those grouped facts.
 

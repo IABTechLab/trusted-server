@@ -3278,20 +3278,7 @@ fn request_origin(scheme: &str, host: &str) -> String {
     }
 }
 
-/// This request's auction result, in both forms the seams need.
-///
-/// The inline `</body>` seam injects a rendered `<script>`; the shared-template seam
-/// splices the bids into a script it builds itself, and therefore needs them
-/// structured. [`write_bids_to_state`] derives both from one bid map under one call, so
-/// the two can never describe different auctions.
-///
-/// # Why the map is carried rather than recovered
-///
-/// An earlier revision stored only the script and reconstructed the map by un-escaping
-/// it. [`html_escape_for_script`] escapes `"` as `\"`, so the extracted text was invalid
-/// JSON for every non-empty map; `serde_json::from_str` failed and `unwrap_or_default()`
-/// turned the failure into `{}`. Shared modes therefore served **zero bids**, silently,
-/// on every request that had any. Every fixture had empty bids, so nothing caught it.
+/// Request-clock auction facts exposed only to an active browser diagnostics session.
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BrowserAuctionDiagnostics {
@@ -3330,6 +3317,20 @@ impl BrowserAuctionDiagnostics {
     }
 }
 
+/// This request's auction result, in both forms the seams need.
+///
+/// The inline `</body>` seam injects a rendered `<script>`; the shared-template seam
+/// splices the bids into a script it builds itself, and therefore needs them
+/// structured. [`write_bids_to_state`] derives both from one bid map under one call, so
+/// the two can never describe different auctions.
+///
+/// # Why the map is carried rather than recovered
+///
+/// An earlier revision stored only the script and reconstructed the map by un-escaping
+/// it. [`html_escape_for_script`] escapes `"` as `\"`, so the extracted text was invalid
+/// JSON for every non-empty map; `serde_json::from_str` failed and `unwrap_or_default()`
+/// turned the failure into `{}`. Shared modes therefore served **zero bids**, silently,
+/// on every request that had any. Every fixture had empty bids, so nothing caught it.
 #[derive(Clone, Default)]
 pub(crate) struct AdBidsState {
     /// Rendered bids `<script>`. Shared with the HTML processor's `</body>` handler,
@@ -6157,8 +6158,7 @@ fn build_bids_script_with_diagnostics(
     bid_map: &serde_json::Map<String, serde_json::Value>,
     auction_diagnostics: Option<&BrowserAuctionDiagnostics>,
 ) -> String {
-    let json = serde_json::to_string(bid_map)
-        .expect("serde_json::to_string of Map<String,Value> should be infallible");
+    let json = serde_json::to_string(bid_map).expect("should serialize the bids map");
     let escaped = html_escape_for_script(&json);
     // adInit() defines GPT slots on the publisher's `-container` wrappers, which
     // mutates those ad-slot subtrees. Calling it synchronously here (this script
@@ -6193,7 +6193,7 @@ fn build_bids_script_with_diagnostics(
     // fall back to a plain assignment, where no SPA hook exists to race with.
     if let Some(auction_diagnostics) = auction_diagnostics {
         let diagnostics = serde_json::to_string(auction_diagnostics)
-            .expect("BrowserAuctionDiagnostics should serialize");
+            .expect("should serialize BrowserAuctionDiagnostics");
         return format!(
             "<script>(function(){{\
 var t=window.tsjs=window.tsjs||{{}};\
@@ -6255,11 +6255,10 @@ fn build_seam_script_with_diagnostics(
     // The local test script probes the minified `var a=JSON.parse`,
     // `var b=JSON.parse`, and `s(b,a)` literals below. Update the harness with any
     // semantically equivalent rewrite so its black-box checks keep matching output.
-    let bids = serde_json::to_string(bid_map)
-        .expect("serde_json::to_string of Map<String,Value> should be infallible");
+    let bids = serde_json::to_string(bid_map).expect("should serialize the bids map");
     if let Some(auction_diagnostics) = auction_diagnostics {
         let diagnostics = serde_json::to_string(auction_diagnostics)
-            .expect("BrowserAuctionDiagnostics should serialize");
+            .expect("should serialize BrowserAuctionDiagnostics");
         return format!(
             "<script>(function(){{\
 var t=window.tsjs=window.tsjs||{{}};\
@@ -7166,7 +7165,7 @@ pub async fn handle_page_bids(
     // adapter that forgets the extension would silently report a different
     // handler-entry timing origin.
     let request_timings = RequestTimings::from_extensions(req.extensions());
-    let has_request_timings = request_timings.is_some();
+    let request_timing_collector_attached = request_timings.is_some();
     let timings = request_timings.unwrap_or_default();
 
     // Adapter fallbacks prepare this before routing. Keep this idempotent call as
@@ -7342,9 +7341,8 @@ pub async fn handle_page_bids(
             ec_context,
         );
         // Same T0-anchored timeline as the navigation path (spec section 18).
-        // This route runs the auction through `run_auction` rather than the
-        // dispatch/collect split, so dispatch and resolve bracket that one
-        // call instead of the origin fetch.
+        // This route uses the dispatch/collect split without an intervening
+        // origin fetch. Only a started provider request stamps the milestones.
         if auction.orchestrator.is_enabled() {
             timings.set_auction_id(observation.auction_id);
         }
@@ -7455,11 +7453,11 @@ pub async fn handle_page_bids(
             };
             match result {
                 Ok(result) => {
-                    // A successful result proves at least one pending or immediate
-                    // provider outcome. Failures can occur before any request leaves
-                    // the edge, so they must not fabricate dispatch timing evidence.
+                    // A successful result can come from an empty provider set or a
+                    // routing-only skip. Browser timing diagnostics require a stamped
+                    // dispatch offset proving that a provider request started.
                     if gpt_diagnostics.browser_session_active()
-                        && has_request_timings
+                        && request_timing_collector_attached
                         && timings.snapshot().auction_dispatched_ms.is_some()
                     {
                         let timing_snapshot = timings.snapshot();

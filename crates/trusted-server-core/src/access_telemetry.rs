@@ -20,8 +20,9 @@ use crate::request_timing::{AuctionWaitPlacement, TimingSnapshot};
 /// entirely client controlled. Capturing one verbatim into a 30-day
 /// `LowCardinality(String)` column would let a single caller inflate that
 /// column's cardinality without bound and would violate this dataset's
-/// bounded-dimension privacy rule (see the module doc). Every standard
-/// method maps to its uppercase form; anything else maps to `"other"`. Runs
+/// bounded-dimension privacy rule (see the module doc). GET, HEAD, POST, PUT,
+/// DELETE, PATCH and OPTIONS map to their uppercase form; all other methods,
+/// including CONNECT and TRACE, map to `"other"`. Runs
 /// inside [`access_event_row`] rather than at each capture site, so every
 /// row-building path is covered regardless of how `method` was populated.
 ///

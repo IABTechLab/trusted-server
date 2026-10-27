@@ -29,7 +29,9 @@ only to `access_logs_v2`. Store its value in the default app-config secret store
 under the key named by `tinybird.access_token_secret`. Set
 `tinybird.access_dataset = "access_logs_v2"` explicitly when updating a config
 that still carries the legacy dataset name. Keep access disabled until this
-schema and token are ready.
+schema and token are ready. With access enabled, validation rejects exactly the
+normalized legacy name `access_logs_raw`; custom dataset names remain allowed,
+and disabled legacy configurations remain accepted.
 
 For runtime behavior, sampling, privacy properties, and the Fastly-only emission
 boundary, see [Telemetry](../docs/guide/telemetry.md). For exact configuration
@@ -57,10 +59,9 @@ including the JSONPaths and nullable types.
 ### Access datasource cutover
 
 The new emitter uses a versioned datasource rather than evolving
-`access_logs_raw`. Main's legacy datasource has nine columns, including raw
-`path` and `cache_state`; it never had the phase columns from the intermediate
-stacked PRs. `access_logs_v2` has no `FORWARD_QUERY` and does not copy historical
-raw paths into bounded route templates.
+`access_logs_raw`. The legacy datasource has nine columns, including raw
+`path` and `cache_state`, and no phase columns. `access_logs_v2` has no
+`FORWARD_QUERY` and does not copy historical raw paths into bounded route templates.
 
 1. Inspect the deployed workspace resources and retention requirements. Preserve
    any existing `access_logs_raw` and its token; do not drop or recreate it.
@@ -68,8 +69,9 @@ raw paths into bounded route templates.
    creates `access_logs_v2` and `ts_access_v2_ingest` without changing the legacy
    datasource. Deploy the new resources before the emitting binary.
 3. Provision the new APPEND token in the platform secret store. Deploy the new
-   binary with access telemetry still disabled, then push a config selecting
-   `access_logs_v2`, the new token key, and a positive sample rate. Use separate
+   binary with access telemetry still disabled, then push a config with
+   `enabled = true`, `access_enabled = true`, `access_dataset = "access_logs_v2"`,
+   the new token key, and a positive sample rate. Use separate
    token keys for the access and auction sinks.
 4. Verify accepted rows, their stored `sample_rate`, ingestion freshness, and
    workspace quarantine. Confirm the UUID join against `auction_events_raw` for
@@ -82,6 +84,9 @@ Rollback disables access emission before restoring an older binary. Re-push a
 compatible config with no non-default `[observability]` table; for access-only
 telemetry also set `tinybird.enabled = false`, since older binaries interpret it
 as auction enablement. Keep both datasets and tokens intact during rollback.
+Do not redeploy an older `tinybird/` project that omits `access_logs_v2`;
+its deployment may propose removing the new datasource. Inspect the dry-run
+rather than treating a binary rollback as a Tinybird project rollback.
 
 These steps are a rollout requirement, not evidence that a live workspace
 migration has already been tested.

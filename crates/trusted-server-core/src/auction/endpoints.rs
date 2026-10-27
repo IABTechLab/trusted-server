@@ -1513,9 +1513,17 @@ mod tests {
         assert_eq!(rows[0].terminal_status.as_deref(), Some("skipped"));
         assert_eq!(rows[0].terminal_reason.as_deref(), Some("consent_denied"));
         let snapshot = timings.snapshot();
-        assert_eq!(rows[0].auction_id, snapshot.auction_id.unwrap().to_string());
+        assert_eq!(
+            rows[0].auction_id,
+            snapshot
+                .auction_id
+                .expect("should record the consent-denied auction UUID")
+                .to_string(),
+            "should retain the skipped-summary join key"
+        );
         assert!(snapshot.auction_dispatched_ms.is_none());
         assert!(snapshot.auction_resolved_ms.is_none());
+        assert!(snapshot.auction_committed_ms.is_none());
         let ndjson = batches[0]
             .to_ndjson(16 * 1024)
             .expect("should serialize telemetry");

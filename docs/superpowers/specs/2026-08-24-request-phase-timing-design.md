@@ -291,10 +291,8 @@ and user-generated content (search terms, usernames, emails in slugs). Replaced 
 
 - Named routes: the matched route-table pattern verbatim, parameters left as
   placeholders.
-- Publisher fallback: a coarse fixed template, `/` plus the first path segment
-  restricted to a bounded allowlisted charset, plus `/*` when deeper (for example
-  `/news/*`). The auction-telemetry normalizer is explicitly not sufficient here: it
-  redacts long tokens but preserves short identifiers and arbitrary slugs.
+- Asset routes: the configured prefix followed by `/*`. Responses without route
+  metadata use `unknown`.
 - Publisher templates come from an operator-configured allowlist of section names
   (`observability.route_sections`, default empty), not from the request: a path
   whose first segment matches an allowlist entry and that has at least one further
@@ -304,10 +302,7 @@ and user-generated content (search terms, usernames, emails in slugs). Replaced 
   bound identity: depth-2 first segments are usernames on `/{username}/posts`
   shapes, and single-segment paths are documents under `/%postname%/` permalinks.
   With the allowlist, the emitted value set is fixed by configuration, so no
-  request-derived byte ever reaches the row. The character allowlist alone does not bound identity (`[a-z0-9_-]`
-  is exactly the alphabet of UUIDs, hex ids, and reset tokens), and a truncated
-  prefix of any of those is still identifying, so the length and digit bounds reject
-  the segment outright.
+  request-derived byte ever reaches the row.
 - Tests are adversarial, not just the happy path: a literal EC identifier on the admin
   route, an email address in a path segment, search-term-shaped segments, overlong
   segments, UUIDs, hex ids, reset tokens, and full article slugs must all normalize
@@ -320,7 +315,7 @@ ClickHouse sorting keys cannot contain nullable columns):
 `service_id`            LowCardinality(String),      -- FASTLY_SERVICE_ID; immutable deployment identity
 `publisher_domain`      LowCardinality(String),      -- matches auction schema
 `env`                   LowCardinality(String),      -- adapter-derived: production | staging | unknown
-`route_class`           LowCardinality(String),      -- publisher_html | tsjs | integration_proxy | ec | auction_api | other
+`route_class`           LowCardinality(String),      -- publisher_html | tsjs | integration_proxy | ec | auction_api | asset | other
 `route_template`        String,                      -- bounded, normalized; replaces path
 `body_mode`             LowCardinality(String),      -- streamed | buffered
 `auction_wait_placement` LowCardinality(String),     -- pre_header | in_stream | none
@@ -710,8 +705,7 @@ Combined with existing columns, one access row now reads as a timeline:
 ```
 t=0 ......... request entry
 t=D ......... auction_dispatched_ms      (bids out; origin fetch typically in flight)
-t=R ......... auction_resolved_ms        (R - D ~ auction duration; join auction_id
-                                          for the per-bidder long pole)
+t=R ......... auction_resolved_ms        (collection returned, not transport completion)
 t=C ......... auction_committed_ms       (targeting available to the response)
 ```
 
@@ -729,17 +723,20 @@ A sanity filter of the form `auction_committed_ms <= time_elapsed_ms` therefore
 discards every valid streamed row. Slice by `body_mode` before comparing the
 auction marks against H at all.
 
-Derivations the dashboard can add without schema help: auction duration on the
-request clock (`R - D`), commit latency (`C - R`), and overlap ratio (share of
-`R - D` that ran concurrently with `ts-origin`). `C - R` is whole-millisecond
-like every other column here, and on the navigation path it brackets
-`write_bids_to_state`, whose cost is per-winning-bid creative processing
-(sanitize, first-party URL rewrite, signing, with `rewrite_creatives` on by
-default). Expect 0 on light auctions and non-zero as creative count and size
-grow; it is not a restatement of `R`. `auction_wait_ms` keeps its existing
-meaning (blocked time only) and is now interpretable next to the timeline:
-`R - D` minus `auction_wait_ms` approximates how much of the auction was
-absorbed by work the request needed anyway.
+`C - R` measures whole-millisecond commit latency. On the navigation path it
+brackets `write_bids_to_state`, including per-winning-bid creative processing.
+Expect 0 on light auctions and non-zero as creative count and size grow.
+
+`R - D` is the dispatch-to-collection window, not auction duration. On streamed
+pages, collection can wait until the `</body>` seam even if provider transport
+finished earlier. Neither `R - D` nor its difference from `auction_wait_ms`
+establishes auction/origin overlap. `origin_ms` can itself measure only the
+remaining origin wait after early dispatch. Transport-completion timestamps would
+be needed to derive that overlap.
+
+`auction_wait_ms` measures blocked collection only on instrumented publisher HTML
+paths after a provider launch. `/auction` and `/_ts/page-bids` leave it null with
+`none` placement; mediator-only collection is also unmeasured.
 
 Joining to per-bidder detail, now that both sides are `UUID`:
 
@@ -751,12 +748,11 @@ INNER JOIN auction_events_raw e ON a.auction_id = e.auction_id
 WHERE a.auction_id IS NOT NULL AND e.event_kind = 'provider_call'
 ```
 
-One caveat on reconciling the two clocks: D is stamped where dispatch returns to
-the caller, while the auction dataset's `total_time_ms` and
-`provider_response_time_ms` start inside the orchestrator's launch loop. So
-`R - D` is the post-launch window and can read slightly smaller than a joined
-per-provider time. Treat `R - D` as the request-clock cost of the auction, and
-the auction dataset as the authority on per-bidder duration.
+D is stamped where dispatch returns to the caller, while the auction dataset's
+`total_time_ms` and `provider_response_time_ms` start inside the orchestrator's
+launch loop. R is stamped when collection returns and includes any delay before
+the caller starts collection. Use the auction dataset for per-bidder duration;
+the access-row window is not a transport-duration measurement.
 
 ### Scope
 

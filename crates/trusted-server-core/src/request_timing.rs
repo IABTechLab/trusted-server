@@ -151,7 +151,9 @@ impl RequestTimings {
     ///
     /// Callers record only when at least one provider request actually started.
     /// A measured zero duration is retained; no-launch collection leaves the
-    /// duration and placement unset.
+    /// duration and placement unset. Current publisher HTML collectors use this
+    /// method; mediator-only work and the `/auction` and `/_ts/page-bids`
+    /// endpoints leave access-row wait timing unrecorded.
     /// Drops the sample silently on lock contention; a poisoned lock is recovered.
     pub fn record_auction_wait(&self, placement: AuctionWaitPlacement, dur: Duration) {
         let _ = self
@@ -191,10 +193,11 @@ impl RequestTimings {
 
     /// Records the telemetry auction id, the first time this is called.
     ///
-    /// Called where the auction observation is built, which happens on every
-    /// auction-eligible request regardless of outcome, so the access row can
-    /// be joined to the `auction_events_raw` row even when the auction was
-    /// skipped or failed to dispatch. Kept separate from
+    /// Called where an enabled auction's observation is built, before any skip,
+    /// dispatch-failure or launch outcome, so the access row can be joined to the
+    /// `auction_events_raw` row even when the auction was skipped or failed to
+    /// dispatch. Disabled auctions are not stamped, so their `auction_disabled`
+    /// summary rows have no access join key. Kept separate from
     /// [`RequestTimings::mark_auction_dispatched`] so a dropped dispatch
     /// sample cannot also lose the join key. Subsequent calls are no-ops
     /// (first call wins). Drops the sample silently on lock contention; a

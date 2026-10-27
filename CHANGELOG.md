@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Auction telemetry failure batches for `/auction` and page-bids now include provider launch-failure rows alongside the summary, so a failed dispatch can emit more than one row. `/auction` summary `elapsed_ms` now uses the orchestrator's elapsed time.
+- GPT diagnostics JSON exports now include bounded server winner and Prebid candidate/win bidder codes and bucketed `hb_pb` values. These observations do not establish which creative GAM ultimately served; raw CPM and creative markup remain excluded.
+- The Axum dev server now runs its own serve loop to apply terminal request-timing handling.
+- The default `tinybird.access_dataset` is now `access_logs_v2`. Since this field is serialized, an upgrade from TOML that omits it may produce a one-time config-envelope diff; review and push once to settle it. Explicit legacy dataset values must be changed before enabling access telemetry.
 - **Breaking:** `x-ts-version` now reports the deployed git version — the release tag, else the branch, else the first 6 characters of the commit — compiled in from the build-time `TRUSTED_SERVER__GIT_VERSION` (set by the deploy pipeline) or local git, and is sent by every adapter, including on the Fastly `GET /health` probe. The Fastly service version it previously carried is now `x-ts-fastly-version`; update dashboards, monitors, and scripts that read `x-ts-version` as the Fastly version number. Builds with neither the override nor git omit the header.
 - **Breaking:** `ts prebid bundle` is now `ts prebid client`, alongside the new `ts prebid server` namespace. Update scripts and runbooks to use `ts prebid client` with the same arguments. The old `bundle` spelling is no longer accepted and has no compatibility alias.
 - The S2S `/_ts/api/v1/batch-sync` endpoint now validates the full batch and calls the CAS-protected update path once per distinct normalized EC ID. The last valid UID wins within a group, and infrastructure failures reject the failing and each unprocessed group, so accepted and `kv_unavailable` input indexes may interleave.

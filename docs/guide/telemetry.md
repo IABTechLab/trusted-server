@@ -55,10 +55,14 @@ flowchart TB
     E --> F[Emit one access row to Tinybird]
 ```
 
-Auction-wait duration measures collection only after at least one provider request
-started. When no provider launched, `auction_wait_ms` is null and
-`auction_wait_placement` is `none`; collection and summary emission still run.
-A measured wait under one millisecond is `0`, with its actual placement retained.
+On publisher HTML paths, auction-wait duration measures collection only after at
+least one provider request started. Mediator-only collection remains unmeasured,
+even if it performs a network request. `/auction` and `/_ts/page-bids` do not record
+an access-row auction wait, even when providers launch. Those routes, and paths
+without a provider launch, report null `auction_wait_ms` and `none` placement;
+collection and summary emission still run. Page-bids browser diagnostics separately
+report `auctionWaitMs = R - D` with `pre_header`, which is not an access-row wait
+measurement. A measured wait under one millisecond is `0`, with its placement retained.
 
 Emission is best effort. Serialization, body-size, transport, and non-2xx failures
 are logged and the row is dropped without changing the delivered response. Access
@@ -66,7 +70,9 @@ ingestion currently waits for Tinybird's reply after client delivery, unlike the
 auction sink. Its backend has a one-second connect timeout and two-second
 first-byte and between-byte timeouts. This wait keeps a reusable sandbox occupied
 before it can accept its next request and counts toward its lifetime. Ingest is
-not included in `request_elapsed_ms`.
+not included in `request_elapsed_ms`. Start with a low `access_sample_rate` and
+measure reused-sandbox latency before increasing it; the example rate below is
+not a throughput guarantee.
 
 ## Access privacy boundary
 
@@ -79,11 +85,15 @@ contain:
   Server release identifier.
 - Coarse route class and bounded route template, body mode, and template-cache
   state. Publisher paths collapse to `/`, `/other/*`, or an operator-allowlisted
-  section such as `/news/*`; named routes retain parameter placeholders.
+  section such as `/news/*`; named routes retain parameter placeholders. Asset
+  routes report `<configured prefix>/*`; responses without route metadata report
+  `unknown`.
 - App-build, filter, geo, KV, origin, template-cache, auction-wait, and stream
   durations, plus headers-ready and request-completion offsets and response bytes
-  accepted by the transport. Unrecorded timings are null. A status of 200 does not
-  establish that a streamed body completed successfully.
+  accepted by the transport. When origin dispatch overlaps other work, `origin_ms`
+  measures only the remaining origin wait after overlap, not full origin latency.
+  A template-cache hit skips the origin span. Unrecorded timings are null. A status
+  of 200 does not establish that a streamed body completed successfully.
 - Auction wait placement, dispatch/collection/commit offsets, and a random auction
   UUID. The UUID joins to `auction_events_raw.auction_id`, where coarse device
   class and browser family can also be present. Disabled auctions have no access
@@ -110,8 +120,11 @@ default app-config secret store. Set `access_enabled = true`,
 and a positive `access_sample_rate`, such as `0.05`. Token values are resolved
 when runtime settings load; only key names belong in config. Existing configs
 that explicitly name `access_logs_raw` must change their dataset and token before
-enabling this sink. The default body limit is 1 MiB and the minimum accepted limit
-is 1 KiB; an individual row exceeding the configured limit is dropped.
+enabling this sink. Validation rejects exactly the normalized `access_logs_raw`
+name when access is enabled. Custom dataset names remain allowed, and disabled
+legacy configurations remain accepted. The default body limit is 1 MiB and the
+minimum accepted limit is 1 KiB; an individual row exceeding the configured limit
+is dropped.
 
 Deploy the datasource before the emitting binary, then push the opt-in config
 only after every serving binary understands it. Check ingestion freshness and
@@ -122,7 +135,8 @@ a workspace cutover.
 Before rolling back to a pre-observability binary, disable access telemetry,
 remove the non-default `[observability]` table, and re-push compatible config. An
 access-only deployment must also disable the Tinybird master switch. Keep both
-datasources during rollback; do not drop or recreate the legacy dataset.
+datasources during rollback; do not drop or recreate the legacy dataset or redeploy
+an older Tinybird project that omits `access_logs_v2`.
 
 The exact settings and secret-handling dispositions are in
 [Configuration](/guide/configuration#tinybird). Token provisioning and the

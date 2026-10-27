@@ -380,7 +380,8 @@ A concise viewport badge appears only when a slot:
 A badge starts with the slot's stable `Ad #N`, matching the side-panel heading. It then
 summarizes the most recent request cycle: the GPT result (Filled, Empty, Rendered (fill
 unknown), or Pending), auction type, a short delivery label, a `Competing paths` marker
-when the request path is `competing`, sizes, and the GAM request-to-response, GAM
+when the request path is `competing` and the auction type is not already `Multiple paths`,
+sizes, and the GAM request-to-response, GAM
 response-to-render, and render-to-viewable durations that are available. It adds
 `Incomplete sequence` when a callback proved a missing or invalid earlier step.
 
@@ -448,7 +449,7 @@ pointer input within its own bounds instead of passing that input to the creativ
 - **Close** dismisses the presentation for the current document.
 - External removal by hydration or DOM reconciliation triggers a debounced remount.
 - Live re-renders preserve open request-history, help, and technical disclosures plus panel scroll position.
-- Selecting an earlier request from a badge opens its history once. A later user collapse remains closed across live updates.
+- Selecting a request from a badge opens its history once, including the latest request. A later user collapse remains closed across live updates.
 - Explicit Close or `hide()` prevents remount until `show()` is called.
 - Capture continues while the panel is hidden.
 

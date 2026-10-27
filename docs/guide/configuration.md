@@ -1316,18 +1316,18 @@ rows. See [Telemetry](/guide/telemetry) for sampling, privacy, and retention.
 
 ### `[tinybird]`
 
-| Field                  | Type           | Default                | Contract                                                                       |
-| ---------------------- | -------------- | ---------------------- | ------------------------------------------------------------------------------ |
-| `enabled`              | Boolean        | `false`                | Master switch for Tinybird telemetry                                           |
-| `auction_enabled`      | Boolean        | `true`                 | Enable auction telemetry when the master switch is on                          |
-| `api_host`             | String         | `""`                   | Required when enabled; regional host without scheme, port, or path             |
-| `auction_dataset`      | String         | `"auction_events_raw"` | 1–128 ASCII letters, digits, or `_`                                            |
-| `auction_token_secret` | String or null | `null`                 | Required for an active auction sink; resolves through the default secret store |
-| `access_enabled`       | Boolean        | `false`                | Enable sampled post-delivery access telemetry                                  |
-| `access_dataset`       | String         | `"access_logs_v2"`     | Versioned access-log Events API datasource name                                |
-| `access_token_secret`  | String or null | `null`                 | Required for an active access sink; resolves through the default secret store  |
-| `access_sample_rate`   | Number         | `0.0`                  | `0.0..=1.0`; must be positive when access telemetry is enabled                 |
-| `max_body_bytes`       | Integer        | `1048576`              | At least `1024` bytes                                                          |
+| Field                  | Type           | Default                | Contract                                                                          |
+| ---------------------- | -------------- | ---------------------- | --------------------------------------------------------------------------------- |
+| `enabled`              | Boolean        | `false`                | Master switch for Tinybird telemetry                                              |
+| `auction_enabled`      | Boolean        | `true`                 | Enable auction telemetry when the master switch is on                             |
+| `api_host`             | String         | `""`                   | Required when enabled; regional host without scheme, port, or path                |
+| `auction_dataset`      | String         | `"auction_events_raw"` | 1–128 ASCII letters, digits, or `_`                                               |
+| `auction_token_secret` | String or null | `null`                 | Required for an active auction sink; resolves through the default secret store    |
+| `access_enabled`       | Boolean        | `false`                | Enable sampled post-delivery access telemetry                                     |
+| `access_dataset`       | String         | `"access_logs_v2"`     | Versioned access datasource; `access_logs_raw` is rejected when access is enabled |
+| `access_token_secret`  | String or null | `null`                 | Required for an active access sink; resolves through the default secret store     |
+| `access_sample_rate`   | Number         | `0.0`                  | `0.0..=1.0`; must be positive when access telemetry is enabled                    |
+| `max_body_bytes`       | Integer        | `1048576`              | At least `1024` bytes                                                             |
 
 `secret_store` is a deprecated compatibility input. It is ignored and omitted
 from newly pushed config. Both sink tokens resolve through
@@ -2968,21 +2968,26 @@ enabling one does not enable the other.
 | `server_timing_enabled` | Boolean  | No       | `false` | Append request-phase timings to the `Server-Timing` response header                                       |
 | `route_sections`        | String[] | No       | `[]`    | Section names kept as publisher route templates (`/{section}/*`) in access telemetry; empty collapses all |
 
-Route sections are matched case-insensitively against the first path segment,
-with at least one further segment required. Names are trimmed, limited to 32
-entries of at most 128 UTF-8 bytes each, and must be nonempty with no slash or
-control characters. For example, `route_sections = [" news "]` normalizes to
-`["news"]`, preserving `/news/*` but not `/news`.
+Route sections are matched ASCII-case-insensitively against the first path segment,
+with at least one further segment required. Leading and trailing non-control
+whitespace is trimmed; tabs, newlines, and other control characters are rejected,
+not trimmed. Names are limited to 32 entries of at most 128 UTF-8 bytes each and
+must be nonempty with no slash or control characters. For example,
+`route_sections = [" news "]` normalizes to `["news"]`, preserving `/news/*` but not
+`/news`.
 
 **Purpose**: Surfaces per-phase request timing (`ts-total` plus recorded
 phases such as `ts-appbuild`, `ts-filter`, `ts-geo`, `ts-kv`, `ts-origin`, and
 `ts-template-cache`) as a standard `Server-Timing` header, in milliseconds
 with one decimal place. An unrecorded phase is omitted from the header
-rather than rendered as zero.
+rather than rendered as zero. When origin dispatch overlaps auction dispatch or
+EC preload, `ts-origin` measures the remaining origin wait after overlap, not full
+origin latency.
 
 **Emission is conservative**: the header is appended only on responses that
-are conclusively private, meaning `Cache-Control` contains `private` or
-`no-store` and no recognized CDN/surrogate cache-control header is present.
+are conclusively private, meaning `Cache-Control` contains a bare `private` or
+`no-store` directive and no recognized CDN/surrogate cache-control header is present.
+A field-qualified directive such as `private="Set-Cookie"` does not qualify.
 An edge-cache header suppresses timing even alongside private/no-store, since
 shared-cache overrides can replay request-specific timings. A response that is
 heuristically cacheable, carries a bare
@@ -3041,21 +3046,8 @@ extra edit to add the table first.
 
 ### `[tinybird]` access telemetry keys
 
-`[tinybird]` configures a shared Events API transport (`enabled`, `api_host`,
-and per-sink dataset and token fields) used by two
-independent emitters: auction telemetry (`auction_dataset`,
-`auction_token_secret`) and access telemetry. The keys below cover the
-access-telemetry sink and the shared enable flags.
-
-| Field                 | Type    | Required                             | Default          | Description                                                                     |
-| --------------------- | ------- | ------------------------------------ | ---------------- | ------------------------------------------------------------------------------- |
-| `enabled`             | Boolean | Yes, when `access_enabled`           | `false`          | Master switch for the shared Tinybird transport and per-sink credentials        |
-| `auction_enabled`     | Boolean | No                                   | `true`           | Independently gates auction telemetry emission, decoupled from access telemetry |
-| `access_enabled`      | Boolean | No                                   | `false`          | Enables the sampled access-telemetry row sent after each response is delivered  |
-| `access_dataset`      | String  | No, defaults when omitted            | `access_logs_v2` | Versioned access-log Events API datasource; must be non-empty when enabled      |
-| `access_token_secret` | String  | Yes, when `access_enabled`           | None             | Secret reference resolving the access APPEND token                              |
-| `max_body_bytes`      | Integer | No                                   | `1048576`        | Maximum NDJSON request body size; must be at least 1024                         |
-| `access_sample_rate`  | Float   | Yes (`> 0.0`), when `access_enabled` | `0.0`            | Fraction (`0.0`-`1.0`) of requests to emit an access-telemetry row for          |
+The authoritative field reference is [Tinybird Configuration](#tinybird).
+The examples below cover access-sink enablement and rollout.
 
 **Purpose**: `access_enabled` and `auction_enabled` gate the two Tinybird
 sinks separately so that turning on one does not silently turn on (or leave
@@ -3117,7 +3109,10 @@ as "auction telemetry on".
 `access_logs_raw`; it is the legacy reserved schema, not the target for these
 rows. Upgrade every serving binary before pushing a config containing the new
 fields. An existing explicit `access_dataset = "access_logs_raw"` must be changed
-to `access_logs_v2`, with the matching token key. Follow the workspace cutover in
+to `access_logs_v2`, with the matching token key. When access is enabled,
+validation rejects exactly the normalized legacy name `access_logs_raw`; custom
+dataset names remain allowed and disabled legacy configurations remain accepted.
+Follow the workspace cutover in
 [`tinybird/README.md`](https://github.com/IABTechLab/trusted-server/blob/main/tinybird/README.md).
 
 **Rolling back**: push a compatibility config first, then roll the binary
@@ -3125,7 +3120,8 @@ back. The compatibility config removes the `[observability]` table, sets
 `access_enabled = false`, and, for a deployment that only used the access
 sink, sets `enabled = false` as well. Otherwise the older binary tries to enable
 auction telemetry, or fails startup if no auction token is present. Keep both
-Tinybird datasources during rollback.
+Tinybird datasources during rollback. Do not redeploy an older Tinybird project
+that omits `access_logs_v2`; inspect the deployment dry-run for proposed removals.
 :::
 
 ## Validation
