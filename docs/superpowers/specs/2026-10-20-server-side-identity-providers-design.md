@@ -32,9 +32,11 @@ User ID module EIDs, deduplicated, with EID-level provenance preserved
 `pbjs.getConfig('ortb2').user.ext.eids`, which a collector that reads only
 `getUserIdsAsEids()` misses (#1246).
 
-This spec does not depend on PR #1260. Its `IdentityCapture` trait,
-`identity_owner` field and `ts-eids-s` cookie are not on `main`. Where this
-spec reuses a name from #1260, it defines the thing from scratch here.
+This spec does not depend on PR #1260, and supersedes it: #1260 will not
+merge. Its `IdentityCapture` trait, `identity_owner` field and `ts-eids-s`
+cookie are not on `main`. Where this spec reuses a name from #1260, it
+defines the thing from scratch here, and it keeps `ts-eids` and `x-ts-eids`,
+which #1260 retires.
 
 Terms used throughout:
 
@@ -2110,7 +2112,7 @@ cookie.
 
 `SCHEMA_VERSION` becomes 2 (`ec/kv_types.rs:17`). `KvPartnerId`
 (`ec/kv_types.rs:102`) is replaced by one record shape, and `KvEntry`
-gains `ps`. KV item metadata, which Fastly caps at 2,048 bytes, holds no IDs
+gains `ps`. KV item metadata, which Fastly caps at 2,000 bytes, holds no IDs
 (`ec/kv_types.rs:199-219`) and is unaffected.
 
 **One record shape.** Every record stores its source's entry set in `eids`:
@@ -2671,8 +2673,8 @@ Rules:
   `gdpr_applies` or a jurisdiction of `Gdpr` or `Unknown`, matching
   `consent_allows_server_side_auction` (`consent/mod.rs:298-308`). Each check
   maps to a signal TS decodes:
-  - TCF purposes and vendor consents (`consent/tcf.rs:145`). A small
-    `has_vendor_consent` helper is new.
+  - TCF purposes and vendor consents (`consent/tcf.rs:145`). Vendor consent
+    uses the existing `TcfConsent::has_vendor_consent` (`consent/types.rs:278`).
   - The US sale opt-out, from GPP US sections (`consent/gpp.rs:74`, `:125`)
     or the US Privacy string (`consent/us_privacy.rs:50-63`).
   - The US sharing and targeted-advertising opt-outs. This work extends the
