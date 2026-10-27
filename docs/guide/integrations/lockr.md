@@ -216,7 +216,7 @@ curl https://edge.example.com/
 
 **Solutions**:
 
-- Verify `organization_id` and `project_id` are correct
+- Verify `app_id` is correct
 - Check Lockr API endpoint is reachable
 - Ensure GDPR consent is granted
 - Review Lockr API credentials
