@@ -813,9 +813,16 @@ impl IntegrationScriptRewriter for NextJsIntegration {
 
 **Actions**:
 
-- `keep()` - Leave script unchanged
-- `replace(content)` - Replace script content
-- `remove_node()` - Delete script element
+- `keep()` - Preserve the current working text fragment
+- `replace(content)` - Pass replacement text to subsequent matching stages
+- `remove_node()` - Suppress this text fragment, not the `<script>` element
+
+Matching script rewriters compose in registration order. Each receives the
+previous stage's output, including empty suppressed text, with the original
+final-fragment flag. Downstream stages still run after `remove_node()` and may
+flush buffered text. Only the composed result is applied to the parser fragment;
+script replacements are emitted as raw source, not HTML-entity-escaped text.
+Selectors must match `<script>` elements; non-script text hooks are unsupported.
 
 ### Head Injectors
 
