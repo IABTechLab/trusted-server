@@ -2680,6 +2680,10 @@ pub(crate) mod hold_fixture {
         }
 
         /// Runs the hold dispatch before the auction.
+        ///
+        /// It runs inside an executor, as the publisher handler does, so a
+        /// nested `block_on` anywhere in the hold dispatch panics every hold
+        /// test instead of only failing in production.
         pub(crate) fn run_hold(&mut self) -> HoldResults {
             let random = ThreadRandom;
             let deps = self.runtime.deps(
