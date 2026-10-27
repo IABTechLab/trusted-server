@@ -532,9 +532,12 @@ describe('GptDiagnosticsOverlay', () => {
     expect(emptySummary?.textContent).not.toContain('Served bidder not confirmed');
 
     expect(root!.textContent).toContain('How to read this evidence');
-    expect(root!.querySelector<HTMLAnchorElement>('a')?.href).toBe(
+    const dictionaryLink = root!.querySelector<HTMLAnchorElement>('a');
+    expect(dictionaryLink?.href).toBe(
       'https://iabtechlab.github.io/trusted-server/guide/integrations/gpt-diagnostics-dictionary'
     );
+    expect(dictionaryLink?.relList.contains('noopener')).toBe(true);
+    expect(dictionaryLink?.relList.contains('noreferrer')).toBe(true);
     button(root!, 'Export JSON').click();
     expect(exportSnapshot).toHaveBeenCalledTimes(1);
 

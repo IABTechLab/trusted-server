@@ -721,7 +721,7 @@ export class GptDiagnosticsOverlay {
     dictionaryLink.href =
       'https://iabtechlab.github.io/trusted-server/guide/integrations/gpt-diagnostics-dictionary';
     dictionaryLink.target = '_blank';
-    dictionaryLink.rel = 'noopener';
+    dictionaryLink.rel = 'noopener noreferrer';
     dictionaryLink.textContent = 'Label dictionary';
     dictionaryLink.setAttribute('aria-label', 'Open GPT diagnostics label dictionary');
     filterLabel.append(select);
