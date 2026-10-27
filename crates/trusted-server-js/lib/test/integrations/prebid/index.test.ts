@@ -5844,6 +5844,59 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     });
   });
 
+  it('retries failed bidWon registration without duplicating a successful listener', () => {
+    const slot = {
+      getSlotElementId: () => 'example-retry-slot',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const recordPrebidWin = vi.fn();
+    testWindow.tsjs = {
+      gptDiagnosticsRecorder: {
+        recordPrebidRefresh: vi.fn(),
+        recordPrebidAuction: vi.fn(),
+        recordPrebidWin,
+      },
+    };
+    const { originalRefresh, pubads } = installGpt([slot]);
+    installPrebidNpm();
+    mockPbjs.setTargetingForGPTAsync = vi.fn();
+    let auctionSequence = 0;
+    mockRequestBids.mockImplementation((opts) => {
+      opts.bidsBackHandler?.({}, false, `example-retry-auction-${++auctionSequence}`);
+    });
+    mockOnEvent.mockClear();
+    mockOnEvent.mockImplementationOnce(() => {
+      throw new Error('publisher onEvent failed once');
+    });
+
+    try {
+      pubads.refresh([slot]);
+      expect(mockOnEvent).toHaveBeenCalledExactlyOnceWith('bidWon', expect.any(Function));
+      expect(mockOnEvent.mock.results[0].type).toBe('throw');
+
+      pubads.refresh([slot]);
+      expect(mockOnEvent).toHaveBeenCalledTimes(2);
+      expect(mockOnEvent.mock.results[1].type).toBe('return');
+      const bidWon = mockOnEvent.mock.calls[1][1];
+      bidWon({
+        auctionId: 'example-retry-auction-2',
+        adUnitCode: 'example-retry-slot',
+        adserverTargeting: { hb_bidder: 'example-client', hb_pb: '2.40' },
+      });
+      expect(recordPrebidWin).toHaveBeenCalledExactlyOnceWith(slot, 'example-retry-auction-2', {
+        bidder: 'example-client',
+        priceBucket: '2.40',
+      });
+
+      pubads.refresh([slot]);
+      expect(mockOnEvent).toHaveBeenCalledTimes(2);
+      expect(originalRefresh).toHaveBeenCalledTimes(3);
+    } finally {
+      mockOnEvent.mockReset();
+    }
+  });
+
   it('does not record a completed auction for duplicate ad-unit element IDs', () => {
     const code = 'duplicate-client-slot';
     const firstSlot = {

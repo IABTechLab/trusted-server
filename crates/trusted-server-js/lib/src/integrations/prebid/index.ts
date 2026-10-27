@@ -1120,7 +1120,6 @@ function recordCompletedPrebidAuction(
 function installPrebidWinDiagnostics(): void {
   const diagnosticPbjs = pbjs as PbjsGlobal & { __tsDiagnosticsBidWonInstalled?: boolean };
   if (diagnosticPbjs.__tsDiagnosticsBidWonInstalled || typeof pbjs.onEvent !== 'function') return;
-  diagnosticPbjs.__tsDiagnosticsBidWonInstalled = true;
   pbjs.onEvent('bidWon', (rawBid: unknown) => {
     if (typeof rawBid !== 'object' || rawBid === null) return;
     const bid = rawBid as Record<string, unknown>;
@@ -1159,6 +1158,7 @@ function installPrebidWinDiagnostics(): void {
       // Diagnostics must not alter delivery.
     }
   });
+  diagnosticPbjs.__tsDiagnosticsBidWonInstalled = true;
 }
 
 function dispatchPrebidRefresh<T>(
