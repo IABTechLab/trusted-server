@@ -261,6 +261,8 @@ fn warn_if_certificate_check_disabled(settings: &Settings) {
 /// continues to rely on the trusted `fastly-ssl` header injected by
 /// `edgezero_main` after sanitization.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
+    // No cooperative timer is installed: Fastly host calls block. EOF consumers
+    // must bound their own transport calls using the remaining finish budget.
     let client_info = ctx
         .request()
         .extensions()
@@ -702,6 +704,7 @@ async fn run_named_route(
                 Some(&partner_registry)
             };
             let auction = AuctionDispatch {
+                integration_registry: &state.registry,
                 orchestrator: &state.orchestrator,
                 slots: state.settings.creative_opportunity_slots(),
                 registry: registry_ref,
@@ -866,6 +869,7 @@ async fn dispatch_fallback(
         match PartnerRegistry::from_config(&state.settings.ec.partners) {
             Ok(partner_registry) => {
                 let auction = AuctionDispatch {
+                    integration_registry: &state.registry,
                     orchestrator: &state.orchestrator,
                     slots,
                     registry: Some(&partner_registry),
@@ -1390,6 +1394,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use error_stack::Report;
+    use futures::StreamExt as _;
     use futures::executor::block_on;
     use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
     use trusted_server_core::ec::device::DeviceSignals;
@@ -1406,6 +1411,7 @@ mod tests {
         TemplateCacheMiss, TemplateCacheReservation, TemplateEntry, TemplateMetadata,
     };
     use trusted_server_core::settings::Settings;
+    use trusted_server_core::test_support::nextjs_auction;
 
     #[test]
     fn hooks_store_metadata_matches_edgezero_manifest() {
@@ -3010,6 +3016,7 @@ mod tests {
                         None,
                         &mut ec_context,
                         AuctionDispatch {
+                            integration_registry: &registry,
                             orchestrator: &orchestrator,
                             slots: settings.creative_opportunity_slots(),
                             registry: None,
@@ -3145,6 +3152,58 @@ mod tests {
             matches!(response.body(), Body::Stream(_)),
             "EdgeZero asset dispatch must stream the origin body, not buffer it"
         );
+    }
+
+    #[test]
+    fn dispatch_fallback_nextjs_gtm_response_is_complete() {
+        for gzip in [false, true] {
+            let state = build_state_from_settings(nextjs_auction::script_composition_settings())
+                .expect("should build mixed state");
+            let origin = Arc::new(nextjs_auction::NextJsAuctionOrigin::with_html_response(
+                &nextjs_auction::script_composition_html(),
+                gzip,
+                true,
+            ));
+            let services = nextjs_auction::services(origin);
+            let request = request_builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "https://{}/article",
+                    nextjs_auction::PUBLISHER_HOST
+                ))
+                .header("host", nextjs_auction::PUBLISHER_HOST)
+                .header("accept", "text/html")
+                .body(Body::empty())
+                .expect("should build navigation");
+            let response = block_on(super::dispatch_fallback(&state, &services, request));
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "should return a successful composed publisher response"
+            );
+            assert!(
+                !response.headers().contains_key(header::CONTENT_LENGTH),
+                "should drop the stale content length after streaming rewrites"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_ENCODING)
+                    .map(|value| value.to_str().expect("should have ASCII coding")),
+                gzip.then_some("gzip"),
+                "should retain the requested response compression"
+            );
+            let Body::Stream(mut stream) = response.into_body() else {
+                panic!("should retain lazy Fastly body");
+            };
+            let mut bytes = Vec::new();
+            block_on(async {
+                while let Some(chunk) = stream.next().await {
+                    bytes.extend_from_slice(&chunk.expect("should process every stream item"));
+                }
+            });
+            nextjs_auction::assert_script_composition_response(&bytes, gzip);
+        }
     }
 
     #[test]

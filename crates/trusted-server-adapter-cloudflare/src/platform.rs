@@ -1,3 +1,5 @@
+#[cfg(any(target_arch = "wasm32", test))]
+use std::future::Future;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -631,7 +633,7 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
     // simply absent on the native host target, producing Ok(None) from lookup().
     let geo = build_geo(ctx);
 
-    RuntimeServices::builder()
+    let builder = RuntimeServices::builder()
         .config_store(config_store)
         .secret_store(secret_store)
         .kv_store(kv_store)
@@ -643,8 +645,13 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
             tls_protocol: None,
             tls_cipher: None,
             ..ClientInfo::default()
-        })
-        .build()
+        });
+    #[cfg(target_arch = "wasm32")]
+    static TIMER: std::sync::OnceLock<Arc<dyn trusted_server_core::platform::PlatformTimer>> =
+        std::sync::OnceLock::new();
+    #[cfg(target_arch = "wasm32")]
+    let builder = builder.timer(Arc::clone(TIMER.get_or_init(|| Arc::new(CloudflareTimer))));
+    builder.build()
 }
 
 // ---------------------------------------------------------------------------
@@ -754,10 +761,124 @@ fn reject_multi_provider_fanout(len: usize) -> Result<(), Report<PlatformError>>
     Ok(())
 }
 
+#[cfg(target_arch = "wasm32")]
+struct CloudflareTimer;
+
+#[cfg(target_arch = "wasm32")]
+impl trusted_server_core::platform::PlatformTimer for CloudflareTimer {
+    fn delay(&self, duration: std::time::Duration) -> futures::future::LocalBoxFuture<'static, ()> {
+        relay_timer_waker(worker::Delay::from(duration))
+    }
+}
+
+// `worker::Delay` retains its first waker. Keep that waker stable while relaying
+// wakeups to the latest task polling the shared HTML completion deadline.
+#[cfg(any(target_arch = "wasm32", test))]
+fn relay_timer_waker(
+    delay: impl Future<Output = ()> + 'static,
+) -> futures::future::LocalBoxFuture<'static, ()> {
+    let relay = Arc::new(TimerWakerRelay(futures::task::AtomicWaker::new()));
+    let relay_waker = futures::task::waker(Arc::clone(&relay));
+    let mut delay = Box::pin(delay);
+    Box::pin(futures::future::poll_fn(move |context| {
+        relay.0.register(context.waker());
+        delay
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&relay_waker))
+    }))
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+struct TimerWakerRelay(futures::task::AtomicWaker);
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl futures::task::ArcWake for TimerWakerRelay {
+    fn wake_by_ref(relay: &Arc<Self>) {
+        relay.0.wake();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use edgezero_core::context::RequestContext;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Waker};
+
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
+
+    impl futures::task::ArcWake for WakeCounter {
+        fn wake_by_ref(counter: &Arc<Self>) {
+            counter.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn timer_relay_wakes_the_latest_task() {
+        let first_waker = Arc::new(Mutex::new(None::<Waker>));
+        let ready = Arc::new(AtomicBool::new(false));
+        let captured_waker = Arc::clone(&first_waker);
+        let delay_ready = Arc::clone(&ready);
+        // Model worker::Delay by saving only the first poll's waker.
+        let delay = futures::future::poll_fn(move |context| {
+            captured_waker
+                .lock()
+                .expect("should lock the captured waker")
+                .get_or_insert_with(|| context.waker().clone());
+            if delay_ready.load(Ordering::SeqCst) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        });
+        let mut timer = relay_timer_waker(delay);
+        let first = Arc::new(WakeCounter::default());
+        let latest = Arc::new(WakeCounter::default());
+        let first_task_waker = futures::task::waker(Arc::clone(&first));
+        let latest_task_waker = futures::task::waker(Arc::clone(&latest));
+
+        assert!(
+            timer
+                .as_mut()
+                .poll(&mut Context::from_waker(&first_task_waker))
+                .is_pending(),
+            "should register the first polling task"
+        );
+        assert!(
+            timer
+                .as_mut()
+                .poll(&mut Context::from_waker(&latest_task_waker))
+                .is_pending(),
+            "should register the latest polling task"
+        );
+        ready.store(true, Ordering::SeqCst);
+        first_waker
+            .lock()
+            .expect("should lock the captured waker")
+            .as_ref()
+            .expect("should capture the delay's first waker")
+            .wake_by_ref();
+
+        assert_eq!(
+            first.0.load(Ordering::SeqCst),
+            0,
+            "should leave the old task asleep"
+        );
+        assert_eq!(
+            latest.0.load(Ordering::SeqCst),
+            1,
+            "should wake the latest polling task"
+        );
+        assert!(
+            timer
+                .as_mut()
+                .poll(&mut Context::from_waker(&latest_task_waker))
+                .is_ready(),
+            "should complete the timer in the latest task"
+        );
+    }
 
     #[cfg(target_arch = "wasm32")]
     #[test]
