@@ -99,9 +99,12 @@ const PANEL_STYLES = `
   summary { cursor: pointer; color: #93c5fd; }
   .tsgd-cycle { margin: 6px 0 0; padding: 6px 8px; background: #0f172a; border-radius: 5px; }
   .tsgd-badge-layer { position: fixed; z-index: 2147483646; inset: 0; pointer-events: none; }
-  .tsgd-badge {
-    position: fixed;
-    pointer-events: auto;
+  .tsgd-badge { position: fixed; pointer-events: none; }
+  .tsgd-badge-evidence {
+    display: block;
+    max-height: calc(100vh - 8px);
+    overflow: hidden;
+    pointer-events: none;
     padding: 5px 7px;
     color: #fff;
     background: rgb(15 23 42 / 94%);
@@ -111,8 +114,18 @@ const PANEL_STYLES = `
     font: 11px/1.35 ui-sans-serif, system-ui, sans-serif;
     white-space: pre-line;
     text-align: left;
-    cursor: pointer;
   }
+  .tsgd-badge-handle {
+    position: fixed;
+    pointer-events: auto;
+    min-height: 0;
+    padding: 2px 4px;
+    overflow: hidden;
+    white-space: nowrap;
+    font: 11px/1.35 ui-sans-serif, system-ui, sans-serif;
+    border-color: #60a5fa;
+  }
+  .tsgd-badge-handle[hidden] { display: none; }
   .tsgd-highlight {
     position: fixed;
     border: 3px solid #fbbf24;
@@ -520,7 +533,11 @@ export class GptDiagnosticsOverlay {
   selectRequest(runtimeSlotNumber: number, requestNumber: number): void {
     if (this.destroyed) return;
     this.selectedRequest = { runtimeSlotNumber, requestNumber };
-    this.historySlotToOpenOnce = runtimeSlotNumber;
+    const slot = this.store
+      .snapshot()
+      .slots.find((candidate) => candidate.runtimeSlotNumber === runtimeSlotNumber);
+    this.historySlotToOpenOnce =
+      slot && latestCycle(slot)?.requestNumber !== requestNumber ? runtimeSlotNumber : undefined;
     this.filter = 'all';
     this.collapsed = false;
     this.show();

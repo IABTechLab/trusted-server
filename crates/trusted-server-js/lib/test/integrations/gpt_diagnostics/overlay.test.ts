@@ -710,12 +710,20 @@ describe('GptDiagnosticsOverlay', () => {
     runNextFrame(frames);
     runNextFrame(frames);
 
+    overlay.selectRequest(1, 2);
+    runNextFrame(frames);
+    const current = root?.querySelector<HTMLElement>('.tsgd-slot');
+    expect(current?.getAttribute('aria-current')).toBe('true');
+    expect(root?.activeElement).toBe(current);
+    expect(root?.querySelector<HTMLDetailsElement>('.tsgd-history')?.open).toBe(false);
+
     overlay.selectRequest(1, 1);
     runNextFrame(frames);
     const selected = root?.querySelector<HTMLElement>(
       '[data-runtime-slot="1"][data-request-number="1"]'
     );
     expect(selected?.getAttribute('aria-current')).toBe('true');
+    expect(root?.activeElement).toBe(selected);
     expect(root?.textContent).toContain('Request history (1 previous)');
     const focus = vi.spyOn(HTMLElement.prototype, 'focus');
     selected?.focus();

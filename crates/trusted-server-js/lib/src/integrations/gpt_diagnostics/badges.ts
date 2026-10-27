@@ -32,6 +32,8 @@ type BadgeWindow = Window & {
 
 const BADGE_MAX_WIDTH_PX = 260;
 const BADGE_EDGE_GUTTER_PX = 4;
+const HANDLE_WIDTH_PX = 72;
+const HANDLE_HEIGHT_PX = 26;
 const MAX_BADGE_REQUESTED_SLOT_SIZES = 3;
 
 interface BadgeOptions {
@@ -201,12 +203,17 @@ export class GptDiagnosticsBadgeManager {
     if (this.destroyed || !this.layer?.isConnected) return;
     const observedElements: HTMLElement[] = [];
     const existingBadges = new Map(
-      Array.from(this.layer.querySelectorAll<HTMLButtonElement>('.tsgd-badge')).map((badge) => [
+      Array.from(this.layer.querySelectorAll<HTMLDivElement>('.tsgd-badge')).map((badge) => [
         badge.dataset.runtimeSlot,
         badge,
       ])
     );
-    const badges = new Set<HTMLButtonElement>();
+    const badges = new Set<HTMLDivElement>();
+    const creativeRectangles = this.slots.flatMap((slot) => {
+      const binding = this.bindings.get(slot.runtimeSlotNumber);
+      if (binding.binding.status !== 'bound' || !binding.element?.isConnected) return [];
+      return [binding.element.getBoundingClientRect()];
+    });
 
     for (const slot of this.slots) {
       const cycle = latestCycle(slot);
@@ -222,10 +229,15 @@ export class GptDiagnosticsBadgeManager {
       const runtimeSlot = String(slot.runtimeSlotNumber);
       let badge = existingBadges.get(runtimeSlot);
       if (!badge) {
-        const createdBadge = this.document.createElement('button');
-        createdBadge.type = 'button';
+        const createdBadge = this.document.createElement('div');
         createdBadge.className = 'tsgd-badge';
-        createdBadge.addEventListener('click', () => {
+        const evidence = this.document.createElement('span');
+        evidence.className = 'tsgd-badge-evidence';
+        const handle = this.document.createElement('button');
+        handle.type = 'button';
+        handle.className = 'tsgd-badge-handle';
+        createdBadge.append(evidence, handle);
+        handle.addEventListener('click', () => {
           const runtimeSlotNumber = Number(createdBadge.dataset.runtimeSlot);
           const requestNumber = Number(createdBadge.dataset.requestNumber);
           if (!Number.isSafeInteger(runtimeSlotNumber) || !Number.isSafeInteger(requestNumber)) {
@@ -238,30 +250,43 @@ export class GptDiagnosticsBadgeManager {
       const text = badgeText(cycle);
       badge.dataset.runtimeSlot = runtimeSlot;
       badge.dataset.requestNumber = String(cycle.requestNumber);
-      badge.textContent = `Ad #${slot.runtimeSlotNumber} · Request #${cycle.requestNumber} · ${text}`;
-      badge.setAttribute(
+      const evidence = badge.querySelector<HTMLElement>('.tsgd-badge-evidence')!;
+      evidence.textContent = `Request #${cycle.requestNumber} · ${text}`;
+      const handle = badge.querySelector<HTMLButtonElement>('.tsgd-badge-handle')!;
+      handle.textContent = `Ad #${slot.runtimeSlotNumber}`;
+      handle.setAttribute(
         'aria-label',
         `Open diagnostics for Ad #${slot.runtimeSlotNumber}, Request #${cycle.requestNumber}: ${text}`
       );
-      badge.style.maxWidth = `${BADGE_MAX_WIDTH_PX}px`;
+      badge.style.maxWidth = `${Math.max(
+        0,
+        Math.min(BADGE_MAX_WIDTH_PX, this.window.innerWidth - 2 * BADGE_EDGE_GUTTER_PX)
+      )}px`;
       badge.style.left = `${Math.max(
         BADGE_EDGE_GUTTER_PX,
         Math.min(rectangle.left, this.window.innerWidth - BADGE_MAX_WIDTH_PX - BADGE_EDGE_GUTTER_PX)
       )}px`;
-      if (rectangle.top >= 56) {
-        badge.style.top = `${rectangle.top - 8}px`;
-        badge.style.transform = 'translateY(-100%)';
-      } else {
-        badge.style.top = `${Math.max(
-          BADGE_EDGE_GUTTER_PX,
-          rectangle.top + BADGE_EDGE_GUTTER_PX
-        )}px`;
-        badge.style.transform = '';
+      if (!badge.isConnected) this.layer.append(badge);
+      const evidenceHeight = evidence.getBoundingClientRect().height;
+      badge.style.top = `${Math.max(
+        BADGE_EDGE_GUTTER_PX,
+        Math.min(
+          rectangle.top - evidenceHeight - BADGE_EDGE_GUTTER_PX,
+          this.window.innerHeight - evidenceHeight - BADGE_EDGE_GUTTER_PX
+        )
+      )}px`;
+      const handlePosition = this.handlePosition(rectangle, creativeRectangles);
+      handle.hidden = !handlePosition;
+      handle.style.width = `${HANDLE_WIDTH_PX}px`;
+      handle.style.height = `${HANDLE_HEIGHT_PX}px`;
+      if (handlePosition) {
+        handle.style.left = `${handlePosition.left}px`;
+        handle.style.top = `${handlePosition.top}px`;
       }
       badges.add(badge);
     }
 
-    for (const badge of Array.from(this.layer.querySelectorAll<HTMLButtonElement>('.tsgd-badge'))) {
+    for (const badge of Array.from(this.layer.querySelectorAll<HTMLDivElement>('.tsgd-badge'))) {
       if (!badges.has(badge)) badge.remove();
     }
     for (const badge of badges) {
@@ -282,6 +307,37 @@ export class GptDiagnosticsBadgeManager {
     this.resizeObserver?.disconnect();
     this.layer?.replaceChildren();
     this.layer = undefined;
+  }
+
+  private handlePosition(
+    rectangle: DOMRect,
+    creativeRectangles: DOMRect[]
+  ): { left: number; top: number } | undefined {
+    const gutter = BADGE_EDGE_GUTTER_PX;
+    const maxLeft = this.window.innerWidth - HANDLE_WIDTH_PX - gutter;
+    const maxTop = this.window.innerHeight - HANDLE_HEIGHT_PX - gutter;
+    const left = Math.max(gutter, Math.min(rectangle.left, maxLeft));
+    const top = Math.max(gutter, Math.min(rectangle.top, maxTop));
+    const candidates = [
+      { left, top: rectangle.top - HANDLE_HEIGHT_PX - gutter },
+      { left, top: rectangle.bottom + gutter },
+      { left: rectangle.right + gutter, top },
+      { left: rectangle.left - HANDLE_WIDTH_PX - gutter, top },
+    ];
+    return candidates.find(
+      (candidate) =>
+        candidate.left >= gutter &&
+        candidate.top >= gutter &&
+        candidate.left <= maxLeft &&
+        candidate.top <= maxTop &&
+        creativeRectangles.every(
+          (creative) =>
+            candidate.left + HANDLE_WIDTH_PX <= creative.left ||
+            candidate.left >= creative.right ||
+            candidate.top + HANDLE_HEIGHT_PX <= creative.top ||
+            candidate.top >= creative.bottom
+        )
+    );
   }
 
   private readonly scheduleUpdate = (): void => {
