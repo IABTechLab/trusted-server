@@ -4331,6 +4331,7 @@ mod tests {
                 random: &ThreadRandom,
                 ec_id: Some(format!("{}.ABC123", "a".repeat(64))),
                 stored: BTreeMap::new(),
+                cookies: BTreeMap::new(),
             };
             futures::executor::block_on(dispatch(&deps, calls, &signals, budget))
         }
@@ -5465,6 +5466,8 @@ mod tests {
                     user_agent: Some("ExampleBrowser/1.0".to_owned()),
                     dnt: false,
                     page_url: None,
+                    hashed_email: None,
+                    cookies: BTreeMap::new(),
                 });
             let mut writer = HoldFixture::new(
                 vec![hold_provider("p", HOLD_HOST, HOLD_SOURCE)],
@@ -5531,6 +5534,8 @@ mod tests {
                         user_agent: Some("ExampleBrowser/1.0".to_owned()),
                         dnt: false,
                         page_url: None,
+                        hashed_email: None,
+                        cookies: BTreeMap::new(),
                     });
                 fixture.run_hold();
             }
@@ -5544,6 +5549,8 @@ mod tests {
                     user_agent: Some("ExampleBrowser/1.0".to_owned()),
                     dnt: false,
                     page_url: None,
+                    hashed_email: None,
+                    cookies: BTreeMap::new(),
                 });
             fixture.run_hold();
 
@@ -6178,6 +6185,8 @@ mod tests {
                     user_agent: None,
                     dnt: false,
                     page_url: None,
+                    hashed_email: None,
+                    cookies: BTreeMap::new(),
                 },
             );
 

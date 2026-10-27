@@ -19,6 +19,7 @@ use validator::Validate;
 
 use crate::constants::INTERNAL_HEADERS;
 use crate::error::TrustedServerError;
+use crate::integrations::lockr_identity::LockrIdentityProvider;
 use crate::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
@@ -28,7 +29,7 @@ use crate::integrations::{
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
 
-const LOCKR_INTEGRATION_ID: &str = "lockr";
+pub(crate) const LOCKR_INTEGRATION_ID: &str = "lockr";
 
 /// Configuration for Lockr integration.
 #[derive(Debug, Deserialize, Validate)]
@@ -71,6 +72,12 @@ pub struct LockrConfig {
     #[serde(default)]
     #[validate(url)]
     pub origin_override: Option<String>,
+
+    /// Registers Lockr as a capture-only identity provider that revokes IDs
+    /// when Lockr's API reports a consent revocation. Needs
+    /// `[ec.identity.providers.lockr].sources`. Default: off.
+    #[serde(default)]
+    pub capture_identity: bool,
 }
 
 impl IntegrationConfig for LockrConfig {
@@ -336,12 +343,14 @@ pub fn register(
         integration.config.rewrite_sdk
     );
 
-    Ok(Some(
-        IntegrationRegistration::builder(LOCKR_INTEGRATION_ID)
-            .with_proxy(integration.clone())
-            .with_attribute_rewriter(integration)
-            .build(),
-    ))
+    let mut builder = IntegrationRegistration::builder(LOCKR_INTEGRATION_ID)
+        .with_proxy(integration.clone())
+        .with_attribute_rewriter(integration.clone());
+    if integration.config.capture_identity {
+        builder =
+            builder.try_with_identity_provider(LockrIdentityProvider::new(&integration.config))?;
+    }
+    Ok(Some(builder.build()))
 }
 
 #[async_trait(?Send)]
@@ -450,6 +459,7 @@ mod tests {
             rewrite_sdk: true,
             rewrite_sdk_host: None,
             origin_override: None,
+            capture_identity: false,
         }
     }
 

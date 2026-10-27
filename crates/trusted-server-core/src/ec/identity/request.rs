@@ -6,6 +6,7 @@ use std::sync::Arc;
 use url::Url;
 
 use super::ids::{IdentityProviderId, SourceDomain};
+use super::input::HashedEmail;
 use super::mutation::{IdentityMutation, is_opted_out};
 use super::runtime::IdentityRuntime;
 use crate::ec::kv_types::KvEntry;
@@ -37,6 +38,8 @@ pub(crate) struct RequestIdentity {
     user_agent: Option<String>,
     dnt: bool,
     page_url: Option<Url>,
+    hashed_email: Option<HashedEmail>,
+    cookies: BTreeMap<String, String>,
     runtime: Option<Arc<IdentityRuntime>>,
     rate_limiter: Option<Arc<dyn RateLimiter + Send + Sync>>,
     runs_auction: bool,
@@ -97,6 +100,19 @@ impl RequestIdentity {
     #[must_use]
     pub(crate) fn page_url(&self) -> Option<&Url> {
         self.page_url.as_ref()
+    }
+
+    /// The hashed email from the request's `ts-hem` cookie.
+    #[must_use]
+    pub(crate) fn hashed_email(&self) -> Option<&HashedEmail> {
+        self.hashed_email.as_ref()
+    }
+
+    /// The request's first-party cookies other than Trusted Server's own and
+    /// the consent cookies, for providers that declare them.
+    #[must_use]
+    pub(crate) fn cookies(&self) -> &BTreeMap<String, String> {
+        &self.cookies
     }
 
     /// The request's identity runtime, when the adapter set one.
@@ -251,6 +267,8 @@ impl RequestIdentity {
         self.user_agent = decision.user_agent;
         self.dnt = decision.dnt;
         self.page_url = decision.page_url;
+        self.hashed_email = decision.hashed_email;
+        self.cookies = decision.cookies;
     }
 
     /// Records only the real-browser flag, for a route that is never the writer.
@@ -271,6 +289,8 @@ pub(crate) struct WriterDecision {
     pub(crate) user_agent: Option<String>,
     pub(crate) dnt: bool,
     pub(crate) page_url: Option<Url>,
+    pub(crate) hashed_email: Option<HashedEmail>,
+    pub(crate) cookies: BTreeMap<String, String>,
 }
 
 #[cfg(test)]

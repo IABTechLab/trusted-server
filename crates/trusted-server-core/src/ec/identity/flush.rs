@@ -355,6 +355,7 @@ pub(super) fn request_facts(context: &EcContext, now: u64, runs_auction: bool) -
         (Input::UserAgent, identity.user_agent().is_some()),
         (Input::PageUrl, identity.page_url().is_some()),
         (Input::Region, region(context).is_some()),
+        (Input::HashedEmail, identity.hashed_email().is_some()),
     ] {
         if present {
             available_inputs.insert(input);
@@ -493,13 +494,14 @@ pub(super) async fn add_dispatch_results(
         user_agent: identity.user_agent(),
         page_url: identity.page_url().cloned(),
         region: region(input.context),
-        hashed_email: None,
+        hashed_email: identity.hashed_email().cloned(),
         consent: ProviderConsent::from_context(input.context.consent()),
         publisher_domain: &deps.settings.publisher.domain,
         now: input.facts.now,
         random: deps.random,
         ec_id: Some(input.ec_id.to_owned()),
         stored,
+        cookies: identity.cookies().clone(),
     };
     let catalog = deps.catalog;
     for (id, outcome) in dispatch(deps, calls, &signals, budget).await {
@@ -686,6 +688,8 @@ mod tests {
                 user_agent: Some("ExampleBrowser/1.0".to_owned()),
                 dnt: false,
                 page_url: None,
+                hashed_email: None,
+                cookies: BTreeMap::new(),
             });
             if let Some(row) = row {
                 graph.create(TEST_EC_ID, row).expect("should seed the row");
@@ -1197,6 +1201,8 @@ mod tests {
                 user_agent: None,
                 dnt: false,
                 page_url: None,
+                hashed_email: None,
+                cookies: BTreeMap::new(),
             });
 
         assert_eq!(
