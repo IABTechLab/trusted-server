@@ -2,9 +2,9 @@
 
 The Trusted Server project will be governed as an open-source initiative, in accordance with the established guidelines of the IAB Tech Lab Open Source initiative. However, certain key distinctions apply:
 
-* The Trusted Server Task Force shall be responsible for the definition of requirements and the project roadmap.
-* The Task Force shall adhere to the working group rules and procedures of the Tech Lab.
-* The Trusted Server Development Team shall oversee engineering development and releases.
+- The Trusted Server Task Force shall be responsible for the definition of requirements and the project roadmap.
+- The Task Force shall adhere to the working group rules and procedures of the Tech Lab.
+- The Trusted Server Development Team shall oversee engineering development and releases.
 
 ## The Trusted Server Task Force
 
@@ -18,8 +18,8 @@ The Task Force will convene biweekly, and detailed meeting minutes will be metic
 
 The Development Team shall be responsible for the evaluation of technical feasibility of requirements, the definition of system architecture, and the construction of the Trusted Server in alignment with the roadmap established by the Task Force. The team composition is as follows:
 
-* **Project Release Manager:** This individual holds ultimate responsibility for project development and possesses 'write' access to the repository.
-* **Committer:** This developer possesses 'write' access to the repository and is responsible for implementing final changes.
-* **Developer:** This contributor contributes to the project through code or documentation and may assume further project management responsibilities.
+- **Project Release Manager:** This individual holds ultimate responsibility for project development and possesses 'write' access to the repository.
+- **Committer:** This developer possesses 'write' access to the repository and is responsible for implementing final changes.
+- **Developer:** This contributor contributes to the project through code or documentation and may assume further project management responsibilities.
 
 The Development Team shall be responsible for the development and release of the Trusted Server and will establish its own sprint and meeting schedule.

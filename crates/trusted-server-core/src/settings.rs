@@ -29,6 +29,12 @@ use crate::redacted::Redacted;
 pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
 #[cfg(test)]
 pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
+/// Build inputs that share the settings prefix but are not settings.
+///
+/// The core build script exports these with `cargo:rustc-env`, and Cargo sets
+/// them on every `cargo test` run of this crate.
+#[cfg(test)]
+const BUILD_ENVIRONMENT_VARIABLES: [&str; 1] = ["TRUSTED_SERVER__GIT_VERSION"];
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
@@ -65,7 +71,8 @@ pub struct Publisher {
     /// trips, so the response is truncated mid-body (with the error logged)
     /// rather than replaced with a 5xx.
     ///
-    /// Buffered adapters keep using it as the post-rewrite output buffer cap.
+    /// The async HTML EOF driver also caps cumulative raw and decoded input on
+    /// every adapter. Other buffered responses use the post-rewrite output cap.
     /// There it additionally bounds how much decoded gzip output may sit in the
     /// heap at once, so a bomb is rejected mid-decode instead of after its full
     /// expansion; that bound is per-step, never cumulative, so a gzip-encoded
@@ -78,6 +85,38 @@ pub struct Publisher {
     #[serde(default = "default_max_buffered_body_bytes")]
     #[validate(range(min = 1, message = "must be at least 1 byte"))]
     pub max_buffered_body_bytes: usize,
+    /// Explicit operator permission for asynchronous HTML EOF work.
+    ///
+    /// Defaults to false. Enabled work can delay response delivery, especially
+    /// on buffered adapters and processors retaining output until EOF.
+    ///
+    /// Skipped from serialization while false: [`Publisher`] denies unknown
+    /// fields, so a default blob must stay readable by a binary built before
+    /// this field existed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_async_html_finish: bool,
+    /// Whole-chain HTML EOF budget in milliseconds; inert without an async processor.
+    ///
+    /// Skipped from serialization at its default for the same rollback reason
+    /// as [`Self::allow_async_html_finish`].
+    #[serde(
+        default = "default_html_finalization_timeout_ms",
+        skip_serializing_if = "is_default_html_finalization_timeout_ms"
+    )]
+    #[validate(range(
+        min = 1,
+        max = 60000,
+        message = "must be between 1 and 60000 milliseconds"
+    ))]
+    pub html_finalization_timeout_ms: u32,
+}
+
+fn default_html_finalization_timeout_ms() -> u32 {
+    5000
+}
+
+fn is_default_html_finalization_timeout_ms(value: &u32) -> bool {
+    *value == default_html_finalization_timeout_ms()
 }
 
 fn default_max_buffered_body_bytes() -> usize {
@@ -98,6 +137,8 @@ impl Default for Publisher {
             origin_host_header_override: None,
             proxy_secret: Redacted::default(),
             max_buffered_body_bytes: default_max_buffered_body_bytes(),
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         }
     }
 }
@@ -189,6 +230,8 @@ impl Publisher {
     ///     origin_host_header_override: None,
     ///     proxy_secret: Redacted::new("proxy-secret".to_string()),
     ///     max_buffered_body_bytes: 16 * 1024 * 1024,
+    ///     html_finalization_timeout_ms: 5000,
+    ///     allow_async_html_finish: false,
     /// };
     /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
     /// ```
@@ -443,7 +486,8 @@ pub struct EcPartner {
 }
 
 impl EcPartner {
-    /// Known partner API token placeholders that must not be used in deployments.
+    /// Known partner secret placeholders (`api_token` and `ts_pull_token`) that
+    /// must not be used in deployments.
     pub const API_TOKEN_PLACEHOLDERS: &[&str] = &[
         "partner-api-token-32-bytes-minimum",
         "replace-with-partner-api-token-32-bytes-minimum",
@@ -1022,7 +1066,28 @@ pub struct ImageOptimizerSettings {
 }
 
 impl ImageOptimizerSettings {
-    fn normalize(&mut self) {
+    /// Trim image configuration keys and values, rejecting keys that collide after trimming.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if retained profile-set or profile keys
+    /// collide after trimming.
+    fn normalize(&mut self) -> Result<(), Report<TrustedServerError>> {
+        validate_trimmed_image_optimizer_keys(
+            self.profile_sets.keys(),
+            "image_optimizer.profile_sets",
+        )?;
+        let mut profile_sets: Vec<_> = self.profile_sets.iter().collect();
+        profile_sets.sort_unstable_by_key(|(name, _)| *name);
+        for (name, profile_set) in profile_sets {
+            if !name.trim().is_empty() {
+                validate_trimmed_image_optimizer_keys(
+                    profile_set.profiles.keys(),
+                    &format!("image_optimizer.profile_sets.{name:?}.profiles"),
+                )?;
+            }
+        }
+
         self.profile_sets = self
             .profile_sets
             .drain()
@@ -1032,6 +1097,7 @@ impl ImageOptimizerSettings {
             })
             .filter(|(key, _)| !key.is_empty())
             .collect();
+        Ok(())
     }
 
     /// Eagerly validate configured image profile sets.
@@ -1041,6 +1107,36 @@ impl ImageOptimizerSettings {
         }
         Ok(())
     }
+}
+
+/// Check retained image configuration keys before normalization discards originals.
+///
+/// # Errors
+///
+/// Returns a configuration error naming both original keys when they trim to
+/// the same non-empty name.
+fn validate_trimmed_image_optimizer_keys<'a>(
+    keys: impl Iterator<Item = &'a String>,
+    path: &str,
+) -> Result<(), Report<TrustedServerError>> {
+    let mut names: Vec<_> = keys
+        .map(|key| (key.trim(), key.as_str()))
+        .filter(|(trimmed, _)| !trimmed.is_empty())
+        .collect();
+    names.sort_unstable();
+
+    for pair in names.windows(2) {
+        let (trimmed, first) = pair[0];
+        let (next_trimmed, second) = pair[1];
+        if trimmed == next_trimmed {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "{path} keys {first:?} and {second:?} collide after trimming to {trimmed:?}"
+                ),
+            }));
+        }
+    }
+    Ok(())
 }
 
 /// Named set of profile-table Image Optimizer mappings.
@@ -2548,6 +2644,33 @@ pub struct DebugConfig {
     /// un-sanitized creative for diagnostics, so never enable in production.
     #[serde(default)]
     pub inject_adm_for_testing: bool,
+
+    /// Expose the reusable-sandbox counters endpoint at `GET /_ts/debug/sandbox`
+    /// and attach the same counters to private, no-store workload responses.
+    ///
+    /// The counters are the guest-instance identifier, the request ordinal
+    /// within that instance, the application build count, and the request
+    /// correlation id. They carry no settings, secrets, or request content.
+    /// Cacheable responses omit counters without changing their cache policy;
+    /// probes of those routes cannot establish sandbox reuse.
+    ///
+    /// Independent of the adapter's `reusable-sandbox` Cargo feature by design:
+    /// the feature decides whether a `Serve` loop exists, this flag decides
+    /// whether counters are emitted. Keeping them separate is what lets the
+    /// feature-off baseline be measured on the same channel as the reuse arms.
+    ///
+    /// Skipped from serialization while false: [`DebugConfig`] denies unknown
+    /// fields, so a default blob must stay readable by a binary built before
+    /// this field existed. A blob with it enabled requires restoring a
+    /// compatible blob before rolling back, the same trade
+    /// [`DebugConfig::auction_html_comment_options`] makes.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sandbox_metrics_enabled: bool,
+}
+
+/// Serde predicate for omitting `false` flags from serialized config blobs.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Metadata keys safe to surface in the `ts-debug` auction comment.
@@ -2724,11 +2847,46 @@ pub enum AuctionDebugCommentFormat {
 }
 
 /// Tester-cookie endpoint configuration.
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct TesterCookieConfig {
     /// Enable tester-cookie endpoints that set and clear `ts-tester`.
     #[serde(default)]
     pub enabled: bool,
+    /// Lifetime of the `ts-tester` cookie in seconds. Defaults to 30 days.
+    ///
+    /// Without an explicit lifetime the cookie is session-scoped, and Safari
+    /// deletes session cookies when the browser quits, so testers silently
+    /// fall back to the baseline arm on their next visit. Safari's ITP may
+    /// still cap the effective lifetime (for example to 7 days when the
+    /// serving host is a CNAME to a third-party edge), which remains far
+    /// better than session scope.
+    #[validate(range(
+        min = 1,
+        max = 31_536_000,
+        message = "must be between 1 second and 1 year"
+    ))]
+    #[serde(default = "TesterCookieConfig::default_max_age_seconds")]
+    pub max_age_seconds: u32,
+}
+
+impl TesterCookieConfig {
+    /// Default tester-cookie lifetime: 30 days.
+    #[must_use]
+    pub const fn default_max_age_seconds() -> u32 {
+        30 * 24 * 60 * 60
+    }
+}
+
+// A manual impl rather than derive: derive(Default) would zero
+// `max_age_seconds` whenever the whole `[tester_cookie]` section is absent,
+// because `Settings.tester_cookie` uses `#[serde(default)]`.
+impl Default for TesterCookieConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_age_seconds: Self::default_max_age_seconds(),
+        }
+    }
 }
 
 /// Authenticated forwarding configuration for a trusted client IP header.
@@ -2845,6 +3003,7 @@ pub struct Settings {
     #[validate(nested)]
     pub publisher: Publisher,
     #[serde(default)]
+    #[validate(nested)]
     pub tester_cookie: TesterCookieConfig,
     /// Optional authenticated trusted client IP forwarding configuration.
     ///
@@ -2928,16 +3087,26 @@ impl Settings {
     /// Runtime loading does not use this legacy helper; `EdgeZero` CLI app-config
     /// overlays are applied before deserializing [`crate::config::TrustedServerAppConfig`].
     /// This helper remains available to existing tests that exercise legacy
-    /// parsing behavior.
+    /// parsing behavior. Build inputs such as `TRUSTED_SERVER__GIT_VERSION`
+    /// are not treated as overrides.
     ///
     /// # Errors
     ///
     /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
     #[cfg(test)]
     pub fn from_toml_and_env(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
+        let overrides = std::env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+            .filter(|(key, _)| {
+                !BUILD_ENVIRONMENT_VARIABLES
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(key))
+            })
+            .collect();
         let environment = Environment::default()
             .prefix(ENVIRONMENT_VARIABLE_PREFIX)
-            .separator(ENVIRONMENT_VARIABLE_SEPARATOR);
+            .separator(ENVIRONMENT_VARIABLE_SEPARATOR)
+            .source(Some(overrides));
 
         let toml = File::from_str(toml_str, FileFormat::Toml);
         let config = Config::builder()
@@ -2957,22 +3126,28 @@ impl Settings {
         Self::finalize_deserialized(settings, "Build-time configuration")
     }
 
-    pub(crate) fn normalize_deserialized(&mut self) {
+    /// Normalize settings after deserialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if image optimizer keys collide after trimming.
+    pub(crate) fn normalize_deserialized(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.cache.normalize();
         self.proxy.normalize();
-        self.image_optimizer.normalize();
+        self.image_optimizer.normalize()?;
         self.debug.auction_html_comment_options.normalize();
         self.tinybird.normalize();
         self.integrations
             .remove_legacy_static_secret_store_selectors();
         self.consent.validate();
+        Ok(())
     }
 
     pub(crate) fn finalize_deserialized(
         mut settings: Self,
         validation_label: &str,
     ) -> Result<Self, Report<TrustedServerError>> {
-        settings.normalize_deserialized();
+        settings.normalize_deserialized()?;
         settings.prepare_runtime()?;
 
         settings.validate().map_err(|err| {
@@ -3088,6 +3263,16 @@ impl Settings {
                 .is_some_and(|token| EcPartner::is_placeholder_api_token(token.expose()))
             {
                 insecure_fields.push(format!("ec.partners[{}].api_token", partner.source_domain));
+            }
+            if partner
+                .ts_pull_token
+                .as_ref()
+                .is_some_and(|token| EcPartner::is_placeholder_api_token(token.expose()))
+            {
+                insecure_fields.push(format!(
+                    "ec.partners[{}].ts_pull_token",
+                    partner.source_domain
+                ));
             }
         }
         for handler in &self.handlers {
@@ -3681,11 +3866,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use regex::Regex;
-    use serde_json::json;
-    use std::collections::BTreeSet;
-    use std::sync::Arc;
-
     use crate::auction::build_orchestrator;
     use crate::integrations::{
         IntegrationRegistry, gpt::GptConfig, nextjs::NextJsIntegrationConfig,
@@ -3693,6 +3873,141 @@ mod tests {
     };
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+    use regex::Regex;
+    use serde_json::json;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    #[test]
+    fn html_finalization_timeout_defaults_and_boundaries() {
+        let parsed = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse an omitted terminal timeout");
+        assert_eq!(
+            parsed.publisher.html_finalization_timeout_ms,
+            Publisher::default().html_finalization_timeout_ms,
+            "should match TOML omission and the hand-written default"
+        );
+        assert_eq!(
+            Publisher::default().html_finalization_timeout_ms,
+            5000,
+            "should default the chain budget to five seconds"
+        );
+        for (milliseconds, invalid) in [
+            (0, true),
+            (1, false),
+            (5000, false),
+            (60000, false),
+            (60001, true),
+        ] {
+            let publisher = Publisher {
+                html_finalization_timeout_ms: milliseconds,
+                ..Publisher::default()
+            };
+            let errors = publisher
+                .validate()
+                .expect_err("should reject the other empty publisher fields");
+            assert_eq!(
+                errors
+                    .field_errors()
+                    .contains_key("html_finalization_timeout_ms"),
+                invalid,
+                "should enforce finish timeout boundaries"
+            );
+        }
+    }
+    #[test]
+    fn default_publisher_omits_async_finish_settings_for_rollback() {
+        let serialized = serde_json::to_value(Publisher::default())
+            .expect("should serialize default publisher settings");
+        for field in ["allow_async_html_finish", "html_finalization_timeout_ms"] {
+            assert!(
+                serialized.get(field).is_none(),
+                "should omit default {field} for older binaries"
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_publisher_async_finish_settings_round_trip() {
+        let publisher = Publisher {
+            allow_async_html_finish: true,
+            html_finalization_timeout_ms: 1500,
+            ..Publisher::default()
+        };
+        let serialized =
+            serde_json::to_value(&publisher).expect("should serialize enabled EOF settings");
+        assert_eq!(
+            serialized["allow_async_html_finish"],
+            json!(true),
+            "should serialize permission"
+        );
+        assert_eq!(
+            serialized["html_finalization_timeout_ms"],
+            json!(1500),
+            "should serialize custom timeout"
+        );
+        let restored: Publisher =
+            serde_json::from_value(serialized).expect("should restore EOF settings");
+        assert!(
+            restored.allow_async_html_finish,
+            "should preserve permission"
+        );
+        assert_eq!(
+            restored.html_finalization_timeout_ms, 1500,
+            "should preserve timeout"
+        );
+    }
+
+    /// `DebugConfig` denies unknown fields, so a binary built before
+    /// `sandbox_metrics_enabled` existed must still accept a default blob.
+    /// That only holds while the flag is skipped during serialization.
+    #[test]
+    fn default_debug_config_omits_sandbox_metrics_for_rollback() {
+        let serialized =
+            serde_json::to_value(DebugConfig::default()).expect("should serialize debug config");
+
+        assert!(
+            serialized.get("sandbox_metrics_enabled").is_none(),
+            "a default blob must not carry the field, or an older binary rejects it: {serialized}"
+        );
+    }
+
+    #[test]
+    fn enabled_sandbox_metrics_serializes_and_round_trips() {
+        let config = DebugConfig {
+            sandbox_metrics_enabled: true,
+            ..DebugConfig::default()
+        };
+
+        let serialized = serde_json::to_value(&config).expect("should serialize debug config");
+        assert_eq!(
+            serialized.get("sandbox_metrics_enabled"),
+            Some(&json!(true)),
+            "an enabled flag must be written so the setting survives a round trip"
+        );
+
+        let restored: DebugConfig =
+            serde_json::from_value(serialized).expect("should deserialize debug config");
+        assert!(
+            restored.sandbox_metrics_enabled,
+            "the flag should survive a round trip"
+        );
+    }
+
+    #[test]
+    fn debug_config_accepts_a_blob_without_the_sandbox_field() {
+        let restored: DebugConfig = serde_json::from_value(json!({"ja4_endpoint_enabled": true}))
+            .expect("should deserialize a blob written before the field existed");
+
+        assert!(
+            restored.ja4_endpoint_enabled,
+            "existing fields should still load"
+        );
+        assert!(
+            !restored.sandbox_metrics_enabled,
+            "an absent flag should default to off"
+        );
+    }
 
     fn trusted_client_ip_toml(ip_header: &str, auth_header: &str, shared_secret: &str) -> String {
         format!(
@@ -3805,6 +4120,166 @@ mod tests {
             !debug.contains("fictional-shared-secret-0123456789"),
             "should not expose trusted client IP shared secret in debug output"
         );
+    }
+
+    // One distinctive canary per `Redacted<String>` field reachable from
+    // `Settings`'s derived `Debug` impl. This is a regression guard over the
+    // field list below, not a completeness guarantee: a new secret field
+    // added without the `Redacted` wrapper has no canary here and will pass
+    // this test while leaking. Adding the canary is a manual step.
+    //
+    // Integration configs are deliberately out of scope. They reach
+    // `Settings` as opaque JSON under `IntegrationSettings`, whose
+    // hand-written `Debug` impl prints only integration IDs, never values.
+    //
+    // Do not use `..Struct::default()` anywhere in this function. A default
+    // spread would let a new secret field be added to `Handler`,
+    // `TinybirdSettings`, or any other struct built here without forcing
+    // anyone to consider it. The compile break is the prompt; the canary
+    // list below is still maintained by hand. List every field explicitly.
+    #[test]
+    fn settings_debug_output_redacts_every_secret_field() {
+        const CANARY_PROXY_SECRET: &str = "CANARY-PROXY-SECRET-0123456789";
+        const CANARY_EC_PASSPHRASE: &str = "CANARY-EC-PASSPHRASE-0123456789";
+        const CANARY_HANDLER_USERNAME: &str = "CANARY-HANDLER-USERNAME-0123456789";
+        const CANARY_HANDLER_PASSWORD: &str = "CANARY-HANDLER-PASSWORD-0123456789";
+        const CANARY_EC_PARTNER_API_TOKEN: &str = "CANARY-EC-PARTNER-API-TOKEN-0123456789";
+        const CANARY_EC_PARTNER_TS_PULL_TOKEN: &str = "CANARY-EC-PARTNER-TS-PULL-TOKEN-0123456789";
+        const CANARY_TRUSTED_CLIENT_IP_SHARED_SECRET: &str =
+            "CANARY-TRUSTED-CLIENT-IP-SHARED-SECRET-0123456789";
+        const CANARY_S3_ACCESS_KEY_ID: &str = "CANARY-S3-ACCESS-KEY-ID-0123456789";
+        const CANARY_S3_SECRET_ACCESS_KEY: &str = "CANARY-S3-SECRET-ACCESS-KEY-0123456789";
+        const CANARY_S3_SESSION_TOKEN: &str = "CANARY-S3-SESSION-TOKEN-0123456789";
+        const CANARY_TINYBIRD_AUCTION_TOKEN: &str = "CANARY-TINYBIRD-AUCTION-TOKEN-0123456789";
+        const CANARY_TINYBIRD_ACCESS_TOKEN: &str = "CANARY-TINYBIRD-ACCESS-TOKEN-0123456789";
+        const CANARY_DATADOME_SERVER_SIDE_KEY: &str = "CANARY-DATADOME-SERVER-SIDE-KEY-0123456789";
+
+        let mut settings = create_test_settings();
+
+        settings.publisher.proxy_secret = Redacted::new(CANARY_PROXY_SECRET.to_string());
+        settings.ec.passphrase = Redacted::new(CANARY_EC_PASSPHRASE.to_string());
+
+        settings.handlers = vec![Handler {
+            path: "^/secure".to_string(),
+            username: Redacted::new(CANARY_HANDLER_USERNAME.to_string()),
+            password: Redacted::new(CANARY_HANDLER_PASSWORD.to_string()),
+            regex: OnceLock::new(),
+        }];
+
+        settings.ec.partners = vec![EcPartner {
+            name: "canary-partner".to_string(),
+            source_domain: "canary-partner.example".to_string(),
+            openrtb_atype: EcPartner::default_openrtb_atype(),
+            bidstream_enabled: false,
+            api_token: Some(Redacted::new(CANARY_EC_PARTNER_API_TOKEN.to_string())),
+            batch_rate_limit: EcPartner::default_batch_rate_limit(),
+            pull_sync_enabled: false,
+            pull_sync_url: None,
+            pull_sync_allowed_domains: Vec::new(),
+            pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
+            pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            ts_pull_token: Some(Redacted::new(CANARY_EC_PARTNER_TS_PULL_TOKEN.to_string())),
+        }];
+
+        settings.trusted_client_ip = Some(TrustedClientIpConfig {
+            ip_header: "fastly-client-ip".to_string(),
+            auth_header: "x-trusted-client-auth".to_string(),
+            shared_secret: Redacted::new(CANARY_TRUSTED_CLIENT_IP_SHARED_SECRET.to_string()),
+        });
+
+        let mut asset_route = ProxyAssetRoute::new("/s3-assets/", "https://s3.canary.example");
+        asset_route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+            region: "us-east-1".to_string(),
+            secret_store: None,
+            access_key_id: Redacted::new(CANARY_S3_ACCESS_KEY_ID.to_string()),
+            secret_access_key: Redacted::new(CANARY_S3_SECRET_ACCESS_KEY.to_string()),
+            session_token: Some(Redacted::new(CANARY_S3_SESSION_TOKEN.to_string())),
+            origin_query: None,
+        }));
+        settings.proxy.asset_routes = vec![asset_route];
+
+        settings.tinybird = TinybirdSettings {
+            auction_token_secret: Some(Redacted::new(CANARY_TINYBIRD_AUCTION_TOKEN.to_string())),
+            access_token_secret: Some(Redacted::new(CANARY_TINYBIRD_ACCESS_TOKEN.to_string())),
+            enabled: false,
+            api_host: String::new(),
+            secret_store: None,
+            auction_dataset: String::new(),
+            access_enabled: false,
+            access_dataset: String::new(),
+            access_sample_rate: 0.0f64,
+            max_body_bytes: 0,
+        };
+
+        // `IntegrationSettings` stores integration configs as opaque JSON and
+        // relies on a hand-written `Debug` impl to suppress their values. That
+        // impl is the only thing keeping resolved DataDome credentials out of
+        // this output, so pin it here.
+        settings
+            .integrations
+            .insert_config(
+                "datadome",
+                &json!({
+                    "enabled": true,
+                    "server_side_key_secret_name": CANARY_DATADOME_SERVER_SIDE_KEY,
+                }),
+            )
+            .expect("should insert datadome integration config");
+
+        let debug = format!("{settings:?}");
+
+        assert!(
+            debug.contains("[REDACTED]"),
+            "should redact secret fields in Settings debug output"
+        );
+        assert!(
+            debug.contains("^/secure"),
+            "should leave non-secret handler path visible in debug output"
+        );
+
+        let canaries = [
+            ("publisher.proxy_secret", CANARY_PROXY_SECRET),
+            ("ec.passphrase", CANARY_EC_PASSPHRASE),
+            ("handlers[].username", CANARY_HANDLER_USERNAME),
+            ("handlers[].password", CANARY_HANDLER_PASSWORD),
+            ("ec.partners[].api_token", CANARY_EC_PARTNER_API_TOKEN),
+            (
+                "ec.partners[].ts_pull_token",
+                CANARY_EC_PARTNER_TS_PULL_TOKEN,
+            ),
+            (
+                "trusted_client_ip.shared_secret",
+                CANARY_TRUSTED_CLIENT_IP_SHARED_SECRET,
+            ),
+            (
+                "proxy.asset_routes[].auth.access_key_id",
+                CANARY_S3_ACCESS_KEY_ID,
+            ),
+            (
+                "proxy.asset_routes[].auth.secret_access_key",
+                CANARY_S3_SECRET_ACCESS_KEY,
+            ),
+            (
+                "proxy.asset_routes[].auth.session_token",
+                CANARY_S3_SESSION_TOKEN,
+            ),
+            (
+                "tinybird.auction_token_secret",
+                CANARY_TINYBIRD_AUCTION_TOKEN,
+            ),
+            ("tinybird.access_token_secret", CANARY_TINYBIRD_ACCESS_TOKEN),
+            (
+                "integrations.datadome.server_side_key_secret_name",
+                CANARY_DATADOME_SERVER_SIDE_KEY,
+            ),
+        ];
+
+        for (field, canary) in canaries {
+            assert!(
+                !debug.contains(canary),
+                "should redact {field} in Settings debug output"
+            );
+        }
     }
 
     #[test]
@@ -4572,6 +5047,65 @@ mod tests {
         assert!(
             settings.tester_cookie.enabled,
             "tester-cookie config should enable the route"
+        );
+        assert_eq!(
+            settings.tester_cookie.max_age_seconds,
+            TesterCookieConfig::default_max_age_seconds(),
+            "omitted max_age_seconds should fall back to the 30-day default"
+        );
+    }
+
+    #[test]
+    fn tester_cookie_max_age_parses_from_toml() {
+        let toml_str = format!(
+            r#"{}
+
+            [tester_cookie]
+            enabled = true
+            max_age_seconds = 3600
+        "#,
+            crate_test_settings_str()
+        );
+
+        let settings =
+            Settings::from_toml(&toml_str).expect("should parse tester-cookie max age config");
+
+        assert_eq!(
+            settings.tester_cookie.max_age_seconds, 3_600,
+            "tester-cookie config should use the configured max age"
+        );
+    }
+
+    #[test]
+    fn tester_cookie_absent_section_defaults_max_age() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without a tester-cookie section");
+
+        assert_eq!(
+            settings.tester_cookie.max_age_seconds,
+            TesterCookieConfig::default_max_age_seconds(),
+            "absent tester-cookie section should default max_age_seconds to 30 days"
+        );
+    }
+
+    #[test]
+    fn tester_cookie_zero_max_age_fails_validation() {
+        let toml_str = format!(
+            r#"{}
+
+            [tester_cookie]
+            enabled = true
+            max_age_seconds = 0
+        "#,
+            crate_test_settings_str()
+        );
+
+        let error =
+            Settings::from_toml(&toml_str).expect_err("should reject a zero tester-cookie max age");
+
+        assert!(
+            error.to_string().contains("validation failed"),
+            "zero max_age_seconds should fail settings validation, got: {error}"
         );
     }
 
@@ -5439,6 +5973,86 @@ source_domain = "partner.example.com"
         );
     }
 
+    fn test_partner_with_pull_token(ts_pull_token: &str) -> EcPartner {
+        test_partner_with_tokens(None, ts_pull_token)
+    }
+
+    fn test_partner_with_tokens(api_token: Option<&str>, ts_pull_token: &str) -> EcPartner {
+        EcPartner {
+            name: "Test Partner".to_owned(),
+            source_domain: "partner.example.com".to_owned(),
+            openrtb_atype: EcPartner::default_openrtb_atype(),
+            bidstream_enabled: false,
+            api_token: api_token.map(|token| Redacted::new(token.to_owned())),
+            batch_rate_limit: EcPartner::default_batch_rate_limit(),
+            pull_sync_enabled: true,
+            pull_sync_url: Some("https://partner.example.com/sync".to_owned()),
+            pull_sync_allowed_domains: vec!["partner.example.com".to_owned()],
+            pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
+            pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            ts_pull_token: Some(Redacted::new(ts_pull_token.to_owned())),
+        }
+    }
+
+    #[test]
+    fn reject_placeholder_secrets_includes_partner_pull_tokens() {
+        let mut settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
+        settings.ec.passphrase = Redacted::new("test-secret-key-32-bytes-minimum".to_owned());
+        settings.ec.partners = vec![test_partner_with_pull_token(
+            "partner-api-token-32-bytes-minimum",
+        )];
+
+        let err = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject placeholder partner pull token");
+        assert!(
+            format!("{err:?}").contains("ec.partners[partner.example.com].ts_pull_token"),
+            "error should mention the partner pull token field"
+        );
+    }
+
+    #[test]
+    fn reject_placeholder_secrets_allows_realistic_partner_pull_token() {
+        let mut settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
+        settings.ec.passphrase = Redacted::new("test-secret-key-32-bytes-minimum".to_owned());
+        settings.ec.partners = vec![test_partner_with_pull_token(
+            "unit-test-realistic-pull-sync-token-32-bytes-min",
+        )];
+
+        settings
+            .reject_placeholder_secrets()
+            .expect("should accept a realistic partner pull token");
+    }
+
+    #[test]
+    fn reject_placeholder_secrets_reports_both_partner_tokens() {
+        let mut settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
+        settings.ec.passphrase = Redacted::new("test-secret-key-32-bytes-minimum".to_owned());
+        settings.ec.partners = vec![test_partner_with_tokens(
+            Some("partner-api-token-32-bytes-minimum"),
+            "replace-with-partner-api-token-32-bytes-minimum",
+        )];
+
+        let err = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject placeholder partner tokens");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("ec.partners[partner.example.com].api_token"),
+            "error should mention the partner API token field"
+        );
+        assert!(
+            message.contains("ec.partners[partner.example.com].ts_pull_token"),
+            "error should also mention the partner pull token field on the same partner"
+        );
+    }
+
     #[test]
     fn is_unusable_store_id_rejects_placeholders_empty_and_padded_values() {
         for placeholder in RequestSigning::STORE_ID_PLACEHOLDERS {
@@ -5823,6 +6437,25 @@ source_domain = "partner.example.com"
     }
 
     #[test]
+    fn legacy_env_loader_ignores_build_time_git_version() {
+        let toml_str = crate_test_settings_str();
+
+        for key in [
+            "TRUSTED_SERVER__GIT_VERSION",
+            "trusted_server__git_version",
+            "Trusted_Server__Git_Version",
+        ] {
+            for value in ["v0.0.0-example", ""] {
+                temp_env::with_var(key, Some(value), || {
+                    Settings::from_toml_and_env(&toml_str).expect(
+                        "should ignore the build-time git version input regardless of case",
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
     fn test_origin_host_header_override_env() {
         let env_key = format!(
             "{}{}PUBLISHER{}ORIGIN_HOST_HEADER_OVERRIDE",
@@ -5872,6 +6505,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "origin.example.com:8080");
 
@@ -5883,6 +6518,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "origin.example.com");
 
@@ -5894,6 +6531,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -5905,6 +6544,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -5916,6 +6557,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "192.168.1.1:8080");
 
@@ -5927,6 +6570,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
     }
@@ -5940,6 +6585,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
 
         assert_eq!(publisher.origin_host_header(), "origin.example.com:8443");
@@ -5954,6 +6601,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: Some("www.example.com".to_string()),
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
 
         assert_eq!(publisher.origin_host_header(), "www.example.com");
@@ -6616,6 +7265,251 @@ source_domain = "partner.example.com"
             format!("{err:?}").contains("image_optimizer region `us-east-2` is not supported"),
             "should mention the unsupported Image Optimizer region: {err:?}"
         );
+    }
+
+    fn assert_image_optimizer_key_collision(toml: &str, expected_fragments: &[&str]) {
+        let raw: Settings = toml::from_str(toml).expect("should deserialize unnormalized settings");
+        let value = serde_json::to_value(raw).expect("should serialize unnormalized settings");
+        let mut messages = Vec::new();
+
+        for result in [Settings::from_toml(toml), Settings::from_json_value(value)] {
+            let error = result.expect_err("should reject colliding image optimizer keys");
+            assert!(
+                matches!(
+                    error.current_context(),
+                    TrustedServerError::Configuration { .. }
+                ),
+                "should return a configuration error"
+            );
+            let message = error.to_string();
+            for expected in expected_fragments {
+                assert!(
+                    message.contains(expected),
+                    "should identify the collision with {expected:?}: {message}"
+                );
+            }
+            messages.push(message);
+        }
+        assert_eq!(messages[0], messages[1], "should report a stable collision");
+    }
+
+    #[test]
+    fn image_optimizer_rejects_profile_keys_that_collide_after_trimming() {
+        for (first, second, second_params) in [
+            ("medium", " medium", "width=200"),
+            ("medium ", "\tmedium", "width=200"),
+            (" medium ", "medium", "width=100"),
+        ] {
+            let toml = format!(
+                "{}\n[image_optimizer.profile_sets.default_images]\n\
+                 default_profile = \"medium\"\n\
+                 [image_optimizer.profile_sets.default_images.profiles]\n\
+                 {first:?} = \"width=100\"\n{second:?} = {second_params:?}\n",
+                crate_test_settings_str()
+            );
+            assert_image_optimizer_key_collision(
+                &toml,
+                &[
+                    "image_optimizer.profile_sets",
+                    "default_images",
+                    "profiles",
+                    "collide after trimming",
+                    &format!("{first:?}"),
+                    &format!("{second:?}"),
+                    "\"medium\"",
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn image_optimizer_rejects_profile_set_keys_that_collide_after_trimming() {
+        for (first, second, second_params) in [
+            ("default_images", " default_images", "width=200"),
+            ("default_images ", "\tdefault_images", "width=200"),
+            (" default_images ", "default_images", "width=100"),
+        ] {
+            let toml = format!(
+                "{}\n[image_optimizer.profile_sets.{first:?}.profiles]\n\
+                 default = \"width=100\"\n\
+                 [image_optimizer.profile_sets.{second:?}.profiles]\n\
+                 default = {second_params:?}\n",
+                crate_test_settings_str()
+            );
+            assert_image_optimizer_key_collision(
+                &toml,
+                &[
+                    "image_optimizer.profile_sets",
+                    "collide after trimming",
+                    &format!("{first:?}"),
+                    &format!("{second:?}"),
+                    "\"default_images\"",
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn image_optimizer_reports_first_profile_key_collision_in_stable_set_order() {
+        let toml = crate_test_settings_str()
+            + r#"
+            [image_optimizer.profile_sets." alpha_images ".profiles]
+            medium = "width=100"
+            " medium" = "width=200"
+
+            [image_optimizer.profile_sets.zeta_images.profiles]
+            medium = "width=300"
+            " medium" = "width=400"
+            "#;
+
+        for _ in 0..32 {
+            assert_image_optimizer_key_collision(
+                &toml,
+                &[
+                    r#"image_optimizer.profile_sets." alpha_images ".profiles keys " medium" and "medium" collide after trimming to "medium""#,
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn image_optimizer_normalization_preserves_non_colliding_configuration() {
+        let toml = crate_test_settings_str()
+            + r#"
+            [image_optimizer.profile_sets." default_images "]
+            base_params = " quality=70 "
+            default_profile = " medium "
+            profile_param = " profile "
+            aspect_ratio_param = " ratio "
+            debug_param = " debug "
+
+            [image_optimizer.profile_sets." default_images ".profiles]
+            " medium " = " width=100 "
+            large = "width=200"
+            "" = "ignored"
+            " " = "also ignored"
+
+            [image_optimizer.profile_sets." default_images ".aspect_ratios]
+            allowed = [" 1-1 ", ""]
+            profiles = [" medium ", ""]
+
+            [image_optimizer.profile_sets." default_images ".crop_offsets]
+            x_param = " x "
+            y_param = " y "
+            buckets = [90, 10, 10]
+
+            [image_optimizer.profile_sets.other_images.profiles]
+            medium = "width=300"
+            default = "width=400"
+
+            [image_optimizer.profile_sets."".profiles]
+            default = "ignored"
+            " default " = "also ignored"
+
+            [image_optimizer.profile_sets." "]
+
+            [[proxy.asset_routes]]
+            prefix = "/images/"
+            origin_url = "https://assets.example.com"
+
+            [proxy.asset_routes.image_optimizer]
+            region = " us_east "
+            profile_set = " default_images "
+            "#;
+        let raw: Settings =
+            toml::from_str(&toml).expect("should deserialize unnormalized settings");
+        let value = serde_json::to_value(raw).expect("should serialize unnormalized settings");
+
+        for result in [Settings::from_toml(&toml), Settings::from_json_value(value)] {
+            let settings = result.expect("should accept non-colliding keys");
+            assert_eq!(
+                settings.image_optimizer.profile_sets.len(),
+                2,
+                "should discard empty profile-set names"
+            );
+            let profile_set = &settings.image_optimizer.profile_sets["default_images"];
+            assert_eq!(
+                profile_set.base_params, "quality=70",
+                "should trim base parameters"
+            );
+            assert_eq!(
+                profile_set.default_profile, "medium",
+                "should trim the default profile reference"
+            );
+            assert_eq!(
+                profile_set.profile_param, "profile",
+                "should trim the profile query parameter name"
+            );
+            assert_eq!(
+                profile_set.aspect_ratio_param, "ratio",
+                "should trim the aspect ratio query parameter name"
+            );
+            assert_eq!(
+                profile_set.debug_param, "debug",
+                "should trim the debug query parameter name"
+            );
+            assert_eq!(
+                profile_set.profiles.len(),
+                2,
+                "should discard empty profile names"
+            );
+            assert_eq!(
+                profile_set.profiles["medium"], "width=100",
+                "should trim profile keys and values"
+            );
+            assert_eq!(
+                profile_set.profiles["large"], "width=200",
+                "should preserve unpadded profile keys and values"
+            );
+            assert_eq!(
+                settings.image_optimizer.profile_sets["other_images"].profiles["medium"],
+                "width=300",
+                "should allow the same profile name in distinct sets"
+            );
+            let ratios = profile_set
+                .aspect_ratios
+                .as_ref()
+                .expect("should retain ratios");
+            assert_eq!(
+                ratios.allowed,
+                ["1-1"],
+                "should trim allowed aspect ratios and discard empty entries"
+            );
+            assert_eq!(
+                ratios.profiles,
+                ["medium"],
+                "should trim aspect ratio profile references and discard empty entries"
+            );
+            let offsets = profile_set
+                .crop_offsets
+                .as_ref()
+                .expect("should retain offsets");
+            assert_eq!(
+                offsets.x_param, "x",
+                "should trim the horizontal crop offset parameter name"
+            );
+            assert_eq!(
+                offsets.y_param, "y",
+                "should trim the vertical crop offset parameter name"
+            );
+            assert_eq!(
+                offsets.buckets,
+                [10, 90],
+                "should sort and deduplicate crop offset buckets"
+            );
+            let route = settings.proxy.asset_routes[0]
+                .image_optimizer
+                .as_ref()
+                .expect("should retain the route's image optimizer");
+            assert_eq!(
+                route.region, "us_east",
+                "should trim the image optimizer region"
+            );
+            assert_eq!(
+                route.profile_set, "default_images",
+                "should trim the route's profile-set reference"
+            );
+        }
     }
 
     #[test]

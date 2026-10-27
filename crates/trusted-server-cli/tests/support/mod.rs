@@ -206,7 +206,7 @@ fn resolve(argv: &[&str]) -> config::ResolvedConfig {
         #[command(flatten)]
         args: trusted_server_cli::commands::dev::proxy::ProxyArgs,
     }
-    let parsed = Wrapper::parse_from(argv);
+    let parsed = Wrapper::try_parse_from(argv).expect("should parse proxy args");
     config::resolve(&parsed.args).expect("should resolve test config")
 }
 

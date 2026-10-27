@@ -67,6 +67,11 @@ proxy_secret = "publisher_proxy_secret"
 # rewriting/injection) instead of streamed. Default 16 MiB; larger responses
 # return 502. Raise for deployments serving very large publisher pages.
 # max_buffered_body_bytes = 16777216  # 16 MiB
+# Explicit permission for integration EOF I/O that can delay HTML delivery.
+# Defaults to false; enabled async processors require true.
+# allow_async_html_finish = false
+# Optional asynchronous HTML processors share this budget after decoder/parser EOF.
+# html_finalization_timeout_ms = 5000  # Valid range: 1-60000 ms
 
 
 # -----------------------------------------------------------------------------
@@ -140,8 +145,10 @@ pull_sync_concurrency = 3
 
 # Tester-cookie endpoints: GET /_ts/set-tester sets ts-tester=true and
 # GET /_ts/clear-tester clears it on publisher.cookie_domain.
+# max_age_seconds is the cookie lifetime; it defaults to 30 days.
 # [tester_cookie]
 # enabled = false
+# max_age_seconds = 2592000
 
 # Consent forwarding. All values below are the defaults — uncomment to override.
 # [consent]
@@ -491,11 +498,11 @@ client_side_bidders = []          # bidders running via native Prebid.js adapter
 # Keep selected GAM inventory out of Trusted Server's Prebid refresh auctions.
 # Matching slots still refresh through GAM.
 # excluded_gam_ad_unit_path_suffixes = ["/trackingonly"]
-# Runtime bundle metadata — set after running `ts prebid bundle` and uploading:
+# Runtime bundle metadata — set after running `ts prebid client` and uploading:
 # external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-<sha256>.js"
 # external_bundle_sha256 = "<manifest sha256>"
 # external_bundle_sri = "<manifest sri>"
-# Bundle build inputs consumed by `ts prebid bundle`, not by the edge runtime.
+# Bundle build inputs consumed by `ts prebid client`, not by the edge runtime.
 # Values are exact upstream module stems without `.js`.
 # [integrations.prebid.bundle.modules]
 # bidder = ["rubiconBidAdapter"]
@@ -512,8 +519,8 @@ client_side_bidders = []          # bidders running via native Prebid.js adapter
 # the checked-in User ID registry. Each `name` must appear only once.
 #
 # The module must be present in the built bundle: name it under
-# [integrations.prebid.bundle].user_id_modules, or omit that list to take the
-# generator's default preset. `ts prebid bundle` resolves every managed name
+# [integrations.prebid.bundle.modules].user_id, or omit that list to take the
+# generator's default preset. `ts prebid client` resolves every managed name
 # through the checked-in User ID registry and fails if the generated manifest
 # omits its required module without updating the configured hash or SRI.
 #

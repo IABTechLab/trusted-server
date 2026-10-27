@@ -16,7 +16,7 @@ use super::profile::{
 use super::routing::{
     PrebidTransportHeaders, ProviderAuctionInput, ProviderSlotInput, RoutedAuction,
 };
-use super::types::{AdFormat, AuctionResponse, Bid};
+use super::types::{AdFormat, AdSlot, AuctionResponse, Bid};
 use crate::consent::ConsentSource;
 use crate::error::TrustedServerError;
 use crate::openrtb::{
@@ -154,11 +154,20 @@ pub(crate) type BidDimensionIndex = BTreeMap<String, SlotBidDimensions>;
 
 /// Build the requested-dimension index once for one provider response.
 pub(crate) fn build_bid_dimension_index(input: &ProviderAuctionInput) -> BidDimensionIndex {
+    build_bid_dimension_index_from_slots(input.slots().iter().map(ProviderSlotInput::slot))
+}
+
+/// Build the requested-dimension index from plain [`AdSlot`]s.
+///
+/// The first slot wins when several share an ID.
+pub(crate) fn build_bid_dimension_index_from_slots<'a>(
+    slots: impl IntoIterator<Item = &'a AdSlot>,
+) -> BidDimensionIndex {
     let mut index = BidDimensionIndex::new();
-    for slot in input.slots() {
+    for slot in slots {
         index
-            .entry(slot.slot().id.clone())
-            .or_insert_with(|| SlotBidDimensions::from_formats(slot.slot().formats.as_slice()));
+            .entry(slot.id.clone())
+            .or_insert_with(|| SlotBidDimensions::from_formats(slot.formats.as_slice()));
     }
     index
 }

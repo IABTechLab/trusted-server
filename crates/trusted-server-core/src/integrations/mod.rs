@@ -295,10 +295,17 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
             id: js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID,
             build: js_asset_proxy::register,
         },
+        #[cfg(feature = "test-utils")]
+        IntegrationBuilder {
+            id: crate::test_support::async_html_finalization::ID,
+            build: crate::test_support::async_html_finalization::register,
+        },
         IntegrationBuilder {
             id: "testlight",
             build: testlight::register,
         },
+        // Next.js must precede GTM: GTM reads the Flight-protection snapshot
+        // that the Next.js script stage records for the same fragment.
         IntegrationBuilder {
             id: "nextjs",
             build: nextjs::register,

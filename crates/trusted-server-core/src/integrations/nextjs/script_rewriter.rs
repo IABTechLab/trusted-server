@@ -62,14 +62,14 @@ impl IntegrationScriptRewriter for NextJsNextDataRewriter {
     }
 
     fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
-        if self.config.rewrite_attributes.is_empty() {
-            return ScriptRewriteAction::keep();
-        }
-
         let state = document_state(ctx.document_state);
         let mut state = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.next_data_fragment = true;
+        if self.config.rewrite_attributes.is_empty() {
+            return ScriptRewriteAction::keep();
+        }
 
         match capture_fragment(
             &mut state.next_data,
@@ -232,6 +232,53 @@ mod tests {
             max_buffered_script_bytes: 16 * 1024 * 1024,
             document_state,
         }
+    }
+
+    #[test]
+    fn an_interrupted_document_leaves_no_residue_for_the_next_document() {
+        // One rewriter serves every document the registry serves, so both
+        // documents below share it and only the document state differs. With
+        // the buffer owned by the rewriter this test fails: document two
+        // emits document one's payload.
+        let rewriter = NextJsNextDataRewriter::new(test_config())
+            .expect("should build Next.js structured rewriter");
+
+        // Document one: cut off before its final fragment arrives.
+        let first_document = IntegrationDocumentState::default();
+        let interrupted = IntegrationScriptContext {
+            is_last_in_text_node: false,
+            ..ctx("script#__NEXT_DATA__", &first_document)
+        };
+        let secret = r#"{"props":{"pageProps":{"sessionToken":"SESSION-ONE-SECRET","href":"#;
+
+        let action = rewriter.rewrite(secret, &interrupted);
+        assert_eq!(
+            action,
+            ScriptRewriteAction::RemoveNode,
+            "the partial fragment should be withheld, which is what strands it"
+        );
+
+        // Document two: fresh document state, same rewriter.
+        let second_document = IntegrationDocumentState::default();
+        let fresh = ctx("script#__NEXT_DATA__", &second_document);
+        let benign = r#"{"props":{"pageProps":{"href":"https://origin.example.com/reviews"}}}"#;
+
+        let action = rewriter.rewrite(benign, &fresh);
+
+        let emitted = match action {
+            ScriptRewriteAction::Replace(value) => value,
+            ScriptRewriteAction::Keep => benign.to_owned(),
+            other => panic!("expected the second document to be emitted, got {other:?}"),
+        };
+
+        assert!(
+            !emitted.contains("SESSION-ONE-SECRET"),
+            "the interrupted document's content must not reach the next document, got: {emitted}"
+        );
+        assert!(
+            emitted.contains("ts.example.com"),
+            "the second document should still be rewritten correctly, got: {emitted}"
+        );
     }
 
     #[test]

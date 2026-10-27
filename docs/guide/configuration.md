@@ -309,14 +309,16 @@ Core publisher settings for domain, origin, and proxy configuration.
 
 ### `[publisher]`
 
-| Field                         | Type    | Required | Description                                                                 |
-| ----------------------------- | ------- | -------- | --------------------------------------------------------------------------- |
-| `domain`                      | String  | Yes      | Publisher's apex domain name                                                |
-| `cookie_domain`               | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                      |
-| `origin_url`                  | String  | Yes      | Full URL of publisher origin server                                         |
-| `origin_host_header_override` | String  | No       | Outbound Host header to send while connecting to `origin_url`               |
-| `proxy_secret`                | String  | Yes      | Secret-store key name for the proxy URL secret                              |
-| `max_buffered_body_bytes`     | Integer | No       | Buffered-body cap / Fastly stream raw+decoded byte ceiling (default 16 MiB) |
+| Field                          | Type    | Required | Description                                                                          |
+| ------------------------------ | ------- | -------- | ------------------------------------------------------------------------------------ |
+| `domain`                       | String  | Yes      | Publisher's apex domain name                                                         |
+| `cookie_domain`                | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                               |
+| `origin_url`                   | String  | Yes      | Full URL of publisher origin server                                                  |
+| `origin_host_header_override`  | String  | No       | Outbound Host header to send while connecting to `origin_url`                        |
+| `proxy_secret`                 | String  | Yes      | Secret-store key name for the proxy URL secret                                       |
+| `max_buffered_body_bytes`      | Integer | No       | Buffered-body cap / Fastly stream raw+decoded byte ceiling (default 16 MiB)          |
+| `allow_async_html_finish`      | Boolean | No       | Explicit permission for async HTML EOF work and its delivery cost (default false)    |
+| `html_finalization_timeout_ms` | Integer | No       | Shared optional EOF budget after decoder/parser EOF (default 5000 ms; range 1–60000) |
 
 > **Note:** EC cookies (`ts-ec`) derive their domain automatically as `.{domain}` and
 > do not use `cookie_domain`. The `cookie_domain` field is used by other cookie helpers.
@@ -342,6 +344,8 @@ TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
 TRUSTED_SERVER__PUBLISHER__ORIGIN_HOST_HEADER_OVERRIDE=www.publisher.com
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=publisher_proxy_secret
 TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
+TRUSTED_SERVER__PUBLISHER__ALLOW_ASYNC_HTML_FINISH=false
+TRUSTED_SERVER__PUBLISHER__HTML_FINALIZATION_TIMEOUT_MS=5000
 ```
 
 ### Field Details
@@ -437,15 +441,63 @@ intentionally, and never put it in the TOML file or pushed app-config blob.
 Changing `proxy_secret` invalidates all existing signed URLs. Plan rotations carefully and use graceful transition periods.
 :::
 
+#### `allow_async_html_finish`
+
+Explicit permission for integrations declaring asynchronous HTML processor completion.
+Defaults to `false`. An enabled integration requiring EOF I/O without permission is
+rejected with a configuration error; its requested work is not silently skipped.
+Permission alone does not change processing when no async factories are registered.
+No built-in integration currently declares async completion, so this setting has no
+effect in a stock build.
+
+Non-retaining processors can release ready HTML before EOF I/O on Fastly. A factory
+requesting output retention delays initial delivery until EOF or overflow. Axum,
+Workers and Spin currently buffer publisher responses, so enabled EOF I/O can add to
+TTFB there even without stage retention. Enable only when accepting that delivery cost.
+
+::: warning Template caching is disabled
+Once an integration requiring async completion is enabled, processed HTML bypasses
+shared-template caching for every page, including pages where the stage leaves the
+output unchanged. Responses use `Cache-Control: no-store, private`. Caching
+document-deterministic async output is tracked in
+[#1397](https://github.com/IABTechLab/trusted-server/issues/1397).
+:::
+
+#### `html_finalization_timeout_ms`
+
+Shared budget for optional asynchronous processor EOF work in milliseconds. The default
+is `5000`; accepted values are `1` through `60000`. It begins after decoder/parser EOF
+and does not change the auction deadline. The initial 5-second default follows the
+issue example; 60 seconds is a configuration ceiling, not a recommended delivery
+latency or a measured optimum. Timer expiry skips later optional I/O while
+still completing downstream synchronous EOF. Timeout retains the current un-emitted
+stage output; it cannot undo bytes already delivered or remote side effects.
+
+The setting is inert without async processors. Axum, Workers and Spin enforce it with
+a cooperative timer that can cancel yielding callbacks. Fastly has no timer: core
+checks the budget only before and after each callback, so an integration that does
+not bound its own blocking host calls can hold the response past this value.
+Opted-in processed HTML bypasses shared-template caching and uses private/no-store
+policy; raw-origin readthrough remains separate. Opted-in HTML with 206 or any
+`Content-Range` bypasses rewriting and EOF work while preserving encoded bytes and
+range/framing metadata. Full error HTML remains eligible and exposes actual status.
+See [Asynchronous HTML processor completion](/guide/integration-guide#asynchronous-html-processor-completion).
+
 #### `max_buffered_body_bytes`
 
-**Purpose**: Upper bound on how much of a publisher origin body the rewrite
-pipeline holds in memory — the post-rewrite output buffer on buffered adapters,
-and the per-stream raw/decoded byte ceiling on the Fastly streaming path.
+**Purpose**: Upper bound on individual publisher body buffers: the post-rewrite
+output buffer on buffered adapters, and the cumulative raw/decoded byte ceiling
+on the Fastly streaming path. Opted-in async HTML processing enforces the same
+cumulative raw/decoded input ceilings on every adapter and body representation.
+Each buffer is limited separately; this is not an aggregate request-memory budget.
+Async retention collectors, replacement candidates, auction suffixes, codec state
+and adapter response buffers can coexist, so total memory may exceed this setting.
+Integration-owned allocations are outside the framework's bound.
 
 **Usage**:
 
-- On **buffered adapters** (Axum, Cloudflare, Spin) it caps the _decoded,
+- On **buffered adapters without async HTML processing** (Axum, Cloudflare, Spin)
+  it caps the _decoded,
   post-rewrite_ output buffer for a publisher response processed in full. It
   also bounds how much decoded gzip output may sit in the heap at any one
   moment, so a decompression bomb is rejected mid-decode rather than after its
@@ -458,6 +510,11 @@ and the per-stream raw/decoded byte ceiling on the Fastly streaming path.
   emitted by the decompressor. The decoded cap is enforced _during_
   decompression, so a decompression bomb is rejected before its expansion is
   materialized rather than after.
+- On **opted-in async HTML paths**, all adapters enforce cumulative _raw_ and
+  _decoded_ input ceilings for both materialized and streamed bodies, using the
+  same capped decoder as the Fastly streaming path. Buffered responses also keep
+  their separate post-rewrite output cap. A processor that reduces the document
+  size cannot bypass these input limits.
 
 **Behavior when exceeded**:
 
@@ -584,14 +641,15 @@ default and should only be enabled for intentional QA or troubleshooting flows.
 
 ### `[tester_cookie]`
 
-| Field     | Type    | Required | Description                                        |
-| --------- | ------- | -------- | -------------------------------------------------- |
-| `enabled` | Boolean | No       | Enables routes to set and clear `ts-tester` cookie |
+| Field             | Type    | Required | Description                                                                  |
+| ----------------- | ------- | -------- | ---------------------------------------------------------------------------- |
+| `enabled`         | Boolean | No       | Enables routes to set and clear `ts-tester` cookie                           |
+| `max_age_seconds` | Integer | No       | Lifetime of the `ts-tester` cookie in seconds. Defaults to 30 days (2592000) |
 
 When enabled, `GET /_ts/set-tester` returns `204 No Content` and sets:
 
 ```http
-Set-Cookie: ts-tester=true; Domain=<publisher.cookie_domain>; Path=/; Secure; SameSite=Lax
+Set-Cookie: ts-tester=true; Domain=<publisher.cookie_domain>; Path=/; Secure; SameSite=Lax; Max-Age=<max_age_seconds>
 Cache-Control: no-store, private
 ```
 
@@ -716,6 +774,11 @@ KV store name only when consent should persist with the EC identity graph.
 | `conflict_resolution.mode`                     | String         | `"restrictive"`             | `restrictive`, `newest`, or `permissive`                    |
 | `conflict_resolution.freshness_threshold_days` | Integer        | `30`                        | Age difference required by `newest`                         |
 
+In `proxy` mode Trusted Server does not decode the TC string, so it cannot
+confirm TCF Purpose 1 + 4. When a TC cookie is present, it fails closed:
+browser-supplied EIDs are neither forwarded in bid requests nor written to the
+EC identity graph, and server-side pull sync is skipped.
+
 ```toml
 [consent]
 mode = "interpreter"
@@ -773,6 +836,77 @@ Edit TOML, validate, and push again for those changes.
 
 ::: warning Header Precedence
 Custom headers may be overwritten by application logic. Standard headers (`Content-Type`, `Content-Length`) are controlled by the application.
+:::
+
+### Origin URLs in proxied response headers
+
+Trusted Server rewrites publisher-origin URLs in page bodies to the serving
+host. It applies the same mapping to URL-bearing headers on every proxied
+publisher response, so the browser stays on the serving host. No configuration
+is required.
+
+| Header                                                               | Behavior                                                                                                                                     |
+| -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Location`, `Content-Location`                                       | An absolute or protocol-relative URL on the origin is mapped to the serving host. Relative URLs, other hosts, and other ports are unchanged. |
+| `Refresh`                                                            | The URL after the delay (`0; url=...`) is mapped the same way.                                                                               |
+| `Link`                                                               | Each `<...>` target and quoted `imagesrcset` candidate on the origin is mapped; `rel`, `as`, and other parameters are kept.                  |
+| `Content-Security-Policy`, <br>`Content-Security-Policy-Report-Only` | Every source naming the origin gains a serving-host source beside it. Origin sources are kept; `report-uri` and `report-to` are unchanged.   |
+
+For example, with the origin `origin.example.com` served at `www.example.com`:
+
+```http
+Location: https://origin.example.com/landing.html
+Content-Security-Policy: img-src https://origin.example.com data:
+```
+
+is delivered as:
+
+```http
+Location: https://www.example.com/landing.html
+Content-Security-Policy: img-src https://origin.example.com https://www.example.com data:
+```
+
+Two exceptions prevent a redirect loop. Rewriting either target would send the
+browser back to the same URL, and the origin would redirect again:
+
+- When the origin redirects to the URL being requested but under a different
+  scheme from `publisher.origin_url` (for example, an `http://` origin forcing
+  HTTPS), the `Location` or `Refresh` target is left unchanged.
+- When the origin answers a `GET` or `HEAD` with a `Location` to the URL being
+  requested, the target is left unchanged if the response sets no cookie, or
+  whatever cookies it sets when `publisher.origin_host_header_override` sends a
+  different `Host`. The origin is redirecting because of something Trusted
+  Server sends unchanged on every retry, such as that `Host`.
+
+Other same-scheme redirects to the current URL, such as after a form POST or
+one that sets a cookie without a `Host` override, are rewritten as usual, as
+is a `Refresh` reload.
+
+`Set-Cookie` headers are not rewritten. If the origin sets a cookie with a
+`Domain` attribute that does not cover the serving host (for example,
+`Domain=origin.example.com` served at `www.example.com`), the browser rejects
+it. A redirect to the current URL that relies on that cookie then repeats until
+the browser reports too many redirects. Have the origin set host-only cookies,
+or a `Domain` shared by both hosts.
+
+Each response keeps its own per-page values. A `[response_headers]` entry for
+the same header still replaces the rewritten value.
+
+Only response headers are covered. A `<meta http-equiv="refresh">` or
+`<meta http-equiv="Content-Security-Policy">` tag in the page body keeps its
+origin URLs, so the browser can still navigate to the origin or block rewritten
+resources. Deliver these as headers on proxied pages.
+
+::: warning CSP and injected scripts
+Host rewriting only adds serving-host sources. It does not authorize inline
+content Trusted Server inserts without a nonce, or the `/static/tsjs=` bundle
+when the policy allows neither `'self'` nor the serving host. Check
+`script-src` (or `default-src`) on pages with a restrictive policy.
+
+A serving-host source without a path also allows Trusted Server's own routes
+on that host, including `/first-party/proxy`, which serves any target that
+`/first-party/sign` signs. A policy that limited scripts to the origin now
+allows those too. Set `proxy.allowed_domains` to bound what the proxy serves.
 :::
 
 ## Request Signing
@@ -1246,6 +1380,8 @@ Profile sets convert small request query controls into a closed set of Image Opt
 
 Profile values live under `[image_optimizer.profile_sets.<name>.profiles]` and use query-string syntax.
 
+Profile and profile-set names are trimmed. Names within the same map that become identical after trimming are rejected, even when their values match. Empty names continue to be discarded.
+
 ```toml
 [image_optimizer.profile_sets.default_images]
 base_params = "quality=70&resize-filter=bicubic"
@@ -1662,9 +1798,9 @@ overrides, and notification suppression belong under `[auction]`.
 | `script_patterns`                    | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid script paths intercepted by Trusted Server                    |
 | `external_bundle_url`                | String        | Required when enabled                                                  | HTTPS publisher-specific Prebid.js bundle URL                                  |
 | `external_bundle_sha256` / `*_sri`   | String        | `None`                                                                 | Optional bundle integrity and cache metadata                                   |
-| `bundle.modules.bidder`              | Array[String] | Required and non-empty                                                 | Exact bidder module stems used by `ts prebid bundle`                           |
-| `bundle.modules.user_id`             | Array[String] | Curated preset when omitted                                            | Exact User ID module stems used by `ts prebid bundle`                          |
-| `bundle.modules.analytics`           | Array[String] | `[]`                                                                   | Exact analytics module stems used by `ts prebid bundle`                        |
+| `bundle.modules.bidder`              | Array[String] | Required and non-empty                                                 | Exact bidder module stems used by `ts prebid client`                           |
+| `bundle.modules.user_id`             | Array[String] | Curated preset when omitted                                            | Exact User ID module stems used by `ts prebid client`                          |
+| `bundle.modules.analytics`           | Array[String] | `[]`                                                                   | Exact analytics module stems used by `ts prebid client`                        |
 | `managed_user_ids`                   | Array[Table]  | `[]`                                                                   | Prebid User ID modules Trusted Server installs and keeps installed (see below) |
 
 Server-side bidder codes are derived from validated `[auction.bidders.*]`
@@ -1758,7 +1894,7 @@ module uses the same vendor-neutral surface. The managed `name` must match a
 
 The module must be present in the built bundle. Name it under
 `[integrations.prebid.bundle].user_id_modules`, or omit that list to take the
-generator's default preset. `ts prebid bundle` resolves each managed `name`
+generator's default preset. `ts prebid client` resolves each managed `name`
 through the checked-in `user_id_modules.json` registry, rejects unknown names,
 ambiguous names, and two names that resolve to the same module, and confirms the
 required modules in the newly generated
@@ -1770,7 +1906,8 @@ unchanged.
 
 Persisting a resolved ID into the Edge Cookie identity graph additionally
 requires a matching `[[ec.partners]]` entry whose `source_domain` equals the
-module's OpenRTB EID source.
+module's OpenRTB EID source, and, when a TCF signal is present, consent to
+TCF Purpose 1 and Purpose 4.
 
 `managed_user_ids` is an array of tables, so it cannot be set through a
 `TRUSTED_SERVER__` environment variable; the scalar overlay only replaces leaves
@@ -2357,10 +2494,23 @@ stored as a shared template.
 
 `template_cache_vary` is necessary because lookup occurs before the origin can
 return `Vary`. Presence, empty values, repeated raw field values, host/scheme,
-origin identity, complete template-shaping settings, TSJS content, and schema
-version all participate in an opaque SHA-256 cache key. `Accept-Encoding` does
-not: the stored template is decoded identity and the assembled result is encoded
-for each reader with `Vary: Accept-Encoding`. This assumes the origin's
+origin identity, complete template-shaping settings, TSJS content, core build
+inputs, and schema version all participate in an opaque SHA-256 cache key. The
+build digest covers every core source file (including Rust-inlined head scripts)
+except hidden, `#`-prefixed, and `~`-suffixed editor artifacts, plus the core
+build script, core and workspace manifests, `edgezero.toml`, and the workspace
+lockfile when present. Any change to these inputs causes a cold template fill
+per URL variant after deployment, even if the change does not affect rendered
+HTML. Core-owned formats (cached metadata, the seam marker, and the assembly
+contract) are covered by the same digest. A manual `TEMPLATE_SCHEMA_VERSION`
+bump is needed only for template-compatibility changes outside those inputs,
+such as the Fastly adapter's template storage or the Rust side of
+`trusted-server-js`, unless another fingerprint input already isolates the
+change.
+
+`Accept-Encoding` does not participate in the key: the stored template is
+decoded identity and the assembled result is encoded for each reader with
+`Vary: Accept-Encoding`. This assumes the origin's
 `Accept-Encoding` variants differ only by HTTP content coding, as normal
 compression negotiation does. Do not enable ESI for an origin that changes the
 document's meaning based on `Accept-Encoding`. Never put `Cookie` or
@@ -2803,125 +2953,37 @@ EdgeZero entry point. The former `edgezero_enabled` and `edgezero_rollout_pct`
 canary keys are no longer read.
 
 `[stores.config].default` in `edgezero.toml` supplies the logical config store
-ID and default blob key, currently `trusted_server_config`. Fastly has no
-process environment. Its entry point reads service-scoped overrides from the
-`edgezero_runtime_env` Config Store before opening the app-config store:
+ID, currently `trusted_server_config`. The Fastly runtime opens the store by
+that logical ID and reads the entry under the same key on every target. Store
+selection is a deploy-time input: a managed `ts deploy --adapter fastly` links
+the physical store named by
+`EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` to the service version
+under the logical ID. No selector is read from a Config Store at runtime, and
+on Fastly the CLI rejects any `--key` or `__KEY` selector other than the
+logical ID.
 
-```mermaid
-flowchart TD
-    A[Manifest default store ID] --> B[Resolve store name and blob key]
-    C[Service-scoped entries in edgezero_runtime_env] --> B
-    B --> D[Open the resolved resource-link name]
-    D --> E[Read the selected blob key from the linked physical store]
-```
-
-For this logical ID, the runtime selectors are:
-
-```text
-EDGEZERO__SERVICES__<SERVICE_ID>__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME
-EDGEZERO__SERVICES__<SERVICE_ID>__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY
-```
-
-The runtime ignores unscoped entries. Missing or blank selectors fall back to
-the logical ID. A resource link must exist under the resolved name, not always
-under `trusted_server_config`.
-
-### Initial setup with a service-specific store
-
-Fastly store names are account-level. Choose a physical name that is not used
-by another service. The default physical name is safe only if the service owns
-that store exclusively.
-
-Create the Fastly service and an editable service version before provisioning
-non-default mappings. Select its ID through top-level `service_id` in
-`fastly.toml` or `FASTLY_SERVICE_ID`. If both are set, they must agree. Do not
-reuse the checked-in service ID for your deployment. Without a service ID,
-provisioning rejects non-default mappings before creating resources.
-
-The following example is for initial setup before the service receives traffic.
-Replace the service ID and choose your own physical store name:
-
-```bash
-export FASTLY_SERVICE_ID="<service-id>"
-export EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=example_config
-
-ts provision --adapter fastly --dry-run
-ts provision --adapter fastly
-```
-
-Provisioning creates the stores and persists the selected name in the
-service-scoped `edgezero_runtime_env` entry. Keep all intended store-name
-overrides set when provisioning, including any [secret-store mapping](/guide/fastly#secret-stores).
-Provisioning reconciles mappings for all declared stores, so omitting a previous
-override can remove it.
-
-For an existing service, Fastly does not reapply `[setup]` entries. Follow the
-provisioner's resource-link instructions. Both the app-config store and the
-runtime-env store must be linked to the same editable version. For this example:
-
-```bash
-fastly resource-link create --service-id "$FASTLY_SERVICE_ID" --version latest --autoclone \
-  --resource-id <config-store-id> --name example_config
-fastly resource-link create --service-id "$FASTLY_SERVICE_ID" --version latest --autoclone \
-  --resource-id <runtime-env-store-id> --name edgezero_runtime_env
-
-ts config push --adapter fastly --dry-run
-ts config push --adapter fastly
-fastly compute publish --service-id "$FASTLY_SERVICE_ID" --version latest
-```
-
-Look up each store ID by its name before linking. Confirm the push dry run names
-`example_config`, not the account-level default. Publish the application to the
-linked version only after seeding its config store; a missing or invalid blob
-makes application startup fail closed. Do not activate a new service's empty
-version before uploading the application. If your deployment separates upload
-from activation, activate the prepared version with
-`fastly service-version activate --service-id "$FASTLY_SERVICE_ID" --version <version>`
-only after both the code and config are ready.
-
-Keep the `__NAME` override in your deployment environment for **every subsequent
-push**. The CLI reads its process environment, not the service's persisted
-runtime mapping. Omitting the override can write to the wrong physical store.
-Reject empty values in deployment scripts rather than relying on the fallback.
-
-For a live service, changing entries in its active `edgezero_runtime_env` store
-changes runtime selection immediately, independently of service-version
-activation. Do not use the initial-setup sequence to migrate a live mapping.
-Prepare and seed the destination and make its resource link available to the
-active version before switching the selector, or use an isolated staged runtime
-configuration.
-
-An existing deployment may instead link a service-specific physical store under
-the logical name `trusted_server_config`, with no runtime `__NAME` override.
-That alias works, but the CLI still needs the physical-name override on every
-push. Do not add a runtime override unless a link under the newly selected name
-also exists.
-
-### Selecting another blob key
-
-A normal push writes at the logical store ID. A runtime `__KEY` override does
-not change that write destination. To select another production key, first push
-with `ts config push --adapter fastly --key <key>`, then set the matching
-service-scoped `__KEY` entry in `edgezero_runtime_env`. Changing that entry affects
-the active service immediately. Do not point the production selector at a
-staging key; staged deployments need their own runtime-env store.
+Keep the `__NAME` selector set in the shell or deploy job for every push, so
+`ts config push` writes into the same physical store the deployment links.
+Isolate staging by selecting a different physical store. See
+[Secret Stores](/guide/fastly#secret-stores) and the
+[CLI lifecycle commands](/guide/cli#lifecycle-commands) for the full deploy and
+staging flow.
 
 ### Local development
 
-The repository's Viceroy configuration uses the default logical app-config name
-and key. Clear production overrides for the local push:
+The repository's Viceroy configuration uses the logical app-config store ID and
+key. Clear any production key override for the local push:
 
 ```bash
-env -u EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME \
-  -u EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY \
+env -u EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY \
   ts config push --adapter fastly --local
 ```
 
-`--local` writes under `[local_server.config_stores.<resolved-name>]` in the
-tracked `fastly.toml`. If you customize Viceroy's service-scoped runtime selectors,
-keep that local name and the pushed key aligned with them. Review the generated
-diff and do not commit deployment-specific app-config entries. Credentials belong
-in secret stores; the app-config blob contains their key references.
+`--local` writes under `[local_server.config_stores.trusted_server_config]` in
+the tracked `fastly.toml`, the logical store ID, regardless of any `__NAME`
+selector. Review the generated diff and do not commit deployment-specific
+app-config entries. Credentials belong in secret stores; the app-config blob
+contains their key references.
 
 ### Rollback
 

@@ -74,11 +74,21 @@ fn detect_max_level(explicit: Option<&str>, hostname: Option<&str>) -> log::Leve
 /// used as-is, so `error`/`off` lowers it just as `debug` raises it; see
 /// [`resolve_max_level`].
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the Fastly logger cannot be built or if the global logger has already
-/// been set.
-pub(crate) fn init_logger() {
+/// Returns a message if the Fastly logger cannot be built or if a global
+/// logger is already installed. Returning rather than panicking lets
+/// `Sandbox::setup_once` mark setup complete only on success, which *allows*
+/// a later callback to retry. It does not by itself make retrying safe:
+/// `setup_once` does not roll back partial side effects, so repeating this
+/// function must stay harmless.
+///
+/// It is, for the two ways it can fail. A failed `Logger::builder().build()`
+/// installs nothing. A failed `fern::Dispatch::apply()` means a global logger
+/// is already installed, so the retry fails the same way and never installs a
+/// second one; the only repeated side effect is constructing a `Logger` that
+/// is then dropped. Neither path leaves the process partially configured.
+pub(crate) fn init_logger() -> Result<(), String> {
     let explicit = std::env::var(LOG_LEVEL_ENV).ok();
     let hostname = std::env::var(LOCAL_HOSTNAME_ENV).ok();
     let max_level = detect_max_level(explicit.as_deref(), hostname.as_deref());
@@ -88,7 +98,7 @@ pub(crate) fn init_logger() {
         .echo_stdout(true)
         .max_level(max_level)
         .build()
-        .expect("should build Logger");
+        .map_err(|e| format!("should build Logger: {e}"))?;
 
     fern::Dispatch::new()
         .level(max_level)
@@ -103,7 +113,7 @@ pub(crate) fn init_logger() {
         })
         .chain(Box::new(logger) as Box<dyn log::Log>)
         .apply()
-        .expect("should initialize logger");
+        .map_err(|e| format!("should initialize logger: {e}"))
 }
 
 #[cfg(test)]
