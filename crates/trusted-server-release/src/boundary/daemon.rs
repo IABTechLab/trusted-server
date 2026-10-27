@@ -12,6 +12,7 @@
 //! Production use stays closed through the uninhabited
 //! [`QualifiedImage`](super::docker::QualifiedImage).
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
@@ -20,7 +21,7 @@ use std::path::Path;
 use error_stack::Report;
 
 use super::host_inputs::HostInputs;
-use crate::documents::{Role as DocumentRole, parse_json};
+use crate::documents::{Role as DocumentRole, canonical_json, parse_json};
 use crate::error::ReleaseError;
 use crate::process::{BoundedCommand, ProcessLimits, ProcessResult};
 
@@ -172,6 +173,23 @@ impl DockerClient {
             image,
         ])?;
         validate_image_volumes(&result.require_success()?)
+    }
+
+    /// Inspects the builder's fixed entrypoint, environment and volume fields.
+    ///
+    /// # Errors
+    ///
+    /// Rejects failed inspection or configuration outside the reviewed policy.
+    pub(super) fn builder_image_configuration(
+        &self,
+        image: &str,
+    ) -> Result<ImageConfiguration, Report<ReleaseError>> {
+        let result = self.host(&[
+            "image", "inspect", "--format",
+            r#"{"Volumes":{{json .Config.Volumes}},"Entrypoint":{{json .Config.Entrypoint}},"Env":{{json .Config.Env}}}"#,
+            image,
+        ])?;
+        ImageConfiguration::parse(&result.require_success()?)
     }
 
     /// Creates a stopped container and requires its acknowledged full identity.
@@ -339,4 +357,141 @@ fn validate_image_volumes(stdout: &[u8]) -> Result<(), Report<ReleaseError>> {
     Err(daemon_error(
         "selected image declares writable volumes or malformed volume metadata",
     ))
+}
+
+/// Retained empty-entrypoint and approved-environment image configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ImageConfiguration {
+    canonical: Vec<u8>,
+}
+
+// Exact entries reviewed against the public Ubuntu 24.04 and UBI 9.6 fixtures.
+// Accepting configuration does not qualify an image or permit other variables.
+const APPROVED_IMAGE_ENVIRONMENT: [&str; 2] = [
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "container=oci",
+];
+
+impl ImageConfiguration {
+    /// Parses the fixed image-inspection projection without authorizing an image.
+    ///
+    /// # Errors
+    ///
+    /// Rejects volumes, entrypoints, unapproved/duplicate environment entries,
+    /// malformed or oversized metadata. Production qualification remains closed.
+    pub(super) fn parse(bytes: &[u8]) -> Result<Self, Report<ReleaseError>> {
+        let rejected = || daemon_error("selected image configuration rejected");
+        let value = parse_json(bytes, DocumentRole::Metadata).map_err(|_| rejected())?;
+        let fields = value.as_object().ok_or_else(rejected)?;
+        if fields.len() != 3
+            || !["Volumes", "Entrypoint", "Env"]
+                .iter()
+                .all(|key| fields.contains_key(*key))
+        {
+            return Err(rejected());
+        }
+        if !(value["Volumes"].is_null()
+            || value["Volumes"]
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty))
+            || !(value["Entrypoint"].is_null()
+                || value["Entrypoint"].as_array().is_some_and(Vec::is_empty))
+        {
+            return Err(rejected());
+        }
+        if !value["Env"].is_null() {
+            let entries = value["Env"].as_array().ok_or_else(rejected)?;
+            if entries.len() > APPROVED_IMAGE_ENVIRONMENT.len() {
+                return Err(rejected());
+            }
+            let mut names = BTreeSet::new();
+            for entry in entries {
+                let entry = entry.as_str().ok_or_else(rejected)?;
+                let (name, _) = entry.split_once('=').ok_or_else(rejected)?;
+                if !APPROVED_IMAGE_ENVIRONMENT.contains(&entry) || !names.insert(name) {
+                    return Err(rejected());
+                }
+            }
+        }
+        let canonical = canonical_json(&value, DocumentRole::Metadata).map_err(|_| rejected())?;
+        Ok(Self { canonical })
+    }
+
+    /// Canonical inspected bytes included in the boundary fingerprint.
+    pub(super) fn canonical(&self) -> &[u8] {
+        &self.canonical
+    }
+}
+
+#[cfg(test)]
+mod image_configuration_tests {
+    use serde_json::json;
+
+    use super::ImageConfiguration;
+
+    const PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+    #[test]
+    fn accepts_only_empty_entrypoints_and_the_approved_environment_entries() {
+        for entrypoint in [json!(null), json!([])] {
+            for environment in [
+                json!(null),
+                json!([]),
+                json!([PATH]),
+                json!([PATH, "container=oci"]),
+            ] {
+                let bytes = serde_json::to_vec(
+                    &json!({"Volumes":null,"Entrypoint":entrypoint,"Env":environment}),
+                )
+                .expect("should encode inspected fields");
+                ImageConfiguration::parse(&bytes)
+                    .expect("should accept only the reviewed configuration");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_entrypoints_unknown_changed_and_duplicate_environment_entries() {
+        let initial = json!({"Volumes":null,"Entrypoint":null,"Env":[PATH]});
+        for (key, replacement) in [
+            ("Entrypoint", json!(["/bin/sh"])),
+            ("Entrypoint", json!([""])),
+            ("Entrypoint", json!("")),
+            ("Env", json!(["PATH=/tmp"])),
+            ("Env", json!(["NODE_OPTIONS=fictional-unapproved-value"])),
+            ("Env", json!(["container=other"])),
+            ("Env", json!([PATH, PATH])),
+            ("Env", json!(["container=oci", "container=oci"])),
+            ("Env", json!([1])),
+            ("Env", json!({})),
+            ("Volumes", json!({"/scratch":{}})),
+        ] {
+            let mut candidate = initial.clone();
+            candidate[key] = replacement;
+            let bytes =
+                serde_json::to_vec(&candidate).expect("should encode rejected configuration");
+            let error = ImageConfiguration::parse(&bytes)
+                .expect_err("should reject image configuration drift");
+            assert!(
+                !format!("{error:?}").contains("fictional-unapproved-value"),
+                "should not echo rejected image environment values"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_missing_extra_duplicate_malformed_and_oversized_image_metadata() {
+        for bytes in [
+            b"{}".to_vec(),
+            b"{\"Volumes\":null,\"Entrypoint\":null,\"Env\":[],\"Extra\":0}".to_vec(),
+            b"{\"Volumes\":null,\"Entrypoint\":null,\"Env\":[],\"Env\":[]}".to_vec(),
+            b"not JSON".to_vec(),
+            vec![b' '; 1024 * 1024 + 1],
+        ] {
+            assert!(
+                ImageConfiguration::parse(&bytes).is_err(),
+                "should reject unsupported image metadata"
+            );
+        }
+    }
 }

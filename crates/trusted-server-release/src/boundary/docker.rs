@@ -34,7 +34,8 @@ use error_stack::Report;
 use sha2::{Digest as _, Sha256};
 
 use super::daemon::{
-    ContainerId, DOCKER_SOCKET, DockerClient, check_daemon_socket, host_arguments,
+    ContainerId, DOCKER_SOCKET, DockerClient, ImageConfiguration, check_daemon_socket,
+    host_arguments,
 };
 use super::roots::{BoundaryRoots, RootRole, validate_path_text};
 use super::{ConfinedCommand, Umask};
@@ -44,7 +45,7 @@ use crate::process::{ProcessLimits, ProcessOutcome, ProcessResult};
 /// Container-namespace prefix for every mount target.
 const MOUNT_PREFIX: &str = "/boundary";
 /// Configuration fingerprint domain.
-const FINGERPRINT_DOMAIN: &[u8] = b"trusted-server-boundary-docker-confirmed-create-v2\n";
+const FINGERPRINT_DOMAIN: &[u8] = b"trusted-server-boundary-docker-image-config-v3\n";
 /// Fixed absolute shell of the selected image that applies a requested umask.
 const SHELL: &str = "/bin/sh";
 /// Fixed `argv[0]` of [`SHELL`]; the program and its arguments follow it.
@@ -52,6 +53,66 @@ const SHELL_NAME: &str = "sh";
 
 fn docker_error(message: impl std::fmt::Display) -> Report<ReleaseError> {
     Report::new(ReleaseError::Boundary).attach(message.to_string())
+}
+
+fn fingerprint_parts(
+    parts: impl IntoIterator<Item = OsString>,
+    image: &ImageConfiguration,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(FINGERPRINT_DOMAIN);
+    let configuration = image.canonical();
+    hasher.update((configuration.len() as u64).to_be_bytes());
+    hasher.update(configuration);
+    for part in parts {
+        let bytes = part.as_encoded_bytes();
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    hasher.finalize().into()
+}
+
+#[cfg(test)]
+mod image_configuration_tests {
+    use serde_json::json;
+
+    use super::{ImageConfiguration, fingerprint_parts};
+
+    #[test]
+    fn fingerprint_binds_actual_entrypoint_and_environment_fields() {
+        let initial = json!({"Volumes":null,"Entrypoint":null,"Env":null});
+        let fingerprint = |value| {
+            let bytes = serde_json::to_vec(&value).expect("should encode retained configuration");
+            let configuration =
+                ImageConfiguration::parse(&bytes).expect("should accept reviewed fields");
+            fingerprint_parts(
+                ["same-image".into(), "same-arguments".into()],
+                &configuration,
+            )
+        };
+        let original = fingerprint(initial.clone());
+        for (key, value) in [
+            ("Entrypoint", json!([])),
+            (
+                "Env",
+                json!(["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]),
+            ),
+            ("Env", json!(["container=oci"])),
+        ] {
+            let mut changed = initial.clone();
+            changed[key] = value;
+            assert_ne!(
+                original,
+                fingerprint(changed),
+                "should bind each inspected image field even with identical arguments and image ID"
+            );
+        }
+        assert_eq!(
+            original,
+            fingerprint(initial),
+            "should retain stable fingerprints for identical inspected values"
+        );
+    }
 }
 
 /// A production OCI image that passed Task 8 qualification.
@@ -389,6 +450,8 @@ fn umask_prefix(umask: Option<Umask>) -> Vec<OsString> {
 pub(crate) fn create_arguments(settings: &DockerSettings, plan: &RunPlan<'_>) -> Vec<OsString> {
     let mut arguments = host_arguments(plan.config);
     arguments.extend(["create", "--name", plan.name].iter().map(OsString::from));
+    arguments.push(OsString::from("--entrypoint="));
+    arguments.push(OsString::from("--no-healthcheck"));
     arguments.extend(ISOLATION_ARGUMENTS.iter().map(OsString::from));
     let mut seccomp = OsString::from("seccomp=");
     seccomp.push(plan.seccomp);
@@ -442,6 +505,7 @@ pub(crate) struct DockerBoundary {
     settings: DockerSettings,
     /// Content ID of the [`ImageSelection`] this boundary was configured with.
     image_id: String,
+    image_configuration: ImageConfiguration,
     mounts: Vec<Mount>,
 }
 
@@ -452,7 +516,9 @@ impl DockerBoundary {
     ///
     /// Returns [`ReleaseError::Boundary`] for invalid settings, an unusable
     /// daemon socket, an unpinned image, unmountable roots or host inputs
-    /// that overlap a mounted root, or an image with declared volumes.
+    /// that overlap a mounted root, or an image with declared volumes,
+    /// a nonempty entrypoint or an unapproved environment entry.
+    /// Container creation always disables inherited image healthchecks.
     pub(crate) fn new(
         roots: &BoundaryRoots,
         settings: DockerSettings,
@@ -480,11 +546,12 @@ impl DockerBoundary {
             &mounted,
             settings.host_limits,
         )?;
-        client.require_no_image_volumes(&image_id)?;
+        let image_configuration = client.builder_image_configuration(&image_id)?;
         Ok(Self {
             client,
             settings,
             image_id,
+            image_configuration,
             mounts,
         })
     }
@@ -509,9 +576,11 @@ impl DockerBoundary {
             self.image_id.clone(),
             state_parent,
         )?;
-        if sibling.client.inputs().digests() != self.client.inputs().digests() {
+        if sibling.client.inputs().digests() != self.client.inputs().digests()
+            || sibling.image_configuration != self.image_configuration
+        {
             return Err(docker_error(
-                "sibling container pinned another Docker client or seccomp profile",
+                "sibling container pinned different host inputs or image configuration",
             ));
         }
         Ok(sibling)
@@ -533,18 +602,11 @@ impl DockerBoundary {
             interactive: false,
             umask: None,
         };
-        let mut hasher = Sha256::new();
-        hasher.update(FINGERPRINT_DOMAIN);
         let digests = self.client.inputs().digests();
         let parts = create_arguments(&self.settings, &plan)
             .into_iter()
             .chain(digests.iter().map(OsString::from));
-        for part in parts {
-            let bytes = part.as_encoded_bytes();
-            hasher.update((bytes.len() as u64).to_be_bytes());
-            hasher.update(bytes);
-        }
-        hasher.finalize().into()
+        fingerprint_parts(parts, &self.image_configuration)
     }
 
     /// Runs `command` in a fresh container, then always cleans it up.

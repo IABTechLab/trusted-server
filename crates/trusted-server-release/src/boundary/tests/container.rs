@@ -143,7 +143,7 @@ fn docker_create_arguments_are_exact() {
 
 /// The exact argv expected for the fixture plan rooted at `root`.
 /// Fixed argv prefix expected before the mounts.
-const EXPECTED_PREFIX: [&str; 32] = [
+const EXPECTED_PREFIX: [&str; 34] = [
     "--config",
     "/host/config",
     "--host",
@@ -151,6 +151,8 @@ const EXPECTED_PREFIX: [&str; 32] = [
     "create",
     "--name",
     "ts-release-boundary-fixture",
+    "--entrypoint=",
+    "--no-healthcheck",
     "--init",
     "--pull",
     "never",
