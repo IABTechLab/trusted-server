@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { gzipSync, gunzipSync } from 'node:zlib'
 import { execFileSync } from 'node:child_process'
 import { completeSpdx, validateSpdx, checkReleaseFormat } from './phase1.mjs'
 import { test } from 'node:test'
@@ -1683,6 +1684,76 @@ test('canonical Fastly route verifies the pinned tool offline without credential
   assert.doesNotMatch(
     canonical.split('    steps:')[0],
     /write|id-token|attestations:/
+  )
+})
+
+test('Fastly route diagnostics preserve literal directory headers and reject malformed size fields', () => {
+  const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const match = workflow.match(
+    /          timeout 15 "\$6" --input-type=commonjs <<'HEADERS'\n([\s\S]*?)          HEADERS/
+  )
+  assert.ok(match, 'should inspect the actual bounded diagnostic program')
+  const script = match[1]
+    .split('\n')
+    .map((line) => line.slice(10))
+    .join('\n')
+  const bytes = Buffer.alloc(3 * 512)
+  for (const [index, path] of ['example-app', 'example-app/bin'].entries()) {
+    const header = bytes.subarray(index * 512, (index + 1) * 512)
+    header.write(path)
+    header.write('00000000000\0', 124)
+    header[156] = 53
+  }
+  const records = []
+  let compressed = gzipSync(bytes)
+  const context = {
+    console: {
+      log: (label, data) => {
+        assert.equal(label, 'Fastly raw TAR header:')
+        records.push(JSON.parse(data))
+      },
+    },
+    require(name) {
+      if (name === 'node:fs')
+        return {
+          lstatSync: () => ({ isFile: () => true, size: compressed.length }),
+          readFileSync: () => compressed,
+        }
+      if (name === 'node:zlib') return { gunzipSync }
+      throw Error(`Unexpected diagnostic module: ${name}`)
+    },
+  }
+  vm.runInNewContext(script, { ...context })
+  assert.deepEqual(
+    records,
+    ['example-app', 'example-app/bin'].map((path) => ({
+      path,
+      type: '5',
+      size: 0,
+      prefix: '',
+      link: '',
+      nonzero_padding: false,
+    }))
+  )
+  bytes[64] = 1
+  compressed = gzipSync(bytes)
+  vm.runInNewContext(script, { ...context })
+  assert.equal(
+    records.at(-2).nonzero_padding,
+    true,
+    'should expose hidden nonzero name padding'
+  )
+  bytes[64] = 0
+  bytes.write('invalid-size', 124)
+  compressed = gzipSync(bytes)
+  assert.throws(
+    () => vm.runInNewContext(script, { ...context }),
+    /Unsupported diagnostic size encoding/
+  )
+  assert.ok(
+    workflow.indexOf('Fastly raw TAR header:') <
+      workflow.indexOf('timeout 30 "$2" inspect-fastly-package'),
+    'should log literal headers before the unchanged strict inspector'
   )
 })
 

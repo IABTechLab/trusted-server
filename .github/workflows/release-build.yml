@@ -88,12 +88,13 @@ jobs:
           expected_wasm=$(sha256sum release-assets/trusted-server-fastly.wasm | awk '{print $1}')
           expected_manifest=$(sha256sum "$route/package/fastly.toml" | awk '{print $1}')
           producer="$RUNNER_TEMP/ordinary-producer-target/x86_64-unknown-linux-gnu/release/trusted-server-release"
+          node_program=$(command -v node)
           host_network=$(readlink /proc/self/ns/net)
           sudo unshare --net -- setpriv --reuid="$(id -u)" --regid="$(id -g)" \
             --clear-groups --inh-caps=-all --ambient-caps=-all --bounding-set=-all --no-new-privs \
             env -i PATH="$route/tool:/usr/bin:/bin:/usr/sbin:/sbin" XDG_CONFIG_HOME="$route/config" \
             XDG_CACHE_HOME="$route/cache" TMPDIR="$route/tmp" LC_ALL=C TZ=UTC \
-            bash -euxo pipefail -s -- "$route/package" "$producer" "$expected_wasm" "$expected_manifest" "$host_network" <<'ROUTE'
+            bash -euxo pipefail -s -- "$route/package" "$producer" "$expected_wasm" "$expected_manifest" "$host_network" "$node_program" <<'ROUTE'
           guest_network=$(readlink /proc/self/ns/net)
           test -n "$guest_network"
           test "$guest_network" != "$5"
@@ -105,6 +106,25 @@ jobs:
           timeout 60 fastly compute pack --wasm-binary ./trusted-server-fastly.wasm
           timeout 30 fastly compute validate --package ./pkg/example-app.tar.gz
           tar -tzf ./pkg/example-app.tar.gz
+          timeout 15 "$6" --input-type=commonjs <<'HEADERS'
+          const fs = require('node:fs'), zlib = require('node:zlib');
+          const file = './pkg/example-app.tar.gz', stat = fs.lstatSync(file);
+          if (!stat.isFile() || stat.size > 768 * 1024 * 1024) throw Error('Diagnostic archive bound exceeded');
+          const bytes = zlib.gunzipSync(fs.readFileSync(file), {maxOutputLength:513 * 1024 * 1024 + 16384});
+          let offset = 0;
+          for (let count = 0; count < 8 && offset + 512 <= bytes.length; count++) {
+            const header = bytes.subarray(offset, offset + 512);
+            if (header.every(byte => byte === 0)) break;
+            const field = (start, end) => header.subarray(start, end).toString('utf8').split('\0')[0];
+            const hidden = (start, end) => { const data = header.subarray(start, end), zero = data.indexOf(0); return zero >= 0 && data.subarray(zero + 1).some(byte => byte !== 0); };
+            const rawSize = field(124, 136).trim();
+            if (!/^[0-7]+$/.test(rawSize)) throw Error('Unsupported diagnostic size encoding');
+            const size = parseInt(rawSize, 8);
+            if (!Number.isSafeInteger(size) || size > bytes.length) throw Error('Diagnostic member bound exceeded');
+            console.log('Fastly raw TAR header:', JSON.stringify({path:field(0, 100), type:String.fromCharCode(header[156]), size, prefix:field(345, 500), link:field(157, 257), nonzero_padding:[[0,100],[157,257],[345,500]].some(([start,end]) => hidden(start,end))}));
+            offset += 512 + Math.ceil(size / 512) * 512;
+          }
+          HEADERS
           timeout 30 "$2" inspect-fastly-package --package-dir ./pkg --manifest ./fastly.toml \
             --expected-manifest-sha256 "$4" --expected-wasm-sha256 "$3"
           tar -xOzf ./pkg/example-app.tar.gz example-app/bin/main.wasm > packaged.wasm
