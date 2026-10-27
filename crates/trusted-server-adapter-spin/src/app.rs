@@ -714,6 +714,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 }
                 let mut ec_context = build_ec_context(&s.settings, &services, &req);
                 let auction = AuctionDispatch {
+                    integration_registry: &s.registry,
                     orchestrator: &s.orchestrator,
                     slots: s.settings.creative_opportunity_slots(),
                     registry: None,
@@ -837,6 +838,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             } else {
                 let mut ec_context = build_ec_context(&state.settings, &services, &req);
                 let auction = AuctionDispatch {
+                    integration_registry: &state.registry,
                     orchestrator: &state.orchestrator,
                     slots: state.settings.creative_opportunity_slots(),
                     registry: None,
@@ -1252,7 +1254,8 @@ mod tests {
         let info = trusted_server_core::http_util::RequestInfo::from_request(
             &req,
             &trusted_server_core::platform::ClientInfo::default(),
-        );
+        )
+        .expect("should accept trusted Spin request metadata");
         assert_eq!(
             info.scheme, "https",
             "should retain trusted Spin HTTPS scheme after forwarding sanitation"
@@ -1357,7 +1360,9 @@ mod tests {
             trusted_server_core::http_util::RequestInfo::from_request(
                 &req,
                 &ClientInfo::default(),
-            ).scheme,
+            )
+            .expect("should accept trusted Spin request metadata")
+            .scheme,
             "https",
             "should retain trusted runtime scheme"
         );

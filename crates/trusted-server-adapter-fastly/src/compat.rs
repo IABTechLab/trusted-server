@@ -172,7 +172,8 @@ mod tests {
                 .expect("should construct converted request");
             core.extensions_mut().insert(prepared);
             prepare_trusted_forwarder(&mut core, &settings);
-            let info = RequestInfo::from_request(&core, &ClientInfo::default());
+            let info = RequestInfo::from_request(&core, &ClientInfo::default())
+                .expect("should accept converted request metadata");
             assert_eq!(
                 info.host,
                 if duplicate {
