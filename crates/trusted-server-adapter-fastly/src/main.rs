@@ -16,12 +16,11 @@ use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 use rand::Rng as _;
 
 use trusted_server_core::access_telemetry::{
-    AccessTelemetrySnapshot, RouteClass, RouteMetadata, access_event_row,
+    AccessTelemetrySnapshot, DeliveryResult, RouteClass, RouteMetadata, access_event_row,
 };
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
 use trusted_server_core::constants::{
-    ENV_FASTLY_IS_STAGING, ENV_FASTLY_POP, ENV_FASTLY_SERVICE_ID, ENV_FASTLY_SERVICE_VERSION,
-    HEADER_X_TS_VERSION,
+    ENV_FASTLY_IS_STAGING, ENV_FASTLY_POP, ENV_FASTLY_SERVICE_ID, HEADER_X_TS_VERSION,
 };
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
@@ -797,7 +796,7 @@ fn run_post_send_steps(pull_sync: impl FnOnce(), emit_access_telemetry: impl FnO
     emit_access_telemetry();
 }
 
-/// Builds and emits the access-telemetry row for one delivered response,
+/// Builds and dispatches the access row after a response's transport attempt,
 /// when access telemetry is enabled and this request is sampled in.
 ///
 /// Called last at every `send_edgezero_response` call site in
@@ -810,8 +809,10 @@ fn run_post_send_steps(pull_sync: impl FnOnce(), emit_access_telemetry: impl FnO
 ///
 /// Sampling happens before snapshot construction, using the same configured
 /// rate stored in the row. Disabled and sampled-out requests have no snapshot
-/// and return silently. Row construction, send, and non-2xx failures log one
-/// warning naming the reason. Credentials were resolved during settings load.
+/// and return silently. Row construction, setup and request-start failures log
+/// one warning. The host-owned ingest request continues after this callback;
+/// later transport errors, HTTP status and remote acceptance are unobserved.
+/// Credentials were resolved during settings load.
 fn emit_access_telemetry_after_send(
     settings: &Settings,
     outcome: &DeliveryOutcome,
@@ -831,7 +832,7 @@ fn emit_access_telemetry_after_send(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let epoch_ms = u64::try_from(since_epoch.as_millis()).unwrap_or(u64::MAX);
-    let row = access_event_row(snapshot, &timings.snapshot(), epoch_ms);
+    let row = access_event_row(snapshot, &timings.snapshot(), outcome.result, epoch_ms);
     let target = tinybird::TinybirdEventsTarget::from_access_config(&settings.tinybird);
     let result = futures::executor::block_on(tinybird::emit_access_event(
         &platform::FastlyPlatformHttpClient,
@@ -867,30 +868,13 @@ struct SendContext<'a> {
 
 /// Outcome of handing a finalized response to the client.
 pub(crate) struct DeliveryOutcome {
-    /// Response body size in bytes.
-    #[allow(dead_code)]
-    pub bytes: u64,
-    /// Whether delivery completed or failed partway. Collected as
-    /// groundwork; not yet emitted on any surface.
-    #[allow(dead_code)]
+    /// Outcome of the local body handoff, emitted as `delivery_result`.
+    /// This does not establish confirmed client receipt.
     pub result: DeliveryResult,
     /// Access-telemetry dimensions captured for this response at the
     /// freeze point. `None` when access telemetry was disabled or sampled out;
     /// the emitter treats that as nothing to send.
     pub snapshot: Option<AccessTelemetrySnapshot>,
-}
-
-/// Whether [`send_edgezero_response`] completed delivery or failed partway.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum DeliveryResult {
-    /// The response was handed to the client in full.
-    Complete,
-    /// Delivery started but did not finish cleanly: some bytes reached the
-    /// client's transport before a stream error, or the transport could not
-    /// be closed cleanly after every byte was written.
-    Partial,
-    /// Delivery failed before any bytes reached the client.
-    Error,
 }
 
 /// Thin Fastly-adapter wrapper around
@@ -988,6 +972,20 @@ fn classify_stream_delivery(
     }
 }
 
+/// Classifies the transport's finish result after a successful body drive.
+fn classify_stream_finish(
+    finish_result: std::io::Result<()>,
+    counter_context: &str,
+) -> DeliveryResult {
+    match finish_result {
+        Ok(()) => DeliveryResult::Complete,
+        Err(error) => {
+            log::error!("failed to finish EdgeZero streaming body{counter_context}: {error}");
+            DeliveryResult::Partial
+        }
+    }
+}
+
 /// Stamps `resp_bytes`/`request_elapsed` for an already-materialized body,
 /// immediately before it is handed to the Fastly client transport, and
 /// returns its byte length.
@@ -1060,26 +1058,9 @@ fn send_edgezero_response(
             // the `Err` arm there moves its `Report` out.
             let result = classify_stream_delivery(&drive_result, bytes);
             match drive_result {
-                Ok(()) => match streaming_body.finish() {
-                    Ok(()) => DeliveryOutcome {
-                        bytes,
-                        result: DeliveryResult::Complete,
-                        snapshot,
-                    },
-                    Err(e) => {
-                        // Every byte was handed to the transport (the drive
-                        // above returned Ok), but the transport itself could
-                        // not close cleanly — the client may still see a
-                        // truncated response.
-                        log::error!(
-                            "failed to finish EdgeZero streaming body{counter_context}: {e}"
-                        );
-                        DeliveryOutcome {
-                            bytes,
-                            result: DeliveryResult::Partial,
-                            snapshot,
-                        }
-                    }
+                Ok(()) => DeliveryOutcome {
+                    result: classify_stream_finish(streaming_body.finish(), &counter_context),
+                    snapshot,
                 },
                 Err(e) => {
                     // After commitment: log and stop. Returning an error here
@@ -1088,19 +1069,14 @@ fn send_edgezero_response(
                     // tagged with the same identity for reconciliation.
                     log::error!("EdgeZero streaming failed{counter_context}: {e:?}");
                     drop(streaming_body);
-                    DeliveryOutcome {
-                        bytes,
-                        result,
-                        snapshot,
-                    }
+                    DeliveryOutcome { result, snapshot }
                 }
             }
         }
         once => {
-            let bytes = record_buffered_delivery(&once, &context.timings);
+            record_buffered_delivery(&once, &context.timings);
             compat::to_fastly_response(HttpResponse::from_parts(parts, once)).send_to_client();
             DeliveryOutcome {
-                bytes,
                 result: DeliveryResult::Complete,
                 snapshot,
             }
@@ -1170,7 +1146,6 @@ fn build_access_telemetry_snapshot(
         env: resolve_env_dimension(),
         service_id: env_var_or_unknown(ENV_FASTLY_SERVICE_ID),
         pop: env_var_or_unknown(ENV_FASTLY_POP),
-        ts_version: env_var_or_unknown(ENV_FASTLY_SERVICE_VERSION),
         country,
         template_cache_state,
         body_mode,
@@ -1419,7 +1394,6 @@ mod tests {
             env: "unknown".to_owned(),
             service_id: "unknown".to_owned(),
             pop: "unknown".to_owned(),
-            ts_version: "unknown".to_owned(),
             country: "unknown".to_owned(),
             template_cache_state: "unknown".to_owned(),
             body_mode: "buffered",
@@ -2002,7 +1976,7 @@ mod tests {
     }
 
     #[test]
-    fn delivery_outcome_reports_bytes_and_request_elapsed_set() {
+    fn streamed_delivery_row_reports_bytes_and_request_elapsed() {
         let timings = RequestTimings::new();
         let body = EdgeBody::stream(futures::stream::iter(vec![
             bytes::Bytes::from_static(b"hello "),
@@ -2013,9 +1987,11 @@ mod tests {
         drive_result.expect("streaming a well-formed body should not fail");
         let bytes = counting.bytes();
         let outcome = DeliveryOutcome {
-            bytes,
             result: DeliveryResult::Complete,
-            snapshot: Some(sample_access_snapshot()),
+            snapshot: Some(AccessTelemetrySnapshot {
+                body_mode: "streamed",
+                ..sample_access_snapshot()
+            }),
         };
 
         assert_eq!(
@@ -2024,12 +2000,24 @@ mod tests {
             "should write every byte to the underlying transport"
         );
         assert_eq!(
-            outcome.bytes,
+            bytes,
             "hello world".len() as u64,
-            "DeliveryOutcome.bytes should equal the streamed body length"
+            "should count bytes accepted by the underlying transport"
         );
 
         let snapshot = timings.snapshot();
+        let row: serde_json::Value = serde_json::from_str(&access_event_row(
+            outcome
+                .snapshot
+                .as_ref()
+                .expect("should capture access dimensions"),
+            &snapshot,
+            outcome.result,
+            0,
+        ))
+        .expect("should parse the emitted delivery row");
+        assert_eq!(row["delivery_result"], "complete");
+        assert_eq!(row["resp_bytes"], bytes);
         assert_eq!(
             snapshot.resp_bytes,
             Some("hello world".len() as u64),
@@ -2108,7 +2096,6 @@ mod tests {
         emit_access_telemetry_after_send(
             &settings,
             &DeliveryOutcome {
-                bytes: 0,
                 result: DeliveryResult::Complete,
                 snapshot,
             },
@@ -2327,6 +2314,53 @@ mod tests {
             "the drive's Phase::Stream span must cover the in-stream auction wait: \
              stream_ms={stream_ms} auction_wait_ms={auction_wait_ms}"
         );
+    }
+
+    #[test]
+    fn failed_stream_drives_emit_partial_or_error_rows_with_actual_bytes() {
+        for (prefix, expected) in [(&b"example"[..], "partial"), (&b""[..], "error")] {
+            let mut chunks = Vec::new();
+            if !prefix.is_empty() {
+                chunks.push(Ok(bytes::Bytes::copy_from_slice(prefix)));
+            }
+            chunks.push(Err(std::io::Error::other("example stream failure")));
+            let body = EdgeBody::from_stream(futures::stream::iter(chunks));
+            let timings = RequestTimings::new();
+            let (writer, drive_result) = drive_streaming_body(body, Vec::new(), &timings);
+            assert!(drive_result.is_err(), "should observe the stream failure");
+            let result = classify_stream_delivery(&drive_result, writer.bytes());
+            let snapshot = AccessTelemetrySnapshot {
+                body_mode: "streamed",
+                ..sample_access_snapshot()
+            };
+            let row: serde_json::Value =
+                serde_json::from_str(&access_event_row(&snapshot, &timings.snapshot(), result, 0))
+                    .expect("should parse the failed delivery row");
+            assert_eq!(row["delivery_result"], expected);
+            assert_eq!(row["resp_bytes"], prefix.len());
+            assert_eq!(row["status"], 200, "should retain the already-sent status");
+        }
+    }
+
+    #[test]
+    fn stream_finish_results_reach_the_access_row() {
+        for (finish_result, expected) in [
+            (Ok(()), "complete"),
+            (
+                Err(std::io::Error::other("example finish failure")),
+                "partial",
+            ),
+        ] {
+            let result = classify_stream_finish(finish_result, "");
+            let row: serde_json::Value = serde_json::from_str(&access_event_row(
+                &sample_access_snapshot(),
+                &Default::default(),
+                result,
+                0,
+            ))
+            .expect("should parse the transport finish row");
+            assert_eq!(row["delivery_result"], expected);
+        }
     }
 
     #[test]

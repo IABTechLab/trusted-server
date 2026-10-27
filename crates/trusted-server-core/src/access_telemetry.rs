@@ -10,6 +10,7 @@
 
 use serde_json::json;
 
+use crate::constants::TS_GIT_VERSION;
 use crate::request_timing::{AuctionWaitPlacement, TimingSnapshot};
 
 /// Normalizes an HTTP method token into the bounded set of values stored in
@@ -201,9 +202,6 @@ pub struct AccessTelemetrySnapshot {
     pub service_id: String,
     /// Fastly POP code, or `unknown` when unavailable.
     pub pop: String,
-    /// Fastly service version, matching `FASTLY_SERVICE_VERSION` and the
-    /// `x-ts-fastly-version` header, or `unknown` when unavailable.
-    pub ts_version: String,
     /// Two-letter geo country code, or `unknown` when no geo lookup
     /// resolved one.
     pub country: String,
@@ -217,21 +215,50 @@ pub struct AccessTelemetrySnapshot {
     pub sample_rate: f64,
 }
 
+/// Outcome observed while handing a response body to the client transport.
+///
+/// This describes the local transport handoff, not confirmed client receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryResult {
+    /// The body was handed to the transport without an observed error.
+    Complete,
+    /// Some body bytes were accepted before a drive failure, or the transport
+    /// failed to finish cleanly after the body was written.
+    Partial,
+    /// The body drive failed before any body bytes were accepted.
+    Error,
+}
+
+impl DeliveryResult {
+    /// Returns the bounded value stored in the access row.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::Error => "error",
+        }
+    }
+}
+
 /// Renders one NDJSON access-log row for the Tinybird Events API.
 ///
 /// Column names match spec section 9 exactly. Phase columns come from
 /// `timings` and serialize as JSON `null` for phases that were never
 /// recorded, as do the auction timeline columns (including `auction_id`,
 /// whose datasource column is `Nullable(UUID)` so it joins natively against
-/// `auction_events_raw.auction_id`). Every dimension column comes from
-/// `snapshot` and is a non-nullable string (callers are expected to
+/// `auction_events_raw.auction_id`). Request dimensions come from
+/// `snapshot` as non-nullable strings (callers are expected to
 /// substitute an `unknown` sentinel rather than leave a dimension empty).
 /// There is no `event_date` column: the datasource's sorting key derives the
-/// date via `toDate(event_ts)`.
+/// date via `toDate(event_ts)`. The `ts_version` dimension comes from the same
+/// compiled-in build identifier as `x-ts-version`, or `unknown` when absent.
+/// `delivery_result` is supplied after send or finish, not at the freeze point.
 #[must_use]
 pub fn access_event_row(
     snapshot: &AccessTelemetrySnapshot,
     timings: &TimingSnapshot,
+    delivery_result: DeliveryResult,
     event_ts_epoch_ms: u64,
 ) -> String {
     let auction_wait_placement = match timings.auction_wait_placement {
@@ -252,6 +279,7 @@ pub fn access_event_row(
         "route_class": snapshot.route_class.as_str(),
         "route_template": snapshot.route_template,
         "body_mode": snapshot.body_mode,
+        "delivery_result": delivery_result.as_str(),
         "auction_wait_placement": auction_wait_placement,
         "appbuild_ms": timings.appbuild_ms,
         "filter_ms": timings.filter_ms,
@@ -264,12 +292,12 @@ pub fn access_event_row(
         "request_elapsed_ms": timings.request_elapsed_ms,
         "resp_bytes": timings.resp_bytes,
         "auction_dispatched_ms": timings.auction_dispatched_ms,
-        "auction_resolved_ms": timings.auction_resolved_ms,
+        "auction_collected_ms": timings.auction_resolved_ms,
         "auction_committed_ms": timings.auction_committed_ms,
         "auction_id": timings.auction_id.map(|id| id.to_string()),
         "template_cache_state": snapshot.template_cache_state,
         "country": snapshot.country,
-        "ts_version": snapshot.ts_version,
+        "ts_version": TS_GIT_VERSION.unwrap_or("unknown"),
         "pop": snapshot.pop,
     });
     row.to_string()
@@ -307,7 +335,6 @@ mod tests {
             env: "unknown".to_owned(),
             service_id: "unknown".to_owned(),
             pop: "unknown".to_owned(),
-            ts_version: "unknown".to_owned(),
             country: "unknown".to_owned(),
             template_cache_state: "unknown".to_owned(),
             body_mode: "buffered",
@@ -322,7 +349,12 @@ mod tests {
         // never carry the caller's actual EC id — even when a caller
         // supplies one shaped exactly like a real one.
         let snapshot = unknown_snapshot(RouteClass::Ec, "/_ts/admin/ec/{id}");
-        let row = access_event_row(&snapshot, &TimingSnapshot::default(), 0);
+        let row = access_event_row(
+            &snapshot,
+            &TimingSnapshot::default(),
+            DeliveryResult::Complete,
+            0,
+        );
 
         assert!(
             !row.contains(SYNTHETIC_EC_ID),
@@ -418,7 +450,12 @@ mod tests {
     #[test]
     fn row_serializes_nulls_for_missing_phases() {
         let snapshot = unknown_snapshot(RouteClass::Other, "/other/*");
-        let row = access_event_row(&snapshot, &TimingSnapshot::default(), 0);
+        let row = access_event_row(
+            &snapshot,
+            &TimingSnapshot::default(),
+            DeliveryResult::Complete,
+            0,
+        );
         let parsed: serde_json::Value =
             serde_json::from_str(&row).expect("should serialize valid JSON");
 
@@ -435,7 +472,7 @@ mod tests {
             "request_elapsed_ms",
             "resp_bytes",
             "auction_dispatched_ms",
-            "auction_resolved_ms",
+            "auction_collected_ms",
             "auction_committed_ms",
             "auction_id",
         ] {
@@ -490,7 +527,12 @@ mod tests {
             auction_committed_ms: Some(11),
             auction_id: Some(uuid::uuid!("33333333-3333-3333-3333-333333333333")),
         };
-        let row = access_event_row(&snapshot, &timings, 1_700_000_000_000);
+        let row = access_event_row(
+            &snapshot,
+            &timings,
+            DeliveryResult::Complete,
+            1_700_000_000_000,
+        );
         let parsed: serde_json::Value =
             serde_json::from_str(&row).expect("should serialize valid JSON");
 
@@ -499,9 +541,113 @@ mod tests {
         assert_eq!(parsed["resp_bytes"], 1024);
         assert_eq!(parsed["auction_wait_placement"], "in_stream");
         assert_eq!(parsed["auction_dispatched_ms"], 9);
-        assert_eq!(parsed["auction_resolved_ms"], 10);
+        assert_eq!(parsed["auction_collected_ms"], 10);
+        assert!(
+            parsed.get("auction_resolved_ms").is_none(),
+            "should not emit the superseded collection column name"
+        );
         assert_eq!(parsed["auction_committed_ms"], 11);
         assert_eq!(parsed["auction_id"], "33333333-3333-3333-3333-333333333333");
+    }
+
+    #[test]
+    fn row_reports_the_compiled_trusted_server_version() {
+        let snapshot = unknown_snapshot(RouteClass::Other, "/other/*");
+        let row = access_event_row(
+            &snapshot,
+            &TimingSnapshot::default(),
+            DeliveryResult::Complete,
+            0,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&row).expect("should serialize valid JSON");
+        let header = crate::version_header::git_version_header_value();
+        assert_eq!(
+            parsed["ts_version"],
+            header
+                .as_ref()
+                .map(|value| value
+                    .to_str()
+                    .expect("should render the build version header"))
+                .unwrap_or("unknown"),
+            "should identify the same Trusted Server build as x-ts-version"
+        );
+    }
+
+    #[test]
+    fn producer_schema_and_fixtures_share_the_access_v2_contract() {
+        let schema = include_str!("../../../tinybird/datasources/access_logs_v2.datasource");
+        let columns: std::collections::BTreeSet<_> = schema
+            .lines()
+            .filter_map(|line| {
+                let column = line.trim().strip_prefix('`')?.split_once('`')?.0;
+                assert!(
+                    line.contains(&format!("`json:$.{column}`")),
+                    "should map {column} to the same JSON field"
+                );
+                Some(column.to_owned())
+            })
+            .collect();
+        assert_eq!(columns.len(), 31, "should match the versioned row contract");
+        let snapshot = unknown_snapshot(RouteClass::Other, "/other/*");
+        let row: serde_json::Value = serde_json::from_str(&access_event_row(
+            &snapshot,
+            &TimingSnapshot::default(),
+            DeliveryResult::Complete,
+            0,
+        ))
+        .expect("should parse the producer row");
+        let producer_fields = row
+            .as_object()
+            .expect("should produce a JSON object")
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            producer_fields, columns,
+            "should emit exactly the schema fields"
+        );
+        for line in include_str!("../../../tinybird/fixtures/access_logs_v2.ndjson").lines() {
+            let fixture: serde_json::Value =
+                serde_json::from_str(line).expect("should parse the access fixture");
+            let fields = fixture
+                .as_object()
+                .expect("should provide a fixture object")
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                fields, columns,
+                "should keep fixture fields in sync with the row"
+            );
+            assert!(
+                ["complete", "partial", "error"].contains(
+                    &fixture["delivery_result"]
+                        .as_str()
+                        .expect("should provide a bounded delivery result")
+                ),
+                "should use a producible transport outcome"
+            );
+        }
+    }
+
+    #[test]
+    fn row_preserves_each_transport_delivery_outcome() {
+        let snapshot = unknown_snapshot(RouteClass::PublisherHtml, "/other/*");
+        for (result, expected) in [
+            (DeliveryResult::Complete, "complete"),
+            (DeliveryResult::Partial, "partial"),
+            (DeliveryResult::Error, "error"),
+        ] {
+            let row = access_event_row(&snapshot, &TimingSnapshot::default(), result, 0);
+            let parsed: serde_json::Value =
+                serde_json::from_str(&row).expect("should serialize valid JSON");
+            assert_eq!(
+                parsed["delivery_result"], expected,
+                "should preserve the actual transport outcome instead of deriving it from status"
+            );
+            assert_eq!(parsed["status"], 200);
+        }
     }
 
     #[test]
@@ -556,7 +702,12 @@ mod tests {
         // the row unnormalized.
         let mut snapshot = unknown_snapshot(RouteClass::Other, "/other/*");
         snapshot.method = "PROPFIND".to_owned();
-        let row = access_event_row(&snapshot, &TimingSnapshot::default(), 0);
+        let row = access_event_row(
+            &snapshot,
+            &TimingSnapshot::default(),
+            DeliveryResult::Complete,
+            0,
+        );
         let parsed: serde_json::Value =
             serde_json::from_str(&row).expect("should serialize valid JSON");
 

@@ -13,6 +13,7 @@ SCHEMA >
   `route_class` LowCardinality(String) `json:$.route_class`,
   `route_template` String `json:$.route_template`,
   `body_mode` LowCardinality(String) `json:$.body_mode`,
+  `delivery_result` LowCardinality(String) `json:$.delivery_result`,
   `auction_wait_placement` LowCardinality(String) `json:$.auction_wait_placement`,
   `appbuild_ms` Nullable(UInt32) `json:$.appbuild_ms`,
   `filter_ms` Nullable(UInt32) `json:$.filter_ms`,
@@ -29,7 +30,7 @@ SCHEMA >
   `ts_version` LowCardinality(String) `json:$.ts_version`,
   `pop` LowCardinality(String) `json:$.pop`,
   `auction_dispatched_ms` Nullable(UInt32) `json:$.auction_dispatched_ms`,
-  `auction_resolved_ms` Nullable(UInt32) `json:$.auction_resolved_ms`,
+  `auction_collected_ms` Nullable(UInt32) `json:$.auction_collected_ms`,
   `auction_committed_ms` Nullable(UInt32) `json:$.auction_committed_ms`,
   `auction_id` Nullable(UUID) `json:$.auction_id`
 
