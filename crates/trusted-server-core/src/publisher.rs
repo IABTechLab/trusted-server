@@ -4793,8 +4793,8 @@ pub(crate) fn request_can_use_shared_template(
 ///
 /// # Errors
 ///
-/// Returns a [`TrustedServerError`] if the proxy request fails or the
-/// origin backend is unreachable.
+/// Returns a [`TrustedServerError`] if the request host is malformed, the proxy
+/// request fails, or the origin backend is unreachable.
 pub async fn handle_publisher_request(
     settings: &Settings,
     services: &RuntimeServices,
@@ -4818,17 +4818,21 @@ pub async fn handle_publisher_request(
     // Prebid.js requests are not intercepted here anymore. The HTML processor removes
     // publisher-supplied Prebid scripts; the unified TSJS bundle includes Prebid.js when enabled.
 
-    // Extract request host and scheme (uses Host header and TLS detection after edge sanitization)
-    let request_info = RequestInfo::from_request(&req, services.client_info());
+    // Validate request host before it can enter HTML or Flight rewrite output.
+    let request_info = RequestInfo::from_request(&req, services.client_info())?;
     let request_host = &request_info.host;
     let request_scheme = &request_info.scheme;
 
     log::debug!(
-        "Request info: host={}, scheme={} (X-Forwarded-Host: {:?}, Host: {:?}, X-Forwarded-Proto: {:?})",
+        "Request info: host={}, scheme={} (X-Forwarded-Host: {:?}, Host: {:?}, URI host: {:?}, URI port: {:?}, X-Forwarded-Proto: {:?})",
         request_host,
         request_scheme,
         req.headers().get("x-forwarded-host"),
         req.headers().get(header::HOST),
+        req.uri().authority().map(http::uri::Authority::host),
+        req.uri()
+            .authority()
+            .and_then(http::uri::Authority::port_u16),
         req.headers().get("x-forwarded-proto"),
     );
 
@@ -7299,7 +7303,8 @@ fn normalize_page_bids_path(raw: &str) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`TrustedServerError`] if cookie parsing or EC ID generation fails.
+/// Returns [`TrustedServerError`] if the request host is malformed, cookie
+/// parsing fails, or EC ID generation fails.
 pub async fn handle_page_bids(
     settings: &Settings,
     services: &RuntimeServices,
@@ -7374,7 +7379,7 @@ pub async fn handle_page_bids(
     // Trusted request origin for absolute inline creative URLs — derived from the
     // origin the visitor is actually on (scheme, host, port), not the configured
     // publisher domain, which cannot carry a port and may differ by subdomain.
-    let request_info = RequestInfo::from_request(&req, services.client_info());
+    let request_info = RequestInfo::from_request(&req, services.client_info())?;
     let page_bids_request_origin = request_origin(&request_info.scheme, &request_info.host);
 
     let path_param = req
@@ -7406,7 +7411,6 @@ pub async fn handle_page_bids(
         Vec::new()
     };
 
-    let request_info = crate::http_util::RequestInfo::from_request(&req, services.client_info());
     // Owned so the identity-graph snapshot can be stored back on `ec_context`
     // below without holding a borrow of it across the mutation.
     let ec_id = ec_context
@@ -20666,6 +20670,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publisher_request_rewrites_html_using_uri_authority() {
+        for version in [http::Version::HTTP_11, http::Version::HTTP_2] {
+            for (uri, empty_host) in [
+                ("https://publisher.example.com:8443/page", false),
+                ("https://user:pass@publisher.example.com:8443/page", false),
+                ("https://publisher.example.com:8443/page", true),
+            ] {
+                let mut settings = create_test_settings();
+                settings.publisher.origin_url = "https://origin.example.com".to_owned();
+                let registry = IntegrationRegistry::new(&settings)
+                    .expect("should create integration registry");
+                let stub = Arc::new(StubHttpClient::new());
+                stub.push_response_with_headers(
+                    200,
+                    b"<html><head></head><body><a href=\"https://origin.example.com/article\">Article</a></body></html>".to_vec(),
+                    vec![("content-type", "text/html; charset=utf-8")],
+                );
+                let services = build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                );
+                let mut req = HttpRequest::builder()
+                    .version(version)
+                    .uri(uri)
+                    .header("x-forwarded-proto", "https")
+                    .header("sec-fetch-dest", "document")
+                    .body(EdgeBody::empty())
+                    .expect("should build authority-only publisher request");
+                if empty_host {
+                    req.headers_mut()
+                        .insert(header::HOST, HeaderValue::from_static(""));
+                }
+                for name in ["forwarded", "x-forwarded-host"] {
+                    assert!(
+                        !req.headers().contains_key(name),
+                        "should have no {name} header"
+                    );
+                }
+
+                assert!(
+                    req.headers()
+                        .get(header::HOST)
+                        .is_none_or(HeaderValue::is_empty),
+                    "should have no nonempty Host header"
+                );
+
+                let publisher_response = run_publisher_proxy(&settings, &services, req).await;
+                let response = buffer_publisher_response_async(
+                    publisher_response,
+                    &Method::GET,
+                    &settings,
+                    &registry,
+                    &AuctionOrchestrator::new(settings.auction.clone()),
+                    &services,
+                )
+                .await
+                .expect("should buffer processed publisher response");
+                let html = response_body_string(response);
+                let case = format!("{version:?} {uri} (empty Host: {empty_host})");
+
+                assert!(
+                    html.contains("href=\"https://publisher.example.com:8443/article\""),
+                    "should rewrite origin links using URI authority for {case}: {html}"
+                );
+                assert!(
+                    !html.contains("user:pass@"),
+                    "should omit URI userinfo from rewritten HTML for {case}: {html}"
+                );
+                assert!(
+                    html.contains("id=\"trustedserver-js\""),
+                    "should inject the Trusted Server script for {case}: {html}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn publisher_request_sends_configured_host_header_override() {
         let mut settings = create_test_settings();
         settings.publisher.origin_host_header_override = Some("www.example.com".to_string());
@@ -23114,31 +23194,6 @@ mod tests {
         }
     }
 
-    std::thread_local! {
-        static CANCELLATION_WARNINGS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-    }
-
-    struct CancellationLogger;
-    impl log::Log for CancellationLogger {
-        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-            metadata.level() <= log::Level::Warn
-        }
-        fn log(&self, record: &log::Record<'_>) {
-            if record
-                .args()
-                .to_string()
-                .starts_with("Dispatched server-side auction dropped without collection")
-            {
-                CANCELLATION_WARNINGS.with(|count| {
-                    if let Some(previous) = count.get() {
-                        count.set(Some(previous + 1));
-                    }
-                });
-            }
-        }
-        fn flush(&self) {}
-    }
-
     struct HungTerminalFactory {
         started: Arc<AtomicUsize>,
         dropped: Arc<AtomicUsize>,
@@ -23203,10 +23258,7 @@ mod tests {
 
     #[test]
     fn html_finalization_client_cancellation_drops_work_and_warns_for_auction_once() {
-        static LOGGER: CancellationLogger = CancellationLogger;
-        let _ = log::set_logger(&LOGGER);
-        log::set_max_level(log::LevelFilter::Warn);
-        CANCELLATION_WARNINGS.with(|count| count.set(Some(0)));
+        let warnings = crate::test_support::logging::WarningCapture::start();
         let settings = Arc::new(crate::publisher::allow_eof_test_settings(
             create_test_settings(),
         ));
@@ -23272,10 +23324,17 @@ mod tests {
             1,
             "should drop the callback when the reader disconnects"
         );
-        let warnings = CANCELLATION_WARNINGS.with(std::cell::Cell::take);
+        let cancellation_warnings = warnings
+            .take()
+            .into_iter()
+            .filter(|warning| {
+                warning
+                    .message
+                    .starts_with("Dispatched server-side auction dropped without collection")
+            })
+            .count();
         assert_eq!(
-            warnings,
-            Some(1),
+            cancellation_warnings, 1,
             "should preserve exactly one existing auction cancellation warning"
         );
     }
