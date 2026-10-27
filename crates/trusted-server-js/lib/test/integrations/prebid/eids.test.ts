@@ -335,6 +335,86 @@ describe('mergeEidCookieEntries', () => {
     expect(mergeEidCookieEntries([entry('a.example.com', 'a1')], [], new Set())).toEqual([]);
   });
 
+  it('puts the request entries first, then the kept cookie entries in cookie order', () => {
+    const merged = mergeEidCookieEntries(
+      [entry('c.example.com', 'c1'), entry('a.example.com', 'a1')],
+      [entry('b.example.com', 'b0'), entry('a.example.com', 'a0'), entry('c.example.com', 'c0')],
+      registered
+    );
+
+    expect(merged, 'request order first, then the cookie sources the request lacks').toEqual([
+      entry('c.example.com', 'c1'),
+      entry('a.example.com', 'a1'),
+      entry('b.example.com', 'b0'),
+    ]);
+  });
+
+  it('keeps every cookie entry of a repeated source the request lacks', () => {
+    const first = { source: 'b.example.com', inserter: 'one.example.com', uids: [{ id: 'b1' }] };
+    const second = { source: 'b.example.com', inserter: 'two.example.com', uids: [{ id: 'b2' }] };
+
+    const merged = mergeEidCookieEntries([], [first, second], registered);
+
+    expect(merged, 'both cookie entries for the source should stay').toEqual([first, second]);
+  });
+
+  it('matches a source with surrounding whitespace', () => {
+    const merged = mergeEidCookieEntries(
+      [entry(' a.example.com ', 'a1')],
+      [entry('a.example.com', 'a0')],
+      registered
+    );
+
+    expect(merged, 'whitespace should not make a second source').toEqual([
+      entry(' a.example.com ', 'a1'),
+    ]);
+  });
+
+  it.each([
+    ['a missing source', { uids: [{ id: 'x' }] }],
+    ['a numeric source', { source: 42, uids: [{ id: 'x' }] }],
+    ['an empty source', { source: '', uids: [{ id: 'x' }] }],
+    ['an array', [{ source: 'a.example.com' }]],
+    ['null', null],
+  ])('drops a request entry with %s', (_label, bad) => {
+    expect(mergeEidCookieEntries([bad], [], registered)).toEqual([]);
+  });
+
+  it('drops a cookie entry whose uids is not an array', () => {
+    const notArray = { source: 'b.example.com', uids: { id: 'b0' } };
+
+    expect(mergeEidCookieEntries([], [notArray], registered)).toEqual([]);
+  });
+
+  it('a registered source does not match a subdomain or a parent domain', () => {
+    const merged = mergeEidCookieEntries(
+      [entry('sub.a.example.com', 's1'), entry('example.com', 'p1')],
+      [],
+      registered
+    );
+
+    expect(merged, 'only the exact registered domain should match').toEqual([]);
+  });
+
+  it('when the merge overflows the cookie, trims kept cookie entries before request ones', () => {
+    const big = (source: string, id: string) => ({
+      source,
+      uids: [{ id: id + 'x'.repeat(900), atype: 1 }],
+    });
+    const current = [big('a.example.com', 'fresh-a'), big('b.example.com', 'fresh-b')];
+    const previous = [big('c.example.com', 'stale-c'), big('a.example.com', 'stale-a')];
+
+    const fitted = fitEidCookie(mergeEidCookieEntries(current, previous, registered));
+    const sources = decodeEidCookie(fitted.value).map(
+      (kept) => (kept as { source: string }).source
+    );
+
+    expect(sources, 'the fresh request sources should survive the trim').toEqual([
+      'a.example.com',
+      'b.example.com',
+    ]);
+  });
+
   it('does not modify its inputs', () => {
     const current = [entry('a.example.com', 'a1')];
     const previous = [entry('b.example.com', 'b0')];

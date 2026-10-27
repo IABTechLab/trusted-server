@@ -2836,6 +2836,41 @@ describe('prebid/installPrebidNpm', () => {
       ).toBe(true);
     });
 
+    it('replaces a ts-eids value it cannot decode with the request entries', () => {
+      const spec = getAdapterSpec();
+      const fresh = { source: 'first.example.com', uids: [{ id: 'first-uid' }] };
+      presetTsEidsCookie('%%%not-base64%%%');
+
+      withRegisteredSources(['first.example.com'], () => {
+        spec.buildRequests(
+          trustedServerBidRequests(),
+          prebidBidderRequest({ ext: { eids: [fresh] } })
+        );
+      });
+
+      expect(decodedTsEidsCookie(), 'a corrupt cookie should not block the write').toEqual([fresh]);
+    });
+
+    it('drops a source from an old ts-eids once it is no longer registered', () => {
+      const spec = getAdapterSpec();
+      const kept = { source: 'first.example.com', uids: [{ id: 'first-uid' }] };
+      const retired = { source: 'retired.example.com', uids: [{ id: 'retired-uid' }] };
+      const fresh = { source: 'second.example.com', uids: [{ id: 'second-uid' }] };
+      presetTsEidsCookie(btoa(JSON.stringify([retired, kept])));
+
+      withRegisteredSources(['first.example.com', 'second.example.com'], () => {
+        spec.buildRequests(
+          trustedServerBidRequests(),
+          prebidBidderRequest({ ext: { eids: [fresh] } })
+        );
+      });
+
+      expect(
+        decodedTsEidsCookie(),
+        'the unregistered source should leave the cookie on the next write'
+      ).toEqual([fresh, kept]);
+    });
+
     it('merges a later request into ts-eids per source', () => {
       const spec = getAdapterSpec();
       const first = { source: 'first.example.com', uids: [{ id: 'first-uid' }] };
