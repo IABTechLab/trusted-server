@@ -1,7 +1,9 @@
 //! Fresh atomic ordinary outputs; no index or qualification evidence writer.
 
+use std::ffi::CString;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::fs::{
     DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
 };
@@ -86,6 +88,24 @@ fn persist(
     value: &Value,
     role: Role,
 ) -> Result<PathBuf, Report<ReleaseError>> {
+    persist_with_checkpoints(output, name, value, role, &|_, _| Ok(()))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteCheckpoint {
+    Persisted,
+    Verified,
+}
+
+type WriteCheck<'a> = dyn Fn(WriteCheckpoint, &Path) -> Result<(), Report<ReleaseError>> + 'a;
+
+fn persist_with_checkpoints(
+    output: &Path,
+    name: &str,
+    value: &Value,
+    role: Role,
+    checkpoint: &WriteCheck<'_>,
+) -> Result<PathBuf, Report<ReleaseError>> {
     let bytes = documents::canonical_json(value, role)?;
     let parent = output.parent().ok_or_else(invalid)?;
     require(
@@ -115,23 +135,78 @@ fn persist(
     temporary.as_file().sync_all().map_err(|_| invalid())?;
     same_directory(&held_parent, parent)?;
     same_directory(&held_output, output)?;
-    temporary
+    let persisted = temporary
         .persist_noclobber(&destination)
         .map_err(|_| invalid())?;
-    held_output.sync_all().map_err(|_| invalid())?;
-    held_parent.sync_all().map_err(|_| invalid())?;
-    same_directory(&held_parent, parent)?;
-    same_directory(&held_output, output)?;
-    let retained = documents::read_bounded(&destination, role)?;
-    let entries = fs::read_dir(output)
-        .map_err(|_| invalid())?
-        .take(2)
-        .map(|entry| entry.map(|entry| entry.file_name()));
-    require(
-        retained.bytes == bytes && exact_entry(entries, name)?,
-        "ordinary output has changed or contains unexpected entries",
-    )?;
+    let verification = (|| {
+        checkpoint(WriteCheckpoint::Persisted, output)?;
+        held_output.sync_all().map_err(|_| invalid())?;
+        held_parent.sync_all().map_err(|_| invalid())?;
+        same_directory(&held_parent, parent)?;
+        same_directory(&held_output, output)?;
+        let retained = documents::read_bounded(&destination, role)?;
+        let entries = fs::read_dir(output)
+            .map_err(|_| invalid())?
+            .take(2)
+            .map(|entry| entry.map(|entry| entry.file_name()));
+        require(
+            retained.bytes == bytes && exact_entry(entries, name)?,
+            "ordinary output has changed or contains unexpected entries",
+        )?;
+        checkpoint(WriteCheckpoint::Verified, output)
+    })();
+    if let Err(mut failure) = verification {
+        if let Err(cleanup) = remove_owned_result(&held_output, &persisted, name) {
+            failure = failure.attach(format!("ordinary output rollback failed: {cleanup:?}"));
+        }
+        return Err(failure);
+    }
     Ok(destination)
+}
+
+/// Attempts to remove a result still matching our persisted inode.
+///
+/// Refuses observed replacements; the ordinary boundary does not contain a
+/// hostile process with the same UID racing the final check and unlink.
+fn remove_owned_result(
+    directory: &fs::File,
+    persisted: &fs::File,
+    name: &str,
+) -> Result<(), Report<ReleaseError>> {
+    let own = persisted.metadata().map_err(|_| invalid())?;
+    if own.nlink() == 0 {
+        return Ok(());
+    }
+    let name = CString::new(name).map_err(|_| invalid())?;
+    // SAFETY: the directory descriptor is live and the name is NUL-terminated.
+    // O_NOFOLLOW prevents opening a replacement symlink's target.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    require(
+        descriptor >= 0,
+        "ordinary rollback cannot locate its owned result",
+    )?;
+    // SAFETY: openat returned a new owned descriptor, not held by another File.
+    let retained = unsafe { fs::File::from_raw_fd(descriptor) };
+    let current = retained.metadata().map_err(|_| invalid())?;
+    require(
+        current.is_file() && (current.dev(), current.ino()) == (own.dev(), own.ino()),
+        "ordinary rollback refuses a replacement result",
+    )?;
+    // SAFETY: the held directory and NUL-terminated leaf remain live; no parent
+    // path is traversed, even if the output root was renamed or replaced.
+    let removed = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+    require(removed == 0, "ordinary owned result cannot be removed")?;
+    directory.sync_all().map_err(|_| invalid())?;
+    require(
+        persisted.metadata().map_err(|_| invalid())?.nlink() == 0,
+        "ordinary result still has an unknown filesystem link",
+    )
 }
 
 fn exact_entry(

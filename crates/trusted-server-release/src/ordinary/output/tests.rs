@@ -7,6 +7,209 @@ use super::{COMPANION, companion, observation};
 use crate::ordinary::transfer::tests::checked_fixture;
 
 #[test]
+fn failed_post_persist_or_final_verification_leaves_no_matched_companion() {
+    for point in [
+        super::WriteCheckpoint::Persisted,
+        super::WriteCheckpoint::Verified,
+    ] {
+        let temporary = tempfile::tempdir().expect("should create failure fixture");
+        let parent = fs::canonicalize(temporary.path()).expect("should resolve output parent");
+        let directory = parent.join("comparison");
+        let result = super::persist_with_checkpoints(
+            &directory,
+            COMPANION,
+            &checked_fixture().receipt(),
+            crate::documents::Role::Companion,
+            &|site, _| {
+                if site == point {
+                    Err(super::invalid())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(
+            result.is_err(),
+            "should return the injected sealing failure"
+        );
+        assert!(
+            !directory.join(COMPANION).exists(),
+            "should remove the owned matched result after every later error"
+        );
+    }
+}
+
+#[test]
+fn real_membership_failure_removes_only_the_new_result() {
+    let temporary = tempfile::tempdir().expect("should create membership fixture");
+    let parent = fs::canonicalize(temporary.path()).expect("should resolve output parent");
+    let directory = parent.join("comparison");
+    let result = super::persist_with_checkpoints(
+        &directory,
+        COMPANION,
+        &checked_fixture().receipt(),
+        crate::documents::Role::Companion,
+        &|site, root| {
+            if site == super::WriteCheckpoint::Persisted {
+                fs::write(root.join("extra"), b"retained evidence")
+                    .expect("should inject an extra output");
+            }
+            Ok(())
+        },
+    );
+    assert!(
+        result.is_err(),
+        "should fail the actual exact-membership check"
+    );
+    assert!(
+        !directory.join(COMPANION).exists(),
+        "should remove its newly persisted result"
+    );
+    assert_eq!(
+        fs::read(directory.join("extra")).expect("should retain other evidence"),
+        b"retained evidence",
+        "should not delete unrelated files"
+    );
+}
+
+#[test]
+fn rollback_uses_the_original_directory_without_following_its_replacement() {
+    let temporary = tempfile::tempdir().expect("should create root replacement fixture");
+    let parent = fs::canonicalize(temporary.path()).expect("should resolve output parent");
+    let directory = parent.join("comparison");
+    let retained = parent.join("retained");
+    let replacement = parent.join("replacement");
+    fs::create_dir(&replacement).expect("should create unrelated replacement tree");
+    fs::write(replacement.join(COMPANION), b"unrelated bytes")
+        .expect("should retain unrelated file");
+    let result = super::persist_with_checkpoints(
+        &directory,
+        COMPANION,
+        &checked_fixture().receipt(),
+        crate::documents::Role::Companion,
+        &|site, root| {
+            if site == super::WriteCheckpoint::Persisted {
+                fs::rename(root, &retained).expect("should retain the original output directory");
+                symlink(&replacement, root).expect("should replace output root with a symlink");
+                return Err(super::invalid());
+            }
+            Ok(())
+        },
+    );
+    assert!(
+        result.is_err(),
+        "should fail sealing after the injected root change"
+    );
+    assert!(
+        !retained.join(COMPANION).exists(),
+        "should unlink only the result inside its held directory"
+    );
+    assert_eq!(
+        fs::read(replacement.join(COMPANION)).expect("should retain unrelated file"),
+        b"unrelated bytes",
+        "should never traverse the replacement root"
+    );
+}
+
+#[test]
+fn rollback_preserves_a_replacement_leaf_when_its_own_result_is_already_unlinked() {
+    let temporary = tempfile::tempdir().expect("should create leaf replacement fixture");
+    let parent = fs::canonicalize(temporary.path()).expect("should resolve output parent");
+    let directory = parent.join("comparison");
+    let result = super::persist_with_checkpoints(
+        &directory,
+        COMPANION,
+        &checked_fixture().receipt(),
+        crate::documents::Role::Companion,
+        &|site, root| {
+            if site == super::WriteCheckpoint::Persisted {
+                fs::remove_file(root.join(COMPANION)).expect("should unlink the owned result");
+                fs::write(root.join(COMPANION), b"replacement").expect("should replace the leaf");
+                return Err(super::invalid());
+            }
+            Ok(())
+        },
+    );
+    assert!(result.is_err(), "should retain the failed command outcome");
+    assert_eq!(
+        fs::read(directory.join(COMPANION)).expect("should retain replacement"),
+        b"replacement",
+        "should not remove a file it did not create"
+    );
+}
+
+#[test]
+fn rollback_reports_a_retained_inode_that_was_moved_away_from_its_destination() {
+    let temporary = tempfile::tempdir().expect("should create moved-result fixture");
+    let parent = fs::canonicalize(temporary.path()).expect("should resolve output parent");
+    let directory = parent.join("comparison");
+    let moved = parent.join("moved-result");
+    let result = super::persist_with_checkpoints(
+        &directory,
+        COMPANION,
+        &checked_fixture().receipt(),
+        crate::documents::Role::Companion,
+        &|site, root| {
+            if site == super::WriteCheckpoint::Persisted {
+                fs::rename(root.join(COMPANION), &moved).expect("should move the owned inode");
+                fs::write(root.join(COMPANION), b"unrelated replacement")
+                    .expect("should replace the leaf");
+                return Err(super::invalid());
+            }
+            Ok(())
+        },
+    );
+    let error = result.expect_err("should fail rather than removing an observed replacement");
+    assert!(
+        format!("{error:?}").contains("ordinary output rollback failed"),
+        "should report incomplete cleanup loudly"
+    );
+    assert_eq!(
+        fs::read(directory.join(COMPANION)).expect("should preserve replacement"),
+        b"unrelated replacement",
+        "should not unlink another inode"
+    );
+    assert!(
+        moved.exists(),
+        "should not guess an unknown location for the original inode"
+    );
+}
+
+#[test]
+fn rollback_reports_an_unknown_hardlink_after_removing_the_owned_destination() {
+    let temporary = tempfile::tempdir().expect("should create linked-result fixture");
+    let parent = fs::canonicalize(temporary.path()).expect("should resolve output parent");
+    let directory = parent.join("comparison");
+    let linked = parent.join("linked-result");
+    let result = super::persist_with_checkpoints(
+        &directory,
+        COMPANION,
+        &checked_fixture().receipt(),
+        crate::documents::Role::Companion,
+        &|site, root| {
+            if site == super::WriteCheckpoint::Persisted {
+                fs::hard_link(root.join(COMPANION), &linked)
+                    .expect("should inject an extra inode link");
+            }
+            Ok(())
+        },
+    );
+    let error = result.expect_err("should reject the actual linked-file readback");
+    assert!(
+        !directory.join(COMPANION).exists(),
+        "should remove the destination it created"
+    );
+    assert!(
+        linked.exists(),
+        "should not guess or sweep other link locations"
+    );
+    assert!(
+        format!("{error:?}").contains("ordinary output rollback failed"),
+        "should report observed incomplete cleanup"
+    );
+}
+
+#[test]
 fn directory_iteration_errors_never_count_as_a_successful_entry() {
     let entries = [Err(std::io::Error::other("fictional enumeration error"))];
     assert!(
