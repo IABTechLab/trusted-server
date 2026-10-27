@@ -2488,4 +2488,21 @@ slot_id = "sidebar"
             "should report the error location: {error}"
         );
     }
+
+    #[test]
+    fn splice_creative_slots_parse_error_does_not_echo_config_source() {
+        let existing = "[publisher]\norigin_url = \"https://origin-private.example.com/internal\n";
+
+        let error = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
+            .expect_err("should reject invalid TOML");
+
+        assert!(
+            !error.contains("origin-private.example.com"),
+            "should not echo config source text: {error}"
+        );
+        assert!(
+            error.contains("at line 2, column "),
+            "should report the error location: {error}"
+        );
+    }
 }

@@ -80,4 +80,17 @@ mod tests {
             "should omit location without span"
         );
     }
+
+    #[test]
+    fn toml_error_location_counts_columns_in_characters() {
+        // "é" is two bytes, so counting bytes would report column 10.
+        let source = "a = \"é\" x\n";
+
+        let location = toml_error_location(source, Some(9..10));
+
+        assert_eq!(
+            location, " at line 1, column 9",
+            "should count the column in characters, not bytes"
+        );
+    }
 }

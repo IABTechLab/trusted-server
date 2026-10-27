@@ -1919,7 +1919,7 @@ real_time_data = ["exampleRtdProvider"]
             "should not echo config source text: {error}"
         );
         assert!(
-            error.contains("at line "),
+            error.contains("at line 2, column "),
             "should report the error location: {error}"
         );
     }
@@ -1938,7 +1938,7 @@ real_time_data = ["exampleRtdProvider"]
             "should not echo config source text: {error}"
         );
         assert!(
-            error.contains("at line "),
+            error.contains("at line 2, column "),
             "should report the error location: {error}"
         );
     }
