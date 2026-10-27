@@ -66,6 +66,12 @@ if [[ "$build_target" == wasm32-wasip1 ]]; then
   export CARGO_TARGET_DIR="$RUNNER_TEMP/ordinary-fastly-$ordinary_role-target"
 fi
 [[ ! -e "$CARGO_TARGET_DIR" ]]
+if [[ "$build_target" == wasm32-wasip1 ]]; then
+  mkdir "$CARGO_TARGET_DIR"
+  ordinary_rustflags=$("$ORDINARY_RELEASE_PRODUCER" ordinary-rustflags \
+    --checkout "$PWD" --target "$CARGO_TARGET_DIR" --role "$ordinary_role" \
+    --output "$RUNNER_TEMP/ordinary-rustflags")
+fi
 mkdir -p release-assets
 [[ -z "$(ls -A release-assets)" ]]
 # The pinned Node distribution includes npm. npm verifies lockfile integrity for
@@ -109,7 +115,7 @@ else
     musl-gcc -dumpfullversion
   fi
   if [[ "$build_target" == wasm32-wasip1 ]]; then
-    cargo build --package "$build_package" --release --target "$build_target" --locked \
+    cargo --config "$ordinary_rustflags" build --package "$build_package" --release --target "$build_target" --locked \
       --message-format=json-render-diagnostics | tee "$ordinary_messages"
   else
     cargo build --package "$build_package" --release --target "$build_target" --locked
@@ -175,6 +181,7 @@ if [[ "$build_target" == wasm32-wasip1 ]]; then
     ORDINARY_UMASK="$ordinary_umask" ORDINARY_RUSTC="$ordinary_rustc" \
     ORDINARY_NODE="$ordinary_node" ORDINARY_MESSAGES="$ordinary_messages" \
     ORDINARY_METADATA="$tool_root/cargo-metadata.json" \
+    ORDINARY_RUSTFLAGS="$RUNNER_TEMP/ordinary-rustflags/rustflags.json" \
     node - "$RUNNER_TEMP/ordinary-capture.json" <<'JAVASCRIPT'
 const fs = require('node:fs')
 const env = process.env
@@ -191,6 +198,7 @@ const capture = {
   },
   rustc: env.ORDINARY_RUSTC, node: env.ORDINARY_NODE,
   cargo_messages: env.ORDINARY_MESSAGES, cargo_metadata: env.ORDINARY_METADATA,
+  rustflags: env.ORDINARY_RUSTFLAGS,
 }
 if (capture.environment.target_root !== env.CARGO_TARGET_DIR)
   throw Error('Compiler-visible ordinary target root must be canonical')

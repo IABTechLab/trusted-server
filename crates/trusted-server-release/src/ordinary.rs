@@ -17,11 +17,12 @@ use crate::error::ReleaseError;
 mod archive;
 mod commands;
 mod inputs;
+mod normalization;
 mod output;
 mod run;
 mod transfer;
 
-pub(crate) use commands::{compare_transfers, measure_build, transfer_plan};
+pub(crate) use commands::{compare_transfers, measure_build, prepare_rustflags, transfer_plan};
 
 const PROFILE: &str = "ordinary-release-fastly-byte-equality-v1";
 const ASSET: &str = "trusted-server-fastly.wasm";
@@ -140,25 +141,49 @@ pub(crate) fn pair(
             && canonical.tools == reproduction.tools,
         "ordinary build inputs differ",
     )?;
-    let canonical = &canonical.environment;
-    let reproduction = &reproduction.environment;
+    let canonical_environment = &canonical.environment;
+    let reproduction_environment = &reproduction.environment;
     require(
-        canonical.started_at_seconds != reproduction.started_at_seconds
-            && canonical.umask == 0o022
-            && reproduction.umask == 0o027
-            && canonical.jobs == 4
-            && reproduction.jobs == 2
-            && canonical.uid == reproduction.uid,
+        canonical_environment.started_at_seconds != reproduction_environment.started_at_seconds
+            && canonical_environment.umask == 0o022
+            && reproduction_environment.umask == 0o027
+            && canonical_environment.jobs == 4
+            && reproduction_environment.jobs == 2
+            && canonical_environment.uid == reproduction_environment.uid,
         "ordinary environment pairing rejected",
     )?;
-    for left in [&canonical.checkout_root, &canonical.target_root] {
-        for right in [&reproduction.checkout_root, &reproduction.target_root] {
+    for left in [
+        &canonical_environment.checkout_root,
+        &canonical_environment.target_root,
+    ] {
+        for right in [
+            &reproduction_environment.checkout_root,
+            &reproduction_environment.target_root,
+        ] {
             require(
                 !Path::new(left).starts_with(right) && !Path::new(right).starts_with(left),
                 "ordinary build roots overlap",
             )?;
         }
     }
+    let mut arguments = Vec::new();
+    for facts in [canonical, reproduction] {
+        let flags = normalization::plan(
+            Path::new(&facts.environment.checkout_root),
+            Path::new(&facts.environment.target_root),
+            &facts.role,
+        )?;
+        require(
+            flags.sha256 == facts.rustflags_sha256,
+            "ordinary retained rustflags disagree with derived physical roots",
+        )?;
+        arguments.push(flags.arguments);
+    }
+    require(
+        arguments[0] == arguments[1],
+        "ordinary builds used different raw remap arguments",
+    )?;
+
     Ok(())
 }
 
@@ -177,6 +202,7 @@ struct Facts {
     cargo_lock_sha256: String,
     npm_lock_sha256: String,
     js_inventory_sha256: String,
+    rustflags_sha256: String,
     tools: Tools,
     environment: Environment,
     artifact: Artifact,
@@ -271,6 +297,7 @@ pub(crate) fn observation(bytes: &[u8]) -> Result<Observation, Report<ReleaseErr
                 &facts.cargo_lock_sha256,
                 &facts.npm_lock_sha256,
                 &facts.js_inventory_sha256,
+                &facts.rustflags_sha256,
                 &facts.artifact.sha256,
                 &facts.tools.rustc.sha256,
                 &facts.tools.node.sha256,

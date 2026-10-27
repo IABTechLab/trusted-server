@@ -312,6 +312,7 @@ jobs:
             "$RUNNER_TEMP/ordinary-compare-tool/x86_64-unknown-linux-gnu/release/trusted-server-release" \
             "$RUNNER_TEMP/ordinary-inputs" "$RUNNER_TEMP/ordinary-archives"
       - name: Compare every final byte and seal only a real matched companion
+        id: comparison
         run: |
           set -euo pipefail
           if ! env -i PATH="$PATH" LC_ALL=C TZ=UTC \
@@ -325,6 +326,7 @@ jobs:
           fi
           echo 'SUCCESS: actual canonical and reproduction Fastly bytes match; ordinary unqualified companion sealed'
       - name: Upload the real Fastly rebuild check
+        if: ${{ success() && steps.comparison.outcome == 'success' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: fastly-rebuild-check

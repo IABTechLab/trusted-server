@@ -93,7 +93,7 @@ Every new ordinary module path is Gate 1 implementation, distinct from frozen-so
 
 ## Proposed normalization amendment after `cc7df930f`
 
-**Status:** Draft for approval. The user approved drafting this amendment after the real mismatch; changing the build recipe is not yet approved. Independent review must precede the approval request and implementation. The existing comparator remains unchanged.
+**Status:** Approved after independent review at `604d5d869d194ebfb0dd19554cc2810eb10f4812`. Implementation preserves every final byte in the comparison and retains debug information. A remaining real A/B difference stops the attempt for another decision.
 
 ### Observed failure and remaining uncertainty
 

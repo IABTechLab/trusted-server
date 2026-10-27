@@ -20,6 +20,19 @@ use crate::error::ReleaseError;
 
 const COMPANION: &str = "trusted-server-fastly.wasm.rebuild-check.json";
 
+/// Retains the exact target-scoped Cargo argument pair before compilation.
+pub(super) fn rustflags(
+    directory: &Path,
+    arguments: &[String],
+) -> Result<PathBuf, Report<ReleaseError>> {
+    persist(
+        directory,
+        "rustflags.json",
+        &serde_json::json!(arguments),
+        Role::Metadata,
+    )
+}
+
 /// Seals one matched ordinary comparison under the permanent companion name.
 ///
 /// # Errors

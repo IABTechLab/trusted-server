@@ -14,7 +14,8 @@ use super::{SourceIdentity, javascript_identity, real_root, source_file, source_
 use crate::documents::{self, Role};
 use crate::error::ReleaseError;
 use crate::ordinary::{
-    ASSET, Environment, GAPS, Observation, PROFILE, Tool, Tools, digest, observation, require, root,
+    ASSET, Environment, GAPS, Observation, PROFILE, Tool, Tools, digest, normalization,
+    observation, require, root,
 };
 use crate::process::{BoundedCommand, ProcessLimits};
 
@@ -140,6 +141,7 @@ struct Request {
     node: PathBuf,
     cargo_messages: PathBuf,
     cargo_metadata: PathBuf,
+    rustflags: PathBuf,
 }
 
 #[derive(PartialEq, Eq)]
@@ -216,7 +218,11 @@ fn validate(request: &Request) -> Result<(), Report<ReleaseError>> {
             "ordinary tool path must name the actual canonical executable, not a shim",
         )?;
     }
-    for path in [&request.cargo_messages, &request.cargo_metadata] {
+    for path in [
+        &request.cargo_messages,
+        &request.cargo_metadata,
+        &request.rustflags,
+    ] {
         require(
             path.to_str().is_some_and(root)
                 && fs::canonicalize(path).is_ok_and(|resolved| resolved == *path),
@@ -306,6 +312,13 @@ fn finish(
         "ordinary final binary path is missing or aliased",
     )?;
     let binary = documents::read_bounded(&binary, Role::Executable)?;
+    let flags = normalization::plan(checkout, target, &request.role)?;
+    let retained = documents::read_bounded(&request.rustflags, Role::Metadata)?;
+    require(
+        retained.bytes == flags.bytes && retained.sha256 == flags.sha256,
+        "ordinary captured Cargo arguments differ from the source-owned four-map plan",
+    )?;
+    normalization::scan(&binary.bytes, &flags)?;
     let source = source_identity(checkout, &request.source_commit)?;
     require(
         source == *initial,
@@ -319,7 +332,7 @@ fn finish(
         "version":1,"profile":PROFILE,"release_qualification":false,
         "source_commit":request.source_commit,"asset":ASSET,"target":"wasm32-wasip1","variant":"default","role":request.role,
         "recipe_sha256":source.recipe_sha256,"cargo_lock_sha256":source.cargo_lock_sha256,"npm_lock_sha256":source.npm_lock_sha256,
-        "js_inventory_sha256":js,"tools":tools,"environment":request.environment,
+        "js_inventory_sha256":js,"rustflags_sha256":retained.sha256,"tools":tools,"environment":request.environment,
         "artifact":{"size":binary.bytes.len(),"sha256":binary.sha256},"gaps":GAPS,
     });
     observation(&documents::canonical_json(&value, Role::Metadata)?)

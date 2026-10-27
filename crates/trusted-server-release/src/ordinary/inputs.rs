@@ -58,6 +58,7 @@ pub(super) fn source_identity(
         "bin": "trusted-server-adapter-fastly", "target": "wasm32-wasip1",
         "profile": "release", "default_features": true, "features": [],
         "locked": true, "files": files,
+        "normalization": super::normalization::policy(),
     });
     Ok(SourceIdentity {
         recipe_sha256: hex::encode(Sha256::digest(documents::canonical_json(

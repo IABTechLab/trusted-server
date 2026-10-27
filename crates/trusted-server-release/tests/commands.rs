@@ -612,10 +612,10 @@ fn bootstrap_checks_rust_toolchain_at_its_repository_root() {
 
 /// Process fixtures stay in this CI-only integration harness, never the pure selection.
 fn ordinary_measurement(root: &Path, node_body: &str) -> Output {
-    let checkout = root.join("source");
-    let target = root.join("target");
-    fs::create_dir(&checkout).expect("should create ordinary source root");
-    fs::create_dir(&target).expect("should create ordinary target root");
+    let checkout = root.join("workspace/ordinary-canonical-source");
+    let target = root.join("temp/ordinary-fastly-canonical-target");
+    fs::create_dir_all(&checkout).expect("should create ordinary source root");
+    fs::create_dir_all(&target).expect("should create ordinary target root");
     for name in [
         "scripts/release/phase1-build.sh",
         ".cargo/config.toml",
@@ -625,6 +625,26 @@ fn ordinary_measurement(root: &Path, node_body: &str) -> Output {
     ] {
         write(&checkout, name, b"fictional source input\n");
     }
+    write(&checkout, ".cargo/config.toml", b"[alias]\n");
+    let arguments = Command::new(RELEASE_BIN)
+        .env_clear()
+        .current_dir(root)
+        .arg("ordinary-rustflags")
+        .arg("--checkout")
+        .arg(&checkout)
+        .arg("--target")
+        .arg(&target)
+        .arg("--role")
+        .arg("canonical")
+        .arg("--output")
+        .arg(root.join("arguments"))
+        .output()
+        .expect("should prepare fixed arguments only in CI");
+    assert!(
+        arguments.status.success(),
+        "should seal actual arguments before building the fixture: {}",
+        String::from_utf8_lossy(&arguments.stderr)
+    );
     write(
         &checkout,
         "rust-toolchain.toml",
@@ -644,7 +664,7 @@ fn ordinary_measurement(root: &Path, node_body: &str) -> Output {
     write(
         &checkout,
         "release-assets/trusted-server-fastly.wasm",
-        b"\0asm\x01\0\0\0",
+        b"\0asm\x01\0\0\0\0\x0d\x0b.debug_info\0\0\x1b\x0a.debug_str/trusted-server\0\0\x0d\x0b.debug_line\0\0\x06\x04name\0",
     );
     let js = checkout.join("crates/trusted-server-js");
     fs::create_dir_all(js.join("lib/src/integrations"))
@@ -700,7 +720,8 @@ fn ordinary_measurement(root: &Path, node_body: &str) -> Output {
             "uid":fs::metadata(&checkout).expect("should inspect actual fixture owner").uid()
         },
         "rustc":checkout.join("tools/rustc"),"node":checkout.join("tools/node"),
-        "cargo_messages":target.join("messages.jsonl"),"cargo_metadata":target.join("metadata.json")
+        "cargo_messages":target.join("messages.jsonl"),"cargo_metadata":target.join("metadata.json"),
+        "rustflags":root.join("arguments/rustflags.json")
     });
     let request_path = root.join("request.json");
     fs::write(

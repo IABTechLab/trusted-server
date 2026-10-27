@@ -1,5 +1,6 @@
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
+use std::path::Path;
 
 use super::{Observation, compare, observation, pair};
 
@@ -19,14 +20,15 @@ pub(super) fn fixture() -> Value {
         "cargo_lock_sha256": "c".repeat(64),
         "npm_lock_sha256": "d".repeat(64),
         "js_inventory_sha256": "e".repeat(64),
+        "rustflags_sha256": super::normalization::plan(Path::new("/example/workspace/ordinary-canonical-source"), Path::new("/example/temp/ordinary-fastly-canonical-target"), "canonical").expect("should derive actual argument identity").sha256,
         "tools": {
             "rustc": {"version": "rustc 1.98.1 (example)", "sha256": "f".repeat(64)},
             "node": {"version": "v24.20.0", "sha256": "1".repeat(64)},
             "acquisition": "ordinary-hosted-toolchain"
         },
         "environment": {
-            "checkout_root": "/example/canonical/source",
-            "target_root": "/example/canonical/target",
+            "checkout_root": "/example/workspace/ordinary-canonical-source",
+            "target_root": "/example/temp/ordinary-fastly-canonical-target",
             "started_at_seconds": 1700000000,
             "umask": 18,
             "jobs": 4,
@@ -52,8 +54,10 @@ fn parse(value: &Value) -> Observation {
 pub(super) fn reproduction() -> Value {
     let mut value = fixture();
     value["role"] = json!("reproduction");
-    value["environment"]["checkout_root"] = json!("/example/reproduction/source");
-    value["environment"]["target_root"] = json!("/example/reproduction/target");
+    value["environment"]["checkout_root"] =
+        json!("/example/workspace/ordinary-reproduction-source");
+    value["environment"]["target_root"] =
+        json!("/example/temp/ordinary-fastly-reproduction-target");
     value["environment"]["started_at_seconds"] = json!(1700000900);
     value["environment"]["umask"] = json!(23);
     value["environment"]["jobs"] = json!(2);
@@ -64,6 +68,37 @@ pub(super) fn reproduction() -> Value {
 fn accepts_matching_inputs_with_observed_environment_variation() {
     pair(&parse(&fixture()), &parse(&reproduction()))
         .expect("should accept matching ordinary inputs with measured variation");
+}
+
+#[test]
+fn rejects_unbound_raw_arguments_or_different_derived_sibling_maps() {
+    let mut value = reproduction();
+    value["rustflags_sha256"] = json!("9".repeat(64));
+    assert!(
+        pair(&parse(&fixture()), &parse(&value)).is_err(),
+        "should reject arguments not bound to the stated physical roots"
+    );
+    let mut value = reproduction();
+    value["environment"]["checkout_root"] = json!("/other/workspace/ordinary-reproduction-source");
+    let flags = super::normalization::plan(
+        Path::new(
+            value["environment"]["checkout_root"]
+                .as_str()
+                .expect("should name source"),
+        ),
+        Path::new(
+            value["environment"]["target_root"]
+                .as_str()
+                .expect("should name target"),
+        ),
+        "reproduction",
+    )
+    .expect("should derive individually valid different maps");
+    value["rustflags_sha256"] = json!(flags.sha256);
+    assert!(
+        pair(&parse(&fixture()), &parse(&value)).is_err(),
+        "should reject individually valid but unequal raw arguments"
+    );
 }
 
 #[test]
@@ -199,7 +234,8 @@ fn rejects_false_environment_variation_and_swapped_roles() {
 #[test]
 fn rejects_overlapping_cross_build_roots() {
     let mut changed = reproduction();
-    changed["environment"]["checkout_root"] = json!("/example/canonical/source/child");
+    changed["environment"]["checkout_root"] =
+        json!("/example/workspace/ordinary-canonical-source/child");
     let error = pair(&parse(&fixture()), &parse(&changed))
         .expect_err("should reject overlapping roots instead of treating spelling as independence");
     assert!(

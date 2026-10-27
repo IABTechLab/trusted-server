@@ -113,7 +113,7 @@ impl CaptureFixture {
         fs::create_dir(files.checkout.join("release-assets")).expect("should create artifact root");
         fs::write(
             files.checkout.join("release-assets").join(ASSET),
-            b"\0asm\x01\0\0\0",
+            crate::ordinary::normalization::TEST_WASM,
         )
         .expect("should write final artifact");
         let cargo_metadata = files.target.join("metadata.json");
@@ -132,6 +132,11 @@ impl CaptureFixture {
             })
             .collect();
         fs::write(&cargo_messages, bytes).expect("should retain Cargo messages");
+        let rustflags = files.target.join("rustflags.json");
+        let flags =
+            crate::ordinary::normalization::plan(&files.checkout, &files.target, "canonical")
+                .expect("should derive source-owned target flags");
+        fs::write(&rustflags, flags.bytes).expect("should retain actual Cargo arguments");
         let uid = fs::metadata(&files.checkout)
             .expect("should inspect source owner")
             .uid();
@@ -160,6 +165,7 @@ impl CaptureFixture {
             node: tools.join("node"),
             cargo_messages,
             cargo_metadata,
+            rustflags,
         };
         let captured =
             capture(&serde_json::to_vec(&request).expect("should encode explicit capture"))
@@ -233,7 +239,7 @@ fn assembles_only_whitelisted_ordinary_facts_from_retained_inputs() {
     );
     assert_eq!(
         observed.value()["artifact"]["sha256"],
-        hex::encode(Sha256::digest(b"\0asm\x01\0\0\0")),
+        hex::encode(Sha256::digest(crate::ordinary::normalization::TEST_WASM)),
         "should bind final retained bytes"
     );
 }
@@ -262,6 +268,61 @@ fn rejects_wrong_source_versions_or_source_changes_before_recording() {
         .is_err(),
         "should reject source changes during measurement"
     );
+}
+
+#[test]
+fn rejects_changed_retained_arguments_and_unmapped_or_stripped_final_wasm() {
+    for change in ["arguments", "stripped", "physical-root"] {
+        let fixture = CaptureFixture::new();
+        if change == "arguments" {
+            fs::write(
+                &fixture.captured.request.rustflags,
+                b"[\"--config\",\"wrong\"]\n",
+            )
+            .expect("should alter actual retained arguments");
+        } else {
+            let bytes = if change == "stripped" {
+                b"\0asm\x01\0\0\0".to_vec()
+            } else {
+                let mut bytes = crate::ordinary::normalization::TEST_WASM.to_vec();
+                let root = fixture
+                    .files
+                    .checkout
+                    .to_str()
+                    .expect("should encode physical root");
+                let data = root.as_bytes();
+                // A custom section leaves all existing debug sections intact.
+                bytes.push(0);
+                let mut length = data.len() + 2;
+                loop {
+                    let next = (length & 0x7f) as u8;
+                    length >>= 7;
+                    bytes.push(next | if length == 0 { 0 } else { 0x80 });
+                    if length == 0 {
+                        break;
+                    }
+                }
+                bytes.extend([1, b'x']);
+                bytes.extend(data);
+                bytes
+            };
+            fs::write(
+                fixture.files.checkout.join("release-assets").join(ASSET),
+                bytes,
+            )
+            .expect("should alter final Wasm evidence");
+        }
+        assert!(
+            finish(
+                &fixture.captured,
+                &fixture.initial,
+                &fixture.pins,
+                &fixture.tools()
+            )
+            .is_err(),
+            "should refuse altered retained argument bytes or debug/path evidence"
+        );
+    }
 }
 
 #[test]

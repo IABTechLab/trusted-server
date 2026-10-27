@@ -16,10 +16,10 @@ impl Fixture {
     pub(in crate::ordinary) fn new() -> Self {
         let temporary = tempfile::tempdir().expect("should create source fixture");
         let outer = fs::canonicalize(temporary.path()).expect("should resolve fixture root");
-        let checkout = outer.join("source");
-        let target = outer.join("target");
-        fs::create_dir(&checkout).expect("should create source root");
-        fs::create_dir(&target).expect("should create target root");
+        let checkout = outer.join("workspace/ordinary-canonical-source");
+        let target = outer.join("temp/ordinary-fastly-canonical-target");
+        fs::create_dir_all(&checkout).expect("should create source root");
+        fs::create_dir_all(&target).expect("should create target root");
         for file in [
             "scripts/release/phase1-build.sh",
             ".cargo/config.toml",
@@ -34,6 +34,8 @@ impl Fixture {
                 .expect("should create fixed input directory");
             fs::write(path, b"example source input\n").expect("should write fixed input");
         }
+        fs::write(checkout.join(".cargo/config.toml"), b"[alias]\n")
+            .expect("should retain valid Cargo configuration");
         Self {
             _temporary: temporary,
             checkout,

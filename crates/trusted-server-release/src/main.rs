@@ -71,6 +71,17 @@ enum Command {
     },
     /// Diagnostic report of pending inputs; constructs no authorization.
     AuditInputs,
+    /// Seal fixed target-scoped remapping arguments before an ordinary build.
+    OrdinaryRustflags {
+        #[arg(long)]
+        checkout: PathBuf,
+        #[arg(long)]
+        target: PathBuf,
+        #[arg(long)]
+        role: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Record one actual ordinary Fastly build; grants no recipe qualification.
     OrdinaryMeasure {
         #[arg(long)]
@@ -164,6 +175,19 @@ fn run(
             Ok(ExitCode::SUCCESS)
         }
         Command::AuditInputs => audit_inputs(),
+        Command::OrdinaryRustflags {
+            checkout,
+            target,
+            role,
+            output,
+        } => {
+            let argument =
+                ordinary::prepare_rustflags(&checkout, &target, &role, &output, inherited)?;
+            writeln!(std::io::stdout(), "{argument}").map_err(|_| {
+                Report::new(ReleaseError::Document).attach("cannot write ordinary Cargo argument")
+            })?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::OrdinaryMeasure { request, output } => {
             ordinary::measure_build(&request, &output)?;
             Ok(ExitCode::SUCCESS)

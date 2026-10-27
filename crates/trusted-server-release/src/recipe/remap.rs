@@ -57,7 +57,7 @@ pub(super) const CARGO_CONFIG: &str = ".cargo/config.toml";
 /// Legacy extensionless configuration Cargo also reads; always refused.
 pub(super) const LEGACY_CARGO_CONFIG: &str = ".cargo/config";
 /// Fixed prefix of the source checkout.
-pub(super) const REMAPPED_CHECKOUT: &str = "/trusted-server";
+pub(crate) const REMAPPED_CHECKOUT: &str = "/trusted-server";
 /// Fixed prefix of the vendored dependency directory.
 pub(super) const REMAPPED_VENDOR: &str = "/cargo-vendor";
 /// Fixed prefix of the private Cargo home.
@@ -65,7 +65,7 @@ pub(super) const REMAPPED_CARGO_HOME: &str = "/cargo-home";
 /// Fixed prefix of the Rust tool root, which is the compiler sysroot.
 pub(super) const REMAPPED_TOOLS: &str = "/rust-tools";
 /// Fixed prefix of the Cargo target directory, which holds every `OUT_DIR`.
-pub(super) const REMAPPED_TARGET: &str = "/cargo-target";
+pub(crate) const REMAPPED_TARGET: &str = "/cargo-target";
 /// Every fixed prefix, in emitted order.
 pub(super) const REMAPPED_PREFIXES: [&str; 5] = [
     REMAPPED_CHECKOUT,
@@ -129,9 +129,32 @@ pub(super) fn remap_arguments_with(
         ));
     }
     let flags: Vec<String> = remapped_pairs(sources)?
-        .map(|(from, to)| format!("\"--remap-path-prefix={from}={to}\""))
-        .chain(extra.iter().map(|flag| format!("\"{flag}\"")))
+        .map(|(from, to)| format!("--remap-path-prefix={from}={to}"))
+        .chain(extra.iter().cloned())
         .collect();
+    rustflags_arguments(triple, &flags)
+}
+
+/// Encodes one target-scoped configuration pair without replacing source flags.
+///
+/// # Errors
+///
+/// Rejects unsafe target names or flags requiring unsupported TOML escaping.
+pub(crate) fn rustflags_arguments(
+    triple: &str,
+    flags: &[String],
+) -> Result<Vec<String>, Report<ReleaseError>> {
+    if triple.is_empty()
+        || !triple
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        || flags
+            .iter()
+            .any(|flag| flag.contains(['"', '\\']) || flag.chars().any(char::is_control))
+    {
+        return Err(recipe_error("target rustflags cannot be safely encoded"));
+    }
+    let flags: Vec<_> = flags.iter().map(|flag| format!("\"{flag}\"")).collect();
     Ok(vec![
         "--config".to_owned(),
         format!("target.\"{triple}\".rustflags=[{}]", flags.join(",")),
@@ -239,7 +262,7 @@ pub(super) fn c_prefix_map_environment_with(
 ///
 /// Returns [`ReleaseError::Recipe`] when the bytes are not UTF-8 TOML or set
 /// `build.rustflags`.
-pub(super) fn check_cargo_config(bytes: &[u8]) -> Result<(), Report<ReleaseError>> {
+pub(crate) fn check_cargo_config(bytes: &[u8]) -> Result<(), Report<ReleaseError>> {
     let text = std::str::from_utf8(bytes)
         .map_err(|error| recipe_error(format!("{CARGO_CONFIG} is not UTF-8: {error}")))?;
     let table: toml::Table = toml::from_str(text)
@@ -265,7 +288,7 @@ pub(super) fn check_cargo_config(bytes: &[u8]) -> Result<(), Report<ReleaseError
 ///
 /// Returns [`ReleaseError::Recipe`] when the approved source tracks it, it
 /// exists on disk in any form, or its absence cannot be established.
-pub(super) fn check_no_extensionless_config(
+pub(crate) fn check_no_extensionless_config(
     checkout: &Path,
     tracked: bool,
 ) -> Result<(), Report<ReleaseError>> {
@@ -321,6 +344,28 @@ pub(crate) fn scan_remapped_bytes(
     bytes: &[u8],
     forbidden: &[&str],
 ) -> Result<RemapScan, Report<ReleaseError>> {
+    reject_execution_prefixes(bytes, forbidden)?;
+    let found: Vec<&'static str> = REMAPPED_PREFIXES
+        .into_iter()
+        .filter(|prefix| contains(bytes, format!("{prefix}/").as_bytes()))
+        .collect();
+    if found.is_empty() {
+        return Err(recipe_error(
+            "final bytes hold no remapped path prefix, so remapping is unproven",
+        ));
+    }
+    Ok(RemapScan { found })
+}
+
+/// Rejects actual execution prefixes anywhere in final bytes.
+///
+/// # Errors
+///
+/// Rejects unsupported prefix bounds or any surviving raw/container prefix.
+pub(crate) fn reject_execution_prefixes(
+    bytes: &[u8],
+    forbidden: &[&str],
+) -> Result<(), Report<ReleaseError>> {
     if forbidden.len() > MAX_FORBIDDEN {
         return Err(recipe_error("too many forbidden prefixes for one scan"));
     }
@@ -334,14 +379,5 @@ pub(crate) fn scan_remapped_bytes(
             )));
         }
     }
-    let found: Vec<&'static str> = REMAPPED_PREFIXES
-        .into_iter()
-        .filter(|prefix| contains(bytes, format!("{prefix}/").as_bytes()))
-        .collect();
-    if found.is_empty() {
-        return Err(recipe_error(
-            "final bytes hold no remapped path prefix, so remapping is unproven",
-        ));
-    }
-    Ok(RemapScan { found })
+    Ok(())
 }

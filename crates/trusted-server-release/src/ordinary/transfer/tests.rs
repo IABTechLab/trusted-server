@@ -5,7 +5,20 @@ use super::{Archives, Checked, check};
 use crate::ordinary::archive::tests::zip;
 use crate::ordinary::{ASSET, run, tests};
 
-const WASM: &[u8] = b"\0asm\x01\0\0\0";
+const WASM: &[u8] = crate::ordinary::normalization::TEST_WASM;
+
+fn canonical_observation() -> Value {
+    with_artifact(tests::fixture())
+}
+
+fn reproduction_observation() -> Value {
+    with_artifact(tests::reproduction())
+}
+
+fn with_artifact(mut value: Value) -> Value {
+    value["artifact"] = json!({"size":WASM.len(),"sha256":hex::encode(Sha256::digest(WASM))});
+    value
+}
 
 fn encoded(value: &Value) -> Vec<u8> {
     serde_json::to_vec(value).expect("should encode fixture")
@@ -31,12 +44,18 @@ impl Fixture {
             archives: [
                 build.clone(),
                 zip(
-                    &[("fastly-observation.json", &encoded(&tests::fixture()))],
+                    &[(
+                        "fastly-observation.json",
+                        &encoded(&canonical_observation()),
+                    )],
                     false,
                 ),
                 build,
                 zip(
-                    &[("fastly-observation.json", &encoded(&tests::reproduction()))],
+                    &[(
+                        "fastly-observation.json",
+                        &encoded(&reproduction_observation()),
+                    )],
                     false,
                 ),
             ],
@@ -96,7 +115,10 @@ pub(in crate::ordinary) fn command_fixture(
     let mut fixture = Fixture::new();
     let identity = crate::ordinary::inputs::source_identity(source, &"a".repeat(40))
         .expect("should derive fixture recipe from independent comparison source");
-    for (index, mut observed) in [(1, tests::fixture()), (3, tests::reproduction())] {
+    for (index, mut observed) in [
+        (1, canonical_observation()),
+        (3, reproduction_observation()),
+    ] {
         observed["recipe_sha256"] = json!(identity.recipe_sha256);
         observed["cargo_lock_sha256"] = json!(identity.cargo_lock_sha256);
         observed["npm_lock_sha256"] = json!(identity.npm_lock_sha256);
@@ -123,6 +145,10 @@ fn joins_exact_archives_and_emits_only_an_ordinary_matched_receipt() {
     assert_eq!(
         receipt["outcome"], "matched",
         "should record the actual comparison"
+    );
+    assert!(
+        receipt.get("rustflags_sha256").is_none(),
+        "should keep the physical argument digest private and preserve the public v1 fields"
     );
     assert_eq!(
         receipt["release_qualification"], false,
@@ -190,7 +216,10 @@ fn rejects_role_swaps_even_with_valid_archive_digests() {
 #[test]
 fn rejects_observed_source_disagreeing_with_current_run() {
     let mut fixture = Fixture::new();
-    for (index, mut observation) in [(1, tests::fixture()), (3, tests::reproduction())] {
+    for (index, mut observation) in [
+        (1, canonical_observation()),
+        (3, reproduction_observation()),
+    ] {
         observation["source_commit"] = json!("f".repeat(40));
         fixture.archives[index] = zip(
             &[("fastly-observation.json", &encoded(&observation))],
@@ -207,7 +236,7 @@ fn rejects_observed_source_disagreeing_with_current_run() {
 #[test]
 fn rejects_observed_start_outside_its_producing_job() {
     let mut fixture = Fixture::new();
-    let mut observation = tests::reproduction();
+    let mut observation = reproduction_observation();
     observation["environment"]["started_at_seconds"] = json!(1_700_000_000);
     fixture.archives[3] = zip(
         &[("fastly-observation.json", &encoded(&observation))],
@@ -247,7 +276,7 @@ fn rejects_real_mismatch_even_when_both_observations_are_accurate() {
         &[(ASSET, &bytes), (&format!("{ASSET}.spdx.json"), b"{}")],
         false,
     );
-    let mut observation = tests::reproduction();
+    let mut observation = reproduction_observation();
     observation["artifact"] =
         json!({"size":bytes.len(), "sha256":hex::encode(Sha256::digest(&bytes))});
     fixture.archives[3] = zip(

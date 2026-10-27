@@ -4,6 +4,7 @@ use error_stack::Report;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use super::archive::{self, Profile};
 use super::run::{Archive, Bindings, Build};
@@ -138,6 +139,18 @@ pub(super) fn check(
         reproduction,
     )?;
     let equality = compare(canonical, reproduction, &left[ASSET], &right[ASSET])?;
+    for (observed, bytes) in [
+        (&equality.canonical, &left[ASSET]),
+        (&equality.reproduction, &right[ASSET]),
+    ] {
+        let facts = &observed.facts;
+        let flags = super::normalization::plan(
+            Path::new(&facts.environment.checkout_root),
+            Path::new(&facts.environment.target_root),
+            &facts.role,
+        )?;
+        super::normalization::scan(bytes, &flags)?;
+    }
     let spdx_name = format!("{ASSET}.spdx.json");
     let reproduction_spdx_sha256 = hex::encode(Sha256::digest(&right[&spdx_name]));
     // Exact ZIP membership is already checked. SPDX semantics remain enforced

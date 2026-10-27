@@ -1,11 +1,12 @@
 //! Explicit ordinary command assembly, without authenticated or qualified authority.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use error_stack::Report;
 use serde_json::{Value, json};
 
-use super::{inputs, output, require, root, run, transfer};
+use super::{inputs, normalization, output, require, root, run, transfer};
 use crate::documents::{self, Role};
 use crate::error::ReleaseError;
 
@@ -15,6 +16,23 @@ const ARCHIVES: [&str; 4] = [
     "reproduction.zip",
     "reproduction-observation.zip",
 ];
+
+/// Checks fresh runner layout and seals the exact Cargo arguments before build.
+///
+/// # Errors
+///
+/// Rejects reused/aliased paths, competing flags or a failed private atomic write.
+pub(crate) fn prepare_rustflags(
+    checkout: &Path,
+    target: &Path,
+    role: &str,
+    output: &Path,
+    inherited: &[(OsString, OsString)],
+) -> Result<String, Report<ReleaseError>> {
+    let flags = normalization::prepare(checkout, target, role, inherited)?;
+    output::rustflags(output, &flags.arguments)?;
+    Ok(flags.arguments[1].clone())
+}
 
 fn directory(path: &Path) -> Result<(), Report<ReleaseError>> {
     require(

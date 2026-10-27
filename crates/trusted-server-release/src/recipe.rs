@@ -55,6 +55,11 @@ mod native;
 mod paths;
 mod plan;
 mod remap;
+
+pub(crate) use remap::{
+    REMAPPED_CHECKOUT, REMAPPED_TARGET, check_cargo_config, check_no_extensionless_config,
+    reject_execution_prefixes, rustflags_arguments,
+};
 mod runtime;
 mod sources;
 mod startup;

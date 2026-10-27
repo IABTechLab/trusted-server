@@ -1349,6 +1349,14 @@ test('workflows select exactly the descriptive cohort and restrict actual build 
 })
 
 test('ordinary Fastly gate binds dedicated A and B uploads before isolated signing', () => {
+  const build = readFileSync('scripts/release/phase1-build.sh', 'utf8')
+  assert.match(build, /ordinary-rustflags/)
+  assert.match(build, /cargo --config "\$ordinary_rustflags" build/)
+  assert.ok(
+    build.indexOf('ordinary-rustflags') < build.indexOf('npm --prefix'),
+    'should seal arguments before dependency preparation and compilation'
+  )
+  assert.match(build, /rustflags: env\.ORDINARY_RUSTFLAGS/)
   const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
   const caller = readFileSync('.github/workflows/release.yml', 'utf8')
   const job = (name) =>
@@ -1381,9 +1389,27 @@ test('ordinary Fastly gate binds dedicated A and B uploads before isolated signi
   }
   assert.match(comparison, /needs: \[fastly-canonical, fastly-reproduction\]/)
   assert.match(comparison, /actions: read/)
+  assert.match(
+    comparison,
+    /ref: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}/
+  )
+  assert.match(
+    comparison,
+    /test "\$\(git rev-parse HEAD\)" = "\$SOURCE_COMMIT"/
+  )
   assert.doesNotMatch(comparison, /id-token|attestations:|contents: write/)
   assert.match(comparison, /ordinary-fetch/)
   assert.match(comparison, /ordinary-compare/)
+  assert.match(comparison, /id: comparison/)
+  assert.match(
+    comparison,
+    /if:.*success\(\).*steps\.comparison\.outcome == 'success'/
+  )
+  assert.match(comparison, /if ! env -i/)
+  assert.doesNotMatch(
+    comparison,
+    /(?:test -[ef]|existsSync).*rebuild-check\.json/
+  )
   for (const role of ['canonical', 'reproduction'])
     for (const output of [
       'artifact-id',
