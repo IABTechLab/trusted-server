@@ -646,8 +646,10 @@ test('isolated signing accepts only bound 3/2 input sets and retains exact prove
           if (mode === 'binary') receipt.canonical_sha256 = '0'.repeat(64)
           if (mode === 'spdx') receipt.canonical.spdx_sha256 = '0'.repeat(64)
           let text = JSON.stringify(canonical(receipt)) + '\n'
-          if (mode === 'duplicate-key')
-            text = text.replace('{', '{"version":0,')
+          if (mode === 'duplicate-key') {
+            assert.ok(text.startsWith('{'))
+            text = '{"version":0,' + text.slice(1)
+          }
           if (mode !== 'missing')
             writeFileSync(
               join(root, 'comparison', `${asset}.rebuild-check.json`),
