@@ -64,6 +64,48 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # A hung job, a PR-triggered workflow without per-PR cancellation, or a
+      # job outside its per-author queue brings back the runner pile-up that
+      # the concurrency blocks prevent. Every PR-triggered workflow must carry
+      # test.yml's workflow-level block, and every job must set timeout-minutes
+      # and a per-author queue (keyed on the matrix too, for matrix jobs).
+      # Jobs that call a reusable workflow are skipped: they cannot set these.
+      - name: Require per-PR cancellation, per-author job queues and timeouts
+        shell: bash
+        run: |
+          reference=.github/workflows/test.yml
+          if [ "$(yq '.concurrency."cancel-in-progress" == true and (.concurrency.group // "" | test("pull_request\.number"))' "$reference")" != true ]; then
+            echo "::error file=$reference::test.yml must cancel superseded runs per pull request."
+            exit 1
+          fi
+          expected=$(yq -o=json -I=0 '.concurrency' "$reference")
+          status=0
+          for f in .github/workflows/*.yml .github/workflows/*.yaml; do
+            [ -f "$f" ] || continue
+            on_pr=$(yq '.on | ((tag == "!!map" and has("pull_request")) or (tag == "!!str" and . == "pull_request") or (tag == "!!seq" and ([.[] | select(. == "pull_request")] | length > 0)))' "$f")
+            [ "$on_pr" = true ] || continue
+            if [ "$(yq -o=json -I=0 '.concurrency' "$f")" != "$expected" ]; then
+              echo "::error file=$f::PR-triggered workflows must use the workflow-level concurrency block from test.yml."
+              status=1
+            fi
+            while read -r job; do
+              [ -n "$job" ] || continue
+              echo "::error file=$f::Job '$job' must set timeout-minutes."
+              status=1
+            done < <(yq '.jobs | to_entries[] | select(.value.uses == null and .value["timeout-minutes"] == null) | .key' "$f")
+            while read -r job; do
+              [ -n "$job" ] || continue
+              echo "::error file=$f::Job '$job' must join a per-author queue: concurrency.group keyed on pull_request.user.login and queue: max."
+              status=1
+            done < <(yq '.jobs | to_entries[] | select(.value.uses == null and (.value.concurrency.queue != "max" or (.value.concurrency.group // "" | test("pull_request\.user\.login") | not))) | .key' "$f")
+            while read -r job; do
+              [ -n "$job" ] || continue
+              echo "::error file=$f::Matrix job '$job' must include the matrix in its concurrency group so its legs do not queue behind each other."
+              status=1
+            done < <(yq '.jobs | to_entries[] | select(.value.strategy.matrix != null and (.value.concurrency.group // "" | test("matrix\.") | not)) | .key' "$f")
+          done
+          exit "$status"
+
       # Rust jobs must set up the toolchain through ./.github/actions/setup-rust,
       # which removes the image's stable and only saves caches from main. A
       # direct setup-rust-toolchain or rust-cache step skips both silently.
