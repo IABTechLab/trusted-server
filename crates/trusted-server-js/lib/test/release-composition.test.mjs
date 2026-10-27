@@ -294,6 +294,18 @@ describe('release collector boundaries', () => {
     );
     expect(imported.status).toBe(0);
     expect(imported.stdout).toBe('');
+    const guardedLink = path.join(libDir, `.release-test-entrypoint-${crypto.randomUUID()}.mjs`);
+    fs.symlinkSync(buildScript, guardedLink);
+    temporary.push(guardedLink);
+    const rejectedOutput = path.join(root, 'rejected-entrypoint');
+    const rejected = spawnSync(
+      process.execPath,
+      ['--preserve-symlinks-main', guardedLink, '--out-dir', rejectedOutput],
+      { env, encoding: 'utf8' }
+    );
+    expect(rejected.status).not.toBe(0);
+    expect(rejected.stderr).toMatch(/build-all entrypoint identity check failed/);
+    expect(fs.existsSync(rejectedOutput)).toBe(false);
   }, 30_000);
   it('reaches bootstrap refusal from absolute, relative and own-directory shell invocation', () => {
     const directory = path.join(repoRoot, 'scripts/release');

@@ -52,21 +52,36 @@ fn accepts_benign_environment_and_keeps_search_path() {
 }
 
 #[test]
-fn rejects_tsjs_skip_build_with_empty_value() {
-    let text = rejection(&[("TSJS_SKIP_BUILD", "")]);
-    assert!(text.contains("TSJS_SKIP_BUILD"), "should name skip flag");
+fn rejects_tsjs_build_controls_with_empty_value() {
+    for name in ["TSJS_PREBUILT_DIR", "TSJS_SKIP_BUILD", "TSJS_TEST"] {
+        let text = rejection(&[(name, "")]);
+        assert!(
+            text.contains(name),
+            "should name the inherited build control"
+        );
+    }
 }
 
 #[test]
-fn rejects_tsjs_skip_build_with_zero_value() {
-    let text = rejection(&[("TSJS_SKIP_BUILD", "0")]);
-    assert!(text.contains("TSJS_SKIP_BUILD"), "should name skip flag");
+fn rejects_tsjs_build_controls_with_zero_value() {
+    for name in ["TSJS_PREBUILT_DIR", "TSJS_SKIP_BUILD", "TSJS_TEST"] {
+        let text = rejection(&[(name, "0")]);
+        assert!(
+            text.contains(name),
+            "should name the inherited build control"
+        );
+    }
 }
 
 #[test]
-fn rejects_tsjs_skip_build_with_one_value() {
-    let text = rejection(&[("TSJS_SKIP_BUILD", "1")]);
-    assert!(text.contains("TSJS_SKIP_BUILD"), "should name skip flag");
+fn rejects_tsjs_build_controls_with_one_value() {
+    for name in ["TSJS_PREBUILT_DIR", "TSJS_SKIP_BUILD", "TSJS_TEST"] {
+        let text = rejection(&[(name, "1")]);
+        assert!(
+            text.contains(name),
+            "should name the inherited build control"
+        );
+    }
 }
 
 fn assert_each_rejected(class: &str, names: &[&str]) {

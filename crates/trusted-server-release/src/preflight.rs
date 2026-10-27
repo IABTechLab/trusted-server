@@ -59,7 +59,9 @@ const REJECTED_EXACT: &[&str] = &[
     "SDKROOT",
     "SOURCE_DATE_EPOCH",
     "SSH_AUTH_SOCK",
+    "TSJS_PREBUILT_DIR",
     "TSJS_SKIP_BUILD",
+    "TSJS_TEST",
     "VCPKG_INSTALLATION_ROOT",
     "VCPKG_ROOT",
 ];

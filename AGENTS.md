@@ -373,7 +373,9 @@ Every PR must pass:
 9. Native core build-digest test and lint (`cargo test -p trusted-server-core --test template_build_digest` and `cargo clippy -p trusted-server-core --test template_build_digest -- -D warnings`)
 10. Wasm clock lint: `scripts/lint-wasm-clock.sh` (crates built into the Cloudflare Worker must use `web_time`, not the `std::time::{Instant,SystemTime}` `now`/`elapsed` methods, which panic there)
 11. Documentation proposal scripts: `shellcheck scripts/docs-proposal/*.sh && node --test scripts/docs-proposal/hunks.test.mjs && scripts/docs-proposal/test.sh`
-12. Release producer checks: `node --test scripts/release/phase1.test.mjs && shellcheck scripts/release/phase1-build.sh`
+12. Release producer helpers: `node --test scripts/release/phase1.test.mjs && shellcheck scripts/release/phase1-build.sh scripts/release/bootstrap.sh scripts/release/build.sh scripts/release/build-js.sh`
+13. Native release producer tests and lint: `cargo test --package trusted-server-release --target <host-triple> --locked` and `cargo clippy --package trusted-server-release --target <host-triple> --all-targets --all-features --locked -- -D warnings` (CI uses `x86_64-unknown-linux-gnu`).
+14. Native checked/ordinary JS release fixtures: `cargo test --package trusted-server-js --target <host-triple> --locked --test release_prebuilt` and `cargo clippy --package trusted-server-js --target <host-triple> --all-targets --all-features --locked -- -D warnings` (CI uses `x86_64-unknown-linux-gnu`).
 
 CI also runs these HTML EOF checks. Run them locally only when changing EOF
 finalization, publisher or HTML-processor code:

@@ -448,10 +448,14 @@ fn omitting_require_qualified_still_fails() {
 }
 
 #[test]
-fn empty_skip_flag_fails_naming_the_variable() {
+fn inherited_js_build_controls_fail_naming_the_variable() {
     let fixture = SourceFixture::new(|_| {});
-    let output = fixture.preflight(true, &[("TSJS_SKIP_BUILD", "")]);
-    assert_failed_without_output(&output, "TSJS_SKIP_BUILD");
+    for name in ["TSJS_PREBUILT_DIR", "TSJS_SKIP_BUILD", "TSJS_TEST"] {
+        for value in ["", "0", "1"] {
+            let output = fixture.preflight(true, &[(name, value)]);
+            assert_failed_without_output(&output, name);
+        }
+    }
 }
 
 #[test]

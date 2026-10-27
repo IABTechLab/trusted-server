@@ -116,6 +116,12 @@ export async function buildAll({
   return records.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href) {
+if (import.meta.main) {
+  if (
+    !process.argv[1] ||
+    import.meta.url !== pathToFileURL(fs.realpathSync(process.argv[1])).href
+  ) {
+    throw new Error('build-all entrypoint identity check failed');
+  }
   await buildAll({ outDir: resolveOutDir(process.argv.slice(2)) });
 }

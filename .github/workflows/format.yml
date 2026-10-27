@@ -195,7 +195,7 @@ jobs:
           node-version: ${{ steps.node-version.outputs.node-version }}
 
       - name: Run shellcheck
-        run: shellcheck scripts/docs-proposal/*.sh scripts/release/phase1-build.sh
+        run: shellcheck scripts/docs-proposal/*.sh scripts/release/phase1-build.sh scripts/release/bootstrap.sh scripts/release/build.sh scripts/release/build-js.sh
 
       - name: Test hunk review builder
         run: node --test scripts/docs-proposal/hunks.test.mjs

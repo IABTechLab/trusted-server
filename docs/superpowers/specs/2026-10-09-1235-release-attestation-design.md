@@ -342,6 +342,8 @@ One immutable build-fact mechanism MUST extend merged #1213. Absence of `TRUSTED
 
 Release Rust builds MUST receive absolute `TSJS_PREBUILT_DIR` and `TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY` paths, validate the inventory and copied bytes, expose its raw digest as `TRUSTED_SERVER__TSJS_INVENTORY_SHA256`, and MUST NOT run npm. Rust Cargo builds MUST reject any presence of `TSJS_SKIP_BUILD`, including empty, `0` and `1`; Node development build/Vitest entry points preserve its development behavior when release control is absent.
 
+**Phase 2 ordinary-path note:** The approved ordinary release path builds JavaScript fresh with npm into private `OUT_DIR`. The checked-prebuilt/no-npm requirement above remains the controlled-recipe destination; the ordinary profile does not establish controlled qualification.
+
 The recipe MUST supply `TRUSTED_SERVER__GIT_VERSION` as the approved full source commit after sanitation, and release builds MUST reject missing/malformed values and prohibit ambient `.git` tag/branch fallback. Development fallback from #1213 MAY remain outside release execution and MUST be recorded as a development input.
 
 A typed `BuildInfo` MUST derive target from Cargo `TARGET` through `TRUSTED_SERVER__BUILD_TARGET`, package version from `CARGO_PKG_VERSION` and variant/features in the owning adapter/product. Core cannot infer a Fastly feature that is not forwarded to it. Caller-supplied target/variant strings MUST NOT override these derived facts. `TEMPLATE_BUILD_DIGEST` remains separately named.
