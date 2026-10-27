@@ -3686,9 +3686,8 @@ mod tests {
             assert_writes(&scenario.store, (1, 0, 0), "one Add by the writer");
         }
 
-        const REGISTERED_FIRST_TRIM_COOKIE: &str = include_str!(
-            "../../trusted-server-js/lib/test/fixtures/ts-eids-registered-first-trim.txt"
-        );
+        const REGISTERED_ONLY_COOKIE: &str =
+            include_str!("../../trusted-server-js/lib/test/fixtures/ts-eids-registered-only.txt");
         const ORTB2_ONLY_COOKIE: &str =
             include_str!("../../trusted-server-js/lib/test/fixtures/ts-eids-ortb2-only.txt");
 
@@ -4076,7 +4075,7 @@ mod tests {
         #[test]
         fn registered_source_beyond_todays_trim_reaches_kv_on_next_navigation() {
             use base64::Engine as _;
-            let cookie_value = REGISTERED_FIRST_TRIM_COOKIE.trim_end();
+            let cookie_value = REGISTERED_ONLY_COOKIE.trim_end();
             let decoded: serde_json::Value = serde_json::from_slice(
                 &base64::engine::general_purpose::STANDARD
                     .decode(cookie_value)
@@ -4090,13 +4089,9 @@ mod tests {
                 .filter_map(|entry| entry["source"].as_str())
                 .collect();
             assert_eq!(
-                sources.first().copied(),
-                Some("registered.example.com"),
-                "control: the shim's trim should keep the registered source first"
-            );
-            assert!(
-                !sources.contains(&"u6.example.com"),
-                "control: the trim should have dropped an unregistered source: {sources:?}"
+                sources,
+                ["registered.example.com"],
+                "control: the shim should keep only the registered source"
             );
             let scenario = Scenario::with_settings(&partner_toml("registered.example.com"));
             scenario.seed_live();

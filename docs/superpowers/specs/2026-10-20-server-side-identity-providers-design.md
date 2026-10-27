@@ -70,8 +70,8 @@ Terms used throughout:
 - **Orphan recovery**: what TS does when a visitor's EC cookie has no KV row
   (`ec/finalize.rs:282`).
 - **`ts-eids`**: the existing first-party cookie the Prebid shim writes with
-  the browser's EIDs. Unchanged by this spec, except that its trim keeps
-  registered sources first (section 5.3).
+  the browser's EIDs. Unchanged by this spec, except that it holds only
+  registered sources, merged per source across auctions (section 5.3).
 - **`ts-eids-s`**: a new client-only cookie, named `__Host-ts-eids-s`, that
   the shim writes from the servable server set TS returns in `/auction` and
   `/_ts/page-bids` responses. It mirrors server IDs for page scripts. The
@@ -201,10 +201,10 @@ can be written, and each extra write is another CAS race between tabs.
   has no way to obtain one.
 - **G10.** No browser EID that reaches KV today is lost, within one bound.
   Browser ingest runs only on the writer request, from `ts-eids`. The shim
-  trims `ts-eids` keeping registered sources first (section 5.3), so the
-  next writer request ingests every registered source today's `/auction`
-  ingest writes from the body. A body-only registered ID is lost only when
-  the registered sources alone exceed the 3,072-byte trim. What today's
+  writes only registered sources into `ts-eids` and merges them per source
+  (section 5.3), so the next writer request ingests every registered source
+  today's `/auction` ingest writes from the body. A body-only registered ID
+  is lost only when the registered sources alone exceed the 3,072-byte trim. What today's
   `/_ts/page-bids` ingest writes comes from `ts-eids` too; only an SPA
   session longer than that cookie's one-day lifetime can lose such an ID.
 - **G11.** Writing a provider is easy, and extending the trait does not
@@ -1882,15 +1882,19 @@ their JSON response, from the KV row they read. The shim writes
 `ts-eids-s` from it. These responses are already private, so the mirror
 costs no HTML cacheability.
 
-**The `ts-eids` trim keeps registered sources first.** Today `/auction`
-ingests registered sources from its body, which carries more than the
-3,072-byte `ts-eids` cookie. Under this design only the writer ingests, and
-only from `ts-eids`. So the shim, when it trims `ts-eids` (EID fidelity
-spec §4.3), drops unregistered sources before any registered one. It learns
-the registered source domains from the configuration TS injects with its
-script. Within each group the EID fidelity trim order is unchanged. Every
-registered source today's `/auction` ingest writes then reaches the next
-writer's ingest, unless the registered sources alone exceed the trim (G10).
+**`ts-eids` holds only registered sources, merged per source.** Today
+`/auction` ingests registered sources from its body, which carries more than
+the 3,072-byte `ts-eids` cookie. Under this design only the writer ingests,
+and only from `ts-eids`. So the shim writes only registered sources into
+`ts-eids`; it learns their domains from the configuration TS injects with
+its script, and writes no cookie when none is injected. Each `trustedServer`
+request's registered entries replace the cookie's entries for the same
+source, and the cookie keeps the sources the request lacks, so an auction
+that misses an ID module does not remove its ID. A request with no EIDs
+leaves the cookie as it is; a TCF block still clears it. The EID fidelity
+trim (§4.3) then runs on the merged set. Every registered source today's
+`/auction` ingest writes then reaches the next writer's ingest, unless the
+registered sources alone exceed the trim (G10).
 
 **Concurrent stagers.** Stagers set no server cookie, so concurrent
 responses cannot overwrite each other's state. Each can return a mirror
@@ -4010,8 +4014,8 @@ request opens or parses `ts-eids-s`.
 
 **No lost EIDs (G10).**
 
-- The shim's `ts-eids` trim keeps every registered source before any
-  unregistered one, and keeps the EID fidelity order within each group.
+- The shim writes no unregistered source into `ts-eids`, and keeps a
+  registered source a later request lacks.
 - A registered source present in the `/auction` body but beyond today's
   trim is kept in `ts-eids` and written by the next navigation.
 - When the registered sources alone exceed the trim, only those the trim
@@ -4149,8 +4153,8 @@ G13 must not change:
   sent. The expected values are captured from `main`, not written from
   this sentence
 - the `x-ts-eids` header's per-entry truncation
-- the `ts-eids` cookie's content and EID-level `ext` removal, and its trim
-  order apart from the registered-first rule G10 adds
+- the `ts-eids` cookie's EID-level `ext` removal and trim order, apart from
+  the registered-only merge G10 adds
 - `/auction` body forwarding and the merge of browser entries
 - a row read from `main`'s schema version 1 goes out to bidders exactly as
   it does on `main`, and the golden requests of the EID fidelity spec
@@ -4186,8 +4190,8 @@ Two steps, each shippable on its own:
      responses, and the shim code that writes and clears the cookie, once
      section 15 names a consumer; without one, this step ships without the
      mirror
-   - the shim's registered-first `ts-eids` trim, with the registered source
-     list in the injected configuration (section 5.3)
+   - the shim's registered-only, per-source merge of `ts-eids`, with the
+     registered source list in the injected configuration (section 5.3)
    - a metric for the inbound `Cookie` header size
    - KV schema version 2 (section 6.1): the one record shape, `ps`, with
      `Default` and constructors, and the read of version 1 rows. Full entry
@@ -4311,7 +4315,7 @@ Decisions made while writing this spec, with the user:
 | New-visitor write                | One create before routing, as today, carrying browser EIDs. No provider runs on the first navigation. Changed in rounds 3 and 4; open question 6 asks whether to revisit.                                                                |
 | New-visitor recovery             | Today's rotation. The cookie-proof recreation of revision 3 is removed with the deferred create.                                                                                                                                         |
 | Failed write                     | Not retried. Changed from one merge-retry once Fastly's per-key limit was confirmed.                                                                                                                                                     |
-| Browser EIDs beyond the cookie   | The shim's `ts-eids` trim keeps registered sources first, and the next navigation ingests them. Revision 14 removed the KV gap that `/auction` saved in `ts-eids-s`.                                                                     |
+| Browser EIDs beyond the cookie   | The shim writes only registered sources into `ts-eids`, merged per source, and the next navigation ingests them. Revision 14 removed the KV gap that `/auction` saved in `ts-eids-s`.                                                    |
 | Delay on body-less routes        | Accepted: a browser ID first seen in an `/auction` body reaches KV one page view later.                                                                                                                                                  |
 | SPA views (`/_ts/page-bids`)     | Stagers. They never write KV and call no provider.                                                                                                                                                                                       |
 | Hold budget                      | `hold_budget_ms` defaults to 100 ms, reduced from 300 ms (section 4.7 gives the reasons).                                                                                                                                                |

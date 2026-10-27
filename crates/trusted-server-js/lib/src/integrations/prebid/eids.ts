@@ -32,6 +32,7 @@ export interface FittedEidCookie {
 }
 
 const utf8Encoder = new TextEncoder();
+const utf8Decoder = new TextDecoder();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -153,11 +154,76 @@ function cookieLabel(entry: unknown): string {
   return isRecord(entry) && typeof entry.source === 'string' ? entry.source : '(malformed entry)';
 }
 
-function isRegistered(entry: unknown, registeredSources: ReadonlySet<string>): boolean {
+/** An entry's source lowercased without a trailing dot, or `undefined` when it has none. */
+function normalizedSource(entry: unknown): string | undefined {
   if (!isRecord(entry) || typeof entry.source !== 'string') {
-    return false;
+    return undefined;
   }
-  return registeredSources.has(entry.source.trim().toLowerCase().replace(/\.$/, ''));
+  return entry.source.trim().toLowerCase().replace(/\.$/, '');
+}
+
+function isRegistered(entry: unknown, registeredSources: ReadonlySet<string>): boolean {
+  const source = normalizedSource(entry);
+  return source !== undefined && registeredSources.has(source);
+}
+
+function decodeUtf8Base64(value: string): string {
+  return utf8Decoder.decode(Uint8Array.from(atob(value), (char) => char.charCodeAt(0)));
+}
+
+/**
+ * Reads the entries of a `ts-eids` cookie value.
+ *
+ * @param value the base64 cookie value, if any
+ * @returns the decoded entries, or an empty array when the value is absent
+ *   or is not base64 of a JSON array
+ */
+export function decodeEidCookie(value: string | undefined): unknown[] {
+  if (!value) {
+    return [];
+  }
+  try {
+    const parsed: unknown = JSON.parse(decodeUtf8Base64(value));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Merges a request's EIDs into the entries `ts-eids` already holds, keeping
+ * only `[[ec.partners]]` sources.
+ *
+ * Every registered entry of `current` is kept, in order. A registered entry
+ * of `previous` that has a `uids` array follows them when `current` has no
+ * entry for its source, so a request that lacks a source does not remove it
+ * from the cookie. Unregistered and malformed entries of either set are
+ * dropped. The inputs are not modified.
+ *
+ * @param current the entries forwarded in this request's `/auction` body
+ * @param previous the entries the `ts-eids` cookie holds now
+ * @param registeredSources the `[[ec.partners]]` source domains the server
+ *   injected
+ * @returns the entries to fit into the cookie
+ */
+export function mergeEidCookieEntries(
+  current: readonly unknown[],
+  previous: readonly unknown[],
+  registeredSources: ReadonlySet<string>
+): unknown[] {
+  const merged = current.filter((entry) => isRegistered(entry, registeredSources));
+  const currentSources = new Set(merged.map(normalizedSource));
+  for (const entry of previous) {
+    if (
+      isRegistered(entry, registeredSources) &&
+      isRecord(entry) &&
+      Array.isArray(entry.uids) &&
+      !currentSources.has(normalizedSource(entry))
+    ) {
+      merged.push(entry);
+    }
+  }
+  return merged;
 }
 
 function encodeUtf8Base64(text: string): string {
@@ -169,30 +235,22 @@ function encodeUtf8Base64(text: string): string {
 }
 
 /**
- * Builds the `ts-eids` cookie value from a request's collected EIDs.
+ * Builds the `ts-eids` cookie value from the entries
+ * {@link mergeEidCookieEntries} kept.
  *
  * Removes each entry's EID-level `ext`, drops entries that become identical
  * (compared with sorted keys), then trims from the tail until the standard
  * padded base64 of the JSON array's UTF-8 bytes is at most
  * {@link MAX_EID_COOKIE_BYTES} long: drop UIDs from the last entry, then the
  * entry itself, and repeat. A last entry that is not an object with a `uids`
- * array is removed whole. The input is not modified.
+ * array is removed whole. A set that fits keeps its order. The input is not
+ * modified.
  *
- * Only the writer navigation ingests `ts-eids`, so when the set does not fit
- * the entries of registered sources move ahead of the others and trimming
- * reaches them last. Within each group the order is unchanged. A set that
- * fits keeps its order.
- *
- * @param eids the entries forwarded in the `/auction` body
- * @param registeredSources the `[[ec.partners]]` source domains the server
- *   injected; empty keeps the plain tail trim
+ * @param eids the entries to write
  * @returns the cookie value, or `undefined` when nothing fits, and the
  *   sources trimming touched
  */
-export function fitEidCookie(
-  eids: readonly unknown[],
-  registeredSources: ReadonlySet<string> = new Set()
-): FittedEidCookie {
+export function fitEidCookie(eids: readonly unknown[]): FittedEidCookie {
   const seen = new Set<string>();
   const payload: unknown[] = [];
   for (const entry of eids) {
@@ -211,7 +269,6 @@ export function fitEidCookie(
 
   const dropped = new Set<string>();
   const trimmed = new Set<string>();
-  let registeredFirst = false;
   while (payload.length > 0) {
     const value = encodeUtf8Base64(JSON.stringify(payload));
     if (value.length <= MAX_EID_COOKIE_BYTES) {
@@ -220,13 +277,6 @@ export function fitEidCookie(
         droppedSources: [...dropped],
         trimmedSources: [...trimmed],
       };
-    }
-
-    if (!registeredFirst) {
-      registeredFirst = true;
-      const registered = payload.filter((entry) => isRegistered(entry, registeredSources));
-      const others = payload.filter((entry) => !isRegistered(entry, registeredSources));
-      payload.splice(0, payload.length, ...registered, ...others);
     }
 
     const last = payload[payload.length - 1];

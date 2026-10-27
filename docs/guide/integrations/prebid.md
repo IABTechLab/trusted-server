@@ -865,8 +865,8 @@ page or auction. When available, the opaque value follows the standard path:
 1. Prebid places the `liveramp.com` entry in the `trustedServer` bidder
    request's `ortb2.user.ext.eids`.
 2. The adapter forwards that entry in the `/auction` body and, before sending
-   the request, copies the body's EIDs (without EID-level `ext`) into the
-   bounded `ts-eids` cookie.
+   the request, merges the body's EIDs from registered partners (without
+   EID-level `ext`) into the bounded `ts-eids` cookie.
 3. Trusted Server consent-gates it and forwards it to Prebid Server as
    `user.ext.eids`.
 4. After the response, the same `/auction` request ingests the body entry into
@@ -963,9 +963,12 @@ not passed by this implementation.
 Trusted Server combines browser EIDs with the EC/KV identity graph:
 
 1. **Browser EIDs** are the entries Prebid placed in the `trustedServer`
-   bidder request. The adapter sends them in the `/auction` body as plain data
-   and copies them, without EID-level `ext`, into the `ts-eids` cookie before
-   the request is sent.
+   bidder request. The adapter sends them in the `/auction` body as plain data.
+   Before the request is sent, it merges the entries of sources configured in
+   `[[ec.partners]]`, without EID-level `ext`, into the `ts-eids` cookie. A
+   request's entries replace the cookie's entries for the same source, and the
+   cookie keeps sources the request lacks. Unregistered sources never reach
+   the cookie.
 2. **Server-side EIDs** are resolved from the EC/KV identity graph for
    partners with `bidstream_enabled = true`.
 3. Browser entries are forwarded first, exactly as sent. KV adds entries only
@@ -1071,7 +1074,8 @@ the purpose check.
 With the full rule, `trustedServer` still needs Purpose 2 consent and skips
 only the vendor check. A publisher that sets `eidsRequireP4Consent` must also
 add the same full rule for `personalizedAds`; without it `trustedServer` gets
-bid requests with no EIDs and `ts-eids` is cleared after every auction.
+bid requests with no EIDs. The adapter then leaves `ts-eids` as it is, so it
+can hold the last IDs for up to a day.
 
 ## Endpoints
 

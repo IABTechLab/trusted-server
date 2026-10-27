@@ -292,7 +292,7 @@ Each request also logs one `identity request measurement: ...` line after the re
 - Attributes: `Path=/; Secure; SameSite=Lax`, no `Domain`, and not `HttpOnly`, because the shim writes it with `document.cookie`.
 - Lifetime: a `Max-Age` of at most one day, and never past the earliest expiry of an ID it holds.
 - Size: at most 2,048 bytes. When the IDs do not fit, whole sources are left out, lowest `cookie_priority` first, never part of a source.
-- The shim's `ts-eids` trim now keeps registered sources first, so a size-capped `ts-eids` loses unregistered sources before registered ones.
+- The shim now writes only registered (`[[ec.partners]]`) sources into `ts-eids`, and merges each auction's entries into the cookie per source instead of replacing it. A source an auction lacks stays in the cookie until it expires; a TCF block still clears it.
 
 ## Server-Side Identity Providers
 

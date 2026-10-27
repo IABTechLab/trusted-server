@@ -29,6 +29,8 @@ const CONTROL_EID = {
   source: 'control.example.com',
   uids: [{ id: 'control-uid', atype: 1 }],
 };
+// The `[[ec.partners]]` sources the server injects; `ts-eids` keeps only these.
+const REGISTERED_SOURCES = ['control.example.com', 'ids.example.com', 'preset.example.com'];
 const PRESET_COOKIE_EIDS = [{ source: 'preset.example.com', uids: [{ id: 'preset-uid' }] }];
 const LIVERAMP_EID = {
   source: 'liveramp.com',
@@ -195,7 +197,11 @@ function createPage({ cookies = [], vendorConsents } = {}) {
 
   // Mirror the server's head-injected state.
   pageWindow.eval('window.pbjs = { que: [], cmd: [] };');
-  pageWindow.__tsjs_prebid = { clientSideBidders: [], serverSideBidders: [] };
+  pageWindow.__tsjs_prebid = {
+    clientSideBidders: [],
+    serverSideBidders: [],
+    registeredSources: REGISTERED_SOURCES,
+  };
 
   return {
     pageWindow,

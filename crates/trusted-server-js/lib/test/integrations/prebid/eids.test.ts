@@ -6,9 +6,11 @@ import { describe, expect, it } from 'vitest';
 
 import {
   collectBidderEids,
+  decodeEidCookie,
   fitEidCookie,
   MAX_AUCTION_EIDS_BYTES,
   MAX_EID_COOKIE_BYTES,
+  mergeEidCookieEntries,
   type EidCollectionStats,
 } from '../../../src/integrations/prebid/eids';
 import { FIXTURE_EIDS } from '../../fixtures/eid-fixture-input';
@@ -264,82 +266,105 @@ describe('collectBidderEids', () => {
   });
 });
 
-describe('fitEidCookie', () => {
-  describe('registered sources', () => {
-    const long = 'x'.repeat(400);
-    const entry = (source: string) => ({ source, uids: [{ id: long, atype: 1 }] });
+describe('mergeEidCookieEntries', () => {
+  const registered = new Set(['a.example.com', 'b.example.com', 'c.example.com']);
+  const entry = (source: string, id: string) => ({ source, uids: [{ id, atype: 1 }] });
 
-    it('keeps_registered_sources_before_unregistered_ones', () => {
-      // Eight entries are over the cookie cap; the registered source comes last.
-      const unregistered = [0, 1, 2, 3, 4, 5, 6].map((index) => entry(`u${index}.example.com`));
-      const registered = entry('registered.example.com');
+  it('keeps only registered sources from both sets', () => {
+    const merged = mergeEidCookieEntries(
+      [entry('a.example.com', 'a1'), entry('media.example.com', 'm1')],
+      [entry('b.example.com', 'b0'), entry('other.example.com', 'o0')],
+      registered
+    );
 
-      const fitted = fitEidCookie(
-        [...unregistered, registered],
-        new Set(['registered.example.com'])
-      );
-
-      const sources = (decodeCookie(fitted.value) as Array<{ source: string }>).map(
-        (item) => item.source
-      );
-      expect(sources[0]).toBe('registered.example.com');
-      expect(sources).not.toContain('u6.example.com');
-      expect(fitted.droppedSources).toContain('u6.example.com');
-      expect(fitted.droppedSources).not.toContain('registered.example.com');
-      expect(fitted.value!.length).toBeLessThanOrEqual(MAX_EID_COOKIE_BYTES);
-    });
-
-    it('matches registered sources after lowercasing and removing a trailing dot', () => {
-      const unregistered = [0, 1, 2, 3, 4, 5, 6].map((index) => entry(`u${index}.example.com`));
-
-      const fitted = fitEidCookie(
-        [...unregistered, entry('Registered.Example.com.')],
-        new Set(['registered.example.com'])
-      );
-
-      expect(fitted.droppedSources).not.toContain('Registered.Example.com.');
-    });
-
-    it('keeps the trim order within each group', () => {
-      const registered = [0, 1, 2, 3, 4, 5, 6].map((index) => entry(`r${index}.example.com`));
-      const unregistered = [0, 1].map((index) => entry(`u${index}.example.com`));
-
-      const fitted = fitEidCookie(
-        [...registered.slice(0, 3), unregistered[0], ...registered.slice(3), unregistered[1]],
-        new Set(registered.map((item) => item.source))
-      );
-
-      // Unregistered sources go first, last-first, then registered ones from the tail.
-      expect(fitted.droppedSources).toEqual([
-        'u1.example.com',
-        'u0.example.com',
-        'r6.example.com',
-        'r5.example.com',
-      ]);
-    });
-
-    it('keeps the input order when the set fits', () => {
-      const small = [
-        { source: 'u.example.com', uids: [{ id: 'u' }] },
-        { source: 'r.example.com', uids: [{ id: 'r' }] },
-      ];
-
-      const fitted = fitEidCookie(small, new Set(['r.example.com']));
-
-      expect(decodeCookie(fitted.value)).toEqual(small);
-    });
-
-    it('trims as before when no source is registered', () => {
-      const entries = [0, 1, 2, 3, 4, 5, 6].map((index) => entry(`s${index}.example.com`));
-
-      expect(fitEidCookie(entries, new Set())).toEqual(fitEidCookie(entries));
-      expect(fitEidCookie(entries, new Set()).droppedSources).toEqual([
-        's6.example.com',
-        's5.example.com',
-      ]);
-    });
+    expect(merged, 'unregistered sources should never reach the cookie').toEqual([
+      entry('a.example.com', 'a1'),
+      entry('b.example.com', 'b0'),
+    ]);
   });
 
+  it('lets the request replace the cookie entry for the same source', () => {
+    const merged = mergeEidCookieEntries(
+      [entry('a.example.com', 'new')],
+      [entry('a.example.com', 'old'), entry('c.example.com', 'c0')],
+      registered
+    );
+
+    expect(merged, 'the request should win per source').toEqual([
+      entry('a.example.com', 'new'),
+      entry('c.example.com', 'c0'),
+    ]);
+  });
+
+  it('keeps every entry the request has for a repeated source', () => {
+    const first = { source: 'a.example.com', inserter: 'one.example.com', uids: [{ id: 'a1' }] };
+    const second = { source: 'a.example.com', inserter: 'two.example.com', uids: [{ id: 'a2' }] };
+
+    const merged = mergeEidCookieEntries(
+      [first, second],
+      [entry('a.example.com', 'old')],
+      registered
+    );
+
+    expect(merged, 'both request entries should stay, the old one should go').toEqual([
+      first,
+      second,
+    ]);
+  });
+
+  it('keeps the cookie sources when the request has no EIDs', () => {
+    const previous = [entry('a.example.com', 'a0'), entry('b.example.com', 'b0')];
+
+    expect(mergeEidCookieEntries([], previous, registered)).toEqual(previous);
+  });
+
+  it('matches sources after lowercasing and removing a trailing dot', () => {
+    const merged = mergeEidCookieEntries(
+      [entry('A.Example.com.', 'a1')],
+      [entry('a.example.com', 'a0')],
+      registered
+    );
+
+    expect(merged, 'the spellings should name one source').toEqual([entry('A.Example.com.', 'a1')]);
+  });
+
+  it('drops malformed cookie entries and keeps nothing without registered sources', () => {
+    const legacy = { source: 'b.example.com', id: 'flat', atype: 1 };
+
+    expect(mergeEidCookieEntries([], [legacy, null, 'x'], registered)).toEqual([]);
+    expect(mergeEidCookieEntries([entry('a.example.com', 'a1')], [], new Set())).toEqual([]);
+  });
+
+  it('does not modify its inputs', () => {
+    const current = [entry('a.example.com', 'a1')];
+    const previous = [entry('b.example.com', 'b0')];
+    const snapshot = structuredClone([current, previous]);
+
+    mergeEidCookieEntries(current, previous, registered);
+
+    expect([current, previous]).toEqual(snapshot);
+  });
+});
+
+describe('decodeEidCookie', () => {
+  it('round-trips a value fitEidCookie wrote, including non-Latin-1 text', () => {
+    const entries = [{ source: 'a.example.com', inserter: 'inserter-€', uids: [{ id: '日本' }] }];
+
+    expect(decodeEidCookie(fitEidCookie(entries).value)).toEqual(entries);
+  });
+
+  it.each([
+    ['absent', undefined],
+    ['empty', ''],
+    ['not base64', '%%%'],
+    ['not JSON', btoa('not json')],
+    ['not an array', btoa('{"source":"a.example.com"}')],
+  ])('returns no entries when the value is %s', (_label, value) => {
+    expect(decodeEidCookie(value)).toEqual([]);
+  });
+});
+
+describe('fitEidCookie', () => {
   it('removes EID-level ext and drops the duplicates that creates, comparing with sorted keys', () => {
     const withExt = {
       source: 'a.example.com',

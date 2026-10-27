@@ -429,6 +429,24 @@ function decodedTsEidsCookie(): unknown {
   return value === undefined ? undefined : JSON.parse(decodeBase64Utf8(value));
 }
 
+/** Runs `run` with `sources` injected as the `[[ec.partners]]` source domains. */
+function withRegisteredSources(sources: string[], run: () => void): void {
+  testWindow.__tsjs_prebid = { registeredSources: sources };
+  try {
+    run();
+  } finally {
+    delete testWindow.__tsjs_prebid;
+  }
+}
+
+function encodeBase64Utf8(value: unknown): string {
+  let binary = '';
+  for (const byte of new TextEncoder().encode(JSON.stringify(value))) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary);
+}
+
 function presetTsEidsCookie(value: string): void {
   document.cookie = `ts-eids=${value}; Path=/; Secure; SameSite=Lax; Max-Age=60`;
   expect(readTsEidsCookie(), 'the preset ts-eids cookie should read back').toBe(value);
@@ -2629,9 +2647,14 @@ describe('prebid/installPrebidNpm', () => {
     it('writes exactly the ts-eids fixture for the fixture input', () => {
       const spec = getAdapterSpec();
 
-      spec.buildRequests(
-        trustedServerBidRequests(),
-        prebidBidderRequest({ ext: { eids: FIXTURE_EIDS } })
+      withRegisteredSources(
+        FIXTURE_EIDS.map((eid) => eid.source),
+        () => {
+          spec.buildRequests(
+            trustedServerBidRequests(),
+            prebidBidderRequest({ ext: { eids: FIXTURE_EIDS } })
+          );
+        }
       );
 
       expect(readTsEidsCookie()).toBe(readFixture('ts-eids-cookie.txt'));
@@ -2649,10 +2672,13 @@ describe('prebid/installPrebidNpm', () => {
         uids: [{ id: 'ids-uid', atype: 1 }],
       };
 
-      const result = spec.buildRequests(
-        trustedServerBidRequests(),
-        prebidBidderRequest({ ext: { eids: [withExt, plain] } })
-      );
+      let result: { data: unknown } = { data: '' };
+      withRegisteredSources(['liveintent.example.com', 'ids.example.com'], () => {
+        result = spec.buildRequests(
+          trustedServerBidRequests(),
+          prebidBidderRequest({ ext: { eids: [withExt, plain] } })
+        );
+      });
 
       expect(JSON.parse(String(result.data)).eids, 'the body keeps EID-level ext').toEqual([
         withExt,
@@ -2663,15 +2689,60 @@ describe('prebid/installPrebidNpm', () => {
       );
     });
 
-    it('clears ts-eids before the request when the bidder request holds no EIDs', () => {
+    it('keeps the ts-eids sources when the bidder request holds no EIDs', () => {
       const spec = getAdapterSpec();
-      presetTsEidsCookie('preset-value');
+      const stored = [{ source: 'ids.example.com', uids: [{ id: 'stored-uid', atype: 1 }] }];
+      presetTsEidsCookie(encodeBase64Utf8(stored));
 
-      const result = spec.buildRequests(trustedServerBidRequests(), prebidBidderRequest({}));
+      let result: { data: unknown } = { data: '' };
+      withRegisteredSources(['ids.example.com'], () => {
+        result = spec.buildRequests(trustedServerBidRequests(), prebidBidderRequest({}));
+      });
 
       const payload = JSON.parse(String(result.data));
       expect(payload.adUnits[0].code, 'the request should still be built').toBe('div-gpt-1');
       expect(payload.eids, 'the body should carry no eids').toBeUndefined();
+      expect(decodedTsEidsCookie(), 'the cookie should keep its sources').toEqual(stored);
+    });
+
+    it('drops unregistered sources from ts-eids but keeps them in the body', () => {
+      const spec = getAdapterSpec();
+      const registered = { source: 'ids.example.com', uids: [{ id: 'ids-uid', atype: 1 }] };
+      const unregistered = { source: 'media.example.com', uids: [{ id: 'm-uid', atype: 3 }] };
+      presetTsEidsCookie(
+        encodeBase64Utf8([{ source: 'stale.example.com', uids: [{ id: 's-uid' }] }])
+      );
+
+      let result: { data: unknown } = { data: '' };
+      withRegisteredSources(['ids.example.com'], () => {
+        result = spec.buildRequests(
+          trustedServerBidRequests(),
+          prebidBidderRequest({ ext: { eids: [unregistered, registered] } })
+        );
+      });
+
+      expect(JSON.parse(String(result.data)).eids, 'the body forwards every entry').toEqual([
+        unregistered,
+        registered,
+      ]);
+      expect(decodedTsEidsCookie(), 'the cookie holds registered sources only').toEqual([
+        registered,
+      ]);
+    });
+
+    it('clears ts-eids when no registered source is injected', () => {
+      const spec = getAdapterSpec();
+      presetTsEidsCookie(
+        encodeBase64Utf8([{ source: 'ids.example.com', uids: [{ id: 'stored-uid' }] }])
+      );
+
+      spec.buildRequests(
+        trustedServerBidRequests(),
+        prebidBidderRequest({
+          ext: { eids: [{ source: 'ids.example.com', uids: [{ id: 'ids-uid' }] }] },
+        })
+      );
+
       expect(readTsEidsCookie(), 'the cookie should be cleared').toBeUndefined();
     });
 
@@ -2681,10 +2752,13 @@ describe('prebid/installPrebidNpm', () => {
       presetTsEidsCookie('preset-value');
       const entry = { source: 'huge.example.com', uids: [{ id: 'h'.repeat(5000) }] };
 
-      const result = spec.buildRequests(
-        trustedServerBidRequests(),
-        prebidBidderRequest({ ext: { eids: [entry] } })
-      );
+      let result: { data: unknown } = { data: '' };
+      withRegisteredSources(['huge.example.com'], () => {
+        result = spec.buildRequests(
+          trustedServerBidRequests(),
+          prebidBidderRequest({ ext: { eids: [entry] } })
+        );
+      });
 
       expect(JSON.parse(String(result.data)).eids, 'the body keeps the entry').toEqual([entry]);
       expect(readTsEidsCookie(), 'the cookie should be cleared').toBeUndefined();
@@ -2762,21 +2836,36 @@ describe('prebid/installPrebidNpm', () => {
       ).toBe(true);
     });
 
-    it('lets the later of two overlapping requests own ts-eids', () => {
+    it('merges a later request into ts-eids per source', () => {
       const spec = getAdapterSpec();
       const first = { source: 'first.example.com', uids: [{ id: 'first-uid' }] };
       const second = { source: 'second.example.com', uids: [{ id: 'second-uid' }] };
+      const replaced = { source: 'first.example.com', uids: [{ id: 'first-uid-2' }] };
 
-      spec.buildRequests(
-        trustedServerBidRequests(),
-        prebidBidderRequest({ ext: { eids: [first] } })
-      );
-      spec.buildRequests(
-        trustedServerBidRequests(),
-        prebidBidderRequest({ ext: { eids: [second] } })
-      );
+      withRegisteredSources(['first.example.com', 'second.example.com'], () => {
+        spec.buildRequests(
+          trustedServerBidRequests(),
+          prebidBidderRequest({ ext: { eids: [first] } })
+        );
+        spec.buildRequests(
+          trustedServerBidRequests(),
+          prebidBidderRequest({ ext: { eids: [second] } })
+        );
+        expect(decodedTsEidsCookie(), 'a source the later request lacks should stay').toEqual([
+          second,
+          first,
+        ]);
 
-      expect(decodedTsEidsCookie()).toEqual([second]);
+        spec.buildRequests(
+          trustedServerBidRequests(),
+          prebidBidderRequest({ ext: { eids: [replaced] } })
+        );
+      });
+
+      expect(decodedTsEidsCookie(), 'the later request should win for its source').toEqual([
+        replaced,
+        second,
+      ]);
     });
 
     it('forwards ortb2 EIDs and writes ts-eids without the User ID module', () => {
@@ -2791,10 +2880,13 @@ describe('prebid/installPrebidNpm', () => {
           uids: [{ id: 'fictional-id5', atype: 1 }],
         };
 
-        const result = spec.buildRequests(
-          trustedServerBidRequests(),
-          prebidBidderRequest({ ext: { eids: [lockrId5] } })
-        );
+        let result: { data: unknown } = { data: '' };
+        withRegisteredSources(['id5-sync.com'], () => {
+          result = spec.buildRequests(
+            trustedServerBidRequests(),
+            prebidBidderRequest({ ext: { eids: [lockrId5] } })
+          );
+        });
 
         expect(JSON.parse(String(result.data)).eids).toEqual([lockrId5]);
         expect(decodedTsEidsCookie()).toEqual([lockrId5]);
@@ -2819,10 +2911,13 @@ describe('prebid/installPrebidNpm', () => {
         'control: getUserIdsAsEids should not hold the ID5 entry'
       ).not.toContain('id5-sync.com');
 
-      const result = spec.buildRequests(
-        trustedServerBidRequests(),
-        prebidBidderRequest({ ext: { eids: [lockrId5] } })
-      );
+      let result: { data: unknown } = { data: '' };
+      withRegisteredSources(['id5-sync.com'], () => {
+        result = spec.buildRequests(
+          trustedServerBidRequests(),
+          prebidBidderRequest({ ext: { eids: [lockrId5] } })
+        );
+      });
 
       expect(JSON.parse(String(result.data)).eids, 'the /auction body carries the entry').toEqual([
         lockrId5,
@@ -2833,8 +2928,8 @@ describe('prebid/installPrebidNpm', () => {
     });
 
     it('ts_eids_cookie_golden', () => {
-      // A set with no unregistered source, so the registered-first trim
-      // leaves it exactly as before. EID-level ext never reaches the cookie.
+      // Every source is registered, so the cookie keeps the whole set.
+      // EID-level ext never reaches the cookie.
       testWindow.__tsjs_prebid = { registeredSources: ['id5-sync.com', 'sharedid.org'] };
       try {
         const spec = getAdapterSpec();
@@ -2867,11 +2962,10 @@ describe('prebid/installPrebidNpm', () => {
       }
     });
 
-    it('writes a registered source beyond the old trim into ts-eids as this exact value', () => {
+    it('writes only the registered source into ts-eids as this exact value', () => {
       // The Rust identity tests ingest this value: its registered source is
       // the eighth entry, which the pre-G10 trim dropped.
-      testWindow.__tsjs_prebid = { registeredSources: ['registered.example.com'] };
-      try {
+      withRegisteredSources(['registered.example.com'], () => {
         const spec = getAdapterSpec();
         const long = 'x'.repeat(400);
         const unregistered = [0, 1, 2, 3, 4, 5, 6].map((index) => ({
@@ -2885,10 +2979,8 @@ describe('prebid/installPrebidNpm', () => {
           prebidBidderRequest({ ext: { eids: [...unregistered, registered] } })
         );
 
-        expect(readTsEidsCookie()).toBe(readFixture('ts-eids-registered-first-trim.txt'));
-      } finally {
-        delete testWindow.__tsjs_prebid;
-      }
+        expect(readTsEidsCookie()).toBe(readFixture('ts-eids-registered-only.txt'));
+      });
     });
 
     it('logs EID counts and the cookie decision at debug level, never values', () => {
@@ -2902,14 +2994,16 @@ describe('prebid/installPrebidNpm', () => {
       try {
         const spec = getAdapterSpec();
 
-        spec.buildRequests(
-          trustedServerBidRequests(),
-          prebidBidderRequest({
-            ext: {
-              eids: [{ source: 'ids.example.com', uids: [{ id: 'secret-uid-value' }] }],
-            },
-          })
-        );
+        withRegisteredSources(['ids.example.com'], () => {
+          spec.buildRequests(
+            trustedServerBidRequests(),
+            prebidBidderRequest({
+              ext: {
+                eids: [{ source: 'ids.example.com', uids: [{ id: 'secret-uid-value' }] }],
+              },
+            })
+          );
+        });
 
         expect(spies[0]).toHaveBeenCalledWith('[tsjs-prebid] forwarding bidder EIDs', {
           forwarded: 1,
@@ -2936,9 +3030,15 @@ describe('prebid/installPrebidNpm', () => {
         uids: [{ id: long, atype: 1 }],
       }));
 
-      const result = spec.buildRequests(
-        trustedServerBidRequests(),
-        prebidBidderRequest({ ext: { eids: entries } })
+      let result: { data: unknown } = { data: '' };
+      withRegisteredSources(
+        entries.map((entry) => entry.source),
+        () => {
+          result = spec.buildRequests(
+            trustedServerBidRequests(),
+            prebidBidderRequest({ ext: { eids: entries } })
+          );
+        }
       );
 
       expect(JSON.parse(String(result.data)).eids, 'the body keeps every entry').toEqual(entries);
@@ -3046,9 +3146,8 @@ describe('prebid/installPrebidNpm', () => {
       expect(mockWriteEidsMirror).not.toHaveBeenCalled();
     });
 
-    it('keeps injected registered sources in ts-eids when the set must be trimmed', () => {
-      testWindow.__tsjs_prebid = { registeredSources: ['registered.example.com'] };
-      try {
+    it('keeps only injected registered sources in ts-eids', () => {
+      withRegisteredSources(['registered.example.com'], () => {
         const spec = getAdapterSpec();
         const long = 'x'.repeat(400);
         const unregistered = [0, 1, 2, 3, 4, 5, 6].map((index) => ({
@@ -3063,14 +3162,10 @@ describe('prebid/installPrebidNpm', () => {
         );
 
         expect(JSON.parse(String(result.data)).eids, 'the body keeps every entry').toHaveLength(8);
-        const sources = (decodedTsEidsCookie() as Array<{ source: string }>).map(
-          (entry) => entry.source
-        );
-        expect(sources[0]).toBe('registered.example.com');
-        expect(sources).not.toContain('u6.example.com');
-      } finally {
-        delete testWindow.__tsjs_prebid;
-      }
+        expect(decodedTsEidsCookie(), 'the cookie holds the registered source only').toEqual([
+          registered,
+        ]);
+      });
     });
 
     it('interpretResponse handles empty/missing seatbid', () => {

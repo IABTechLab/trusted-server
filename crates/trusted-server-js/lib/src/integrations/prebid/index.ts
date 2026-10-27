@@ -31,8 +31,10 @@ import type { AuctionSlot, TsjsApi } from '../../core/types';
 
 import {
   collectBidderEids,
+  decodeEidCookie,
   fitEidCookie,
   MAX_EID_COOKIE_BYTES,
+  mergeEidCookieEntries,
   type EidCollectionStats,
 } from './eids';
 import {
@@ -190,7 +192,7 @@ interface InjectedPrebidConfig {
   excludedGamAdUnitPathSuffixes?: string[];
   /** Operator-owned Prebid User ID module entries, forwarded verbatim. */
   managedUserIds?: InjectedManagedUserId[];
-  /** `[[ec.partners]]` source domains the `ts-eids` trim keeps first. */
+  /** `[[ec.partners]]` source domains, the only sources `ts-eids` keeps. */
   registeredSources?: string[];
 }
 
@@ -2844,6 +2846,17 @@ const EID_COOKIE_MAX_AGE = 86400;
 /** What `buildRequests` did with `ts-eids`, for debug logs. */
 type EidCookieDecision = 'written' | 'trimmed' | 'cleared';
 
+/** The current `ts-eids` cookie value, if any. */
+function readPrebidEidsCookie(): string | undefined {
+  for (const part of document.cookie.split(';')) {
+    const [name, ...value] = part.trim().split('=');
+    if (name === EID_COOKIE_NAME) {
+      return value.join('=') || undefined;
+    }
+  }
+  return undefined;
+}
+
 /** Clears any previously persisted Prebid EIDs cookie. */
 function clearPrebidEidsCookie(): void {
   try {
@@ -2875,14 +2888,20 @@ function logTrimmedEidSources(droppedSources: string[], trimmedSources: string[]
 }
 
 /**
- * Writes `ts-eids` from the EIDs of the `trustedServer` request being built:
- * the same entries without EID-level `ext`, fitted to the cookie size cap.
- * Clears the cookie when nothing fits or encoding fails, so it never holds a
- * set that no longer matches the latest request.
+ * Merges the EIDs of the `trustedServer` request being built into `ts-eids`:
+ * only `[[ec.partners]]` sources, this request's entries replacing the
+ * cookie's for the same source and the cookie's other sources kept, without
+ * EID-level `ext` and fitted to the cookie size cap. Clears the cookie when
+ * nothing remains or encoding fails.
  */
-function writePrebidEidsCookie(eids: unknown[]): EidCookieDecision {
+function writePrebidEidsCookie(eids: readonly unknown[]): EidCookieDecision {
   try {
-    const fitted = fitEidCookie(eids, new Set(getInjectedConfig()?.registeredSources ?? []));
+    const merged = mergeEidCookieEntries(
+      eids,
+      decodeEidCookie(readPrebidEidsCookie()),
+      new Set(getInjectedConfig()?.registeredSources ?? [])
+    );
+    const fitted = fitEidCookie(merged);
     logTrimmedEidSources(fitted.droppedSources, fitted.trimmedSources);
     if (fitted.value === undefined) {
       clearPrebidEidsCookie();
@@ -2901,8 +2920,9 @@ function writePrebidEidsCookie(eids: unknown[]): EidCookieDecision {
 
 /**
  * Collects the EIDs Prebid placed in this `trustedServer` bidder request and
- * mirrors them into `ts-eids` synchronously, before Prebid sends the request,
- * so the server never falls back to a stale cookie for it.
+ * merges them into `ts-eids` synchronously, before Prebid sends the request.
+ * A request without EIDs leaves the cookie's sources in place; a TCF block
+ * clears it (`tcf2Enforcement`).
  *
  * `bidderRequest.ortb2` is what Prebid lets `trustedServer` see: global
  * first-party data merged with its own bidder fragment, IDs restricted to
@@ -2923,13 +2943,7 @@ function forwardBidderEids(bidderRequest: unknown): unknown[] | undefined {
     overBudget: 0,
   };
   const eids = collectBidderEids(bidderRequest, stats);
-  let cookie: EidCookieDecision;
-  if (eids) {
-    cookie = writePrebidEidsCookie(eids);
-  } else {
-    clearPrebidEidsCookie();
-    cookie = 'cleared';
-  }
+  const cookie = writePrebidEidsCookie(eids ?? []);
   log.debug('[tsjs-prebid] forwarding bidder EIDs', { ...stats, cookie });
   return eids;
 }
