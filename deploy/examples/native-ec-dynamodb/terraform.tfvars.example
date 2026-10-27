@@ -1,0 +1,7 @@
+# Illustrative identifiers only. Do not use a disposable workload ID here.
+aws_account_id = "123456789012"
+aws_region     = "us-east-1"
+table_name     = "example-retained-ec"
+namespace      = "example-staging"
+owner          = "example-platform-team"
+task_role_name = "example-application-task"

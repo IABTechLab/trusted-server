@@ -380,7 +380,7 @@ impl EcContext {
     ///
     /// Returns an error if the client IP is unavailable and generation is
     /// needed, or if HMAC generation fails.
-    pub fn generate_if_needed(
+    pub async fn generate_if_needed(
         &mut self,
         settings: &Settings,
         kv: Option<&KvIdentityGraph>,
@@ -420,7 +420,7 @@ impl EcContext {
                 .map(DeviceSignals::to_kv_device);
 
             if let Some(graph) = kv {
-                match graph.create_if_absent(&ec_id, &entry) {
+                match graph.create_if_absent(&ec_id, &entry).await {
                     Ok(CreateIfAbsentOutcome::Written) => {
                         self.kv_snapshot = EcKvSnapshot::Present {
                             ec_id: ec_id.clone(),
@@ -789,18 +789,22 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl EcKvStore for AddCollidingEcKv {
         fn store_name(&self) -> &str {
             self.inner.store_name()
         }
-        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
-            self.inner.lookup(key)
+        async fn lookup(
+            &self,
+            key: &str,
+        ) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.inner.lookup(key).await
         }
-        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
-            self.inner.key_exists(key)
+        async fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            self.inner.key_exists(key).await
         }
 
-        fn insert(
+        async fn insert(
             &self,
             key: &str,
             write: EcKvWrite<'_>,
@@ -815,17 +819,17 @@ mod tests {
                     return Ok(EcKvWriteOutcome::PreconditionFailed);
                 }
             }
-            self.inner.insert(key, write)
+            self.inner.insert(key, write).await
         }
-        fn list_keys_with_prefix(
+        async fn list_keys_with_prefix(
             &self,
             prefix: &str,
             limit: u32,
         ) -> Result<Vec<String>, Report<TrustedServerError>> {
-            self.inner.list_keys_with_prefix(prefix, limit)
+            self.inner.list_keys_with_prefix(prefix, limit).await
         }
-        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
-            self.inner.delete(key)
+        async fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key).await
         }
     }
 
@@ -837,14 +841,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generate_if_needed_retries_id_collision_then_persists() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn generate_if_needed_retries_id_collision_then_persists() {
         let settings = create_test_settings();
         let mut ec =
             EcContext::new_for_test_with_ip(None, granting_consent(), Some("192.0.2.5".to_owned()));
         let graph = KvIdentityGraph::new(AddCollidingEcKv::new(2));
 
         ec.generate_if_needed(&settings, Some(&graph))
+            .await
             .expect("should generate after bounded collisions");
 
         assert!(ec.ec_value().is_some(), "should allocate a fresh EC ID");
@@ -855,15 +860,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn generate_if_needed_errors_after_collision_exhaustion() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn generate_if_needed_errors_after_collision_exhaustion() {
         let settings = create_test_settings();
         let mut ec =
             EcContext::new_for_test_with_ip(None, granting_consent(), Some("192.0.2.6".to_owned()));
         // Collide on every attempt so the bounded retry is exhausted.
         let graph = KvIdentityGraph::new(AddCollidingEcKv::new(u32::MAX));
 
-        let result = ec.generate_if_needed(&settings, Some(&graph));
+        let result = ec.generate_if_needed(&settings, Some(&graph)).await;
 
         assert!(result.is_err(), "should fail after exhausting attempts");
         assert!(
@@ -1075,8 +1080,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn generate_if_needed_skips_when_ec_exists() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn generate_if_needed_skips_when_ec_exists() {
         let settings = create_test_settings();
         let ec_id = valid_ec_id("d", "Exist1");
         let cookie = format!("ts-ec={ec_id}");
@@ -1085,6 +1090,7 @@ mod tests {
         let mut ec = EcContext::read_from_request(&settings, &req, &noop_services())
             .expect("should read EC context");
         ec.generate_if_needed(&settings, None)
+            .await
             .expect("should not error when EC already exists");
 
         assert_eq!(

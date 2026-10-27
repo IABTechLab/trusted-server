@@ -19,7 +19,7 @@ feature_ifs=$IFS
 IFS=,
 for feature in $NATIVE_FEATURES; do
   case "$feature" in
-    aws-appconfig-agent|aws-secrets-manager|geo-cloudfront) ;;
+    aws-appconfig-agent|aws-secrets-manager|aws-dynamodb-ec|geo-cloudfront) ;;
     *) echo 'Only the declared native AWS store and CloudFront Geo features are supported' >&2; exit 1 ;;
   esac
 done

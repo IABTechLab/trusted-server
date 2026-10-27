@@ -6,6 +6,8 @@
 
 /// Application routing and handler registration for the Axum dev server.
 pub mod app;
+/// Native live DynamoDB conditional identity storage and provider selection.
+pub mod ec_kv;
 /// Request middleware (auth, response finalisation).
 pub mod middleware;
 /// Explicit native Geo boot profile and provider composition.

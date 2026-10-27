@@ -273,7 +273,7 @@ struct SkippedPartnerId {
 ///
 /// Returns [`TrustedServerError::KvStore`] when the store open or read
 /// fails.
-pub fn handle_admin_ec_lookup(
+pub async fn handle_admin_ec_lookup(
     kv: Option<&KvIdentityGraph>,
     registry: &PartnerRegistry,
     req: &Request<EdgeBody>,
@@ -287,7 +287,7 @@ pub fn handle_admin_ec_lookup(
         Err(response) => return Ok(*response),
     };
 
-    let Some(lookup) = kv.lookup_raw(&ec_id)? else {
+    let Some(lookup) = kv.lookup_raw(&ec_id).await? else {
         log::info!("Admin EC lookup: no entry for '{}'", log_id(&ec_id));
         return Ok(json_error(
             StatusCode::NOT_FOUND,
@@ -742,18 +742,22 @@ mod tests {
             .expect("should build test request")
     }
 
-    fn kv_with_entry(ec_id: &str, entry: &KvEntry) -> KvIdentityGraph {
+    async fn kv_with_entry(ec_id: &str, entry: &KvEntry) -> KvIdentityGraph {
         let kv = KvIdentityGraph::in_memory("test-store");
-        kv.create(ec_id, entry).expect("should seed KV entry");
+        kv.create(ec_id, entry).await.expect("should seed KV entry");
         kv
     }
 
-    fn kv_with_raw_body(ec_id: &str, body: &str) -> KvIdentityGraph {
+    async fn kv_with_raw_body(ec_id: &str, body: &str) -> KvIdentityGraph {
         let metadata = serde_json::json!({ "ok": true, "country": "US", "v": 1 }).to_string();
-        kv_with_raw_body_and_metadata(ec_id, body, &metadata)
+        kv_with_raw_body_and_metadata(ec_id, body, &metadata).await
     }
 
-    fn kv_with_raw_body_and_metadata(ec_id: &str, body: &str, metadata: &str) -> KvIdentityGraph {
+    async fn kv_with_raw_body_and_metadata(
+        ec_id: &str,
+        body: &str,
+        metadata: &str,
+    ) -> KvIdentityGraph {
         let store = InMemoryEcKv::new("test-store");
         store
             .insert(
@@ -765,6 +769,7 @@ mod tests {
                     mode: EcKvWriteMode::Add,
                 },
             )
+            .await
             .expect("should seed raw KV body");
         KvIdentityGraph::new(store)
     }
@@ -971,13 +976,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn returns_entry_with_auction_view() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn returns_entry_with_auction_view() {
         let ec_id = test_ec_id();
-        let kv = kv_with_entry(&ec_id, &sample_entry());
+        let kv = kv_with_entry(&ec_id, &sample_entry()).await;
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
         let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+            .await
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -1037,8 +1043,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn preserves_raw_entry_and_metadata_shapes() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn preserves_raw_entry_and_metadata_shapes() {
         let ec_id = test_ec_id();
         let body = serde_json::json!({
             "v": 1,
@@ -1070,10 +1076,11 @@ mod tests {
             "future_metadata": { "source": "edge" }
         })
         .to_string();
-        let kv = kv_with_raw_body_and_metadata(&ec_id, &body, &metadata);
+        let kv = kv_with_raw_body_and_metadata(&ec_id, &body, &metadata).await;
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
         let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+            .await
             .expect("should handle lookup");
         let json = response_json(response);
 
@@ -1093,14 +1100,15 @@ mod tests {
         assert_eq!(json["auction"]["eids"][0]["source"], "bidstream.example");
     }
 
-    #[test]
-    fn valid_json_with_invalid_entry_schema_remains_visible() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn valid_json_with_invalid_entry_schema_remains_visible() {
         let ec_id = test_ec_id();
         let body = serde_json::json!({ "future": "value" }).to_string();
-        let kv = kv_with_raw_body(&ec_id, &body);
+        let kv = kv_with_raw_body(&ec_id, &body).await;
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
         let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+            .await
             .expect("should handle lookup");
         let json = response_json(response);
 
@@ -1115,17 +1123,19 @@ mod tests {
         assert!(json.get("auction").is_none());
     }
 
-    #[test]
-    fn reports_tombstone_entries() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn reports_tombstone_entries() {
         let ec_id = test_ec_id();
         // Only an identity the store already holds can be tombstoned, so seed
         // the live entry the withdrawal replaces.
         let kv = kv_with_entry(
             &ec_id,
             &KvEntry::minimal("bidstream.example", "uid-live", 1_741_824_000),
-        );
+        )
+        .await;
         assert_eq!(
             kv.write_withdrawal_tombstone(&ec_id, drop)
+                .await
                 .expect("should write tombstone"),
             TombstoneOutcome::Written,
             "should tombstone the seeded identity"
@@ -1133,6 +1143,7 @@ mod tests {
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
         let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+            .await
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -1147,35 +1158,38 @@ mod tests {
         );
     }
 
-    #[test]
-    fn missing_entry_returns_404() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_entry_returns_404() {
         let kv = KvIdentityGraph::in_memory("test-store");
         let req = get_request(&format!("/_ts/admin/ec/{}", test_ec_id()));
 
         let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+            .await
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    #[test]
-    fn invalid_id_returns_400() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_id_returns_400() {
         let kv = KvIdentityGraph::in_memory("test-store");
         let req = get_request("/_ts/admin/ec/not-a-valid-id");
 
         let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+            .await
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    #[test]
-    fn corrupt_entry_returns_parse_error_and_raw_body() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn corrupt_entry_returns_parse_error_and_raw_body() {
         let ec_id = test_ec_id();
-        let kv = kv_with_raw_body(&ec_id, "not json at all");
+        let kv = kv_with_raw_body(&ec_id, "not json at all").await;
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
         let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+            .await
             .expect("should handle lookup");
 
         assert_eq!(
@@ -1203,8 +1217,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn invalid_schema_version_reports_validation_error() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_schema_version_reports_validation_error() {
         let ec_id = test_ec_id();
         let body = serde_json::json!({
             "v": 99,
@@ -1213,10 +1227,11 @@ mod tests {
             "geo": { "country": "US" }
         })
         .to_string();
-        let kv = kv_with_raw_body(&ec_id, &body);
+        let kv = kv_with_raw_body(&ec_id, &body).await;
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
         let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+            .await
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -1235,13 +1250,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bare_route_uses_ts_ec_cookie() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn bare_route_uses_ts_ec_cookie() {
         let ec_id = test_ec_id();
-        let kv = kv_with_entry(&ec_id, &sample_entry());
+        let kv = kv_with_entry(&ec_id, &sample_entry()).await;
         let req = get_request_with_cookie("/_ts/admin/ec", &format!("other=1; ts-ec={ec_id}; x=2"));
 
         let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+            .await
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -1253,20 +1269,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bare_route_uses_last_duplicate_ts_ec_cookie() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn bare_route_uses_last_duplicate_ts_ec_cookie() {
         // `CookieJar` — the parser the live EC lifecycle uses — keeps the last
         // duplicate pair. The diagnostic must inspect that same record, not the
         // first one a header scan would find.
         let stale_ec_id = format!("{}.stale1", "b".repeat(64));
         let live_ec_id = test_ec_id();
-        let kv = kv_with_entry(&live_ec_id, &sample_entry());
+        let kv = kv_with_entry(&live_ec_id, &sample_entry()).await;
         let req = get_request_with_cookie(
             "/_ts/admin/ec",
             &format!("ts-ec={stale_ec_id}; ts-ec={live_ec_id}"),
         );
 
         let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+            .await
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -1278,12 +1295,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bare_route_without_cookie_returns_404() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn bare_route_without_cookie_returns_404() {
         let kv = KvIdentityGraph::in_memory("test-store");
         let req = get_request("/_ts/admin/ec");
 
         let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+            .await
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -1297,12 +1315,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn missing_identity_graph_returns_501() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_identity_graph_returns_501() {
         let req = get_request(&format!("/_ts/admin/ec/{}", test_ec_id()));
 
-        let response =
-            handle_admin_ec_lookup(None, &test_registry(), &req).expect("should handle lookup");
+        let response = handle_admin_ec_lookup(None, &test_registry(), &req)
+            .await
+            .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
@@ -1331,12 +1350,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn kv_read_failure_propagates() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn kv_read_failure_propagates() {
         let kv = KvIdentityGraph::failing("broken-store");
         let req = get_request(&format!("/_ts/admin/ec/{}", test_ec_id()));
 
-        let result = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req);
+        let result = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req).await;
 
         assert!(result.is_err(), "should propagate KV read failures");
     }

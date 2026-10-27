@@ -518,7 +518,14 @@ fn edgezero_main(
             }
             let pull_sync = match (ec_state, settings) {
                 (Some(mut ec_state), Some(settings)) => {
-                    match apply_edgezero_ec_finalize(&settings, &mut ec_state, response) {
+                    // EdgeZero's Fastly response hook is synchronous, and the
+                    // Fastly KV SDK still completes I/O through hostcall waits.
+                    // Keep this bridge in Fastly, never in the native runtime.
+                    match futures::executor::block_on(apply_edgezero_ec_finalize(
+                        &settings,
+                        &mut ec_state,
+                        response,
+                    )) {
                         Ok(registry) => Some((settings, registry, ec_state)),
                         Err(error) => {
                             log::error!("EdgeZero EC finalization failed: {error:?}");
@@ -542,7 +549,9 @@ fn edgezero_main(
                 .as_ref()
                 .is_some_and(|state| state.delivery_observation.completed()) =>
         {
-            run_edgezero_pull_sync_after_send(&settings, &registry, &ec_state);
+            futures::executor::block_on(run_edgezero_pull_sync_after_send(
+                &settings, &registry, &ec_state,
+            ));
         }
         Ok(_) => {}
         Err(error) => {
@@ -600,7 +609,7 @@ fn apply_entry_point_finalize_headers(
     apply_finalize_headers(settings, geo_info.as_ref(), response);
 }
 
-fn apply_edgezero_ec_finalize(
+async fn apply_edgezero_ec_finalize(
     settings: &Settings,
     ec_state: &mut EcFinalizeState,
     response: &mut HttpResponse,
@@ -619,11 +628,12 @@ fn apply_edgezero_ec_finalize(
         ec_state.eids_cookie.as_deref(),
         ec_state.sharedid_cookie.as_deref(),
         response,
-    );
+    )
+    .await;
     Ok(partner_registry)
 }
 
-fn run_edgezero_pull_sync_after_send(
+async fn run_edgezero_pull_sync_after_send(
     settings: &Settings,
     partner_registry: &PartnerRegistry,
     ec_state: &EcFinalizeState,
@@ -647,7 +657,8 @@ fn run_edgezero_pull_sync_after_send(
         &limiter,
         &context,
         &ec_state.services,
-    );
+    )
+    .await;
 }
 
 fn prepare_pull_sync_after_send<F>(
