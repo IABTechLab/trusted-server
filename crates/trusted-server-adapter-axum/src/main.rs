@@ -1,14 +1,16 @@
+use std::convert::Infallible;
 use std::net::SocketAddr;
 
 use axum::Router;
+use axum::body::Body;
+use axum::http::{Request, Response};
 use edgezero_adapter_axum::dev_server::AxumDevServerConfig;
 use edgezero_adapter_axum::service::EdgeZeroAxumService;
 use log::LevelFilter;
 use tokio::net::TcpListener;
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::signal;
-use tower::Service as _;
-use tower::service_fn;
+use tower::{Service, ServiceExt as _, service_fn};
 use trusted_server_adapter_axum::app::TrustedServerApp;
 use trusted_server_adapter_axum::timing::TimingService;
 
@@ -46,7 +48,6 @@ fn main() {
         None => AxumDevServerConfig::default(),
     };
 
-    log::info!("Listening on http://{}", config.addr);
     let service = TrustedServerApp::dev_server_service();
     if let Err(err) = run(service, config) {
         log::error!("trusted-server-adapter-axum failed: {err}");
@@ -59,7 +60,7 @@ fn main() {
 /// `EdgeZeroAxumService`, ahead of `axum::serve`.
 ///
 /// This does not use `edgezero_adapter_axum::dev_server::AxumDevServer::run`:
-/// that helper only accepts a bare [`RouterService`] and builds its own
+/// that helper only accepts a bare [`RouterService`](edgezero_core::router::RouterService) and builds its own
 /// `EdgeZeroAxumService` and `axum::Router` internally, with no seam for an
 /// outer service wrapper. Router-generated 404/405 responses bypass
 /// `RouterBuilder::middleware` (see `trusted_server_adapter_axum::timing`),
@@ -76,7 +77,15 @@ fn run(
     service: TimingService<EdgeZeroAxumService>,
     config: AxumDevServerConfig,
 ) -> std::io::Result<()> {
-    let runtime = RuntimeBuilder::new_multi_thread().enable_all().build()?;
+    let runtime = RuntimeBuilder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("failed to build tokio runtime: {error}"),
+            )
+        })?;
     runtime.block_on(serve(service, config))
 }
 
@@ -91,11 +100,10 @@ async fn serve(
         )
     })?;
 
-    let axum_router = Router::new().fallback_service(service_fn(move |req| {
-        let mut svc = service.clone();
-        async move { svc.call(req).await }
-    }));
-    let make_service = axum_router.into_make_service_with_connect_info::<SocketAddr>();
+    log::info!("Listening on http://{}", listener.local_addr()?);
+
+    let make_service =
+        dev_server_router(service).into_make_service_with_connect_info::<SocketAddr>();
 
     let server = axum::serve(listener, make_service);
     if config.enable_ctrl_c {
@@ -107,6 +115,19 @@ async fn serve(
     } else {
         server.await
     }
+    .map_err(|error| std::io::Error::new(error.kind(), format!("axum server error: {error}")))
+}
+
+fn dev_server_router<S>(service: S) -> Router
+where
+    S: Service<Request<Body>, Response = Response<Body>, Error = Infallible>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send + 'static,
+{
+    Router::new().fallback_service(service_fn(move |req| service.clone().oneshot(req)))
 }
 
 /// Parses an optional `RUST_LOG` value into the logger's maximum level.
@@ -148,10 +169,100 @@ fn port_from_env() -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
+    use std::future::{Ready, ready};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
     use super::*;
 
-    #[test]
-    fn crate_compiles() {}
+    struct ReadinessSensitiveService {
+        polled: bool,
+        readied: bool,
+        pending_polls: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Clone for ReadinessSensitiveService {
+        fn clone(&self) -> Self {
+            Self {
+                polled: false,
+                readied: false,
+                pending_polls: Arc::clone(&self.pending_polls),
+                calls: Arc::clone(&self.calls),
+            }
+        }
+    }
+
+    impl Service<Request<Body>> for ReadinessSensitiveService {
+        type Response = Response<Body>;
+        type Error = Infallible;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            if !self.polled {
+                self.polled = true;
+                self.pending_polls.fetch_add(1, Ordering::Relaxed);
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            self.readied = true;
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request<Body>) -> Self::Future {
+            assert!(
+                self.readied,
+                "should wait for this instance to become ready"
+            );
+            self.readied = false;
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            ready(Ok(Response::builder()
+                .header("cache-control", "private")
+                .body(Body::empty())
+                .expect("should build a private response")))
+        }
+    }
+
+    #[tokio::test]
+    async fn dev_server_bridge_waits_for_readiness_on_timed_and_health_paths() {
+        for path in ["/private", "/health"] {
+            for enabled in [true, false] {
+                let pending_polls = Arc::new(AtomicUsize::new(0));
+                let calls = Arc::new(AtomicUsize::new(0));
+                let router = dev_server_router(TimingService::new(
+                    ReadinessSensitiveService {
+                        polled: false,
+                        readied: false,
+                        pending_polls: Arc::clone(&pending_polls),
+                        calls: Arc::clone(&calls),
+                    },
+                    enabled,
+                ));
+
+                for expected_calls in 1..=2 {
+                    let response = router
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .uri(path)
+                                .body(Body::empty())
+                                .expect("should build a bridge request"),
+                        )
+                        .await
+                        .expect("should serve the request after readiness");
+
+                    assert_eq!(calls.load(Ordering::Relaxed), expected_calls);
+                    assert_eq!(pending_polls.load(Ordering::Relaxed), expected_calls);
+                    assert_eq!(
+                        response.headers().contains_key("server-timing"),
+                        enabled && path != "/health",
+                        "should preserve timing configuration and health exclusion"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn parse_log_level_defaults_to_info_when_unset_or_blank() {

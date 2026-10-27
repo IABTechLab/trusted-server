@@ -10,9 +10,9 @@
 //!
 //! This wraps *outside* `RouterService` rather than registering as
 //! `RouterBuilder::middleware` because the tower boundary is the terminal
-//! freeze point: by the time a response reaches this layer -- after
+//! freeze point. Before a response reaches this layer,
 //! `RouterService::oneshot` inside `EdgeZeroAxumService::call` has
-//! converted any dispatch error into a plain response -- every response is
+//! converted any dispatch error into a plain response. Every response is
 //! covered uniformly regardless of how routing produced it, and the
 //! position survives future routing changes. (In this application's router
 //! a catch-all fallback spans every path and publisher method, so
@@ -24,10 +24,10 @@
 //! collector is even created: this wrapper bypasses timing for every method
 //! on that path, leaving any preinstalled handle unchanged.
 //!
-//! Unlike the Fastly adapter (state built per request, adding
-//! `Phase::AppBuild` to the rendered header), the Axum dev server builds its
-//! application state once at startup. There is no per-request app-build
-//! interval to measure, so `ts-appbuild` never appears in the header here.
+//! The Axum dev server builds its application state once at startup, so
+//! `ts-appbuild` never appears in its per-request header. Fastly records
+//! per-request setup and, on cold requests, application construction in
+//! `Phase::AppBuild`.
 
 use std::convert::Infallible;
 use std::future::Future;
