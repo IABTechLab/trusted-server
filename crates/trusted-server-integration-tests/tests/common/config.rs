@@ -8,6 +8,14 @@ use crate::common::runtime::{TestError, TestResult};
 const GENERATED_AT: &str = "2026-06-23T00:00:00Z";
 const APP_CONFIG: &str = include_str!("../../fixtures/configs/trusted-server.integration.toml");
 
+/// Compile fictional native credentials for the integration feature configuration.
+///
+/// # Errors
+/// Returns a config-generation error if the fixture or native rendering is invalid.
+///
+/// # Examples
+/// Use `integration_native_fixtures("spin")` to obtain the fixture's generated
+/// Spin variable names and public test values.
 pub fn integration_native_fixtures(
     adapter: &str,
 ) -> TestResult<Vec<trusted_server_integration_tests::NativeFixture>> {
@@ -136,16 +144,17 @@ mod tests {
         ] {
             let config = if name == "Viceroy integration template" {
                 let app: trusted_server_core::config::TrustedServerAppConfig =
-                    toml::from_str(super::APP_CONFIG).expect("valid integration config");
+                    toml::from_str(super::APP_CONFIG)
+                        .expect("should deserialize the integration feature configuration");
                 let blocks =
                     trusted_server_integration_tests::fastly_fixture_blocks(&app.into_settings())
-                        .expect("compiled native fixture blocks");
+                        .expect("should compile the Fastly native fixture blocks");
                 let (before, rest) = config
                     .split_once("# BEGIN GENERATED APP SECRET FIXTURES")
-                    .expect("begin marker");
+                    .expect("should find the generated app-secret section start marker");
                 let (_, after) = rest
                     .split_once("# END GENERATED APP SECRET FIXTURES")
-                    .expect("end marker");
+                    .expect("should find the generated app-secret section end marker");
                 format!("{before}{blocks}{after}")
             } else {
                 config.to_owned()
@@ -183,10 +192,10 @@ mod tests {
 
         let config: trusted_server_core::config::TrustedServerAppConfig =
             toml::from_str(include_str!("../../../../trusted-server.example.toml"))
-                .expect("valid example config");
+                .expect("should deserialize the public example configuration");
         let fixtures =
             trusted_server_integration_tests::native_fixtures(&config.into_settings(), "fastly")
-                .expect("compiled native fixtures");
+                .expect("should compile native fixtures for the public example");
         for fixture in fixtures {
             let key = fixture.native.key;
             assert!(

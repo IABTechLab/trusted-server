@@ -24,12 +24,17 @@ use crate::run::RunOutcome;
 const PLAN_VERSION: u32 = 1;
 const NATIVE_MAPPING_VERSION: &str = "trusted-server-native-v1";
 
+/// Native runtime selected for credential planning and presence checks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Adapter {
+    /// Fastly secret-store keys and reviewed direct writes.
     Fastly,
+    /// Axum process-environment credential bindings.
     Axum,
+    /// Cloudflare Worker secret bindings.
     Cloudflare,
+    /// Spin application and component variables.
     Spin,
 }
 
@@ -44,6 +49,7 @@ impl Adapter {
     }
 }
 
+/// Existing deployment selection and unresolved app-config inputs.
 #[derive(Debug, Args)]
 pub(crate) struct TargetArgs {
     #[command(flatten)]
@@ -56,6 +62,7 @@ pub(crate) struct TargetArgs {
     service_id: Option<String>,
 }
 
+/// Arguments for rendering a secret-free native binding plan.
 #[derive(Debug, Args)]
 pub(crate) struct PlanArgs {
     #[command(flatten)]
@@ -65,6 +72,7 @@ pub(crate) struct PlanArgs {
     out: Option<PathBuf>,
 }
 
+/// Arguments for checking reviewed-plan agreement and native presence.
 #[derive(Debug, Args)]
 pub(crate) struct CheckArgs {
     #[command(flatten)]
@@ -74,6 +82,7 @@ pub(crate) struct CheckArgs {
     plan: PathBuf,
 }
 
+/// Arguments for one explicitly approved Fastly credential write.
 #[derive(Debug, Args)]
 pub(crate) struct SetArgs {
     /// Active fixed purpose selector, for example tinybird.auction.
@@ -94,9 +103,13 @@ pub(crate) struct SetArgs {
     yes: bool,
 }
 
+/// Review credential bindings, check presence, or provision one approved value.
 #[derive(Debug, Subcommand)]
 pub(crate) enum SecretsCommand {
     /// Compile active roles and render secret-free native identities and declarations.
+    ///
+    /// Every owner remains in the plan. Only the first identical native request
+    /// carries declaration snippets. Merge Spin component assignments under one header.
     Plan(PlanArgs),
     /// Check reviewed inputs and presence only, never runtime credential validity.
     Check(CheckArgs),
@@ -161,6 +174,7 @@ impl Interaction for Terminal {
 struct PlanEntry<'a> {
     entry_id: String,
     compiled: &'a CompiledBinding,
+    /// Later owners retain native identity metadata but share the first owner's declarations.
     native: NativeBinding,
 }
 
@@ -175,6 +189,24 @@ fn entry_id(binding: &CompiledBinding) -> Result<String, String> {
     let metadata = serde_json::to_value(binding)
         .map_err(|_| "could not encode compiled binding".to_owned())?;
     Ok(format!("binding_{}", canonical_data_sha256(&metadata)))
+}
+
+fn coalesce_native_declarations<'a>(
+    requests: &mut BTreeMap<String, (&'a CompiledBinding, NativeBinding)>,
+    compiled: &'a CompiledBinding,
+    native: &mut NativeBinding,
+) -> Result<(), String> {
+    if let Some((previous, previous_native)) = requests.get(&native.native_name) {
+        // The owning schema path is intentionally excluded. Every context,
+        // target, store/key pair and full native rendering must still match.
+        if !previous.same_authorization(compiled) || previous_native != &*native {
+            return Err("distinct credential contexts collide in the native namespace".to_owned());
+        }
+        native.declarations.clear();
+    } else {
+        requests.insert(native.native_name.clone(), (compiled, native.clone()));
+    }
+    Ok(())
 }
 
 fn prepare(target: &TargetArgs, provider: &dyn Provider) -> Result<Prepared, String> {
@@ -212,20 +244,10 @@ fn prepare(target: &TargetArgs, provider: &dyn Provider) -> Result<Prepared, Str
                         declaration.replace("[component.trusted-server.variables]", &header);
                 }
             }
-            native_by_key.insert(binding.key().to_owned(), native.clone());
-            let request = (
-                binding.scope(),
-                binding.subject(),
-                binding.export(),
-                binding.key(),
-            );
-            if let Some(previous) = native_requests.insert(native.native_name.clone(), request)
-                && previous != request
-            {
-                return Err(
-                    "distinct credential contexts collide in the native namespace".to_owned(),
-                );
-            }
+            coalesce_native_declarations(&mut native_requests, binding, &mut native)?;
+            native_by_key
+                .entry(binding.key().to_owned())
+                .or_insert_with(|| native.clone());
             Ok(PlanEntry {
                 entry_id: entry_id(binding)?,
                 compiled: binding,
@@ -442,6 +464,11 @@ fn execute(
     }
 }
 
+/// Execute a credential command with native transport and terminal interaction.
+///
+/// # Errors
+/// Returns a sanitized error for invalid inputs, plan drift, unsupported operations,
+/// unavailable interaction, or failed provider operations.
 pub(crate) fn run(command: &SecretsCommand) -> Result<RunOutcome, String> {
     let mut out = io::stdout().lock();
     execute(

@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use edgezero_core::app_config::{SecretField, SecretKind, SecretPathSegment};
 use error_stack::Report;
 use http::HeaderValue;
 use serde::Serialize;
@@ -19,16 +20,23 @@ use crate::settings::{
     TrustedClientIpConfig,
 };
 
+/// Versioned domain separator for the context-derived native-key ABI.
 pub const BINDING_ABI_VERSION: &str = "trusted-server-secret-binding-v1";
+/// Logical native store containing all app credential bindings.
 pub const SECRET_STORE_ID: &str = "trusted_server_secrets";
 
 /// Fixed executable-owned purposes, also used for legacy-leaf validation metadata.
 pub struct BindingDescriptor {
+    /// Fixed CLI role selector identifying this credential purpose.
     pub id: &'static str,
+    /// Executable-owned purpose code included in key derivation.
     pub scope: &'static str,
+    /// Former credential path used by validation metadata, with `[]` for collections.
     pub schema_path: &'static str,
+    /// Whether the former validation leaf was optional, not permission to probe.
     pub optional: bool,
 }
+/// Fixed credential purposes shared by compilation and validation metadata.
 pub const DESCRIPTORS: &[BindingDescriptor] = &[
     BindingDescriptor {
         id: "publisher.proxy",
@@ -105,9 +113,14 @@ pub const DESCRIPTORS: &[BindingDescriptor] = &[
 ];
 
 /// Metadata identifies protected validation leaves, not operator-configurable references.
+///
+/// # Examples
+/// ```
+/// use trusted_server_core::secret_bindings::{DESCRIPTORS, secret_fields};
+/// assert_eq!(secret_fields().len(), DESCRIPTORS.len());
+/// ```
 #[must_use]
 pub fn secret_fields() -> Vec<edgezero_core::app_config::SecretField> {
-    use edgezero_core::app_config::{SecretField, SecretKind, SecretPathSegment};
     DESCRIPTORS
         .iter()
         .map(|descriptor| {
@@ -155,11 +168,32 @@ fn invalid(path: &str, category: &str) -> Report<TrustedServerError> {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CompiledTarget {
+    /// A credential use that does not authorize an outbound destination.
     None,
-    Pull { endpoint: String },
-    Tinybird { endpoint: String, dataset: String },
-    DataDome { endpoint: String },
-    S3 { origin: String },
+    /// An approved partner pull-sync endpoint.
+    Pull {
+        /// Normalized HTTPS endpoint before the runtime EC-ID query is added.
+        endpoint: String,
+    },
+    /// An approved Tinybird Events endpoint and dataset.
+    Tinybird {
+        /// Normalized HTTPS Events endpoint without its dataset query.
+        endpoint: String,
+        /// Exact dataset used to build the Events request's `name` query.
+        dataset: String,
+    },
+    /// An approved `DataDome` Protection endpoint.
+    DataDome {
+        /// Complete normalized HTTPS validation endpoint.
+        endpoint: String,
+    },
+    /// An approved S3 origin and its compiled signing context.
+    S3 {
+        /// Normalized HTTPS origin restricting every signed request.
+        origin: String,
+        /// Validated signing region included in the bound route policy.
+        region: String,
+    },
 }
 
 /// Public, secret-free explanation of an executable-owned binding.
@@ -175,36 +209,119 @@ pub struct CompiledBinding {
 }
 
 impl CompiledBinding {
+    /// Return the fixed role selector for this binding.
+    ///
+    /// # Examples
+    /// ```
+    /// # fn inspect(binding: &trusted_server_core::secret_bindings::CompiledBinding) {
+    /// let role = binding.descriptor_id();
+    /// assert!(!role.is_empty());
+    /// # }
+    /// ```
     #[must_use]
     pub fn descriptor_id(&self) -> &str {
         self.descriptor_id
     }
+    /// Return the executable-owned purpose code used in key derivation.
+    ///
+    /// # Examples
+    /// ```
+    /// # fn inspect(binding: &trusted_server_core::secret_bindings::CompiledBinding) {
+    /// assert!(!binding.scope().is_empty());
+    /// # }
+    /// ```
     #[must_use]
     pub fn scope(&self) -> &str {
         self.scope
     }
+    /// Return the concrete schema path of this credential use.
+    ///
+    /// # Examples
+    /// ```
+    /// # fn inspect(binding: &trusted_server_core::secret_bindings::CompiledBinding) {
+    /// assert!(!binding.field_path().is_empty());
+    /// # }
+    /// ```
     #[must_use]
     pub fn field_path(&self) -> &str {
         &self.field_path
     }
+    /// Return the normalized identity components included in key derivation.
+    ///
+    /// # Examples
+    /// ```
+    /// # fn inspect(binding: &trusted_server_core::secret_bindings::CompiledBinding) {
+    /// let identity = binding.subject();
+    /// assert!(!identity.is_empty());
+    /// # }
+    /// ```
     #[must_use]
     pub fn subject(&self) -> &[String] {
         &self.subject
     }
+    /// Return the destination-policy components included in key derivation.
+    ///
+    /// # Examples
+    /// ```
+    /// # fn inspect(binding: &trusted_server_core::secret_bindings::CompiledBinding) {
+    /// let policy = binding.export();
+    /// assert!(!policy.is_empty());
+    /// # }
+    /// ```
     #[must_use]
     pub fn export(&self) -> &[String] {
         &self.export
     }
+    /// Return the complete generated native lookup key.
+    ///
+    /// # Examples
+    /// ```
+    /// # fn inspect(binding: &trusted_server_core::secret_bindings::CompiledBinding) {
+    /// assert!(binding.key().starts_with("ts1_"));
+    /// # }
+    /// ```
     #[must_use]
     pub fn key(&self) -> &str {
         &self.key
     }
+    /// Return the destination compiled together with this lookup identity.
+    ///
+    /// # Examples
+    /// ```
+    /// # fn inspect(binding: &trusted_server_core::secret_bindings::CompiledBinding) {
+    /// let approved_target = binding.target();
+    /// # }
+    /// ```
     #[must_use]
     pub fn target(&self) -> &CompiledTarget {
         &self.target
     }
+
+    /// Compare authorization identity without comparing the owning schema location.
+    ///
+    /// This includes purpose, subject, export policy, derived key, and typed target.
+    /// Physical-request coalescers must separately compare complete native identities.
+    /// Runtime context validation instead uses full equality, including `field_path`.
+    ///
+    /// # Examples
+    /// ```
+    /// # fn inspect(first: &trusted_server_core::secret_bindings::CompiledBinding,
+    /// #            second: &trusted_server_core::secret_bindings::CompiledBinding) {
+    /// let equal_context = first.same_authorization(second);
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn same_authorization(&self, other: &Self) -> bool {
+        self.descriptor_id == other.descriptor_id
+            && self.scope == other.scope
+            && self.subject == other.subject
+            && self.export == other.export
+            && self.key == other.key
+            && self.target == other.target
+    }
 }
 
+/// Secret-free compiled lookups for every active credential use.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BindingPlan {
     abi_version: &'static str,
@@ -212,13 +329,26 @@ pub struct BindingPlan {
 }
 
 impl BindingPlan {
+    /// Return all active compiled uses, including repeated owners of an equal context.
+    ///
+    /// # Examples
+    /// ```
+    /// # fn inspect(binding: &trusted_server_core::secret_bindings::BindingPlan) {
+    /// for entry in binding.entries() {
+    ///     assert!(entry.key().starts_with("ts1_"));
+    /// }
+    /// # }
+    /// ```
     #[must_use]
     pub fn entries(&self) -> &[CompiledBinding] {
         &self.entries
     }
 }
 
-/// No deserialization, serialization, or public arbitrary-use constructor.
+/// Validated credential uses captured together in one loaded snapshot.
+///
+/// These uses cannot be deserialized, serialized, or arbitrarily constructed.
+/// The default value contains no capabilities.
 #[derive(Clone, Default)]
 pub struct ResolvedBindings {
     entries: Vec<ResolvedBinding>,
@@ -232,6 +362,7 @@ impl fmt::Debug for ResolvedBindings {
     }
 }
 
+/// A validated native credential paired with its compiled identity and destination.
 #[derive(Clone)]
 pub struct ResolvedBinding {
     compiled: CompiledBinding,
@@ -249,26 +380,80 @@ impl fmt::Debug for ResolvedBinding {
 }
 
 impl ResolvedBinding {
+    /// Return the context that authorized this native credential lookup.
+    ///
+    /// # Examples
+    /// ```
+    /// # fn inspect(binding: &trusted_server_core::secret_bindings::ResolvedBinding) {
+    /// assert!(binding.compiled().key().starts_with("ts1_"));
+    /// # }
+    /// ```
     #[must_use]
     pub fn compiled(&self) -> &CompiledBinding {
         &self.compiled
     }
+    /// Borrow the exact validated credential value without normalization.
+    ///
+    /// The returned value is sensitive. Do not log it or serialize it into configuration.
+    ///
+    /// # Examples
+    /// ```
+    /// # fn inspect(binding: &trusted_server_core::secret_bindings::ResolvedBinding) {
+    /// assert!(!binding.credential().is_empty());
+    /// # }
+    /// ```
     #[must_use]
     pub fn credential(&self) -> &str {
         &self.credential
     }
+    /// Borrow the prevalidated sensitive Bearer header for supported outbound roles.
+    ///
+    /// # Examples
+    /// ```
+    /// # fn inspect(binding: &trusted_server_core::secret_bindings::ResolvedBinding) {
+    /// if let Some(header) = binding.bearer_header() {
+    ///     assert!(header.is_sensitive());
+    /// }
+    /// # }
+    /// ```
     #[must_use]
     pub fn bearer_header(&self) -> Option<&HeaderValue> {
         self.bearer_header.as_ref()
     }
+    /// Return the identity components captured with this credential.
+    ///
+    /// # Examples
+    /// ```
+    /// # fn inspect(binding: &trusted_server_core::secret_bindings::ResolvedBinding) {
+    /// assert_eq!(binding.subject(), binding.compiled().subject());
+    /// # }
+    /// ```
     #[must_use]
     pub fn subject(&self) -> &[String] {
         self.compiled.subject()
     }
+    /// Return the destination-policy components captured with this credential.
+    ///
+    /// # Examples
+    /// ```
+    /// # fn inspect(binding: &trusted_server_core::secret_bindings::ResolvedBinding) {
+    /// assert_eq!(binding.export(), binding.compiled().export());
+    /// # }
+    /// ```
     #[must_use]
     pub fn export(&self) -> &[String] {
         self.compiled.export()
     }
+    /// Return the approved endpoint or S3 origin, if this use exports a credential.
+    ///
+    /// # Examples
+    /// ```
+    /// # fn inspect(binding: &trusted_server_core::secret_bindings::ResolvedBinding) {
+    /// if let Some(endpoint) = binding.endpoint() {
+    ///     assert!(endpoint.starts_with("https://"));
+    /// }
+    /// # }
+    /// ```
     #[must_use]
     pub fn endpoint(&self) -> Option<&str> {
         match &self.compiled.target {
@@ -276,16 +461,57 @@ impl ResolvedBinding {
             CompiledTarget::Pull { endpoint }
             | CompiledTarget::Tinybird { endpoint, .. }
             | CompiledTarget::DataDome { endpoint } => Some(endpoint),
-            CompiledTarget::S3 { origin } => Some(origin),
+            CompiledTarget::S3 { origin, .. } => Some(origin),
+        }
+    }
+
+    /// Return the named signing region captured with an S3 credential.
+    ///
+    /// Other credential roles have no signing region.
+    ///
+    /// # Examples
+    /// ```
+    /// # fn inspect(binding: &trusted_server_core::secret_bindings::ResolvedBinding) {
+    /// if let Some(region) = binding.s3_region() {
+    ///     assert!(!region.is_empty());
+    /// }
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn s3_region(&self) -> Option<&str> {
+        match &self.compiled.target {
+            CompiledTarget::S3 { region, .. } => Some(region),
+            _ => None,
         }
     }
 }
 
 impl ResolvedBindings {
+    /// Return the validated credential uses belonging to this loaded snapshot.
+    ///
+    /// # Examples
+    /// ```
+    /// # fn inspect(binding: &trusted_server_core::secret_bindings::ResolvedBindings) {
+    /// for loaded in binding.entries() {
+    ///     assert!(!loaded.credential().is_empty());
+    /// }
+    /// # }
+    /// ```
     #[must_use]
     pub fn entries(&self) -> &[ResolvedBinding] {
         &self.entries
     }
+    /// Find a loaded use by fixed role selector and concrete schema path.
+    ///
+    /// This does not validate mutable settings against the captured context.
+    /// Exporter construction must use [`Self::require_for_settings`] instead.
+    ///
+    /// # Examples
+    /// ```
+    /// # fn inspect(bindings: &trusted_server_core::secret_bindings::ResolvedBindings) {
+    /// let loaded = bindings.get("publisher.proxy", "publisher.proxy_secret");
+    /// # }
+    /// ```
     #[must_use]
     pub fn get(&self, descriptor_id: &str, field_path: &str) -> Option<&ResolvedBinding> {
         self.entries.iter().find(|entry| {
@@ -296,6 +522,14 @@ impl ResolvedBindings {
     ///
     /// # Errors
     /// Returns a schema-only error for invalid settings or a changed/missing capability.
+    ///
+    /// # Examples
+    /// ```
+    /// # fn inspect(bindings: &trusted_server_core::secret_bindings::ResolvedBindings,
+    /// #            settings: &trusted_server_core::settings::Settings) {
+    /// let result = bindings.validated_for(settings, "ec.pull", "ec.partners[0].ts_pull_token");
+    /// # }
+    /// ```
     pub fn validated_for(
         &self,
         settings: &Settings,
@@ -303,6 +537,22 @@ impl ResolvedBindings {
         field_path: &str,
     ) -> BindingResult<Option<&ResolvedBinding>> {
         let current = compile_bindings(settings)?;
+        self.validated_for_plan(&current, descriptor_id, field_path)
+    }
+
+    /// Compare a loaded capability against an immutable current compilation.
+    ///
+    /// This borrows one operation-local plan so repeated role checks do not
+    /// recompile unrelated identities, routes, or destinations.
+    ///
+    /// # Errors
+    /// Rejects missing or unequal current/loaded contexts with a schema-only error.
+    pub(crate) fn validated_for_plan(
+        &self,
+        current: &BindingPlan,
+        descriptor_id: &str,
+        field_path: &str,
+    ) -> BindingResult<Option<&ResolvedBinding>> {
         let expected = current
             .entries
             .iter()
@@ -317,13 +567,35 @@ impl ResolvedBindings {
     ///
     /// # Errors
     /// Returns a schema-only error for invalid settings or a changed/missing capability.
+    ///
+    /// # Examples
+    /// ```
+    /// # fn inspect(bindings: &trusted_server_core::secret_bindings::ResolvedBindings,
+    /// #            settings: &trusted_server_core::settings::Settings) {
+    /// let result = bindings.require_for_settings(settings, "publisher.proxy", "publisher.proxy_secret");
+    /// # }
+    /// ```
     pub fn require_for_settings(
         &self,
         settings: &Settings,
         descriptor_id: &str,
         field_path: &str,
     ) -> BindingResult<&ResolvedBinding> {
-        self.validated_for(settings, descriptor_id, field_path)?
+        let current = compile_bindings(settings)?;
+        self.require_for_plan(&current, descriptor_id, field_path)
+    }
+
+    /// Require a loaded capability matching the borrowed operation-local plan.
+    ///
+    /// # Errors
+    /// Rejects inactive, absent, or unequal current/loaded credential contexts.
+    pub(crate) fn require_for_plan(
+        &self,
+        current: &BindingPlan,
+        descriptor_id: &str,
+        field_path: &str,
+    ) -> BindingResult<&ResolvedBinding> {
+        self.validated_for_plan(current, descriptor_id, field_path)?
             .ok_or_else(|| invalid(field_path, "required resolved binding unavailable"))
     }
 }
@@ -372,10 +644,19 @@ fn strings(values: &[&str]) -> Vec<String> {
 }
 
 /// Validate original syntax before URL parsing can erase forbidden distinctions.
+///
 /// Errors contain the supplied schema path, never the input endpoint.
 ///
 /// # Errors
 /// Rejects syntax outside the v1 HTTPS DNS endpoint grammar.
+///
+/// # Examples
+/// ```
+/// use trusted_server_core::secret_bindings::normalize_endpoint;
+/// let endpoint = normalize_endpoint("HTTPS://SYNC.EXAMPLE.COM:443/pull", "ec.partners[0].pull_sync_url")
+///     .expect("should normalize the approved HTTPS endpoint");
+/// assert_eq!(endpoint, "https://sync.example.com/pull");
+/// ```
 pub fn normalize_endpoint(input: &str, field_path: &str) -> BindingResult<String> {
     let fail = || invalid(field_path, "invalid credential endpoint");
     if !input.is_ascii()
@@ -446,6 +727,14 @@ pub fn normalize_endpoint(input: &str, field_path: &str) -> BindingResult<String
 ///
 /// # Errors
 /// Rejects missing/invalid endpoints or mismatched allowlist assertions.
+///
+/// # Examples
+/// ```
+/// use trusted_server_core::secret_bindings::normalize_pull_endpoint;
+/// # fn inspect(partner: &trusted_server_core::settings::EcPartner) {
+/// let endpoint = normalize_pull_endpoint(partner, "ec.partners[0].pull_sync_url");
+/// # }
+/// ```
 pub fn normalize_pull_endpoint(partner: &EcPartner, field_path: &str) -> BindingResult<String> {
     let raw = partner
         .pull_sync_url
@@ -464,10 +753,52 @@ pub fn normalize_pull_endpoint(partner: &EcPartner, field_path: &str) -> Binding
     Ok(endpoint)
 }
 
+/// Compile a Tinybird DNS authority into its fixed HTTPS Events API endpoint.
+///
+/// Callers retain their stage-specific activation and empty-disabled-host rules.
+///
+/// # Errors
+/// Rejects schemes, paths, or syntax outside the shared credential endpoint grammar.
+pub(crate) fn tinybird_events_endpoint(authority: &str) -> BindingResult<String> {
+    if authority.contains('/') {
+        return Err(invalid("tinybird.api_host", "invalid credential endpoint"));
+    }
+    normalize_endpoint(
+        &format!("https://{authority}/v0/events"),
+        "tinybird.api_host",
+    )
+}
+
+/// Validate the existing exact-byte Tinybird datasource identifier grammar.
+///
+/// # Errors
+/// Rejects empty, over-128-byte, or non-ASCII-alphanumeric/underscore identifiers.
+pub(crate) fn validate_tinybird_dataset(value: &str, field_path: &str) -> BindingResult<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(invalid(
+            field_path,
+            "must be a non-empty datasource identifier",
+        ));
+    }
+    Ok(())
+}
+
 /// Compile active roles from effective ordinary settings without reading secrets.
 ///
 /// # Errors
 /// Rejects malformed active identities, destinations, activation, and route policy.
+///
+/// # Examples
+/// ```
+/// use trusted_server_core::{secret_bindings::compile_bindings, settings::Settings};
+/// let plan = compile_bindings(&Settings::default()).expect("should compile the required app roles");
+/// assert_eq!(plan.entries().len(), 2);
+/// ```
 pub fn compile_bindings(settings: &Settings) -> BindingResult<BindingPlan> {
     let mut entries = Vec::new();
     let mut add = |descriptor_id: &'static str,
@@ -580,24 +911,9 @@ pub fn compile_bindings(settings: &Settings) -> BindingResult<BindingPlan> {
         ));
     }
     if settings.tinybird.enabled {
-        let host = &settings.tinybird.api_host;
-        if host.contains('/') {
-            return Err(invalid("tinybird.api_host", "invalid credential endpoint"));
-        }
-        let endpoint =
-            normalize_endpoint(&format!("https://{host}/v0/events"), "tinybird.api_host")?;
+        let endpoint = tinybird_events_endpoint(&settings.tinybird.api_host)?;
         let dataset = &settings.tinybird.auction_dataset;
-        if dataset.is_empty()
-            || dataset.len() > 128
-            || !dataset
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        {
-            return Err(invalid(
-                "tinybird.auction_dataset",
-                "invalid telemetry dataset",
-            ));
-        }
+        validate_tinybird_dataset(dataset, "tinybird.auction_dataset")?;
         add(
             "tinybird.auction",
             "tinybird",
@@ -734,15 +1050,17 @@ pub fn compile_bindings(settings: &Settings) -> BindingResult<BindingPlan> {
             &auth.region,
             query,
         ]);
+        let target = CompiledTarget::S3 {
+            origin,
+            region: auth.region.clone(),
+        };
         add(
             "s3.access-id",
             "s3id",
             format!("{path}.auth.access_key_id"),
             subject.clone(),
             strings(&["s3"]),
-            CompiledTarget::S3 {
-                origin: origin.clone(),
-            },
+            target.clone(),
         )?;
         add(
             "s3.secret",
@@ -750,9 +1068,7 @@ pub fn compile_bindings(settings: &Settings) -> BindingResult<BindingPlan> {
             format!("{path}.auth.secret_access_key"),
             subject.clone(),
             strings(&["s3"]),
-            CompiledTarget::S3 {
-                origin: origin.clone(),
-            },
+            target.clone(),
         )?;
         if auth.session_token_enabled {
             add(
@@ -761,7 +1077,7 @@ pub fn compile_bindings(settings: &Settings) -> BindingResult<BindingPlan> {
                 format!("{path}.auth.session_token"),
                 subject,
                 strings(&["s3"]),
-                CompiledTarget::S3 { origin },
+                target,
             )?;
         }
     }
@@ -791,6 +1107,13 @@ fn bool_value(value: &Value, key: &str, default: bool, path: &str) -> BindingRes
 ///
 /// # Errors
 /// Rejects unknown scopes, invalid UTF-8, empty/placeholder values, and invalid wire representation.
+///
+/// # Examples
+/// ```
+/// use trusted_server_core::secret_bindings::validate_credential;
+/// assert!(validate_credential("tinybird", b"fictional-token").is_ok());
+/// assert!(validate_credential("tinybird", b"fictional-token\n").is_err());
+/// ```
 pub fn validate_credential(scope: &str, bytes: &[u8]) -> BindingResult<()> {
     validate_value(scope, bytes, "secret_bindings")
 }
@@ -853,7 +1176,7 @@ fn validate_value(scope: &str, bytes: &[u8], path: &str) -> BindingResult<()> {
 /// # Errors
 /// Rejects invalid contexts, missing native values, and invalid credentials.
 /// The store is selected by trusted loader/runtime mappings, never app config.
-pub fn resolve_bindings(
+pub(crate) fn resolve_bindings(
     settings: &Settings,
     store: &dyn PlatformSecretStore,
     store_name: &StoreName,
@@ -901,6 +1224,13 @@ pub fn resolve_bindings(
 ///
 /// # Errors
 /// Returns only a schema path and fixed migration category for removed inputs.
+///
+/// # Examples
+/// ```
+/// use trusted_server_core::secret_bindings::reject_removed_references;
+/// let value = serde_json::json!({"publisher": {"proxy_secret": "removed-label"}});
+/// assert!(reject_removed_references(&value).is_err());
+/// ```
 pub fn reject_removed_references(value: &Value) -> BindingResult<()> {
     for (path, field) in [
         ("publisher", "proxy_secret"),
@@ -956,6 +1286,13 @@ pub fn reject_removed_references(value: &Value) -> BindingResult<()> {
 ///
 /// # Errors
 /// Rejects malformed endpoint syntax or collections, including inactive features.
+///
+/// # Examples
+/// ```
+/// use trusted_server_core::secret_bindings::validate_original_endpoints;
+/// let value = serde_json::json!({"tinybird": {"api_host": "api.example.com:8443"}});
+/// assert!(validate_original_endpoints(&value).is_ok());
+/// ```
 pub fn validate_original_endpoints(value: &Value) -> BindingResult<()> {
     if let Some(partners) = value.pointer("/ec/partners") {
         let items = collection_items(partners, "ec.partners")?;
@@ -988,10 +1325,7 @@ pub fn validate_original_endpoints(value: &Value) -> BindingResult<()> {
             .as_str()
             .ok_or_else(|| invalid("tinybird.api_host", "invalid credential endpoint"))?;
         if !host.is_empty() {
-            if host.contains('/') {
-                return Err(invalid("tinybird.api_host", "invalid credential endpoint"));
-            }
-            normalize_endpoint(&format!("https://{host}/v0/events"), "tinybird.api_host")?;
+            tinybird_events_endpoint(host)?;
         }
     }
     if let Some(routes) = value.pointer("/proxy/asset_routes") {
@@ -1032,10 +1366,15 @@ fn collection_items(node: &Value, path: &str) -> BindingResult<Vec<Value>> {
 /// Exact adapter-native identity for the fixed TS logical store.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct NativeBinding {
+    /// Runtime adapter whose native identity this entry describes.
     pub adapter: String,
+    /// Logical credential-store identity, independent of its physical mapping.
     pub store_id: String,
+    /// Generated context-derived lookup key before native name mapping.
     pub key: String,
+    /// Exact native store key, environment name, or component-variable lookup name.
     pub native_name: String,
+    /// Native configuration declarations required for this plan entry.
     pub declarations: Vec<String>,
 }
 
@@ -1043,6 +1382,15 @@ pub struct NativeBinding {
 ///
 /// # Errors
 /// Rejects unknown adapters, non-TS logical stores, and non-generated keys.
+///
+/// # Examples
+/// ```
+/// use trusted_server_core::{secret_bindings::{SECRET_STORE_ID, compile_bindings, render_native}, settings::Settings};
+/// let plan = compile_bindings(&Settings::default()).expect("should compile required app bindings");
+/// let native = render_native("axum", SECRET_STORE_ID, plan.entries()[0].key())
+///     .expect("should render the generated Axum identity");
+/// assert!(native.native_name.starts_with("TRUSTED_SERVER_SECRET_"));
+/// ```
 pub fn render_native(
     adapter: &str,
     logical_store: &str,
@@ -1058,6 +1406,15 @@ pub fn render_native(
 ///
 /// # Errors
 /// Rejects invalid role identities or a mapping unsupported by the native bridge.
+///
+/// # Examples
+/// ```
+/// use trusted_server_core::{secret_bindings::{SECRET_STORE_ID, compile_bindings, render_native_with_mapping}, settings::Settings};
+/// let plan = compile_bindings(&Settings::default()).expect("should compile required app bindings");
+/// let native = render_native_with_mapping("axum", SECRET_STORE_ID, plan.entries()[0].key(), "stage_secrets")
+///     .expect("should render the selected trusted store mapping");
+/// assert!(native.native_name.starts_with("TRUSTED_SERVER_SECRET_STAGE_SECRETS_"));
+/// ```
 pub fn render_native_with_mapping(
     adapter: &str,
     logical_store: &str,
@@ -1101,6 +1458,13 @@ pub fn render_native_with_mapping(
 }
 
 /// Native Axum environment mapping, shared with the runtime bridge.
+///
+/// # Examples
+/// ```
+/// use trusted_server_core::secret_bindings::axum_secret_name;
+/// assert_eq!(axum_secret_name("example-store", "example-key"),
+///     "TRUSTED_SERVER_SECRET_EXAMPLE_STORE_EXAMPLE_KEY");
+/// ```
 #[must_use]
 pub fn axum_secret_name(store: &str, key: &str) -> String {
     let normalize = |value: &str| value.to_uppercase().replace(['-', '.', ' '], "_");
@@ -1115,6 +1479,14 @@ pub fn axum_secret_name(store: &str, key: &str) -> String {
 ///
 /// # Errors
 /// Rejects identity components outside the existing Spin encoder grammar.
+///
+/// # Examples
+/// ```
+/// use trusted_server_core::secret_bindings::spin_secret_name;
+/// let name = spin_secret_name("example_store", "example-key")
+///     .expect("should encode the native Spin identity");
+/// assert_eq!(name, "v_example_x5fstore_v_example_x2dkey");
+/// ```
 pub fn spin_secret_name(store: &str, key: &str) -> BindingResult<String> {
     Ok(format!(
         "{}_{}",

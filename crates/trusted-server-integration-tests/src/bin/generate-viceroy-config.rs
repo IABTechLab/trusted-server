@@ -305,10 +305,11 @@ mod tests {
     }
 
     fn integration_secret_store() -> IntegrationSecretStore {
-        let settings = fixture_settings(APP_CONFIG, None).expect("valid fixture");
+        let settings = fixture_settings(APP_CONFIG, None)
+            .expect("should deserialize the integration fixture settings");
         IntegrationSecretStore {
             values: native_fixtures(&settings, "fastly")
-                .expect("compiled native fixtures")
+                .expect("should compile the integration native credentials")
                 .into_iter()
                 .map(|fixture| (fixture.native.key, fixture.value.into_bytes()))
                 .collect(),
@@ -422,21 +423,27 @@ mod tests {
 
     #[test]
     fn generated_native_fixtures_load_the_production_envelope() {
-        let settings = fixture_settings(APP_CONFIG, None).expect("valid fixture");
-        let envelope = build_app_config_envelope(APP_CONFIG, None).expect("valid envelope");
-        let native =
-            inject_native_fixtures(TEMPLATE, &settings, "fastly").expect("native fixtures");
-        let parsed: toml::Value = toml::from_str(&native).expect("valid generated TOML");
+        let settings = fixture_settings(APP_CONFIG, None)
+            .expect("should deserialize the integration fixture settings");
+        let envelope = build_app_config_envelope(APP_CONFIG, None)
+            .expect("should build the validated integration config envelope");
+        let native = inject_native_fixtures(TEMPLATE, &settings, "fastly")
+            .expect("should inject compiler-generated Fastly fixture blocks");
+        let parsed: toml::Value =
+            toml::from_str(&native).expect("should parse the generated Fastly fixture TOML");
         let values = parsed["local_server"]["secret_stores"]["trusted_server_secrets"]
             .as_array()
-            .expect("native fixture store")
+            .expect("should expose the generated logical secret-store entries")
             .iter()
             .map(|entry| {
                 (
-                    entry["key"].as_str().expect("native key").to_owned(),
+                    entry["key"]
+                        .as_str()
+                        .expect("should expose the generated native key")
+                        .to_owned(),
                     entry["data"]
                         .as_str()
-                        .expect("fictional value")
+                        .expect("should expose the fictional raw credential value")
                         .as_bytes()
                         .to_vec(),
                 )
@@ -447,7 +454,7 @@ mod tests {
             &IntegrationSecretStore { values },
             &StoreName::from("trusted_server_secrets"),
         )
-        .expect("actual generated native values load");
+        .expect("should load the production envelope using generated native values");
         assert!(
             loaded
                 .ec
@@ -457,18 +464,23 @@ mod tests {
         );
         assert_eq!(
             native,
-            inject_native_fixtures(&native, &settings, "fastly").expect("idempotent generation")
+            inject_native_fixtures(&native, &settings, "fastly")
+                .expect("should leave generated fixture blocks unchanged on a second injection")
         );
     }
 
     #[test]
     fn spin_fixtures_declare_both_native_variable_levels_without_values() {
-        let settings = fixture_settings(APP_CONFIG, None).expect("valid fixture");
+        let settings = fixture_settings(APP_CONFIG, None)
+            .expect("should deserialize the integration fixture settings");
         let template = "# BEGIN GENERATED APP SECRET VARIABLES\n# END GENERATED APP SECRET VARIABLES\n[component.trusted-server.variables]\n# BEGIN GENERATED APP SECRET COMPONENT\n# END GENERATED APP SECRET COMPONENT\n";
-        let generated =
-            inject_native_fixtures(template, &settings, "spin").expect("native declarations");
-        let parsed: toml::Value = toml::from_str(&generated).expect("valid native declarations");
-        for fixture in native_fixtures(&settings, "spin").expect("compiled native fixtures") {
+        let generated = inject_native_fixtures(template, &settings, "spin")
+            .expect("should generate both Spin declaration levels");
+        let parsed: toml::Value = toml::from_str(&generated)
+            .expect("should parse the generated Spin declarations as TOML");
+        for fixture in native_fixtures(&settings, "spin")
+            .expect("should compile the native Spin fixture identities")
+        {
             let name = fixture.native.native_name;
             assert_eq!(parsed["variables"][&name]["secret"].as_bool(), Some(true));
             assert_eq!(parsed["variables"][&name]["required"].as_bool(), Some(true));
@@ -477,6 +489,70 @@ mod tests {
                 Some(format!("{{{{ {name} }}}}").as_str())
             );
             assert!(!generated.contains(&fixture.value));
+        }
+    }
+
+    #[test]
+    fn equal_handler_owners_generate_valid_cloudflare_and_spin_manifests() {
+        let config =
+            format!("{APP_CONFIG}\n[[handlers]]\npath = \"^/_ts/admin\"\nusername = \"admin\"\n");
+        let settings = fixture_settings(&config, None)
+            .expect("should parse integration configuration with two equal handler owners");
+        let plan = trusted_server_core::secret_bindings::compile_bindings(&settings)
+            .expect("should preserve both equal handler owners in the compiled plan");
+        assert_eq!(plan.entries().len(), 6);
+
+        let cloudflare = inject_native_fixtures(
+            include_str!("../../../trusted-server-adapter-cloudflare/wrangler.ci.toml"),
+            &settings,
+            "cloudflare",
+        )
+        .expect("should emit each equal Cloudflare native binding once");
+        let cloudflare: toml::Value = toml::from_str(&cloudflare)
+            .expect("should parse the complete Cloudflare manifest with equal handlers");
+        let fixtures = native_fixtures(&settings, "cloudflare")
+            .expect("should compile five physical Cloudflare fixtures for six owner rows");
+        assert_eq!(fixtures.len(), 5);
+        let vars = cloudflare["vars"]
+            .as_table()
+            .expect("should retain the Cloudflare vars table");
+        assert_eq!(
+            vars.keys().filter(|name| name.starts_with("ts1_")).count(),
+            5
+        );
+        for fixture in fixtures {
+            assert_eq!(
+                vars[&fixture.native.native_name].as_str(),
+                Some(fixture.value.as_str())
+            );
+        }
+
+        let spin = inject_native_fixtures(
+            include_str!("../../../trusted-server-adapter-spin/spin.toml"),
+            &settings,
+            "spin",
+        )
+        .expect("should emit both Spin declaration levels once per physical request");
+        let spin: toml::Value = toml::from_str(&spin)
+            .expect("should parse the complete Spin manifest with equal handlers");
+        let application = spin["variables"]
+            .as_table()
+            .expect("should retain the Spin application variables table");
+        let component = spin["component"]["trusted-server"]["variables"]
+            .as_table()
+            .expect("should retain the Spin component variables table");
+        assert_eq!(application.len(), 5);
+        assert_eq!(component.len(), 5);
+        for fixture in native_fixtures(&settings, "spin")
+            .expect("should compile the coalesced Spin fixture identities")
+        {
+            let name = fixture.native.native_name;
+            assert_eq!(application[&name]["secret"].as_bool(), Some(true));
+            assert_eq!(application[&name]["required"].as_bool(), Some(true));
+            assert_eq!(
+                component[&name].as_str(),
+                Some(format!("{{{{ {name} }}}}").as_str())
+            );
         }
     }
 
@@ -494,7 +570,7 @@ mod tests {
             ]
             .map(str::to_owned),
         )
-        .expect("offline fixture output");
+        .expect("should parse bindings-only output without a template");
         assert!(args.bindings_only);
         assert_eq!(args.adapter, "axum");
     }
@@ -502,10 +578,11 @@ mod tests {
     #[test]
     fn public_starter_generates_native_fixtures_but_not_a_deployable_envelope() {
         const EXAMPLE: &str = include_str!("../../../../trusted-server.example.toml");
-        let settings = fixture_settings(EXAMPLE, None).expect("starter schema is valid");
+        let settings =
+            fixture_settings(EXAMPLE, None).expect("should deserialize the public starter schema");
         for adapter in ["fastly", "axum", "cloudflare", "spin"] {
             let fixtures = native_fixtures(&settings, adapter)
-                .expect("starter placeholders do not change binding policy");
+                .expect("should compile binding policy despite ordinary starter placeholders");
             assert_eq!(
                 fixtures.len(),
                 3,
@@ -514,17 +591,19 @@ mod tests {
         }
         let fastly =
             inject_native_fixtures(include_str!("../../../../fastly.toml"), &settings, "fastly")
-                .expect("local Fastly fixtures render from the public starter");
-        toml::from_str::<toml::Value>(&fastly).expect("valid local Fastly manifest");
+                .expect("should render local Fastly fixtures from the public starter");
+        toml::from_str::<toml::Value>(&fastly)
+            .expect("should parse the generated local Fastly manifest");
         let spin = inject_native_fixtures(
             include_str!("../../../trusted-server-adapter-spin/spin.toml"),
             &settings,
             "spin",
         )
-        .expect("local Spin declarations render from the public starter");
-        toml::from_str::<toml::Value>(&spin).expect("valid local Spin manifest");
+        .expect("should render local Spin declarations from the public starter");
+        toml::from_str::<toml::Value>(&spin)
+            .expect("should parse the generated local Spin manifest");
         let error = build_app_config_envelope(EXAMPLE, None)
-            .expect_err("native-only fixture generation must not waive envelope validation");
+            .expect_err("should reject starter placeholders when building a deployable envelope");
         let message = error.to_string();
         assert!(message.contains("Insecure default"));
         assert!(message.contains("publisher.domain"));

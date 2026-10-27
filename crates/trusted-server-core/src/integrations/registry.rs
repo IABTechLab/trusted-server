@@ -841,8 +841,8 @@ impl IntegrationRegistry {
                 binding.target(),
                 crate::secret_bindings::CompiledTarget::None
             ) {
-                settings.resolved_bindings.require_for_settings(
-                    settings,
+                settings.resolved_bindings.require_for_plan(
+                    &bindings,
                     binding.descriptor_id(),
                     binding.field_path(),
                 )?;

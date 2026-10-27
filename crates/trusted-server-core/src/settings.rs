@@ -24,6 +24,7 @@ use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
 use crate::redacted::Redacted;
+use crate::secret_bindings::{tinybird_events_endpoint, validate_tinybird_dataset};
 
 #[cfg(test)]
 pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
@@ -2032,35 +2033,13 @@ impl TinybirdSettings {
         if !self.enabled {
             return Ok(());
         }
-        validate_tinybird_api_host(&self.api_host)?;
+        tinybird_events_endpoint(&self.api_host)?;
         validate_tinybird_dataset(&self.auction_dataset, "tinybird.auction_dataset")?;
         if let Some(token) = &self.auction_token_secret {
             validate_tinybird_secret(token.expose(), "tinybird.auction_token_secret")?;
         }
         Ok(())
     }
-}
-
-fn validate_tinybird_api_host(host: &str) -> Result<(), Report<TrustedServerError>> {
-    crate::secret_bindings::normalize_endpoint(
-        &format!("https://{host}/v0/events"),
-        "tinybird.api_host",
-    )
-    .map(|_| ())
-}
-
-fn validate_tinybird_dataset(value: &str, setting: &str) -> Result<(), Report<TrustedServerError>> {
-    if value.is_empty()
-        || value.len() > 128
-        || !value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-    {
-        return Err(Report::new(TrustedServerError::Configuration {
-            message: format!("{setting} must be a non-empty datasource identifier"),
-        }));
-    }
-    Ok(())
 }
 
 fn validate_tinybird_secret(value: &str, setting: &str) -> Result<(), Report<TrustedServerError>> {
@@ -4072,7 +4051,7 @@ mod tests {
         let value = serde_json::to_value(&settings).expect("should serialize settings");
 
         serde_json::from_value::<BaseRevisionSettings>(value)
-            .expect("base revision top-level key set should accept the serialized fields");
+            .expect("should accept serialized fields within the base revision top-level key set");
     }
 
     #[test]
@@ -4868,6 +4847,135 @@ mod tests {
             value.get("auction_html_comment_options").is_some(),
             "non-default options must still serialize, got {value}"
         );
+    }
+
+    #[test]
+    fn tinybird_shared_helpers_match_active_compiler_and_settings_validation() {
+        for (authority, endpoint) in [
+            ("api.example.com", "https://api.example.com/v0/events"),
+            ("API.EXAMPLE.COM:443", "https://api.example.com/v0/events"),
+            (
+                "api.example.com:8443",
+                "https://api.example.com:8443/v0/events",
+            ),
+        ] {
+            let mut tinybird = TinybirdSettings {
+                enabled: true,
+                api_host: authority.to_owned(),
+                ..TinybirdSettings::default()
+            };
+            assert_eq!(
+                tinybird_events_endpoint(authority)
+                    .expect("should compile an accepted Tinybird authority"),
+                endpoint
+            );
+            crate::secret_bindings::validate_original_endpoints(
+                &json!({"tinybird":{"api_host":authority}}),
+            )
+            .expect("should accept the same original authority before normalization");
+            tinybird
+                .prepare_runtime()
+                .expect("should validate accepted Tinybird settings through shared helpers");
+            let settings = Settings {
+                tinybird,
+                ..Default::default()
+            };
+            let plan = crate::secret_bindings::compile_bindings(&settings)
+                .expect("should compile active settings with the same Tinybird authority");
+            let binding = plan
+                .entries()
+                .iter()
+                .find(|entry| entry.descriptor_id() == "tinybird.auction")
+                .expect("should include the active Tinybird auction binding");
+            assert_eq!(binding.export()[1], endpoint);
+        }
+        for authority in [
+            "https://api.example.com",
+            "api.example.com/events",
+            "@api.example.com",
+            "api.example.com?",
+            "api.example.com:0",
+        ] {
+            assert!(tinybird_events_endpoint(authority).is_err());
+            assert!(
+                crate::secret_bindings::validate_original_endpoints(
+                    &json!({"tinybird":{"api_host":authority}})
+                )
+                .is_err()
+            );
+            let mut tinybird = TinybirdSettings {
+                enabled: true,
+                api_host: authority.to_owned(),
+                ..TinybirdSettings::default()
+            };
+            assert!(tinybird.prepare_runtime().is_err());
+            let settings = Settings {
+                tinybird,
+                ..Default::default()
+            };
+            assert!(crate::secret_bindings::compile_bindings(&settings).is_err());
+        }
+        for dataset in [
+            "events_1".to_owned(),
+            "a".repeat(128),
+            String::new(),
+            " events".to_owned(),
+            "é".to_owned(),
+            "a".repeat(129),
+            "events-1".to_owned(),
+        ] {
+            let expected = validate_tinybird_dataset(&dataset, "tinybird.auction_dataset").is_ok();
+            let mut tinybird = TinybirdSettings {
+                enabled: true,
+                api_host: "api.example.com".to_owned(),
+                auction_dataset: dataset,
+                ..TinybirdSettings::default()
+            };
+            assert_eq!(tinybird.prepare_runtime().is_ok(), expected);
+            let settings = Settings {
+                tinybird,
+                ..Default::default()
+            };
+            assert_eq!(
+                crate::secret_bindings::compile_bindings(&settings).is_ok(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn tinybird_shared_helpers_preserve_stage_specific_activation_and_original_checks() {
+        let mut disabled = TinybirdSettings::default();
+        disabled
+            .prepare_runtime()
+            .expect("should retain disabled Tinybird settings with an empty authority");
+        let settings = Settings::default();
+        assert_eq!(
+            crate::secret_bindings::compile_bindings(&settings)
+                .expect("should compile only required app roles when Tinybird is disabled")
+                .entries()
+                .len(),
+            2
+        );
+        crate::secret_bindings::validate_original_endpoints(
+            &json!({"tinybird":{"enabled":false,"api_host":""}}),
+        )
+        .expect("should preserve the disabled empty-authority raw-config case");
+        assert!(tinybird_events_endpoint("").is_err());
+        for authority in [
+            " api.example.com",
+            "api.example.com ",
+            "api.example.com/path",
+        ] {
+            assert!(
+                crate::secret_bindings::validate_original_endpoints(
+                    &json!({"tinybird":{"enabled":false,"api_host":authority}})
+                )
+                .is_err()
+            );
+        }
+        disabled.enabled = true;
+        assert!(disabled.prepare_runtime().is_err());
     }
 
     #[test]

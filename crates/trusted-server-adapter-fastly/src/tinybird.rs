@@ -11,12 +11,8 @@ use trusted_server_core::auction::telemetry::{
 };
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
-#[cfg(test)]
-use trusted_server_core::redacted::Redacted;
 use trusted_server_core::secret_bindings::{CompiledTarget, ResolvedBinding};
 use trusted_server_core::settings::Settings;
-#[cfg(test)]
-use trusted_server_core::settings::TinybirdSettings;
 
 const TINYBIRD_NDJSON_CONTENT_TYPE: &str = "application/x-ndjson";
 const TINYBIRD_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -24,6 +20,10 @@ const TINYBIRD_BETWEEN_BYTES_TIMEOUT: Duration = Duration::from_secs(2);
 const TINYBIRD_MAX_ROWS_PER_AUCTION_BATCH: usize = 512;
 
 /// Build the configured auction telemetry sink from a loaded credential use.
+///
+/// # Errors
+/// Returns a configuration error if enabled telemetry lacks a matching loaded
+/// credential binding or a valid compiled target.
 pub(crate) fn auction_sink_from_settings(
     settings: &Settings,
 ) -> Result<Arc<dyn AuctionTelemetrySink>, Report<TrustedServerError>> {
@@ -210,8 +210,11 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
+    use edgezero_core::blob_envelope::BlobEnvelope;
     use error_stack::Report;
     use trusted_server_core::auction::telemetry::{AuctionEventBatch, AuctionEventRow};
+    use trusted_server_core::config::TrustedServerAppConfig;
+    use trusted_server_core::config_payload::settings_from_config_blob;
     use trusted_server_core::platform::{
         ClientInfo, PlatformBackend, PlatformConfigStore, PlatformError, PlatformGeo,
         PlatformHttpClient, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
@@ -436,23 +439,23 @@ mod tests {
     }
 
     fn enabled_config_for_host(api_host: &str) -> Settings {
-        let mut settings = Settings {
-            tinybird: TinybirdSettings {
-                enabled: true,
-                api_host: api_host.to_owned(),
-                secret_store: None,
-                auction_dataset: "auction_events_raw".to_owned(),
-                auction_token_secret: Some(Redacted::new("append-token".to_owned())),
-                access_enabled: false,
-                access_dataset: "access_logs_raw".to_owned(),
-                access_token_secret: None,
-                access_sample_rate: 0.0,
-                max_body_bytes: 1024 * 1024,
+        let config: TrustedServerAppConfig = serde_json::from_value(serde_json::json!({
+            "publisher": {
+                "domain": "publisher.example.com",
+                "cookie_domain": ".publisher.example.com",
+                "origin_url": "https://origin.publisher.example.com"
             },
-            ..Default::default()
-        };
-        let plan = trusted_server_core::secret_bindings::compile_bindings(&settings)
-            .expect("should compile test plan");
+            "handlers": [{ "path": "^/_ts/admin", "username": "admin" }],
+            "tinybird": {
+                "enabled": true,
+                "api_host": api_host,
+                "auction_dataset": "auction_events_raw",
+                "max_body_bytes": 1024 * 1024
+            }
+        }))
+        .expect("should parse the fictional Tinybird feature configuration");
+        let plan = trusted_server_core::secret_bindings::compile_bindings(config.settings())
+            .expect("should compile the fictional Tinybird credential lookups");
         let store = MapSecretStore(
             plan.entries()
                 .iter()
@@ -466,13 +469,19 @@ mod tests {
                 })
                 .collect(),
         );
-        settings.resolved_bindings = trusted_server_core::secret_bindings::resolve_bindings(
-            &settings,
+        let data = serde_json::to_value(&config)
+            .expect("should serialize the unresolved Tinybird feature configuration");
+        let envelope =
+            serde_json::to_string(&BlobEnvelope::new(data, "2026-10-26T00:00:00Z".to_owned()))
+                .expect("should encode the fictional Tinybird config envelope");
+        settings_from_config_blob(
+            &envelope,
             &store,
             &StoreName::from(trusted_server_core::secret_bindings::SECRET_STORE_ID),
         )
-        .expect("should resolve fictional native bindings");
-        settings
+        .expect("should fully load the fictional Tinybird config and native credentials")
+        .settings()
+        .clone()
     }
 
     #[test]

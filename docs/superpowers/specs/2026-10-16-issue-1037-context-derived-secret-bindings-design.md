@@ -4,7 +4,7 @@
 
 For [issue #1037](https://github.com/IABTechLab/trusted-server/issues/1037), keep credentials as raw native secret values. Derive each physical secret key from its schema-owned purpose, actual identity, and approved destination or route policy. Operators configure the feature and provide its credential, but do not invent a reference label or physical key. Provisioning a value at the generated key authorizes that particular use. Changing an authorization-relevant input selects a different key, not the same credential with new permissions.
 
-This is the selected design, not an implemented security fix. The operator workflow now includes context-aware Fastly writes through existing deployment configuration, rather than requiring manual key copying. Implementation, provisioning guides, migration tooling, and native runtime proof remain required before the issue can close. The [implementation plan](../plans/2026-10-26-issue-1037-secret-bindings-implementation-plan.md) defines the work sequence.
+Implementation is under review on `feature/1037-secret-bindings`. The shared compiler, atomic loader, exporters, secure Fastly CLI, guides, and native fixture generation are implemented. This is not a released security fix. Native HTTPS/no-follow behavior, IAM separation, protected CI execution, and migration rehearsals remain release gates. The [implementation plan](../plans/2026-10-26-issue-1037-secret-bindings-implementation-plan.md) defines the work sequence.
 
 This revision replaces the earlier label-bearing draft before any binding ABI has shipped. There is no compatibility lookup for that draft's names.
 
@@ -30,7 +30,7 @@ Source observations at that revision:
 | `trusted-server-core/src/proxy.rs`; `trusted-server-core/src/s3_sigv4.rs`                                      | S3 exports its access ID and optional session token, signs the final target, and has signing/preflight paths beyond the primary GET.                                                              |
 | Adapter `app.rs` files; `trusted-server-adapter-fastly/src/main.rs`                                            | Settings-only builders, registry construction, retained state, diagnostic loads, and finalization fallback reloads all need the loaded-use boundary.                                              |
 
-Pinned EdgeZero v0.0.9 at `f7176742d46aa4d1a04ce4588b606afda388fd30` exposes only path, kind, and optionality in secret metadata. Its CLI walks raw references in two places, and its Spin validator applies native-looking syntax and lowercased duplicate checks to those references. A companion lookup-plan change is required below.
+At the investigation base, EdgeZero v0.0.9 at `f7176742d46aa4d1a04ce4588b606afda388fd30` exposed only path, kind, and optionality in secret metadata. Its CLI walks raw references in two places, and its Spin validator applies native-looking syntax and lowercased duplicate checks to those references. A companion lookup-plan change is required below.
 
 These are source observations, not executable security proof. An isolated fictional encoding model supports the naming contract, but no shipping Rust implementation or provider runtime has verified it.
 
@@ -182,7 +182,7 @@ The same parser supplies both derivation inputs and actual exporter targets. Nev
 
 All credential-bearing flows require certificate and hostname verification independently of `proxy.certificate_check`. Backend reuse must not inherit weaker TLS settings. Each HTTP operation sends once and never follows redirects, even on the same host. Legitimate S3 HEAD/GET preflight operations may remain separate operations, all confined to the same bound origin; "one send" does not prohibit that existing flow.
 
-Exporters that observe a response treat 3xx as unsuccessful and never retry at `Location`. Preserve Tinybird's existing fire-and-forget behavior in this change. Its guarantee is no automatic redirect following, not observed classification of a response whose pending handle is dropped. Claiming observed delivery/3xx failure would require a separately specified response-observation change.
+Exporters that observe a response treat 3xx as unsuccessful and never retry at `Location`. DataDome's recognized 301/302 challenge verdicts retain their existing challenge/failure handling; they never trigger an HTTP client redirect. Preserve Tinybird's existing fire-and-forget behavior in this change. Its guarantee is no automatic redirect following, not observed classification of a response whose pending handle is dropped. Claiming observed delivery/3xx failure would require a separately specified response-observation change.
 
 Validate header, form, and signing representation before backend creation. Pull and Tinybird require nonempty RFC 6750 b64token values plus existing length/placeholder checks. Build sensitive headers without panics. Safely encode DataDome form data, validate S3 header material, and redact access IDs as well as secret/session keys. Preserve credential bytes exactly. Native provider value limits still apply; there is no new JSON-record size limit.
 

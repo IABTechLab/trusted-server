@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
 use clap::Parser;
@@ -279,6 +279,209 @@ fn secrets_cli_spin_implicit_and_ambiguous_component_selection_reuses_lifecycle_
     assert!(fixture.transport.methods.borrow().is_empty());
 }
 
+#[test]
+fn secrets_cli_identical_handler_owners_share_physical_declarations() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.temp.path().join("trusted-server.toml"),
+        format!("{CONFIG}\n[[handlers]]\npath='^/_ts/admin'\nusername='admin'\n[[handlers]]\npath='^/_ts/admin'\nusername='admin'\n"),
+    ).expect("should configure identical handler owners");
+    for adapter in ["spin", "cloudflare"] {
+        let (result, output) =
+            fixture.run(&["plan", "--adapter", adapter], &mut FakeInput::default());
+        result.expect("should plan every owner of a shared native request");
+        let plan: Value = serde_json::from_str(&output).expect("should decode shared-binding plan");
+        let entries = plan["entries"]
+            .as_array()
+            .expect("should retain compiled owners");
+        assert_eq!(entries.len(), 5);
+        let handlers = entries
+            .iter()
+            .filter(|entry| entry["compiled"]["descriptor_id"] == "handler.password")
+            .collect::<Vec<_>>();
+        assert_eq!(handlers.len(), 2);
+        assert_ne!(handlers[0]["entry_id"], handlers[1]["entry_id"]);
+        assert_ne!(
+            handlers[0]["compiled"]["field_path"],
+            handlers[1]["compiled"]["field_path"]
+        );
+        for field in [
+            "descriptor_id",
+            "scope",
+            "subject",
+            "export",
+            "target",
+            "key",
+        ] {
+            assert_eq!(
+                handlers[0]["compiled"][field],
+                handlers[1]["compiled"][field]
+            );
+        }
+        for field in ["adapter", "store_id", "key", "native_name"] {
+            assert_eq!(handlers[0]["native"][field], handlers[1]["native"][field]);
+        }
+        let names = entries
+            .iter()
+            .map(|entry| {
+                entry["native"]["native_name"]
+                    .as_str()
+                    .expect("should retain native identity metadata")
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names.len(), 4);
+        let snippets = entries
+            .iter()
+            .flat_map(|entry| {
+                entry["native"]["declarations"]
+                    .as_array()
+                    .expect("should retain a declaration list for every owner")
+            })
+            .map(|snippet| snippet.as_str().expect("should render declaration text"))
+            .collect::<Vec<_>>();
+        if adapter == "spin" {
+            assert_eq!(
+                handlers[0]["native"]["declarations"]
+                    .as_array()
+                    .expect("should declare first owner")
+                    .len(),
+                2
+            );
+            assert!(
+                handlers[1]["native"]["declarations"]
+                    .as_array()
+                    .expect("should retain later owner metadata")
+                    .is_empty()
+            );
+            assert_eq!(snippets.len(), names.len() * 2);
+            let mut application = String::new();
+            let mut component_header = None;
+            let mut assignments = String::new();
+            for snippet in snippets {
+                if snippet.starts_with("[component.") {
+                    let (header, body) = snippet
+                        .split_once('\n')
+                        .expect("should separate component header and assignment");
+                    if let Some(previous) = component_header {
+                        assert_eq!(header, previous);
+                    } else {
+                        component_header = Some(header);
+                    }
+                    assignments.push_str(body);
+                    assignments.push('\n');
+                } else {
+                    application.push_str(snippet);
+                    application.push('\n');
+                }
+            }
+            // Follow the operator guide: keep application tables and merge all
+            // component assignments beneath one component header.
+            let merged = format!(
+                "{application}\n{}\n{assignments}",
+                component_header.expect("should render a component header")
+            );
+            let document: toml::Value = toml::from_str(&merged)
+                .expect("should parse all deduplicated Spin declarations together");
+            let variables = document["variables"]
+                .as_table()
+                .expect("should declare application variables");
+            let component = document["component"]["trusted-server"]["variables"]
+                .as_table()
+                .expect("should declare component variables");
+            assert_eq!(variables.len(), names.len());
+            assert_eq!(component.len(), names.len());
+            for name in names {
+                assert_eq!(variables[name]["required"].as_bool(), Some(true));
+                assert_eq!(variables[name]["secret"].as_bool(), Some(true));
+                assert_eq!(
+                    component[name].as_str(),
+                    Some(format!("{{{{ {name} }}}}").as_str())
+                );
+            }
+        } else {
+            // Cloudflare plans expose every owner identity but never emit
+            // plaintext [vars] declarations or credential values.
+            assert!(snippets.is_empty());
+            let document: toml::Value = toml::from_str(&snippets.join("\n"))
+                .expect("should parse the empty Cloudflare declaration block");
+            assert!(
+                document
+                    .as_table()
+                    .expect("should retain a metadata-only plan")
+                    .is_empty()
+            );
+        }
+    }
+    assert!(fixture.transport.methods.borrow().is_empty());
+}
+
+#[test]
+fn secrets_cli_declaration_coalescing_checks_full_context_store_key_and_rendering() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.temp.path().join("trusted-server.toml"),
+        format!("{CONFIG}\n[[handlers]]\npath='^/one'\nusername='one'\n[[handlers]]\npath='^/two'\nusername='two'\n"),
+    ).expect("should configure distinct handler contexts");
+    let SecretsCommand::Plan(args) = fixture.parse(&["plan", "--adapter", "spin"]) else {
+        panic!("should parse the native plan command");
+    };
+    let loaded =
+        load_settings(&args.target.config).expect("should load real handler configuration");
+    let plan =
+        compile_bindings(&loaded.settings).expect("should compile distinct handler contexts");
+    let handlers = plan
+        .entries()
+        .iter()
+        .filter(|binding| binding.descriptor_id() == "handler.password")
+        .collect::<Vec<_>>();
+    assert_eq!(handlers.len(), 2);
+    let native =
+        render_native_with_mapping("spin", SECRET_STORE_ID, handlers[0].key(), SECRET_STORE_ID)
+            .expect("should render the first native request");
+    let mut requests = BTreeMap::new();
+    coalesce_native_declarations(&mut requests, handlers[0], &mut native.clone())
+        .expect("should record the complete first request");
+    let mut wrong_context = native.clone();
+    assert!(coalesce_native_declarations(&mut requests, handlers[1], &mut wrong_context).is_err());
+    let mut wrong_store = native.clone();
+    wrong_store.store_id = "other-fictional-store".to_owned();
+    let mut wrong_key = native.clone();
+    wrong_key.key = handlers[1].key().to_owned();
+    let mut wrong_adapter = native.clone();
+    wrong_adapter.adapter = "cloudflare".to_owned();
+    let mut wrong_declarations = native.clone();
+    wrong_declarations
+        .declarations
+        .push("incompatible declaration".to_owned());
+    for mut different in [wrong_store, wrong_key, wrong_adapter, wrong_declarations] {
+        let original = different.clone();
+        assert!(coalesce_native_declarations(&mut requests, handlers[0], &mut different).is_err());
+        assert_eq!(different, original);
+    }
+    let mut identical = native.clone();
+    coalesce_native_declarations(&mut requests, handlers[0], &mut identical)
+        .expect("should share declarations only after exact request equality");
+    assert!(identical.declarations.is_empty());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests
+            .get(&native.native_name)
+            .expect("should retain the original complete rendering")
+            .1,
+        native
+    );
+}
+
+#[test]
+fn secrets_cli_plan_help_documents_shared_owner_declarations() {
+    let help = TestCli::try_parse_from(["secrets", "plan", "--help"])
+        .expect_err("should display native planning help")
+        .to_string();
+    assert!(help.contains("Every owner"));
+    assert!(help.contains("Only the first"));
+    assert!(help.contains("Spin component"));
+}
+
 const CONFIG: &str = r#"
 [publisher]
 domain = "publisher.example.com"
@@ -291,7 +494,7 @@ api_host = "api.example.com"
 auction_dataset = "auction_events"
 "#;
 
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 struct TestCli {
     #[command(subcommand)]
     command: SecretsCommand,

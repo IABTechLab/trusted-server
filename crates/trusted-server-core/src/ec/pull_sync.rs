@@ -850,36 +850,13 @@ mod tests {
 
     use crate::ec::kv::TombstoneOutcome;
     use crate::error::TrustedServerError;
-    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
+    use crate::platform::test_support::{
+        RecordingBackend, StubHttpClient, build_services_with_http_client,
+    };
     use crate::settings::EcPartner;
     use crate::test_support::tests::create_test_settings;
     use error_stack::Report;
     use std::sync::Arc;
-
-    #[derive(Default)]
-    struct PullBackendSpy(std::sync::Mutex<Vec<PlatformBackendSpec>>);
-
-    impl crate::platform::PlatformBackend for PullBackendSpy {
-        fn naming_policy(&self) -> crate::platform::BackendNamingPolicy {
-            crate::platform::BackendNamingPolicy::Axum
-        }
-        fn predict_name(
-            &self,
-            _: &PlatformBackendSpec,
-        ) -> Result<String, Report<crate::platform::PlatformError>> {
-            Ok("pull-backend".to_owned())
-        }
-        fn ensure(
-            &self,
-            spec: &PlatformBackendSpec,
-        ) -> Result<String, Report<crate::platform::PlatformError>> {
-            self.0
-                .lock()
-                .expect("should lock backend")
-                .push(spec.clone());
-            Ok("pull-backend".to_owned())
-        }
-    }
 
     #[test]
     fn pull_secret_bindings_force_tls_and_never_follow_redirects() {
@@ -891,7 +868,7 @@ mod tests {
             let graph = KvIdentityGraph::in_memory("pull_store");
             let ec_id = snapshot_ec_id();
             let snapshot = seed_present_snapshot(&graph, &ec_id);
-            let backend = Arc::new(PullBackendSpy::default());
+            let backend = Arc::new(RecordingBackend::default());
             let http = Arc::new(StubHttpClient::new());
             http.push_response_with_headers(
                 status,
@@ -922,7 +899,7 @@ mod tests {
                 http.recorded_request_uris(),
                 vec![format!("https://sync.example.com/sync?ec_id={ec_id}")]
             );
-            let specs = backend.0.lock().expect("should lock backend");
+            let specs = backend.specs();
             assert_eq!(specs.len(), 1);
             assert!(specs[0].certificate_check);
             assert_eq!(specs[0].host_header_override, None);

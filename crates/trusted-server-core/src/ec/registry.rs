@@ -136,12 +136,21 @@ impl PartnerRegistry {
     ///
     /// # Errors
     /// Returns an error if an enabled use has no matching loaded capability.
+    ///
+    /// # Examples
+    /// ```
+    /// use trusted_server_core::{ec::registry::PartnerRegistry, settings::Settings};
+    /// # fn inspect(settings: &Settings) {
+    /// let registry = PartnerRegistry::from_settings(settings);
+    /// # }
+    /// ```
     pub fn from_settings(settings: &Settings) -> Result<Self, Report<TrustedServerError>> {
+        let plan = crate::secret_bindings::compile_bindings(settings)?;
         let mut partners = settings.ec.partners.clone();
         for (index, partner) in partners.iter_mut().enumerate() {
             partner.api_token = if partner.api_token_enabled {
-                let binding = settings.resolved_bindings.require_for_settings(
-                    settings,
+                let binding = settings.resolved_bindings.require_for_plan(
+                    &plan,
                     "ec.inbound",
                     &format!("ec.partners[{index}].api_token"),
                 )?;
@@ -155,8 +164,8 @@ impl PartnerRegistry {
             if !partner.pull_sync_enabled {
                 continue;
             }
-            let binding = settings.resolved_bindings.require_for_settings(
-                settings,
+            let binding = settings.resolved_bindings.require_for_plan(
+                &plan,
                 "ec.pull",
                 &format!("ec.partners[{index}].ts_pull_token"),
             )?;
@@ -501,7 +510,7 @@ mod tests {
         ];
 
         PartnerRegistry::validate_config_for_deploy(&partners)
-            .expect("shadow strings are not lookup identities");
+            .expect("should ignore equal credential shadows during deploy validation");
     }
 
     #[test]
@@ -551,7 +560,7 @@ mod tests {
         partner.api_token_enabled = false;
         assert!(
             PartnerRegistry::from_config(&[partner.clone()])
-                .expect("disabled inbound should be allowed")
+                .expect("should allow a partner with inbound authentication disabled")
                 .get("ssp.example.com")
                 .expect("should have partner")
                 .api_key_hash

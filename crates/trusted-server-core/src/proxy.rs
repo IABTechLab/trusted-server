@@ -943,19 +943,20 @@ fn apply_asset_origin_auth(
     // in settings. Reinterpreting an old capability for a new route is forbidden.
     let mut effective = settings.clone();
     effective.proxy.asset_routes[index] = route.clone();
-    let id = settings.resolved_bindings.require_for_settings(
-        &effective,
+    let plan = crate::secret_bindings::compile_bindings(&effective)?;
+    let id = settings.resolved_bindings.require_for_plan(
+        &plan,
         "s3.access-id",
         &format!("proxy.asset_routes[{index}].auth.access_key_id"),
     )?;
-    let secret = settings.resolved_bindings.require_for_settings(
-        &effective,
+    let secret = settings.resolved_bindings.require_for_plan(
+        &plan,
         "s3.secret",
         &format!("proxy.asset_routes[{index}].auth.secret_access_key"),
     )?;
     let session = if config.session_token_enabled {
-        Some(settings.resolved_bindings.require_for_settings(
-            &effective,
+        Some(settings.resolved_bindings.require_for_plan(
+            &plan,
             "s3.session",
             &format!("proxy.asset_routes[{index}].auth.session_token"),
         )?)
@@ -981,7 +982,7 @@ fn apply_asset_origin_auth(
         session_token: session
             .map(|binding| crate::redacted::Redacted::new(binding.credential().to_owned())),
     };
-    let region = id.subject().get(7).ok_or_else(fail)?;
+    let region = id.s3_region().ok_or_else(fail)?;
     s3_sigv4::sign_headers(
         method,
         target_url,
@@ -2316,13 +2317,13 @@ mod tests {
     use crate::creative;
     use crate::error::{IntoHttpResponse, TrustedServerError};
     use crate::platform::test_support::{
-        HashMapSecretStore, StubHttpClient, build_services_with_http_client,
+        HashMapSecretStore, RecordingBackend, StubHttpClient, build_services_with_http_client,
         build_services_with_secret_and_http_client, noop_services,
     };
     use crate::platform::{
-        PlatformBackendSpec, PlatformError, PlatformHttpClient, PlatformHttpRequest,
-        PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult,
-        RuntimeServices, StoreId, StoreName,
+        PlatformError, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
+        PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
+        StoreName,
     };
     use crate::redacted::Redacted;
     use crate::settings::{
@@ -5315,33 +5316,8 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct CredentialBackendSpy(std::sync::Mutex<Vec<PlatformBackendSpec>>);
-
-    impl crate::platform::PlatformBackend for CredentialBackendSpy {
-        fn naming_policy(&self) -> crate::platform::BackendNamingPolicy {
-            crate::platform::BackendNamingPolicy::Axum
-        }
-        fn predict_name(
-            &self,
-            _: &PlatformBackendSpec,
-        ) -> Result<String, Report<crate::platform::PlatformError>> {
-            Ok("credential-backend".to_owned())
-        }
-        fn ensure(
-            &self,
-            spec: &PlatformBackendSpec,
-        ) -> Result<String, Report<crate::platform::PlatformError>> {
-            self.0
-                .lock()
-                .expect("should lock backend")
-                .push(spec.clone());
-            Ok("credential-backend".to_owned())
-        }
-    }
-
     fn credential_services(
-        backend: Arc<CredentialBackendSpy>,
+        backend: Arc<RecordingBackend>,
         http: Arc<StubHttpClient>,
     ) -> RuntimeServices {
         RuntimeServices::builder()
@@ -5389,7 +5365,7 @@ mod tests {
                 }
                 _ => {}
             }
-            let backend = Arc::new(CredentialBackendSpy::default());
+            let backend = Arc::new(RecordingBackend::default());
             let http = Arc::new(StubHttpClient::new());
             let services = credential_services(backend.clone(), http.clone());
             let method = if mutation == 7 {
@@ -5405,7 +5381,7 @@ mod tests {
                 .is_err()
             );
             assert!(
-                backend.0.lock().expect("should lock backend").is_empty(),
+                backend.specs().is_empty(),
                 "rejection must precede backend creation"
             );
             assert!(
@@ -5423,7 +5399,7 @@ mod tests {
             let mut route = test_s3_image_optimizer_route();
             route.image_optimizer = None;
             authorize_s3_test_route(&mut settings, &route);
-            let backend = Arc::new(CredentialBackendSpy::default());
+            let backend = Arc::new(RecordingBackend::default());
             let http = Arc::new(StubHttpClient::new());
             http.push_response_with_headers(
                 status,
@@ -5438,7 +5414,7 @@ mod tests {
             .expect("should surface origin redirect");
             assert_eq!(response.response().status().as_u16(), status);
             assert_eq!(http.recorded_request_uris().len(), 1);
-            let specs = backend.0.lock().expect("should lock backend");
+            let specs = backend.specs();
             assert_eq!(specs.len(), 1);
             assert!(specs[0].certificate_check);
             assert_eq!(specs[0].host_header_override, None);
@@ -5622,6 +5598,13 @@ mod tests {
                         .any(|(name, value)| name == "x-amz-security-token"
                             && value == "session-token")),
                 "should sign both requests with the cached session token"
+            );
+            assert!(
+                headers.iter().all(
+                    |sent| sent.iter().any(|(name, value)| name == "authorization"
+                        && value.contains("/us-east-1/s3/aws4_request"))
+                ),
+                "should sign both requests using the compiled S3 region"
             );
         });
     }

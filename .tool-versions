@@ -1,6 +1,7 @@
 fastly    16.0.0
 rust      1.98.1
 nodejs    24.20.0
+wrangler  4.83.0
 viceroy   0.21.0
 wasmtime  48.0.1
 spin      4.1.0
