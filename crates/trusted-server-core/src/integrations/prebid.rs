@@ -23,7 +23,7 @@ use validator::{Validate, ValidationError};
 
 use crate::auction::openrtb::{
     BidDimensionIndex, BidRejectionReason, ResponseAdmissionDiagnostics, build_bid_dimension_index,
-    parse_optional_bid_dimension, resolve_bid_dimensions,
+    resolve_bid_media,
 };
 use crate::auction::orchestrator::ERROR_TYPE_HTTP_STATUS;
 use crate::auction::plan::AuctionPlan;
@@ -2338,9 +2338,7 @@ fn parse_planned_prebid_bid(
         .filter(|slot_id| !slot_id.is_empty())
         .ok_or(BidRejectionReason::InvalidBid)?
         .to_string();
-    let width = parse_optional_bid_dimension(bid, "w")?;
-    let height = parse_optional_bid_dimension(bid, "h")?;
-    let (width, height) = resolve_bid_dimensions(dimensions_by_slot, &slot_id, width, height)?;
+    let media = resolve_bid_media(bid, &slot_id, dimensions_by_slot)?;
     let price = bid
         .get("price")
         .and_then(Json::as_f64)
@@ -2378,6 +2376,7 @@ fn parse_planned_prebid_bid(
     }
 
     Ok(AuctionBid {
+        video: media.video,
         slot_id,
         price: Some(price),
         currency: DEFAULT_CURRENCY.to_string(),
@@ -2391,8 +2390,8 @@ fn parse_planned_prebid_bid(
         }),
         bidder: delivery_bidder.to_string(),
         returned_seat: returned_seat.map(str::to_string),
-        width,
-        height,
+        width: media.width,
+        height: media.height,
         nurl: bid.get("nurl").and_then(Json::as_str).map(String::from),
         burl: bid.get("burl").and_then(Json::as_str).map(String::from),
         bid_id: bid
@@ -3317,6 +3316,7 @@ impl PrebidAuctionProvider {
         }
 
         Ok(AuctionBid {
+            video: None,
             slot_id,
             price: Some(price), // Prebid provides decoded prices
             currency: DEFAULT_CURRENCY.to_string(),
@@ -3835,6 +3835,7 @@ mod tests {
         AuctionRequest {
             id: "auction-123".to_string(),
             slots: vec![AdSlot {
+                video: None,
                 id: "slot-1".to_string(),
                 formats: vec![AdFormat {
                     media_type: MediaType::Banner,
@@ -6552,6 +6553,7 @@ external_bundle_sri = "sha384-AAAA"
         // Set dimensions that overflow i32 — they will be filtered out,
         // leaving an empty format list.
         auction_request.slots = vec![AdSlot {
+            video: None,
             id: "oversized-slot".to_string(),
             formats: vec![AdFormat {
                 media_type: MediaType::Banner,
@@ -7410,6 +7412,7 @@ external_bundle_sri = "sha384-AAAA"
 
     fn make_slot(id: &str, bidders: HashMap<String, Json>) -> AdSlot {
         AdSlot {
+            video: None,
             id: id.to_string(),
             formats: vec![AdFormat {
                 media_type: MediaType::Banner,

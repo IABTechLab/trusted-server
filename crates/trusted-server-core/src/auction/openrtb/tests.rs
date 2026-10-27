@@ -626,6 +626,7 @@ fn pbs_filtering_keeps_slot_pairs_and_drops_demandless_trusted_routes() {
     ]
     .into_iter()
     .map(|(id, envelope)| AdSlot {
+        video: None,
         id: id.to_string(),
         bidders: HashMap::from([("trustedServer".to_string(), envelope)]),
         ..template.clone()
@@ -983,6 +984,7 @@ fn defensive_no_impression_outcome_does_not_build_transportable_request() {
     let (plan, mut routed) = routed("standard", json!({}));
     let mut common = routed.inputs()[0].common_request().clone();
     common.slots = vec![AdSlot {
+        video: None,
         id: "video-only".to_string(),
         formats: vec![AdFormat {
             media_type: MediaType::Video,
@@ -1568,4 +1570,424 @@ fn malformed_top_level_standard_response_is_error() {
         extract_standard_response("fictional-provider", &routed.inputs()[0], &json!([]), 0);
     assert_eq!(response.status, BidStatus::Error);
     assert_eq!(response.metadata["error_type"], "parse_response");
+}
+
+fn video_request_fixture(mixed: bool) -> crate::auction::types::AuctionRequest {
+    let mut request = canonical_parity_auction_request();
+    request.slots[0].formats = vec![AdFormat {
+        media_type: MediaType::Video,
+        width: 640,
+        height: 360,
+    }];
+    if mixed {
+        request.slots[0].formats.insert(
+            0,
+            AdFormat {
+                media_type: MediaType::Banner,
+                width: 300,
+                height: 250,
+            },
+        );
+    }
+    request.slots[0].video = Some(VideoPlacement {
+        mimes: vec![
+            "video/mp4".to_string(),
+            "application/vnd.apple.mpegurl".to_string(),
+            "application/x-mpegURL".to_string(),
+            "application/dash+xml".to_string(),
+        ],
+        protocols: vec![7, 8],
+        minduration: 0,
+        maxduration: 30,
+        plcmt: 1,
+        api: vec![7],
+        playbackmethod: vec![1],
+        startdelay: Some(0),
+        skip: Some(1),
+    });
+    request
+}
+
+#[test]
+fn video_requests_reach_standard_and_pbs_without_becoming_banners() {
+    for profile in ["standard", "prebid-server"] {
+        let value = serde_json::to_value(build_with_request(
+            profile,
+            json!({}),
+            video_request_fixture(false),
+            None,
+        ))
+        .expect("should serialize video request");
+        let imp = &value["imp"][0];
+        assert_eq!(
+            imp["id"], "fictional-slot",
+            "should preserve the routed impression ID"
+        );
+        assert!(
+            imp.get("banner").is_none(),
+            "should not invent banner inventory"
+        );
+        assert_eq!(imp["video"]["w"], 640, "should send the player width");
+        assert_eq!(imp["video"]["h"], 360, "should send the player height");
+        assert_eq!(
+            imp["video"]["mimes"],
+            json!([
+                "video/mp4",
+                "application/vnd.apple.mpegurl",
+                "application/x-mpegURL",
+                "application/dash+xml"
+            ]),
+            "should preserve MIME types"
+        );
+        assert_eq!(
+            imp["video"]["protocols"],
+            json!([7, 8]),
+            "should preserve VAST protocols"
+        );
+        assert_eq!(
+            imp["video"]["minduration"], 0,
+            "should preserve minimum duration"
+        );
+        assert_eq!(
+            imp["video"]["maxduration"], 30,
+            "should preserve maximum duration"
+        );
+        assert_eq!(
+            imp["video"]["plcmt"], 1,
+            "should preserve explicit placement"
+        );
+        assert_eq!(
+            imp["video"]["api"],
+            json!([7]),
+            "should preserve player APIs"
+        );
+        assert_eq!(
+            imp["video"]["skip"], 1,
+            "should use OpenRTB integer booleans"
+        );
+        assert_eq!(value["tmax"], 321, "should preserve the auction budget");
+        assert!(
+            value.get("regs").is_some(),
+            "should preserve privacy signaling"
+        );
+    }
+}
+
+#[test]
+fn video_only_and_mixed_inventory_respect_profile_capabilities() {
+    let aps = json!({"account_id": "example-account-id"});
+    let (_, video_only) =
+        routed_with_request("aps", aps.clone(), video_request_fixture(false), None);
+    assert!(
+        video_only.inputs().is_empty(),
+        "should skip unsupported APS video inventory"
+    );
+    assert_eq!(
+        video_only.skipped_no_eligible_provider_ids().len(),
+        1,
+        "should record the skipped provider"
+    );
+    for profile in ["standard", "prebid-server", "aps"] {
+        let config = if profile == "aps" {
+            aps.clone()
+        } else {
+            json!({})
+        };
+        let value = serde_json::to_value(build_with_request(
+            profile,
+            config,
+            video_request_fixture(true),
+            None,
+        ))
+        .expect("should serialize mixed inventory");
+        assert!(
+            value["imp"][0].get("banner").is_some(),
+            "should preserve supported banner inventory"
+        );
+        assert_eq!(
+            value["imp"][0].get("video").is_some(),
+            profile != "aps",
+            "should gate video by profile"
+        );
+    }
+}
+
+#[test]
+fn video_pbs_stored_fallback_keeps_the_video_impression() {
+    let mut request = video_request_fixture(false);
+    request.slots[0].bidders.clear();
+    let value = serde_json::to_value(build_with_request(
+        "prebid-server",
+        json!({}),
+        request,
+        None,
+    ))
+    .expect("should serialize stored video request");
+    assert_eq!(
+        value["imp"][0]["ext"]["prebid"]["storedrequest"]["id"], "fictional-slot",
+        "should retain stored-request fallback"
+    );
+    assert!(
+        value["imp"][0].get("video").is_some(),
+        "should preserve video requirements"
+    );
+}
+
+#[test]
+fn video_response_admission_preserves_valid_siblings_and_creative_dimensions() {
+    let (_, routed) =
+        routed_with_request("standard", json!({}), video_request_fixture(false), None);
+    let value = json!({"seatbid":[{"seat":"example-server","bid":[
+        {"id":"valid","impid":"fictional-slot","price":2.0,"mtype":2,"adm":"<VAST/>","w":1920,"h":1080,"protocol":7,"dur":15},
+        {"impid":"fictional-slot","price":10.0,"mtype":1,"adm":"<div/>"},
+        {"impid":"fictional-slot","price":10.0,"mtype":4,"adm":"{}"},
+        {"impid":"fictional-slot","price":10.0,"mtype":"video","adm":"<VAST/>"},
+        {"impid":"fictional-slot","price":10.0,"mtype":2,"adm":" "},
+        {"impid":"fictional-slot","price":10.0,"mtype":2,"adm":"<VAST/>","protocol":15},
+        {"impid":"fictional-slot","price":10.0,"mtype":2,"adm":"<VAST/>","dur":31},
+        {"impid":"unrequested","price":10.0,"mtype":2,"adm":"<VAST/>"}
+    ]}]});
+    let response = extract_standard_response("fictional-provider", &routed.inputs()[0], &value, 0);
+    assert_eq!(
+        response.bids.len(),
+        1,
+        "should isolate incompatible sibling bids"
+    );
+    let bid = &response.bids[0];
+    assert_eq!(
+        (bid.width, bid.height),
+        (1920, 1080),
+        "should accept media dimensions different from player size"
+    );
+    assert_eq!(
+        bid.video.as_ref().expect("should mark video").protocol,
+        Some(7),
+        "should retain protocol"
+    );
+    assert_eq!(
+        response.metadata["response_admission"]["rejected_bid_count"], 7,
+        "should report fixed admission diagnostics"
+    );
+}
+
+#[test]
+fn video_response_requires_unambiguous_media_and_inline_markup() {
+    let (_, routed) = routed_with_request("standard", json!({}), video_request_fixture(true), None);
+    let input = &routed.inputs()[0];
+    for value in [
+        json!({"impid":"fictional-slot","price":2.0,"adm":"<VAST/>"}),
+        json!({"impid":"fictional-slot","price":2.0,"mtype":2}),
+        json!({"impid":"fictional-slot","price":2.0,"mtype":2,"adm":"x".repeat(1024*1024+1)}),
+        json!({"impid":"fictional-slot","price":2.0,"mtype":2,"adm":"<VAST/>","ext":{"prebid":{"type":"banner"}}}),
+        json!({"impid":"fictional-slot","price":2.0,"adm":"<VAST/>","ext":{"prebid":{"type":"native"}}}),
+    ] {
+        let parsed = extract_standard_response(
+            "fictional-provider",
+            input,
+            &json!({"seatbid":[{"bid":[value]}]}),
+            0,
+        );
+        assert!(
+            parsed.bids.is_empty(),
+            "should reject unsupported video admission"
+        );
+    }
+    for value in [
+        json!({"impid":"fictional-slot","price":2.0,"mtype":2,"adm":"<VAST/>"}),
+        json!({"impid":"fictional-slot","price":2.0,"adm":"<VAST/>","ext":{"prebid":{"type":"video"}}}),
+    ] {
+        let parsed = extract_standard_response(
+            "fictional-provider",
+            input,
+            &json!({"seatbid":[{"bid":[value]}]}),
+            0,
+        );
+        assert_eq!(
+            parsed.bids.len(),
+            1,
+            "should use an explicit media declaration"
+        );
+        assert!(
+            parsed.bids[0].video.is_some(),
+            "should retain video identity"
+        );
+        assert_eq!(
+            (parsed.bids[0].width, parsed.bids[0].height),
+            (640, 360),
+            "should retain player dimensions when creative dimensions are omitted"
+        );
+    }
+}
+
+#[test]
+fn video_response_checks_and_retains_declared_player_apis() {
+    let (_, routed) =
+        routed_with_request("standard", json!({}), video_request_fixture(false), None);
+    let input = &routed.inputs()[0];
+    for declaration in [
+        json!({"api": 1}),
+        json!({"apis": [1]}),
+        json!({"apis": [7, 1]}),
+        json!({"apis": [7], "api": 1}),
+        json!({"apis": "7"}),
+        json!({"apis": ["7"]}),
+        json!({"apis": [7.5]}),
+        json!({"apis": [4294967296_u64]}),
+        json!({"apis": [0]}),
+        json!({"api": "7"}),
+    ] {
+        let mut bid = json!({"impid":"fictional-slot","price":2.0,"mtype":2,"adm":"<VAST/>"});
+        bid.as_object_mut()
+            .expect("should find the bid object")
+            .extend(
+                declaration
+                    .as_object()
+                    .expect("should find API fields")
+                    .clone(),
+            );
+        let parsed = extract_standard_response(
+            "fictional-provider",
+            input,
+            &json!({"seatbid":[{"bid":[bid]}]}),
+            0,
+        );
+        assert!(
+            parsed.bids.is_empty(),
+            "should reject incompatible or malformed APIs: {declaration}"
+        );
+    }
+    for (declaration, expected) in [
+        (json!({"apis": [7]}), vec![7]),
+        (json!({"api": 7}), vec![7]),
+        (json!({"apis": [7], "api": 7}), vec![7]),
+        (json!({"apis": []}), vec![]),
+        (json!({"apis": null, "api": null}), vec![]),
+        (json!({}), vec![]),
+    ] {
+        let mut bid = json!({"impid":"fictional-slot","price":2.0,"mtype":2,"adm":"<VAST/>"});
+        bid.as_object_mut()
+            .expect("should find the bid object")
+            .extend(
+                declaration
+                    .as_object()
+                    .expect("should find API fields")
+                    .clone(),
+            );
+        let parsed = extract_standard_response(
+            "fictional-provider",
+            input,
+            &json!({"seatbid":[{"bid":[bid]}]}),
+            0,
+        );
+        assert_eq!(
+            parsed.bids.len(),
+            1,
+            "should accept supported or omitted APIs: {declaration}"
+        );
+        assert_eq!(
+            parsed.bids[0]
+                .video
+                .as_ref()
+                .expect("should mark video")
+                .apis,
+            expected,
+            "should retain normalized API declarations"
+        );
+    }
+    let mut no_api_request = video_request_fixture(false);
+    no_api_request.slots[0]
+        .video
+        .as_mut()
+        .expect("should find player requirements")
+        .api
+        .clear();
+    let (_, routed) = routed_with_request("standard", json!({}), no_api_request, None);
+    let parsed = extract_standard_response(
+        "fictional-provider",
+        &routed.inputs()[0],
+        &json!({"seatbid":[{"bid":[{"impid":"fictional-slot","price":2.0,"mtype":2,"adm":"<VAST/>","apis":[7]}]}]}),
+        0,
+    );
+    assert!(
+        parsed.bids.is_empty(),
+        "should not assume support for an unoffered API"
+    );
+}
+
+#[test]
+fn video_provider_round_trip_uses_active_standard_and_pbs_parsers() {
+    futures::executor::block_on(async {
+        for profile in ["standard", "prebid-server"] {
+            let (plan, routed) =
+                routed_with_request(profile, json!({}), video_request_fixture(false), None);
+            let provider = GenericOpenRtbProvider::new(plan.providers()[0].clone());
+            let client = Arc::new(StubHttpClient::new());
+            let vast = " \n<VAST version=\"4.0\"><Ad id=\"example\"><InLine><Impression><![CDATA[https://track.example.com/i?a=1&b=2]]></Impression></InLine></Ad></VAST>\n";
+            client.push_response(200, serde_json::to_vec(&json!({"seatbid":[{"seat":"example-server","bid":[
+                {"id":"video-bid","impid":"fictional-slot","price":2.0,"mtype":2,"adm":vast,"protocol":7,"dur":15},
+                {"id":"wrong-type","impid":"fictional-slot","price":20.0,"adm":"<div/>","ext":{"prebid":{"type":"banner"}}}
+            ]}]})).expect("should serialize the fictional bidder response"));
+            let services = build_services_with_backend_and_http_client(
+                Arc::new(StubBackend),
+                Arc::clone(&client) as Arc<dyn PlatformHttpClient>,
+            );
+            let outcome = provider
+                .request_bids_routed(
+                    &routed.inputs()[0],
+                    &routed,
+                    321,
+                    321,
+                    None,
+                    &services,
+                    &mut HashSet::new(),
+                )
+                .await
+                .expect("should dispatch video inventory");
+            let ProviderRequestOutcome::Pending {
+                request,
+                parse_state,
+                ..
+            } = outcome
+            else {
+                panic!("should dispatch a pending video request");
+            };
+            let selected = services
+                .http_client()
+                .select(vec![request])
+                .await
+                .expect("should collect the provider response");
+            let parsed = provider
+                .parse_response_with_state(
+                    selected.ready.expect("should receive a response"),
+                    1,
+                    parse_state.as_deref(),
+                )
+                .await
+                .expect("should parse the video response");
+            assert_eq!(
+                parsed.bids.len(),
+                1,
+                "should isolate the incompatible sibling"
+            );
+            assert_eq!(
+                parsed.bids[0].creative.as_deref(),
+                Some(vast),
+                "should preserve the raw VAST response"
+            );
+            assert!(
+                parsed.bids[0].video.is_some(),
+                "should preserve video identity"
+            );
+            let sent: Value = serde_json::from_slice(&client.recorded_request_bodies()[0])
+                .expect("should parse dispatched inventory");
+            assert!(
+                sent["imp"][0].get("video").is_some(),
+                "should send video inventory"
+            );
+            assert!(
+                sent["imp"][0].get("banner").is_none(),
+                "should not send video as banner"
+            );
+        }
+    });
 }

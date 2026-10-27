@@ -2,6 +2,99 @@
 
 Learn how Trusted Server coordinates multiple demand sources in parallel to maximize revenue and minimize latency.
 
+## Use the direct auction API for instream video
+
+`POST /auction` accepts linear instream video inventory through the `standard`
+and `prebid-server` OpenRTB 2.6 profiles. The caller consumes the returned inline
+VAST with its own video player. Use this API directly for video; the current
+Trusted Server browser Prebid adapter and GPT render bridge deliver banners.
+
+```json
+{
+  "adUnits": [
+    {
+      "code": "example-video",
+      "mediaTypes": {
+        "video": {
+          "context": "instream",
+          "playerSize": [640, 360],
+          "mimes": ["video/mp4"],
+          "protocols": [7, 8],
+          "minduration": 0,
+          "maxduration": 30,
+          "plcmt": 1,
+          "api": [7],
+          "playbackmethod": [1],
+          "startdelay": 0,
+          "skip": 1
+        }
+      },
+      "bids": [
+        {
+          "bidder": "example-server",
+          "params": { "placementId": "example" }
+        }
+      ]
+    }
+  ]
+}
+```
+
+Configure `example-server` in `[auction.bidders]` for the intended provider.
+PBS stored-request fallback remains available when no inline bidder parameters
+are supplied. Configure video auctions without a mediator. Video input with a
+configured mediator receives a bad-request error before providers are called.
+
+The video contract requires `context: "instream"`, one positive `playerSize`
+within the OpenRTB integer range, nonempty video MIME types and VAST protocol
+lists, nonnegative minimum duration, a positive maximum duration at least as
+large as the minimum, and explicit `plcmt` of 1 or 2. A single nested player size,
+`[[640, 360]]`, is equivalent to the flat pair. `context` does not infer the IAB
+placement classification. Optional `linearity` must be 1. The API forwards only
+the defined player fields; arbitrary video extensions are not forwarded.
+
+MIME capabilities accept `video/*` types, the HLS playlist types
+`application/vnd.apple.mpegurl` and `application/x-mpegURL`, and the DASH manifest
+type `application/dash+xml`. Manifest types describe the player's video
+capability; this API does not load the media.
+
+`api`, `playbackmethod`, `startdelay`, and `skip` are optional. API codes must be
+1 through 9, playback methods 1 through 6, and start delay at least -2. The skip
+flag must be either 0 or 1. Protocols accept VAST codes 1 through 8 and 11
+through 16. DAAST codes 9 and 10 are unsupported. Invalid or unsupported video
+input receives a bad-request error. Video auctions require unique ad-unit codes.
+
+A placement can offer both banner and video inventory, or the request can
+contain separate banner and video units. Standard and PBS profiles receive the
+offered video requirements in `imp.video`. APS receives eligible banner
+inventory and skips video-only impressions. A mixed-media response must declare
+its media through `mtype` or the PBS `ext.prebid.type` field. Omitted media type
+is inferred only for an impression offering one supported type. The API returns
+explicit `mtype: 1` for banner winners and `mtype: 2` for video winners, including
+mixed impressions.
+
+A returned video bid has `mtype: 2` and nonempty inline VAST in `adm`. The API
+preserves the VAST string, including whitespace, CDATA, tracking URLs and
+auction macros, through response serialization even when HTML creative
+sanitization and rewriting are enabled. Optional response `protocol` and `dur`
+are checked against the requested requirements and retained. This API also
+requires every declared response `apis` or legacy `api` framework to appear in
+the requested player `api` list; an omitted player list offers no frameworks.
+Malformed or unsupported declarations are rejected before winner selection.
+Accepted declarations are returned in `apis`, with legacy `api` normalized into
+that array. Missing response declarations do not infer any framework support,
+and the caller still validates the actual VAST. Creative video
+sizes can differ from the player's dimensions. Missing creative dimensions use
+the requested player dimensions for internal delivery metadata.
+
+The caller validates VAST, resolves auction macros at the applicable clearing
+price, loads media, handles wrappers and playback, and fires tracking and any
+returned `nurl` or `burl` at their appropriate lifecycle events. Trusted Server
+transports these fields and does not execute them. Cache-only video responses,
+VAST URL delivery, nonlinear video, outstream rendering, and video mediation
+need separate delivery contracts. PBS settings or stored requests that set
+`returnCreative: false` cannot supply this inline-VAST flow.
+
 ## Overview
 
 The auction orchestrator is the core system that manages server-side ad auctions. It launches bid requests to multiple demand providers simultaneously, collects responses, and selects winners.
