@@ -159,7 +159,9 @@ jobs:
   trace-runtime-tests:
     name: trace runtime and browser acceptance
     needs: prepare-artifacts
-    runs-on: ubuntu-latest
+    # Pinned for the same reason as the browser integration tests job below:
+    # Playwright cannot install chromium on the ubuntu-latest 26.04 image.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
