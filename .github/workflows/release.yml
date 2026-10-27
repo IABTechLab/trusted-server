@@ -142,8 +142,10 @@ jobs:
           fs.writeFileSync('release-assets/SHA256SUMS', files.map(file => `${hash(regular(`release-assets/${file}`))}  ${file}\n`).join(''));
           files.push('SHA256SUMS');
           // Close API connections before synchronous gh checks can leave pooled sockets idle.
+          // Every read is time-bounded. Mutations are single-shot and rely on the job timeout:
+          // a client-side abort cannot cancel a create, upload or publish GitHub already accepted.
           const api = async (path, method = 'GET', body, timeout = 10000) => {
-            const response = await fetch(`https://api.github.com/repos/${repo}/${path}`, {method, headers:{Connection:'close', Authorization:`Bearer ${token}`, Accept:'application/vnd.github+json', 'Content-Type':'application/json'}, ...(method === 'GET' && (path.startsWith('releases/') || path.startsWith('attestations/')) ? {signal:AbortSignal.timeout(timeout)} : {}), ...(body ? {body:JSON.stringify(body)} : {})}); // allow-domain: api.github.com
+            const response = await fetch(`https://api.github.com/repos/${repo}/${path}`, {method, headers:{Connection:'close', Authorization:`Bearer ${token}`, Accept:'application/vnd.github+json', 'Content-Type':'application/json'}, ...(method === 'GET' ? {signal:AbortSignal.timeout(timeout)} : {}), ...(body ? {body:JSON.stringify(body)} : {})}); // allow-domain: api.github.com
             if (!response.ok || path.startsWith('attestations/') && response.status !== 200) throw Object.assign(Error(`GitHub API failed: ${method} ${path} ${response.status}`), {status:response.status, retryAfter:response.headers.get('retry-after')});
             return response.json();
           };
@@ -223,12 +225,10 @@ jobs:
           await verifyIdentity();
           // The release attestation can be created after the immutable release becomes visible.
           const availabilityDeadline = Math.min(retryDeadline, Date.now() + 60000);
-          const verifyBundle = async (record, otherTag = false) => {
+          const verifyBundle = async (record) => {
             if (Date.now() >= retryDeadline) throw Error('Post-publish verification window exhausted');
-            const deadline = otherTag ? availabilityDeadline : retryDeadline;
-            const read = () => execFileSync('gh', ['release','verify','--repo',repo,'--format','json','--',record.statement.predicate.tag], {timeout:Math.max(1, Math.min(10000, deadline - Date.now())), stdio:'pipe'});
-            const proof = JSON.parse(otherTag ? await retryRead(read, deadline) : read());
-            if (Date.now() >= deadline) throw Error('Post-publish verification window exhausted');
+            const proof = JSON.parse(execFileSync('gh', ['release','verify','--repo',repo,'--format','json','--',record.statement.predicate.tag], {timeout:Math.max(1, Math.min(10000, retryDeadline - Date.now())), stdio:'pipe'}));
+            if (Date.now() >= retryDeadline) throw Error('Post-publish verification window exhausted');
             if (!isDeepStrictEqual(proof.attestation?.bundle, record.bundle)) throw Error('Verified release attestation bundle mismatch');
           };
           for (let attempt = 1; ; attempt++) {
@@ -257,9 +257,10 @@ jobs:
             const current = records.filter(record => record.statement.predicate.tag === tag);
             if (current.length > 1) throw Error('Multiple release attestations for current tag');
             if (current.length && (current[0].statement.predicate.databaseId !== String(id) || current[0].subjects.length !== files.length || current[0].subjects.some(subject => !files.includes(subject.name) || subject.digest.sha256 !== hash(regular(`release-assets/${subject.name}`))))) throw Error('Current release attestation identity or assets mismatch');
+            // Another tag's release (for example an earlier prerelease on this commit) can be
+            // deleted or slow to verify; it says nothing about this release, so it is not verified.
             for (const record of records.filter(record => record.statement.predicate.tag !== tag)) {
-              await verifyBundle(record, true);
-              console.log('Ignored verified release attestation for other tag:', JSON.stringify(record.statement.predicate.tag));
+              console.log('Ignored release attestation for other tag:', JSON.stringify(record.statement.predicate.tag));
             }
             if (current.length) {
               await verifyBundle(current[0]);

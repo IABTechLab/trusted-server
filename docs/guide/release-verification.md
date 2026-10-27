@@ -113,7 +113,7 @@ shasum -a 256 --check SHA256SUMS
 
 <!-- release-verification:end -->
 
-Both predicates use the binary as their subject. The verified SBOM predicate must equal the shipped SPDX document. `--signer-workflow` matches a prefix; the separate `--cert-identity` check pins the exact reusable workflow at the tag. GitHub CLI makes those two identity options mutually exclusive.
+Provenance covers the binary and its SPDX document, plus the rebuild-check for Fastly; the SBOM attestation covers the binary. The verified SBOM predicate must equal the shipped SPDX document. `--signer-workflow` matches a prefix; the separate `--cert-identity` check pins the exact reusable workflow at the tag. GitHub CLI makes those two identity options mutually exclusive.
 
 The checksums cover the other 29 assets, never `SHA256SUMS` itself. Immutable release verification establishes membership; provenance establishes the reviewed signer and source. Both are required.
 
@@ -404,9 +404,11 @@ HTTP 5xx/429 diagnostic or a recognized transport/timeout code may retry;
 ambiguous failures stop. Successful responses with wrong identity, immutability,
 membership or digests, and definitive verification failures stop immediately.
 Release listing before creation and every create/upload/publish mutation remain
-single-shot.
+single-shot. Every API read, including that listing, times out after 10s. Mutations
+have no client-side timeout and are bounded by the 15-minute job limit: aborting a
+create, upload or publish cannot cancel a change GitHub already accepted.
 
-Before cryptographic release verification, the availability check makes at most five release-attestation GETs, with 2s/5s/10s/20s backoff (37s total waiting). Only this endpoint treats HTTP 404 as no record yet; a valid HTTP 200 with no current-tag record may also wait. Each GET times out after at most 4s, and a separate 60s deadline bounds availability checking, including other-tag verification, within the shared three-minute scheduling window. Every other non-200 status fails immediately. Malformed records, duplicate current-tag records, identity/source/asset mismatches and definitive cryptographic failures stop immediately. Other-tag records are ignored only after their exact bundles verify; those read-only verification calls may retry recognized transient failures within the same bounds. Current-tag cryptographic verification is single-shot. Logs show every wait or availability on the first check. No mutation is retried.
+Before cryptographic release verification, the availability check makes at most five release-attestation GETs, with 2s/5s/10s/20s backoff (37s total waiting). Only this endpoint treats HTTP 404 as no record yet; a valid HTTP 200 with no current-tag record may also wait. Each GET times out after at most 4s, and a separate 60s deadline bounds availability checking within the shared three-minute scheduling window. Every other non-200 status fails immediately. Malformed records, duplicate current-tag records, identity/source/asset mismatches and definitive cryptographic failures stop immediately. Well-formed records for other tags, such as an earlier prerelease of the same commit, are logged and ignored without cryptographic verification: their state does not affect this release, and a deleted or slow earlier release must not fail an already published one. Current-tag cryptographic verification is single-shot. Logs show every wait or availability on the first check. No mutation is retried.
 
 The publisher re-downloads all 30 assets into a fresh temporary directory, checks the exact file set and byte-compares them with the validated signed handoff, including identical SHA256SUMS. Only transport download failures may retry; any missing, extra or different file fails immediately. Temporary downloads are removed after each attempt.
 
@@ -475,6 +477,8 @@ commands below only inspect settings; this workflow applies none of them.
 
 ```bash
 REPO=IABTechLab/trusted-server
+# Replace with the full commit you intend to tag.
+COMMIT=0123456789abcdef0123456789abcdef01234567
 gh api "repos/$REPO/immutable-releases"
 gh api "repos/$REPO/rulesets?includes_parents=true" \
   --jq '.[] | {id, name, target, enforcement}'

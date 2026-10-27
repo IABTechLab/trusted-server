@@ -58,7 +58,7 @@ use crate::sandbox::{RetainedApp, Sandbox, SandboxCounters, ServeMode, StartupDi
 use crate::sandbox::RetirementCounters;
 
 /// Immutable facts compiled into the owning Fastly product.
-pub const BUILD_INFO: BuildInfo = BuildInfo::new(
+const BUILD_INFO: BuildInfo = BuildInfo::new(
     env!("CARGO_PKG_VERSION"),
     env!("TRUSTED_SERVER__BUILD_TARGET"),
     if cfg!(feature = "reusable-sandbox") {
