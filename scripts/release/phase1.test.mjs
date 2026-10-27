@@ -903,8 +903,9 @@ test('workflows select exactly the descriptive cohort and restrict actual build 
   const actualBuild = build.split('\n  build:')[1].split('\n  sign:')[0]
   assert.doesNotMatch(actualBuild, /id-token|attestations:/)
   // Signing and publication need a push of a `v*` tag and the enablement variable.
+  // Anchor to the job-level indentation so a matching step-level `if:` cannot satisfy it.
   const gate =
-    "if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.RELEASE_PUBLICATION_ENABLED == 'true'\n"
+    "\n    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.RELEASE_PUBLICATION_ENABLED == 'true'\n"
   assert.ok(
     release.split('\n  release:')[1]?.includes(gate),
     'should gate publication on a v* tag push and enablement'

@@ -355,7 +355,9 @@ HTTP 5xx/429 diagnostic or a recognized transport/timeout code may retry;
 ambiguous failures stop. Successful responses with wrong identity, immutability,
 membership or digests, and definitive verification failures stop immediately.
 Release listing before creation and every create/upload/publish mutation remain
-single-shot.
+single-shot. Every API read, including that listing, times out after 10s. Mutations
+have no client-side timeout and are bounded by the 15-minute job limit: aborting a
+create, upload or publish cannot cancel a change GitHub already accepted.
 
 Before cryptographic release verification, the availability check makes at most five release-attestation GETs, with 2s/5s/10s/20s backoff (37s total waiting). Only this endpoint treats HTTP 404 as no record yet; a valid HTTP 200 with no current-tag record may also wait. Each GET times out after at most 4s, and a separate 60s deadline bounds availability checking within the shared three-minute scheduling window. Every other non-200 status fails immediately. Malformed records, duplicate current-tag records, identity/source/asset mismatches and definitive cryptographic failures stop immediately. Well-formed records for other tags, such as an earlier prerelease of the same commit, are logged and ignored without cryptographic verification: their state does not affect this release, and a deleted or slow earlier release must not fail an already published one. Current-tag cryptographic verification is single-shot. Logs show every wait or availability on the first check. No mutation is retried.
 

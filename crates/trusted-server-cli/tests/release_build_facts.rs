@@ -194,6 +194,11 @@ fn actual_cli_version_reads_all_owning_facts_and_ignores_external_tags() {
     );
     // CI compiles this test once in release mode; the supplied commit must
     // reach the actual CLI unchanged.
+    assert_eq!(
+        cfg!(trusted_server_release_build),
+        option_env!("TRUSTED_SERVER__RELEASE_BUILD").is_some(),
+        "should compile in release mode exactly when the release control is supplied"
+    );
     if cfg!(trusted_server_release_build) {
         assert_eq!(
             BUILD_INFO.source(),
