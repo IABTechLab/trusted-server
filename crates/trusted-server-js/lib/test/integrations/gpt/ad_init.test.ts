@@ -466,6 +466,7 @@ describe('installTsAdInit', () => {
         'atf_sidebar_ad',
         expectedOpportunity,
         undefined,
+        undefined,
         undefined
       );
     }
@@ -584,6 +585,7 @@ describe('installTsAdInit', () => {
       'atf_sidebar_ad',
       'no_candidate',
       undefined,
+      undefined,
       undefined
     );
   });
@@ -621,7 +623,8 @@ describe('installTsAdInit', () => {
       'atf_sidebar_ad',
       'no_candidate',
       undefined,
-      formats
+      formats,
+      undefined
     );
   });
 
@@ -647,7 +650,8 @@ describe('installTsAdInit', () => {
       'atf_sidebar_ad',
       'no_candidate',
       undefined,
-      formats
+      formats,
+      undefined
     );
   });
 
@@ -686,6 +690,7 @@ describe('installTsAdInit', () => {
       mockSlot,
       'atf_sidebar_ad',
       'no_candidate',
+      undefined,
       undefined,
       undefined
     );

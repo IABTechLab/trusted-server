@@ -2974,7 +2974,11 @@ whitespace is trimmed; tabs, newlines, and other control characters are rejected
 not trimmed. Names are limited to 32 entries of at most 128 UTF-8 bytes each and
 must be nonempty with no slash or control characters. For example,
 `route_sections = [" news "]` normalizes to `["news"]`, preserving `/news/*` but not
-`/news`.
+`/news`. Matching uses the raw path without percent-decoding, so literal non-ASCII
+section names do not match their percent-encoded URLs. Use ASCII section names.
+The name `other`, in any case, shares the fallback `/other/*` bucket rather than
+creating a distinct section. Configure this array in TOML, for example
+`route_sections = ["news"]`; the environment overlay cannot set arrays.
 
 **Purpose**: Surfaces per-phase request timing (`ts-total` plus recorded
 phases such as `ts-appbuild`, `ts-filter`, `ts-geo`, `ts-kv`, `ts-origin`, and

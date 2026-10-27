@@ -326,6 +326,11 @@ provider = "pbs-main"
 # cannot create a missing configuration leaf. The Server-Timing header stays
 # off until enabled.
 server_timing_enabled = false
+# Keep selected first path segments in access-telemetry route templates.
+# Set this array in TOML; the environment overlay cannot set arrays.
+# Use ASCII names; "other" shares the fallback bucket. Matching uses the raw,
+# percent-encoded path, so literal non-ASCII names do not match encoded URLs.
+# route_sections = ["news"]
 
 # Server-side ad slot templates + creative-opportunity auction. Kept active.
 [creative_opportunities]

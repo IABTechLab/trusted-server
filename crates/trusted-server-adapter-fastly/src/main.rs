@@ -33,7 +33,7 @@ use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoLookupState;
 use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::platform::PlatformGeo as _;
-use trusted_server_core::platform::TimedKvStore;
+use trusted_server_core::platform::{PlatformHttpClient, TimedKvStore};
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
 use trusted_server_core::publisher::TemplateCacheResponseState;
 use trusted_server_core::request_timing::{Phase, RequestTimings, append_server_timing_if_private};
@@ -560,6 +560,16 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
         policy.apply_after_route_finalization(&mut response, EdgeCacheHeader::SurrogateControl);
     }
 
+    let send_context = SendContext {
+        timings: timings.clone(),
+        server_timing_enabled,
+        method: request_method.as_str(),
+        publisher_domain,
+        access_sample_rate,
+        access_telemetry_enabled,
+    };
+    let access_http_client = platform::FastlyPlatformHttpClient;
+
     if let Some(mut ec_state) = ec_state {
         if let Some(settings) = settings_snapshot.as_deref() {
             match apply_edgezero_ec_finalize(settings, &mut ec_state, &mut response, &timings) {
@@ -567,14 +577,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
                     let outcome = send_edgezero_response(
                         response,
                         request_filter_effects.as_ref(),
-                        &SendContext {
-                            timings: timings.clone(),
-                            server_timing_enabled,
-                            method: request_method.as_str(),
-                            publisher_domain,
-                            access_sample_rate,
-                            access_telemetry_enabled,
-                        },
+                        &send_context,
                         counters.as_ref(),
                     );
                     run_post_send_steps(
@@ -585,7 +588,14 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
                                 &ec_state,
                             )
                         },
-                        || emit_access_telemetry_after_send(settings, &outcome, &timings),
+                        || {
+                            emit_access_telemetry_after_send(
+                                &access_http_client,
+                                settings,
+                                &outcome,
+                                &timings,
+                            )
+                        },
                     );
                     return;
                 }
@@ -608,14 +618,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
                             let outcome = send_edgezero_response(
                                 response,
                                 request_filter_effects.as_ref(),
-                                &SendContext {
-                                    timings: timings.clone(),
-                                    server_timing_enabled,
-                                    method: request_method.as_str(),
-                                    publisher_domain,
-                                    access_sample_rate,
-                                    access_telemetry_enabled,
-                                },
+                                &send_context,
                                 counters.as_ref(),
                             );
                             run_post_send_steps(
@@ -626,7 +629,14 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
                                         &ec_state,
                                     );
                                 },
-                                || emit_access_telemetry_after_send(&settings, &outcome, &timings),
+                                || {
+                                    emit_access_telemetry_after_send(
+                                        &access_http_client,
+                                        &settings,
+                                        &outcome,
+                                        &timings,
+                                    )
+                                },
                             );
                             return;
                         }
@@ -647,14 +657,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
     let outcome = send_edgezero_response(
         response,
         request_filter_effects.as_ref(),
-        &SendContext {
-            timings: timings.clone(),
-            server_timing_enabled,
-            method: request_method.as_str(),
-            publisher_domain,
-            access_sample_rate,
-            access_telemetry_enabled,
-        },
+        &send_context,
         counters.as_ref(),
     );
     // The asset/admin/error fallback path: no `EcFinalizeState` (or the ec
@@ -664,7 +667,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
     // necessarily false without a settings snapshot, so the outcome carries
     // no access snapshot, and reloading settings here could not change that.
     if let Some(settings) = settings_snapshot.as_deref() {
-        emit_access_telemetry_after_send(settings, &outcome, &timings);
+        emit_access_telemetry_after_send(&access_http_client, settings, &outcome, &timings);
     }
 }
 
@@ -814,6 +817,7 @@ fn run_post_send_steps(pull_sync: impl FnOnce(), emit_access_telemetry: impl FnO
 /// later transport errors, HTTP status and remote acceptance are unobserved.
 /// Credentials were resolved during settings load.
 fn emit_access_telemetry_after_send(
+    http_client: &dyn PlatformHttpClient,
     settings: &Settings,
     outcome: &DeliveryOutcome,
     timings: &RequestTimings,
@@ -833,12 +837,10 @@ fn emit_access_telemetry_after_send(
         .unwrap_or_default();
     let epoch_ms = u64::try_from(since_epoch.as_millis()).unwrap_or(u64::MAX);
     let row = access_event_row(snapshot, &timings.snapshot(), outcome.result, epoch_ms);
-    let target = tinybird::TinybirdEventsTarget::from_access_config(&settings.tinybird);
-    let result = futures::executor::block_on(tinybird::emit_access_event(
-        &platform::FastlyPlatformHttpClient,
-        &target,
-        row,
-    ));
+    let result = futures::executor::block_on(async {
+        let target = tinybird::TinybirdEventsTarget::from_access_config(&settings.tinybird)?;
+        tinybird::emit_access_event(http_client, &target, row).await
+    });
     if let Err(error) = result {
         log::warn!("access telemetry emission dropped: {error:?}");
     }
@@ -1353,8 +1355,48 @@ mod tests {
     use fastly::mime;
     use std::time::Duration;
     use trusted_server_core::integrations::HeaderMutation;
-    use trusted_server_core::platform::RuntimeServices;
+    use trusted_server_core::platform::{
+        PlatformError, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
+        PlatformSelectResult, RuntimeServices,
+    };
     use trusted_server_core::request_timing::AuctionWaitPlacement;
+
+    #[derive(Default)]
+    struct RecordingAccessHttpClient {
+        requests: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformHttpClient for RecordingAccessHttpClient {
+        async fn send(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            self.requests
+                .lock()
+                .expect("should lock recorded requests")
+                .push(request.request.uri().to_string());
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        async fn send_async(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            self.requests
+                .lock()
+                .expect("should lock recorded requests")
+                .push(request.request.uri().to_string());
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        async fn select(
+            &self,
+            _pending_requests: Vec<PlatformPendingRequest>,
+        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
 
     fn test_settings() -> Settings {
         Settings::from_toml(
@@ -2088,12 +2130,15 @@ mod tests {
         );
         assert!(snapshot.is_none(), "should exclude the sampling boundary");
         let mut settings = test_settings();
+        settings.tinybird.api_host = "ingest.example.com".to_owned();
         settings.tinybird.enabled = true;
         settings.tinybird.access_enabled = true;
-        // No resolved token: reaching target construction would panic and a
-        // transport call would require a registered backend. Neither may run.
-        settings.tinybird.access_token_secret = None;
+        settings.tinybird.access_token_secret = Some(trusted_server_core::redacted::Redacted::new(
+            "access-append-token".to_owned(),
+        ));
+        let http_client = RecordingAccessHttpClient::default();
         emit_access_telemetry_after_send(
+            &http_client,
             &settings,
             &DeliveryOutcome {
                 result: DeliveryResult::Complete,
@@ -2101,6 +2146,78 @@ mod tests {
             },
             &context.timings,
         );
+
+        assert!(
+            http_client
+                .requests
+                .lock()
+                .expect("should lock recorded requests")
+                .is_empty(),
+            "should not dispatch access telemetry for a sampled-out response"
+        );
+    }
+
+    #[test]
+    fn access_telemetry_setup_error_skips_transport_without_panicking() {
+        let mut settings = test_settings();
+        settings.tinybird.api_host = "ingest.example.com".to_owned();
+        settings.tinybird.enabled = true;
+        settings.tinybird.access_enabled = true;
+        settings.tinybird.access_token_secret = None;
+        let http_client = RecordingAccessHttpClient::default();
+
+        emit_access_telemetry_after_send(
+            &http_client,
+            &settings,
+            &DeliveryOutcome {
+                result: DeliveryResult::Complete,
+                snapshot: Some(sample_access_snapshot()),
+            },
+            &RequestTimings::new(),
+        );
+
+        assert!(
+            http_client
+                .requests
+                .lock()
+                .expect("should lock recorded requests")
+                .is_empty(),
+            "should not dispatch access telemetry without a resolved token"
+        );
+    }
+
+    #[test]
+    fn access_telemetry_dispatch_is_gated_and_best_effort() {
+        for (enabled, access_enabled) in [(false, true), (true, false), (true, true)] {
+            let mut settings = test_settings();
+            settings.tinybird.api_host = "ingest.example.com".to_owned();
+            settings.tinybird.enabled = enabled;
+            settings.tinybird.access_enabled = access_enabled;
+            settings.tinybird.access_token_secret = Some(
+                trusted_server_core::redacted::Redacted::new("access-append-token".to_owned()),
+            );
+            let http_client = RecordingAccessHttpClient::default();
+
+            emit_access_telemetry_after_send(
+                &http_client,
+                &settings,
+                &DeliveryOutcome {
+                    result: DeliveryResult::Complete,
+                    snapshot: Some(sample_access_snapshot()),
+                },
+                &RequestTimings::new(),
+            );
+
+            assert_eq!(
+                http_client
+                    .requests
+                    .lock()
+                    .expect("should lock recorded requests")
+                    .len(),
+                usize::from(enabled && access_enabled),
+                "should dispatch once only when both toggles are enabled, without retrying errors"
+            );
+        }
     }
 
     #[test]

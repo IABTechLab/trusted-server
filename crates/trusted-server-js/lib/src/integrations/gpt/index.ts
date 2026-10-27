@@ -1214,24 +1214,14 @@ function schedulePublisherFirstImpressionFallback(
 
       try {
         const auctionFacts = diagnosticsAuctionFacts(generation, auctionDiagnostics, bid);
-        if (auctionFacts) {
-          ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
-            gptSlot,
-            slot.id,
-            trustedServerOpportunity(bid),
-            bid.hb_auction_id,
-            slot.formats,
-            auctionFacts
-          );
-        } else {
-          ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
-            gptSlot,
-            slot.id,
-            trustedServerOpportunity(bid),
-            bid.hb_auction_id,
-            slot.formats
-          );
-        }
+        ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
+          gptSlot,
+          slot.id,
+          trustedServerOpportunity(bid),
+          bid.hb_auction_id,
+          slot.formats,
+          auctionFacts
+        );
       } catch {
         // Diagnostics must not alter fallback delivery.
       }
@@ -1431,24 +1421,14 @@ export function installTsAdInit(): void {
           const opportunity = trustedServerOpportunity(bid);
           const auctionFacts = diagnosticsAuctionFacts(generation, auctionDiagnostics, bid);
           const recorder = ts.gptDiagnosticsRecorder;
-          if (auctionFacts) {
-            recorder?.recordTrustedServerOpportunity(
-              gptSlot,
-              slot.id,
-              opportunity,
-              bid.hb_auction_id,
-              requestedSlotSizes,
-              auctionFacts
-            );
-          } else {
-            recorder?.recordTrustedServerOpportunity(
-              gptSlot,
-              slot.id,
-              opportunity,
-              bid.hb_auction_id,
-              requestedSlotSizes
-            );
-          }
+          recorder?.recordTrustedServerOpportunity(
+            gptSlot,
+            slot.id,
+            opportunity,
+            bid.hb_auction_id,
+            requestedSlotSizes,
+            auctionFacts
+          );
         } catch {
           // Diagnostics must not alter ad delivery.
         }

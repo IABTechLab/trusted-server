@@ -352,13 +352,16 @@ pub fn append_server_timing_if_private<B>(
     enabled: bool,
 ) {
     timings.mark_headers_ready();
+    if !enabled {
+        return;
+    }
 
     let headers = response.headers();
     let conclusively_private = cache_control_headers_have_bare_private_or_no_store(headers)
         && !EDGE_CACHE_HEADER_NAMES
             .iter()
             .any(|name| headers.contains_key(*name));
-    if !enabled || !conclusively_private {
+    if !conclusively_private {
         return;
     }
 

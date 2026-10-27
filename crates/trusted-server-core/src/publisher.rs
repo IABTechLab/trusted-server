@@ -7154,6 +7154,20 @@ pub async fn handle_page_bids(
     ec_context: &mut EcContext,
     mut req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    // Reject cross-site invocations before diagnostics preparation or the
+    // not-configured 404 below, which would otherwise tell a cross-site caller
+    // whether this deployment has creative opportunities.
+    if !page_bids_request_allowed(&req) {
+        log::debug!(
+            "page-bids: rejecting request (sec-fetch-site={:?}, tsjs header present={})",
+            req.headers()
+                .get("sec-fetch-site")
+                .and_then(|v| v.to_str().ok()),
+            req.headers().contains_key("x-tsjs-page-bids")
+        );
+        return Ok(page_bids_preflight_denied());
+    }
+
     // Keep a local collector for direct-handler callers, but only expose
     // browser timings from an adapter-attached request clock. Otherwise an
     // adapter that forgets the extension would silently report a different
@@ -7168,19 +7182,6 @@ pub async fn handle_page_bids(
     let gpt_diagnostics =
         crate::integrations::gpt_diagnostics::prepare_request(settings, &mut req)?;
 
-    // CSRF-style gate: refuse cross-site invocations before any other work —
-    // including the not-configured 404 below, which would otherwise tell a
-    // cross-site caller whether this deployment has creative opportunities.
-    if !page_bids_request_allowed(&req) {
-        log::debug!(
-            "page-bids: rejecting request (sec-fetch-site={:?}, tsjs header present={})",
-            req.headers()
-                .get("sec-fetch-site")
-                .and_then(|v| v.to_str().ok()),
-            req.headers().contains_key("x-tsjs-page-bids")
-        );
-        return Ok(page_bids_preflight_denied());
-    }
     ec_context.set_eid_sync_source(EidSyncSource::PageBids);
 
     // Deprecation signal for the transition alias. Evaluated after the
@@ -25836,6 +25837,39 @@ mod tests {
                 StatusCode::FORBIDDEN,
                 "cross-site request should be denied, not answered with the 404"
             );
+        }
+
+        #[tokio::test]
+        async fn cross_site_request_is_denied_before_diagnostics_configuration_errors() {
+            let mut settings = settings_with_co();
+            settings
+                .integrations
+                .insert_config(
+                    "gpt_diagnostics",
+                    &serde_json::json!({ "enabled": true, "unexpected": true }),
+                )
+                .expect("should insert invalid diagnostics configuration");
+            let mut probe = make_page_bids_request("/2024/01/my-article/");
+            assert!(
+                crate::integrations::gpt_diagnostics::prepare_request(&settings, &mut probe)
+                    .is_err(),
+                "should exercise a diagnostics configuration error"
+            );
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+
+            for endpoint in [PAGE_BIDS_PATH, PAGE_BIDS_LEGACY_PATH] {
+                let mut req = make_page_bids_request_on(endpoint, "/2024/01/my-article/");
+                set_test_header(&mut req, "sec-fetch-site", "cross-site");
+
+                let response =
+                    run_page_bids_response(&settings, &orchestrator, &article_slot(), req).await;
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::FORBIDDEN,
+                    "should deny cross-site requests before diagnostics preparation on {endpoint}"
+                );
+            }
         }
 
         #[tokio::test]

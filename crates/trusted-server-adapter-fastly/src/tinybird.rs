@@ -81,19 +81,28 @@ impl TinybirdEventsTarget {
     /// `access_token_secret` instead of the auction pair, so access-log
     /// emission never shares a datasource or token with auction telemetry
     /// even though both configs come from the same [`TinybirdSettings`].
-    pub(crate) fn from_access_config(config: &TinybirdSettings) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the access token has not been resolved.
+    pub(crate) fn from_access_config(
+        config: &TinybirdSettings,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        let append_token = config.access_token_secret.clone().ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
+                message: "Tinybird access token is not resolved".to_owned(),
+            })
+        })?;
         let uri = tinybird_events_uri(&config.api_host, &config.access_dataset);
         let backend_spec = tinybird_backend_spec(&config.api_host);
-        Self {
+        Ok(Self {
             api_host: config.api_host.clone(),
             dataset: config.access_dataset.clone(),
-            append_token: config.access_token_secret.clone().expect(
-                "should contain a resolved Tinybird access token when access telemetry is enabled",
-            ),
+            append_token,
             uri,
             backend_spec,
             max_body_bytes: config.max_body_bytes,
-        }
+        })
     }
 }
 
@@ -850,12 +859,36 @@ mod tests {
     }
 
     #[test]
+    fn access_target_rejects_unresolved_token_without_panicking() {
+        let mut config = enabled_config();
+        config.access_token_secret = None;
+
+        let error = TinybirdEventsTarget::from_access_config(&config)
+            .expect_err("should reject an unresolved access token");
+
+        assert!(
+            matches!(
+                error.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "should report a configuration error"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("Tinybird access token is not resolved"),
+            "should explain the missing resolved access token"
+        );
+    }
+
+    #[test]
     fn access_target_borrows_settings_and_uses_only_access_fields() {
         let mut config = enabled_config();
         config.auction_token_secret = None;
         config.max_body_bytes = 2048;
 
-        let target = TinybirdEventsTarget::from_access_config(&config);
+        let target = TinybirdEventsTarget::from_access_config(&config)
+            .expect("should build access telemetry target");
 
         assert_eq!(target.api_host, config.api_host);
         assert_eq!(target.dataset, config.access_dataset);
@@ -875,7 +908,8 @@ mod tests {
     fn access_emitter_rejects_oversized_row_before_sending() {
         let mut config = enabled_config();
         config.max_body_bytes = 1024;
-        let target = TinybirdEventsTarget::from_access_config(&config);
+        let target = TinybirdEventsTarget::from_access_config(&config)
+            .expect("should build access telemetry target");
         let http_client = RecordingHttpClient::default();
         let row = "x".repeat(1025);
 
@@ -900,7 +934,8 @@ mod tests {
     fn access_emitter_accepts_row_exactly_at_body_limit_including_newline() {
         let mut config = enabled_config();
         config.max_body_bytes = 1024;
-        let target = TinybirdEventsTarget::from_access_config(&config);
+        let target = TinybirdEventsTarget::from_access_config(&config)
+            .expect("should build access telemetry target");
         let http_client = RecordingHttpClient::default();
         let row = "x".repeat(1023);
 
@@ -918,7 +953,8 @@ mod tests {
 
     #[test]
     fn access_emitter_posts_ndjson_and_drops_pending_without_waiting() {
-        let target = TinybirdEventsTarget::from_access_config(&enabled_config());
+        let target = TinybirdEventsTarget::from_access_config(&enabled_config())
+            .expect("should build access telemetry target");
         let http_client = RecordingHttpClient::default();
         let row = r#"{"status":200}"#.to_owned();
 
@@ -960,7 +996,8 @@ mod tests {
 
     #[test]
     fn access_emitter_surfaces_async_start_failure_without_retrying() {
-        let target = TinybirdEventsTarget::from_access_config(&enabled_config());
+        let target = TinybirdEventsTarget::from_access_config(&enabled_config())
+            .expect("should build access telemetry target");
         let http_client = RecordingHttpClient {
             fail_async_start: true,
             ..RecordingHttpClient::default()
@@ -993,7 +1030,8 @@ mod tests {
 
     #[test]
     fn access_emitter_preserves_existing_newline() {
-        let target = TinybirdEventsTarget::from_access_config(&enabled_config());
+        let target = TinybirdEventsTarget::from_access_config(&enabled_config())
+            .expect("should build access telemetry target");
         let http_client = RecordingHttpClient::default();
         let row = "{\"status\":200}\n".to_owned();
 
@@ -1011,7 +1049,8 @@ mod tests {
     fn access_emitter_counts_added_newline_against_body_limit() {
         let mut config = enabled_config();
         config.max_body_bytes = 1024;
-        let target = TinybirdEventsTarget::from_access_config(&config);
+        let target = TinybirdEventsTarget::from_access_config(&config)
+            .expect("should build access telemetry target");
         let http_client = RecordingHttpClient::default();
 
         let error =
@@ -1032,7 +1071,8 @@ mod tests {
     fn access_emitter_rejects_invalid_authorization_before_dispatch() {
         let mut config = enabled_config();
         config.access_token_secret = Some(Redacted::new("invalid\ntoken".to_owned()));
-        let target = TinybirdEventsTarget::from_access_config(&config);
+        let target = TinybirdEventsTarget::from_access_config(&config)
+            .expect("should build access telemetry target");
         let http_client = RecordingHttpClient::default();
 
         let error =

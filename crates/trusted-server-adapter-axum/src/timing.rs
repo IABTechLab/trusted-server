@@ -420,7 +420,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn axum_404_carries_header_when_private() {
         // An empty router has no routes at all, so any path dispatches
-        // through `RouterInner::dispatch`'s `NotFound` branch -- exactly the
+        // through `RouterInner::dispatch`'s `NotFound` branch, exactly the
         // path that bypasses `RouterBuilder::middleware`. The router's own
         // `EdgeError::into_response` does not attach `Cache-Control`, so a
         // small wrapping service forces the response private here, standing
