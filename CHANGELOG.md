@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add an ordinary Fastly release byte-equality gate and a real provenance-attested `trusted-server-fastly.wasm.rebuild-check.json`. Merging Phase 2 activates a second fresh Fastly build plus comparison on the next release tag; mismatch prevents signing and publication. The ordinary profile remains unqualified, native reproduction is not a release gate, and the seven binary names and signer identity stay unchanged.
 - Add Phase 1 attested Fastly wasm, three Linux/macOS CLI and three production Axum binaries, with SPDX 2.3 inventories, provenance/SBOM bundles, immutable verification, GNU glibc 2.34 and static musl startup checks. Reproducibility and the custom verifier remain later work; production publication requires maintainer settings.
 
 ### Changed

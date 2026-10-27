@@ -378,22 +378,53 @@ jobs:
         with:
           name: release-${{ matrix.asset }}
           path: release-assets
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        if: matrix.asset == 'trusted-server-fastly.wasm'
+        with:
+          name: fastly-rebuild-check
+          path: comparison
       - name: Validate signing inputs and retain their digests
+        id: inputs
         env:
           ASSET: ${{ matrix.asset }}
+          SOURCE_COMMIT: ${{ github.sha }}
         run: |
           set -euo pipefail
-          cd release-assets
-          test "$(find . -mindepth 1 -maxdepth 1 | wc -l)" -eq 2
-          for file in "$ASSET" "$ASSET.spdx.json"; do test -f "$file" && test ! -L "$file" && test -s "$file"; done
-          sha256sum "$ASSET" "$ASSET.spdx.json" > ../inputs.sha256
+          node <<'NODE'
+          // BEGIN SIGNING INPUTS
+          const fs = require('node:fs');
+          const { createHash } = require('node:crypto');
+          const { ASSET: asset, SOURCE_COMMIT: source, GITHUB_RUN_ID: run, GITHUB_RUN_ATTEMPT: attempt } = process.env;
+          const names = ['trusted-server-axum-x86_64-unknown-linux-gnu', 'trusted-server-axum-x86_64-unknown-linux-musl', 'trusted-server-axum-aarch64-unknown-linux-gnu', 'trusted-server-fastly.wasm', 'ts-aarch64-apple-darwin', 'ts-x86_64-apple-darwin', 'ts-x86_64-unknown-linux-gnu'];
+          if (!names.includes(asset) || !/^[a-f0-9]{40}$/.test(source) || !/^[1-9][0-9]*$/.test(run) || !/^[1-9][0-9]*$/.test(attempt)) throw Error('Invalid signing identity');
+          const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+          const regular = (path, limit) => { const stat = fs.lstatSync(path); if (!stat.isFile() || !stat.size || stat.size > limit) throw Error('Invalid signing input'); return fs.readFileSync(path); };
+          const exact = (dir, files) => { if (JSON.stringify(fs.readdirSync(dir).sort()) !== JSON.stringify([...files].sort())) throw Error('Unexpected signing inputs'); };
+          const inputs = [asset, `${asset}.spdx.json`];
+          exact('release-assets', inputs);
+          const binary = regular(`release-assets/${asset}`, 512 * 1024 * 1024), spdx = regular(`release-assets/${asset}.spdx.json`, 32 * 1024 * 1024);
+          if (asset === 'trusted-server-fastly.wasm') {
+            const companion = `${asset}.rebuild-check.json`;
+            exact('comparison', [companion]);
+            const bytes = regular(`comparison/${companion}`, 32 * 1024 * 1024), receipt = JSON.parse(bytes.toString('utf8'));
+            const canonical = value => Array.isArray(value) ? value.map(canonical) : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
+            if (!bytes.equals(Buffer.from(JSON.stringify(canonical(receipt)) + '\n'))) throw Error('Noncanonical or ambiguous rebuild check');
+            if (receipt.version !== 1 || receipt.profile !== 'ordinary-release-fastly-byte-equality-v1' || receipt.release_qualification !== false || receipt.source_commit !== source || receipt.asset !== asset || receipt.target !== 'wasm32-wasip1' || receipt.variant !== 'default' || receipt.outcome !== 'matched' || receipt.canonical_sha256 !== hash(binary) || receipt.reproduction_sha256 !== hash(binary)) throw Error('Rebuild check identity or equality mismatch');
+            for (const build of [receipt.canonical, receipt.reproduction]) if (!build || build.run_id !== Number(run) || build.run_attempt !== Number(attempt) || !Number.isSafeInteger(build.job_id) || build.job_id <= 0 || build.size !== binary.length || build.sha256 !== hash(binary)) throw Error('Rebuild check run or binary mismatch');
+            if (receipt.canonical.job_id === receipt.reproduction.job_id || receipt.canonical.spdx_sha256 !== hash(spdx)) throw Error('Rebuild check job or SPDX mismatch');
+            fs.writeFileSync(`release-assets/${companion}`, bytes, {flag:'wx'});
+            inputs.push(companion);
+          }
+          exact('release-assets', inputs);
+          fs.writeFileSync('inputs.sha256', inputs.map(file => `${hash(regular(`release-assets/${file}`, 512 * 1024 * 1024))}  ${file}\n`).join(''), {flag:'wx'});
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `subjects<<PROVENANCE_SUBJECTS\n${inputs.map(file => `release-assets/${file}`).join('\n')}\nPROVENANCE_SUBJECTS\n`);
+          // END SIGNING INPUTS
+          NODE
       - name: Attest SLSA build provenance
         id: provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-path: |
-            release-assets/${{ matrix.asset }}
-            release-assets/${{ matrix.asset }}.spdx.json
+          subject-path: ${{ steps.inputs.outputs.subjects }}
       - name: Attest the binary's SPDX SBOM
         id: sbom
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
@@ -412,6 +443,9 @@ jobs:
           mkdir signed-assets
           cp "$PROVENANCE" "signed-assets/$ASSET.provenance.sigstore.json"
           cp "$SBOM" "signed-assets/$ASSET.sbom.sigstore.json"
+          if [[ "$ASSET" == trusted-server-fastly.wasm ]]; then
+            cp "release-assets/$ASSET.rebuild-check.json" "signed-assets/$ASSET.rebuild-check.json"
+          fi
           cp inputs.sha256 signed-assets/SHA256SUMS
           (cd signed-assets && sha256sum "$ASSET.provenance.sigstore.json" "$ASSET.sbom.sigstore.json" >> SHA256SUMS)
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0

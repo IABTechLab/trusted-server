@@ -562,6 +562,171 @@ const assets = [
   'ts-x86_64-unknown-linux-gnu',
 ]
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex')
+
+test('isolated signing accepts only bound 3/2 input sets and retains exact provenance subjects', () => {
+  const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const match = workflow.match(
+    /          \/\/ BEGIN SIGNING INPUTS\n([\s\S]*?)          \/\/ END SIGNING INPUTS/
+  )
+  assert.ok(match, 'should exercise the actual inline signer validation')
+  const script = match[1]
+    .split('\n')
+    .map((line) => line.slice(10))
+    .join('\n')
+  const canonical = (value) =>
+    Array.isArray(value)
+      ? value.map(canonical)
+      : value && typeof value === 'object'
+        ? Object.fromEntries(
+            Object.keys(value)
+              .sort()
+              .map((key) => [key, canonical(value[key])])
+          )
+        : value
+  for (const asset of assets)
+    for (const mode of asset === 'trusted-server-fastly.wasm'
+      ? [
+          'success',
+          'missing',
+          'extra',
+          'source',
+          'run',
+          'attempt',
+          'failed',
+          'profile',
+          'qualified',
+          'binary',
+          'spdx',
+          'duplicate-key',
+        ]
+      : ['success', 'extra']) {
+      const root = mkdtempSync(join(tmpdir(), 'ordinary-sign-'))
+      try {
+        mkdirSync(join(root, 'release-assets'))
+        const binary = Buffer.from(`fixture ${asset}`),
+          spdx = Buffer.from('{}')
+        writeFileSync(join(root, 'release-assets', asset), binary)
+        writeFileSync(join(root, 'release-assets', `${asset}.spdx.json`), spdx)
+        if (asset === 'trusted-server-fastly.wasm') {
+          mkdirSync(join(root, 'comparison'))
+          const receipt = {
+            version: 1,
+            profile: 'ordinary-release-fastly-byte-equality-v1',
+            release_qualification: false,
+            source_commit: 'a'.repeat(40),
+            asset,
+            target: 'wasm32-wasip1',
+            variant: 'default',
+            outcome: 'matched',
+            canonical_sha256: hash(binary),
+            reproduction_sha256: hash(binary),
+            canonical: {
+              run_id: 17,
+              run_attempt: 2,
+              job_id: 101,
+              size: binary.length,
+              sha256: hash(binary),
+              spdx_sha256: hash(spdx),
+            },
+            reproduction: {
+              run_id: 17,
+              run_attempt: 2,
+              job_id: 102,
+              size: binary.length,
+              sha256: hash(binary),
+            },
+          }
+          if (mode === 'source') receipt.source_commit = 'b'.repeat(40)
+          if (mode === 'run') receipt.canonical.run_id = 18
+          if (mode === 'attempt') receipt.reproduction.run_attempt = 1
+          if (mode === 'failed') receipt.outcome = 'mismatched'
+          if (mode === 'profile') receipt.profile = 'controlled-recipe'
+          if (mode === 'qualified') receipt.release_qualification = true
+          if (mode === 'binary') receipt.canonical_sha256 = '0'.repeat(64)
+          if (mode === 'spdx') receipt.canonical.spdx_sha256 = '0'.repeat(64)
+          let text = JSON.stringify(canonical(receipt)) + '\n'
+          if (mode === 'duplicate-key')
+            text = text.replace('{', '{"version":0,')
+          if (mode !== 'missing')
+            writeFileSync(
+              join(root, 'comparison', `${asset}.rebuild-check.json`),
+              text
+            )
+          if (mode === 'extra')
+            writeFileSync(join(root, 'comparison', 'unexpected'), 'extra')
+        } else if (mode === 'extra')
+          writeFileSync(join(root, 'release-assets', 'unexpected'), 'extra')
+        const local = (path) => join(root, path)
+        const context = {
+          Buffer,
+          process: {
+            env: {
+              ASSET: asset,
+              SOURCE_COMMIT: 'a'.repeat(40),
+              GITHUB_RUN_ID: '17',
+              GITHUB_RUN_ATTEMPT: '2',
+              GITHUB_OUTPUT: 'outputs',
+            },
+          },
+          require(name) {
+            if (name === 'node:crypto') return { createHash }
+            if (name === 'node:fs')
+              return {
+                readdirSync: (path) => fs.readdirSync(local(path)),
+                lstatSync: (path) => fs.lstatSync(local(path)),
+                readFileSync: (path) => fs.readFileSync(local(path)),
+                writeFileSync: (path, ...args) =>
+                  fs.writeFileSync(local(path), ...args),
+                appendFileSync: (path, ...args) =>
+                  fs.appendFileSync(local(path), ...args),
+              }
+            throw Error(`Unexpected signing module: ${name}`)
+          },
+        }
+        const execute = () => vm.runInNewContext(script, context)
+        if (mode !== 'success') {
+          assert.throws(execute, undefined, `${asset}: ${mode}`)
+          assert.equal(
+            fs.existsSync(join(root, 'inputs.sha256')),
+            false,
+            'should not seal failed inputs'
+          )
+          continue
+        }
+        execute()
+        const files = [
+          asset,
+          `${asset}.spdx.json`,
+          ...(asset === 'trusted-server-fastly.wasm'
+            ? [`${asset}.rebuild-check.json`]
+            : []),
+        ]
+        assert.equal(
+          readFileSync(join(root, 'inputs.sha256'), 'utf8'),
+          files
+            .map(
+              (file) =>
+                `${hash(readFileSync(join(root, 'release-assets', file)))}  ${file}\n`
+            )
+            .join('')
+        )
+        const output = readFileSync(join(root, 'outputs'), 'utf8')
+        for (const file of files)
+          assert.ok(
+            output.includes(`release-assets/${file}\n`),
+            'should attest every sealed input'
+          )
+        assert.equal(
+          readFileSync(join(root, 'inputs.sha256'), 'utf8').trim().split('\n')
+            .length,
+          files.length
+        )
+      } finally {
+        rmSync(root, { recursive: true, force: true })
+      }
+    }
+})
+
 function publicationScript() {
   const workflow = readFileSync('.github/workflows/release.yml', 'utf8')
   const match = workflow.match(
@@ -576,6 +741,19 @@ function publicationScript() {
     .map((line) => line.slice(10))
     .join('\n')
 }
+
+test('release verification commands parse in Bash (CI only)', () => {
+  const guide = readFileSync(
+    'docs/guide/release-verification.md',
+    'utf8'
+  ).match(/<!-- release-verification:start -->\s*```bash\n([\s\S]*?)\n```/)
+  assert.ok(
+    guide,
+    'should syntax-check the commands matched by the publisher test'
+  )
+  execFileSync('bash', ['-n'], { input: guide[1] })
+})
+
 test('publication binds exact signing handoffs and refuses drafts, corruption and partial uploads', async () => {
   const script = publicationScript()
   for (const mode of [
@@ -597,6 +775,10 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'extra',
     'changed',
     'empty-bundle',
+    'missing-companion',
+    'changed-companion',
+    'extra-companion',
+    'unsigned-companion',
     'upload-error',
     'mutable',
     'wrong-id',
@@ -653,6 +835,19 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             bytes
           )
           entries.push(`${hash(bytes)}  ${asset}${suffix}\n`)
+        }
+        if (asset === 'trusted-server-fastly.wasm') {
+          const companion = `${asset}.rebuild-check.json`,
+            bytes = Buffer.from('fixture signed ordinary rebuild check')
+          writeFileSync(join(signed, companion), bytes)
+          if (mode !== 'unsigned-companion')
+            entries.splice(2, 0, `${hash(bytes)}  ${companion}\n`)
+          if (mode === 'changed-companion')
+            writeFileSync(join(signed, companion), 'changed')
+          if (mode === 'missing-companion')
+            fs.unlinkSync(join(signed, companion))
+          if (mode === 'extra-companion')
+            writeFileSync(join(signed, 'unexpected'), 'extra')
         }
         writeFileSync(join(signed, 'SHA256SUMS'), entries.join(''))
       }
@@ -795,9 +990,6 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             normalize(guide[1]),
             'release commands should match the guide'
           )
-          execFileSync('bash', ['-n'], {
-            input: body.match(/```bash\n([\s\S]*?)\n```/)[1],
-          })
           return response(release(true), 201)
         }
         if (u.pathname.endsWith('/assets') && method === 'POST') {
@@ -970,6 +1162,10 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           'extra',
           'changed',
           'empty-bundle',
+          'missing-companion',
+          'changed-companion',
+          'extra-companion',
+          'unsigned-companion',
         ].includes(mode)
       )
         assert.ok(!calls.some(([method]) => method === 'POST'), mode)
@@ -978,18 +1174,18 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
       if (['upload-error'].includes(mode))
         assert.ok(!calls.some(([method]) => method === 'PATCH'), mode)
       if (successful) {
-        assert.equal(uploaded.length, 29)
+        assert.equal(uploaded.length, 30)
         assert.equal(
           calls.filter(
             ([method, args]) => method === 'gh' && args[1][1] !== 'download'
           ).length,
           mode === 'attestation-other-transient'
-            ? 32
+            ? 33
             : mode === 'attestation-other-tag'
-              ? 31
+              ? 32
               : mode === 'attestation-other-tag-before-current'
-                ? 33
-                : 30
+                ? 34
+                : 31
         )
       }
       assert.equal(
@@ -1045,7 +1241,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           calls.filter(
             ([method, path]) => method === 'POST' && path.endsWith('/assets')
           ).length,
-          29,
+          30,
           mode
         )
         assert.equal(
@@ -1325,7 +1521,24 @@ test('workflows select exactly the descriptive cohort and restrict actual build 
     names
   )
   const sign = build.split('\n  sign:')[1]
-  for (const name of names) assert.equal(sign.split(name).length - 1, 1)
+  const matrix = sign
+    .split('\n    steps:')[0]
+    .match(/\n        asset:\s*\[([\s\S]*?)\]/)[1]
+  assert.deepEqual(
+    matrix
+      .split(',')
+      .map((name) => name.trim())
+      .filter(Boolean)
+      .sort(),
+    names,
+    'should sign precisely the cohort'
+  )
+  const allowed = sign.match(/const names = (\[[^;]+\]);/)[1]
+  assert.deepEqual(
+    Array.from(vm.runInNewContext(allowed)).sort(),
+    names,
+    'should validate the same exact input cohort'
+  )
   const published = publicationScript().match(/const names = (\[[^;]+\]);/)[1]
   assert.deepEqual(Array.from(vm.runInNewContext(published)).sort(), names)
   for (const prefix of ['release-', 'signed-'])
