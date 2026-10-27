@@ -260,18 +260,28 @@ The Fastly adapter is the reference implementation of the taxonomy. Axum differs
 structurally and its emissions are defined accordingly rather than pretending parity:
 
 - `ts-appbuild` is absent: Axum builds application state once at startup.
-- `body_mode` is always `buffered`: the Axum HTTP client buffers upstream bodies, so
-  `stream_ms` measures buffered-body write-out and `auction_wait_placement` is always
-  `pre_header`.
-- The freeze point is an outer service wrapper around the `RouterService` inside
-  `AxumDevServer`, not router middleware: router-generated 404/405 responses bypass
-  router middleware, and middleware returns before Axum serializes the body. The
-  wrapper sees every response including router-generated ones; `/health` is excluded
-  by path match inside the wrapper.
+- Axum records no `Phase::Stream`; `stream_ms` is not a buffered-body write-out
+  measurement there. Core auction collection occurs before headers are sent.
+- The freeze point is `TimingService` around `EdgeZeroAxumService`, driven by
+  the adapter's own `axum::serve` loop rather than `AxumDevServer`. It sees
+  every response before serialization, independently of router middleware and
+  router-generated error handling. `/health` is excluded by path match.
 - Axum emits the header only; no Tinybird rows in v1 (unchanged).
 
 Cloudflare and Spin attach the per-request collector so core request-scoped consumers
 share the adapter clock, but have no header or telemetry emission wiring in v1.
+
+The request-clock origins differ:
+
+| Adapter           | T0 boundary                                                  | App-build meaning                                                                                |
+| ----------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| Fastly            | Before per-request config-store opening and setup            | Per-request setup, plus cold application construction when required; warm values can be non-null |
+| Axum              | Entry to `TimingService::call`                               | State is built once at startup; no per-request app-build phase                                   |
+| Cloudflare / Spin | Router timing middleware after per-request application setup | Setup precedes the collector; not comparable to Fastly app-build                                 |
+
+`origin_ms` is caller-blocking wait. An early-dispatched origin request overlaps
+other work, so its span measures only the remaining wait. Neither this phase nor
+`appbuild_ms` is a cross-adapter transport-latency or cold-start indicator.
 
 ## 9. Access telemetry row
 
@@ -318,6 +328,7 @@ ClickHouse sorting keys cannot contain nullable columns):
 `route_class`           LowCardinality(String),      -- publisher_html | tsjs | integration_proxy | ec | auction_api | asset | other
 `route_template`        String,                      -- bounded, normalized; replaces path
 `body_mode`             LowCardinality(String),      -- streamed | buffered
+`delivery_result`       LowCardinality(String),      -- complete | partial | error; transport handoff only
 `auction_wait_placement` LowCardinality(String),     -- pre_header | in_stream | none
 `appbuild_ms`           Nullable(UInt32),
 `filter_ms`             Nullable(UInt32),
@@ -331,10 +342,10 @@ ClickHouse sorting keys cannot contain nullable columns):
 `resp_bytes`            Nullable(UInt64),
 `template_cache_state`  LowCardinality(String),      -- from the typed response extension, not the public header
 `country`               LowCardinality(String),
-`ts_version`            LowCardinality(String),
+`ts_version`            LowCardinality(String),      -- compiled TS build identifier, matching x-ts-version
 `pop`                   LowCardinality(String),      -- FASTLY_POP, 'unknown' when absent
 `auction_dispatched_ms` Nullable(UInt32),            -- section 18
-`auction_resolved_ms`   Nullable(UInt32),            -- section 18
+`auction_collected_ms`   Nullable(UInt32),            -- section 18
 `auction_committed_ms`  Nullable(UInt32),            -- section 18
 `auction_id`            Nullable(UUID)               -- section 18; join key to auction_events_raw
 ```
@@ -657,7 +668,7 @@ Four auction columns on the new `access_logs_v2` row, all populated from the
 
 ```
 `auction_dispatched_ms`  Nullable(UInt32),  `json:$.auction_dispatched_ms`
-`auction_resolved_ms`    Nullable(UInt32),  `json:$.auction_resolved_ms`
+`auction_collected_ms`    Nullable(UInt32),  `json:$.auction_collected_ms`
 `auction_committed_ms`   Nullable(UInt32),  `json:$.auction_committed_ms`
 `auction_id`             Nullable(UUID),    `json:$.auction_id`
 ```
@@ -665,18 +676,23 @@ Four auction columns on the new `access_logs_v2` row, all populated from the
 Null on an offset means "this milestone was not reached", not "no auction ran".
 `auction_id` is what separates the cases, and the two read together:
 
-| `auction_id` | `dispatched` | `resolved` | `committed` | Meaning                                                             |
-| ------------ | ------------ | ---------- | ----------- | ------------------------------------------------------------------- |
-| null         | null         | null       | null        | no auction was attempted (assets, EC endpoints, disabled)           |
-| set          | null         | null       | null        | attempted, then skipped or failed to launch any provider            |
-| set          | set          | null       | null        | dispatched, never collected (origin error, 304, disconnect)         |
-| set          | set          | set        | null        | collected, but targeting was not committed to response state        |
-| set          | set          | set        | set         | collected and targeting committed, including no-bid/timeout results |
+| `auction_id` | `dispatched` | `collected` | `committed` | Meaning                                                                   |
+| ------------ | ------------ | ----------- | ----------- | ------------------------------------------------------------------------- |
+| null         | null         | null        | null        | no auction observation, including disabled auctions                       |
+| set          | null         | null        | null        | observed, then skipped or failed before network work                      |
+| set          | set          | null        | null        | provider dispatched, never collected, such as origin error or disconnect  |
+| set          | set          | set         | null        | collected, targeting not committed                                        |
+| set          | set          | set         | set         | provider work collected and targeting committed, including no-bid/timeout |
+| set          | null         | set         | null        | mediator-only network work collected, targeting not committed             |
+| set          | null         | set         | set         | mediator-only network work collected and targeting committed              |
 
-Dispatch evidence means at least one provider started a request;
-routing-only skipped outcomes do not qualify. `resolved` is a
-collection-time mark, not a separately observed transport-completion timestamp.
-Whenever all three milestones exist, `dispatched <= resolved <= committed`.
+Dispatch evidence means at least one provider started a request; routing-only
+outcomes do not qualify. Collection can observe a mediator Pending result or a
+started-request error without provider dispatch. A configured mediator or an
+Immediate result alone is not launch evidence. Existing dispatch/admission choices
+are unchanged. The internal and browser fields retain their resolved names;
+`auction_collected_ms` names the persisted milestone, not transport completion.
+Whenever all three milestones exist, `dispatched <= collected <= committed`.
 Headers-ready can fall before or after these milestones, as described below.
 
 The third row is the case worth watching: bid requests went out and the response
@@ -705,7 +721,7 @@ Combined with existing columns, one access row now reads as a timeline:
 ```
 t=0 ......... request entry
 t=D ......... auction_dispatched_ms      (bids out; origin fetch typically in flight)
-t=R ......... auction_resolved_ms        (collection returned, not transport completion)
+t=R ......... auction_collected_ms        (collection returned, not transport completion)
 t=C ......... auction_committed_ms       (targeting available to the response)
 ```
 
@@ -719,9 +735,10 @@ ladder, and where it lands depends on `body_mode`:
   polled, while the collect happens at the `</body>` seam inside that body. So
   D < H < R < C is the normal ordering for a streamed HTML page.
 
-A sanity filter of the form `auction_committed_ms <= time_elapsed_ms` therefore
-discards every valid streamed row. Slice by `body_mode` before comparing the
-auction marks against H at all.
+Requiring `auction_committed_ms <= time_elapsed_ms` can discard valid streamed
+rows. Slice by wait placement before comparing auction marks against H. The
+illustrated ordering assumes distinct millisecond values; adjacent marks can be
+equal after whole-millisecond conversion.
 
 `C - R` measures whole-millisecond commit latency. On the navigation path it
 brackets `write_bids_to_state`, including per-winning-bid creative processing.
@@ -734,14 +751,16 @@ establishes auction/origin overlap. `origin_ms` can itself measure only the
 remaining origin wait after early dispatch. Transport-completion timestamps would
 be needed to derive that overlap.
 
-`auction_wait_ms` measures blocked collection only on instrumented publisher HTML
-paths after a provider launch. `/auction` and `/_ts/page-bids` leave it null with
-`none` placement; mediator-only collection is also unmeasured.
+`auction_wait_ms` measures actual collection after provider or mediator launch.
+`/auction` and `/_ts/page-bids` record `pre_header`; HTML uses its actual pre-header
+or in-stream placement. No-work outcomes leave wait null with `none` placement.
+A measured zero retains its placement, and mediator-only collection may have wait
+and collected/committed offsets while provider dispatch remains null.
 
 Joining to per-bidder detail, now that both sides are `UUID`:
 
 ```sql
-SELECT a.auction_id, a.auction_resolved_ms - a.auction_dispatched_ms AS edge_window,
+SELECT a.auction_id, a.auction_collected_ms - a.auction_dispatched_ms AS edge_window,
        e.provider, e.provider_response_time_ms
 FROM access_logs_v2 a
 INNER JOIN auction_events_raw e ON a.auction_id = e.auction_id

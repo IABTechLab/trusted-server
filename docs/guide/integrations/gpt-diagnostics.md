@@ -188,7 +188,8 @@ executed or became visible.
 ```mermaid
 flowchart TB
     A[Server timing origin] --> B[Auction dispatched]
-    B --> C[Auction resolved]
+    B --> C[Auction collected]
+    A -->|Mediator-only collection| C
     C --> D[Bids committed to page state]
     E[GPT slotRequested] --> F[GPT slotResponseReceived]
     F --> G[GPT slotRenderEnded]
@@ -226,6 +227,14 @@ synchronous diagnostics context while delegating their own refresh, so a nested
 `pubads.refresh` is not mislabeled `publisher_refresh` or `competing`. Both clear that
 context even when the delegated refresh throws, and the Prebid wrapper restores the
 exact prior value. Diagnostics never suppresses or changes a GPT request.
+
+The always-served Prebid shim calls one optional completed-auction recorder hook
+with the exact Prebid instance and targeted slots. Targeting reads, `bidWon`
+subscription and bounded correlation state live in the separate diagnostics bundle.
+Without that runtime, the shim does not install diagnostics listeners or read
+candidate targeting. Runtime destruction removes its own listener when `offEvent`
+is available; otherwise its listener becomes inert and releases retained recorder
+state.
 
 For a direct observation, the optional opaque auction ID is retained only after
 trimming to a non-empty value no longer than 256 UTF-8 bytes. Winning bidder names are
@@ -439,9 +448,11 @@ content or altering the APS sandbox, so this field cannot prove the inner creati
 pixels.
 
 Badges and the panel live in a closed Shadow DOM. Diagnostics do not add attributes,
-classes, or inline styles to publisher slot elements. Each badge is an interactive button
-positioned over the slot's top-left area. While diagnostics are active, the badge intercepts
-pointer input within its own bounds instead of passing that input to the creative.
+classes, or inline styles to publisher slot elements. Badge evidence is noninteractive
+and passes pointer input through. Only the small native `Ad #N` button is clickable.
+It is positioned outside the bound creative rectangles observed by diagnostics and
+inside the viewport. If no such position fits, the button is hidden while the panel
+remains available. The button supports normal keyboard focus and activation.
 
 ## Presentation Lifecycle
 
@@ -449,7 +460,7 @@ pointer input within its own bounds instead of passing that input to the creativ
 - **Close** dismisses the presentation for the current document.
 - External removal by hydration or DOM reconciliation triggers a debounced remount.
 - Live re-renders preserve open request-history, help, and technical disclosures plus panel scroll position.
-- Selecting a request from a badge opens its history once, including the latest request. A later user collapse remains closed across live updates.
+- Selecting the latest request focuses its current details without opening history. Selecting an earlier retained request opens its history once. A later user collapse remains closed across live updates.
 - Explicit Close or `hide()` prevents remount until `show()` is called.
 - Capture continues while the panel is hidden.
 

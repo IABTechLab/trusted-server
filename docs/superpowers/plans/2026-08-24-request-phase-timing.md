@@ -1,5 +1,11 @@
 # Request Phase Timing Implementation Plan
 
+> PR #1261 contract update: access v2 has 31 columns, including `delivery_result`
+> and `auction_collected_ms`. `ts_version` is the compiled TS build identifier.
+> Access ingestion is best-effort dispatch/drop, not a confirmed-ingest wait.
+> The guide/spec and current tests define these contracts; historical unchecked
+> steps do not prove deployment or committed-pin validation.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Every application response attributes its own server time by phase via a
@@ -50,7 +56,7 @@ task.
 | `crates/trusted-server-adapter-fastly/src/main.rs` (modify)       | T0, appbuild span, freeze point, `DeliveryOutcome`, post-send emission ordering                    |
 | `crates/trusted-server-adapter-fastly/src/app.rs` (modify)        | filter span, geo span + `GeoLookupState` attach, route class assignment                            |
 | `crates/trusted-server-adapter-fastly/src/middleware.rs` (modify) | finalize consumes `GeoLookupState`                                                                 |
-| `crates/trusted-server-adapter-fastly/src/tinybird.rs` (modify)   | access sink with confirmed delivery                                                                |
+| `crates/trusted-server-adapter-fastly/src/tinybird.rs` (modify)   | best-effort post-send access dispatch                                                              |
 | `crates/trusted-server-adapter-axum/src/` (modify)                | terminal freeze layer, header emission                                                             |
 | `tinybird/datasources/access_logs_v2.datasource` (create)         | versioned phase-column schema; preserve the legacy reserved datasource                             |
 | `trusted-server.example.toml` (modify)                            | `[observability]`, tinybird keys                                                                   |
@@ -763,8 +769,8 @@ git commit -m "Capture stream duration, auction wait placement, and response byt
   - `pub fn publisher_route_template(path: &str) -> String`: `/` plus first segment
     filtered to `[a-z0-9_-]`, truncated to 32 chars, plus `/*` when deeper; empty or
     disallowed first segments render `/other/*`.
-  - `pub struct AccessTelemetrySnapshot { pub method: String, pub status: u16, pub route_class: RouteClass, pub route_template: String, pub publisher_domain: String, pub env: String, pub service_id: String, pub pop: String, pub ts_version: String, pub country: String, pub template_cache_state: String, pub body_mode: &'static str, pub sample_rate: f64 }`
-  - `pub fn access_event_row(snapshot: &AccessTelemetrySnapshot, timings: &TimingSnapshot, event_ts_epoch_ms: u64) -> String` (one NDJSON line).
+  - `pub struct AccessTelemetrySnapshot { pub method: String, pub status: u16, pub route_class: RouteClass, pub route_template: String, pub publisher_domain: String, pub env: String, pub service_id: String, pub pop: String, pub country: String, pub template_cache_state: String, pub body_mode: &'static str, pub sample_rate: f64 }`
+  - `pub fn access_event_row(snapshot: &AccessTelemetrySnapshot, timings: &TimingSnapshot, delivery_result: DeliveryResult, event_ts_epoch_ms: u64) -> String` (one NDJSON line).
 
 - [ ] **Step 1: Write the failing tests** (adversarial, per spec 9)
 
@@ -838,7 +844,7 @@ git commit -m "Add access telemetry snapshot, route classes, and coarse route te
 
 ---
 
-### Task 8: Access sink with confirmed delivery + post-send ordering
+### Task 8: Best-effort access dispatch and post-send ordering
 
 **Files:**
 
@@ -850,9 +856,9 @@ git commit -m "Add access telemetry snapshot, route classes, and coarse route te
 - Consumes: `AccessTelemetrySnapshot` + `access_event_row` (Task 7), settings flags
   (Task 2), `DeliveryOutcome` (Tasks 3/6).
 - Produces: `pub(crate) async fn emit_access_event(client: &FastlyPlatformHttpClient, target: &TinybirdEventsTarget, row: String) -> Result<(), Report<TrustedServerError>>`,
-  sending via the adapter's stateless platform client (the blocking variant,
-  post-delivery), checking `response.status().is_success()`, warning with status
-  otherwise. The transport context is adapter-owned and route-independent (target
+  starting the host-owned request with `send_async` after client delivery,
+  then dropping its pending handle. Serialization/setup/start errors are returned;
+  later transport, HTTP status and ingestion acceptance are unobserved. The transport context is adapter-owned and route-independent (target
   derived from settings once at entry), so asset, admin, and error responses emit
   without `RuntimeServices` or `EcFinalizeState`.
 
@@ -860,15 +866,14 @@ git commit -m "Add access telemetry snapshot, route classes, and coarse route te
 
 ```rust
 #[test]
-fn access_emitter_posts_ndjson_and_validates_2xx() {
-    // RecordingHttpClient returning 202: assert URI is /v0/events?name=access_logs_v2,
-    // body is the row, Authorization bearer from the secret stub.
+fn access_emitter_dispatches_ndjson_and_drops_without_waiting() {
+    // Assert exact URI/body/auth, one async start, no synchronous send or wait,
+    // and destruction of the returned pending handle.
 }
 
 #[test]
-fn access_emitter_warns_and_drops_on_non_2xx() {
-    // RecordingHttpClient returning 422: emit returns Err naming the status; no retry
-    // request recorded (exactly one request seen).
+fn access_emitter_reports_start_failure_without_retry() {
+    // An async-start failure returns Err; no retry or wait is attempted.
 }
 
 #[test]
@@ -891,11 +896,10 @@ Expected: FAIL.
 - [ ] **Step 3: Implement**
 
 - Reuse `TinybirdEventsTarget` with a second constructor
-  `from_access_config(config: TinybirdSettings)` using `access_dataset` and
+  `from_access_config(config: &TinybirdSettings)` using `access_dataset` and
   `access_token_secret`.
-- Sampling decision: `fn sampled_in(rate: f64, entropy: u64) -> bool` where entropy is
-  derived from the event timestamp nanos XOR a per-request counter (no `rand`
-  dependency; document that uniformity is approximate and sufficient).
+- Sampling decision: `fn sampled_in(rate: f64, roll: f64) -> bool` compares the
+  configured rate to one uniform random draw before snapshot construction.
 - `main.rs` post-send, in order: `timings.mark_request_elapsed()` (already placed in
   Task 6), existing pull-sync dispatch unchanged, then when
   `settings.tinybird.enabled && settings.tinybird.access_enabled` and sampled in:
@@ -911,7 +915,7 @@ Expected: PASS.
 
 ```bash
 git add crates/trusted-server-adapter-fastly/src/tinybird.rs crates/trusted-server-adapter-fastly/src/main.rs
-git commit -m "Emit confirmed access telemetry rows after pull-sync post-send"
+git commit -m "Dispatch access telemetry after pull-sync post-send"
 ```
 
 ---
@@ -929,7 +933,7 @@ git commit -m "Emit confirmed access telemetry rows after pull-sync post-send"
 - Produces: the deployed schema contract for the dashboard (separate repo).
 
 - [ ] **Step 1: Create the versioned schema** per spec section 9, with the
-      30 producer fields and JSONPaths, non-nullable dimension columns, nullable
+      31 producer fields and JSONPaths, non-nullable dimension columns, nullable
       phase/milestone columns, and a 30-day TTL. Use
       `ENGINE_SORTING_KEY "toDate(event_ts), service_id, publisher_domain, env, route_class, pop, status"`.
       Keep the legacy nine-column datasource unchanged. No `FORWARD_QUERY` or

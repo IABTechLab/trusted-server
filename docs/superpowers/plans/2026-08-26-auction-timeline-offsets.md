@@ -1,5 +1,11 @@
 # Auction Timeline Offsets Implementation Plan
 
+> PR #1261 contract update: the persisted collection field is `auction_collected_ms`.
+> Internal Rust and browser `resolved` names remain unchanged. Collection wait uses
+> actual provider or mediator launch evidence, while provider dispatch stays null
+> for mediator-only work. Historical checkboxes below are not evidence that the
+> current committed Fastly dependency or a live deployment has been validated.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Record three T0-anchored auction milestones (dispatched, resolved, committed) plus the auction id on `RequestTimings`, and emit them as four auction columns on the versioned `access_logs_v2` row.
@@ -13,9 +19,9 @@
 ## Global Constraints
 
 - Marks are first-call-wins; `try_lock` only; a contended lock drops the sample, a poisoned lock is recovered (matching every other write on the collector).
-- A null offset means "this milestone was not reached", not "no auction ran". `auction_id` is what separates the two: null id means no auction was attempted; a non-null id with a null dispatch offset means attempted but nothing sent; a non-null dispatch offset with a null resolve offset means dispatched and never collected.
+- A null offset means "this milestone was not reached", not "no auction ran". `auction_id` is what separates the two: null id means no auction was attempted; a non-null id with a null dispatch offset means no provider launch, but mediator-only collection may still have occurred; a non-null dispatch offset with a null resolve offset means dispatched and never collected.
 - The id is stamped where an active-auction observation is built, not on dispatch, so active skipped and dispatch-failed auctions stay joinable. Disabled auctions have null access UUIDs on all three routes.
-- Column names: `auction_dispatched_ms`, `auction_resolved_ms`, `auction_committed_ms`, `auction_id`; JSONPaths `json:$.<name>`. The new versioned datasource has no `FORWARD_QUERY`; the legacy dataset is preserved.
+- Column names: `auction_dispatched_ms`, `auction_collected_ms`, `auction_committed_ms`, `auction_id`; JSONPaths `json:$.<name>`. The new versioned datasource has no `FORWARD_QUERY`; the legacy dataset is preserved.
 - `auction_id` is `Nullable(UUID)`, matching `auction_events_raw.auction_id` so the join needs no cast and no sentinel.
 - All three `AuctionSource` variants are instrumented: `InitialNavigation`, `SpaNavigation` (`/_ts/page-bids`), and `AuctionApi` (`POST /auction`).
 - No header emission and no config surface. Changes are confined to `trusted-server-core`, `tinybird/`, and the spec and plan documents.
@@ -51,8 +57,8 @@
 - Consumes: Task 1 methods; `observation.auction_id` (`AuctionObservationContext`), in scope wherever an observation is built.
 
 - [x] Navigation path: `set_auction_id` at observation construction; `mark_auction_dispatched()` in the `DispatchAuctionOutcome::Dispatched` arm; `mark_auction_resolved()` after both `record_auction_wait` calls; `mark_auction_committed()` after both `write_bids_to_state` calls.
-- [x] `/_ts/page-bids`: pull the collector off the request extensions; `set_auction_id` at observation construction; dispatch before `run_auction`, resolve on both its `Ok` and `Err` arms, commit after the bid map is built.
-- [x] `POST /auction`: pull the collector off `parts.extensions` (the request is consumed by `into_parts` before the auction runs); same bracket around `run_auction`, commit once the OpenRTB response is converted.
+- [x] `/_ts/page-bids`: preserve the adapter collector, stamp the enabled observation UUID, use the orchestrator-owned dispatch/collect mapping and measured pre-header wait, then commit after the bid map is built. No-work outcomes keep timing null.
+- [x] `POST /auction`: preserve the adapter collector and use the same observed orchestration path; commit once the OpenRTB response is converted. Mediator work does not synthesize provider dispatch.
 - [x] Tests: extend the two existing collect-site tests to assert the resolve and commit offsets alongside `auction_wait_ms`.
 - [x] `cargo test-fastly`, commit.
 

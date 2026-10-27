@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Access telemetry v2 now uses `auction_collected_ms` for collection return, sets `ts_version` to the TS build identifier matching `x-ts-version`, and adds `delivery_result` for local complete/partial/error transport handoff. It does not establish client receipt. Coordinate any deployed preview v2 schema before updating the producer.
+- Access ingestion now dispatches without waiting for Tinybird's reply. Start failures are reported; later transport errors, non-2xx responses and remote ingestion acceptance are unobserved, with no retry.
+- `/auction`, page-bids and HTML collectors share measured collection waits and outcome mapping. Real mediator-only work can have collection/wait/commit timing without a provider dispatch offset; routing and admission still decide whether any request is sent.
+- Prebid diagnostics listener, targeting and correlation code now lives in the optional diagnostics bundle. Badge evidence passes clicks through, its small control sits outside observed creative bounds, and selecting the latest request no longer opens history.
+
 - Auction telemetry failure batches for `/auction` and page-bids now include provider launch-failure rows alongside the summary, so a failed dispatch can emit more than one row. `/auction` summary `elapsed_ms` now uses the orchestrator's elapsed time.
 - GPT diagnostics JSON exports now include bounded server winner and Prebid candidate/win bidder codes and bucketed `hb_pb` values. These observations do not establish which creative GAM ultimately served; raw CPM and creative markup remain excluded.
 - The Axum dev server now runs its own serve loop to apply terminal request-timing handling.

@@ -2982,7 +2982,9 @@ phases such as `ts-appbuild`, `ts-filter`, `ts-geo`, `ts-kv`, `ts-origin`, and
 with one decimal place. An unrecorded phase is omitted from the header
 rather than rendered as zero. When origin dispatch overlaps auction dispatch or
 EC preload, `ts-origin` measures the remaining origin wait after overlap, not full
-origin latency.
+origin latency. Fastly `ts-appbuild` measures per-request setup and includes application
+construction only on cold requests; a non-null warm value is not a cold-start signal.
+Axum builds state at startup and has no per-request app-build phase.
 
 **Emission is conservative**: the header is appended only on responses that
 are conclusively private, meaning `Cache-Control` contains a bare `private` or
@@ -3088,11 +3090,13 @@ The example's Tinybird block is commented out; uncomment and configure it first.
 Keep `access_sample_rate` as a TOML float, such as `0.05` or `0.0`, since overlay
 coercion uses the existing leaf's type.
 
-A sampled request emits one access-telemetry row to `access_dataset` after
-client delivery. Ingestion does not delay that response, but the current Fastly
-implementation waits for Tinybird's reply before the reusable sandbox can accept
-its next request. The row records the configured sample rate and has a 30-day TTL;
-see [Telemetry](/guide/telemetry#access-data-path) for limits and privacy.
+A sampled request dispatches one access-telemetry row to `access_dataset` after
+client delivery. Fastly starts the host-owned request and drops its pending handle,
+without awaiting the ingest reply or retrying. Local serialization/setup/start
+failures are logged; later transport errors, non-2xx responses and ingestion
+acceptance are not observed. The row records the configured sample rate and has a
+30-day TTL. See [Telemetry](/guide/telemetry#access-data-path) for limits, the
+collection-time and delivery-result contracts, and privacy.
 
 ### Deploy and rollback ordering
 

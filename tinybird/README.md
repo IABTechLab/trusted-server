@@ -11,7 +11,7 @@ auction and access telemetry.
 - `fixtures/auction_events_raw.ndjson` is test data only.
 - `tests/` checks auction summary, provider health, and seat-yield results.
 - `datasources/access_logs_v2.datasource` is the sampled access-telemetry ingest
-  target, with a 30-day TTL. `fixtures/access_logs_v2.ndjson` is test data only.
+  target, with 31 columns and a 30-day TTL. `fixtures/access_logs_v2.ndjson` is test data only.
 - `datasources/access_logs_raw.datasource` preserves the reserved legacy schema.
   It is not the target for the new emitter and is not replaced or backfilled.
 
@@ -55,6 +55,18 @@ Adding an auction field means changing three things together: the struct in
 `crates/trusted-server-core/src/access_telemetry.rs`,
 `datasources/access_logs_v2.datasource`, and `fixtures/access_logs_v2.ndjson`,
 including the JSONPaths and nullable types.
+
+The access v2 contract uses `auction_collected_ms` for collection return, not
+provider transport completion. `ts_version` identifies the TS build like the
+`x-ts-version` header, not a Fastly activation number. `delivery_result` reports
+local transport handoff as `complete`, `partial`, or `error`, not client receipt.
+Access ingestion is fire-and-forget; HTTP success and quarantined rows are not
+observed by the emitter. The core producer/schema/fixture test checks field and
+JSONPath agreement, but cannot establish live ingestion success.
+
+These are pre-rollout changes to the new v2 datasource. If a preview v2 schema
+has already been deployed, inspect and coordinate its migration before deploying
+this producer; do not assume the new name and column appear automatically.
 
 ### Access datasource cutover
 

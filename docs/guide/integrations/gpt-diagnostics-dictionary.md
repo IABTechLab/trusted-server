@@ -19,9 +19,10 @@ See [GPT Runtime Diagnostics](./gpt-diagnostics.md) for activation and operation
 | `Request history`             | —            | retained cycles             | Earlier retained requests. At most ten cycles are retained per slot. An evicted selection is reported as no longer retained.           |
 | `Technical details`           | —            | allowlisted snapshot fields | Expands correlation IDs, coverage, failures, and other non-summary evidence.                                                           |
 
-Each page badge is a button over the slot's top-left area. While diagnostics are
-active, clicks within its bounds open the panel instead of reaching the creative.
-Activating a badge opens the selected request's history, including the latest request.
+Badge evidence passes pointer input through. A small keyboard-accessible `Ad #N`
+button opens the panel from outside the observed bound creative rectangles. If no
+outside position fits inside the viewport, only the button is hidden. Selecting
+the latest request focuses its current details; an earlier request opens history.
 
 The per-request panel groups are `Summary`, `Auction evidence`, `Delivery evidence`, `Timing`, and `Size and visibility`. Summary prefixes are `GPT result:` and `Observed auction path:`. Technical prefixes include `Ad unit`, `Request intent:`, `Trusted Server auction:`, and `Prebid auction:`. A fact appears in one detailed group; Technical details does not repeat those grouped facts.
 

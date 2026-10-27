@@ -52,37 +52,51 @@ flowchart TB
     B --> C[Headers-ready boundary and sampling]
     C --> D[Capture selected response dimensions]
     D --> E[Send or finish client response]
-    E --> F[Emit one access row to Tinybird]
+    E --> F[Dispatch one access row]
+    F --> G[Fastly host continues ingest after callback return]
 ```
 
-On publisher HTML paths, auction-wait duration measures collection only after at
-least one provider request started. Mediator-only collection remains unmeasured,
-even if it performs a network request. `/auction` and `/_ts/page-bids` do not record
-an access-row auction wait, even when providers launch. Those routes, and paths
-without a provider launch, report null `auction_wait_ms` and `none` placement;
-collection and summary emission still run. Page-bids browser diagnostics separately
-report `auctionWaitMs = R - D` with `pre_header`, which is not an access-row wait
-measurement. A measured wait under one millisecond is `0`, with its placement retained.
+Auction-wait duration measures the actual collection interval after a provider or
+mediator request started. `/auction` and `/_ts/page-bids` record this interval with
+`pre_header` placement. Publisher HTML records `pre_header` or `in_stream` according
+to where collection runs. A measured wait under one millisecond is `0`, with its
+placement retained. Empty plans, routing-only or immediate outcomes with no network
+work, and failures before collection leave wait timing null with `none` placement.
 
-Emission is best effort. Serialization, body-size, transport, and non-2xx failures
-are logged and the row is dropped without changing the delivered response. Access
-ingestion currently waits for Tinybird's reply after client delivery, unlike the
-auction sink. Its backend has a one-second connect timeout and two-second
-first-byte and between-byte timeouts. This wait keeps a reusable sandbox occupied
-before it can accept its next request and counts toward its lifetime. Ingest is
-not included in `request_elapsed_ms`. Start with a low `access_sample_rate` and
-measure reused-sandbox latency before increasing it; the example rate below is
-not a throughput guarantee.
+`auction_dispatched_ms` records provider dispatch only. Mediator-only collection
+can therefore have a wait, `auction_collected_ms` and commit offset while provider
+dispatch is null. A configured mediator alone is not launch evidence; a pending
+request or explicit started-request error is required. Instrumentation does not
+start new mediator requests on paths that otherwise return without dispatch.
+Page-bids browser diagnostics use the same measured wait, not R minus D. Browser
+wire fields retain the name `auctionResolvedMs`; the persisted access column is
+`auction_collected_ms` to describe the collection-return point accurately.
+
+Emission is best effort. Serialization, body-size, backend-registration and request
+start failures are logged without changing the delivered response. Like the auction
+sink, access telemetry starts `send_async` and drops the pending handle. Fastly's
+host continues transmission after the callback returns, so a reusable sandbox does
+not wait for the ingest reply. Dispatch preparation still costs work. Ingest is not
+included in `request_elapsed_ms`.
+
+Successful dispatch is not confirmed ingestion. Later transport/TLS failures,
+non-2xx responses and quarantined rows are unobserved by the emitter; there is no
+retry or durability guarantee. Check workspace ingestion and quarantine during
+rollout. The SDK lifetime contract was exercised with delayed local Viceroy backends,
+including sandbox reuse, not a production Tinybird deployment.
 
 ## Access privacy boundary
 
-The new `access_logs_v2` datasource has a configured 30-day TTL. Its 30 columns
+The new `access_logs_v2` datasource has a configured 30-day TTL. Its 31 columns
 contain:
 
 - Event timestamp, normalized HTTP method, response status, and sampling rate.
 - Fastly service ID, publisher domain, deployment environment, POP, country, and
-  `ts_version`, which is the Fastly service configuration version, not a Trusted
-  Server release identifier.
+  `ts_version`, which matches the Trusted Server build identifier in `x-ts-version`.
+  It uses the build-pipeline override, exact Git tag, branch name, then six-character
+  commit SHA, in that order; absent metadata is `unknown`. It is not the numeric
+  Fastly activation version from `x-ts-fastly-version`. A branch name is not an
+  immutable source fingerprint.
 - Coarse route class and bounded route template, body mode, and template-cache
   state. Publisher paths collapse to `/`, `/other/*`, or an operator-allowlisted
   section such as `/news/*`; named routes retain parameter placeholders. Asset
@@ -92,13 +106,23 @@ contain:
   durations, plus headers-ready and request-completion offsets and response bytes
   accepted by the transport. When origin dispatch overlaps other work, `origin_ms`
   measures only the remaining origin wait after overlap, not full origin latency.
-  A template-cache hit skips the origin span. Unrecorded timings are null. A status
-  of 200 does not establish that a streamed body completed successfully.
+  A template-cache hit skips the origin span. Unrecorded timings are null.
+- `delivery_result` is `complete`, `partial`, or `error`. It describes local body
+  handoff to the transport, not confirmed client receipt. `partial` means bytes
+  were accepted before a drive error, or transport finish failed; `error` means a
+  drive failed before any body byte was accepted. A status of 200 can accompany
+  either failure result.
 - Auction wait placement, dispatch/collection/commit offsets, and a random auction
   UUID. The UUID joins to `auction_events_raw.auction_id`, where coarse device
   class and browser family can also be present. Disabled auctions have no access
   UUID; active consent-denied observations retain their join key without launch
   milestones.
+
+`appbuild_ms` measures Fastly per-request setup, including config-store opening and,
+on cold requests, application construction. A warm sample can be non-null; this is
+not a cold-start flag. Axum builds its state at startup and records no per-request
+app-build phase. Adapter entry points start their clocks at different boundaries,
+so compare timings within one adapter rather than treating their T0 values as equal.
 
 Access rows contain no raw path, query string, IP address, User-Agent, cookie,
 EC ID, or creative content. Configuring a route section preserves that operator
