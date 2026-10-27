@@ -19,15 +19,16 @@ on:
   schedule:
     - cron: "42 6 * * 0"
 
-# Each pull request author runs one PR at a time per workflow, so one person
-# opening many PRs cannot fill the runner queue ahead of everyone else. Their
-# other runs wait in order instead of being cancelled, and every job has a
-# timeout so a hung run cannot hold that queue for hours. Bot-authored PRs and
-# other events get their own group from the run ID and are never held back.
+# A newer push to a pull request cancels that PR's superseded run. Each job
+# then joins a per-author queue for that job (its own `concurrency` block), so
+# one person opening many PRs runs one copy of each job at a time and cannot
+# fill the runner pool ahead of everyone else. Queued jobs start in the order they began waiting; GitHub
+# keeps up to 100 pending per queue and cancels arrivals past that. Every job
+# has a timeout so a hung job cannot hold its queue for hours. Bot-authored
+# PRs and non-PR events key on the run ID and never wait on a queue.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
-  cancel-in-progress: false
-  queue: max
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   analyze:
@@ -39,6 +40,9 @@ jobs:
     # Consider using larger runners or machines with greater resources for possible analysis time improvements.
     runs-on: ${{ (matrix.language == 'swift' && 'macos-latest') || 'ubuntu-latest' }}
     timeout-minutes: 45
+    concurrency:
+      group: ${{ github.workflow }}-analyze-${{ matrix.language }}-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     permissions:
       # required for all workflows
       security-events: write

@@ -8,21 +8,25 @@ on:
 permissions:
   contents: read
 
-# Each pull request author runs one PR at a time per workflow, so one person
-# opening many PRs cannot fill the runner queue ahead of everyone else. Their
-# other runs wait in order instead of being cancelled, and every job has a
-# timeout so a hung run cannot hold that queue for hours. Bot-authored PRs and
-# other events get their own group from the run ID and are never held back.
+# A newer push to a pull request cancels that PR's superseded run. Each job
+# then joins a per-author queue for that job (its own `concurrency` block), so
+# one person opening many PRs runs one copy of each job at a time and cannot
+# fill the runner pool ahead of everyone else. Queued jobs start in the order they began waiting; GitHub
+# keeps up to 100 pending per queue and cancels arrivals past that. Every job
+# has a timeout so a hung job cannot hold its queue for hours. Bot-authored
+# PRs and non-PR events key on the run ID and never wait on a queue.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
-  cancel-in-progress: false
-  queue: max
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   check-claude-md-symlink:
     name: CLAUDE.md symlink guard
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    concurrency:
+      group: ${{ github.workflow }}-check-claude-md-symlink-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     steps:
       - uses: actions/checkout@v4
 
@@ -54,6 +58,9 @@ jobs:
     name: cargo fmt
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    concurrency:
+      group: ${{ github.workflow }}-format-rust-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     steps:
       - uses: actions/checkout@v4
 
@@ -116,6 +123,9 @@ jobs:
   format-typescript:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    concurrency:
+      group: ${{ github.workflow }}-format-typescript-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     defaults:
       run:
         working-directory: crates/trusted-server-js/lib
@@ -148,6 +158,9 @@ jobs:
   format-docs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    concurrency:
+      group: ${{ github.workflow }}-format-docs-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     defaults:
       run:
         working-directory: docs
@@ -190,6 +203,9 @@ jobs:
     name: docs-proposal scripts
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    concurrency:
+      group: ${{ github.workflow }}-docs-proposal-scripts-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+      queue: max
     steps:
       - uses: actions/checkout@v4
 
