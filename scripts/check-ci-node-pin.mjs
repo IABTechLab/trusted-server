@@ -35,7 +35,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 
 const COMPILE = new RegExp(
-  String.raw`\bcargo(?:[\s\\]+[+-]\S+)*[\s\\]+` +
+  String.raw`\bcargo(?:(?:[ \t]|\\\n)+[+-]\S+)*(?:[ \t]|\\\n)+` +
     String.raw`(?!(?:fmt|metadata|tree|install(?![^\n]*--path))(?:\s|$))\w` +
     String.raw`|\bworker-build\b`,
 );
@@ -394,13 +394,19 @@ function resolveRoot(root) {
 
 /** Run the check from the command line and return the exit code. */
 export function main(argv = process.argv.slice(2)) {
-  const { values } = parseArgs({
-    args: argv,
-    options: {
-      root: { type: "string" },
-      help: { type: "boolean", short: "h" },
-    },
-  });
+  let values;
+  try {
+    ({ values } = parseArgs({
+      args: argv,
+      options: {
+        root: { type: "string" },
+        help: { type: "boolean", short: "h" },
+      },
+    }));
+  } catch (error) {
+    console.error(`error: ${error.message}`);
+    return 2;
+  }
   if (values.help) {
     console.log(
       "usage: check-ci-node-pin.mjs [--root ROOT]\n\n" +

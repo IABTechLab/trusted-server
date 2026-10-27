@@ -167,6 +167,8 @@ test("ignores cargo commands that do not compile", () => {
     "cargo tree",
     "cargo install cargo-nextest",
     "cargo",
+    "|\n    cargo --version\n    rustc --version",
+    "|\n    command -v cargo\n    echo found",
   ]) {
     assertClean(
       check([CHECKOUT, `- run: ${run}`, PIN]),
@@ -434,7 +436,7 @@ test("mapping reads quoted, commented and unterminated values", () => {
 
 // Command line and real trees.
 
-test("the command line exits 0 on a clean tree and 1 with violations", () => {
+test("the command line exits 0 on a clean tree, 1 with violations and 2 on bad options", () => {
   const clean = fixture({
     ".github/workflows/ci.yml": workflow([CHECKOUT, PIN, BUILD]),
   });
@@ -472,6 +474,16 @@ test("the command line exits 0 on a clean tree and 1 with violations", () => {
     /^no workflows found under /,
     "should explain the failure",
   );
+
+  const unknown = spawnSync(process.execPath, [SCRIPT, "--rot", clean], {
+    encoding: "utf8",
+  });
+  assert.equal(unknown.status, 2, "should exit 2 on an unknown option");
+  assert.match(
+    unknown.stderr,
+    /^error: Unknown option '--rot'/,
+    "should report the unknown option without a stack trace",
+  );
 });
 
 test("the current tree pins Node in every job", () => {
@@ -493,10 +505,11 @@ function hasCommit(commit) {
 
 test("the pre-guard tree has 8 jobs that compile before pinning Node", (context) => {
   if (!hasCommit(PRE_GUARD_COMMIT)) {
-    // CI fetches full history for this job, so only skip in a local shallow clone.
+    // The CI job fetches this commit before running the tests, so only skip
+    // in a local shallow clone.
     assert.ok(
       !process.env.CI,
-      `should have ${PRE_GUARD_COMMIT} in CI; check out with fetch-depth: 0`,
+      `should have ${PRE_GUARD_COMMIT} in CI; see the "Fetch the pre-guard commit" step`,
     );
     context.skip(`${PRE_GUARD_COMMIT} is not in this clone`);
     return;
