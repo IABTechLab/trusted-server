@@ -130,7 +130,7 @@ Add `Rewrite::normalize(&mut self)` and call it from `Settings::normalize_deseri
 
 - Both lists: trim each entry and lowercase it with `to_ascii_lowercase`.
 - `exclude_domains`: drop empty entries and a bare `*` with a `log::warn!`, as `Proxy::normalize` does. Neither can match a host today, so dropping them changes no behavior, and rejecting them would make an existing blob fail to load after a binary upgrade. This deviates from issue #1231, which asks to reject empty entries and a bare `*`; dropping with a warning keeps existing blobs loading.
-- `exclude_domains`: after dropping, run each remaining entry through the same `check_include_domain` check and `log::warn!` once per entry it rejects (for example `https://cdn.example.com`, `cdn.example.com:443` or `[2001:0db8::1]`). Such an entry never matches, so its host keeps being proxied and keeps receiving `ts-ec`, the leak #1231 is about. The entry is kept and nothing is rejected, so behavior does not change.
+- `exclude_domains`: before dropping, check every entry with `check_exclude_domain` and `log::warn!` once per entry it rejects (for example `https://cdn.example.com`, `cdn.example.com:443` or `[2001:0db8::1]`). The check is looser than the `include_domains` grammar: an entry with a trailing `.`, a `_` or a wildcard IP address still matches a URL host and is not flagged. The warning names the entry by its position in the configured list, counted before the drop, plus a static reason. It never includes the value, which may be a pasted URL carrying credentials. Such an entry never matches, so its host keeps being proxied and keeps receiving `ts-ec`, the leak #1231 is about. The entry is kept and nothing is rejected, so behavior does not change.
 - `include_domains`: keep entries as normalized. `validate_include_domains` rejects every entry that can never equal `Url::host_str()`: after its syntactic checks, each entry must round-trip unchanged through `url::Host::parse` (the parser behind `host_str()`), with brackets kept for IPv6. The key is new, so no existing config can trip this. A malformed allowlist is better caught at `ts config push` than silently widened to "proxy everything", or silently narrowed to "proxy nothing" by an entry that never matches.
 
   An accepted entry is one of:
@@ -144,7 +144,7 @@ Add `Rewrite::normalize(&mut self)` and call it from `Settings::normalize_deseri
   - a leading or trailing `.`, or an empty label;
   - an unbracketed or non-compressed IPv6 address, a wildcard IP address, and a host whose last label is numeric but is not a dotted-quad IPv4 address (`host_str()` would render it as IPv4).
 
-  Non-ASCII (IDN) entries fail with a separate code, `non_ascii_rewrite_include_domain`, and are not converted to punycode; the docs tell operators to write the `xn--` form. `validation_error_summary` reports only the code, so the code is what makes the error clear.
+  Non-ASCII (IDN) entries fail with a separate code, `non_ascii_rewrite_include_domain`, and are not converted to punycode; the docs tell operators to write the `xn--` form. Both error messages name the entry by its index (`rewrite.include_domains[1]`), never its value, which may be a pasted URL carrying credentials; `normalize` drops no `include_domains` entries, so the index matches the TOML. At the edge, `validation_error_summary` reports only the code.
 
 Settings validation runs after normalization (`settings.rs:2997-3013`), so the validator sees trimmed, lowercased entries.
 
