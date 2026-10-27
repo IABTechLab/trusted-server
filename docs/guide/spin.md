@@ -17,17 +17,18 @@ configuration.
 
 ## Prerequisites
 
-Spin 4.1.0 or newer, pinned as `spin` in `.tool-versions`. `spin-sdk` 7 imports
-`wasi:http/types@0.3.0`, which Spin 4.0.x does not provide, so an older runtime
-cannot start the component. Install or upgrade from the
-[Spin install guide](https://spinframework.dev/install).
+Spin 4.1.0 or newer, pinned as `spin` in `.tool-versions`. This branch temporarily
+uses `spin-sdk` 6 to match the unreleased EdgeZero secret-provisioning APIs;
+the runtime minimum remains unchanged. `spin-sdk` 7 imports
+`wasi:http/types@0.3.0`, which Spin 4.0.x does not provide. Install or upgrade
+from the [Spin install guide](https://spinframework.dev/install).
 
 asdf has no first-party Spin plugin, so `asdf install` does not provide this
 one; install it directly, or add a community plugin if you want asdf to manage
 it. The pin records the required version and is what the smoke checks against.
 
-Nothing in the build catches this. The component compiles, `cargo
-test-spin` passes, and only `spin up` reports:
+With `spin-sdk` 7, the build does not catch an older runtime. The component
+compiles, `cargo test-spin` passes, and only `spin up` reports:
 
 ```
 Error: component imports instance `wasi:http/types@0.3.0`, but a

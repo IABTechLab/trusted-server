@@ -1611,13 +1611,13 @@ dependencies = [
  "ctor",
  "edgezero-adapter",
  "edgezero-core",
- "fastly 0.12.1",
+ "fastly",
  "fern",
  "flate2",
  "futures",
  "futures-util",
  "log",
- "log-fastly 0.12.1",
+ "log-fastly",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1645,7 +1645,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "spin-sdk 6.0.0",
+ "spin-sdk",
  "subtle",
  "thiserror 2.0.18",
  "toml",
@@ -1675,7 +1675,7 @@ dependencies = [
  "simple_logger",
  "thiserror 2.0.18",
  "toml",
- "validator 0.20.0",
+ "validator",
 ]
 
 [[package]]
@@ -1705,7 +1705,7 @@ dependencies = [
  "toml",
  "tower-service",
  "tracing",
- "validator 0.20.0",
+ "validator",
  "web-time",
 ]
 
@@ -1721,7 +1721,7 @@ dependencies = [
  "serde_json",
  "syn 3.0.4",
  "toml",
- "validator 0.20.0",
+ "validator",
 ]
 
 [[package]]
@@ -1836,13 +1836,14 @@ dependencies = [
 [[package]]
 name = "esi"
 version = "0.7.2"
-source = "git+https://github.com/stackpop/esi?rev=75bfbb396d4cb7792610f1287cbec61675f13f38#75bfbb396d4cb7792610f1287cbec61675f13f38"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "026264c3022569f7bc5052f9452362537e923b34ecc9248b803437c2b89cdd81"
 dependencies = [
  "atoi",
  "base64",
  "bytes",
  "chrono",
- "fastly 0.13.1",
+ "fastly",
  "html-escape",
  "log",
  "md5",
@@ -1896,39 +1897,12 @@ dependencies = [
  "bytes",
  "downcast-rs",
  "elsa",
- "fastly-macros 0.12.1",
- "fastly-shared 0.12.1",
- "fastly-sys 0.12.1",
+ "fastly-macros",
+ "fastly-shared",
+ "fastly-sys",
  "http",
  "itertools 0.13.0",
  "lazy_static",
- "mime",
- "serde",
- "serde_json",
- "serde_repr",
- "serde_urlencoded",
- "sha2 0.9.9",
- "smallvec",
- "thiserror 1.0.69",
- "time",
- "url",
-]
-
-[[package]]
-name = "fastly"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c5c07c0c67d0b5826d1cb2311e563a17860b50e2ae89e1c703d6400d904d1e2"
-dependencies = [
- "anyhow",
- "bytes",
- "downcast-rs",
- "elsa",
- "fastly-macros 0.13.1",
- "fastly-shared 0.13.1",
- "fastly-sys 0.13.1",
- "http",
- "itertools 0.13.0",
  "mime",
  "serde",
  "serde_json",
@@ -1953,31 +1927,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "fastly-macros"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "698025eab5612adab20df48963a5126650893014e8505af02a0af20939ee6a05"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 1.0.109",
-]
-
-[[package]]
 name = "fastly-shared"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "080ad138403159fd366d3e0b14bb49cb0c01dc18c25095bbbd1c85e3338f5413"
-dependencies = [
- "bitflags 1.3.2",
- "http",
-]
-
-[[package]]
-name = "fastly-shared"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "191c2cf082f5d17f4ca0685cedaa0642ad4ade949fac8d1dbdd62ff756b13500"
 dependencies = [
  "bitflags 1.3.2",
  "http",
@@ -1990,20 +1943,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "de75ef193f6c29c43d667458bede648970715aedd5db2d42c2eba3ffa3ad738b"
 dependencies = [
  "bitflags 1.3.2",
- "fastly-shared 0.12.1",
- "http",
- "wasip2",
- "wit-bindgen 0.51.0",
-]
-
-[[package]]
-name = "fastly-sys"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "239c77706cf9110b423a89b6b03b8011729b144390d2a7f641d95ef66b2768b8"
-dependencies = [
- "bitflags 1.3.2",
- "fastly-shared 0.13.1",
+ "fastly-shared",
  "http",
  "wasip2",
  "wit-bindgen 0.51.0",
@@ -4017,18 +3957,7 @@ version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51dae5def13a2d557fdb63862d642f8d4641ec3773c036bb14092697b6764013"
 dependencies = [
- "fastly 0.12.1",
- "log",
- "regex",
-]
-
-[[package]]
-name = "log-fastly"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "433713b6191ad3e1d5248db9536f3e2d99a12d7ff998afd272a98d96e6dbc2ed"
-dependencies = [
- "fastly 0.13.1",
+ "fastly",
  "log",
  "regex",
 ]
@@ -5987,17 +5916,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "spin-macro"
-version = "7.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac8a641da857d4e7cada31a853c40180eeb10485a0f2f0282d0a7e5a2a4105d4"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 1.0.109",
-]
-
-[[package]]
 name = "spin-sdk"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6009,26 +5927,9 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
- "spin-macro 6.0.0",
+ "spin-macro",
  "thiserror 2.0.18",
- "wasip3 0.6.0+wasi-0.3.0-rc-2026-03-15",
-]
-
-[[package]]
-name = "spin-sdk"
-version = "7.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b7a3d9a6805ccdb4d404e91ccf7198ac5e486b6199dc9387aeebaa368272112"
-dependencies = [
- "anyhow",
- "bytes",
- "futures",
- "http",
- "http-body",
- "http-body-util",
- "spin-macro 7.0.0",
- "thiserror 2.0.18",
- "wasip3 0.7.1+wasi-0.3.0",
+ "wasip3",
 ]
 
 [[package]]
@@ -6702,11 +6603,11 @@ dependencies = [
  "edgezero-core",
  "error-stack",
  "esi",
- "fastly 0.13.1",
+ "fastly",
  "fern",
  "futures",
  "log",
- "log-fastly 0.13.1",
+ "log-fastly",
  "serde",
  "serde_json",
  "toml",
@@ -6731,7 +6632,7 @@ dependencies = [
  "futures",
  "http-body-util",
  "log",
- "spin-sdk 7.0.0",
+ "spin-sdk",
  "tokio",
  "trusted-server-core",
  "trusted-server-js",
@@ -6837,7 +6738,7 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
- "validator 0.21.0",
+ "validator",
  "web-time",
 ]
 
@@ -7110,21 +7011,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "validator"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3d68c6633c483df6780cc5277a417c7c2d1bceee2649d06c8ab6b0fd2dd3c81"
-dependencies = [
- "idna",
- "regex",
- "serde",
- "serde_derive",
- "serde_json",
- "url",
- "validator_derive",
-]
-
-[[package]]
 name = "validator_derive"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7198,19 +7084,6 @@ name = "wasip3"
 version = "0.6.0+wasi-0.3.0-rc-2026-03-15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed83456dd6a0b8581998c0365e4651fa2997e5093b49243b7f35391afaa7a3d9"
-dependencies = [
- "bytes",
- "http",
- "http-body",
- "thiserror 2.0.18",
- "wit-bindgen 0.57.1",
-]
-
-[[package]]
-name = "wasip3"
-version = "0.7.1+wasi-0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75e9ed91ee5a995b6fe16c89d4511a8c12eb76967be20b57557618e02e781bcc"
 dependencies = [
  "bytes",
  "http",
