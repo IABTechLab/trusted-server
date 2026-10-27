@@ -4,9 +4,7 @@ Status: Draft, revision 15. Revised after review rounds 1 to 14. Revision 14
 made `ts-eids-s` a client-only cookie, at the user's request. Revision 15
 removes the `ts-eids-r` removal cookies, runs providers only on writer
 navigations, makes capture revoke-only and moves KV to schema version 2,
-accepting breaking changes. Section 16 lists the decisions; the
-[review log](2026-10-20-server-side-identity-providers-review-log.md) maps
-each earlier finding to its fix.
+accepting breaking changes. Section 16 lists the decisions.
 
 Issue: none filed yet. Related:
 [#1245](https://github.com/IABTechLab/trusted-server/issues/1245)
@@ -4354,6 +4352,3 @@ review, which allowed breaking changes:
 | Stored hashes        | `ps.iv` hashes are unkeyed and the consent fingerprint is a plain bitmask, because the row already holds the raw values. No legacy revision hash                                  |
 | Pull sync            | The pull-complete marker and the legacy pull sync config keys are removed                                                                                                         |
 | Withdrawal retry     | A tombstone that fails before send gets one more attempt after send                                                                                                               |
-
-Decisions from earlier rounds, and the finding behind each revision, are in
-the [review log](2026-10-20-server-side-identity-providers-review-log.md).
