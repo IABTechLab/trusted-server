@@ -4906,7 +4906,7 @@ pub async fn handle_publisher_request(
             // This navigation runs an auction: hold-mode providers run now,
             // within their budget, and phase 4 leaves them alone (spec 4.7).
             ec_context.identity_mut().set_runs_auction(true);
-            let hold = hold_before_auction(settings, services, ec_context);
+            let hold = hold_before_auction(settings, services, ec_context).await;
             let slots_ctx = MatchedSlotsContext {
                 matched_slots: &matched_slots,
                 request_path: &request_path,

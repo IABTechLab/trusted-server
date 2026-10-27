@@ -2688,7 +2688,7 @@ pub(crate) mod hold_fixture {
                 &random,
                 Some(self.limiter.as_ref()),
             );
-            run_hold(&deps, &mut self.context)
+            futures::executor::block_on(run_hold(&deps, &mut self.context))
         }
 
         /// Runs phase 4 for a response with `status`.

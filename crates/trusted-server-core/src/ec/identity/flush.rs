@@ -181,7 +181,10 @@ pub fn run_after_send(input: AfterSendInput<'_>) -> FlushOutcome {
     if !calls.is_empty() {
         let random = ThreadRandom;
         let deps = runtime.deps(settings, services, &random, Some(rate_limiter));
-        add_dispatch_results(
+        // Phase 4 runs after the response is sent, outside any executor, so
+        // blocking here is safe. The hold dispatch awaits instead: it runs
+        // inside the request handler's executor.
+        futures::executor::block_on(add_dispatch_results(
             &mut mutation,
             &deps,
             &DispatchInput {
@@ -195,7 +198,7 @@ pub fn run_after_send(input: AfterSendInput<'_>) -> FlushOutcome {
                 calls,
                 budget: None,
             },
-        );
+        ));
     }
 
     for provider in regranted {
@@ -467,7 +470,7 @@ pub(super) struct DispatchRun {
 }
 
 /// Dispatches `run.calls` and adds their outcomes to `mutation`.
-pub(super) fn add_dispatch_results(
+pub(super) async fn add_dispatch_results(
     mutation: &mut IdentityMutation,
     deps: &IdentityDeps<'_>,
     input: &DispatchInput<'_>,
@@ -499,7 +502,7 @@ pub(super) fn add_dispatch_results(
         stored,
     };
     let catalog = deps.catalog;
-    for (id, outcome) in dispatch(deps, calls, &signals, budget) {
+    for (id, outcome) in dispatch(deps, calls, &signals, budget).await {
         let Some(provider) = catalog.get(&id) else {
             continue;
         };

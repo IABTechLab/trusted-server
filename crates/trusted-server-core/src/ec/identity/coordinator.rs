@@ -1137,28 +1137,28 @@ pub(crate) enum Waited {
 ///
 /// `keep_waiting` is asked before each wait. Once it returns `false`, every
 /// request still pending is dropped without waiting.
-pub(crate) fn drain_in_flight<T: core::fmt::Display>(
+pub(crate) async fn drain_in_flight<T: core::fmt::Display>(
     in_flight: &mut Vec<(T, PlatformPendingRequest)>,
     services: &RuntimeServices,
     mut keep_waiting: impl FnMut() -> bool,
 ) -> Vec<(T, Waited)> {
     let mut waiting = true;
-    in_flight
-        .drain(..)
-        .map(|(label, pending)| {
-            waiting = waiting && keep_waiting();
-            if !waiting {
-                return (label, Waited::Dropped);
+    let mut waited = Vec::with_capacity(in_flight.len());
+    for (label, pending) in in_flight.drain(..) {
+        waiting = waiting && keep_waiting();
+        if !waiting {
+            waited.push((label, Waited::Dropped));
+            continue;
+        }
+        match services.http_client().wait(pending).await {
+            Ok(response) => waited.push((label, Waited::Response(response))),
+            Err(error) => {
+                log::warn!("Request failed for '{label}': {error:?}");
+                waited.push((label, Waited::Failed));
             }
-            match futures::executor::block_on(services.http_client().wait(pending)) {
-                Ok(response) => (label, Waited::Response(response)),
-                Err(error) => {
-                    log::warn!("Request failed for '{label}': {error:?}");
-                    (label, Waited::Failed)
-                }
-            }
-        })
-        .collect()
+        }
+    }
+    waited
 }
 
 /// Logs a provider `Config` failure. Only the error's own context is logged,
@@ -1298,7 +1298,7 @@ fn burst_capped(
 }
 
 /// Builds, checks and sends one call.
-fn prepare_call<'a>(
+async fn prepare_call<'a>(
     deps: &IdentityDeps<'a>,
     call: &'a Call,
     signals: &'a ResolveSignals<'a>,
@@ -1385,11 +1385,12 @@ fn prepare_call<'a>(
     };
     let call_context = request.call_context_json().map(str::to_owned);
 
-    match futures::executor::block_on(
-        deps.services
-            .http_client()
-            .send_async(PlatformHttpRequest::new(outbound, backend)),
-    ) {
+    match deps
+        .services
+        .http_client()
+        .send_async(PlatformHttpRequest::new(outbound, backend))
+        .await
+    {
         Ok(pending) => Prepared::Sent(
             Box::new(InFlightCall {
                 provider,
@@ -1458,68 +1459,85 @@ fn finish_call(
 /// an ordinary transport failure.
 // Temporary: the request wiring, the first non-test caller, arrives in a later task.
 #[allow(dead_code)]
-pub(crate) fn dispatch(
+pub(crate) async fn dispatch(
     deps: &IdentityDeps<'_>,
     calls: Vec<Call>,
     signals: &ResolveSignals<'_>,
     budget: Option<Duration>,
 ) -> Vec<(IdentityProviderId, CallOutcome)> {
     let started = Instant::now();
-    let identity = &deps.settings.ec.identity;
-    let max_concurrency = identity.max_concurrency.max(1);
+    let max_concurrency = deps.settings.ec.identity.max_concurrency.max(1);
     let calls = dispatch_order(calls, deps.catalog, signals.now);
     let mut outcomes = Vec::with_capacity(calls.len());
-    let mut in_flight: Vec<(IdentityProviderId, PlatformPendingRequest)> = Vec::new();
-    let mut sent: BTreeMap<IdentityProviderId, Box<InFlightCall<'_>>> = BTreeMap::new();
-
-    let drain = |in_flight: &mut Vec<(IdentityProviderId, PlatformPendingRequest)>,
-                 sent: &mut BTreeMap<IdentityProviderId, Box<InFlightCall<'_>>>,
-                 outcomes: &mut Vec<(IdentityProviderId, CallOutcome)>| {
-        let within_budget = || budget.is_none_or(|budget| started.elapsed() < budget);
-        for (id, waited) in drain_in_flight(in_flight, deps.services, within_budget) {
-            let Some(call) = sent.remove(&id) else {
-                continue;
-            };
-            let outcome = match waited {
-                Waited::Response(response) => {
-                    finish_call(&call, response, identity.max_response_bytes)
-                }
-                // A failed wait is a cut off only when the hold budget was
-                // spent: the whole budget, or a timeout the remaining budget
-                // set. Any other failure counts against the provider.
-                Waited::Failed
-                    if budget.is_some_and(|budget| started.elapsed() >= budget)
-                        || (budget.is_some()
-                            && call.budget_limited
-                            && call.sent_at.elapsed() >= call.timeout) =>
-                {
-                    CallOutcome::HoldCutOff
-                }
-                Waited::Failed => CallOutcome::TransportFailure,
-                Waited::Dropped => CallOutcome::HoldCutOff,
-            };
-            record_failure(deps, &id, &outcome);
-            outcomes.push((id, outcome));
-        }
-    };
+    let mut batch = InFlightBatch::default();
+    let clock = DispatchClock { started, budget };
 
     for call in &calls {
-        match prepare_call(deps, call, signals, started, budget) {
+        match prepare_call(deps, call, signals, started, budget).await {
             Prepared::Settled(outcome) => {
                 record_failure(deps, &call.provider, &outcome);
                 outcomes.push((call.provider.clone(), outcome));
             }
             Prepared::Sent(sent_call, pending) => {
-                sent.insert(call.provider.clone(), sent_call);
-                in_flight.push((call.provider.clone(), pending));
-                if in_flight.len() >= max_concurrency {
-                    drain(&mut in_flight, &mut sent, &mut outcomes);
+                batch.sent.insert(call.provider.clone(), sent_call);
+                batch.in_flight.push((call.provider.clone(), pending));
+                if batch.in_flight.len() >= max_concurrency {
+                    drain_batch(deps, &mut batch, clock, &mut outcomes).await;
                 }
             }
         }
     }
-    drain(&mut in_flight, &mut sent, &mut outcomes);
+    drain_batch(deps, &mut batch, clock, &mut outcomes).await;
     outcomes
+}
+
+/// The calls [`dispatch`] has sent and not yet waited for.
+#[derive(Default)]
+struct InFlightBatch<'a> {
+    in_flight: Vec<(IdentityProviderId, PlatformPendingRequest)>,
+    sent: BTreeMap<IdentityProviderId, Box<InFlightCall<'a>>>,
+}
+
+/// When a [`dispatch`] started and the hold budget it shares, if any.
+#[derive(Clone, Copy)]
+struct DispatchClock {
+    started: Instant,
+    budget: Option<Duration>,
+}
+
+/// Waits for every call in `batch` and adds each outcome to `outcomes`.
+async fn drain_batch(
+    deps: &IdentityDeps<'_>,
+    batch: &mut InFlightBatch<'_>,
+    clock: DispatchClock,
+    outcomes: &mut Vec<(IdentityProviderId, CallOutcome)>,
+) {
+    let DispatchClock { started, budget } = clock;
+    let max_response_bytes = deps.settings.ec.identity.max_response_bytes;
+    let within_budget = || budget.is_none_or(|budget| started.elapsed() < budget);
+    for (id, waited) in drain_in_flight(&mut batch.in_flight, deps.services, within_budget).await {
+        let Some(call) = batch.sent.remove(&id) else {
+            continue;
+        };
+        let outcome = match waited {
+            Waited::Response(response) => finish_call(&call, response, max_response_bytes),
+            // A failed wait is a cut off only when the hold budget was
+            // spent: the whole budget, or a timeout the remaining budget
+            // set. Any other failure counts against the provider.
+            Waited::Failed
+                if budget.is_some_and(|budget| started.elapsed() >= budget)
+                    || (budget.is_some()
+                        && call.budget_limited
+                        && call.sent_at.elapsed() >= call.timeout) =>
+            {
+                CallOutcome::HoldCutOff
+            }
+            Waited::Failed => CallOutcome::TransportFailure,
+            Waited::Dropped => CallOutcome::HoldCutOff,
+        };
+        record_failure(deps, &id, &outcome);
+        outcomes.push((id, outcome));
+    }
 }
 
 /// Whether the visitor's consent now re-grants `descriptor`'s provider after
@@ -1622,7 +1640,7 @@ pub(crate) fn opt_out_clears(
 /// Runs [`run_hold`] with the request's runtime and limiter. `None` when the
 /// adapter set no identity runtime (no provider is configured) or no limiter
 /// (fails closed).
-pub(crate) fn hold_before_auction(
+pub(crate) async fn hold_before_auction(
     settings: &Settings,
     services: &RuntimeServices,
     context: &mut EcContext,
@@ -1641,7 +1659,7 @@ pub(crate) fn hold_before_auction(
         &random,
         Some(limiter.as_ref() as &dyn RateLimiter),
     );
-    Some(run_hold(&deps, context))
+    Some(run_hold(&deps, context).await)
 }
 
 /// What the hold dispatch before a navigation's auction learned (spec 4.7).
@@ -1672,7 +1690,7 @@ pub(crate) struct HoldResults {
 ///
 /// A request that is not a returning writer, runs no auction, or whose phase 1
 /// read is not a live, consenting row dispatches nothing.
-pub(crate) fn run_hold(deps: &IdentityDeps<'_>, context: &mut EcContext) -> HoldResults {
+pub(crate) async fn run_hold(deps: &IdentityDeps<'_>, context: &mut EcContext) -> HoldResults {
     let mut results = HoldResults::default();
     if !context.identity().runs_auction() || !may_flush(context) {
         return results;
@@ -1743,7 +1761,8 @@ pub(crate) fn run_hold(deps: &IdentityDeps<'_>, context: &mut EcContext) -> Hold
                 deps.settings.ec.identity.hold_budget_ms,
             )),
         },
-    );
+    )
+    .await;
 
     // Computed on the phase 1 row; the flush applies the same mutation to the
     // phase 4 live row, which may differ.
@@ -4313,7 +4332,7 @@ mod tests {
                 ec_id: Some(format!("{}.ABC123", "a".repeat(64))),
                 stored: BTreeMap::new(),
             };
-            dispatch(&deps, calls, &signals, budget)
+            futures::executor::block_on(dispatch(&deps, calls, &signals, budget))
         }
     }
 
