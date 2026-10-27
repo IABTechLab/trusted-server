@@ -321,6 +321,12 @@ Phase 3 will index and digest this same companion. Later controlled-recipe evide
 
 The Fastly provenance attestation adds the rebuild-check subject while retaining the existing reusable signer identity and bundle name. Rehearsal must prove that existing binary verification commands pass unchanged and separately verify the rebuild-check's provenance, release membership and checksum. Merging Phase 2 activates the gate on the next real tag, adding a second Fastly build and comparison before signing. A mismatch prevents release; retain bounded diagnostics and ask for a decision without exclusions or weaker comparison.
 
+### Manual Fastly package directory headers
+
+[CI at `a8f8bcb81`](https://github.com/IABTechLab/trusted-server/actions/runs/40469201263/job/122071972950) confirmed that the pinned Fastly CLI emits exactly two zero-sized type-5 directory headers named `example-app` and `example-app/bin`, without trailing slashes. The other two headers are the regular wasm and manifest files; prefixes and link names are empty, and no hidden nonzero padding or metadata headers were present.
+
+The private read-only package inspector accepts those two known directory names with or without one trailing slash, only with type 5 and size zero. It deduplicates their logical identities, so mixing the two spellings cannot bypass duplicate rejection. File names/types, links, prefixes, metadata rejection, four-member requirement, expansion/trailer bounds and independent manifest/wasm hashes remain unchanged. Other path aliases remain rejected. This transport compatibility correction grants no recipe, runtime, official-release or deployment qualification.
+
 ### Phase 2 ordinary metadata and closed destination policy
 
 Phase 2 validates all seven current ordinary cohort rows strictly. The retained controlled recipes, consumer policy and index schema still cover four destination artifacts. Projection uses those four source-owned names in fixed order; the three ordinary Axum rows grant no controlled recipe or seven-asset index authority. The separate Phase 3 index amendment remains required. No carried cohort, tools, consumer-policy or schema bytes are changed by this split.

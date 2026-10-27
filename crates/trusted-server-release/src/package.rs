@@ -210,6 +210,7 @@ fn module_member(
     let mut archive = tar::Archive::new(decoded);
     let root = format!("{name}/");
     let bin = format!("{name}/bin/");
+    let bare_bin = format!("{name}/bin");
     let module_name = format!("{name}/bin/main.wasm");
     let manifest_name = format!("{name}/fastly.toml");
     let mut seen = BTreeSet::new();
@@ -221,11 +222,21 @@ fn module_member(
         }
         let header = entry.header();
         let path = raw_field(&header.as_old().name)?.to_owned();
+        // Only the two known directory entries may omit their trailing slash.
+        // Canonical logical IDs reject duplicates across those raw spellings;
+        // file paths, links, prefixes and metadata remain exact.
+        let directory = if path == name || path == root {
+            Some(root.as_str())
+        } else if path == bare_bin || path == bin {
+            Some(bin.as_str())
+        } else {
+            None
+        };
         if header
             .as_ustar()
             .is_some_and(|ustar| ustar.prefix.iter().any(|byte| *byte != 0))
             || !raw_field(&header.as_old().linkname)?.is_empty()
-            || !seen.insert(path.clone())
+            || !seen.insert(directory.unwrap_or(&path).to_owned())
         {
             return Err(rejected(
                 "package has prefixed paths, links or duplicate entries",
@@ -233,7 +244,7 @@ fn module_member(
         }
         let kind = header.entry_type().as_byte();
         let size = entry.size();
-        if path == root || path == bin {
+        if directory.is_some() {
             if kind != b'5' || size != 0 {
                 return Err(rejected(
                     "package directory has the wrong type or nonzero size",

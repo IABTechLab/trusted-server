@@ -127,6 +127,94 @@ fn change_header(tar: &mut [u8], offset: usize, change: impl FnOnce(&mut tar::He
 }
 
 #[test]
+fn accepts_only_the_known_directory_names_with_optional_single_trailing_slashes() {
+    for root in ["example-package", "example-package/"] {
+        for bin in ["example-package/bin", "example-package/bin/"] {
+            let mut tar = tar_bytes();
+            for (offset, path) in [(0, root), (512, bin)] {
+                change_header(&mut tar, offset, |header| {
+                    header.as_old_mut().name.fill(0);
+                    header.as_old_mut().name[..path.len()].copy_from_slice(path.as_bytes());
+                });
+            }
+            check_archive(&compress(&tar), &digest(WASM))
+                .expect("should accept each exact zero-sized type-5 directory representation");
+        }
+    }
+}
+
+#[test]
+fn rejects_directory_alias_duplicates_across_both_trailing_slash_forms() {
+    for directory in ["example-package", "example-package/bin"] {
+        let slash = format!("{directory}/");
+        for (first, second) in [(directory, slash.as_str()), (slash.as_str(), directory)] {
+            let mut tar = tar_bytes();
+            for (offset, path) in [(0, first), (512, second)] {
+                change_header(&mut tar, offset, |header| {
+                    header.as_old_mut().name.fill(0);
+                    header.as_old_mut().name[..path.len()].copy_from_slice(path.as_bytes());
+                });
+            }
+            let error = check_archive(&compress(&tar), &digest(WASM))
+                .expect_err("should reject duplicate logical directories across raw spellings");
+            assert!(
+                format!("{error:?}").contains("duplicate"),
+                "should detect the logical duplicate before missing-member checks"
+            );
+        }
+    }
+}
+
+#[test]
+fn rejects_wrong_types_nonzero_sizes_and_other_directory_path_aliases() {
+    for (offset, path) in [(0, "example-package"), (512, "example-package/bin")] {
+        for kind in [
+            0, b'0', b'1', b'2', b'3', b'4', b'6', b'x', b'g', b'L', b'K', b'S',
+        ] {
+            let mut tar = tar_bytes();
+            change_header(&mut tar, offset, |header| {
+                header.as_old_mut().name.fill(0);
+                header.as_old_mut().name[..path.len()].copy_from_slice(path.as_bytes());
+                header.set_entry_type(tar::EntryType::new(kind));
+            });
+            assert!(
+                check_archive(&compress(&tar), &digest(WASM)).is_err(),
+                "should require directory type-5 for both new raw spellings"
+            );
+        }
+        let mut tar = tar_bytes();
+        change_header(&mut tar, offset, |header| {
+            header.as_old_mut().name.fill(0);
+            header.as_old_mut().name[..path.len()].copy_from_slice(path.as_bytes());
+            header.set_size(1);
+        });
+        assert!(
+            check_archive(&compress(&tar), &digest(WASM)).is_err(),
+            "should require zero-sized directory entries"
+        );
+    }
+    for path in [
+        "example-package//",
+        "example-package/./",
+        "./example-package",
+        "/example-package",
+        "example-package/bin//",
+        "example-package/./bin",
+        "example-package\\bin",
+    ] {
+        let mut tar = tar_bytes();
+        change_header(&mut tar, 0, |header| {
+            header.as_old_mut().name.fill(0);
+            header.as_old_mut().name[..path.len()].copy_from_slice(path.as_bytes());
+        });
+        assert!(
+            check_archive(&compress(&tar), &digest(WASM)).is_err(),
+            "should reject every unapproved raw path spelling"
+        );
+    }
+}
+
+#[test]
 fn rejects_manifest_only_generic_layout() {
     let mut tar = tar_bytes();
     tar.drain(1024..2048);
