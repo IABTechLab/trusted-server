@@ -858,14 +858,18 @@ impl HarnessSetup {
         self
     }
 
-    /// Sets the page URL.
+    /// Sets the page URL, without its query string and fragment, as a
+    /// request gives it to a provider.
     ///
     /// # Panics
     ///
     /// Panics when `url` is not a URL.
     #[must_use]
     pub fn with_page_url(mut self, url: &str) -> Self {
-        self.page_url = Some(Url::parse(url).expect("should parse the page URL"));
+        let mut url = Url::parse(url).expect("should parse the page URL");
+        url.set_query(None);
+        url.set_fragment(None);
+        self.page_url = Some(url);
         self
     }
 
