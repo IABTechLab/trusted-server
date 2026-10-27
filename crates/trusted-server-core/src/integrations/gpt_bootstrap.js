@@ -107,20 +107,20 @@
 
   function firstImpressionState(now) {
     var generation = ts.navGeneration || 0;
-    if (
-      !ts.firstImpression ||
-      ts.firstImpression.generation !== generation
-    ) {
+    if (!ts.firstImpression || ts.firstImpression.generation !== generation) {
       ts.firstImpression = {
         generation: generation,
         nextToken: 0,
-        slots: {},
-        fallbackSlots: {},
+        slots: Object.create(null),
+        fallbackSlots: Object.create(null),
       };
     }
     var state = ts.firstImpression;
-    state.slots = state.slots || {};
-    state.fallbackSlots = state.fallbackSlots || {};
+    state.slots = Object.assign(Object.create(null), state.slots);
+    state.fallbackSlots = Object.assign(
+      Object.create(null),
+      state.fallbackSlots,
+    );
     Object.keys(state.slots).forEach(function (elementId) {
       var claim = state.slots[elementId];
       if (
@@ -246,7 +246,7 @@
       phase: "delivery_pending",
       // Unbounded by contract; see the fallback transition above.
       expiresAt: Number.POSITIVE_INFINITY,
-      publisherAuctions: {},
+      publisherAuctions: Object.create(null),
     };
     if (!storeFirstImpressionClaim(state, claim)) return null;
     schedulePendingRenderDiagnostic(claim);
@@ -281,6 +281,7 @@
               : "";
           var element = elementId && document.getElementById(elementId);
           if (!element) return;
+          if (phase === "rendered") observePublisherSlotRender(ts, event.slot);
           var state = firstImpressionState(Date.now());
           var claim = state.slots[elementId];
           if (!claim) {
@@ -291,7 +292,7 @@
               owner: "publisher",
               phase: phase,
               expiresAt: Number.POSITIVE_INFINITY,
-              publisherAuctions: {},
+              publisherAuctions: Object.create(null),
             });
             return;
           }
@@ -310,6 +311,614 @@
   }
 
   installFirstImpressionListeners();
+
+  // Protocol v1 deliberately mirrors publisher_registration.ts; the shared executable contract checks both.
+  const CANDIDATE_KEYS = [
+    "hb_pb",
+    "hb_bidder",
+    "hb_adid",
+    "hb_cache_host",
+    "hb_cache_path",
+  ];
+  function registrationTag() {
+    return window.googletag;
+  }
+  function invalidatePublisherSlotRegistrations(ts) {
+    var _a, _b, _c;
+    const previous = ts.publisherSlotRegistrationState;
+    for (const record of Object.values(
+      (_a = previous == null ? void 0 : previous.records) != null ? _a : {},
+    )) {
+      record.status = { status: "cancelled", reason: "navigation" };
+      record.element = void 0;
+      record.gptSlot = void 0;
+    }
+    ts.publisherSlotRegistrationState = {
+      generation: (_b = ts.navGeneration) != null ? _b : 0,
+      nextToken:
+        (_c = previous == null ? void 0 : previous.nextToken) != null ? _c : 0,
+      records: /* @__PURE__ */ Object.create(null),
+    };
+  }
+  function registrationState(ts) {
+    var _a, _b;
+    if (
+      ((_a = ts.publisherSlotRegistrationState) == null
+        ? void 0
+        : _a.generation) !== ((_b = ts.navGeneration) != null ? _b : 0)
+    ) {
+      invalidatePublisherSlotRegistrations(ts);
+    }
+    return ts.publisherSlotRegistrationState;
+  }
+  function settlePublisherSlotPayload(ts, generation, slots, bids) {
+    var _a, _b;
+    if (((_a = ts.navGeneration) != null ? _a : 0) !== generation) return;
+    registrationState(ts).payload = { generation, slots, bids };
+    (_b = ts.publisherSlotRegistrationDispatch) == null ? void 0 : _b.call(ts);
+  }
+  function retainPublisherSlotMappings(ts, mapping, targetingKeys) {
+    const state = registrationState(ts);
+    for (const record of Object.values(state.records)) {
+      if (!record.consumed || !record.targetingKeys) continue;
+      mapping[record.elementId] = record.slotId;
+      targetingKeys[record.elementId] = record.targetingKeys;
+    }
+  }
+  function registeredCandidateAllowed(ts, slotId, bid) {
+    var _a, _b, _c, _d, _e, _f, _g, _h;
+    const record =
+      ((_a = ts.publisherSlotRegistrationState) == null
+        ? void 0
+        : _a.generation) === ((_b = ts.navGeneration) != null ? _b : 0)
+        ? ts.publisherSlotRegistrationState.records[slotId]
+        : void 0;
+    if (record) {
+      if (
+        !record.consumed ||
+        record.selectedCandidate !== bid ||
+        !((_c = record.element) == null ? void 0 : _c.isConnected) ||
+        record.element.id !== record.elementId ||
+        document.getElementById(record.elementId) !== record.element
+      )
+        return false;
+      try {
+        return (
+          !!record.gptSlot &&
+          !!((_g =
+            (_e = (_d = registrationTag()) == null ? void 0 : _d.pubads) == null
+              ? void 0
+              : (_f = _e.call(_d)).getSlots) == null
+            ? void 0
+            : _g.call(_f).includes(record.gptSlot))
+        );
+      } catch (e) {
+        return false;
+      }
+    }
+    return !((_h = ts.adSlots) == null
+      ? void 0
+      : _h.some(
+          (slot) =>
+            slot.id === slotId &&
+            slot.initialization === "publisher_registered",
+        ));
+  }
+  function observePublisherSlotRender(ts, native) {
+    var _a, _b;
+    const state = ts.publisherSlotRegistrationState;
+    if (
+      (state == null ? void 0 : state.generation) !==
+      ((_a = ts.navGeneration) != null ? _a : 0)
+    )
+      return;
+    for (const record of Object.values(state.records)) {
+      if (
+        record.gptSlot === native &&
+        record.consumed &&
+        ((_b = record.element) == null ? void 0 : _b.isConnected) &&
+        record.element.id === record.elementId &&
+        document.getElementById(record.elementId) === record.element &&
+        (record.status.status === "requested" ||
+          record.status.status === "dispatching")
+      ) {
+        record.status = { status: "rendered" };
+      }
+    }
+  }
+  function finiteSize(size) {
+    return (
+      Array.isArray(size) &&
+      size.length === 2 &&
+      size.every(
+        (value) =>
+          typeof value === "number" && Number.isInteger(value) && value > 0,
+      )
+    );
+  }
+  function normalizedFormats(formats) {
+    return [
+      ...new Map(
+        formats.map((size) => [size.join("x"), [size[0], size[1]]]),
+      ).values(),
+    ].sort((left, right) => left[0] - right[0] || left[1] - right[1]);
+  }
+  function loadPolicy(ts, tag) {
+    var _a, _b;
+    try {
+      const effective =
+        (_b =
+          (_a = tag == null ? void 0 : tag.getConfig) == null
+            ? void 0
+            : _a.call(tag, "disableInitialLoad")) == null
+          ? void 0
+          : _b.disableInitialLoad;
+      if (effective !== void 0) ts.gptInitialLoadDisabled = effective === true;
+      if (
+        effective === true ||
+        (effective === void 0 && ts.gptInitialLoadDisabled === true)
+      )
+        return;
+      return {
+        status: "rejected",
+        reason:
+          effective === false || ts.gptInitialLoadDisabled === false
+            ? "initial_load_enabled"
+            : "initial_load_unknown",
+      };
+    } catch (e) {
+      return { status: "rejected", reason: "initial_load_unknown" };
+    }
+  }
+  function exactElement(id) {
+    const element = document.getElementById(id);
+    if (!id || !(element == null ? void 0 : element.isConnected))
+      return { error: { status: "rejected", reason: "missing_element" } };
+    if (
+      Array.from(document.querySelectorAll("[id]")).filter(
+        (candidate) => candidate.id === id,
+      ).length !== 1
+    ) {
+      return { error: { status: "rejected", reason: "duplicate_dom_id" } };
+    }
+    return { element };
+  }
+  function registrationHandle(ts, record) {
+    return {
+      getStatus: () => {
+        var _a;
+        if (
+          record.generation !== ((_a = ts.navGeneration) != null ? _a : 0) &&
+          !record.consumed
+        ) {
+          record.status = { status: "cancelled", reason: "navigation" };
+        }
+        return { ...record.status };
+      },
+      cancel: () => {
+        if (
+          record.status.status === "rejected" ||
+          record.status.status === "cancelled"
+        )
+          return;
+        record.status = { status: "cancelled", reason: "explicit" };
+        if (!record.consumed) {
+          record.element = void 0;
+          record.gptSlot = void 0;
+        }
+      },
+    };
+  }
+  function installPublisherSlotRegistration(ts, claim) {
+    registrationState(ts);
+    ts.publisherSlotRegistrationVersion = 1;
+    ts.registerPublisherSlot = (options) => {
+      var _a, _b, _c, _d, _e;
+      const state = registrationState(ts);
+      const rejected = (status) => ({
+        getStatus: () => ({ ...status }),
+        cancel: () => {},
+      });
+      if (
+        !options ||
+        typeof options.slotId !== "string" ||
+        !options.slotId ||
+        !Number.isInteger(options.navigationGeneration) ||
+        !Array.isArray(options.eligibleFormats) ||
+        !options.eligibleFormats.every(finiteSize) ||
+        !options.gptSlot ||
+        ![
+          "getSlotElementId",
+          "getAdUnitPath",
+          "setTargeting",
+          "clearTargeting",
+        ].every((key) => typeof options.gptSlot[key] === "function")
+      ) {
+        return rejected({ status: "rejected", reason: "invalid_arguments" });
+      }
+      if (options.navigationGeneration !== state.generation)
+        return rejected({ status: "rejected", reason: "stale_generation" });
+      const tag = registrationTag();
+      const policy = loadPolicy(ts, tag);
+      if (policy) return rejected(policy);
+      let elementId;
+      let adUnitPath;
+      try {
+        elementId = options.gptSlot.getSlotElementId();
+        adUnitPath = options.gptSlot.getAdUnitPath();
+        if (typeof elementId !== "string" || typeof adUnitPath !== "string")
+          throw new Error("invalid slot identity");
+        if (
+          !((_c =
+            (_a = tag == null ? void 0 : tag.pubads) == null
+              ? void 0
+              : (_b = _a.call(tag)).getSlots) == null
+            ? void 0
+            : _c.call(_b).includes(options.gptSlot))
+        )
+          return rejected({
+            status: "rejected",
+            reason: "native_slot_missing",
+          });
+      } catch (e) {
+        return rejected({ status: "rejected", reason: "invalid_arguments" });
+      }
+      const { element, error } = exactElement(elementId);
+      if (error || !element) return rejected(error);
+      const configured =
+        (_d = state.payload) == null
+          ? void 0
+          : _d.slots.find((slot) => slot.id === options.slotId);
+      if (configured && configured.gam_unit_path !== adUnitPath) {
+        return rejected({ status: "rejected", reason: "path_mismatch" });
+      }
+      const eligibleFormats = normalizedFormats(options.eligibleFormats);
+      const previous = state.records[options.slotId];
+      if (
+        previous &&
+        (previous.consumed || previous.status.status !== "cancelled")
+      ) {
+        if (
+          previous.gptSlot === options.gptSlot &&
+          previous.element === element &&
+          JSON.stringify(previous.eligibleFormats) ===
+            JSON.stringify(eligibleFormats)
+        )
+          return registrationHandle(ts, previous);
+        return rejected({
+          status: "rejected",
+          reason: "conflicting_registration",
+        });
+      }
+      const record = {
+        generation: state.generation,
+        slotId: options.slotId,
+        token: ++state.nextToken,
+        gptSlot: options.gptSlot,
+        element,
+        elementId,
+        adUnitPath,
+        eligibleFormats,
+        status: { status: "waiting_payload" },
+        consumed: false,
+        queued: false,
+      };
+      state.records[record.slotId] = record;
+      (_e = ts.publisherSlotRegistrationDispatch) == null
+        ? void 0
+        : _e.call(ts);
+      return registrationHandle(ts, record);
+    };
+    ts.publisherSlotRegistrationDispatch = (readyRecord) => {
+      const state = registrationState(ts);
+      const current = (record) =>
+        state.records[record.slotId] === record &&
+        record.generation === state.generation &&
+        !record.consumed &&
+        (record.status.status === "waiting_payload" ||
+          record.status.status === "waiting_delivery");
+      const dispatch = (record) => {
+        var _a, _b, _c, _d, _e;
+        if (!current(record)) return;
+        record.queued = false;
+        const payload = state.payload;
+        if (!payload || payload.generation !== state.generation) return;
+        const slot = payload.slots.find(
+          (candidate) => candidate.id === record.slotId,
+        );
+        if (!slot || slot.initialization !== "publisher_registered") {
+          record.status = {
+            status: "inactive",
+            reason: slot ? "not_registered_mode" : "not_admitted",
+          };
+          return;
+        }
+        const tag = registrationTag();
+        const policy = loadPolicy(ts, tag);
+        if (policy) {
+          record.status = policy;
+          return;
+        }
+        const identity = exactElement(record.elementId);
+        if (
+          !record.element ||
+          identity.element !== record.element ||
+          record.element.id !== record.elementId
+        ) {
+          record.status = { status: "cancelled", reason: "element_changed" };
+          return;
+        }
+        const native = record.gptSlot;
+        const service =
+          (_a = tag == null ? void 0 : tag.pubads) == null
+            ? void 0
+            : _a.call(tag);
+        if (
+          !native ||
+          !((_b = service == null ? void 0 : service.getSlots) == null
+            ? void 0
+            : _b.call(service).includes(native)) ||
+          native.getSlotElementId() !== record.elementId
+        ) {
+          record.status = {
+            status: "cancelled",
+            reason: "native_slot_missing",
+          };
+          return;
+        }
+        if (
+          native.getAdUnitPath() !== record.adUnitPath ||
+          record.adUnitPath !== slot.gam_unit_path
+        ) {
+          record.status = { status: "rejected", reason: "path_mismatch" };
+          return;
+        }
+        if (document.hidden) {
+          queue(record);
+          return;
+        }
+        const first = claim(record.element);
+        if (!first) {
+          record.status = { status: "publisher_owned", reason: "prior_claim" };
+          return;
+        }
+        record.consumed = true;
+        record.status = { status: "dispatching" };
+        const wasInternal = ts.gptSlotHandoffInternal;
+        const wasRefreshing = ts.adInitRefreshInProgress;
+        try {
+          const bid = payload.bids[record.slotId];
+          const fits =
+            bid &&
+            finiteSize([bid.w, bid.h]) &&
+            slot.formats.some(
+              (size) => size[0] === bid.w && size[1] === bid.h,
+            ) &&
+            record.eligibleFormats.some(
+              (size) => size[0] === bid.w && size[1] === bid.h,
+            );
+          const candidate =
+            ts.tsRenderBridgeVersion === 1 && fits ? bid : void 0;
+          record.selectedCandidate = candidate;
+          if (!candidate)
+            record.noCandidateReason = !bid
+              ? "no_bid"
+              : ts.tsRenderBridgeVersion !== 1
+                ? "renderer_unavailable"
+                : "incompatible_dimensions";
+          const previousKeys =
+            (_d =
+              (_c = ts.prevSlotTargetingKeys) == null
+                ? void 0
+                : _c[record.elementId]) != null
+              ? _d
+              : [];
+          for (const key of /* @__PURE__ */ new Set([
+            ...CANDIDATE_KEYS,
+            "ts_initial",
+            ...previousKeys,
+          ]))
+            native.clearTargeting(key);
+          const targeting = { ...slot.targeting, ts_initial: "1" };
+          for (const key of CANDIDATE_KEYS) {
+            delete targeting[key];
+            if (candidate == null ? void 0 : candidate[key])
+              targeting[key] = String(candidate[key]);
+          }
+          record.targetingKeys = Object.keys(targeting);
+          for (const [key, value] of Object.entries(targeting))
+            native.setTargeting(key, value);
+          first.targeting = targeting;
+          ts.divToSlotId = Object.assign(
+            /* @__PURE__ */ Object.create(null),
+            ts.divToSlotId,
+          );
+          ts.prevSlotTargetingKeys = Object.assign(
+            /* @__PURE__ */ Object.create(null),
+            ts.prevSlotTargetingKeys,
+          );
+          retainPublisherSlotMappings(
+            ts,
+            ts.divToSlotId,
+            ts.prevSlotTargetingKeys,
+          );
+          try {
+            (_e = ts.gptDiagnosticsRecorder) == null
+              ? void 0
+              : _e.recordTrustedServerOpportunity(
+                  native,
+                  slot.id,
+                  (candidate == null ? void 0 : candidate.hb_adid)
+                    ? candidate.adm || candidate.hb_cache_host
+                      ? "renderable_candidate"
+                      : "unrenderable_candidate"
+                    : "no_candidate",
+                  candidate == null ? void 0 : candidate.hb_auction_id,
+                  record.eligibleFormats,
+                );
+          } catch (e) {}
+          ts.gptSlotHandoffInternal = true;
+          ts.adInitRefreshInProgress = true;
+          tag.display(record.elementId);
+          service.refresh([native]);
+          if (record.status.status === "dispatching")
+            record.status = { status: "requested" };
+        } catch (e) {
+          record.status = {
+            status: "failed_after_dispatch",
+            reason: "delivery_exception",
+          };
+        } finally {
+          ts.gptSlotHandoffInternal = wasInternal;
+          ts.adInitRefreshInProgress = wasRefreshing;
+        }
+      };
+      const queue = (record) => {
+        if (!current(record) || record.queued) return;
+        record.queued = true;
+        record.status = { status: "waiting_delivery" };
+        const foreground = () => {
+          if (!current(record)) return;
+          if (document.hidden) {
+            document.addEventListener("visibilitychange", foreground, {
+              once: true,
+            });
+            return;
+          }
+          window.requestAnimationFrame(() => {
+            var _a, _b;
+            if (!current(record)) return;
+            if (document.hidden) {
+              foreground();
+              return;
+            }
+            (_b = (_a = registrationTag()) == null ? void 0 : _a.cmd) == null
+              ? void 0
+              : _b.push(() => {
+                  var _a2;
+                  return (_a2 = ts.publisherSlotRegistrationDispatch) == null
+                    ? void 0
+                    : _a2.call(ts, record);
+                });
+          });
+        };
+        foreground();
+      };
+      if (readyRecord) {
+        dispatch(readyRecord);
+        return;
+      }
+      for (const record of Object.values(state.records)) {
+        if (!current(record)) continue;
+        if (!state.payload) {
+          record.status = { status: "waiting_payload" };
+          continue;
+        }
+        const admitted = state.payload.slots.find(
+          (slot) => slot.id === record.slotId,
+        );
+        if (!admitted || admitted.initialization !== "publisher_registered") {
+          record.status = {
+            status: "inactive",
+            reason: admitted ? "not_registered_mode" : "not_admitted",
+          };
+          continue;
+        }
+        queue(record);
+      }
+    };
+  }
+
+  installPublisherSlotRegistration(ts, claimFirstImpressionForTrustedServer);
+
+  // Snapshot exact old native identities before retiring their registration records.
+  // This mirrors runtime navigation cleanup, without adding a bootstrap auction client.
+  function clearBootstrapNavigationTargeting() {
+    var gpt = window.googletag;
+    var previousKeys = Object.assign(
+      Object.create(null),
+      ts.prevSlotTargetingKeys,
+    );
+    var registeredRecords = Object.values(
+      (ts.publisherSlotRegistrationState &&
+        ts.publisherSlotRegistrationState.records) ||
+        {},
+    ).filter(function (record) {
+      return record.consumed && record.targetingKeys;
+    });
+    var registeredIds = new Set();
+    var snapshot = new Map();
+    var baseKeys = CANDIDATE_KEYS.concat(["ts_initial"]);
+    registeredRecords.forEach(function (record) {
+      registeredIds.add(record.elementId);
+      previousKeys[record.elementId] = record.targetingKeys;
+      if (record.gptSlot)
+        snapshot.set(record.gptSlot, baseKeys.concat(record.targetingKeys));
+    });
+    var touchedIds = new Set(
+      Object.keys(previousKeys).concat(Object.keys(ts.divToSlotId || {})),
+    );
+    var pubads = gpt.pubads && gpt.pubads();
+    var live = pubads && pubads.getSlots ? pubads.getSlots() : [];
+    live.concat(ts.prevGptSlots || []).forEach(function (slot) {
+      var id = slot.getSlotElementId();
+      if (touchedIds.has(id) && !registeredIds.has(id)) {
+        snapshot.set(slot, baseKeys.concat(previousKeys[id] || []));
+      }
+    });
+    var clearSnapshot = function () {
+      var current = window.googletag.pubads && window.googletag.pubads();
+      if (!current) return false;
+      var currentSlots = current.getSlots ? current.getSlots() : [];
+      snapshot.forEach(function (keys, slot) {
+        if (
+          !currentSlots.includes(slot) ||
+          typeof slot.clearTargeting !== "function"
+        )
+          return;
+        new Set(keys).forEach(function (key) {
+          slot.clearTargeting(key);
+        });
+      });
+      return true;
+    };
+    if (snapshot.size > 0 && !clearSnapshot()) tag.cmd.push(clearSnapshot);
+    ts.prevSlotTargetingKeys = Object.create(null);
+    ts.divToSlotId = Object.create(null);
+  }
+
+  // One observer resolves a replaceable handler, so runtime takeover preserves
+  // framework wrappers and transfers counter ownership instead of nesting writers.
+  function installBootstrapNavigationBridge() {
+    if (ts.gptNavigationBridge) return;
+    var currentPath = location.pathname;
+    ts.gptNavigationBridge = {
+      onNavigate: function (path) {
+        if (path === currentPath) return;
+        currentPath = path;
+        clearBootstrapNavigationTargeting();
+        ts.navGeneration = (ts.navGeneration || 0) + 1;
+        invalidatePublisherSlotRegistrations(ts);
+        delete ts.firstImpression;
+        Object.entries(ts.gptSlotHandoffs || {}).forEach(function (entry) {
+          if (!entry[1].publisherClaimed) delete ts.gptSlotHandoffs[entry[0]];
+        });
+        ts.gptNavigationBridge.pendingGeneration = ts.navGeneration;
+      },
+    };
+    var observe = function () {
+      ts.gptNavigationBridge.onNavigate(location.pathname);
+    };
+    ["pushState", "replaceState"].forEach(function (method) {
+      var original = history[method].bind(history);
+      history[method] = function (state, unused, url) {
+        original(state, unused, url);
+        observe();
+      };
+    });
+    window.addEventListener("popstate", observe, true);
+  }
+  installBootstrapNavigationBridge();
 
   // Minimal fallback for tsjs.scheduleInitialAdInit, mirroring the bundle's
   // hydration-safe scheduler in
@@ -336,6 +945,9 @@
     // would overwrite a committed SPA navigation's slots.
     if (initialSlots !== undefined) ts.adSlots = initialSlots;
     if (initialBids !== undefined) ts.bids = initialBids;
+    if (initialBids !== undefined || initialSlots !== undefined) {
+      settlePublisherSlotPayload(ts, 0, ts.adSlots || [], ts.bids || {});
+    }
     var fire = function () {
       if ((ts.navGeneration || 0) !== 0) return;
       if (typeof ts.adInit === "function") ts.adInit();
@@ -749,10 +1361,12 @@
   }
 
   ts.adInit = function () {
-    var slots = ts.adSlots || [];
+    var slots = (ts.adSlots || []).filter(function (slot) {
+      return slot.initialization !== "publisher_registered";
+    });
     var bids = ts.bids || {};
-    var divToSlotId = {};
-    var nextSlotTargetingKeys = {};
+    var divToSlotId = Object.create(null);
+    var nextSlotTargetingKeys = Object.create(null);
     // Generation this invocation belongs to. The slot work below is queued on
     // googletag.cmd, which drains only when GPT loads; recheck first inside
     // the queued callback so a navigation committed in the gap cancels the
@@ -881,6 +1495,7 @@
         }
       });
       ts.prevGptSlots = newSlots;
+      retainPublisherSlotMappings(ts, divToSlotId, nextSlotTargetingKeys);
       ts.divToSlotId = divToSlotId;
       ts.prevSlotTargetingKeys = nextSlotTargetingKeys;
       var hasRenderableWork =

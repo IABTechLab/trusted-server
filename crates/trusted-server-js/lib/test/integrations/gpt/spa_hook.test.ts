@@ -378,6 +378,8 @@ describe('installSpaAuctionHook', () => {
     const ts = (window as TestWindow).tsjs!;
     ts.prevSlotTargetingKeys = { [element.id]: ['ts_route_a'] };
     ts.divToSlotId = { [element.id]: 'route_a_slot' };
+    // Even while the public GPT getter is absent, cleanup retains old native identity.
+    ts.prevGptSlots = [gptSlot];
     const queuedBeforeNavigation = queuedCommands.length;
 
     history.pushState({}, '', '/route-b');

@@ -622,6 +622,24 @@ impl CreativeOpportunitiesConfig {
     }
 }
 
+/// Controls who establishes the native slot for initial ad delivery.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CreativeOpportunityInitialization {
+    /// Use the existing automatic slot initialization.
+    #[default]
+    Auto,
+    /// Wait for the publisher to register its final native slot.
+    PublisherRegistered,
+}
+
+impl CreativeOpportunityInitialization {
+    /// Whether initial delivery uses the default automatic behavior.
+    pub(crate) const fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
 /// A single ad placement opportunity on the publisher's site.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -640,6 +658,12 @@ pub struct CreativeOpportunitySlot {
     pub page_patterns: Vec<String>,
     /// Supported ad formats (size + media type combinations).
     pub formats: Vec<CreativeOpportunityFormat>,
+    /// Initial delivery ownership, defaulting to automatic slot initialization.
+    #[serde(
+        default,
+        skip_serializing_if = "CreativeOpportunityInitialization::is_auto"
+    )]
+    pub initialization: CreativeOpportunityInitialization,
     /// Optional floor price in CPM (USD).
     pub floor_price: Option<f64>,
     /// Slot-level targeting key–value pairs forwarded to the auction.
@@ -1459,12 +1483,124 @@ mod tests {
                 height: 250,
                 media_type: crate::auction::types::MediaType::Banner,
             }],
+            initialization: Default::default(),
             floor_price: Some(0.50),
             targeting: Default::default(),
             providers: Default::default(),
             compiled_patterns: Vec::new(),
             compiled_unit: None,
         }
+    }
+
+    #[test]
+    fn slot_initialization_defaults_to_auto_without_changing_serialization() {
+        let original = serde_json::to_value(make_slot("header", vec!["/example/*"]))
+            .expect("should serialize automatic slot");
+        let absent: CreativeOpportunitySlot = serde_json::from_value(original.clone())
+            .expect("should deserialize slot without initialization");
+        assert!(
+            original.get("initialization").is_none(),
+            "should omit initialization from the default serialized slot"
+        );
+        let mut explicit = original.clone();
+        explicit["initialization"] = serde_json::json!("auto");
+        let automatic: CreativeOpportunitySlot = serde_json::from_value(explicit)
+            .expect("should deserialize explicit automatic initialization");
+
+        for slot in [absent, automatic] {
+            assert_eq!(
+                serde_json::to_value(slot).expect("should serialize automatic slot"),
+                original,
+                "should omit default initialization and preserve the existing shape"
+            );
+        }
+    }
+
+    #[test]
+    fn slot_initialization_publisher_registered_round_trips() {
+        let mut value = serde_json::to_value(make_slot("header", vec!["/example/*"]))
+            .expect("should serialize slot");
+        value["initialization"] = serde_json::json!("publisher_registered");
+        let slot: CreativeOpportunitySlot = serde_json::from_value(value.clone())
+            .expect("should deserialize publisher-registered initialization");
+
+        assert_eq!(
+            serde_json::to_value(slot).expect("should serialize registered slot"),
+            value,
+            "should preserve publisher-registered initialization in a round trip"
+        );
+    }
+
+    #[test]
+    fn slot_initialization_toml_configuration_accepts_only_known_modes() {
+        let base = r#"
+            id = "header"
+            page_patterns = ["/example/*"]
+            formats = [{ width = 300, height = 250, media_type = "banner" }]
+        "#;
+        for mode in [None, Some("auto"), Some("publisher_registered")] {
+            let source = match mode {
+                Some(mode) => format!("{base}\ninitialization = \"{mode}\"\n"),
+                None => base.to_string(),
+            };
+            let slot: CreativeOpportunitySlot =
+                toml::from_str(&source).expect("should parse a supported initialization mode");
+            let serialized = serde_json::to_value(&slot).expect("should serialize configured slot");
+            assert_eq!(
+                serialized.get("initialization"),
+                mode.filter(|mode| *mode != "auto")
+                    .map(serde_json::Value::from)
+                    .as_ref(),
+                "should emit only non-default initialization for {mode:?}"
+            );
+        }
+        assert!(
+            toml::from_str::<CreativeOpportunitySlot>(&format!(
+                "{base}\ninitialization = \"publisher_ready\"\n"
+            ))
+            .is_err(),
+            "should reject an unknown TOML initialization mode"
+        );
+    }
+
+    #[test]
+    fn slot_initialization_does_not_change_auction_input_or_path_matching() {
+        let mut slot = make_slot("header", vec!["/example/*"]);
+        slot.compile_patterns();
+        let automatic = serde_json::to_value(slot.to_ad_slot())
+            .expect("should serialize automatic auction slot");
+        slot.initialization = CreativeOpportunityInitialization::PublisherRegistered;
+
+        assert_eq!(
+            serde_json::to_value(slot.to_ad_slot())
+                .expect("should serialize registered auction slot"),
+            automatic,
+            "should change delivery ownership without changing auction inputs"
+        );
+        assert!(
+            slot.matches_path("/example/article"),
+            "should retain matching paths"
+        );
+        assert!(
+            !slot.matches_path("/other"),
+            "should retain non-matching paths"
+        );
+        assert!(
+            slot.validate_runtime().is_ok(),
+            "should retain valid slot semantics"
+        );
+    }
+
+    #[test]
+    fn slot_initialization_rejects_unknown_values() {
+        let mut value = serde_json::to_value(make_slot("header", vec!["/example/*"]))
+            .expect("should serialize slot");
+        value["initialization"] = serde_json::json!("publisher_ready");
+
+        assert!(
+            serde_json::from_value::<CreativeOpportunitySlot>(value).is_err(),
+            "should reject an unknown initialization mode"
+        );
     }
 
     #[test]

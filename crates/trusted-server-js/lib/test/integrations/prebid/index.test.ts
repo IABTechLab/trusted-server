@@ -4191,6 +4191,82 @@ describe('prebid/installRefreshHandler', () => {
     expect(originalRefresh).toHaveBeenCalledWith([gptSlot], undefined);
   });
 
+  it('forwards registered initial delivery unchanged, then auctions a later publisher refresh with its options', async () => {
+    const { installPublisherSlotRegistration, settlePublisherSlotPayload } =
+      await import('../../../src/integrations/gpt/publisher_registration');
+    const code = 'registered-example-header';
+    attachTestSlot(code);
+    const values = new Map<string, string[]>();
+    values.set('publisher_key', ['keep']);
+    const slot = {
+      getSlotElementId: () => code,
+      getAdUnitPath: () => '/123/example/header',
+      getTargeting: (key: string) => values.get(key) ?? [],
+      setTargeting: vi.fn((key: string, value: string | string[]) => {
+        values.set(key, Array.isArray(value) ? value : [value]);
+      }),
+      clearTargeting: vi.fn((key?: string) => {
+        if (key) values.delete(key);
+      }),
+    };
+    const unrelated = { ...slot, getSlotElementId: () => 'unrelated-example' };
+    const originalRefresh = vi.fn();
+    const pubads = { getSlots: () => [slot, unrelated], refresh: originalRefresh };
+    const display = vi.fn();
+    testWindow.googletag = {
+      cmd: { push: (callback: () => void) => callback() },
+      getConfig: () => ({ disableInitialLoad: true }),
+      pubads: () => pubads,
+      display,
+    };
+    const ts = {
+      adSlots: [
+        {
+          id: 'header',
+          gam_unit_path: '/123/example/header',
+          div_id: code,
+          formats: [[300, 250]],
+          initialization: 'publisher_registered',
+        },
+      ],
+      bids: {},
+    } as TsjsApi;
+    testWindow.tsjs = ts;
+    const frames: FrameRequestCallback[] = [];
+    const raf = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    installRefreshHandler(750);
+    installPublisherSlotRegistration(ts);
+    const handle = ts.registerPublisherSlot!({
+      slotId: 'header',
+      gptSlot: slot,
+      navigationGeneration: 0,
+      eligibleFormats: [[300, 250]],
+    });
+    settlePublisherSlotPayload(ts, 0, ts.adSlots!, {});
+    frames.splice(0).forEach((callback) => callback(0));
+    expect(handle.getStatus().status).toBe('requested');
+    expect(display).toHaveBeenCalledExactlyOnceWith(code);
+    expect(mockRequestBids).not.toHaveBeenCalled();
+    expect(originalRefresh).toHaveBeenCalledExactlyOnceWith([slot], undefined);
+    expect(values.get('ts_initial')).toEqual(['1']);
+    expect(values.get('publisher_key')).toEqual(['keep']);
+    // A genuinely later refresh follows initial render settlement, not a competing first delivery.
+    observeFirstImpressionGptLifecycle(ts, document.getElementById(code)!, 'rendered');
+    const options = { changeCorrelator: false };
+    pubads.refresh([slot], options);
+    expect(mockRequestBids).toHaveBeenCalledTimes(1);
+    mockRequestBids.mock.calls[0][0].bidsBackHandler();
+    expect(originalRefresh).toHaveBeenLastCalledWith([slot], options);
+    expect(originalRefresh).toHaveBeenCalledTimes(2);
+    expect(values.get('publisher_key')).toEqual(['keep']);
+    expect(ts.adInitRefreshInProgress).not.toBe(true);
+    expect(ts.gptSlotHandoffInternal).not.toBe(true);
+    raf.mockRestore();
+  });
+
   it('runs a client-side auction for publisher refreshes after adInit completes', () => {
     const originalRefresh = vi.fn();
     const gptSlot = {

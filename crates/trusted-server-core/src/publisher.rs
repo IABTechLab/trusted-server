@@ -6064,7 +6064,8 @@ pub(crate) fn build_empty_bids_script() -> String {
 /// [`handle_page_bids`] (SPA navigation) so the slot wire shape has a single
 /// definition and the two paths cannot silently diverge. Property names match
 /// what the client-side TSJS bundle expects: `gam_unit_path`, `div_id`,
-/// `formats`, and `targeting`. Returns `None` when the slot's dynamic GAM unit
+/// `formats`, and `targeting`. Non-default `initialization` is emitted only for
+/// explicitly opted-in slots. Returns `None` when the slot's dynamic GAM unit
 /// path exceeds its rendering limit.
 pub(crate) fn build_slot_json(
     slot: &crate::creative_opportunities::CreativeOpportunitySlot,
@@ -6083,13 +6084,17 @@ pub(crate) fn build_slot_json(
         .iter()
         .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
         .collect();
-    Some(serde_json::json!({
+    let mut value = serde_json::json!({
         "id": slot.id,
         "gam_unit_path": gam_path,
         "div_id": div_id,
         "formats": formats,
         "targeting": targeting,
-    }))
+    });
+    if !slot.initialization.is_auto() {
+        value["initialization"] = serde_json::json!(slot.initialization);
+    }
+    Some(value)
 }
 
 /// Match creative-opportunity slots and omit dynamic GAM paths that cannot be
@@ -7685,6 +7690,7 @@ mod tests {
 
     fn scheduling_slot() -> CreativeOpportunitySlot {
         CreativeOpportunitySlot {
+            initialization: Default::default(),
             id: "scheduling-slot".to_owned(),
             gam_unit_path: None,
             div_id: None,
@@ -10284,6 +10290,7 @@ mod tests {
         /// branch that only runs when it is on.
         fn article_slot() -> crate::creative_opportunities::CreativeOpportunitySlot {
             crate::creative_opportunities::CreativeOpportunitySlot {
+                initialization: Default::default(),
                 id: "test-slot".to_string(),
                 gam_unit_path: None,
                 div_id: Some("test-slot".to_string()),
@@ -16008,6 +16015,7 @@ mod tests {
 
         pub(super) fn slot() -> CreativeOpportunitySlot {
             CreativeOpportunitySlot {
+                initialization: Default::default(),
                 id: "atf".to_string(),
                 gam_unit_path: Some("/99999/example/home".to_string()),
                 div_id: Some("ad-atf".to_string()),
@@ -16048,6 +16056,66 @@ mod tests {
                 slot: vec![slot()],
             });
             settings
+        }
+
+        #[test]
+        fn registered_initialization_uses_the_admitted_inline_and_shared_slot_wire() {
+            let settings = settings_with_slots();
+            let mut value = serde_json::to_value(slot()).expect("should serialize slot");
+            value["initialization"] = serde_json::json!("publisher_registered");
+            let registered =
+                serde_json::from_value(value).expect("should deserialize registered slot");
+            let slots = [registered];
+            let config = settings
+                .creative_opportunities
+                .as_ref()
+                .expect("should configure creative opportunities");
+            let wire = build_slot_json(&slots[0], config, "example")
+                .expect("should build registered slot JSON");
+            assert_eq!(
+                wire["initialization"], "publisher_registered",
+                "should emit the explicitly selected initialization mode"
+            );
+            let expected =
+                serde_json::to_string(&vec![wire]).expect("should serialize expected slot wire");
+            let inline =
+                template_ad_slots_script(AssemblyMode::Inline, true, &settings, &slots, "/")
+                    .expect("should emit admitted inline slots");
+            assert_eq!(
+                inline,
+                format!(
+                    "<script>(window.tsjs=window.tsjs||{{}}).adSlots=JSON.parse(\"{}\");</script>",
+                    html_escape_for_script(&expected)
+                ),
+                "should use the same slot serializer for inline documents"
+            );
+            assert_eq!(
+                seam_ad_slots_json(AssemblyMode::Esi, true, &settings, &slots, "/"),
+                Some(expected),
+                "should use the same slot serializer for shared-template seams"
+            );
+            for mode in [AssemblyMode::Inline, AssemblyMode::Esi] {
+                assert_eq!(
+                    template_ad_slots_script(mode, false, &settings, &slots, "/"),
+                    None,
+                    "should not enable a gated head payload for {mode:?}"
+                );
+                assert_eq!(
+                    seam_ad_slots_json(mode, false, &settings, &slots, "/"),
+                    None,
+                    "should not enable a gated seam payload for {mode:?}"
+                );
+            }
+            assert_eq!(
+                seam_ad_slots_json(AssemblyMode::Esi, true, &settings, &[], "/"),
+                Some("[]".to_string()),
+                "should preserve explicitly empty admitted slots"
+            );
+            assert_eq!(
+                template_ad_slots_script(AssemblyMode::Esi, true, &settings, &slots, "/"),
+                None,
+                "should keep shared-template head configuration neutral"
+            );
         }
 
         #[test]
@@ -16501,6 +16569,7 @@ mod tests {
 
         fn article_slot() -> CreativeOpportunitySlot {
             CreativeOpportunitySlot {
+                initialization: Default::default(),
                 id: "article-slot".to_string(),
                 gam_unit_path: None,
                 div_id: None,
@@ -21931,6 +22000,7 @@ mod tests {
 
         fn make_slot() -> CreativeOpportunitySlot {
             CreativeOpportunitySlot {
+                initialization: Default::default(),
                 id: "atf_sidebar_ad".to_string(),
                 gam_unit_path: Some("/21765378893/publisher/atf-sidebar".to_string()),
                 div_id: Some("div-atf-sidebar".to_string()),
@@ -21979,6 +22049,26 @@ mod tests {
                 cache_path: None,
                 metadata: Default::default(),
             }
+        }
+
+        #[test]
+        fn build_slot_json_preserves_automatic_wire_bytes() {
+            let slot = make_slot();
+            let config = make_config();
+            let wire = crate::publisher::build_slot_json(&slot, &config, "example")
+                .expect("should build automatic slot JSON");
+            let expected = serde_json::json!({
+                "id": "atf_sidebar_ad",
+                "gam_unit_path": "/21765378893/publisher/atf-sidebar",
+                "div_id": "div-atf-sidebar",
+                "formats": [[300, 250]],
+                "targeting": {"pos": "atf"},
+            });
+            assert_eq!(
+                serde_json::to_string(&wire).expect("should serialize automatic wire"),
+                serde_json::to_string(&expected).expect("should serialize expected wire"),
+                "should preserve automatic slot wire byte-for-byte"
+            );
         }
 
         #[test]
@@ -23667,6 +23757,7 @@ mod tests {
 
         fn article_slot() -> Vec<CreativeOpportunitySlot> {
             vec![CreativeOpportunitySlot {
+                initialization: Default::default(),
                 id: "atf".to_string(),
                 gam_unit_path: None,
                 div_id: None,
@@ -23686,6 +23777,85 @@ mod tests {
 
         fn make_page_bids_request(path: &str) -> Request<EdgeBody> {
             make_page_bids_request_on(PAGE_BIDS_PATH, path)
+        }
+
+        #[tokio::test]
+        async fn page_bids_registered_initialization_preserves_admission_gates() {
+            let mut value =
+                serde_json::to_value(&article_slot()[0]).expect("should serialize article slot");
+            value["initialization"] = serde_json::json!("publisher_registered");
+            let slots =
+                vec![serde_json::from_value(value).expect("should deserialize registered slot")];
+            let settings = settings_with_co();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let admitted = run_page_bids_consent_allowed(
+                &settings,
+                &orchestrator,
+                &slots,
+                make_page_bids_request("/2024/article"),
+            )
+            .await;
+            let expected = crate::publisher::build_slot_json(
+                &slots[0],
+                settings
+                    .creative_opportunities
+                    .as_ref()
+                    .expect("should configure slots"),
+                "2024",
+            )
+            .expect("should build registered wire");
+            assert_eq!(
+                expected["initialization"], "publisher_registered",
+                "should emit publisher-registered mode"
+            );
+            assert_eq!(
+                admitted["slots"],
+                serde_json::json!([expected]),
+                "should return the shared slot wire for admitted SPA delivery"
+            );
+
+            let consent_denied = run_page_bids(
+                &settings,
+                &orchestrator,
+                &slots,
+                make_page_bids_request("/2024/article"),
+            )
+            .await;
+            assert_eq!(
+                consent_denied["slots"],
+                serde_json::json!([]),
+                "should not bypass consent admission"
+            );
+            let unmatched = run_page_bids_consent_allowed(
+                &settings,
+                &orchestrator,
+                &slots,
+                make_page_bids_request("/other"),
+            )
+            .await;
+            assert_eq!(
+                unmatched["slots"],
+                serde_json::json!([]),
+                "should not bypass page matching"
+            );
+            for gated in [
+                settings_with_co_auction_disabled(),
+                settings_with_co_templates_disabled(),
+            ] {
+                let orchestrator = AuctionOrchestrator::new(gated.auction.clone());
+                let response = run_page_bids_consent_allowed(
+                    &gated,
+                    &orchestrator,
+                    &slots,
+                    make_page_bids_request("/2024/article"),
+                )
+                .await;
+                assert_eq!(
+                    response["slots"],
+                    serde_json::json!([]),
+                    "should not bypass auction or template admission"
+                );
+            }
         }
 
         #[tokio::test]
@@ -24634,6 +24804,7 @@ mod tests {
 
         fn article_slot() -> Vec<CreativeOpportunitySlot> {
             vec![CreativeOpportunitySlot {
+                initialization: Default::default(),
                 id: "atf".to_string(),
                 gam_unit_path: None,
                 div_id: None,

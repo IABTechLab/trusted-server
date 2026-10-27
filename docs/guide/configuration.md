@@ -2268,6 +2268,36 @@ TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED=false
 > restore `enabled` to its default, re-push and finalize the configuration, then
 > roll back the binary.
 
+### Per-slot initialization
+
+Each `[[creative_opportunities.slot]]` can select its initial GPT delivery owner:
+
+| `initialization`         | Default                     | Behavior                                                                                                                                                          |
+| ------------------------ | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `"auto"`                 | Yes, including when omitted | Existing automatic slot initialization and handoff. The default field is omitted from client slot JSON.                                                           |
+| `"publisher_registered"` | No                          | Wait for the publisher to register its exact live native GPT slot and for the current navigation's admitted server payload. TS makes one scoped initial delivery. |
+
+Unknown values are configuration errors. The mode does not change page matching,
+auction selection, consent or template admission. It is emitted through the same
+slot serializer for initial documents, shared-template seams and SPA page-bids.
+
+Registered mode requires the publisher to disable initial loading before enabling
+GPT services, own native setup and teardown, provide current finite-size
+eligibility, and omit its competing initial display/refresh/Prebid auction. TS
+never defines a fallback for these placements. A timeout or missing admission
+payload is not permission to request.
+
+See the [publisher integration contract and React example](integrations/gpt.md#publisher-registered-initial-delivery)
+for API version 1, cancellation, pending breakpoint updates, renderer-unavailable
+ordinary-GAM delivery and activation gates. This setting alone does not fix an
+unmodified publisher.
+
+Deploy a matching server/bootstrap/runtime/publisher adapter before adding the
+new setting. Older servers reject unknown slot fields, including an explicit
+`initialization = "auto"`. Remove the field before rolling back to a server that
+predates it, as part of a compatible configuration and publisher release. Do not
+switch ownership inside already-open documents.
+
 ### Shared template assembly (`assembly_mode = "esi"`)
 
 `inline` remains the default. `esi` is opt-in per deployment, covered by the

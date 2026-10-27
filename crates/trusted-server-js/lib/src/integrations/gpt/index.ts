@@ -27,6 +27,14 @@ import {
 } from '../aps/render';
 
 import { installGptGuard } from './script_guard';
+import {
+  installPublisherSlotRegistration,
+  invalidatePublisherSlotRegistrations,
+  observePublisherSlotRender,
+  registeredCandidateAllowed,
+  retainPublisherSlotMappings,
+  settlePublisherSlotPayload,
+} from './publisher_registration';
 
 /**
  * Google Publisher Tags (GPT) Integration Shim
@@ -808,6 +816,9 @@ function installScheduleInitialAdInit(ts: TsjsApi): void {
     ts.initialAdInitScheduled = true;
     if (initialSlots !== undefined) ts.adSlots = initialSlots;
     if (initialBids !== undefined) ts.bids = initialBids;
+    if (initialBids !== undefined || initialSlots !== undefined) {
+      settlePublisherSlotPayload(ts, 0, ts.adSlots ?? [], ts.bids ?? {});
+    }
     const runUnlessNavigated = (): void => {
       if ((ts.navGeneration ?? 0) !== 0) return;
       ts.adInit?.();
@@ -1033,6 +1044,7 @@ function installFirstImpressionLifecycleObservers(ts: TsjsApi, g: Partial<Google
         const elementId = event.slot?.getSlotElementId?.();
         const element = elementId ? document.getElementById(elementId) : null;
         if (element) observeFirstImpressionGptLifecycle(ts, element, phase);
+        if (phase === 'rendered') observePublisherSlotRender(ts, event.slot);
       };
     pubads.addEventListener('slotRequested', observe('requested'));
     pubads.addEventListener('slotRenderEnded', observe('rendered'));
@@ -1074,38 +1086,60 @@ function applyTrustedServerTargeting(
 
 function clearPreviousTargetingSnapshot(
   g: Partial<GoogleTag>,
-  previousKeys: Record<string, string[]>,
-  touchedElementIds: ReadonlySet<string>
+  snapshot: ReadonlyMap<GoogleTagSlot, readonly string[]>
 ): boolean {
   const pubads = g.pubads?.();
   if (!pubads) return false;
-
-  for (const slot of pubads.getSlots?.() ?? []) {
-    const elementId = slot.getSlotElementId();
-    if (!touchedElementIds.has(elementId)) continue;
-    clearTargetingKeys(slot, [...TS_BASE_TARGETING_KEYS, ...(previousKeys[elementId] ?? [])]);
+  const liveSlots = pubads.getSlots?.() ?? [];
+  for (const [slot, keys] of snapshot) {
+    if (!liveSlots.includes(slot)) continue;
+    clearTargetingKeys(slot, keys);
   }
   return true;
 }
 
 function clearPreviousNavigationTargeting(ts: TsjsApi, g: Partial<GoogleTag>): void {
-  const previousKeys = ts.prevSlotTargetingKeys ?? {};
+  const previousKeys: Record<string, string[]> = Object.assign(
+    Object.create(null),
+    ts.prevSlotTargetingKeys
+  );
+  const registeredRecords = Object.values(ts.publisherSlotRegistrationState?.records ?? {}).filter(
+    (record) => record.consumed && record.targetingKeys
+  );
+  for (const record of registeredRecords) previousKeys[record.elementId] = record.targetingKeys!;
   const touchedElementIds = new Set([
     ...Object.keys(previousKeys),
     ...Object.keys(ts.divToSlotId ?? {}),
   ]);
 
-  if (
-    touchedElementIds.size > 0 &&
-    !clearPreviousTargetingSnapshot(g, previousKeys, touchedElementIds)
-  ) {
+  // Capture exact old native identities before retiring records or advancing navigation.
+  const snapshot = new Map<GoogleTagSlot, readonly string[]>();
+  const registeredElementIds = new Set(registeredRecords.map((record) => record.elementId));
+  for (const record of registeredRecords) {
+    if (record.gptSlot) {
+      snapshot.set(record.gptSlot as GoogleTagSlot, [
+        ...TS_BASE_TARGETING_KEYS,
+        ...record.targetingKeys!,
+      ]);
+    }
+  }
+  for (const slot of [
+    ...(g.pubads?.().getSlots?.() ?? []),
+    ...((ts.prevGptSlots ?? []) as GoogleTagSlot[]),
+  ]) {
+    const elementId = slot.getSlotElementId();
+    if (touchedElementIds.has(elementId) && !registeredElementIds.has(elementId)) {
+      snapshot.set(slot, [...TS_BASE_TARGETING_KEYS, ...(previousKeys[elementId] ?? [])]);
+    }
+  }
+  if (snapshot.size > 0 && !clearPreviousTargetingSnapshot(g, snapshot)) {
     g.cmd?.push(() => {
-      clearPreviousTargetingSnapshot(g, previousKeys, touchedElementIds);
+      clearPreviousTargetingSnapshot(g, snapshot);
     });
   }
 
-  ts.prevSlotTargetingKeys = {};
-  ts.divToSlotId = {};
+  ts.prevSlotTargetingKeys = Object.create(null) as Record<string, string[]>;
+  ts.divToSlotId = Object.create(null) as Record<string, string>;
 }
 
 function schedulePublisherFirstImpressionFallback(
@@ -1222,13 +1256,16 @@ function schedulePublisherFirstImpressionFallback(
 export function installTsAdInit(): void {
   const ts = (window.tsjs ??= {} as TsjsApi);
   installInitialLoadDetector(ts);
+  installPublisherSlotRegistration(ts);
   installScheduleInitialAdInit(ts);
 
   const g = (window as GptWindow).googletag;
   if (g) installFirstImpressionLifecycleObservers(ts, g);
   installLatePublisherSlotHandoff(ts);
   ts.adInit = function () {
-    const slots = ts.adSlots ?? [];
+    const slots = (ts.adSlots ?? []).filter(
+      (slot) => slot.initialization !== 'publisher_registered'
+    );
     // Snapshot bids at adInit() call time — correct for targeting setup.
     // The slotRenderEnded listener below reads ts.bids live so SPA navigation
     // updates (new ts.bids injected before </body>) are picked up at render time.
@@ -1274,9 +1311,9 @@ export function installTsAdInit(): void {
       // alone no-ops for a slot that was never displayed, so these are
       // display()ed instead of refreshed.
       const slotsToDisplay: string[] = [];
-      const divToSlotId: Record<string, string> = {};
+      const divToSlotId: Record<string, string> = Object.create(null);
       const prevSlotTargetingKeys = ts.prevSlotTargetingKeys ?? {};
-      const nextSlotTargetingKeys: Record<string, string[]> = {};
+      const nextSlotTargetingKeys: Record<string, string[]> = Object.create(null);
 
       // Clear TS-managed targeting from every previously TS-touched GPT slot
       // before applying the current route. Without this sweep, navigating to a
@@ -1288,10 +1325,15 @@ export function installTsAdInit(): void {
         ...Object.keys(prevSlotTargetingKeys),
         ...Object.keys(ts.divToSlotId ?? {}),
       ]);
+      const registeredElementIds = new Set(
+        Object.values(ts.publisherSlotRegistrationState?.records ?? {})
+          .filter((record) => record.generation === generation && record.consumed)
+          .map((record) => record.elementId)
+      );
       if (prevTouchedDivIds.size > 0) {
         (g.pubads!().getSlots?.() ?? []).forEach((gptSlot: GoogleTagSlot) => {
           const elementId = gptSlot.getSlotElementId();
-          if (!prevTouchedDivIds.has(elementId)) return;
+          if (!prevTouchedDivIds.has(elementId) || registeredElementIds.has(elementId)) return;
           const element = document.getElementById(elementId);
           if (element && firstImpressionClaim(ts, element)) return;
           clearTargetingKeys(gptSlot, [
@@ -1410,7 +1452,8 @@ export function installTsAdInit(): void {
       });
 
       ts.prevGptSlots = newSlots as unknown[];
-      // Replace (not merge) so destroyed slots from previous navigation don't linger.
+      // Replace automatic entries, deriving registered entries from their consumed records.
+      retainPublisherSlotMappings(ts, divToSlotId, nextSlotTargetingKeys);
       ts.divToSlotId = divToSlotId;
       ts.prevSlotTargetingKeys = nextSlotTargetingKeys;
 
@@ -1443,7 +1486,7 @@ export function installTsAdInit(): void {
           // on, so it is the per-bid signal that the testing bypass is enabled.
           // In production the render bridge serves the creative and GAM stays in
           // the loop; this direct replace stays testing-only.
-          if (bid.adm && bid.debug_bid) {
+          if (bid.adm && bid.debug_bid && registeredCandidateAllowed(ts, slotId, bid)) {
             injectAdmIntoSlot(divId, bid.adm);
           }
         });
@@ -1634,15 +1677,30 @@ function waitForSlotElements(slots: AuctionSlot[], signal: AbortSignal): Promise
   });
 }
 
+/** Reuse one history observer while transferring its active navigation handler. */
+function installGptNavigationBridge(ts: TsjsApi, onNavigate: (path: string) => void): void {
+  if (ts.gptNavigationBridge) {
+    ts.gptNavigationBridge.onNavigate = onNavigate;
+    return;
+  }
+  ts.gptNavigationBridge = { onNavigate };
+  const observe = (): void => ts.gptNavigationBridge?.onNavigate(location.pathname);
+  for (const method of ['pushState', 'replaceState'] as const) {
+    const original = history[method].bind(history);
+    history[method] = function (state: unknown, unused: string, url?: string | URL | null): void {
+      original(state, unused, url);
+      observe();
+    };
+  }
+  window.addEventListener('popstate', observe, true);
+}
+
 /**
- * Install SPA navigation hook.
+ * Install SPA navigation and adopt a provisional bootstrap transition, if any.
  *
- * Patches `history.pushState` and `history.replaceState`, and listens to
- * `popstate`, so that after each client-side route change the trusted server
- * fetches fresh slots + bids from `/_ts/page-bids?path=<new_path>`, updates
- * `window.tsjs.adSlots` / `window.tsjs.bids`, and calls `window.tsjs.adInit()`.
- *
- * Idempotent: guarded by `window.tsjs.spaHookInstalled` so multiple calls are safe.
+ * Accepted pathname changes and current-generation catch-up share the existing
+ * page-bids operation. Installing without a navigation does not re-auction SSR.
+ * The shared bridge preserves framework wrappers and one navigation writer.
  */
 export function installSpaAuctionHook(): void {
   if (typeof window === 'undefined') return;
@@ -1657,16 +1715,21 @@ export function installSpaAuctionHook(): void {
   // route's DOM by then, so a pending initial callback must still stand down.
   ts.navGeneration ??= 0;
 
+  const pendingGeneration = ts.gptNavigationBridge?.pendingGeneration;
+  const catchingUp = pendingGeneration !== undefined && pendingGeneration === ts.navGeneration;
   let inflight: AbortController | null = null;
-  // Last path an auction was run for. popstate fires for hash-only and
-  // same-pathname changes, so guard against re-requesting loaded impressions.
-  let currentPath = location.pathname;
+  // Keep the captured path/generation for a failed startup catch-up. Retrying
+  // that still-unapplied navigation must preserve its pending publisher records.
+  const catchUpPath = catchingUp ? location.pathname : undefined;
+  // A provisional navigation is not applied merely because its URL is current.
+  // The null state also permits a later same-path retry after catch-up fails.
+  let currentPath: string | null = catchingUp ? null : location.pathname;
   // Last path whose slots/bids were actually applied — the initial SSR page
   // counts. A failed navigation rolls `currentPath` back to this rather than to
   // the immediately-previous committed value: on rapid A→B where A was aborted
   // mid-flight and B then fails, rolling back to A (never loaded) would strand
   // it behind the no-op guard, so we roll back to the last applied route instead.
-  let lastAppliedPath = location.pathname;
+  let lastAppliedPath: string | null = catchingUp ? null : location.pathname;
   // Endpoint this session requests. Starts canonical; if the deployment does
   // not serve page-bids there, one navigation retries on the deprecated alias
   // and the session stays on it rather than re-probing every navigation.
@@ -1694,15 +1757,30 @@ export function installSpaAuctionHook(): void {
   async function onNavigate(path: string): Promise<void> {
     if (path === currentPath) return;
     currentPath = path;
+    if (
+      catchingUp &&
+      path === catchUpPath &&
+      pendingGeneration === ts.navGeneration &&
+      lastAppliedPath === null &&
+      !ts.publisherSlotRegistrationState?.payload
+    ) {
+      await fetchAndApplyPageBids(path, pendingGeneration);
+      return;
+    }
     const g = (window as GptWindow).googletag;
     if (g) clearPreviousNavigationTargeting(ts, g);
     ts.navGeneration = (ts.navGeneration ?? 0) + 1;
+    invalidatePublisherSlotRegistrations(ts);
     delete ts.firstImpression;
     // A route change invalidates hydration aliases before the new route's
     // publisher can define a same-prefix slot while page-bids is in flight.
     for (const [elementId, handoff] of Object.entries(ts.gptSlotHandoffs ?? {})) {
       if (!handoff.publisherClaimed) delete ts.gptSlotHandoffs![elementId];
     }
+    await fetchAndApplyPageBids(path, ts.navGeneration);
+  }
+
+  async function fetchAndApplyPageBids(path: string, generation: number): Promise<void> {
     inflight?.abort();
     const controller = new AbortController();
     inflight = controller;
@@ -1714,14 +1792,24 @@ export function installSpaAuctionHook(): void {
         // committed path back so a later navigation here retries instead of
         // being skipped by the no-op guard at the top. Only roll back when no
         // newer navigation has already advanced currentPath.
-        if (inflight === controller) currentPath = lastAppliedPath;
+        if (inflight === controller && ts.navGeneration === generation)
+          currentPath = lastAppliedPath;
         return;
       }
-      if (inflight !== controller) return;
-      // Defer applying bids until the new route's ad containers exist, so a
-      // fast edge response cannot beat the DOM and drop server-side bids.
-      await waitForSlotElements(data.slots, controller.signal);
-      if (inflight !== controller) return;
+      if (inflight !== controller || ts.navGeneration !== generation) return;
+      // Registered delivery and its renderer need the accepted current payload now.
+      // Automatic-only routes retain the existing delayed public assignment below.
+      if (data.slots.some((slot) => slot.initialization === 'publisher_registered')) {
+        ts.adSlots = data.slots;
+        ts.bids = data.bids;
+      }
+      settlePublisherSlotPayload(ts, generation, data.slots, data.bids);
+      // Automatic placements retain their existing DOM wait.
+      await waitForSlotElements(
+        data.slots.filter((slot) => slot.initialization !== 'publisher_registered'),
+        controller.signal
+      );
+      if (inflight !== controller || ts.navGeneration !== generation) return;
       ts.adSlots = data.slots;
       ts.bids = data.bids;
       // This route is now the committed, loaded state — a later failed
@@ -1740,32 +1828,21 @@ export function installSpaAuctionHook(): void {
       }
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return;
-      if (inflight === controller) currentPath = lastAppliedPath;
+      if (inflight === controller && ts.navGeneration === generation) currentPath = lastAppliedPath;
       log.warn('SPA auction hook: fetch failed', err);
     }
   }
 
-  function patchHistoryMethod(method: 'pushState' | 'replaceState'): void {
-    const original = history[method].bind(history);
-    history[method] = function (state: unknown, unused: string, url?: string | URL | null): void {
-      original(state, unused, url);
-      const locationUrl = url ? new URL(String(url), location.href) : location;
-      const newPath = locationUrl.pathname;
-      // onNavigate no-ops when newPath equals the last loaded path.
-      void onNavigate(newPath);
-    };
+  installGptNavigationBridge(ts, (path) => {
+    void onNavigate(path);
+  });
+  if (ts.gptNavigationBridge) delete ts.gptNavigationBridge.pendingGeneration;
+  if (catchingUp) {
+    currentPath = location.pathname;
+    // Adopt the pending records and token at the already-advanced generation.
+    // Only an accepted page-bids response can authorize their delivery.
+    void fetchAndApplyPageBids(currentPath, pendingGeneration);
   }
-
-  patchHistoryMethod('pushState');
-  patchHistoryMethod('replaceState');
-
-  window.addEventListener(
-    'popstate',
-    () => {
-      void onNavigate(location.pathname);
-    },
-    true
-  );
 }
 
 /**
@@ -1953,6 +2030,8 @@ function recordConsumedPrebidApsId(
  */
 export function installTsRenderBridge(): void {
   if (typeof window === 'undefined') return;
+  const ts = (window.tsjs ??= {} as TsjsApi);
+  if (ts.tsRenderBridgeVersion === 1) return;
 
   // `slotId|adId` renders whose PBS Cache fetch is in flight. `fireWinBillingBeacons`
   // only dedups after the async fetch resolves, so two Prebid Request messages for
@@ -2084,7 +2163,12 @@ export function installTsRenderBridge(): void {
     // Not a TS bid, or the requesting slot's bid does not own this adId — let
     // Prebid.js handle it. The adId guard also prevents an iframe under slot A from
     // pulling slot B's creative and firing slot B's win/billing beacons.
-    if (!matchedBid || matchedBid.hb_adid !== adId) return;
+    if (
+      !matchedBid ||
+      matchedBid.hb_adid !== adId ||
+      !registeredCandidateAllowed(window.tsjs!, slotId, matchedBid)
+    )
+      return;
 
     if (matchedBid.renderer !== undefined) {
       // This slot and ad ID belong to TS, so fail closed before validating the
@@ -2312,6 +2396,7 @@ export function installTsRenderBridge(): void {
         renderingKeys.delete(renderingKey);
       });
   });
+  ts.tsRenderBridgeVersion = 1;
 }
 
 // Register the activation function on `window` so the server-injected inline

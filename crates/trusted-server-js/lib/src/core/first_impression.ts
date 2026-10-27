@@ -52,12 +52,17 @@ function removePublisherAuction(
 function pruneFirstImpressionState(ts: TsjsApi, now = Date.now()): FirstImpressionState {
   const generation = currentGeneration(ts);
   if (ts.firstImpression?.generation !== generation) {
-    ts.firstImpression = { generation, nextToken: 0, slots: {}, fallbackSlots: {} };
+    ts.firstImpression = {
+      generation,
+      nextToken: 0,
+      slots: Object.create(null),
+      fallbackSlots: Object.create(null),
+    };
   }
 
   const state = ts.firstImpression;
-  state.slots ??= {};
-  state.fallbackSlots ??= {};
+  state.slots = Object.assign(Object.create(null), state.slots);
+  state.fallbackSlots = Object.assign(Object.create(null), state.fallbackSlots);
   for (const [elementId, claim] of Object.entries(state.slots)) {
     if (
       claim.slotElementId !== elementId ||
@@ -195,7 +200,7 @@ export function claimFirstImpressionForTrustedServer(
     phase: 'delivery_pending',
     // Unbounded by contract; see the fallback transition above.
     expiresAt: Number.POSITIVE_INFINITY,
-    publisherAuctions: {},
+    publisherAuctions: Object.create(null),
   };
   if (!storeClaim(state, claim)) return undefined;
   schedulePendingRenderDiagnostic(ts, claim);
@@ -254,7 +259,7 @@ export function registerPublisherFirstImpressionAuctions(
         owner: 'publisher',
         phase: 'auctioning',
         expiresAt: now + FIRST_IMPRESSION_LEASE_MS,
-        publisherAuctions: {},
+        publisherAuctions: Object.create(null),
       };
       if (!storeClaim(state, claim)) continue;
     }
@@ -388,7 +393,7 @@ export function observeFirstImpressionGptLifecycle(
       owner: 'publisher',
       phase,
       expiresAt: Number.POSITIVE_INFINITY,
-      publisherAuctions: {},
+      publisherAuctions: Object.create(null),
     };
     storeClaim(state, claim);
     return;
