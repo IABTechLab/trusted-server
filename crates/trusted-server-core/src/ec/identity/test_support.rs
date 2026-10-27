@@ -837,6 +837,7 @@ pub struct HarnessSetup {
     state_json: Option<String>,
     now: Option<UnixTime>,
     random_seed: Option<u64>,
+    cookies: BTreeMap<String, String>,
 }
 
 impl HarnessSetup {
@@ -889,6 +890,13 @@ impl HarnessSetup {
     #[must_use]
     pub fn with_hashed_email(mut self, email: HashedEmail) -> Self {
         self.hashed_email = Some(email);
+        self
+    }
+
+    /// Adds a first-party cookie the request carries. Repeatable.
+    #[must_use]
+    pub fn with_cookie(mut self, name: &str, value: &str) -> Self {
+        self.cookies.insert(name.to_owned(), value.to_owned());
         self
     }
 
@@ -1295,6 +1303,12 @@ impl<'provider> ProviderHarness<'provider> {
     #[must_use]
     pub fn with_hashed_email(self, email: HashedEmail) -> Self {
         self.map_setup(|setup| setup.with_hashed_email(email))
+    }
+
+    /// Adds a first-party cookie the request carries. Repeatable.
+    #[must_use]
+    pub fn with_cookie(self, name: &str, value: &str) -> Self {
+        self.map_setup(|setup| setup.with_cookie(name, value))
     }
 
     /// Sets the raw consent strings. Default: GDPR does not apply and no
@@ -1832,6 +1846,7 @@ impl<'provider> ProviderHarness<'provider> {
             random: &self.random,
             ec_id: self.ec_id.clone(),
             stored: self.stored_by_source(),
+            cookies: self.setup.cookies.clone(),
         }
     }
 }
@@ -2666,6 +2681,8 @@ pub(crate) mod hold_fixture {
                 user_agent: Some("ExampleBrowser/1.0".to_owned()),
                 dnt: false,
                 page_url: None,
+                hashed_email: None,
+                cookies: BTreeMap::new(),
             });
             context.identity_mut().set_runs_auction(runs_auction);
             context.set_kv_snapshot(graph.load_snapshot(TEST_EC_ID));
@@ -2818,6 +2835,8 @@ pub(crate) mod capture_fixture {
                 user_agent: Some("ExampleBrowser/1.0".to_owned()),
                 dnt: false,
                 page_url: None,
+                hashed_email: None,
+                cookies: BTreeMap::new(),
             });
             context.set_kv_snapshot(graph.load_snapshot(TEST_EC_ID));
             store.reset_counts();

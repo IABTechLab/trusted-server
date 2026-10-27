@@ -1136,6 +1136,8 @@ mod tests {
                 user_agent: None,
                 dnt: false,
                 page_url: None,
+                hashed_email: None,
+                cookies: BTreeMap::new(),
             },
         );
         let cookie = cookie_only_ts_eids();

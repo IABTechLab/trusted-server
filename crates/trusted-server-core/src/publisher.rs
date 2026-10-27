@@ -7852,6 +7852,8 @@ mod tests {
                 user_agent: None,
                 dnt: false,
                 page_url: None,
+                hashed_email: None,
+                cookies: std::collections::BTreeMap::new(),
             },
         );
         assert!(
@@ -8196,6 +8198,8 @@ mod tests {
                 user_agent: None,
                 dnt: false,
                 page_url: None,
+                hashed_email: None,
+                cookies: std::collections::BTreeMap::new(),
             },
         );
         ec_context.set_identity_runtime(Arc::new(
@@ -8711,6 +8715,8 @@ mod tests {
                 user_agent: None,
                 dnt: false,
                 page_url: None,
+                hashed_email: None,
+                cookies: std::collections::BTreeMap::new(),
             },
         );
         let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
@@ -17678,6 +17684,8 @@ mod tests {
                     user_agent: None,
                     dnt: false,
                     page_url: None,
+                    hashed_email: None,
+                    cookies: std::collections::BTreeMap::new(),
                 },
             );
             context
