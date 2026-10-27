@@ -293,6 +293,14 @@ push configuration, implement staging, or supply recovery guarantees.
 
 From the private directory:
 
+The canonical Fastly CI job also exercises this route on its freshly built wasm,
+using the `.tool-versions` CLI version and a source-pinned archive checksum.
+After downloading the CLI, it clears inherited credentials and runs in a
+network namespace with no active interfaces or retained capabilities. CLI
+configuration and caches live only in the job's fresh temporary directory.
+The job logs pack, validation, strict archive inspection and both byte comparisons;
+the rehearsal transcript links that job. No deployment command is run.
+
 ```bash
 fastly compute pack --wasm-binary ./trusted-server-fastly.wasm
 fastly compute validate --package ./pkg/example-app.tar.gz

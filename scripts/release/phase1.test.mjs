@@ -1638,6 +1638,54 @@ test('ordinary Fastly gate binds dedicated A and B uploads before isolated signi
   assert.match(caller.split('\n  release:')[0], /actions: read/)
 })
 
+test('canonical Fastly route verifies the pinned tool offline without credentials or deployment', () => {
+  const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const canonical = workflow
+    .split('\n  fastly-canonical:')[1]
+    .split('\n  fastly-reproduction:')[0]
+  const route = canonical
+    .split('- name: Verify the pinned manual Fastly route offline')[1]
+    ?.split('      - name: Upload canonical release artifact')[0]
+  assert.ok(route, 'should check the actual canonical binary before upload')
+  assert.match(route, /\.tool-versions/)
+  assert.match(route, /test "\$fastly_version" = 16\.0\.0/)
+  assert.match(
+    route,
+    /b1b89112f1f1291ff275393779ffdacba8724ac64091bda0fa6000ae06308459/
+  )
+  assert.match(route, /sha256sum --check/)
+  assert.ok(
+    route.indexOf('sha256sum --check') < route.indexOf('unshare --net'),
+    'should authenticate the downloaded CLI before any execution'
+  )
+  assert.match(route, /unshare --net -- setpriv/)
+  assert.match(route, /--bounding-set=-all --no-new-privs/)
+  assert.match(route, /env -i/)
+  assert.match(route, /guest_network=\$\(readlink \/proc\/self\/ns\/net\)/)
+  assert.match(route, /active_interfaces=\$\(ip -o link show up\)/)
+  assert.doesNotMatch(route, /test[^\n]*\$\((?:ip|readlink) /)
+  assert.match(route, /XDG_CONFIG_HOME="\$route\/config"/)
+  assert.doesNotMatch(
+    route,
+    /(?:^|\s)HOME=|--token|FASTLY_API_TOKEN|fastly compute deploy|contents: write|id-token/m
+  )
+  for (const command of [
+    'fastly compute pack --wasm-binary ./trusted-server-fastly.wasm',
+    'fastly compute validate --package ./pkg/example-app.tar.gz',
+    'tar -tzf ./pkg/example-app.tar.gz',
+    'cmp trusted-server-fastly.wasm packaged.wasm',
+    'cmp fastly.toml packaged.toml',
+    'inspect-fastly-package',
+  ])
+    assert.ok(route.includes(command), `should execute ${command}`)
+  assert.match(route, /set -euxo pipefail/)
+  assert.match(route, /SUCCESS: pinned Fastly route/)
+  assert.doesNotMatch(
+    canonical.split('    steps:')[0],
+    /write|id-token|attestations:/
+  )
+})
+
 test('negative comparator proof keeps canaries read-only and audits both skipped stages', () => {
   const workflow = readFileSync('.github/workflows/test.yml', 'utf8')
   const job = (name) =>

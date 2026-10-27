@@ -69,6 +69,53 @@ jobs:
             SOURCE_COMMIT="$SOURCE_COMMIT" RELEASE_VERSION="$RELEASE_VERSION" \
             ORDINARY_RELEASE_PRODUCER="$RUNNER_TEMP/ordinary-producer-target/x86_64-unknown-linux-gnu/release/trusted-server-release" \
             bash scripts/release/phase1-build.sh trusted-server-adapter-fastly wasm32-wasip1 "$RELEASE_ASSET" canonical
+      - name: Verify the pinned manual Fastly route offline
+        timeout-minutes: 5
+        run: |
+          set -euxo pipefail
+          fastly_version=$(awk '$1 == "fastly" { print $2 }' .tool-versions)
+          test "$fastly_version" = 16.0.0
+          route=$(mktemp -d "$RUNNER_TEMP/fastly-route.XXXXXX")
+          mkdir "$route/tool" "$route/config" "$route/cache" "$route/tmp" "$route/package"
+          archive="fastly_v${fastly_version}_linux-amd64.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --retry 2 --max-time 30 \
+            "https://github.com/fastly/cli/releases/download/v${fastly_version}/$archive" --output "$route/$archive"
+          printf '%s  %s\n' b1b89112f1f1291ff275393779ffdacba8724ac64091bda0fa6000ae06308459 "$archive" > "$route/CLI.sha256"
+          (cd "$route" && sha256sum --check CLI.sha256)
+          tar -xzf "$route/$archive" -C "$route/tool"
+          cp release-assets/trusted-server-fastly.wasm "$route/package/trusted-server-fastly.wasm"
+          printf 'manifest_version = 3\nname = "example-app"\n' > "$route/package/fastly.toml"
+          expected_wasm=$(sha256sum release-assets/trusted-server-fastly.wasm | awk '{print $1}')
+          expected_manifest=$(sha256sum "$route/package/fastly.toml" | awk '{print $1}')
+          producer="$RUNNER_TEMP/ordinary-producer-target/x86_64-unknown-linux-gnu/release/trusted-server-release"
+          host_network=$(readlink /proc/self/ns/net)
+          sudo unshare --net -- setpriv --reuid="$(id -u)" --regid="$(id -g)" \
+            --clear-groups --inh-caps=-all --ambient-caps=-all --bounding-set=-all --no-new-privs \
+            env -i PATH="$route/tool:/usr/bin:/bin:/usr/sbin:/sbin" XDG_CONFIG_HOME="$route/config" \
+            XDG_CACHE_HOME="$route/cache" TMPDIR="$route/tmp" LC_ALL=C TZ=UTC \
+            bash -euxo pipefail -s -- "$route/package" "$producer" "$expected_wasm" "$expected_manifest" "$host_network" <<'ROUTE'
+          guest_network=$(readlink /proc/self/ns/net)
+          test -n "$guest_network"
+          test "$guest_network" != "$5"
+          active_interfaces=$(ip -o link show up)
+          test -z "$active_interfaces"
+          cd "$1"
+          timeout 15 fastly version | tee cli-version.txt
+          grep -E '^Fastly CLI version v16\.0\.0( |$)' cli-version.txt
+          timeout 60 fastly compute pack --wasm-binary ./trusted-server-fastly.wasm
+          timeout 30 fastly compute validate --package ./pkg/example-app.tar.gz
+          tar -tzf ./pkg/example-app.tar.gz
+          timeout 30 "$2" inspect-fastly-package --package-dir ./pkg --manifest ./fastly.toml \
+            --expected-manifest-sha256 "$4" --expected-wasm-sha256 "$3"
+          tar -xOzf ./pkg/example-app.tar.gz example-app/bin/main.wasm > packaged.wasm
+          cmp trusted-server-fastly.wasm packaged.wasm
+          tar -xOzf ./pkg/example-app.tar.gz example-app/fastly.toml > packaged.toml
+          cmp fastly.toml packaged.toml
+          printf '%s  %s\n' "$3" trusted-server-fastly.wasm > input.sha256
+          sha256sum --check input.sha256
+          echo 'SUCCESS: pinned Fastly route packed, validated, inspected and byte-compared without credentials or network'
+          ROUTE
+          printf '%s  %s\n' "$expected_wasm" release-assets/trusted-server-fastly.wasm | sha256sum --check
       - name: Upload canonical release artifact
         id: artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
