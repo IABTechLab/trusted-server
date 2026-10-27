@@ -673,7 +673,7 @@ Each provider can have an `[ec.identity.providers.<id>]` table. A provider with 
 
 #### Source ownership (`[[ec.partners]].owner`)
 
-`owner` is an optional key on an `[[ec.partners]]` entry. It names the identity provider that owns that source. An owner refreshes the source and wins over browser and other writers: its result replaces the source's whole entry set, and batch sync never replaces its value. A source with no `owner` is unowned, and a provider can only fill it when absent or expired.
+`owner` is an optional key on an `[[ec.partners]]` entry. It names the identity provider that owns that source. An owner refreshes the source and wins over browser and other writers: its result replaces the source's whole entry set, and batch sync writes to it only when the row holds no value for the source. An expired owned record still counts as a value, so batch sync never fills or replaces it. A source with no `owner` is unowned, and a provider can only fill it when absent or expired.
 
 ```toml
 [[ec.partners]]

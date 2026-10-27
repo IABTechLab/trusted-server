@@ -252,7 +252,7 @@ Provider IDs match `^[a-z][a-z0-9_-]{0,62}$`, and two providers cannot share an 
 
 ## Testing with the harness
 
-`ProviderHarness` drives a provider the way the coordinator does, so vendor tests stay short. It lives in `trusted_server_core::ec::identity::test_support`, behind `cfg(any(test, feature = "test-utils"))`. A provider in its own crate enables `test-utils` as a dev-dependency feature of `trusted-server-core`.
+`ProviderHarness` drives a provider the way the coordinator does, so vendor tests stay short. It lives in `trusted_server_core::ec::identity::test_support`, behind `cfg(any(test, feature = "test-utils"))`. A provider in its own crate enables `test-utils` as a dev-dependency feature of `trusted-server-core`. `ExampleIdProvider` is a crate-private fixture in the core crate, so the snippets in this guide are illustrative: substitute your own provider type and config.
 
 ```rust
 let provider = ExampleIdProvider::new(&example_config()).expect("should build the provider");
@@ -280,10 +280,10 @@ assert_eq!(
 );
 ```
 
-- `respond_raw(status, headers, bytes)` covers empty and non-JSON bodies. `request_json::<T>()` decodes the built body. `capture(&CaptureFixture)` runs a capture. `state_of::<T>(&resolution)` decodes the replacement state.
-- `with_stored(StoredId::for_test(..))` makes a source a refresh. `StoredId::with_eids` gives a refreshing provider a stored full set.
+- `respond_raw(status, headers, bytes)` covers empty and non-JSON bodies. `request_json::<T>()` decodes the built body. `capture(&CaptureFixture)` runs a capture (build the fixture with `CaptureFixture::new(Method::POST, path).with_response(status, &json)`). `state_of::<T>(&resolution)` decodes the replacement state.
+- `with_stored(StoredId::for_test(&source, "example-uid"))` makes a source a refresh. `HashedEmail::for_test` takes a `[u8; 32]` digest. Both are available under `test-utils`. `StoredId::with_eids` gives a refreshing provider a stored full set.
 - The `Resolution` getters show what the provider set. Provenance defaults are applied only by `output_eids(&resolution)`, which returns the EIDs bidders would see after the section 4.5 rules and your descriptor's defaults.
-- `check_conformance(&cases)` runs the checks every provider must pass; `check_conformance_with_state::<S>` also round-trips your state type. Both panic with a message naming the failure. `try_check_conformance` and `try_check_conformance_with_state::<S>` return a `Result` with a `ConformanceFailure` instead. Use them to assert that a deliberately broken provider fails, because a panic aborts the whole `wasm32-wasip1` test run.
+- `check_conformance(&cases)` runs the checks every provider must pass; `check_conformance_with_state::<S>` also round-trips your state type. Both panic with a message naming the failure. `try_check_conformance` and `try_check_conformance_with_state::<S>` return `Result<(), Report<ConformanceFailure>>` instead (`ConformanceFailure` is `#[non_exhaustive]`). Use them to assert that a deliberately broken provider fails, because a panic aborts the whole `wasm32-wasip1` test run.
 - `check_descriptor_ignores_secrets(&placeholder_config, &resolved_config)` fails if your descriptor depends on a secret.
 
 `check_conformance` verifies that inputs hold only what the descriptor declares, that a resolver returns a request for at least one listed setup, that requests go only to declared hosts over HTTPS with valid headers and no `Cookie`, that entries are for declared sources and no fixture hits a limit, that expiries are reported and present for expiring sources, that nothing returns state without `with_private_state()`, that `capture` never changes state, and that a bare-JSON-string stored state is never accepted.
