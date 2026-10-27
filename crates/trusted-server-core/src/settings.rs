@@ -367,21 +367,25 @@ impl IntegrationSettings {
         };
 
         if Self::is_explicitly_disabled(raw) {
-            T::validate_disabled_schema(raw).change_context(TrustedServerError::Configuration {
-                message: format!(
-                    "Integration '{integration_id}' configuration could not be parsed"
-                ),
+            T::validate_disabled_schema(raw).map_err(|error| {
+                let context = TrustedServerError::Configuration {
+                    message: format!(
+                        "Integration '{integration_id}' configuration could not be parsed: {error}"
+                    ),
+                };
+                Report::new(error).change_context(context)
             })?;
             return Ok(None);
         }
 
-        let config: T = serde_json::from_value(raw.clone()).change_context(
-            TrustedServerError::Configuration {
+        let config: T = serde_json::from_value(raw.clone()).map_err(|error| {
+            let context = TrustedServerError::Configuration {
                 message: format!(
-                    "Integration '{integration_id}' configuration could not be parsed"
+                    "Integration '{integration_id}' configuration could not be parsed: {error}"
                 ),
-            },
-        )?;
+            };
+            Report::new(error).change_context(context)
+        })?;
 
         // Field validation runs only for integrations that resolve to enabled.
         // An integration whose `enabled` flag is omitted falls back to its
@@ -1942,6 +1946,7 @@ impl Proxy {
 
 /// Direct Tinybird Events API telemetry configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TinybirdSettings {
     /// Master enablement for auction telemetry ingestion.
     #[serde(default)]
@@ -2848,6 +2853,7 @@ pub enum AuctionDebugCommentFormat {
 
 /// Tester-cookie endpoint configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct TesterCookieConfig {
     /// Enable tester-cookie endpoints that set and clear `ts-tester`.
     #[serde(default)]
@@ -5724,6 +5730,22 @@ origin_host_header_overide = "www.example.com""#,
             assert!(
                 result.is_err(),
                 "origin_host_header_override {override_value:?} should fail validation"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_reject_unknown_tester_cookie_and_tinybird_fields() {
+        for section in ["tester_cookie", "tinybird"] {
+            let source = format!(
+                "{}\n[{section}]\nmade_up_key = true\n",
+                crate_test_settings_str()
+            );
+            let error = Settings::from_toml(&source)
+                .expect_err("should reject unknown keys in strict settings sections");
+            assert!(
+                format!("{error:?}").contains("made_up_key"),
+                "should name offending {section} key: {error:?}"
             );
         }
     }

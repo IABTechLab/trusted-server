@@ -378,7 +378,7 @@ curl https://myorg.edge.permutive.app/workspace-123-web.js
 **Error Message:**
 
 ```
-No route matched for /integrations/custom/endpoint
+No route matched for /assets/vendor.js
 ```
 
 **Cause:** Integration not enabled or route not registered
@@ -388,8 +388,12 @@ No route matched for /integrations/custom/endpoint
 1. Enable integration:
 
 ```toml
-[integrations.custom]
+[integrations.js_asset_proxy]
 enabled = true
+
+[[integrations.js_asset_proxy.assets]]
+path = "/assets/vendor.js"
+origin_url = "https://cdn.example.com/vendor.js"
 ```
 
 2. Verify integration is compiled in (check build logs)
