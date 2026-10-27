@@ -590,3 +590,11 @@ The separately reviewed Gate 1 group now includes the source-pinned runtime reco
 Local checks pass for 258 audited pure producer cases with CI's backtrace setting and eight mocked transport cases. The native command process fixtures compile locally and remain CI-only. The current CI correction bounds owned diagnostic payloads separately from caller-enabled backtraces; production error handling is unchanged.
 
 Actual A/B build capture, workflow dependencies, the additive provenance subject, publication membership and the fork rehearsal remain pending. No release gate is activated by these unwired commands/helpers, no qualified selector is inhabited, and no Phase 2 rehearsal is claimed.
+
+### Ordinary A/B evidence and signing handoff
+
+At `7beaa5483166d073c88f12dda295ffd26bdbec97`, the [real hosted A/B comparison](https://github.com/IABTechLab/trusted-server/actions/runs/40456925305) passed with complete byte equality after the approved four-map compiler-path normalization. Both actual builds retained their debug sections and passed the physical-path scan. All four real artifact archives passed current-run upload binding and the narrow ZIP rules. This is CI build evidence, not a signed-publication rehearsal or controlled qualification.
+
+The additive signing handoff keeps binary/SPDX inputs unchanged, adds the real matched companion only for Fastly, checks its source/run/attempt and binary/SPDX digests, and signs it as a third provenance subject from the existing reusable signer. The companion travels with the signed Fastly artifact and its digest receipt. Publication validates that handoff before any mutation and adds only this companion, for 30 files and 29 checksum entries. Binary-only SPDX attestations and native input sets remain unchanged. Real attestation compatibility and rerun-all behavior require the Phase 2 rehearsal; neither is inferred from local tests.
+
+The CI-only negative fixture invokes the real comparison executable on synthetic bound archives containing accurately hashed different fixture bytes. It requires the actual mismatch diagnostic, nonzero exit and absence of matched/later-stage sentinels within fixed time/output bounds. Separate read-only canaries and their audit exercise skipped-stage wiring without a release-path bypass, new trigger or altered-source tag. Process tests remain hosted-only.

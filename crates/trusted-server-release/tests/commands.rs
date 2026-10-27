@@ -1,10 +1,13 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
+use flate2::Crc;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tempfile::{TempDir, tempdir};
@@ -797,6 +800,262 @@ fn ordinary_measurement_command_rejects_wrong_versions_and_sanitizes_failed_quer
         assert!(
             !root.join("observed").exists(),
             "should retain no output after failed measurement"
+        );
+    }
+}
+
+// The fixture uses the same narrow stored-ZIP construction as the ordinary
+// archive unit tests; it invokes no archive tools or producer qualification.
+fn ordinary_fixture_zip(members: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut central = Vec::new();
+    for (name, body) in members {
+        let offset = bytes.len() as u32;
+        let mut crc = Crc::new();
+        crc.update(body);
+        let crc = crc.sum();
+        let size = body.len() as u32;
+        bytes.extend(0x04034b50_u32.to_le_bytes());
+        bytes.extend(20_u16.to_le_bytes());
+        bytes.extend([0; 8]);
+        for field in [crc, size, size] {
+            bytes.extend(field.to_le_bytes());
+        }
+        bytes.extend((name.len() as u16).to_le_bytes());
+        bytes.extend([0; 2]);
+        bytes.extend(name.as_bytes());
+        bytes.extend(*body);
+        central.extend(0x02014b50_u32.to_le_bytes());
+        central.extend(20_u16.to_le_bytes());
+        central.extend(20_u16.to_le_bytes());
+        central.extend([0; 8]);
+        for field in [crc, size, size] {
+            central.extend(field.to_le_bytes());
+        }
+        central.extend((name.len() as u16).to_le_bytes());
+        central.extend([0; 12]);
+        central.extend(offset.to_le_bytes());
+        central.extend(name.as_bytes());
+    }
+    let offset = bytes.len() as u32;
+    let size = central.len() as u32;
+    bytes.extend(central);
+    bytes.extend(0x06054b50_u32.to_le_bytes());
+    bytes.extend([0; 4]);
+    for _ in 0..2 {
+        bytes.extend((members.len() as u16).to_le_bytes());
+    }
+    bytes.extend(size.to_le_bytes());
+    bytes.extend(offset.to_le_bytes());
+    bytes.extend([0; 2]);
+    bytes
+}
+
+fn bounded_negative_compare(root: &Path, source: &Path) -> Output {
+    let stdout = root.join("negative.stdout");
+    let stderr = root.join("negative.stderr");
+    let mut child = Command::new(RELEASE_BIN)
+        .env_clear()
+        .current_dir(root)
+        .arg("ordinary-compare")
+        .arg("--input")
+        .arg(root.join("input"))
+        .arg("--archives")
+        .arg(root.join("archives"))
+        .arg("--source")
+        .arg(source)
+        .arg("--output")
+        .arg(root.join("matched"))
+        .stdout(Stdio::from(
+            fs::File::create(&stdout).expect("should create bounded stdout capture"),
+        ))
+        .stderr(Stdio::from(
+            fs::File::create(&stderr).expect("should create bounded stderr capture"),
+        ))
+        .spawn()
+        .expect("should execute the real comparator only in CI");
+    let started = Instant::now();
+    let status = loop {
+        let bounded = [&stdout, &stderr]
+            .into_iter()
+            .all(|path| fs::metadata(path).is_ok_and(|metadata| metadata.len() <= 32768));
+        if !bounded || started.elapsed() > Duration::from_secs(10) {
+            // Reap even if the child exited between the cap check and kill.
+            let _ = child.kill();
+            let reaped = child.wait();
+            assert!(reaped.is_ok(), "should reap an over-bound comparator");
+            assert!(
+                bounded && started.elapsed() <= Duration::from_secs(10),
+                "should finish the negative comparison within ten seconds and 32 KiB per stream"
+            );
+        }
+        if let Some(status) = child.try_wait().expect("should poll the comparator") {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let read = |path: &Path| {
+        assert!(
+            fs::metadata(path).is_ok_and(|metadata| metadata.len() <= 32768),
+            "should retain bounded post-exit output"
+        );
+        let mut bytes = Vec::new();
+        fs::File::open(path)
+            .expect("should open the retained output")
+            .take(32769)
+            .read_to_end(&mut bytes)
+            .expect("should read bounded output");
+        assert!(
+            bytes.len() <= 32768,
+            "should refuse growth during the bounded read"
+        );
+        bytes
+    };
+    let stdout = read(&stdout);
+    let stderr = read(&stderr);
+    assert!(
+        started.elapsed() <= Duration::from_secs(10),
+        "should finish bounded reads within the comparison deadline"
+    );
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
+#[test]
+fn ordinary_comparison_failure_prevents_signing_and_publication_sentinels() {
+    let temporary = tempdir().expect("should create a CI-only negative fixture");
+    let root = fs::canonicalize(temporary.path()).expect("should resolve the negative fixture");
+    let measured = ordinary_measurement(&root, "printf 'v24.20.0\\n'");
+    assert!(
+        measured.status.success(),
+        "should establish valid ordinary inputs before changing only final bytes: {}",
+        stderr(&measured)
+    );
+    let source = root.join("workspace/ordinary-canonical-source");
+    let binary = fs::read(source.join("release-assets/trusted-server-fastly.wasm"))
+        .expect("should read the measured final fixture");
+    let different = [binary.as_slice(), b"\0\x02\x01x"].concat();
+    let canonical: Value = serde_json::from_slice(
+        &fs::read(root.join("observed/fastly-observation.json"))
+            .expect("should retain actual observation"),
+    )
+    .expect("should parse the actual observation");
+    let mut reproduction = canonical.clone();
+    reproduction["role"] = json!("reproduction");
+    reproduction["environment"]["checkout_root"] =
+        json!(root.join("workspace/ordinary-reproduction-source"));
+    reproduction["environment"]["target_root"] =
+        json!(root.join("temp/ordinary-fastly-reproduction-target"));
+    reproduction["environment"]["started_at_seconds"] = json!(1_700_000_900_u64);
+    reproduction["environment"]["jobs"] = json!(2);
+    reproduction["environment"]["umask"] = json!(23);
+    reproduction["artifact"] =
+        json!({"size":different.len(),"sha256":hex::encode(Sha256::digest(&different))});
+    let canonical =
+        serde_json::to_vec(&canonical).expect("should encode the retained canonical facts");
+    let reproduction = serde_json::to_vec(&reproduction)
+        .expect("should encode correctly measured different final bytes");
+    let archives = [
+        ordinary_fixture_zip(&[
+            ("trusted-server-fastly.wasm", &binary),
+            ("trusted-server-fastly.wasm.spdx.json", b"{}"),
+        ]),
+        ordinary_fixture_zip(&[("fastly-observation.json", &canonical)]),
+        ordinary_fixture_zip(&[
+            ("trusted-server-fastly.wasm", &different),
+            ("trusted-server-fastly.wasm.spdx.json", b"{}"),
+        ]),
+        ordinary_fixture_zip(&[("fastly-observation.json", &reproduction)]),
+    ];
+    let mut context = json!({"repository":"example-owner/example-server","repository_id":17,"head_repository_id":17,"source_commit":"a".repeat(40),"run_id":42,"run_attempt":1,"canonical":{},"reproduction":{}});
+    let mut artifact_records = Vec::new();
+    for (index, ((name, created), bytes)) in [
+        ("release-trusted-server-fastly.wasm", "2023-11-14T22:13:25Z"),
+        ("fastly-observation-canonical", "2023-11-14T22:13:26Z"),
+        (
+            "reproduction-trusted-server-fastly.wasm",
+            "2023-11-14T22:28:25Z",
+        ),
+        ("fastly-observation-reproduction", "2023-11-14T22:28:26Z"),
+    ]
+    .into_iter()
+    .zip(&archives)
+    .enumerate()
+    {
+        let digest = hex::encode(Sha256::digest(bytes));
+        let id = 200 + index;
+        let role = if index < 2 {
+            "canonical"
+        } else {
+            "reproduction"
+        };
+        let prefix = if index % 2 == 0 {
+            "artifact"
+        } else {
+            "observation"
+        };
+        context[role][format!("{prefix}_id")] = json!(id);
+        context[role][format!("{prefix}_digest")] = json!(digest);
+        artifact_records.push(json!({"id":id,"name":name,"digest":format!("sha256:{digest}"),"size_in_bytes":bytes.len(),"expired":false,"created_at":created,"workflow_run":{"id":42,"repository_id":17,"head_repository_id":17,"head_sha":"a".repeat(40)}}));
+    }
+    let jobs: Vec<_> = [
+        (100,"Build trusted-server-fastly.wasm","canonical","2023-11-14T22:13:10Z","2023-11-14T22:13:30Z"),
+        (101,"Reproduce trusted-server-fastly.wasm","reproduction","2023-11-14T22:28:10Z","2023-11-14T22:28:30Z"),
+    ].into_iter().map(|(id,name,role,start,end)| json!({"id":id,"name":format!("build / {name}"),"run_id":42,"run_attempt":1,"head_sha":"a".repeat(40),"status":"completed","conclusion":"success","started_at":start,"completed_at":end,"steps":[{"name":format!("Upload {role} release artifact"),"status":"completed","conclusion":"success"},{"name":format!("Upload {role} observation"),"status":"completed","conclusion":"success"}]})).collect();
+    for (file, value) in [
+        ("context.json", context),
+        ("jobs.json", json!({"total_count":jobs.len(),"jobs":jobs})),
+        (
+            "artifacts.json",
+            json!({"total_count":artifact_records.len(),"artifacts":artifact_records}),
+        ),
+    ] {
+        write(
+            &root,
+            &format!("input/{file}"),
+            &serde_json::to_vec(&value).expect("should encode valid synthetic service records"),
+        );
+    }
+    for (file, bytes) in [
+        "canonical.zip",
+        "canonical-observation.zip",
+        "reproduction.zip",
+        "reproduction-observation.zip",
+    ]
+    .into_iter()
+    .zip(archives)
+    {
+        write(&root, &format!("archives/{file}"), &bytes);
+    }
+    let result = bounded_negative_compare(&root, &source);
+    if result.status.success() {
+        write(&root, "signing-sentinel", b"unexpected signing stage");
+        write(
+            &root,
+            "publication-sentinel",
+            b"unexpected publication stage",
+        );
+    }
+    assert!(
+        !result.status.success(),
+        "should reject complete differing final bytes"
+    );
+    assert!(
+        stderr(&result).contains("ordinary final-byte mismatch"),
+        "should reach actual equality, not fail on fixture setup: {}",
+        stderr(&result)
+    );
+    assert!(
+        result.stdout.is_empty(),
+        "should emit no successful comparison output"
+    );
+    for path in ["matched", "signing-sentinel", "publication-sentinel"] {
+        assert!(
+            !root.join(path).exists(),
+            "should leave no matched output or later stage after a failed exit"
         );
     }
 }

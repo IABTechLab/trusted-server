@@ -21,6 +21,10 @@ use crate::error::ReleaseError;
 const COMPANION: &str = "trusted-server-fastly.wasm.rebuild-check.json";
 
 /// Retains the exact target-scoped Cargo argument pair before compilation.
+///
+/// # Errors
+///
+/// Rejects reused or aliased output paths and any failed atomic write/readback.
 pub(super) fn rustflags(
     directory: &Path,
     arguments: &[String],

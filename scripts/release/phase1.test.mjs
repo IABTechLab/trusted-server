@@ -1637,6 +1637,46 @@ test('ordinary Fastly gate binds dedicated A and B uploads before isolated signi
   assert.match(job('sign'), /needs: \[build, fastly-comparison\]/)
   assert.match(caller.split('\n  release:')[0], /actions: read/)
 })
+
+test('negative comparator proof keeps canaries read-only and audits both skipped stages', () => {
+  const workflow = readFileSync('.github/workflows/test.yml', 'utf8')
+  const job = (name) =>
+    workflow.split(`\n  ${name}:`)[1]?.split(/\n  [a-z][\w-]*:\n/)[0]
+  const native = job('test-axum')
+  assert.match(native, /id: producer-tests/)
+  assert.match(native, /comparison-succeeded=false/)
+  assert.match(
+    native,
+    /ordinary_comparison_failure_prevents_signing_and_publication_sentinels -- --exact/
+  )
+  assert.match(native, /1 passed; 0 failed; 0 ignored;/)
+  const fixture = readFileSync(
+    'crates/trusted-server-release/tests/commands.rs',
+    'utf8'
+  )
+  assert.match(
+    fixture,
+    /fn ordinary_comparison_failure_prevents_signing_and_publication_sentinels\(/
+  )
+  assert.match(
+    fixture,
+    /stderr\(&result\)\.contains\("ordinary final-byte mismatch"\)/
+  )
+  for (const name of ['ordinary-negative-sign', 'ordinary-negative-publish']) {
+    const canary = job(name)
+    assert.match(canary, /needs: test-axum/)
+    assert.match(canary, /if:.*outputs\.comparison-succeeded == 'true'/)
+    assert.match(canary, /contents: read/)
+    assert.match(canary, /exit 1/)
+    assert.doesNotMatch(canary, /uses:|write|gh |cargo |npm |secrets/)
+  }
+  const audit = job('ordinary-negative-audit')
+  assert.match(audit, /if: always\(\)/)
+  assert.match(audit, /test "\$NATIVE_RESULT" = success/)
+  assert.match(audit, /test "\$SIGN_RESULT" = skipped/)
+  assert.match(audit, /test "\$PUBLISH_RESULT" = skipped/)
+})
+
 test('release preflight rejects inherited controls in an isolated script fixture', () => {
   const root = mkdtempSync(join(tmpdir(), 'phase1-preflight-'))
   const script = join(root, 'scripts/release/phase1-build.sh')

@@ -117,6 +117,8 @@ jobs:
   test-axum:
     name: cargo test (axum native)
     runs-on: ubuntu-latest
+    outputs:
+      comparison-succeeded: ${{ steps.producer-tests.outputs.comparison-succeeded }}
     steps:
       - uses: actions/checkout@v4
 
@@ -176,7 +178,16 @@ jobs:
         run: ./scripts/test-cli.sh
 
       - name: Run release producer primitive and process tests
-        run: cargo test --package trusted-server-release --target x86_64-unknown-linux-gnu --locked
+        id: producer-tests
+        run: |
+          set -euo pipefail
+          cargo test --package trusted-server-release --target x86_64-unknown-linux-gnu --locked --test commands -- --list > "$RUNNER_TEMP/ordinary-command-tests.txt"
+          grep -Fx 'ordinary_comparison_failure_prevents_signing_and_publication_sentinels: test' "$RUNNER_TEMP/ordinary-command-tests.txt"
+          cargo test --package trusted-server-release --target x86_64-unknown-linux-gnu --locked
+          cargo test --package trusted-server-release --target x86_64-unknown-linux-gnu --locked --test commands ordinary_comparison_failure_prevents_signing_and_publication_sentinels -- --exact > "$RUNNER_TEMP/ordinary-negative-result.txt"
+          cat "$RUNNER_TEMP/ordinary-negative-result.txt"
+          grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/ordinary-negative-result.txt"
+          echo 'comparison-succeeded=false' >> "$GITHUB_OUTPUT"
 
       - name: Run checked and ordinary JS release build fixtures
         shell: bash
@@ -375,3 +386,45 @@ jobs:
 
       - name: Run unit tests
         run: npm test -- --run
+
+  ordinary-negative-sign:
+    name: Ordinary negative signing canary
+    needs: test-axum
+    if: needs.test-axum.outputs.comparison-succeeded == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - run: exit 1
+
+  ordinary-negative-publish:
+    name: Ordinary negative publication canary
+    needs: test-axum
+    if: needs.test-axum.outputs.comparison-succeeded == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - run: exit 1
+
+  ordinary-negative-audit:
+    name: Audit ordinary negative stages
+    needs: [test-axum, ordinary-negative-sign, ordinary-negative-publish]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Require the failed-comparison fixture and both skipped canaries
+        env:
+          NATIVE_RESULT: ${{ needs.test-axum.result }}
+          SIGN_RESULT: ${{ needs.ordinary-negative-sign.result }}
+          PUBLISH_RESULT: ${{ needs.ordinary-negative-publish.result }}
+          COMPARISON_SUCCEEDED: ${{ needs.test-axum.outputs.comparison-succeeded }}
+        run: |
+          set -euo pipefail
+          test "$NATIVE_RESULT" = success
+          test "$COMPARISON_SUCCEEDED" = false
+          test "$SIGN_RESULT" = skipped
+          test "$PUBLISH_RESULT" = skipped
+          echo 'SUCCESS: real negative comparison rejected; read-only signing/publication canaries skipped'
