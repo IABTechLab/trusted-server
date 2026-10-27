@@ -133,8 +133,8 @@ impl DispatchedAuction {
 
 #[cfg(test)]
 impl DispatchedAuction {
-    /// Creates a token with an immediate no-bid outcome for collector tests.
-    pub(crate) fn immediate_no_bid_for_test(request: AuctionRequest, timeout_ms: u32) -> Self {
+    /// Creates a token modeling a started provider request that resolved to no bid.
+    pub(crate) fn launched_no_bid_for_test(request: AuctionRequest, timeout_ms: u32) -> Self {
         let mut dispatched = Self::empty_for_test(request, timeout_ms);
         dispatched.provider_launched = true;
         dispatched
@@ -1871,10 +1871,12 @@ impl AuctionOrchestrator {
     /// [`DispatchedAuction`] token. The Fastly host begins the SSP round-trips
     /// while WASM continues to `pending_origin.wait()`.
     ///
-    /// Returns [`DispatchAuctionOutcome::NotStarted`] when no providers are configured or
-    /// all providers are disabled / over budget. Returns
-    /// [`DispatchAuctionOutcome::DispatchFailed`] when provider launch attempts
-    /// happened but none could be started.
+    /// Returns [`DispatchAuctionOutcome::NotStarted`] when the auction is disabled
+    /// or has no providers to execute. Routing-only skips can instead yield a
+    /// [`DispatchAuctionOutcome::Dispatched`] token with immediate responses but
+    /// no provider launch. Admission or launch failures can yield
+    /// [`DispatchAuctionOutcome::DispatchFailed`]; its `provider_launched` flag
+    /// preserves evidence of requests that started before a later failure.
     #[must_use]
     pub async fn dispatch_auction(
         &self,
@@ -2066,10 +2068,6 @@ impl AuctionOrchestrator {
                 }
                 Ok(ProviderRequestOutcome::Immediate(response)) => {
                     immediate_response_count += 1;
-                    #[cfg(test)]
-                    {
-                        provider_launch_count += 1;
-                    }
                     completed_responses.push(response);
                 }
                 Err(e) => {
@@ -4505,6 +4503,10 @@ mod tests {
         else {
             panic!("enabled immediate provider should dispatch");
         };
+        assert!(
+            !dispatched.has_provider_launch(),
+            "should not count an immediate no-bid response as a provider request"
+        );
         let result = orchestrator
             .collect_dispatched_auction(dispatched, &services, &context)
             .await;

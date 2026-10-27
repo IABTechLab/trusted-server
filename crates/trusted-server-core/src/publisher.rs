@@ -22253,7 +22253,7 @@ mod tests {
 
         let mut params = make_stream_params(&settings, "");
         params.content_type = "text/html; charset=utf-8".to_string();
-        params.dispatched_auction = Some(DispatchedAuction::immediate_no_bid_for_test(
+        params.dispatched_auction = Some(DispatchedAuction::launched_no_bid_for_test(
             test_auction_request(),
             500,
         ));
@@ -22328,7 +22328,7 @@ mod tests {
         let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
         let timings = RequestTimings::new();
         let mut params = make_stream_params(&settings, "");
-        params.dispatched_auction = Some(DispatchedAuction::immediate_no_bid_for_test(
+        params.dispatched_auction = Some(DispatchedAuction::launched_no_bid_for_test(
             test_auction_request(),
             500,
         ));
@@ -22382,7 +22382,7 @@ mod tests {
         let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
         let timings = RequestTimings::new();
         let mut params = make_stream_params(&settings, "");
-        params.dispatched_auction = Some(DispatchedAuction::immediate_no_bid_for_test(
+        params.dispatched_auction = Some(DispatchedAuction::launched_no_bid_for_test(
             test_auction_request(),
             500,
         ));
@@ -22516,7 +22516,7 @@ mod tests {
 
         let mut params = make_stream_params(&settings, "");
         params.content_type = "text/html; charset=utf-8".to_string();
-        params.dispatched_auction = Some(DispatchedAuction::immediate_no_bid_for_test(
+        params.dispatched_auction = Some(DispatchedAuction::launched_no_bid_for_test(
             test_auction_request(),
             500,
         ));
