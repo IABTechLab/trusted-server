@@ -24,14 +24,15 @@ fi
 
 mkdir -p "$CONFIG_DIR"
 
-GENERATOR_BIN="${GENERATOR_BIN:-$INTEGRATION_TARGET_DIR/$HOST_TARGET/debug/generate-viceroy-config}"
-if [ ! -x "$GENERATOR_BIN" ]; then
+# Cargo checks freshness for the default generator; explicit overrides are caller-owned.
+if [ -z "${GENERATOR_BIN:-}" ]; then
     cargo build \
         --manifest-path crates/trusted-server-integration-tests/Cargo.toml \
         --target-dir "$INTEGRATION_TARGET_DIR" \
         --target "$HOST_TARGET" \
         --bin generate-viceroy-config
 fi
+GENERATOR_BIN="${GENERATOR_BIN:-$INTEGRATION_TARGET_DIR/$HOST_TARGET/debug/generate-viceroy-config}"
 if [ ! -x "$GENERATOR_BIN" ]; then
     echo "Generator binary not found or not executable at $GENERATOR_BIN" >&2
     exit 1

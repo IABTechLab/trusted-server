@@ -212,7 +212,8 @@ smoke_generate_bindings() {
     local host
     host=$(rustc -vV | sed -n 's/^host: //p')
     SMOKE_GENERATOR="${GENERATOR_BIN:-$repository/crates/trusted-server-integration-tests/target/$host/debug/generate-viceroy-config}"
-    if [ ! -x "$SMOKE_GENERATOR" ]; then
+    # Cargo checks freshness for the default generator; explicit overrides are caller-owned.
+    if [ -z "${GENERATOR_BIN:-}" ]; then
         cargo build --manifest-path "$repository/Cargo.toml" \
             -p trusted-server-integration-tests --bin generate-viceroy-config \
             --target-dir "$repository/crates/trusted-server-integration-tests/target" --target "$host"

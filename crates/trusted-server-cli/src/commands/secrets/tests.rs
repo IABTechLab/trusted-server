@@ -149,6 +149,37 @@ fn secrets_cli_worker_plaintext_and_spin_default_collisions_fail_planning() {
 }
 
 #[test]
+fn secrets_cli_spin_requires_explicit_manifest_before_plan_or_check() {
+    let fixture = Fixture::new();
+    let (result, output) = fixture.run(&["plan", "--adapter", "spin"], &mut FakeInput::default());
+    result.expect("should plan the explicitly selected Spin manifest");
+    let plan = fixture.temp.path().join("spin-plan.json");
+    fs::write(&plan, output).expect("should save the reviewed Spin plan");
+    let path = fixture.temp.path().join("edgezero.toml");
+    let manifest = fs::read_to_string(&path)
+        .expect("should read deployment manifest")
+        .replace("manifest = \"spin.toml\"\n", "");
+    fs::write(path, manifest).expect("should remove the explicit Spin manifest path");
+    assert!(fixture.temp.path().join("spin.toml").is_file());
+    let plan = plan.display().to_string();
+
+    for args in [
+        vec!["plan", "--adapter", "spin"],
+        vec!["check", "--adapter", "spin", "--plan", &plan],
+    ] {
+        let mut input = FakeInput::default();
+        let (result, output) = fixture.run(&args, &mut input);
+        assert_eq!(
+            result.expect_err("should reject an implicit Spin manifest before using the plan"),
+            "Spin secret planning requires an explicit adapter manifest"
+        );
+        assert!(output.is_empty(), "should not publish an unchecked plan");
+        assert_eq!(input.reads, 0, "should not request a credential");
+    }
+    assert!(fixture.transport.methods.borrow().is_empty());
+}
+
+#[test]
 fn secrets_cli_spin_declarations_use_selected_component_and_parse_as_toml() {
     let fixture = Fixture::new();
     let path = fixture.temp.path().join("edgezero.toml");

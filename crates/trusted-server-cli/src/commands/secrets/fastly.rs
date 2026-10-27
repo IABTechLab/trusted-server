@@ -107,7 +107,9 @@ pub(super) fn spin_component(target: &TargetArgs) -> Result<Option<String>, Stri
         .manifest()
         .root()
         .unwrap_or_else(|| Path::new("."))
-        .join(adapter.adapter.manifest.as_deref().unwrap_or("spin.toml"));
+        .join(adapter.adapter.manifest.as_deref().ok_or_else(|| {
+            "Spin secret planning requires an explicit adapter manifest".to_owned()
+        })?);
     edgezero_cli::resolve_spin_component(&path, adapter.adapter.component.as_deref())
         .map(Some)
         .map_err(|_| {
