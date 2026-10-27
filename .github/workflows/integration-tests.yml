@@ -155,7 +155,13 @@ jobs:
   browser-tests:
     name: browser integration tests
     needs: prepare-artifacts
-    runs-on: ubuntu-latest
+    # Pinned rather than floating on ubuntu-latest, which moved to 26.04 and
+    # fails at `playwright install` with "Playwright does not support chromium
+    # on ubuntu26.04-x64". Every browser test then fails in milliseconds because
+    # no browser was installed. Other jobs are unaffected: the Axum job obtains
+    # Chrome through browser-actions/setup-chrome, which works on 26.04. Unpin
+    # once the pinned Playwright version supports the newer image.
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
