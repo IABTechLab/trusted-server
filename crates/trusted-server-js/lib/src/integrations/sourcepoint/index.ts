@@ -1,8 +1,10 @@
 import { log } from '../../core/log';
 
+import { ConsentSync } from './consent_sync';
+import { GppConsentCapture, isCookieSafeGppString, type GppWindow } from './gpp_capture';
 import { installSourcepointGuard } from './script_guard';
 
-type SourcepointWindow = Window & {
+type SourcepointWindow = GppWindow & {
   __tsjs_sourcepoint?: {
     rewriteSdk?: boolean;
   };
@@ -57,6 +59,10 @@ interface MirroredSourcepointConsent {
 let initialized = false;
 let initialRetryDone = false;
 let retryTimer: ReturnType<typeof window.setTimeout> | undefined;
+let readyRetry: (() => void) | undefined;
+let gppCapture: GppConsentCapture | undefined;
+let apiMirrorSucceeded = false;
+let consentSync: ConsentSync | undefined;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -173,13 +179,15 @@ function clearCookie(name: string): void {
 }
 
 function clearSourcepointCookies(): void {
-  if (!hasSourcepointMarker()) {
-    return;
+  try {
+    if (!hasSourcepointMarker()) return;
+    clearCookie(GPP_COOKIE_NAME);
+    clearCookie(GPP_SID_COOKIE_NAME);
+    clearCookie(GPP_SOURCE_COOKIE_NAME);
+    consentSync?.publish({ gppString: null, applicableSections: [] });
+  } catch {
+    log.warn('sourcepoint: consent cookie storage is unavailable');
   }
-
-  clearCookie(GPP_COOKIE_NAME);
-  clearCookie(GPP_SID_COOKIE_NAME);
-  clearCookie(GPP_SOURCE_COOKIE_NAME);
 }
 
 function mirrorOnVisible(): void {
@@ -189,12 +197,14 @@ function mirrorOnVisible(): void {
 }
 
 function clearInitialRetryTimer(): void {
-  if (retryTimer === undefined) {
-    return;
+  if (retryTimer !== undefined) {
+    window.clearTimeout(retryTimer);
+    retryTimer = undefined;
   }
-
-  window.clearTimeout(retryTimer);
-  retryTimer = undefined;
+  if (readyRetry) {
+    document.removeEventListener('DOMContentLoaded', readyRetry);
+    readyRetry = undefined;
+  }
 }
 
 function scheduleInitialRetry(): void {
@@ -213,6 +223,7 @@ function scheduleInitialRetry(): void {
   };
 
   if (document.readyState === 'loading') {
+    readyRetry = retry;
     document.addEventListener('DOMContentLoaded', retry, { once: true });
   }
 
@@ -230,26 +241,43 @@ function scheduleInitialRetry(): void {
  * Returns `true` if cookies were written, `false` otherwise.
  */
 export function mirrorSourcepointConsent(): boolean {
-  if (typeof localStorage === 'undefined' || typeof document === 'undefined') {
-    return false;
+  if (typeof document === 'undefined') return false;
+  if (gppCapture?.hasApi()) {
+    apiMirrorSucceeded = false;
+    gppCapture.refresh();
+    return apiMirrorSucceeded;
   }
-
-  const consent = findSourcepointConsent();
-  if (!consent) {
+  try {
+    if (typeof localStorage === 'undefined') return false;
+    const consent = findSourcepointConsent();
+    if (!consent) {
+      clearSourcepointCookies();
+      log.debug('sourcepoint: no GPP data found in localStorage');
+      return false;
+    }
+    return writeMirroredConsent(consent);
+  } catch {
+    // Sandboxed frames and browser storage restrictions must not break the
+    // publisher's scripts or revive an earlier permissive mirror.
     clearSourcepointCookies();
-    log.debug('sourcepoint: no GPP data found in localStorage');
+    log.warn('sourcepoint: consent storage is unavailable');
     return false;
   }
+}
 
+function writeMirroredConsent(consent: MirroredSourcepointConsent): boolean {
   const { gppString, applicableSections } = consent;
-  if (!gppString) {
+  if (
+    !isCookieSafeGppString(gppString) ||
+    applicableSections?.some((id) => !Number.isInteger(id) || id <= 0 || id > 65535)
+  ) {
     clearSourcepointCookies();
-    log.debug('sourcepoint: gppString is empty');
+    log.debug('sourcepoint: GPP snapshot cannot be represented as consent cookies');
     return false;
   }
 
   const existingGppCookie = readCookie(GPP_COOKIE_NAME);
-  if (existingGppCookie && existingGppCookie !== gppString && !hasSourcepointMarker()) {
+  if (existingGppCookie && !hasSourcepointMarker()) {
     log.debug('sourcepoint: preserving existing __gpp cookie from another writer');
     return false;
   }
@@ -265,6 +293,7 @@ export function mirrorSourcepointConsent(): boolean {
 
   initialRetryDone = true;
   clearInitialRetryTimer();
+  consentSync?.publish({ gppString, applicableSections: applicableSections ?? [] });
 
   log.info('sourcepoint: mirrored GPP consent to cookies', {
     gppLength: gppString.length,
@@ -283,15 +312,44 @@ export function initializeSourcepointConsentMirror(): void {
   }
 
   initialized = true;
+  consentSync =
+    typeof window.fetch === 'function' ? new ConsentSync(window.fetch.bind(window)) : undefined;
+  gppCapture = new GppConsentCapture(
+    window as GppWindow,
+    (consent) => {
+      try {
+        apiMirrorSucceeded = writeMirroredConsent(consent);
+      } catch {
+        apiMirrorSucceeded = false;
+        log.warn('sourcepoint: consent cookie storage is unavailable');
+      }
+    },
+    () => {
+      apiMirrorSucceeded = false;
+      clearSourcepointCookies();
+    }
+  );
+  gppCapture.start();
 
-  if (!mirrorSourcepointConsent()) {
-    scheduleInitialRetry();
-  }
+  if (!mirrorSourcepointConsent() && !gppCapture.hasApi()) scheduleInitialRetry();
 
-  // Sourcepoint persists consent changes to localStorage. Re-mirror when a
-  // user returns to the page so session cookies do not remain stale.
+  // Retain legacy localStorage refresh for CMPs without the GPP API. When an
+  // API exists, its ready snapshot is authoritative, including same-tab changes.
   document.addEventListener('visibilitychange', mirrorOnVisible);
   window.addEventListener('focus', mirrorSourcepointConsent);
+}
+
+/** Releases this module's listeners without removing or replacing the publisher CMP. */
+export function disposeSourcepointConsentMirror(): void {
+  gppCapture?.stop();
+  gppCapture = undefined;
+  consentSync?.stop();
+  consentSync = undefined;
+  clearInitialRetryTimer();
+  document.removeEventListener('visibilitychange', mirrorOnVisible);
+  window.removeEventListener('focus', mirrorSourcepointConsent);
+  initialized = false;
+  initialRetryDone = false;
 }
 
 initializeSourcepointConsentMirror();

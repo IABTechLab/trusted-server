@@ -177,6 +177,9 @@ where
     let services = state.services_for_request(&ctx)?;
     if ctx.parts().method == Method::POST {
         let limit = match ctx.parts().uri.path() {
+            trusted_server_core::ec::consent_update::CONSENT_UPDATE_PATH => {
+                Some(trusted_server_core::ec::consent_update::MAX_CONSENT_UPDATE_BODY_BYTES)
+            }
             "/verify-signature" => {
                 Some(trusted_server_core::request_signing::endpoints::VERIFY_MAX_BODY_BYTES)
             }
@@ -193,6 +196,14 @@ where
     }
     let mut req = ctx.into_request()?;
     apply_native_ingress(&mut req)?;
+    if req.uri().path() == trusted_server_core::ec::consent_update::CONSENT_UPDATE_PATH {
+        req = match trusted_server_core::ec::consent_update::prepare_consent_update(&services, req)
+            .await
+        {
+            Ok(req) => req,
+            Err(response) => return Ok(*response),
+        };
+    }
     if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
         &state.settings,
         &mut req,
@@ -313,6 +324,7 @@ enum EcRoute {
     Publisher,
     Auction,
     PageBids,
+    ConsentUpdate,
 }
 
 // ---------------------------------------------------------------------------
@@ -375,6 +387,9 @@ async fn dispatch_ec_route(
         registry: Some(&state.partners),
     };
     let result = match route {
+        EcRoute::ConsentUpdate => Ok(
+            trusted_server_core::ec::consent_update::handle_consent_update(&req, ec.graph.as_ref()),
+        ),
         EcRoute::Auction => {
             handle_auction(
                 &state.settings,
@@ -490,6 +505,7 @@ enum NamedRouteHandler {
     LegacyAdminDenied,
     Auction,
     PageBids,
+    ConsentUpdate,
     Identify,
     FirstPartyProxy,
     FirstPartyClick,
@@ -513,8 +529,23 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 18] {
+fn named_routes() -> [NamedRoute; 19] {
     [
+        NamedRoute {
+            path: trusted_server_core::ec::consent_update::CONSENT_UPDATE_PATH,
+            primary_methods: &[
+                Method::GET,
+                Method::POST,
+                Method::HEAD,
+                Method::OPTIONS,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+                Method::TRACE,
+                Method::CONNECT,
+            ],
+            handler: NamedRouteHandler::ConsentUpdate,
+        },
         NamedRoute {
             path: "/_ts/api/v1/identify",
             primary_methods: &[Method::GET, Method::OPTIONS],
@@ -688,6 +719,9 @@ fn named_route_handler(
                         handle_admin_eids_lookup(&state.partners, &req)
                     }
                     NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
+                    NamedRouteHandler::ConsentUpdate => {
+                        dispatch_ec_route(&state, &services, req, EcRoute::ConsentUpdate).await
+                    }
                     NamedRouteHandler::Identify => {
                         // Read-only identity lookup never enters generation or
                         // response finalization, including cookie ingestion.

@@ -98,6 +98,77 @@ fn assert_route_registered(method: &str, path: &str) {
     );
 }
 
+#[tokio::test]
+async fn consent_route_rejects_other_methods_and_foreign_origins_locally() {
+    for method in [
+        "GET", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE", "TRACE", "CONNECT",
+    ] {
+        assert_route_registered(method, "/_ts/consent");
+        let mut service = make_service();
+        let response = service
+            .ready()
+            .await
+            .expect("ready")
+            .call(
+                Request::builder()
+                    .method(method)
+                    .uri("/_ts/consent")
+                    .header("host", "test-publisher.example.com")
+                    .body(AxumBody::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status().as_u16(), 405);
+        assert_eq!(response.headers()["allow"], "POST");
+        let cache = response.headers()["cache-control"]
+            .to_str()
+            .expect("cache policy");
+        assert!(cache.contains("no-store") && cache.contains("private"));
+    }
+    for origin in [None, Some("https://foreign.example")] {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/_ts/consent")
+            .header("host", "test-publisher.example.com");
+        if let Some(origin) = origin {
+            builder = builder.header("origin", origin);
+        }
+        let response = make_service()
+            .ready()
+            .await
+            .expect("ready")
+            .call(builder.body(AxumBody::empty()).expect("request"))
+            .await
+            .expect("response");
+        assert_eq!(response.status().as_u16(), 403);
+    }
+}
+
+#[tokio::test]
+async fn consent_route_does_not_falsely_acknowledge_an_unconfigured_store() {
+    let response = make_service()
+        .ready()
+        .await
+        .expect("ready")
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/_ts/consent")
+                .header("host", "test-publisher.example.com")
+                .header("origin", "http://test-publisher.example.com")
+                .header("content-type", "application/json")
+                .body(AxumBody::from(
+                    r#"{"gppString":"DBABLA~BVQqAAAAAgA.QA","applicableSections":[7]}"#,
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 503);
+    assert!(!response.headers().contains_key("set-cookie"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn aps_profile_serves_renderer_through_adapter_fallback() {
     let mut settings = test_settings();
@@ -153,6 +224,7 @@ fn all_explicit_routes_are_registered() {
         ("POST", "/admin/keys/rotate"),
         ("POST", "/admin/keys/deactivate"),
         ("POST", "/auction"),
+        ("POST", "/_ts/consent"),
         // SPA re-auction endpoint, plus its deprecated `/__ts/` alias. Both
         // paths are spelled out as literals rather than referencing
         // `PAGE_BIDS_PATH` / `PAGE_BIDS_LEGACY_PATH` so this test pins the
