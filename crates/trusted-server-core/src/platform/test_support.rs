@@ -12,7 +12,7 @@ use super::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformCacheIntent,
     PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
     PlatformImageOptimizerOptions, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
-    PlatformSelectResult, RuntimeServices, StoreId, StoreName,
+    PlatformSelectResult, PlatformTimer, RuntimeServices, StoreId, StoreName,
 };
 
 pub struct NoopConfigStore;
@@ -58,6 +58,33 @@ impl PlatformSecretStore for NoopSecretStore {
 
     fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::Unsupported))
+    }
+}
+
+/// A timer whose sleeps have always already elapsed, recording each requested
+/// duration. Work still pending when its deadline is first raced misses it.
+#[derive(Default)]
+pub struct ElapsedTimer {
+    pub requested: Mutex<Vec<Duration>>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl PlatformTimer for ElapsedTimer {
+    async fn sleep(&self, duration: Duration) {
+        self.requested
+            .lock()
+            .expect("should lock requested durations")
+            .push(duration);
+    }
+}
+
+/// A timer that never fires.
+pub struct StoppedTimer;
+
+#[async_trait::async_trait(?Send)]
+impl PlatformTimer for StoppedTimer {
+    async fn sleep(&self, _duration: Duration) {
+        futures::future::pending::<()>().await;
     }
 }
 
@@ -624,6 +651,7 @@ impl PlatformHttpClient for StubHttpClient {
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         let stream_response = request.stream_response && self.supports_streaming_responses();
         let request_is_head = request.request.method() == edgezero_core::http::Method::HEAD;
+        let max_response_body_bytes = request.max_response_body_bytes;
         self.calls
             .lock()
             .expect("should lock calls")
@@ -707,6 +735,7 @@ impl PlatformHttpClient for StubHttpClient {
             },
             stream_response || response.stream_body,
             request_is_head,
+            max_response_body_bytes,
         )?;
 
         Ok(PlatformResponse::new(edge_response))
@@ -728,6 +757,7 @@ impl PlatformHttpClient for StubHttpClient {
         let backend_name = request.backend_name.clone();
         let stream_response = request.stream_response;
         let request_method = request.request.method().clone();
+        let max_response_body_bytes = request.max_response_body_bytes;
         self.calls
             .lock()
             .expect("should lock calls")
@@ -801,6 +831,12 @@ impl PlatformHttpClient for StubHttpClient {
             return Err(Report::new(PlatformError::Unsupported)
                 .attach("streaming stub responses require StubHttpClient send"));
         }
+        enforce_stub_response_limit(
+            request_method == edgezero_core::http::Method::HEAD,
+            response.status,
+            response.body.len(),
+            max_response_body_bytes,
+        )?;
 
         let pending = StubPendingResponse {
             backend_name: backend_name.clone(),
@@ -814,7 +850,8 @@ impl PlatformHttpClient for StubHttpClient {
             .expect("should lock pending backend name overrides")
             .pop_front();
         let pending = PlatformPendingRequest::new(pending)
-            .with_response_handling(stream_response, request_method);
+            .with_response_handling(stream_response, request_method)
+            .with_max_response_body_bytes(max_response_body_bytes);
         Ok(match override_name {
             Some(Some(name)) => pending.with_backend_name(name),
             Some(None) => pending,
@@ -893,7 +930,7 @@ impl PlatformHttpClient for StubHttpClient {
             });
         }
 
-        let edge_response = build_stub_pending_response(stub, false, false)?;
+        let edge_response = build_stub_pending_response(stub, false, false, None)?;
 
         let ready = Ok(PlatformResponse::new(edge_response).with_backend_name(ready_backend_name));
 
@@ -930,12 +967,18 @@ impl PlatformHttpClient for StubHttpClient {
         }
         let stream_response = pending.stream_response();
         let request_is_head = pending.request_method() == Some(&edgezero_core::http::Method::HEAD);
+        let max_response_body_bytes = pending.max_response_body_bytes();
         let stub = pending.downcast::<StubPendingResponse>().map_err(|_| {
             Report::new(PlatformError::HttpClient)
                 .attach("unexpected inner type in StubHttpClient::wait")
         })?;
         let backend_name = stub.backend_name.clone();
-        let response = build_stub_pending_response(stub, stream_response, request_is_head)?;
+        let response = build_stub_pending_response(
+            stub,
+            stream_response,
+            request_is_head,
+            max_response_body_bytes,
+        )?;
         Ok(PlatformResponse::new(response).with_backend_name(backend_name))
     }
 }
@@ -944,14 +987,19 @@ fn build_stub_pending_response(
     stub: StubPendingResponse,
     stream_response: bool,
     request_is_head: bool,
+    max_response_body_bytes: Option<usize>,
 ) -> Result<edgezero_core::http::Response, Report<PlatformError>> {
     let mut builder = edgezero_core::http::response_builder().status(stub.status);
     for (name, value) in stub.headers {
         builder = builder.header(name, value);
     }
-    let carries_body = !request_is_head
-        && !(100..200).contains(&stub.status)
-        && !matches!(stub.status, 204 | 205 | 304);
+    let carries_body = stub_response_carries_body(request_is_head, stub.status);
+    enforce_stub_response_limit(
+        request_is_head,
+        stub.status,
+        stub.body.len(),
+        max_response_body_bytes,
+    )?;
     let body = if !carries_body {
         edgezero_core::body::Body::empty()
     } else if stream_response {
@@ -960,6 +1008,27 @@ fn build_stub_pending_response(
         edgezero_core::body::Body::from(stub.body)
     };
     builder.body(body).change_context(PlatformError::HttpClient)
+}
+
+fn stub_response_carries_body(request_is_head: bool, status: u16) -> bool {
+    !request_is_head && !(100..200).contains(&status) && !matches!(status, 204 | 205 | 304)
+}
+
+fn enforce_stub_response_limit(
+    request_is_head: bool,
+    status: u16,
+    body_len: usize,
+    max_response_body_bytes: Option<usize>,
+) -> Result<(), Report<PlatformError>> {
+    if stub_response_carries_body(request_is_head, status)
+        && let Some(limit) = max_response_body_bytes
+        && body_len > limit
+    {
+        return Err(Report::new(PlatformError::HttpClient).attach(format!(
+            "stub response body of {body_len} bytes exceeded caller limit of {limit} bytes"
+        )));
+    }
+    Ok(())
 }
 
 pub struct NoopGeo;
@@ -1597,6 +1666,33 @@ mod tests {
             stub.recorded_cache_intents(),
             vec![PlatformCacheIntent::Default],
             "should record the default cache intent"
+        );
+    }
+
+    #[test]
+    fn stub_http_client_enforces_response_body_limits_on_both_send_paths() {
+        let request = || {
+            PlatformHttpRequest::new(
+                request_builder()
+                    .method("GET")
+                    .uri("https://example.com/bounded")
+                    .body(Body::empty())
+                    .expect("should build request"),
+                "stub-backend",
+            )
+            .with_max_response_body_bytes(3)
+        };
+        let stub = StubHttpClient::new();
+        stub.push_response(200, b"four".to_vec());
+        stub.push_response(200, b"four".to_vec());
+
+        assert!(
+            futures::executor::block_on(stub.send(request())).is_err(),
+            "direct send must reject the response before returning it"
+        );
+        assert!(
+            futures::executor::block_on(stub.send_async(request())).is_err(),
+            "async send must not hide an oversized buffered response in a pending handle"
         );
     }
 

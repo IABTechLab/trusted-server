@@ -29,6 +29,7 @@ futures = { workspace = true }
 glob = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
+html5ever = { workspace = true }
 http = { workspace = true }
 httpdate = { workspace = true }
 jose-jwk = { workspace = true }

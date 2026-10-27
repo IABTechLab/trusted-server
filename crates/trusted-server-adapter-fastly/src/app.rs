@@ -85,6 +85,7 @@ use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::context::FastlyRequestContext;
+use edgezero_adapter_fastly::key_value_store::FastlyKvStore;
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
@@ -157,6 +158,23 @@ use crate::platform::{
 // ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
+
+/// The logical id the deployment's KV store is linked to the service under,
+/// as `edgezero.toml` declares it.
+const DEFAULT_KV_STORE_ID: &str = "trusted_server_kv";
+
+/// Opens the KV store linked under [`DEFAULT_KV_STORE_ID`], or
+/// [`UnavailableKvStore`] when the service links none, so a module that
+/// needs the store passes its work by rather than failing the request.
+fn open_default_kv_store() -> Arc<dyn PlatformKvStore> {
+    match FastlyKvStore::open(DEFAULT_KV_STORE_ID) {
+        Ok(store) => Arc::new(store),
+        Err(err) => {
+            log::debug!("The KV store `{DEFAULT_KV_STORE_ID}` is not linked: {err}");
+            Arc::new(UnavailableKvStore)
+        }
+    }
+}
 
 /// The stores a service reads and the key of its app-config blob.
 ///
@@ -398,7 +416,7 @@ pub(crate) fn build_state_with_registrations(
         Arc::new(trusted_server_core::auction::NoopAuctionTelemetrySink)
             as Arc<dyn AuctionTelemetrySink>
     });
-    let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
+    let default_kv_store = open_default_kv_store();
     let loading_caches =
         trusted_server_core::integrations::loading_caches_from(&settings, integrations)?;
 
@@ -462,6 +480,7 @@ pub fn shipped_module_builders() -> Vec<IntegrationBuilder> {
         trusted_server_ad_tag_google::diagnostics::builder(),
         trusted_server_ads_txt_iabtl::builder(),
         trusted_server_headers_geo::builder(),
+        trusted_server_provenance_encypher::builder(),
         // Run by `[shared.51degrees]` rather than selected by a section.
         trusted_server_middleware_51degrees::builder(),
         // The analytics module `[analytics]` selects, which changes no page.
@@ -595,7 +614,9 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
     if let Some(module) = state.registry.device_module() {
         services = services.with_device_module(module);
     }
-    let services = services.with_identifier_modules(state.registry.identifier_modules());
+    let services = services
+        .with_identifier_modules(state.registry.identifier_modules())
+        .with_media_signer(state.registry.media_signer());
     // The publisher this request resolved to, its tenant included, names
     // every key in a shared store and every name the browser holds.
     let prefixes = state.registry.prefixes(
@@ -1363,8 +1384,15 @@ async fn dispatch_asset_fallback(
     let asset_route = &state.settings.proxy.asset_routes[index];
     let answer = match state.registry.route_source(&state.settings, index) {
         Ok(source) => {
-            handle_asset_proxy_request(&state.settings, services, req, asset_route, source.as_ref())
-                .await
+            handle_asset_proxy_request(
+                &state.settings,
+                services,
+                &state.registry,
+                req,
+                asset_route,
+                source.as_ref(),
+            )
+            .await
         }
         Err(report) => Err(report),
     };
@@ -1762,8 +1790,8 @@ impl Hooks for TrustedServerApp {
                 ids: &[DEFAULT_CONFIG_STORE_ID],
             }),
             kv: Some(StoreMetadata {
-                default: "trusted_server_kv",
-                ids: &["trusted_server_kv"],
+                default: DEFAULT_KV_STORE_ID,
+                ids: &[DEFAULT_KV_STORE_ID],
             }),
             secrets: Some(StoreMetadata {
                 default: DEFAULT_SECRET_STORE_ID,
@@ -1864,6 +1892,26 @@ mod tests {
         assert_eq!(stores.config_store_name.as_ref(), "trusted_server_config");
         assert_eq!(stores.config_key, "trusted_server_config");
         assert_eq!(stores.secret_store_name.as_ref(), "trusted_server_secrets");
+    }
+
+    #[test]
+    fn app_state_opens_the_linked_kv_store() {
+        let state = app_state_for_settings(test_settings());
+
+        block_on(
+            state
+                .default_kv_store
+                .put_bytes("default-kv-open-test", Bytes::from_static(b"value")),
+        )
+        .expect("should write to the linked KV store");
+        let value = block_on(state.default_kv_store.get_bytes("default-kv-open-test"))
+            .expect("should read from the linked KV store");
+
+        assert_eq!(
+            value,
+            Some(Bytes::from_static(b"value")),
+            "should read back what was written to the store linked as trusted_server_kv"
+        );
     }
 
     fn app_state_for_settings(settings: Settings) -> Arc<AppState> {
@@ -3919,6 +3967,7 @@ mod tests {
                 "ad-tag.google.diagnostics",
                 "ads-txt.iabtl",
                 "headers.geo",
+                "provenance.encypher",
                 "51degrees",
                 "analytics.tinybird",
                 "auction-protocol.openrtb",

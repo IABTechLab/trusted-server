@@ -8,18 +8,18 @@ use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
 use error_stack::Report;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use error_stack::ResultExt as _;
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-use http_body_util::BodyExt as _;
 use trusted_server_core::platform::{
     AuctionTargetCapabilities, AuctionTargetDescriptor, ClientInfo, GeoInfo, KvError,
     PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError, PlatformGeo,
-    PlatformHttpClient, PlatformKvStore, PlatformSecretStore, RuntimeServices, StoreId, StoreName,
-    UnavailableKvStore,
+    PlatformHttpClient, PlatformKvStore, PlatformSecretStore, PlatformTimer, RuntimeServices,
+    StoreId, StoreName, UnavailableKvStore,
 };
 
 #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
 use trusted_server_core::platform::UnavailableHttpClient;
 
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use spin_sdk::http::body::IncomingBodyExt as _;
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 use std::io::Read as _;
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
@@ -29,11 +29,55 @@ use trusted_server_core::platform::{
     PlatformPendingRequest, PlatformResponse, PlatformSelectResult,
 };
 
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+mod response_stream;
+
 // 8 MiB ceiling: conservative for ad-server responses while leaving headroom in
 // the Spin WASM component heap. Larger responses from misbehaving origins are
 // rejected with a typed error rather than OOMing the component.
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 const MAX_DECOMPRESSED_SIZE: usize = 8 * 1024 * 1024;
+
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+fn effective_response_body_limit(caller_limit: Option<usize>) -> usize {
+    caller_limit
+        .unwrap_or(MAX_DECOMPRESSED_SIZE)
+        .min(MAX_DECOMPRESSED_SIZE)
+}
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+async fn collect_bounded_response_stream<S, B, E>(
+    stream: S,
+    limit: usize,
+) -> Result<Vec<u8>, Report<PlatformError>>
+where
+    S: futures::Stream<Item = Result<B, E>>,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    use futures::StreamExt as _;
+
+    futures::pin_mut!(stream);
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            Report::new(PlatformError::HttpClient).attach(format!(
+                "failed to read Spin outbound response body: {error}"
+            ))
+        })?;
+        let chunk = chunk.as_ref();
+        body.len()
+            .checked_add(chunk.len())
+            .filter(|length| *length <= limit)
+            .ok_or_else(|| {
+                Report::new(PlatformError::HttpClient).attach(format!(
+                    "response body exceeded maximum size of {limit} bytes"
+                ))
+            })?;
+        body.extend_from_slice(chunk);
+    }
+    Ok(body)
+}
 
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 type HeaderPairs = Vec<(String, Vec<u8>)>;
@@ -360,9 +404,22 @@ fn reject_unsupported_request_contracts(
         return Err(Report::new(PlatformError::HttpClient)
             .attach("Spin outbound HTTP does not support Image Optimizer metadata"));
     }
+    Ok(())
+}
+
+/// Refuse a streamed response on the buffered `send_async` path.
+///
+/// `send_async` stores a completed, buffered response for `select`, so a
+/// request that asks for a stream must go through `send` instead of being
+/// silently buffered. The check runs before the outbound request is sent.
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+fn reject_buffered_stream_request(
+    request: &PlatformHttpRequest,
+) -> Result<(), Report<PlatformError>> {
     if request.stream_response {
-        return Err(Report::new(PlatformError::HttpClient)
-            .attach("Spin outbound HTTP does not support streaming responses"));
+        return Err(Report::new(PlatformError::HttpClient).attach(
+            "Spin outbound HTTP streams responses through send alone; send_async buffers",
+        ));
     }
     Ok(())
 }
@@ -371,26 +428,23 @@ fn reject_unsupported_request_contracts(
 fn response_must_not_have_body(method: &edgezero_core::http::Method, status: u16) -> bool {
     method == edgezero_core::http::Method::HEAD
         || (100..200).contains(&status)
-        || status == 204
-        || status == 304
+        || matches!(status, 204 | 205 | 304)
 }
 
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-fn apply_spin_response_policy(
+fn apply_spin_response_policy_with_limit(
     method: &edgezero_core::http::Method,
     status: u16,
     headers: HeaderPairs,
     body: Vec<u8>,
+    limit: usize,
 ) -> Result<BufferedResponseParts, Report<PlatformError>> {
     let mut headers = sanitize_response_headers(headers);
-
-    // Bound the buffered body on every path, not just decompressed ones. An
-    // identity response or an unsupported encoding (e.g. zstd) is returned as-is,
-    // so without this check a large origin/ad-server/proxy response would be
-    // forwarded after being fully buffered instead of failing with a typed error.
-    // For gzip/br this also rejects an overlarge compressed body before
-    // decompression; `decompress_body` separately bounds the expanded size.
-    enforce_response_size(body.len())?;
+    if body.len() > limit {
+        return Err(Report::new(PlatformError::HttpClient).attach(format!(
+            "response body exceeded maximum size of {limit} bytes"
+        )));
+    }
 
     if response_must_not_have_body(method, status) {
         return Ok((headers, body));
@@ -404,22 +458,12 @@ fn apply_spin_response_policy(
         return Ok((headers, body));
     }
 
-    let body = decompress_body(&body, &encoding, MAX_DECOMPRESSED_SIZE)?;
+    let body = decompress_body(&body, &encoding, limit)?;
     headers.retain(|(name, _)| {
         !name.eq_ignore_ascii_case("content-encoding")
             && !name.eq_ignore_ascii_case("content-length")
     });
     Ok((headers, body))
-}
-
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-fn enforce_response_size(len: usize) -> Result<(), Report<PlatformError>> {
-    if len > MAX_DECOMPRESSED_SIZE {
-        return Err(Report::new(PlatformError::HttpClient).attach(format!(
-            "response body exceeded maximum size of {MAX_DECOMPRESSED_SIZE} bytes"
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
@@ -501,6 +545,15 @@ struct SpinPendingResponse {
 
 /// `spin_sdk::http::send`-backed HTTP client for the Spin runtime.
 ///
+/// [`send`](PlatformHttpClient::send) preserves the origin body as a
+/// `Body::Stream` when the request asks for it, reading the WASI incoming
+/// body one host chunk at a time, see
+/// [`response_stream::bounded_origin_stream`]. A streamed body is the
+/// origin's bytes as sent, so it keeps its `Content-Encoding` and
+/// `Content-Length`, and it honors the caller's exact
+/// `max_response_body_bytes`, if any, instead of the buffered path's 8 MiB
+/// ceiling. The buffered path still decodes gzip and Brotli bodies.
+///
 /// `send_async` eagerly executes each request before returning, so
 /// [`PlatformHttpClient::supports_concurrent_fanout`] reports `false` and the
 /// auction orchestrator rejects multi-provider configurations before any
@@ -531,6 +584,9 @@ impl SpinPlatformHttpClient {
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         reject_unsupported_request_contracts(&request)?;
+        let stream_response = request.stream_response;
+        let caller_limit = request.max_response_body_bytes;
+        let response_limit = effective_response_body_limit(caller_limit);
 
         let method = request.request.method().clone();
         let uri = request.request.uri().to_string();
@@ -588,25 +644,62 @@ impl SpinPlatformHttpClient {
             .iter()
             .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
             .collect();
-        let body = spin_response
-            .into_body()
-            .collect()
-            .await
-            .map_err(|error| {
-                Report::new(PlatformError::HttpClient).attach(format!(
-                    "failed to read Spin outbound response body: {error}"
-                ))
-            })?
-            .to_bytes()
-            .to_vec();
+        let response_has_body = !response_must_not_have_body(&method, status);
+        let claimed_len = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| std::str::from_utf8(value).ok())
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        // A streamed body holds one chunk at a time, so only the caller's own
+        // limit applies to it. A buffered body is also held to the ceiling.
+        let enforced_limit = if stream_response {
+            caller_limit
+        } else {
+            Some(response_limit)
+        };
+        if response_has_body
+            && let Some(limit) = enforced_limit
+            && let Some(claimed_len) = claimed_len
+            && u64::try_from(limit).is_ok_and(|limit| claimed_len > limit)
+        {
+            return Err(Report::new(PlatformError::HttpClient).attach(format!(
+                "origin Content-Length exceeds {limit}-byte response body limit"
+            )));
+        }
 
-        let (headers, body) = apply_spin_response_policy(&method, status, headers, body)?;
+        let (headers, body) = if stream_response {
+            let body = if response_has_body {
+                response_stream::bounded_origin_stream(
+                    spin_response.into_body().stream(),
+                    caller_limit,
+                    claimed_len,
+                )
+            } else {
+                edgezero_core::body::Body::empty()
+            };
+            (sanitize_response_headers(headers), body)
+        } else {
+            let body = if response_has_body {
+                collect_bounded_response_stream(spin_response.into_body().stream(), response_limit)
+                    .await?
+            } else {
+                Vec::new()
+            };
+            let (headers, body) = apply_spin_response_policy_with_limit(
+                &method,
+                status,
+                headers,
+                body,
+                response_limit,
+            )?;
+            (headers, edgezero_core::body::Body::from(body))
+        };
         let mut edge_builder = edgezero_core::http::response_builder().status(status);
         for (name, value) in headers {
             edge_builder = edge_builder.header(name.as_str(), value.as_slice());
         }
         let edge_resp = edge_builder
-            .body(edgezero_core::body::Body::from(body))
+            .body(body)
             .change_context(PlatformError::HttpClient)?;
 
         Ok(PlatformResponse::new(edge_resp).with_backend_name(request.backend_name))
@@ -623,6 +716,10 @@ impl PlatformHttpClient for SpinPlatformHttpClient {
         false
     }
 
+    fn supports_streaming_responses(&self) -> bool {
+        true
+    }
+
     async fn send(
         &self,
         request: PlatformHttpRequest,
@@ -634,6 +731,7 @@ impl PlatformHttpClient for SpinPlatformHttpClient {
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+        reject_buffered_stream_request(&request)?;
         let backend_name = request.backend_name.clone();
         let response = self.execute(request).await?;
 
@@ -758,6 +856,32 @@ impl PlatformSecretStore for SpinSecretStoreAdapter {
 }
 
 // ---------------------------------------------------------------------------
+// Timer — Spin wasm32 only (WASI monotonic clock)
+// ---------------------------------------------------------------------------
+
+/// Wall-clock timer backed by the WASI monotonic clock through
+/// [`spin_sdk::time::sleep`].
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+struct SpinPlatformTimer;
+
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+#[async_trait::async_trait(?Send)]
+impl PlatformTimer for SpinPlatformTimer {
+    async fn sleep(&self, duration: Duration) {
+        spin_sdk::time::sleep(duration).await;
+    }
+}
+
+/// The WASI timer in the Spin component; none on the native host.
+fn runtime_timer() -> Option<Arc<dyn PlatformTimer>> {
+    #[cfg(all(feature = "spin", target_arch = "wasm32"))]
+    let timer: Option<Arc<dyn PlatformTimer>> = Some(Arc::new(SpinPlatformTimer));
+    #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
+    let timer: Option<Arc<dyn PlatformTimer>> = None;
+    timer
+}
+
+// ---------------------------------------------------------------------------
 // build_runtime_services
 // ---------------------------------------------------------------------------
 
@@ -816,6 +940,7 @@ pub fn build_runtime_services(
         // crates this adapter links, so every request asks exactly the ones
         // configuration named, in that order.
         .permission_signal_modules(Arc::clone(permission_signal_modules))
+        .timer(runtime_timer())
         .client_info(ClientInfo {
             client_ip,
             tls_protocol: None,
@@ -1032,12 +1157,18 @@ mod tests {
         headers: HeaderPairs,
         body: Vec<u8>,
     ) -> Result<BufferedResponseParts, Report<PlatformError>> {
-        apply_spin_response_policy(&edgezero_core::http::Method::GET, 200, headers, body)
+        apply_spin_response_policy_with_limit(
+            &edgezero_core::http::Method::GET,
+            200,
+            headers,
+            body,
+            MAX_DECOMPRESSED_SIZE,
+        )
     }
 
     #[test]
     fn response_policy_preserves_original_redirect_at_single_send_boundary() {
-        let (headers, body) = apply_spin_response_policy(
+        let (headers, body) = apply_spin_response_policy_with_limit(
             &edgezero_core::http::Method::GET,
             302,
             vec![(
@@ -1045,6 +1176,7 @@ mod tests {
                 b"https://redirect.example/next".to_vec(),
             )],
             Vec::new(),
+            MAX_DECOMPRESSED_SIZE,
         )
         .expect("should preserve redirect response");
 
@@ -1269,12 +1401,20 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_request_contracts_reject_stream_response() {
+    fn send_streams_a_response_and_send_async_refuses_to_buffer_one() {
         let request = platform_request().with_stream_response();
 
         assert!(
-            reject_unsupported_request_contracts(&request).is_err(),
-            "Spin must reject streaming-response requests instead of buffering silently"
+            reject_unsupported_request_contracts(&request).is_ok(),
+            "send should accept a streamed-response request"
+        );
+        assert!(
+            reject_buffered_stream_request(&request).is_err(),
+            "the buffered send_async path must refuse it rather than buffer silently"
+        );
+        assert!(
+            reject_buffered_stream_request(&platform_request()).is_ok(),
+            "a buffered request should still use send_async"
         );
     }
 
@@ -1394,7 +1534,7 @@ mod tests {
 
     #[test]
     fn response_policy_skips_decoding_for_head_responses() {
-        let (headers, body) = apply_spin_response_policy(
+        let (headers, body) = apply_spin_response_policy_with_limit(
             &edgezero_core::http::Method::HEAD,
             200,
             vec![
@@ -1403,6 +1543,7 @@ mod tests {
                 ("transfer-encoding".to_string(), b"chunked".to_vec()),
             ],
             Vec::new(),
+            MAX_DECOMPRESSED_SIZE,
         )
         .expect("should apply HEAD response policy without decoding");
 
@@ -1430,7 +1571,7 @@ mod tests {
     #[test]
     fn response_policy_skips_decoding_for_no_body_statuses() {
         for status in [100, 101, 204, 304] {
-            let (headers, body) = apply_spin_response_policy(
+            let (headers, body) = apply_spin_response_policy_with_limit(
                 &edgezero_core::http::Method::GET,
                 status,
                 vec![
@@ -1439,6 +1580,7 @@ mod tests {
                     ("connection".to_string(), b"close".to_vec()),
                 ],
                 Vec::new(),
+                MAX_DECOMPRESSED_SIZE,
             )
             .expect("should apply no-body response policy without decoding");
 
@@ -1488,6 +1630,31 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn response_stream_rejects_the_host_chunk_that_crosses_the_caller_limit() {
+        let exact = futures::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from_static(b"ab")),
+            Ok(Bytes::from_static(b"cd")),
+        ]);
+        let body = collect_bounded_response_stream(exact, 4)
+            .await
+            .expect("an exact-limit streamed body should fit");
+        assert_eq!(body, b"abcd");
+
+        let oversized = futures::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from_static(b"ab")),
+            Ok(Bytes::from_static(b"cd")),
+            Ok(Bytes::from_static(b"e")),
+        ]);
+        let error = collect_bounded_response_stream(oversized, 4)
+            .await
+            .expect_err("the host chunk crossing the limit must be rejected");
+        assert!(
+            format!("{error:?}").contains("4"),
+            "the error should report the enforced limit: {error:?}"
+        );
+    }
+
     #[test]
     fn response_policy_rejects_oversized_unsupported_encoding_body() {
         let oversized = vec![0u8; MAX_DECOMPRESSED_SIZE + 1];
@@ -1499,6 +1666,27 @@ mod tests {
         assert!(
             result.is_err(),
             "should reject an unsupported-encoding response larger than the size ceiling"
+        );
+    }
+
+    #[test]
+    fn caller_response_limit_applies_to_decompressed_body() {
+        let compressed = gzip_bytes(&[b'a'; 1024]);
+        assert!(
+            compressed.len() <= 64,
+            "fixture must cross the limit only after decompression"
+        );
+        let error = apply_spin_response_policy_with_limit(
+            &edgezero_core::http::Method::GET,
+            200,
+            vec![("content-encoding".to_string(), b"gzip".to_vec())],
+            compressed,
+            64,
+        )
+        .expect_err("decoded body crossing the caller limit must be rejected");
+        assert!(
+            format!("{error:?}").contains("decompression exceeded"),
+            "the decoded-size check should reject the response: {error:?}"
         );
     }
 

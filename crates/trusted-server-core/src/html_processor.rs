@@ -1,12 +1,15 @@
 //! Simplified HTML processor that combines URL replacement and integration injection
 //!
 //! This module provides a `StreamProcessor` implementation for HTML content.
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use futures::future::LocalBoxFuture;
+use http::StatusCode;
 use lol_html::{
     EndTagHandler, Settings as RewriterSettings, element, end,
     html_content::{ContentType, EndTag, TextChunk, TextType},
@@ -22,16 +25,22 @@ use crate::middleware::{
     ElementHandler, MatchedAttribute, MiddlewareChain, MiddlewareContext, MiddlewarePlan, Prepared,
     ResponseHeader, TextHandler,
 };
+use crate::platform::RuntimeServices;
 use crate::prefix::{PUBLIC_PREFIX_ATTRIBUTE, PublicPrefix};
 use crate::publisher::build_empty_bids_script;
+use crate::rehost::{Decision, PageAddress, PageRehost, Reference};
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
 use crate::tsjs;
 
 mod script_text;
+mod source_protection;
 
 use script_text::ScriptTextGuard;
+use source_protection::SourceProtected;
 
+/// The HTML rewriter followed by the middleware's stream processors, each
+/// handed what the one before it produced.
 struct HtmlWithStreamingProcessors {
     inner: Box<dyn StreamProcessor>,
     processors: Vec<Box<dyn StreamProcessor>>,
@@ -51,6 +60,24 @@ impl StreamProcessor for HtmlWithStreamingProcessors {
         for processor in &mut self.processors {
             processor.reset();
         }
+    }
+
+    /// Ends the rewriter once and then each processor in order, so a
+    /// processor is handed its last chunk only after the one before it has
+    /// finished, its asynchronous finish included.
+    fn finish<'a>(
+        &'a mut self,
+        chunk: &'a [u8],
+        services: &'a RuntimeServices,
+    ) -> LocalBoxFuture<'a, Result<Vec<u8>, io::Error>> {
+        Box::pin(async move {
+            let mut output = self.inner.finish(chunk, services).await?;
+            for processor in &mut self.processors {
+                let finished = processor.finish(&output, services).await?;
+                output = finished;
+            }
+            Ok(output)
+        })
     }
 }
 
@@ -125,6 +152,17 @@ pub struct HtmlProcessorConfig {
     /// What the middleware prepared for this document, see
     /// [`Middleware::prepare`](crate::middleware::Middleware::prepare).
     pub prepared: Arc<Prepared>,
+    /// See [`MiddlewareContext::status`].
+    pub status: StatusCode,
+    /// See [`MiddlewareContext::origin_private`].
+    pub origin_private: bool,
+    /// The reader's response headers, see
+    /// [`MiddlewareContext::response_headers`]. `None` where the document may
+    /// be stored and replayed to other readers under other headers.
+    pub response_headers: Option<Arc<http::HeaderMap>>,
+    /// The routes that rehost third-party addresses on this page, and the
+    /// prefix the page's own address carries, see [`crate::rehost`].
+    pub rehost: crate::rehost::PageRehost,
 }
 
 impl HtmlProcessorConfig {
@@ -151,6 +189,14 @@ impl HtmlProcessorConfig {
             csp_nonce_observed: None,
             public_prefix: None,
             prepared: Arc::new(Prepared::default()),
+            status: StatusCode::OK,
+            origin_private: false,
+            response_headers: None,
+            rehost: crate::rehost::PageRehost {
+                routes: crate::rehost::RehostRoutes::of(settings),
+                removed_prefix: String::new(),
+                base: None,
+            },
         }
     }
 
@@ -169,6 +215,14 @@ impl HtmlProcessorConfig {
     ) -> Self {
         self.ad_slots_script = ad_slots_script;
         self.ad_bids_state = ad_bids_state;
+        self
+    }
+
+    /// Hands the serve chain, and the fetch chain of a document that is not
+    /// stored, the headers of the reader's response.
+    #[must_use]
+    pub fn with_response_headers(mut self, headers: Option<Arc<http::HeaderMap>>) -> Self {
+        self.response_headers = headers;
         self
     }
 
@@ -218,10 +272,37 @@ impl HtmlProcessorConfig {
         self
     }
 
+    /// Sets the path prefix request addressing removed from the page's
+    /// address, which a rehosted address is written under, see
+    /// [`crate::rehost`].
+    #[must_use]
+    pub fn with_removed_prefix(mut self, removed_prefix: &str) -> Self {
+        removed_prefix.clone_into(&mut self.rehost.removed_prefix);
+        self
+    }
+
+    /// Sets the effective base resolved from the complete original document.
+    /// Publisher callers must perform that bounded prepass before streaming
+    /// any rewritten HTML.
+    #[must_use]
+    pub fn with_document_base(mut self, base: url::Url) -> Self {
+        self.rehost.base = Some(base);
+        self
+    }
+
     /// Attach what the middleware prepared for this document.
     #[must_use]
     pub fn with_prepared(mut self, prepared: Arc<Prepared>) -> Self {
         self.prepared = prepared;
+        self
+    }
+
+    /// Sets the status of the response the document is the body of, and
+    /// whether the origin marked that response as one reader's.
+    #[must_use]
+    pub fn with_response(mut self, status: StatusCode, origin_private: bool) -> Self {
+        self.status = status;
+        self.origin_private = origin_private;
         self
     }
 }
@@ -295,24 +376,50 @@ pub fn create_html_processor_with_middleware(
     fetch: &MiddlewareChain,
     serve: Option<&MiddlewareChain>,
 ) -> Result<(impl StreamProcessor + use<>, Vec<ResponseHeader>), String> {
+    let mut protection = vec![fetch];
+    protection.extend(serve);
+    create_html_processor_with_source_protection(config, fetch, serve, &protection)
+}
+
+/// Builds the HTML pass with original-source protection selected from both
+/// applicable phases, even when serve actions are deferred until cache replay.
+///
+/// # Errors
+///
+/// Returns the same planning errors as [`create_html_processor_with_middleware`].
+pub fn create_html_processor_with_source_protection(
+    config: HtmlProcessorConfig,
+    fetch: &MiddlewareChain,
+    serve: Option<&MiddlewareChain>,
+    protection: &[&MiddlewareChain],
+) -> Result<(impl StreamProcessor + use<>, Vec<ResponseHeader>), String> {
+    let limit = config.max_buffered_body_bytes;
     let document_state = IntegrationDocumentState::default();
     let plan = fetch.plan(&MiddlewareContext {
         phase: fetch.phase(),
         request_host: &config.request_host,
         request_scheme: &config.request_scheme,
         origin_host: &config.origin_host,
+        status: config.status,
+        origin_private: config.origin_private,
+        // A document a serve chain is not run with may be stored, so its fetch
+        // chain is told nothing of this reader's headers.
+        response_headers: serve.and(config.response_headers.as_deref()),
         platform: config.integrations.platform(),
         document_state: &document_state,
         max_buffered_script_bytes: config.max_buffered_body_bytes,
         prepared: &config.prepared,
     })?;
     let reader = match serve {
-        Some(serve) => create_serve_processor(
+        Some(serve) => create_serve_processor_unprotected(
             serve,
             &ReaderDocument {
                 request_host: &config.request_host,
                 request_scheme: &config.request_scheme,
                 origin_host: &config.origin_host,
+                status: config.status,
+                origin_private: config.origin_private,
+                response_headers: config.response_headers.as_deref(),
                 platform: config.integrations.platform(),
                 request_state: &config.request_state,
                 max_buffered_script_bytes: config.max_buffered_body_bytes,
@@ -323,7 +430,10 @@ pub fn create_html_processor_with_middleware(
     };
     let mut processor = build_html_processor(config, plan);
     processor.processors.extend(reader.processor);
-    Ok((processor, reader.response_headers))
+    Ok((
+        SourceProtected::new(processor, protection, limit),
+        reader.response_headers,
+    ))
 }
 
 /// What a serve chain is told about the reader's copy it works on.
@@ -336,6 +446,12 @@ pub struct ReaderDocument<'a> {
     /// The host the document names as its own, being the `Host` its source
     /// sends.
     pub origin_host: &'a str,
+    /// See [`MiddlewareContext::status`].
+    pub status: StatusCode,
+    /// See [`MiddlewareContext::origin_private`].
+    pub origin_private: bool,
+    /// See [`MiddlewareContext::response_headers`].
+    pub response_headers: Option<&'a http::HeaderMap>,
     /// What the adapter reports about the platform the deployment runs on.
     pub platform: &'a PlatformIdentity,
     /// What modules left on this reader's request for their page changes.
@@ -362,6 +478,38 @@ pub fn create_serve_processor(
     chain: &MiddlewareChain,
     document: &ReaderDocument<'_>,
 ) -> Result<ServePass, String> {
+    create_serve_processor_with_source_protection(chain, document, &[chain])
+}
+
+/// Protects a cached reader copy using both applicable phases' source policies.
+///
+/// # Errors
+///
+/// Returns the same planning errors as [`create_serve_processor`].
+pub fn create_serve_processor_with_source_protection(
+    chain: &MiddlewareChain,
+    document: &ReaderDocument<'_>,
+    protection: &[&MiddlewareChain],
+) -> Result<ServePass, String> {
+    let mut pass = create_serve_processor_unprotected(chain, document)?;
+    if let Some(processor) = pass.processor.take() {
+        let inner = HtmlWithStreamingProcessors {
+            inner: processor,
+            processors: Vec::new(),
+        };
+        pass.processor = Some(Box::new(SourceProtected::new(
+            inner,
+            protection,
+            document.max_buffered_script_bytes,
+        )));
+    }
+    Ok(pass)
+}
+
+fn create_serve_processor_unprotected(
+    chain: &MiddlewareChain,
+    document: &ReaderDocument<'_>,
+) -> Result<ServePass, String> {
     if chain.is_empty() {
         return Ok(ServePass::default());
     }
@@ -372,6 +520,9 @@ pub fn create_serve_processor(
         request_host: document.request_host,
         request_scheme: document.request_scheme,
         origin_host: document.origin_host,
+        status: document.status,
+        origin_private: document.origin_private,
+        response_headers: document.response_headers,
         platform: document.platform,
         document_state: &document_state,
         max_buffered_script_bytes: document.max_buffered_script_bytes,
@@ -408,6 +559,56 @@ type ContentHandler = (
     std::borrow::Cow<'static, lol_html::Selector>,
     lol_html::ElementContentHandlers<'static>,
 );
+
+/// The same structural safety observation applies before rewriting and after
+/// restoring protected ranges. Text mentioning nonce attributes is not markup.
+fn markup_nonce_handlers(observed: Arc<AtomicBool>) -> Vec<ContentHandler> {
+    let meta_observed = Arc::clone(&observed);
+    vec![
+        element!("meta[http-equiv][content]", move |el| {
+            let delivers_csp = el.get_attribute("http-equiv").is_some_and(|equiv| {
+                matches!(
+                    equiv.trim().to_ascii_lowercase().as_str(),
+                    "content-security-policy" | "content-security-policy-report-only"
+                )
+            });
+            if delivers_csp
+                && el
+                    .get_attribute("content")
+                    .is_some_and(|policy| policy.to_ascii_lowercase().contains("'nonce-"))
+            {
+                meta_observed.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }),
+        // lol_html does not decode quoted meta content. Observe nonce attributes
+        // independently so encoded policies cannot hide nonce-bound elements.
+        element!("[nonce]", move |_el| {
+            observed.store(true, Ordering::SeqCst);
+            Ok(())
+        }),
+    ]
+}
+
+/// Observe fully restored markup before shared-template admission, including
+/// protected originals and middleware-generated elements. Never rewrite it.
+pub(crate) fn restored_markup_has_nonce(bytes: &[u8]) -> Result<bool, io::Error> {
+    let observed = Arc::new(AtomicBool::new(false));
+    let mut parser = lol_html::HtmlRewriter::new(
+        RewriterSettings {
+            element_content_handlers: markup_nonce_handlers(Arc::clone(&observed)),
+            ..RewriterSettings::default()
+        },
+        |_: &[u8]| {},
+    );
+    parser
+        .write(bytes)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    parser
+        .end()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(observed.load(Ordering::SeqCst))
+}
 
 /// The handlers that carry out a plan's element and text handlers.
 ///
@@ -548,6 +749,117 @@ fn build_serve_processor(plan: MiddlewarePlan) -> HtmlWithStreamingProcessors {
     }
 }
 
+/// Decodes an HTML attribute with the tokenizer's attribute-value rules.
+/// Only the attribute is tokenized; the document is never copied.
+fn decode_html_attribute(value: &str) -> Cow<'_, str> {
+    if !value.contains(['&', '\r', '\0']) {
+        return Cow::Borrowed(value);
+    }
+    use html5ever::tokenizer::{
+        BufferQueue, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts,
+    };
+    #[derive(Default)]
+    struct AttributeValue(RefCell<String>);
+    impl TokenSink for AttributeValue {
+        type Handle = ();
+
+        fn process_token(&self, token: Token, _: u64) -> TokenSinkResult<()> {
+            if let Token::TagToken(tag) = token
+                && let Some(attribute) = tag.attrs.into_iter().next()
+            {
+                *self.0.borrow_mut() = attribute.value.to_string();
+            }
+            TokenSinkResult::Continue
+        }
+    }
+    // Protect literal quotes, leaving references to be decoded exactly once.
+    let input = BufferQueue::default();
+    input.push_back(format!("<a href=\"{}\">", value.replace('"', "&quot;")).into());
+    let tokenizer = Tokenizer::new(AttributeValue::default(), TokenizerOpts::default());
+    let _ = tokenizer.feed(&input);
+    tokenizer.end();
+    Cow::Owned(tokenizer.sink.0.into_inner())
+}
+
+/// `lol_html` escapes quotes but leaves ampersands alone. Serialize a decoded
+/// URL once so its literal ampersands cannot create new HTML references.
+fn url_attribute(value: String) -> String {
+    if value.contains('&') {
+        value.replace('&', "&amp;")
+    } else {
+        value
+    }
+}
+
+/// Reads the first effective HTML base from complete original bytes. The
+/// parser discards output and builds no DOM. Template contents and foreign
+/// base elements do not set the document's base.
+pub(crate) fn effective_document_base(
+    original: &[u8],
+    document_url: &url::Url,
+) -> Result<url::Url, io::Error> {
+    let base = Rc::new(RefCell::new(document_url.clone()));
+    let seen = Rc::new(Cell::new(false));
+    let template_depth = Rc::new(Cell::new(0usize));
+    let handlers = vec![
+        element!("template", {
+            let depth = Rc::clone(&template_depth);
+            move |el| {
+                if el.namespace_uri() == "http://www.w3.org/1999/xhtml" {
+                    depth.set(depth.get() + 1);
+                    let depth = Rc::clone(&depth);
+                    if let Some(handlers) = el.end_tag_handlers() {
+                        let handler: EndTagHandler<'static> = Box::new(move |_| {
+                            depth.set(depth.get().saturating_sub(1));
+                            Ok(())
+                        });
+                        handlers.push(handler);
+                    }
+                }
+                Ok(())
+            }
+        }),
+        element!("base[href]", {
+            let base = Rc::clone(&base);
+            let seen = Rc::clone(&seen);
+            let template_depth = Rc::clone(&template_depth);
+            move |el| {
+                if el.namespace_uri() != "http://www.w3.org/1999/xhtml"
+                    || template_depth.get() != 0
+                    || seen.replace(true)
+                {
+                    return Ok(());
+                }
+                if let Some(href) = el.get_attribute("href") {
+                    let resolved = base.borrow().join(&decode_html_attribute(&href));
+                    if let Ok(resolved) = resolved
+                        && !matches!(resolved.scheme(), "data" | "javascript")
+                    {
+                        base.replace(resolved);
+                    }
+                }
+                Ok(())
+            }
+        }),
+    ];
+    let mut parser = lol_html::HtmlRewriter::new(
+        RewriterSettings {
+            element_content_handlers: handlers,
+            ..RewriterSettings::default()
+        },
+        |_: &[u8]| {},
+    );
+    parser
+        .write(original)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    parser
+        .end()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(Rc::try_unwrap(base)
+        .expect("base parser released its handlers")
+        .into_inner())
+}
+
 /// `value` with each occurrence of a form's text replaced by that form's
 /// replacement, in one pass from the start, so no replacement is read again.
 ///
@@ -573,6 +885,104 @@ fn replace_each_once(value: &str, forms: &[(String, String)]) -> String {
         rest = &rest[at + len..];
     }
     out.push_str(rest);
+    out
+}
+
+/// What an element's address in `attribute` is fetched as, where a
+/// rehosting route may serve it, or `None` for an address no rehosting
+/// route moves, such as a link a reader follows. `tag` is the element's
+/// name in lower case; `rel`, `link_as` and `input_type` are its `rel`, `as`
+/// and `type` attributes.
+fn rehost_reference(
+    tag: &str,
+    attribute: &str,
+    rel: Option<&str>,
+    link_as: Option<&str>,
+    input_type: Option<&str>,
+) -> Option<Reference> {
+    let has_rel = |wanted: &str| {
+        rel.is_some_and(|rel| {
+            rel.split_ascii_whitespace()
+                .any(|token| token.eq_ignore_ascii_case(wanted))
+        })
+    };
+    match (tag, attribute) {
+        ("link", "href") if has_rel("stylesheet") => Some(Reference::Style),
+        ("link", "href") if has_rel("preload") || has_rel("prefetch") => {
+            match link_as
+                .map(|value| value.trim().to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("style") => Some(Reference::Style),
+                Some("image" | "font" | "audio" | "video" | "track") => Some(Reference::Media),
+                _ => None,
+            }
+        }
+        ("link", "imagesrcset")
+        | ("img" | "source" | "video" | "audio" | "track", "src")
+        | ("img" | "source", "srcset")
+        | ("video", "poster") => Some(Reference::Media),
+        ("input", "src")
+            if input_type.is_some_and(|value| value.trim().eq_ignore_ascii_case("image")) =>
+        {
+            Some(Reference::Media)
+        }
+        _ => None,
+    }
+}
+
+/// What the page's rehosting routes decide about `value`, an element's
+/// address in `attribute`, see [`crate::rehost::RehostRoutes::decide`].
+fn rehost_decision(
+    rehost: &PageRehost,
+    page: &PageAddress<'_>,
+    el: &lol_html::html_content::Element<'_, '_>,
+    attribute: &str,
+    value: &str,
+) -> Decision {
+    if rehost.routes.is_empty() {
+        return Decision::Unmatched;
+    }
+    let tag = el.tag_name().to_ascii_lowercase();
+    let rel = el.get_attribute("rel");
+    let link_as = el.get_attribute("as");
+    let input_type = el.get_attribute("type");
+    let Some(reference) = rehost_reference(
+        &tag,
+        attribute,
+        rel.as_deref(),
+        link_as.as_deref(),
+        input_type.as_deref(),
+    ) else {
+        return Decision::Unmatched;
+    };
+    rehost
+        .routes
+        .decide(value, reference, el.has_attribute("integrity"), page)
+}
+
+/// `value`, a `srcset` or `imagesrcset`, with each candidate's address
+/// decided on its own: one a rehosting route serves is written as the
+/// route's address or kept as written, and `unmatched` rewrites the others.
+/// Every byte between the addresses is kept.
+fn rewrite_srcset_candidates(
+    value: &str,
+    decide: impl Fn(&str) -> Decision,
+    unmatched: impl Fn(&str) -> String,
+) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut written = 0;
+    for range in crate::rehost::srcset_address_ranges(value) {
+        out.push_str(&value[written..range.start]);
+        let address = &value[range.clone()];
+        match decide(address) {
+            Decision::Rehost(rehosted) => out.push_str(&rehosted),
+            Decision::Keep => out.push_str(address),
+            Decision::Unmatched => out.push_str(&unmatched(address)),
+        }
+        written = range.end;
+    }
+    out.push_str(&value[written..]);
     out
 }
 
@@ -632,6 +1042,22 @@ fn build_html_processor(
             }
         }
 
+        /// Moves only a leading authority (or the supported bare host), never
+        /// a publisher host occurring inside a path, query or fragment.
+        fn rewrite_srcset_address(&self, value: &str) -> String {
+            self.srcset_forms
+                .iter()
+                .find_map(|(form, replacement)| {
+                    let rest = value
+                        .get(..form.len())?
+                        .eq_ignore_ascii_case(form)
+                        .then(|| &value[form.len()..])?;
+                    (rest.is_empty() || matches!(rest.as_bytes().first(), Some(b'/' | b'?' | b'#')))
+                        .then(|| format!("{replacement}{rest}"))
+                })
+                .unwrap_or_else(|| value.to_owned())
+        }
+
         fn rewrite_url_value(&self, value: &str) -> Option<String> {
             if !value.contains(&self.origin_host) {
                 return None;
@@ -663,6 +1089,49 @@ fn build_html_processor(
         &config.request_host,
         &config.request_scheme,
     ));
+
+    // A media or stylesheet address on a rehosting route's third-party folder
+    // is decided once, on the value the page wrote, before the origin's
+    // address is moved, so neither rewrite reads the other's output, see
+    // `crate::rehost`.
+    struct RehostScope {
+        rehost: PageRehost,
+        scheme: String,
+        host: String,
+    }
+    impl RehostScope {
+        fn decide(
+            &self,
+            el: &lol_html::html_content::Element<'_, '_>,
+            attribute: &str,
+            original: &str,
+        ) -> Decision {
+            if self.rehost.routes.is_empty() {
+                return Decision::Unmatched;
+            }
+            self.decide_decoded(el, attribute, &decode_html_attribute(original))
+        }
+
+        fn decide_decoded(
+            &self,
+            el: &lol_html::html_content::Element<'_, '_>,
+            attribute: &str,
+            value: &str,
+        ) -> Decision {
+            let page = PageAddress {
+                scheme: &self.scheme,
+                host: &self.host,
+                removed_prefix: &self.rehost.removed_prefix,
+                base: self.rehost.base.as_ref(),
+            };
+            rehost_decision(&self.rehost, &page, el, attribute, value)
+        }
+    }
+    let rehost = Rc::new(RehostScope {
+        rehost: config.rehost.clone(),
+        scheme: config.request_scheme.clone(),
+        host: config.request_host.clone(),
+    });
 
     let injected_tsjs = Rc::new(Cell::new(false));
     let injected_bids = Arc::new(AtomicBool::new(false));
@@ -818,11 +1287,20 @@ fn build_html_processor(
         // Replace URLs in href attributes
         element!("[href]", {
             let patterns = patterns.clone();
+            let rehost = rehost.clone();
             move |el| {
-                if let Some(href) = el.get_attribute("href")
-                    && let Some(rewritten) = patterns.rewrite_url_value(&href)
-                {
-                    el.set_attribute("href", &rewritten)?;
+                if let Some(href) = el.get_attribute("href") {
+                    match rehost.decide(el, "href", &href) {
+                        Decision::Rehost(rehosted) => {
+                            el.set_attribute("href", &url_attribute(rehosted))?
+                        }
+                        Decision::Keep => {}
+                        Decision::Unmatched => {
+                            if let Some(rewritten) = patterns.rewrite_url_value(&href) {
+                                el.set_attribute("href", &rewritten)?;
+                            }
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -830,11 +1308,32 @@ fn build_html_processor(
         // Replace URLs in src attributes
         element!("[src]", {
             let patterns = patterns.clone();
+            let rehost = rehost.clone();
             move |el| {
-                if let Some(src) = el.get_attribute("src")
-                    && let Some(rewritten) = patterns.rewrite_url_value(&src)
+                if let Some(src) = el.get_attribute("src") {
+                    match rehost.decide(el, "src", &src) {
+                        Decision::Rehost(rehosted) => {
+                            el.set_attribute("src", &url_attribute(rehosted))?
+                        }
+                        Decision::Keep => {}
+                        Decision::Unmatched => {
+                            if let Some(rewritten) = patterns.rewrite_url_value(&src) {
+                                el.set_attribute("src", &rewritten)?;
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }),
+        // A video's poster, which only a rehosting route moves.
+        element!("video[poster]", {
+            let rehost = rehost.clone();
+            move |el| {
+                if let Some(poster) = el.get_attribute("poster")
+                    && let Decision::Rehost(rehosted) = rehost.decide(el, "poster", &poster)
                 {
-                    el.set_attribute("src", &rewritten)?;
+                    el.set_attribute("poster", &url_attribute(rehosted))?;
                 }
                 Ok(())
             }
@@ -854,11 +1353,17 @@ fn build_html_processor(
         // Replace URLs in srcset attributes (for responsive images)
         element!("[srcset]", {
             let patterns = patterns.clone();
+            let rehost = rehost.clone();
             move |el| {
                 if let Some(srcset) = el.get_attribute("srcset") {
-                    let rewritten = replace_each_once(&srcset, &patterns.srcset_forms);
-                    if rewritten != srcset {
-                        el.set_attribute("srcset", &rewritten)?;
+                    let decoded = decode_html_attribute(&srcset);
+                    let rewritten = rewrite_srcset_candidates(
+                        &decoded,
+                        |address| rehost.decide_decoded(&*el, "srcset", address),
+                        |address| patterns.rewrite_srcset_address(address),
+                    );
+                    if rewritten != decoded.as_ref() {
+                        el.set_attribute("srcset", &url_attribute(rewritten))?;
                     }
                 }
                 Ok(())
@@ -867,11 +1372,17 @@ fn build_html_processor(
         // Replace URLs in imagesrcset attributes (for link preload)
         element!("[imagesrcset]", {
             let patterns = patterns.clone();
+            let rehost = rehost.clone();
             move |el| {
                 if let Some(imagesrcset) = el.get_attribute("imagesrcset") {
-                    let rewritten = replace_each_once(&imagesrcset, &patterns.url_forms);
-                    if rewritten != imagesrcset {
-                        el.set_attribute("imagesrcset", &rewritten)?;
+                    let decoded = decode_html_attribute(&imagesrcset);
+                    let rewritten = rewrite_srcset_candidates(
+                        &decoded,
+                        |address| rehost.decide_decoded(&*el, "imagesrcset", address),
+                        |address| patterns.rewrite_srcset_address(address),
+                    );
+                    if rewritten != decoded.as_ref() {
+                        el.set_attribute("imagesrcset", &url_attribute(rewritten))?;
                     }
                 }
                 Ok(())
@@ -879,35 +1390,8 @@ fn build_html_processor(
         }),
     ];
 
-    // A response-bound nonce is only safe for the response that carried it, and the
-    // response-header gate cannot see one the origin delivered in the markup instead.
-    // Observed structurally rather than by scanning the output bytes, which cannot tell a
-    // `nonce` attribute from the same word inside a script.
     if let Some(observed) = config.csp_nonce_observed.clone() {
-        let meta_observed = Arc::clone(&observed);
-        element_content_handlers.push(element!("meta[http-equiv][content]", move |el| {
-            let delivers_csp = el.get_attribute("http-equiv").is_some_and(|equiv| {
-                matches!(
-                    equiv.trim().to_ascii_lowercase().as_str(),
-                    "content-security-policy" | "content-security-policy-report-only"
-                )
-            });
-            if delivers_csp
-                && el
-                    .get_attribute("content")
-                    .is_some_and(|policy| policy.to_ascii_lowercase().contains("'nonce-"))
-            {
-                meta_observed.store(true, Ordering::SeqCst);
-            }
-            Ok(())
-        }));
-        // `lol_html` does not entity-decode quoted meta CSP content for the check above.
-        // Reject nonce attributes independently so an entity-encoded meta policy cannot
-        // hide executable nonce-bound content from the template-cache safety scan.
-        element_content_handlers.push(element!("[nonce]", move |_el| {
-            observed.store(true, Ordering::SeqCst);
-            Ok(())
-        }));
+        element_content_handlers.extend(markup_nonce_handlers(observed));
     }
 
     // Shared by every text handler, so each is handed a chunk as the one
@@ -1237,9 +1721,13 @@ mod tests {
 
     fn create_test_config() -> HtmlProcessorConfig {
         HtmlProcessorConfig {
+            rehost: crate::rehost::PageRehost::default(),
             csp_nonce_observed: None,
+            response_headers: None,
             public_prefix: None,
             prepared: Arc::new(Prepared::default()),
+            status: StatusCode::OK,
+            origin_private: false,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_owned(),
             request_host: "test.example.com".to_owned(),
@@ -1988,9 +2476,13 @@ mod tests {
     #[test]
     fn injects_ad_slots_at_head_open() {
         let config = HtmlProcessorConfig {
+            rehost: crate::rehost::PageRehost::default(),
             csp_nonce_observed: None,
+            response_headers: None,
             public_prefix: None,
             prepared: Arc::new(Prepared::default()),
+            status: StatusCode::OK,
+            origin_private: false,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2068,9 +2560,13 @@ mod tests {
         let bids_script = r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
         let config = HtmlProcessorConfig {
+            rehost: crate::rehost::PageRehost::default(),
             csp_nonce_observed: None,
+            response_headers: None,
             public_prefix: None,
             prepared: Arc::new(Prepared::default()),
+            status: StatusCode::OK,
+            origin_private: false,
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2109,9 +2605,13 @@ mod tests {
         let bids_script = r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
         let config = HtmlProcessorConfig {
+            rehost: crate::rehost::PageRehost::default(),
             csp_nonce_observed: None,
+            response_headers: None,
             public_prefix: None,
             prepared: Arc::new(Prepared::default()),
+            status: StatusCode::OK,
+            origin_private: false,
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2151,9 +2651,13 @@ mod tests {
 
         let request_host = "proxy.test-publisher.example.com";
         let config = HtmlProcessorConfig {
+            rehost: crate::rehost::PageRehost::default(),
             csp_nonce_observed: None,
+            response_headers: None,
             public_prefix: None,
             prepared: Arc::new(Prepared::default()),
+            status: StatusCode::OK,
+            origin_private: false,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.test-publisher.example.com".to_string(),
             request_host: request_host.to_string(),
@@ -2207,9 +2711,13 @@ mod tests {
         // (state is None) — e.g. auction timed out with zero bids. Fallback to {}.
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
+            rehost: crate::rehost::PageRehost::default(),
             csp_nonce_observed: None,
+            response_headers: None,
             public_prefix: None,
             prepared: Arc::new(Prepared::default()),
+            status: StatusCode::OK,
+            origin_private: false,
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2241,9 +2749,13 @@ mod tests {
         // unmodified (spec §8: "Existing client-side Prebid/GPT flow runs unmodified").
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
+            rehost: crate::rehost::PageRehost::default(),
             csp_nonce_observed: None,
+            response_headers: None,
             public_prefix: None,
             prepared: Arc::new(Prepared::default()),
+            status: StatusCode::OK,
+            origin_private: false,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2268,7 +2780,9 @@ mod tests {
 
     fn marker_mode_config(marker: &str, observer: Option<Arc<AtomicBool>>) -> HtmlProcessorConfig {
         HtmlProcessorConfig {
+            rehost: crate::rehost::PageRehost::default(),
             csp_nonce_observed: observer,
+            response_headers: None,
             public_prefix: None,
             body_close: BodyCloseInjection::Marker(marker.to_string()),
             origin_host: "origin.example.com".to_string(),
@@ -2280,6 +2794,8 @@ mod tests {
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             prepared: Arc::new(Prepared::default()),
+            status: StatusCode::OK,
+            origin_private: false,
             request_state: IntegrationRequestState::default(),
         }
     }
@@ -2487,9 +3003,13 @@ mod tests {
     fn bodyless_marker_mode_emits_an_owned_terminal_seam_even_after_source_bytes() {
         const MARKER: &str = "<!--reserved-template-cache-seam-->";
         let config = HtmlProcessorConfig {
+            rehost: crate::rehost::PageRehost::default(),
             csp_nonce_observed: None,
+            response_headers: None,
             public_prefix: None,
             prepared: Arc::new(Prepared::default()),
+            status: StatusCode::OK,
+            origin_private: false,
             body_close: BodyCloseInjection::Marker(MARKER.to_string()),
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2541,6 +3061,249 @@ mod tests {
         assert!(
             growth_factor < MAX_GROWTH_FACTOR,
             "processed HTML must not grow by more than {MAX_GROWTH_FACTOR}×: input={input_size}B output={output_size}B factor={growth_factor:.2}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rehost_tests {
+    use std::io::Cursor;
+
+    use super::HtmlProcessorConfig;
+    use super::test_support::{ORIGIN_HOST, REQUEST_HOST, create_page_processor};
+    use crate::integrations::IntegrationRegistry;
+    use crate::middleware::{PhaseEntries, PhaseEntry};
+    use crate::settings::{ProxyAssetRoute, Settings};
+    use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+    use crate::test_support::tests::create_test_settings;
+
+    const ROUTE: &str = "/_rehost/cdn.example.net/npm/";
+    const PAGE_PREFIX: &str = "/www.publisher.example";
+
+    fn rehosting_settings() -> Settings {
+        let mut settings = create_test_settings();
+        let mut route = ProxyAssetRoute::new(ROUTE, "https://cdn.example.net/npm");
+        route.rehost_page_references = true;
+        settings.proxy.asset_routes.push(route);
+        settings.serve = PhaseEntries::new(vec![PhaseEntry {
+            media_type: "text/css".to_owned(),
+            path: Some(format!("{ROUTE}moved/")),
+            middleware: vec!["provenance.encypher.stylesheet".to_owned()],
+        }]);
+        settings
+    }
+
+    fn rendered(settings: &Settings, html: &str) -> String {
+        rendered_at(
+            settings,
+            html,
+            "https://origin.example.com/articles/page.html?view=1",
+        )
+    }
+
+    fn rendered_at(settings: &Settings, html: &str, document_url: &str) -> String {
+        let document_url = url::Url::parse(document_url).expect("document URL");
+        let base = super::effective_document_base(html.as_bytes(), &document_url)
+            .expect("should read the original base");
+        let registry = IntegrationRegistry::default();
+        let config = HtmlProcessorConfig::from_settings(
+            settings,
+            &registry,
+            ORIGIN_HOST,
+            REQUEST_HOST,
+            "https",
+        )
+        .with_removed_prefix(PAGE_PREFIX)
+        .with_document_base(base);
+        let mut pipeline = StreamingPipeline::new(
+            PipelineConfig {
+                input_compression: Compression::None,
+                output_compression: Compression::None,
+                chunk_size: 64,
+            },
+            create_page_processor(settings, &registry, config),
+        );
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("should process the page");
+        String::from_utf8(output).expect("should leave the page UTF-8")
+    }
+
+    #[test]
+    fn third_party_media_and_approved_stylesheets_point_at_the_rehosting_route() {
+        let page = rendered(
+            &rehosting_settings(),
+            concat!(
+                r#"<link rel="stylesheet" href="https://cdn.example.net/npm/moved/a.css?ver=2#x">"#,
+                r#"<link rel="stylesheet" href="//cdn.example.net/npm/kept/b.css?ret=https://origin.example.com/p">"#,
+                r#"<link rel="stylesheet" integrity="sha384-x" href="https://cdn.example.net/npm/moved/c.css?ret=https://origin.example.com/p">"#,
+                r#"<img src="https://cdn.example.net/npm/i.png" srcset="https://cdn.example.net/npm/i.png?w=1,2 1x, https://origin.example.com/o.png 2x">"#,
+                r#"<video poster="https://cdn.example.net/npm/p.jpg"></video>"#,
+                r#"<a href="https://cdn.example.net/npm/page.html">a</a>"#,
+                r#"<img src="https://origin.example.com/own.png">"#,
+            ),
+        );
+        let reader = format!("https://{REQUEST_HOST}{PAGE_PREFIX}{ROUTE}");
+        for expected in [
+            format!(r#"href="{reader}moved/a.css?ver=2#x""#),
+            // A stylesheet no entry moves is kept as written, its query too.
+            r#"href="//cdn.example.net/npm/kept/b.css?ret=https://origin.example.com/p""#
+                .to_owned(),
+            // Integrity is never broken.
+            r#"href="https://cdn.example.net/npm/moved/c.css?ret=https://origin.example.com/p""#
+                .to_owned(),
+            format!(r#"src="{reader}i.png""#),
+            format!(r#"srcset="{reader}i.png?w=1,2 1x, https://{REQUEST_HOST}/o.png 2x""#),
+            format!(r#"poster="{reader}p.jpg""#),
+            // A link a reader follows is not media.
+            r#"href="https://cdn.example.net/npm/page.html""#.to_owned(),
+            format!(r#"src="https://{REQUEST_HOST}/own.png""#),
+        ] {
+            assert!(
+                page.contains(&expected),
+                "should contain {expected}: {page}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_page_with_no_rehosting_route_preserves_publisher_names_inside_other_urls() {
+        let page = rendered(
+            &create_test_settings(),
+            r#"<img srcset="https://cdn.example.net/x.png?u=origin.example.com 1x">"#,
+        );
+        assert!(
+            page.contains(r#"srcset="https://cdn.example.net/x.png?u=origin.example.com 1x""#),
+            "a publisher host inside another URL's query is not an authority: {page}",
+        );
+    }
+
+    #[test]
+    fn source_set_fallback_changes_only_the_leading_authority_or_bare_host() {
+        let value = concat!(
+            "https://reader.example/www.publisher.example/origin.example.com/p.png?q=origin.example.com#f 1x, ",
+            "https://third.example/i.png?u=https://origin.example.com/a#origin.example.com 2x, ",
+            "https://origin.example.com.evil/i.png 3x, ",
+            "origin.example.com.evil/i.png 4x, ",
+            "https://origin.example.com/a/origin.example.com.png?q=%2f&amp;x=origin.example.com#f 5x, ",
+            "//origin.example.com/b.png?x=1,2 6x, ",
+            "origin.example.com/c.png?q=origin.example.com#f 7x"
+        );
+        let expected = format!(
+            concat!(
+                "https://reader.example/www.publisher.example/origin.example.com/p.png?q=origin.example.com#f 1x, ",
+                "https://third.example/i.png?u=https://origin.example.com/a#origin.example.com 2x, ",
+                "https://origin.example.com.evil/i.png 3x, ",
+                "origin.example.com.evil/i.png 4x, ",
+                "https://{REQUEST_HOST}/a/origin.example.com.png?q=%2f&amp;x=origin.example.com#f 5x, ",
+                "//{REQUEST_HOST}/b.png?x=1,2 6x, ",
+                "{REQUEST_HOST}/c.png?q=origin.example.com#f 7x"
+            ),
+            REQUEST_HOST = REQUEST_HOST,
+        );
+        for settings in [create_test_settings(), rehosting_settings()] {
+            let page = rendered(
+                &settings,
+                &format!(
+                    r#"<img srcset="{value}"><link rel="preload" as="image" imagesrcset="{value}">"#
+                ),
+            );
+            assert!(page.contains(&format!(r#"srcset="{expected}""#)), "{page}");
+            assert!(
+                page.contains(&format!(r#"imagesrcset="{expected}""#)),
+                "{page}"
+            );
+        }
+    }
+
+    #[test]
+    fn late_first_base_resolves_earlier_references_and_later_bases_do_not_win() {
+        let page = rendered(
+            &rehosting_settings(),
+            concat!(
+                r#"<img src="i.png?q=%2f&amp;x=1#f">"#,
+                r#"<base href="https&#58;//cdn.example.net/npm/lib/">"#,
+                r#"<base href="http://elsewhere.example/">"#,
+                r#"<img src="//cdn.example.net/npm/lib/second.png">"#,
+            ),
+        );
+        let reader = format!("https://{REQUEST_HOST}{PAGE_PREFIX}{ROUTE}lib/");
+        assert!(
+            page.contains(&format!(r#"src="{reader}i.png?q=%2f&amp;x=1#f""#)),
+            "{page}"
+        );
+        assert!(
+            page.contains(&format!(r#"src="{reader}second.png""#)),
+            "{page}"
+        );
+    }
+
+    #[test]
+    fn protocol_relative_references_follow_the_effective_base_scheme() {
+        let page = rendered(
+            &rehosting_settings(),
+            concat!(
+                r#"<img src="//cdn.example.net/npm/a.png">"#,
+                r#"<base href="http&#58;//cdn.example.net/npm/">"#,
+            ),
+        );
+        assert!(
+            page.contains(r#"src="//cdn.example.net/npm/a.png""#),
+            "{page}"
+        );
+        assert!(
+            !page.contains(&format!("{PAGE_PREFIX}{ROUTE}a.png")),
+            "{page}"
+        );
+    }
+
+    #[test]
+    fn base_scan_ignores_comments_rawtext_templates_and_foreign_elements() {
+        let document = url::Url::parse("https://cdn.example.net/npm/articles/page.html?q=1")
+            .expect("document URL");
+        let source = concat!(
+            r#"<!-- <base href="http://comment.example/"> -->"#,
+            r#"<script>const x='<base href="http://script.example/">'</script>"#,
+            r#"<style>x::before{content:'<base href="http://style.example/">'}</style>"#,
+            r#"<textarea><base href="http://textarea.example/"></textarea>"#,
+            r#"<template><base href="http://template.example/"><template><base href="/nested/"></template></template>"#,
+            r#"<svg><base href="http://svg.example/"/></svg>"#,
+            r#"<base href="../lib/?x=1&amp;y=%2f#f"><base href="http://later.example/">"#,
+        );
+        let base = super::effective_document_base(source.as_bytes(), &document).expect("base");
+        assert_eq!(
+            base.as_str(),
+            "https://cdn.example.net/npm/lib/?x=1&y=%2f#f"
+        );
+        let invalid = super::effective_document_base(
+            br#"<base href="http://[invalid"><base href="http://later.example/">"#,
+            &document,
+        )
+        .expect("invalid first base falls back");
+        assert_eq!(invalid, document);
+    }
+
+    #[test]
+    fn decoded_query_bytes_are_serialized_once_in_each_rehosted_attribute() {
+        let value = "https://cdn.example.net/npm/a.png?q=%2f&amp;literal=&amp;amp;#f%2F";
+        let page = rendered(
+            &rehosting_settings(),
+            &format!(
+                r#"<img src="{value}" srcset="{value} 1x"><link rel="preload" as="image" imagesrcset="{value} 2x">"#
+            ),
+        );
+        let emitted = format!(
+            "https://{REQUEST_HOST}{PAGE_PREFIX}{ROUTE}a.png?q=%2f&amp;literal=&amp;amp;#f%2F"
+        );
+        assert!(page.contains(&format!(r#"src="{emitted}""#)), "{page}");
+        assert!(
+            page.contains(&format!(r#"srcset="{emitted} 1x""#)),
+            "{page}"
+        );
+        assert!(
+            page.contains(&format!(r#"imagesrcset="{emitted} 2x""#)),
+            "{page}"
         );
     }
 }

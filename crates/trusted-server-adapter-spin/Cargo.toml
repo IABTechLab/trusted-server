@@ -29,6 +29,8 @@ edgezero-core = { workspace = true }
 error-stack = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
+# Frames for the streamed response body handed to the Spin host (src/lib.rs).
+http-body = { workspace = true }
 http-body-util = { workspace = true }
 log = { workspace = true }
 trusted-server-ad-server-iabtl = { workspace = true }
@@ -50,6 +52,7 @@ trusted-server-core = { workspace = true }
 trusted-server-framework-nextjs = { workspace = true }
 trusted-server-headers-geo = { workspace = true }
 trusted-server-identity-lockr = { workspace = true }
+trusted-server-provenance-encypher = { workspace = true }
 trusted-server-loading-cache-51degrees = { workspace = true }
 trusted-server-shared-aws = { workspace = true }
 trusted-server-permission-signal-gpc = { workspace = true }

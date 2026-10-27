@@ -1365,7 +1365,7 @@ A module with settings of its own reads them from its own block, `[robots-txt.<n
 1. With `refuse_all` selected the file is the refusal and nothing else, whatever else is selected, and every response the deployment finalizes carries `X-Robots-Tag: noindex, nofollow`.
 2. A path in `always_allow` stays open to every crawler a module's rules refuse the whole site to, `*` included. A narrower rule is kept as the module gave it, so `Disallow: /ads` still closes off `/ads.txt`.
 3. The rules appear in the order `modules` names them, between `top_text` above and the `Sitemap` line and `bottom_text` below.
-4. A module is asked for the host the request was addressed to, never one that `Forwarded` or `X-Forwarded-Host` names, and is given nothing of the crawler's connection. Holding is the normal case. A module's answer is held for that host in the loading cache of the one loading cache module the build links, or of the module `[cache.robots-txt]` names, briefly in memory and in the shared store outside it, so a module is asked again only when no copy young enough is held, rather than by every request, and `[cache.robots-txt]` sets how long the copies last, as described under [Loading caches](#loading-caches). The last answer is also kept apart for 30 days, in the value cache on Fastly and in the key-value store on Cloudflare and Spin, and Axum, which has no key-value store, keeps none. A value cache can drop an entry early, so on Fastly an answer past its age is likely, rather than certain, to be there when a module cannot answer.
+4. A module is asked for the host the request was addressed to, never one that `Forwarded` or `X-Forwarded-Host` names, and is given nothing of the crawler's connection. Holding is the normal case. A module's answer is held for that host in the loading cache of the one loading cache module the build links, or of the module `[cache.robots-txt]` names, briefly in memory and in the shared store outside it, so a module is asked again only when no copy young enough is held, rather than by every request, and `[cache.robots-txt]` sets how long the copies last, as described under [Loading caches](#loading-caches). The last answer is also kept apart for 30 days, in the value cache on Fastly and in the key-value store on Cloudflare and Spin. Axum persists it in the runtime KV file when `TRUSTED_SERVER_KV_PATH` is set; with the variable unset, it keeps no persistent fallback. A value cache can drop an entry early, so on Fastly an answer past its age is likely, rather than certain, to be there when a module cannot answer.
 5. A module that cannot answer has its last answer served past its age. With no answer kept at all, or with no rule anywhere in the file, the file is `503` with `Retry-After: 600`, never an empty file, which a crawler would read as permission to crawl everything. Select `allow_all` to allow every crawler.
 6. Spin's key-value store gives an entry no lifetime, so there a kept answer stays until it is replaced, and one kept for settings that have since changed stays until it is deleted from the store. With no loading cache module linked, or several linked and none named in `[cache.robots-txt]`, no copy is held, so every request for the file asks each module, and a deployment whose key-value store cannot be opened keeps no last answer either.
 7. The file is made by the `robots_txt` middleware, which runs on `text/plain` at `/robots.txt` alone, in the phase the entry places it in, prepares the file before the document is processed, and replaces the origin's `text/plain` file with it. The origin is asked for its whole file, without a crawler's conditional or range headers. Any other answer to a `GET` or `HEAD`, such as a `404`, a page from a single-page application's catch-all, a redirect or a `401` from a staging site behind a login, has the file made in its place with status `200`. An origin that cannot be reached gives `502`, which a crawler reads as refusing everything. The response takes the deployment's cache policy for the path, as every file does, so where the response is stored a module is asked only when the stored copy has ended, however soon its refresh is due. A refusal, as in point 5, is answered before any document is processed, and nothing is stored.
@@ -1703,16 +1703,18 @@ verification off, and they log nothing about it.
 
 Asset routes proxy selected first-party paths to an alternate asset origin without requiring signed `/first-party/proxy` URLs.
 
-| Field             | Type   | Required | Description                                                       |
-| ----------------- | ------ | -------- | ----------------------------------------------------------------- |
-| `prefix`          | String | Yes      | Request path prefix to match                                      |
-| `source`          | Table  | Yes      | Where the route's content comes from, in the shape `[source]` has |
-| `path_pattern`    | String | No       | Regex matched against the incoming request path                   |
-| `target_path`     | String | No       | Replacement path used with `path_pattern`                         |
-| `image_optimizer` | Table  | No       | Optional route-level Image Optimizer settings                     |
+| Field                    | Type    | Required              | Description                                                               |
+| ------------------------ | ------- | --------------------- | ------------------------------------------------------------------------- |
+| `prefix`                 | String  | Yes                   | Request path prefix to match                                              |
+| `source`                 | Table   | Yes                   | Where the route's content comes from, in the shape `[source]` has         |
+| `path_pattern`           | String  | No                    | Regex matched against the incoming request path                           |
+| `target_path`            | String  | No                    | Replacement path used with `path_pattern`                                 |
+| `image_optimizer`        | Table   | No                    | Optional route-level Image Optimizer settings                             |
+| `rehost_page_references` | Boolean | No (default: `false`) | Serve a third party's files from this host and rewrite pages to name them |
 
-Write `prefix`, `path_pattern` and `target_path` before the route's source
-tables, because a table header ends the route's own keys.
+Write `prefix`, `path_pattern`, `target_path` and `rehost_page_references`
+before the route's source tables, because a table header ends the route's own
+keys.
 
 **Example**:
 
@@ -1749,6 +1751,10 @@ url = "https://assets-cdn.example.com"
 - The longest matching asset-route prefix wins.
 - `path_pattern` and `target_path` must be configured together.
 - Unsafe origin response headers such as `Set-Cookie` are stripped before the response reaches the browser.
+- A route with `rehost_page_references = true` serves the files of its `https` origin folder, and pages served through the publisher pipeline name the route's address for media and, where a `[[serve]]` entry for `text/css` covers the path, stylesheets in that folder. Its prefix must end in `/`, must not sit under `/_ts`, and must not overlap another route's. See [Rehosting third-party files](./asset-routes.md#rehosting-third-party-files) for the full contract.
+- With any rehosting route enabled, original HTML is decoded and buffered under `publisher.max_buffered_body_bytes` before rewriting, so its first effective `base[href]` resolves all references, including preceding ones, against the full fetched document URL. Exceeding the bound refuses the response before partial rewritten output. Applicable middleware source-protection policies also hold bounded original HTML, even without rehost routes: Encypher preserves original provenance-bearing inline SVG and all descendants before core, fetch or serve edits. Exact source slices are restored before template publication and protected again on warm reader copies. Invalid ranges or damaged/lost/duplicated protection markers refuse the pass. HTML with neither rehosting nor an applicable protection policy keeps its normal streaming behavior.
+- Shared-template admission structurally observes fully restored markup for nonce attributes and nonce-bearing meta CSP, including protected SVG and middleware-generated markup. A nonce or an observation error prevents shared storage; preservation never hides source bytes from this privacy gate.
+- Rehosting validates the complete outbound `Host` authority, including a non-default port. CSS-chain candidate paths bypass raw-copy caching. Moved CSS keeps browser `max-age` and shared `s-maxage` (fallback `max-age`) independent, subtracts received/apparent age and processing time before rebasing, and applies the corresponding route cap to each, even after middleware and adapter headers. See [Rehosting third-party files](./asset-routes.md#rehosting-third-party-files) for the collection and freshness bounds.
 
 ### `[proxy.asset_routes.source.origin]`
 
@@ -1825,12 +1831,13 @@ Effective `origin_query` precedence is auth-level `origin_query`, then enabled I
 
 Route-level Image Optimizer configuration selects a reusable profile set.
 
-| Field          | Type    | Required         | Default              | Description                                                                 |
-| -------------- | ------- | ---------------- | -------------------- | --------------------------------------------------------------------------- |
-| `enabled`      | Boolean | No               | `true`               | Enable Image Optimizer for the route                                        |
-| `region`       | String  | Yes when enabled | none                 | Fastly IO processing region, such as `us_east`                              |
-| `profile_set`  | String  | Yes when enabled | none                 | Name under `[image_optimizer.profile_sets.*]`                               |
-| `origin_query` | String  | No               | `strip` when enabled | `preserve` or `strip`; effective `preserve` is rejected while IO is enabled |
+| Field           | Type    | Required         | Default              | Description                                                                                                                                                                     |
+| --------------- | ------- | ---------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`       | Boolean | No               | `true`               | Enable Image Optimizer for the route                                                                                                                                            |
+| `region`        | String  | Yes when enabled | none                 | Fastly IO processing region, such as `us_east`                                                                                                                                  |
+| `profile_set`   | String  | Yes when enabled | none                 | Name under `[image_optimizer.profile_sets.*]`                                                                                                                                   |
+| `origin_query`  | String  | No               | `strip` when enabled | `preserve` or `strip`; effective `preserve` is rejected while IO is enabled                                                                                                     |
+| `signed_source` | Boolean | No               | `false`              | With a media signer, IO reads the route's own signed original on this host instead of the origin (see [Asset Routes](/guide/asset-routes#optimized-images-and-c2pa-provenance)) |
 
 **Example**:
 
@@ -2095,8 +2102,10 @@ build their state for each request. The copy in the shared store is the one
 every instance reads. The shared store is the host's value cache where
 it supplies one, being Fastly's cache, and its key-value store otherwise, being
 the `TRUSTED_SERVER_KV` namespace on Cloudflare and the `default` store on
-Spin. Axum has neither, so there the memory copy is the only one. A
-copy in the shared store goes when its lifetime ends, or sooner when no request
+Spin. Axum uses the persistent redb file named by `TRUSTED_SERVER_KV_PATH`
+when set; loading caches and Encypher share that runtime store. With the variable
+unset, Axum holds only the in-memory copy. A copy in the shared store goes when
+its lifetime ends, or sooner when no request
 has used it for the idle time, and an answer with a shorter lifetime of its own
 ends sooner still. Every key starts with `ts.` and the publisher's domain, with
 a leading `www.` dropped, so publishers sharing a store never share a copy.
@@ -2393,9 +2402,78 @@ generated configuration places it in.
 | `ad-tag.google.diagnostics`   | `[[serve]]` | For a request that activated diagnostics, writes the bootstrap ahead of the script bundle and the tag that loads the diagnostics module straight after it                                                                                                                                                                                                         |
 | `ads-txt.iabtl`               | `[[fetch]]` | Writes the lines `[ads-txt.iabtl]` gives at the end of the publisher's `ads.txt`, on `text/plain` alone                                                                                                                                                                                                                                                           |
 | `headers.geo`                 | `[[serve]]` | Writes the location the request resolved as the `x-geo-*` response headers, or `x-geo-info-available: false` where none is known. `[headers] modules = ["geo"]` selects it                                                                                                                                                                                        |
+| `provenance.encypher`         | `[[serve]]` | Signs eligible articles and embedded media on admitted public pages. Shared policy failures leave the page unchanged; article and individual media failures leave only those items unchanged, so other eligible items may still be signed. `[provenance] module = "encypher"` selects it                                                                          |
 | `51degrees.client_hints`      | `[[serve]]` | Asks the 51Degrees service which client hints the reader's browser can send, writes `Accept-CH` and `Critical-CH` unless the browser already sends those hints, `Permissions-Policy` on the response and the `Delegate-CH` tag in the head for that list, and leaves the names in the request's state                                                             |
 | `robots_txt`                  | `[[fetch]]` | Makes the `robots.txt` that `[robots-txt]` describes, in place of whatever the origin answers, on `text/plain` and at `/robots.txt` alone                                                                                                                                                                                                                         |
 | `service_version`             | `[[serve]]` | Writes `X-TS-Version`, the git version the build compiled in, and `X-TS-Service-Version`, the platform's version number of the service, when each is known. Core supplies it, so no section selects it                                                                                                                                                            |
+
+Encypher identifies a reusable signing plan by canonical article text, policy
+and credential context. Page URL and title are deliberately not part of that
+identity: the matching service deduplicates equal canonical text, so a reused
+manifest can retain the first canonical source URL. Configure the middleware
+only where that content identity is correct for the publisher.
+
+`max_document_bytes` also bounds the final signed HTML. The module counts
+inserted marker bytes and the escaped manifest meta element before allocating
+the rendered page; a plan that would cross the bound leaves the original page
+unchanged.
+
+Selecting Encypher also installs the media signer for eligible public binary
+responses delivered through publisher and asset routes. Response media type
+and verified bytes decide eligibility, including on extensionless paths.
+Images, audio, video and fonts are candidates; existing provenance and
+fragmented stream segments are preserved rather than signed again.
+`max_media_bytes` bounds each captured or decoded item, with a maximum of
+8,000,000 bytes.
+
+**Upgrade behavior:** an existing text-signing configuration also enables
+bounded media signing after this upgrade. The defaults are 5,000,000 bytes per
+item and 8 uncached embedded calls per document. There is no separate bounded
+media off switch; removing the module disables its article signing too.
+Deploy the matching API first and confirm media upload approval, API capacity
+and cold-page latency before upgrading an enabled edge. The complete settings,
+validation bounds and rollout contract are in the
+[module design](../superpowers/specs/2026-10-24-encypher-provenance-module-design#_3-configuration).
+
+`article_selector` accepts a single `.class`, exact `[attr=value]` (optionally
+quoted) or tag name, up to 91 characters. Unsupported or malformed syntax
+refuses settings admission. An empty selector, or a valid selector absent from
+the page, retains the normal article-boundary fallback.
+
+The HTML middleware signs eligible source `data:` URIs and inline SVG.
+For embedded data in CSS, place `provenance.encypher.stylesheet` in a
+`[[serve]]` entry with `media_type = "text/css"` and a path narrower than `/`.
+The publisher must know that those stylesheets are not loaded with
+subresource integrity. To move eligible external references onto configured
+asset routes, use the opt-in
+[rehosting contract](./asset-routes#rehosting-third-party-files).
+
+For pages with many embedded images, `[provenance.encypher]`
+`max_media_sign_calls_per_document` accepts `1..=128` and defaults to `8`.
+It bounds uncached embedded-media signing calls in each HTML or CSS document.
+Cache hits do not consume the budget. Once exhausted, remaining items stay
+unchanged without a negative cache entry. Raising this value does not increase
+`max_hold_ms`, body limits or API rate limits; verify the complete cold page
+under the deployed adapter before selecting a larger value.
+
+`max_large_media_bytes = 0` keeps prepared large-media signing off by default.
+Enabling it requires the matching prepared API and signed probe, a
+version-pinned source and a runtime timer that bounds the complete hashing and
+signing operation under `max_large_media_ms`. Fastly has no such total timer,
+so it refuses this lane even where the API supports the file. Its first-byte
+and between-byte timeouts are not substitutes. A refused large-media signing
+attempt delivers a fresh origin response without adding provenance.
+
+Coverage follows the delivered bytes through configured publisher and asset
+routes. A page can still load unsigned media directly from a third-party frame
+or a script, and scripts can create new inline SVG after the response leaves
+Trusted Server. Adding an asset route does not intercept those requests or
+establish provenance for those generated nodes. Private stylesheets and
+integrity-protected resources retain their refusal rules. Verify terminal
+browser responses and dynamic DOM media before claiming complete page coverage;
+successful signing of every routed response alone is not that proof. Detached
+formats also require retrieval of the emitted manifest URL through the public
+deployment, not only verification against a locally supplied sidecar.
 
 An entry that could not do what it says refuses the configuration, both when
 a deployment is validated and when the settings load. That is a media type

@@ -22,6 +22,7 @@ members = [
     "crates/ads-txt/iabtl",
     "crates/analytics/tinybird",
     "crates/headers/geo",
+    "crates/provenance/encypher",
     "crates/loading-cache/51degrees",
     "crates/shared/aws",
     "crates/shared/51degrees",
@@ -98,6 +99,8 @@ edgezero-adapter-fastly = { git = "https://github.com/IABTechLab/edgezero", tag 
 edgezero-adapter-spin = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.9", default-features = false }
 edgezero-cli = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.9" }
 edgezero-core = { git = "https://github.com/IABTechLab/edgezero", tag = "v0.0.9", default-features = false }
+# The tree scraper's HTML sink builds; 0.10 is the version scraper locks.
+ego-tree = "0.10"
 env_logger = "0.11"
 error-stack = "0.6"
 esi = "0.7.2"
@@ -115,8 +118,12 @@ glob = "0.3"
 getrandom = "0.2"
 hex = "0.4.3"
 hmac = "0.12.1"
+# The HTML parser scraper drives; the Encypher module parses inline SVG
+# fragments with it directly. 0.35 is the version scraper already locks.
+html5ever = "0.35"
 http = "1.4.0"
 httpdate = "1.0.3"
+http-body = "1"
 http-body-util = "0.1"
 hyper = "1"
 hyper-util = "0.1"
@@ -136,6 +143,8 @@ rand = "0.8"
 rcgen = { version = "0.13", features = ["x509-parser"] }
 regex = "1.12.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# The Encypher module's XML parser for inline SVG; DTDs stay refused.
+roxmltree = { version = "0.21.1", default-features = false, features = ["std"] }
 rpassword = "7.5"
 rustls = "0.23"
 rustls-pemfile = "2"
@@ -176,6 +185,7 @@ trusted-server-cmp-inmobi = { path = "crates/cmp/inmobi" }
 trusted-server-ads-txt-iabtl = { path = "crates/ads-txt/iabtl" }
 trusted-server-analytics-tinybird = { path = "crates/analytics/tinybird" }
 trusted-server-headers-geo = { path = "crates/headers/geo" }
+trusted-server-provenance-encypher = { path = "crates/provenance/encypher" }
 trusted-server-loading-cache-51degrees = { path = "crates/loading-cache/51degrees" }
 trusted-server-shared-aws = { path = "crates/shared/aws" }
 trusted-server-shared-51degrees = { path = "crates/shared/51degrees" }
@@ -197,6 +207,10 @@ url = "2.5.8"
 urlencoding = "2.1"
 uuid = { version = "1.18", features = ["v4"] }
 validator = { version = "0.20", features = ["derive"] }
+# The Encypher provenance module's probe host: an interpreter with no JIT,
+# so the signed probe release runs on every edge target.
+wasmi = { version = "2.0", default-features = false, features = ["std", "validate", "auto-dispatch"] }
+wat = "1.247"
 web-time = "1"
 webpki-roots = "1"
 which = "8"

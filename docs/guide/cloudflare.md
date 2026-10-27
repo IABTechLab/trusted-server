@@ -89,8 +89,14 @@ selects run as on Fastly, and `[device] module = "platform"` classifies from
 the `User-Agent`, because the Worker supplies no TLS or HTTP/2 signals. An
 Edge Cookie module creates and writes its cookie with no identity graph
 behind it, and `POST /_ts/api/v1/ec/resolve` sets one the same way.
-`[[proxy.asset_routes]]` are served from each route's own source with the
-asset body held whole, up to 10 MiB, and a larger one answers `502`. The
+`[[proxy.asset_routes]]` are served from each route's own source. The HTTP
+client passes a streamed origin body on one runtime chunk at a time, held to
+the caller's byte limit if it sets one, and the Worker sends a streamed
+response to the client as it is produced. A buffered body is held whole, up
+to 10 MiB, and a larger one answers `502`. Because the Workers stream reports
+an aborted origin connection as a clean end, a streamed body without a
+`Content-Encoding` that ends short of its `Content-Length` ends with an error
+instead of reaching the client as complete. The
 adapter does not translate Image Optimizer metadata into Cloudflare's own
 image options, so the Worker warns about each route that enables the Image
 Optimizer, once for each instance (see [Logging](#logging)), and each request

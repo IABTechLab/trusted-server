@@ -468,6 +468,7 @@ pub fn shipped_module_builders() -> Vec<IntegrationBuilder> {
         trusted_server_ad_tag_google::diagnostics::builder(),
         trusted_server_ads_txt_iabtl::builder(),
         trusted_server_headers_geo::builder(),
+        trusted_server_provenance_encypher::builder(),
         // Run by `[shared.51degrees]` rather than selected by a section.
         trusted_server_middleware_51degrees::builder(),
         // The analytics module `[analytics]` selects, which changes no page.
@@ -529,7 +530,9 @@ impl AppState {
         if let Some(module) = self.registry.device_module() {
             services = services.with_device_module(module);
         }
-        services = services.with_identifier_modules(self.registry.identifier_modules());
+        services = services
+            .with_identifier_modules(self.registry.identifier_modules())
+            .with_media_signer(self.registry.media_signer());
         // The publisher this request resolved to names every key in a shared
         // store and every name the browser holds.
         let prefixes = self.registry.prefixes(
@@ -1102,8 +1105,15 @@ async fn dispatch_asset_fallback(
     let asset_route = &state.settings.proxy.asset_routes[index];
     let answer = match state.registry.route_source(&state.settings, index) {
         Ok(source) => {
-            handle_asset_proxy_request(&state.settings, services, req, asset_route, source.as_ref())
-                .await
+            handle_asset_proxy_request(
+                &state.settings,
+                services,
+                &state.registry,
+                req,
+                asset_route,
+                source.as_ref(),
+            )
+            .await
         }
         Err(report) => Err(report),
     };
@@ -2035,6 +2045,7 @@ mod tests {
                 "ad-tag.google.diagnostics",
                 "ads-txt.iabtl",
                 "headers.geo",
+                "provenance.encypher",
                 "51degrees",
                 "analytics.tinybird",
                 "auction-protocol.openrtb",

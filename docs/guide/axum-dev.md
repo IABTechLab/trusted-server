@@ -59,6 +59,16 @@ its `ext.debug` echo of the resolved request) when the `[demand.<name>]` table
 of a Prebid Server demand source sets `debug = true`. Enable it only for short
 local debugging sessions.
 
+## Runtime KV
+
+Generic runtime KV (`RuntimeServices::kv_store`) is off by default. Set
+`TRUSTED_SERVER_KV_PATH` to a file path before starting the server and the dev
+server opens one persistent store at that path, creating missing directories,
+and shares it across all requests. Data survives restarts; two servers pointed
+at different paths do not see each other's data. If the variable is set but the
+store cannot be opened, the server exits with an error. When it is unset,
+runtime KV reports unavailable and a warning is logged once.
+
 ## Runtime boundaries
 
 Axum sanitizes forwarded client-IP headers but does not resolve
@@ -69,10 +79,16 @@ and `[device] module = "platform"` classifies from the `User-Agent`, because
 the dev server supplies no TLS or HTTP/2 signals. An Edge Cookie module
 creates and writes its cookie with no identity graph behind it, and
 `POST /_ts/api/v1/ec/resolve` sets one the same way. `[[proxy.asset_routes]]`
-are served from each route's own source with the asset body held whole, with
-no limit. The dev server has no Image Optimizer, so startup warns about each
-route that enables one, and each request such a route would optimize answers
-`502` (see [Asset Routes](./asset-routes)).
+are served from each route's own source. The HTTP client passes a streamed
+origin body on as it arrives, held to the caller's byte limit if it sets one,
+and the dev server's own front end hands a streamed response to the client
+chunk by chunk, so a slow client slows the origin read and a client that
+leaves drops it. A buffered body is held whole, with no limit. The client's
+30 second timeout covers the whole exchange, a streamed body included. At most
+256 requests run at once, and later ones wait for a free slot. The dev server
+has no Image Optimizer, so startup warns about each route that enables one,
+and each request such a route would optimize answers `502` (see
+[Asset Routes](./asset-routes)).
 
 Axum sends no [auction telemetry](./telemetry#adapter-support), and warns at
 startup when `[analytics]` selects a module.

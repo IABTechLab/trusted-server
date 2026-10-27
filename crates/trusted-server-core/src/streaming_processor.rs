@@ -22,6 +22,7 @@
 use std::cell::{Cell, RefCell};
 use std::io::{self, Read, Write};
 use std::rc::Rc;
+use std::time::Duration;
 
 use brotli::Decompressor;
 use brotli::enc::BrotliEncoderParams;
@@ -29,8 +30,10 @@ use brotli::enc::writer::CompressorWriter;
 use error_stack::{Report, ResultExt as _};
 use flate2::read::ZlibDecoder;
 use flate2::write::{GzEncoder, ZlibEncoder};
+use futures::future::{Either, LocalBoxFuture};
 
 use crate::error::TrustedServerError;
+use crate::platform::RuntimeServices;
 
 /// Trait for streaming content processors
 pub trait StreamProcessor {
@@ -50,6 +53,113 @@ pub trait StreamProcessor {
 
     /// Reset the processor state (useful for reuse)
     fn reset(&mut self) {}
+
+    /// Starts an optional asynchronous finish of this processor's final output.
+    ///
+    /// `held` is exactly what the final [`process_chunk`](Self::process_chunk)
+    /// call (`is_last = true`) returned: the bytes the processor emits when it
+    /// does no asynchronous work. The driver owns `held` and calls this at most
+    /// once, right after that final call, with the request's
+    /// [`RuntimeServices`].
+    ///
+    /// Returning `None`, the default, emits `held` unchanged and creates no
+    /// future. Returning a finish makes the driver await it and emit its
+    /// output in place of `held`. The output is infallible: a processor absorbs
+    /// its own failures and returns the bytes to emit, typically `held` itself.
+    /// On a runtime with a [`PlatformTimer`](crate::platform::PlatformTimer),
+    /// the driver drops the finish once the deadline given to
+    /// [`AsyncFinish::new`] elapses and emits `held` instead.
+    ///
+    /// Only a driver that can await calls this, through
+    /// [`finish`](Self::finish). A synchronous driver, such as
+    /// [`StreamingPipeline`], emits `held`.
+    fn async_finish<'a>(
+        &'a mut self,
+        held: &'a [u8],
+        services: &'a RuntimeServices,
+    ) -> Option<AsyncFinish<'a>> {
+        let _ = (held, services);
+        None
+    }
+
+    /// Ends the document with `chunk` as its last input, awaiting any
+    /// asynchronous finish, for a driver that can await. Called once, in place
+    /// of `process_chunk(chunk, true)`.
+    ///
+    /// The default processes `chunk` as the last chunk and runs
+    /// [`async_finish`](Self::async_finish) over what that returned. A
+    /// processor made of others ends each of them in order with their own
+    /// `finish`, so each is handed what the one before it finished with, and
+    /// none is handed its last chunk before the one before it has finished.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if processing the last chunk fails.
+    fn finish<'a>(
+        &'a mut self,
+        chunk: &'a [u8],
+        services: &'a RuntimeServices,
+    ) -> LocalBoxFuture<'a, Result<Vec<u8>, io::Error>> {
+        Box::pin(async move {
+            let held = self.process_chunk(chunk, true)?;
+            Ok(finish_held(self, held, services).await)
+        })
+    }
+}
+
+/// Asynchronous work a [`StreamProcessor`] completes after its final chunk.
+///
+/// Created by [`StreamProcessor::async_finish`]. The future is `?Send`, like
+/// the platform services it awaits.
+pub struct AsyncFinish<'a> {
+    deadline: Duration,
+    output: LocalBoxFuture<'a, Vec<u8>>,
+}
+
+impl<'a> AsyncFinish<'a> {
+    /// Wraps `output`, which resolves to the bytes to emit, with the time the
+    /// driver may wait for it.
+    ///
+    /// `deadline` is measured from when the driver starts awaiting the finish.
+    /// It is a backstop: a processor should bound its own calls well within it.
+    #[must_use]
+    pub fn new(deadline: Duration, output: impl Future<Output = Vec<u8>> + 'a) -> Self {
+        Self {
+            deadline,
+            output: Box::pin(output),
+        }
+    }
+}
+
+/// Runs `processor`'s optional asynchronous finish over `held`, its final
+/// output.
+///
+/// Returns the finish output, or `held` when the processor has no finish. When
+/// `services` has a timer, the finish races its deadline; on expiry the finish
+/// future is dropped and `held` is returned. Without a timer the finish is
+/// awaited to completion.
+async fn finish_held<P: StreamProcessor + ?Sized>(
+    processor: &mut P,
+    held: Vec<u8>,
+    services: &RuntimeServices,
+) -> Vec<u8> {
+    let deadline = {
+        let Some(AsyncFinish { deadline, output }) = processor.async_finish(&held, services) else {
+            return held;
+        };
+        let Some(timer) = services.timer() else {
+            return output.await;
+        };
+        match futures::future::select(output, timer.sleep(deadline)).await {
+            Either::Left((output, _)) => return output,
+            Either::Right(((), _)) => deadline,
+        }
+    };
+    log::warn!(
+        "A stream processor's finish ran past its {} ms deadline, so its held output is emitted",
+        deadline.as_millis()
+    );
+    held
 }
 
 /// Compression type for the stream

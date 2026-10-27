@@ -74,6 +74,13 @@ pub struct PlatformHttpRequest {
     /// Adapters that cannot preserve streaming response bodies should return an
     /// error rather than silently buffering large asset responses.
     pub stream_response: bool,
+    /// Maximum response-body bytes the adapter may buffer or yield.
+    ///
+    /// `None` preserves the adapter's existing behavior. When set, an adapter
+    /// must enforce the bound while receiving or yielding the body, before
+    /// appending a chunk that would cross it. A `Content-Length` check alone is
+    /// not sufficient because chunked responses may omit it.
+    pub max_response_body_bytes: Option<usize>,
 }
 
 impl PlatformHttpRequest {
@@ -86,6 +93,7 @@ impl PlatformHttpRequest {
             image_optimizer: None,
             cache_intent: PlatformCacheIntent::Default,
             stream_response: false,
+            max_response_body_bytes: None,
         }
     }
 
@@ -127,6 +135,13 @@ impl PlatformHttpRequest {
     #[must_use]
     pub fn with_stream_response(mut self) -> Self {
         self.stream_response = true;
+        self
+    }
+
+    /// Bound the upstream response body before the adapter buffers or yields it.
+    #[must_use]
+    pub fn with_max_response_body_bytes(mut self, limit: usize) -> Self {
+        self.max_response_body_bytes = Some(limit);
         self
     }
 }
@@ -181,6 +196,7 @@ pub struct PlatformPendingRequest {
     backend_name: Option<String>,
     stream_response: bool,
     request_method: Option<Method>,
+    max_response_body_bytes: Option<usize>,
 }
 
 impl PlatformPendingRequest {
@@ -195,6 +211,7 @@ impl PlatformPendingRequest {
             backend_name: None,
             stream_response: false,
             request_method: None,
+            max_response_body_bytes: None,
         }
     }
 
@@ -217,6 +234,22 @@ impl PlatformPendingRequest {
         self.stream_response = stream_response;
         self.request_method = Some(request_method);
         self
+    }
+
+    /// Retain the response-body bound for direct single-handle waits.
+    ///
+    /// An adapter whose host `select` operation cannot preserve this metadata
+    /// must reject bounded handles in `select` rather than silently drop it.
+    #[must_use]
+    pub fn with_max_response_body_bytes(mut self, limit: Option<usize>) -> Self {
+        self.max_response_body_bytes = limit;
+        self
+    }
+
+    /// Maximum response-body bytes requested by the caller.
+    #[must_use]
+    pub fn max_response_body_bytes(&self) -> Option<usize> {
+        self.max_response_body_bytes
     }
 
     /// Whether completion must preserve the response body as a stream.
@@ -246,6 +279,7 @@ impl PlatformPendingRequest {
             backend_name,
             stream_response,
             request_method,
+            max_response_body_bytes,
         } = self;
 
         match inner.downcast::<T>() {
@@ -255,6 +289,7 @@ impl PlatformPendingRequest {
                 backend_name,
                 stream_response,
                 request_method,
+                max_response_body_bytes,
             }),
         }
     }
@@ -266,6 +301,7 @@ impl fmt::Debug for PlatformPendingRequest {
             .field("backend_name", &self.backend_name)
             .field("stream_response", &self.stream_response)
             .field("request_method", &self.request_method)
+            .field("max_response_body_bytes", &self.max_response_body_bytes)
             .finish()
     }
 }

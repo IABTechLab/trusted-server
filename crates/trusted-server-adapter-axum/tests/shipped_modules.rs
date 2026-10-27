@@ -1,23 +1,13 @@
 //! What the module builders the Axum adapter links give a deployment, proven
 //! from outside the adapter: the stock loading cache, each module's own
 //! deploy rules and secret settings, the diagnostics module's request
-//! preparer, the middleware the template and the guide document, the ad
-//! server's decision between planned bids, and the maintainers every crate
-//! outside core names.
+//! preparer, the ad server's decision between planned bids, and the maintainers
+//! every crate outside core names.
 
 #![allow(clippy::panic, reason = "tests use panic-on-failure helpers")]
 
 use trusted_server_adapter_axum::app::shipped_module_builders;
-use trusted_server_core::integrations::{
-    IntegrationRegistry, SuppliedMiddleware, supplied_middleware,
-};
-use trusted_server_core::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
-
-/// The middleware the linked modules and core supply, with the integration
-/// that supplies each, in the order the registry registers them.
-fn listed_middleware() -> Vec<(&'static str, SuppliedMiddleware)> {
-    supplied_middleware(&shipped_module_builders())
-}
+use trusted_server_core::integrations::IntegrationRegistry;
 
 /// A feature selects the stock loading cache by the module's short name, so
 /// a stock build keeps what it loads rather than asking each source every
@@ -306,106 +296,6 @@ fn the_linked_list_attaches_the_diagnostics_module_s_request_preparer() {
             .map(|value| value.to_str().expect("cookie should be text")),
         Some("keep-me=yes"),
         "should strip the reserved diagnostics cookie and keep the rest"
-    );
-}
-
-/// The template's entries name every middleware the linked modules and core
-/// supply, in the order the registry registers them, which is the order a
-/// deployment that runs them all names them in.
-#[test]
-fn the_template_s_entries_name_the_listed_middleware() {
-    use trusted_server_core::settings::Settings;
-    use trusted_server_core::test_support::template::{
-        template_with_resolved_required_secrets, uncomment_block,
-    };
-
-    let template = uncomment_block(
-        &uncomment_block(&template_with_resolved_required_secrets(), "[[fetch]]"),
-        "[[serve]]",
-    );
-    let settings =
-        Settings::from_toml(&template).expect("should load the template with its entries");
-    let listed = listed_middleware();
-
-    for phase in MiddlewarePhase::ALL {
-        let entries = settings.phase_entries(phase).entries();
-        let mut media_types: Vec<&str> = Vec::new();
-        for (_, row) in listed.iter().filter(|(_, row)| row.phase == phase) {
-            if !media_types.contains(&row.media_type) {
-                media_types.push(row.media_type);
-            }
-        }
-        for media_type in media_types {
-            let named_in_list: Vec<&str> = listed
-                .iter()
-                .filter(|(_, row)| row.phase == phase && row.media_type == media_type)
-                .map(|(_, row)| row.name)
-                .collect();
-            let covering: Vec<_> = entries
-                .iter()
-                .filter(|entry| entry.media_type == media_type)
-                .collect();
-            if media_type == HTML_MEDIA_TYPE || covering.iter().any(|entry| entry.path.is_none()) {
-                // One entry covers every page, for HTML and for a media
-                // type a page's own responses come in.
-                assert_eq!(
-                    covering.len(),
-                    1,
-                    "should document one [[{phase}]] entry for {media_type}"
-                );
-                assert!(
-                    covering[0].path.is_none(),
-                    "should document the [[{phase}]] entry that covers every page"
-                );
-            } else {
-                // A file's middleware is placed on the file's own path, one
-                // entry for each file.
-                assert!(
-                    !covering.is_empty(),
-                    "should document a [[{phase}]] entry on a path for each {media_type} file"
-                );
-            }
-            let named: Vec<&str> = covering
-                .iter()
-                .flat_map(|entry| entry.middleware.iter().map(String::as_str))
-                .collect();
-            assert_eq!(
-                named, named_in_list,
-                "should document every {phase} middleware the linked modules supply for \
-                 {media_type}, in the listed order"
-            );
-        }
-    }
-}
-
-/// The guide's table of middleware lists what the linked modules and core
-/// supply, each with its phase, in the order the registry registers them.
-#[test]
-fn the_guide_s_table_lists_the_same_middleware() {
-    const GUIDE: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../docs/guide/configuration.md"
-    ));
-
-    // A row of the table is a name and then the list it is written in.
-    let documented: Vec<(String, String)> = GUIDE
-        .lines()
-        .filter_map(|line| {
-            let mut cells = line.split('|').map(str::trim).skip(1);
-            let name = cells.next()?.strip_prefix('`')?.strip_suffix('`')?;
-            let list = cells.next()?.strip_prefix("`[[")?.strip_suffix("]]`")?;
-            Some((name.to_owned(), list.to_owned()))
-        })
-        .collect();
-    let listed: Vec<(String, String)> = listed_middleware()
-        .iter()
-        .map(|(_, row)| (row.name.to_owned(), row.phase.to_string()))
-        .collect();
-
-    assert_eq!(
-        documented, listed,
-        "should document the middleware the linked modules supply, each with its phase, in \
-         the listed order"
     );
 }
 

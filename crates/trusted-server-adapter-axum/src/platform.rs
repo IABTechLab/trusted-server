@@ -1,19 +1,28 @@
 use std::future::Future;
 use std::net::IpAddr;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use edgezero_adapter_axum::key_value_store::PersistentKvStore;
 use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, header};
+use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
 use error_stack::{Report, ResultExt as _};
 use trusted_server_core::platform::{
-    AuctionTargetCapabilities, AuctionTargetDescriptor, ClientInfo, GeoInfo, PlatformBackend,
-    PlatformBackendSpec, PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient,
-    PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
-    PlatformSelectResult, RuntimeServices, StoreId, StoreName,
+    AuctionTargetCapabilities, AuctionTargetDescriptor, ClientInfo, GeoInfo, KvError,
+    PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError, PlatformGeo,
+    PlatformHttpClient, PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest,
+    PlatformResponse, PlatformSecretStore, PlatformSelectResult, PlatformTimer, RuntimeServices,
+    StoreId, StoreName, UnavailableKvStore,
 };
+
+/// Do not trust an upstream `Content-Length` with an arbitrarily large
+/// allocation before any response bytes arrive.
+const MAX_INITIAL_RESPONSE_BODY_CAPACITY: usize = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // Env-var naming helpers
@@ -302,10 +311,17 @@ impl Future for AxumPendingHandle {
 
 /// reqwest-backed HTTP client for the Axum dev server.
 ///
+/// [`send`](PlatformHttpClient::send) preserves the origin body as a
+/// `Body::Stream` when the request asks for it: each chunk is read from the
+/// connection only when the caller asks for the next one, so a large origin
+/// response never sits whole in memory. The client's 30 second timeout still
+/// covers the whole exchange, body included.
+///
 /// `send_async` buffers any `Body::Stream` in the calling context, then spawns
 /// a `tokio` task for each outbound request so that multiple `send_async` calls
 /// run concurrently. `select` uses [`futures::future::select_all`] to wait for
-/// the first completing handle, preserving fan-out semantics.
+/// the first completing handle, preserving fan-out semantics. That path stays
+/// buffered, so it refuses a request that asks for a streamed response.
 pub struct AxumPlatformHttpClient {
     client: reqwest::Client,
 }
@@ -372,11 +388,115 @@ impl AxumPlatformHttpClient {
         Ok(())
     }
 
+    fn response_carries_body(request_is_head: bool, status: reqwest::StatusCode) -> bool {
+        !request_is_head
+            && !status.is_informational()
+            && status != reqwest::StatusCode::NO_CONTENT
+            && status != reqwest::StatusCode::RESET_CONTENT
+            && status != reqwest::StatusCode::NOT_MODIFIED
+    }
+
+    async fn response_body(
+        mut response: reqwest::Response,
+        limit: Option<usize>,
+        request_is_head: bool,
+    ) -> Result<Vec<u8>, Report<PlatformError>> {
+        let Some(limit) = limit else {
+            return response
+                .bytes()
+                .await
+                .map(|bytes| bytes.to_vec())
+                .change_context(PlatformError::HttpClient);
+        };
+        let content_length = if Self::response_carries_body(request_is_head, response.status()) {
+            response
+                .content_length()
+                .and_then(|length| usize::try_from(length).ok())
+        } else {
+            None
+        };
+        if content_length.is_some_and(|length| length > limit) {
+            return Err(Report::new(PlatformError::HttpClient).attach(format!(
+                "upstream Content-Length exceeds caller response body limit of {limit} bytes"
+            )));
+        }
+        let capacity = content_length
+            .unwrap_or(0)
+            .min(limit)
+            .min(MAX_INITIAL_RESPONSE_BODY_CAPACITY);
+        let mut body = Vec::with_capacity(capacity);
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .change_context(PlatformError::HttpClient)?
+        {
+            body.len()
+                .checked_add(chunk.len())
+                .filter(|length| *length <= limit)
+                .ok_or_else(|| {
+                    Report::new(PlatformError::HttpClient).attach(format!(
+                        "upstream response body exceeded caller limit of {limit} bytes"
+                    ))
+                })?;
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+
+    /// Yield the origin body chunk by chunk, enforcing `limit` before each
+    /// chunk is passed on.
+    ///
+    /// The chunk that would carry the total past `limit` becomes an error
+    /// and ends the stream, as does a failed read, so a truncated or
+    /// oversized origin body never reaches the caller as a complete one.
+    fn streamed_response_body(
+        response: reqwest::Response,
+        limit: Option<usize>,
+    ) -> edgezero_core::body::Body {
+        let stream = futures::stream::unfold(Some((response, 0usize)), move |state| async move {
+            let (mut response, received) = state?;
+            match response.chunk().await {
+                Ok(None) => None,
+                Ok(Some(chunk)) => {
+                    let Some(next_received) = received.checked_add(chunk.len()) else {
+                        return Some((
+                            Err(std::io::Error::other(
+                                "upstream response body byte count overflowed",
+                            )),
+                            None,
+                        ));
+                    };
+                    if let Some(limit) = limit
+                        && next_received > limit
+                    {
+                        return Some((
+                            Err(std::io::Error::other(format!(
+                                "upstream response body exceeded caller limit of {limit} bytes"
+                            ))),
+                            None,
+                        ));
+                    }
+                    Some((Ok(chunk), Some((response, next_received))))
+                }
+                Err(error) => Some((
+                    Err(std::io::Error::other(format!(
+                        "failed to read upstream response body: {error}"
+                    ))),
+                    None,
+                )),
+            }
+        });
+        edgezero_core::body::Body::from_stream(stream)
+    }
+
     async fn execute(
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         Self::refuse_image_optimizer_metadata(&request)?;
+        let max_response_body_bytes = request.max_response_body_bytes;
+        let stream_response = request.stream_response;
+        let request_is_head = request.request.method() == edgezero_core::http::Method::HEAD;
         let uri = request.request.uri().to_string();
         let method = reqwest::Method::from_bytes(request.request.method().as_str().as_bytes())
             .change_context(PlatformError::HttpClient)?;
@@ -398,24 +518,40 @@ impl AxumPlatformHttpClient {
             .change_context(PlatformError::HttpClient)
             .attach(format!("outbound request to {uri} failed"))?;
 
-        let status = resp.status().as_u16();
-        let mut edge_builder = edgezero_core::http::response_builder().status(status);
+        let status = resp.status();
+        let mut edge_builder = edgezero_core::http::response_builder().status(status.as_u16());
         for (name, value) in sanitized_response_headers(resp.headers()) {
             edge_builder = edge_builder.header(name.as_str(), value.as_slice());
         }
-        let resp_bytes = resp
-            .bytes()
-            .await
-            .change_context(PlatformError::HttpClient)?;
-        // Upstream responses are buffered whole with no cap — acceptable for
-        // the dev server, but log the size so a large or hostile upstream is
-        // visible instead of silently growing the heap.
-        log::debug!(
-            "buffered {} upstream response bytes from {uri}",
-            resp_bytes.len()
-        );
+        let body = if !stream_response {
+            let resp_bytes =
+                Self::response_body(resp, max_response_body_bytes, request_is_head).await?;
+            // A caller limit is enforced chunk by chunk before this Vec grows past it.
+            // Unbounded callers retain the dev server's previous whole-body behavior.
+            log::debug!(
+                "buffered {} upstream response bytes from {uri}",
+                resp_bytes.len()
+            );
+            edgezero_core::body::Body::from(resp_bytes)
+        } else if !Self::response_carries_body(request_is_head, status) {
+            edgezero_core::body::Body::empty()
+        } else {
+            // Content-Length permits an early refusal. The stream enforces the
+            // same limit for missing or dishonest lengths.
+            if let Some(limit) = max_response_body_bytes
+                && resp
+                    .content_length()
+                    .is_some_and(|length| u64::try_from(limit).is_ok_and(|limit| length > limit))
+            {
+                return Err(Report::new(PlatformError::HttpClient).attach(format!(
+                    "upstream Content-Length exceeds caller response body limit of {limit} bytes"
+                )));
+            }
+            log::debug!("streaming upstream response body from {uri}");
+            Self::streamed_response_body(resp, max_response_body_bytes)
+        };
         let edge_resp = edge_builder
-            .body(edgezero_core::body::Body::from(resp_bytes.to_vec()))
+            .body(body)
             .change_context(PlatformError::HttpClient)?;
 
         Ok(PlatformResponse::new(edge_resp).with_backend_name(request.backend_name))
@@ -430,6 +566,10 @@ impl Default for AxumPlatformHttpClient {
 
 #[async_trait(?Send)]
 impl PlatformHttpClient for AxumPlatformHttpClient {
+    fn supports_streaming_responses(&self) -> bool {
+        true
+    }
+
     async fn send(
         &self,
         request: PlatformHttpRequest,
@@ -442,10 +582,17 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
         Self::refuse_image_optimizer_metadata(&request)?;
+        if request.stream_response {
+            return Err(Report::new(PlatformError::HttpClient).attach(
+                "the Axum dev server streams responses through send alone; send_async buffers",
+            ));
+        }
         let backend_name = request.backend_name.clone();
+        let max_response_body_bytes = request.max_response_body_bytes;
 
         // Extract all Send-compatible parts before spawning.
         let uri = request.request.uri().to_string();
+        let request_is_head = request.request.method() == edgezero_core::http::Method::HEAD;
         let method_bytes = request.request.method().as_str().as_bytes().to_vec();
         let headers: Vec<(String, Vec<u8>)> = request
             .request
@@ -475,13 +622,8 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
             })?;
             let status = resp.status().as_u16();
             let resp_headers = sanitized_response_headers(resp.headers());
-            let body = resp
-                .bytes()
-                .await
-                .map_err(|e| Report::new(PlatformError::HttpClient).attach(e.to_string()))?
-                .to_vec();
-            // Same unbounded-buffering note as the synchronous path: log the
-            // size so large upstream responses are visible in dev.
+            let body = Self::response_body(resp, max_response_body_bytes, request_is_head).await?;
+            // The same collector enforces a caller limit inside the spawned path.
             log::debug!("buffered {} upstream response bytes from {uri}", body.len());
             Ok::<_, Report<PlatformError>>((status, resp_headers, body))
         });
@@ -564,16 +706,165 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
 }
 
 // ---------------------------------------------------------------------------
+// Runtime KV
+// ---------------------------------------------------------------------------
+
+/// Environment variable naming the file that backs runtime KV.
+///
+/// When set at startup, the dev server persists runtime KV in that file. When
+/// unset, runtime KV is unavailable.
+pub const KV_PATH_ENV: &str = "TRUSTED_SERVER_KV_PATH";
+
+/// Open the persistent runtime KV store at `path`, creating missing parent
+/// directories.
+///
+/// # Errors
+///
+/// Returns an error when the directory cannot be created or the database
+/// cannot be opened (corrupted file, locked by another process).
+pub fn open_kv_handle(path: &Path) -> Result<KvHandle, KvError> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            KvError::Internal(anyhow::anyhow!(
+                "failed to create KV directory `{}`: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    Ok(KvHandle::new(Arc::new(BlockingPoolKvStore(Arc::new(
+        PersistentKvStore::new(path)?,
+    )))))
+}
+
+/// Runs each operation of a synchronous [`KvStore`] on Tokio's blocking pool.
+///
+/// [`PersistentKvStore`] does its `redb` transactions inside its `async fn`s
+/// without yielding, so a slow commit would hold the request task and keep
+/// any timer raced against it (an integration deadline, for example) from
+/// firing. Here the request task only awaits the blocking task and stays
+/// free to observe its deadline.
+///
+/// A caller that stops waiting drops only the join handle: the operation
+/// keeps running to its end in the background. That is safe for `redb`. A
+/// write either commits atomically or fails and its transaction aborts on
+/// drop, and `redb` admits one write transaction at a time, so a later
+/// operation waits for the abandoned one instead of interleaving with it.
+/// Dropping the Tokio runtime waits for running blocking tasks, so a commit in
+/// flight is not cut short when the server stops.
+struct BlockingPoolKvStore<S>(Arc<S>);
+
+impl<S: KvStore + 'static> BlockingPoolKvStore<S> {
+    async fn run<T, F, Fut>(&self, op: F) -> Result<T, KvError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<S>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, KvError>>,
+    {
+        let store = Arc::clone(&self.0);
+        tokio::task::spawn_blocking(move || futures::executor::block_on(op(store)))
+            .await
+            .map_err(|err| KvError::Internal(anyhow::anyhow!("KV task failed: {err}")))?
+    }
+}
+
+#[async_trait(?Send)]
+impl<S: KvStore + 'static> KvStore for BlockingPoolKvStore<S> {
+    async fn delete(&self, key: &str) -> Result<(), KvError> {
+        let key = key.to_owned();
+        self.run(move |store| async move { store.delete(&key).await })
+            .await
+    }
+
+    async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
+        let key = key.to_owned();
+        self.run(move |store| async move { store.get_bytes(&key).await })
+            .await
+    }
+
+    async fn list_keys_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, KvError> {
+        let prefix = prefix.to_owned();
+        let cursor = cursor.map(str::to_owned);
+        self.run(move |store| async move {
+            store
+                .list_keys_page(&prefix, cursor.as_deref(), limit)
+                .await
+        })
+        .await
+    }
+
+    async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
+        let key = key.to_owned();
+        self.run(move |store| async move { store.put_bytes(&key, value).await })
+            .await
+    }
+
+    async fn put_bytes_with_ttl(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl: Duration,
+    ) -> Result<(), KvError> {
+        let key = key.to_owned();
+        self.run(move |store| async move { store.put_bytes_with_ttl(&key, value, ttl).await })
+            .await
+    }
+}
+
+/// Bridges edgezero's [`KvHandle`] to [`PlatformKvStore`].
+struct KvHandleAdapter(KvHandle);
+
+#[async_trait(?Send)]
+impl KvStore for KvHandleAdapter {
+    async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
+        self.0.get_bytes(key).await
+    }
+
+    async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
+        self.0.put_bytes(key, value).await
+    }
+
+    async fn put_bytes_with_ttl(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl: Duration,
+    ) -> Result<(), KvError> {
+        self.0.put_bytes_with_ttl(key, value, ttl).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), KvError> {
+        self.0.delete(key).await
+    }
+
+    async fn list_keys_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, KvError> {
+        self.0.list_keys_page(prefix, cursor, limit).await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // build_runtime_services
 // ---------------------------------------------------------------------------
 
 /// Construct [`RuntimeServices`] for an incoming Axum request.
 ///
-/// # Degraded features in dev
+/// # Runtime KV
 ///
-/// The generic runtime KV slot uses
-/// [`trusted_server_core::platform::UnavailableKvStore`]. A `warn` log is
-/// emitted once per process.
+/// Runtime KV comes from the KV handle the dev server injects into each
+/// request, which `main` builds when [`KV_PATH_ENV`] is set. Without it the
+/// slot is [`UnavailableKvStore`] and a `warn` log is emitted once per process.
 pub fn build_runtime_services(
     ctx: &edgezero_core::context::RequestContext,
     settings: &trusted_server_core::settings::Settings,
@@ -581,17 +872,25 @@ pub fn build_runtime_services(
         [Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>],
     >,
 ) -> RuntimeServices {
-    static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    KV_WARNED.get_or_init(|| {
-        log::warn!("Axum dev server: generic runtime KV is unavailable (UnavailableKvStore).");
-    });
+    let kv_store: Arc<dyn PlatformKvStore> = match ctx.kv_store_default() {
+        Some(handle) => Arc::new(KvHandleAdapter(handle)),
+        None => {
+            static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            KV_WARNED.get_or_init(|| {
+                log::warn!(
+                    "Axum dev server: generic runtime KV is unavailable; set {KV_PATH_ENV} to enable it."
+                );
+            });
+            Arc::new(UnavailableKvStore)
+        }
+    };
 
     let client_ip = edgezero_adapter_axum::context::AxumRequestContext::get(ctx.request())
         .and_then(|c| c.remote_addr)
         .map(|addr| addr.ip());
 
     use trusted_server_core::platform::{
-        PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformKvStore, PlatformSecretStore,
+        PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore,
     };
 
     // Stateless shims are promoted to process-wide statics so callers clone
@@ -600,9 +899,9 @@ pub fn build_runtime_services(
         std::sync::OnceLock::new();
     static SECRET_STORE: std::sync::OnceLock<Arc<dyn PlatformSecretStore>> =
         std::sync::OnceLock::new();
-    static KV_STORE: std::sync::OnceLock<Arc<dyn PlatformKvStore>> = std::sync::OnceLock::new();
     static BACKEND: std::sync::OnceLock<Arc<dyn PlatformBackend>> = std::sync::OnceLock::new();
     static GEO: std::sync::OnceLock<Arc<dyn PlatformGeo>> = std::sync::OnceLock::new();
+    static TIMER: std::sync::OnceLock<Arc<dyn PlatformTimer>> = std::sync::OnceLock::new();
 
     RuntimeServices::builder()
         .config_store(Arc::clone(CONFIG_STORE.get_or_init(|| {
@@ -611,9 +910,7 @@ pub fn build_runtime_services(
         .secret_store(Arc::clone(SECRET_STORE.get_or_init(|| {
             Arc::new(AxumPlatformSecretStore) as Arc<dyn PlatformSecretStore>
         })))
-        .kv_store(Arc::clone(KV_STORE.get_or_init(|| {
-            Arc::new(trusted_server_core::platform::UnavailableKvStore) as Arc<dyn PlatformKvStore>
-        })))
+        .kv_store(kv_store)
         .backend(Arc::clone(BACKEND.get_or_init(|| {
             Arc::new(AxumPlatformBackend) as Arc<dyn PlatformBackend>
         })))
@@ -632,6 +929,9 @@ pub fn build_runtime_services(
         // crates this adapter links, so every request asks exactly the ones
         // configuration named, in that order.
         .permission_signal_modules(Arc::clone(permission_signal_modules))
+        .timer(Some(Arc::clone(TIMER.get_or_init(|| {
+            Arc::new(AxumPlatformTimer) as Arc<dyn PlatformTimer>
+        }))))
         .client_info(ClientInfo {
             client_ip,
             tls_protocol: None,
@@ -639,6 +939,20 @@ pub fn build_runtime_services(
             ..ClientInfo::default()
         })
         .build()
+}
+
+// ---------------------------------------------------------------------------
+// AxumPlatformTimer
+// ---------------------------------------------------------------------------
+
+/// Wall-clock timer backed by the tokio runtime's time driver.
+pub struct AxumPlatformTimer;
+
+#[async_trait(?Send)]
+impl PlatformTimer for AxumPlatformTimer {
+    async fn sleep(&self, duration: Duration) {
+        tokio::time::sleep(duration).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -668,6 +982,7 @@ mod tests {
             &Arc::default(),
         )
     }
+    use futures::StreamExt as _;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -688,6 +1003,23 @@ mod tests {
         assert!(
             !capabilities.has_enforceable_total_request_deadline(),
             "reqwest's transport timeout is not an adapter-enforced auction deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_timer_releases_work_that_never_completes() {
+        let services = test_services();
+        let timer = services.timer().expect("should provide a runtime timer");
+
+        let raced = futures::future::select(
+            Box::pin(futures::future::pending::<()>()),
+            timer.sleep(Duration::from_millis(5)),
+        )
+        .await;
+
+        assert!(
+            matches!(raced, futures::future::Either::Right(_)),
+            "should fire while the other future stays pending"
         );
     }
 
@@ -954,6 +1286,361 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_client_enforces_response_body_limit_while_reading_chunked_responses() {
+        let raw = b"HTTP/1.1 200 OK\r\n\
+                    Transfer-Encoding: chunked\r\n\
+                    \r\n\
+                    2\r\n\
+                    ab\r\n\
+                    2\r\n\
+                    cd\r\n\
+                    0\r\n\
+                    \r\n";
+
+        let exact_url = serve_raw_response(raw).await;
+        let exact_request = edgezero_core::http::request_builder()
+            .uri(exact_url)
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+        let exact = AxumPlatformHttpClient::new()
+            .send(
+                PlatformHttpRequest::new(exact_request, "test_backend")
+                    .with_max_response_body_bytes(4),
+            )
+            .await
+            .expect("an exact-limit chunked body should be accepted")
+            .response
+            .into_body()
+            .into_bytes()
+            .expect("should return a buffered body");
+        assert_eq!(exact.as_ref(), b"abcd");
+
+        for asynchronous in [false, true] {
+            let url = serve_raw_response(raw).await;
+            let request = edgezero_core::http::request_builder()
+                .uri(url)
+                .body(EdgeBody::empty())
+                .expect("should build outbound request");
+            let request =
+                PlatformHttpRequest::new(request, "test_backend").with_max_response_body_bytes(3);
+            let client = AxumPlatformHttpClient::new();
+            let result = if asynchronous {
+                match client.send_async(request).await {
+                    Ok(pending) => client.wait(pending).await,
+                    Err(error) => Err(error),
+                }
+            } else {
+                client.send(request).await
+            };
+
+            assert!(
+                result.is_err(),
+                "asynchronous={asynchronous}: a chunked body over the limit must be rejected"
+            );
+        }
+    }
+
+    /// Serve one connection: read the request through `request_end`, answer
+    /// `head_and_first`, wait for `release`, then send `rest`. The request
+    /// bytes the client sent come back through the returned receiver.
+    async fn serve_gated_response(
+        request_end: &'static [u8],
+        head_and_first: &'static [u8],
+        release: tokio::sync::oneshot::Receiver<()>,
+        rest: &'static [u8],
+    ) -> (String, tokio::sync::oneshot::Receiver<Vec<u8>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind gated HTTP test server");
+        let addr = listener.local_addr().expect("should read local address");
+        let (request_sender, request_receiver) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("should accept request");
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.ends_with(request_end) {
+                let read = stream.read(&mut buffer).await.expect("should read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            drop(request_sender.send(request));
+            stream
+                .write_all(head_and_first)
+                .await
+                .expect("should write the head and first chunk");
+            stream.flush().await.expect("should flush the first chunk");
+            if release.await.is_ok() {
+                stream
+                    .write_all(rest)
+                    .await
+                    .expect("should write the rest of the body");
+            }
+        });
+
+        (format!("http://{addr}/media"), request_receiver)
+    }
+
+    async fn next_chunk(
+        stream: &mut futures::stream::LocalBoxStream<'static, Result<Bytes, anyhow::Error>>,
+    ) -> Option<Result<Bytes, anyhow::Error>> {
+        tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("the next chunk or the end should arrive promptly")
+    }
+
+    #[test]
+    fn the_client_streams_through_send_and_not_through_send_async() {
+        let client = AxumPlatformHttpClient::new();
+        assert!(
+            client.supports_streaming_responses(),
+            "send should preserve origin bodies as streams"
+        );
+        assert!(
+            !client.supports_pending_streaming_responses(),
+            "send_async stays buffered"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_streamed_send_returns_before_the_origin_finishes_and_keeps_the_request() {
+        let (release, release_receiver) = tokio::sync::oneshot::channel();
+        let (url, request_bytes) = serve_gated_response(
+            b"payload",
+            b"HTTP/1.1 200 OK\r\n\
+              Content-Type: video/mp4\r\n\
+              Transfer-Encoding: chunked\r\n\
+              \r\n\
+              6\r\n\
+              first-\r\n",
+            release_receiver,
+            b"6\r\nsecond\r\n0\r\n\r\n",
+        )
+        .await;
+        let request = edgezero_core::http::request_builder()
+            .method("POST")
+            .uri(url)
+            .header(header::AUTHORIZATION, "Bearer example-token")
+            .body(EdgeBody::from(b"payload".to_vec()))
+            .expect("should build outbound request");
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            AxumPlatformHttpClient::new().send(
+                PlatformHttpRequest::new(request, "test_backend")
+                    .with_stream_response()
+                    .with_max_response_body_bytes(64),
+            ),
+        )
+        .await
+        .expect("send should return while the origin body is still open")
+        .expect("the streamed send should succeed")
+        .response;
+
+        let sent = String::from_utf8(request_bytes.await.expect("should capture the request"))
+            .expect("the request head should be text");
+        assert!(
+            sent.starts_with("POST /media "),
+            "should keep the method: {sent}"
+        );
+        assert!(
+            sent.to_ascii_lowercase()
+                .contains("authorization: bearer example-token"),
+            "should forward the authorization header: {sent}"
+        );
+        assert!(
+            sent.ends_with("payload"),
+            "should forward the request body: {sent}"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("video/mp4")
+        );
+        let mut stream = response
+            .into_body()
+            .into_stream()
+            .expect("a streamed send should return a streamed body");
+        let first = next_chunk(&mut stream)
+            .await
+            .expect("the first chunk should arrive before the origin finishes")
+            .expect("the first chunk should be readable");
+        assert_eq!(first.as_ref(), b"first-");
+
+        release
+            .send(())
+            .expect("should release the rest of the body");
+        let mut rest = Vec::new();
+        while let Some(chunk) = next_chunk(&mut stream).await {
+            rest.extend_from_slice(&chunk.expect("the rest of the body should be readable"));
+        }
+        assert_eq!(rest, b"second");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_streamed_send_ends_with_an_error_at_the_chunk_that_crosses_the_caller_limit() {
+        let url = serve_raw_response(
+            b"HTTP/1.1 200 OK\r\n\
+              Transfer-Encoding: chunked\r\n\
+              \r\n\
+              2\r\n\
+              ab\r\n\
+              2\r\n\
+              cd\r\n\
+              1\r\n\
+              e\r\n\
+              0\r\n\
+              \r\n",
+        )
+        .await;
+        let request = edgezero_core::http::request_builder()
+            .uri(url)
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        let mut stream = AxumPlatformHttpClient::new()
+            .send(
+                PlatformHttpRequest::new(request, "test_backend")
+                    .with_stream_response()
+                    .with_max_response_body_bytes(4),
+            )
+            .await
+            .expect("a chunked response has no length to refuse up front")
+            .response
+            .into_body()
+            .into_stream()
+            .expect("a streamed send should return a streamed body");
+
+        let mut delivered = Vec::new();
+        let error = loop {
+            match next_chunk(&mut stream).await {
+                Some(Ok(chunk)) => delivered.extend_from_slice(&chunk),
+                Some(Err(error)) => break Some(error),
+                None => break None,
+            }
+        }
+        .expect("a body over the limit must not end cleanly");
+        assert!(
+            delivered.len() <= 4 && b"abcde".starts_with(&delivered),
+            "should pass on only bytes within the limit: {delivered:?}"
+        );
+        assert!(
+            error.to_string().contains("limit of 4 bytes"),
+            "should report the enforced limit: {error}"
+        );
+        assert!(
+            next_chunk(&mut stream).await.is_none(),
+            "should end at the error"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_streamed_send_refuses_a_declared_length_over_the_caller_limit() {
+        let url =
+            serve_raw_response(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n0123456789").await;
+        let request = edgezero_core::http::request_builder()
+            .uri(url)
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        let result = AxumPlatformHttpClient::new()
+            .send(
+                PlatformHttpRequest::new(request, "test_backend")
+                    .with_stream_response()
+                    .with_max_response_body_bytes(4),
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a declared length over the limit should be refused before any byte is read"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_streamed_send_passes_on_an_origin_that_closes_mid_body() {
+        // The origin declares ten bytes, sends four, and closes.
+        let url = serve_raw_response(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabcd").await;
+        let request = edgezero_core::http::request_builder()
+            .uri(url)
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        let mut stream = AxumPlatformHttpClient::new()
+            .send(PlatformHttpRequest::new(request, "test_backend").with_stream_response())
+            .await
+            .expect("the head arrives before the origin closes")
+            .response
+            .into_body()
+            .into_stream()
+            .expect("a streamed send should return a streamed body");
+
+        let mut delivered = Vec::new();
+        let outcome = loop {
+            match next_chunk(&mut stream).await {
+                Some(Ok(chunk)) => delivered.extend_from_slice(&chunk),
+                Some(Err(error)) => break Err(error),
+                None => break Ok(()),
+            }
+        };
+        assert!(
+            outcome.is_err(),
+            "a truncated origin body must end with an error, after {delivered:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_streamed_head_request_has_an_empty_body_whatever_its_declared_length() {
+        let url = serve_raw_response(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n").await;
+        let request = edgezero_core::http::request_builder()
+            .method("HEAD")
+            .uri(url)
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        let response = AxumPlatformHttpClient::new()
+            .send(
+                PlatformHttpRequest::new(request, "test_backend")
+                    .with_stream_response()
+                    .with_max_response_body_bytes(4),
+            )
+            .await
+            .expect("a HEAD answer carries no body for the limit to refuse")
+            .response;
+
+        assert_eq!(
+            response
+                .into_body()
+                .into_bytes()
+                .expect("a bodiless answer should be an empty buffer")
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_async_refuses_a_streamed_response_rather_than_buffer_it() {
+        let url = serve_raw_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+        let request = edgezero_core::http::request_builder()
+            .uri(url)
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        let result = AxumPlatformHttpClient::new()
+            .send_async(PlatformHttpRequest::new(request, "test_backend").with_stream_response())
+            .await;
+
+        assert!(
+            result.is_err(),
+            "the buffered send_async path must refuse a streamed response"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn select_attributes_failed_backend_name() {
         // Bind and immediately drop a listener so the port is closed — the
         // request fails with connection refused.
@@ -992,6 +1679,89 @@ mod tests {
             result.remaining.is_empty(),
             "no remaining requests expected"
         );
+    }
+
+    /// Stands in for a slow `redb` commit: `put_bytes` blocks its thread
+    /// until the test releases it.
+    struct GatedStore {
+        gate: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        finished: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait(?Send)]
+    impl KvStore for GatedStore {
+        async fn delete(&self, _key: &str) -> Result<(), KvError> {
+            Err(KvError::Unavailable)
+        }
+
+        async fn get_bytes(&self, _key: &str) -> Result<Option<Bytes>, KvError> {
+            Err(KvError::Unavailable)
+        }
+
+        async fn list_keys_page(
+            &self,
+            _prefix: &str,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> Result<KvPage, KvError> {
+            Err(KvError::Unavailable)
+        }
+
+        async fn put_bytes(&self, _key: &str, _value: Bytes) -> Result<(), KvError> {
+            let _ = self
+                .gate
+                .lock()
+                .expect("should lock gate")
+                .recv_timeout(Duration::from_secs(5));
+            self.finished
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn put_bytes_with_ttl(
+            &self,
+            _key: &str,
+            _value: Bytes,
+            _ttl: Duration,
+        ) -> Result<(), KvError> {
+            Err(KvError::Unavailable)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_kv_op_does_not_delay_a_racing_deadline() {
+        let (release, gate) = std::sync::mpsc::channel();
+        let store = Arc::new(GatedStore {
+            gate: std::sync::Mutex::new(gate),
+            finished: std::sync::atomic::AtomicBool::new(false),
+        });
+        let handle = KvHandle::new(Arc::new(BlockingPoolKvStore(Arc::clone(&store))));
+
+        let started = std::time::Instant::now();
+        let raced = tokio::time::timeout(
+            Duration::from_millis(50),
+            handle.put_bytes("key", Bytes::from_static(b"value")),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            raced.is_err(),
+            "the deadline should fire while the store op is still blocked"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the deadline should fire on time, fired after {elapsed:?}"
+        );
+
+        release.send(()).expect("should release the blocked op");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !store.finished.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the abandoned op should still run to completion");
     }
 
     async fn serve_raw_response(response: &'static [u8]) -> String {
