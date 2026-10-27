@@ -1907,13 +1907,15 @@ function safelyRecordCreativeFailure(
 /**
  * A consumed APS ad ID, retained as a security tombstone.
  *
- * `adUnitCode` is kept so a failure relayed later by the creative frame can be
- * source-checked against the ad unit the capability was served to, rather than
- * trusted because it names a live ad ID.
+ * `iframe` is the frame the capability was actually served to, so a failure
+ * relayed later is bound to that frame rather than to the ad unit code. An ad
+ * unit code can be a configured prefix matching several slots, and the ad ID is
+ * public targeting, so checking the code alone would let any frame under a
+ * matching slot write a reason onto its own slot.
  */
 interface ApsConsumedTombstone {
   expiresAt: number;
-  adUnitCode: string;
+  iframe: HTMLIFrameElement;
 }
 
 /** Maximum number of consumed APS Prebid IDs retained as security tombstones. */
@@ -1942,7 +1944,7 @@ function recordConsumedPrebidApsId(
   consumedIds: Map<string, ApsConsumedTombstone>,
   adId: string,
   expiresAt: number,
-  adUnitCode: string
+  iframe: HTMLIFrameElement
 ): void {
   // A capability consumed with little TTL left would otherwise lose its
   // tombstone before the renderer frame's timeout relay arrives, dropping the
@@ -1952,7 +1954,7 @@ function recordConsumedPrebidApsId(
   // frame's own timeout so the two cannot drift apart. This also keeps the ad ID
   // blocked longer, which is the safer direction for a security tombstone.
   const minimum = Date.now() + 2 * RENDERER_READY_TIMEOUT_MS;
-  consumedIds.set(adId, { expiresAt: Math.max(expiresAt, minimum), adUnitCode });
+  consumedIds.set(adId, { expiresAt: Math.max(expiresAt, minimum), iframe });
 }
 
 /**
@@ -2014,15 +2016,14 @@ export function installTsRenderBridge(): void {
         const tombstone = consumedPrebidApsIds.get(failedAdId);
         let failedSlotId: string | undefined;
         if (tombstone) {
-          // The Prebid path tombstones the publisher's ad unit code, which can
-          // be a configured prefix rather than a DOM id. The store keys
-          // associations by Trusted Server slot id, so resolve the slot through
-          // the authenticated frame rather than treating the code as a map key:
-          // that resolver handles exact ids, prefixes, and ambiguity, and
-          // `divToSlotId` holds only resolved ids. The capability's own source
-          // check still gates it, so a sender outside the served ad unit is
-          // rejected before the slot is resolved.
-          if (sourceFrameForAdUnit(e.source, tombstone.adUnitCode)) {
+          // Bind the report to the frame the capability was served to. An ad
+          // unit code can be a configured prefix matching several slots, and the
+          // ad ID is public targeting, so authenticating against the code alone
+          // would let any frame under a matching slot write a reason onto its
+          // own slot. The frame must also still be the live one for its slot,
+          // so a detached or replaced frame cannot report.
+          const sender = tombstone.iframe;
+          if (e.source && sender.contentWindow === e.source) {
             failedSlotId = slotFrameForMessageSource(e.source)?.slotId;
           }
         } else {
@@ -2077,7 +2078,7 @@ export function installTsRenderBridge(): void {
         consumedPrebidApsIds,
         adId,
         prebidRendererEntry.expiresAt,
-        prebidRendererEntry.adUnitCode
+        sourceFrame.iframe
       );
 
       const markUsed = (): void => {

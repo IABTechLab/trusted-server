@@ -3789,6 +3789,115 @@ describe('installTsRenderBridge', () => {
     }
   });
 
+  it('rejects a relayed APS failure from a sibling slot under the same prefix', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'prebid-sibling-relay-ad-id';
+    const store = new GptDiagnosticsStore({ defer: () => undefined });
+    (window as TestWindow).tsjs.gptDiagnosticsRecorder = store as never;
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        // One capability registered for a prefix that matches both slots below.
+        adUnitCode: 'div-',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markUsed: vi.fn(),
+      },
+    };
+
+    try {
+      const bridgeListener = await captureBridgeListener();
+      const headerSource = createTrustedSlotIframe('div-header');
+      const footerSource = createTrustedSlotIframe('div-footer');
+      const headerSlot = {
+        getSlotElementId: () => 'div-header',
+        getAdUnitPath: () => '/example/div-header',
+      };
+      const footerSlot = {
+        getSlotElementId: () => 'div-footer',
+        getAdUnitPath: () => '/example/div-footer',
+      };
+      // Keep `adSlots` and `divToSlotId` consistent: both slots are configured
+      // and both div ids match the `div-` prefix the capability was served for.
+      (window as TestWindow).tsjs.adSlots = [
+        {
+          id: 'homepage_header',
+          formats: [[728, 90]] as [number, number][],
+          gam_unit_path: '/a/b/c',
+          div_id: 'div-header',
+          targeting: {},
+        },
+        {
+          id: 'homepage_footer',
+          formats: [[728, 90]] as [number, number][],
+          gam_unit_path: '/a/b/d',
+          div_id: 'div-footer',
+          targeting: {},
+        },
+      ];
+      (window as TestWindow).tsjs.divToSlotId = {
+        'div-header': 'homepage_header',
+        'div-footer': 'homepage_footer',
+      };
+      store.recordTrustedServerOpportunity(headerSlot, 'homepage_header', 'renderable_candidate');
+      store.recordSlotRequested(headerSlot);
+      store.recordTrustedServerOpportunity(footerSlot, 'homepage_footer', 'renderable_candidate');
+      store.recordSlotRequested(footerSlot);
+
+      // The capability is served only to the header frame.
+      const portMessages: string[] = [];
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+          ports: [{ postMessage: (m: string) => portMessages.push(m) }],
+          source: headerSource,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+      expect(portMessages, 'capability should be served to the header frame').toHaveLength(1);
+
+      // The footer frame never requested or received it, but the ad ID is public
+      // targeting, so it must not be able to write a reason onto its own slot.
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: {
+            message: APS_RENDER_FAILED_MESSAGE,
+            adId: prebidAdId,
+            reason: 'nonce_mismatch',
+          },
+          source: footerSource,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+
+      const afterSibling = store.snapshot().slots;
+      for (const slot of afterSibling) {
+        expect(
+          slot.requests[0].trustedServerCreativeFailures,
+          `should not record a failure for '${slot.slotElementId}'`
+        ).toBeUndefined();
+      }
+
+      // The frame that was actually served still reports normally.
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: {
+            message: APS_RENDER_FAILED_MESSAGE,
+            adId: prebidAdId,
+            reason: 'frame_timeout',
+          },
+          source: headerSource,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+
+      const header = store.snapshot().slots.find((slot) => slot.slotElementId === 'div-header');
+      expect(header?.requests[0].trustedServerCreativeFailures).toEqual(['aps_frame_timeout']);
+    } finally {
+      delete (window as TestWindow).tsjs.gptDiagnosticsRecorder;
+    }
+  });
+
   it('records a relayed APS render failure for a prefix-based ad unit', async () => {
     const renderer = apsRenderer();
     const prebidAdId = 'prebid-prefix-relay-ad-id';
