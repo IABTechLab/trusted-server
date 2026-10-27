@@ -4793,8 +4793,8 @@ pub(crate) fn request_can_use_shared_template(
 ///
 /// # Errors
 ///
-/// Returns a [`TrustedServerError`] if the proxy request fails or the
-/// origin backend is unreachable.
+/// Returns a [`TrustedServerError`] if the request host is malformed, the proxy
+/// request fails, or the origin backend is unreachable.
 pub async fn handle_publisher_request(
     settings: &Settings,
     services: &RuntimeServices,
@@ -4818,9 +4818,8 @@ pub async fn handle_publisher_request(
     // Prebid.js requests are not intercepted here anymore. The HTML processor removes
     // publisher-supplied Prebid scripts; the unified TSJS bundle includes Prebid.js when enabled.
 
-    // Extract request host and scheme using Host or URI authority and TLS
-    // detection after edge sanitization.
-    let request_info = RequestInfo::from_request(&req, services.client_info());
+    // Validate request host before it can enter HTML or Flight rewrite output.
+    let request_info = RequestInfo::from_request(&req, services.client_info())?;
     let request_host = &request_info.host;
     let request_scheme = &request_info.scheme;
 
@@ -7304,7 +7303,8 @@ fn normalize_page_bids_path(raw: &str) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`TrustedServerError`] if cookie parsing or EC ID generation fails.
+/// Returns [`TrustedServerError`] if the request host is malformed, cookie
+/// parsing fails, or EC ID generation fails.
 pub async fn handle_page_bids(
     settings: &Settings,
     services: &RuntimeServices,
@@ -7379,7 +7379,7 @@ pub async fn handle_page_bids(
     // Trusted request origin for absolute inline creative URLs — derived from the
     // origin the visitor is actually on (scheme, host, port), not the configured
     // publisher domain, which cannot carry a port and may differ by subdomain.
-    let request_info = RequestInfo::from_request(&req, services.client_info());
+    let request_info = RequestInfo::from_request(&req, services.client_info())?;
     let page_bids_request_origin = request_origin(&request_info.scheme, &request_info.host);
 
     let path_param = req
@@ -7411,7 +7411,6 @@ pub async fn handle_page_bids(
         Vec::new()
     };
 
-    let request_info = crate::http_util::RequestInfo::from_request(&req, services.client_info());
     // Owned so the identity-graph snapshot can be stored back on `ec_context`
     // below without holding a borrow of it across the mutation.
     let ec_id = ec_context
@@ -23195,31 +23194,6 @@ mod tests {
         }
     }
 
-    std::thread_local! {
-        static CANCELLATION_WARNINGS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-    }
-
-    struct CancellationLogger;
-    impl log::Log for CancellationLogger {
-        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-            metadata.level() <= log::Level::Warn
-        }
-        fn log(&self, record: &log::Record<'_>) {
-            if record
-                .args()
-                .to_string()
-                .starts_with("Dispatched server-side auction dropped without collection")
-            {
-                CANCELLATION_WARNINGS.with(|count| {
-                    if let Some(previous) = count.get() {
-                        count.set(Some(previous + 1));
-                    }
-                });
-            }
-        }
-        fn flush(&self) {}
-    }
-
     struct HungTerminalFactory {
         started: Arc<AtomicUsize>,
         dropped: Arc<AtomicUsize>,
@@ -23284,10 +23258,7 @@ mod tests {
 
     #[test]
     fn html_finalization_client_cancellation_drops_work_and_warns_for_auction_once() {
-        static LOGGER: CancellationLogger = CancellationLogger;
-        let _ = log::set_logger(&LOGGER);
-        log::set_max_level(log::LevelFilter::Warn);
-        CANCELLATION_WARNINGS.with(|count| count.set(Some(0)));
+        let warnings = crate::test_support::logging::WarningCapture::start();
         let settings = Arc::new(crate::publisher::allow_eof_test_settings(
             create_test_settings(),
         ));
@@ -23353,10 +23324,17 @@ mod tests {
             1,
             "should drop the callback when the reader disconnects"
         );
-        let warnings = CANCELLATION_WARNINGS.with(std::cell::Cell::take);
+        let cancellation_warnings = warnings
+            .take()
+            .into_iter()
+            .filter(|warning| {
+                warning
+                    .message
+                    .starts_with("Dispatched server-side auction dropped without collection")
+            })
+            .count();
         assert_eq!(
-            warnings,
-            Some(1),
+            cancellation_warnings, 1,
             "should preserve exactly one existing auction cancellation warning"
         );
     }
@@ -25856,6 +25834,50 @@ mod tests {
             assert!(
                 !adm.contains("/static/tsjs="),
                 "should not inject the tsjs bundle into a foreign-origin creative iframe, got: {adm}"
+            );
+        }
+
+        #[test]
+        fn build_bid_map_keeps_inline_anchors_raw_when_clicks_are_off() {
+            let mut settings = test_settings();
+            settings.auction.rewrite_creatives = true;
+            settings.auction.rewrite_clicks = Some(false);
+            settings.publisher.domain = "example.com".to_string();
+
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "examplessp",
+                "abc123",
+                "https://ssp.example.com/win",
+                "https://ssp.example.com/bill",
+            );
+            bid.creative = Some(
+                "<html><body><a href=\"https://landing.example.com/page\"><img src=\"https://cdn.example.com/pixel.png\"></a></body></html>"
+                    .to_string(),
+            );
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, "", false);
+            let adm = map
+                .get("atf_sidebar_ad")
+                .and_then(|v| v.as_object())
+                .and_then(|o| o.get("adm"))
+                .and_then(|v| v.as_str())
+                .expect("should include a rewritten adm");
+
+            assert!(
+                adm.contains("https://example.com/first-party/proxy?tsurl="),
+                "should still proxy the image with an absolute URL, got: {adm}"
+            );
+            assert!(
+                adm.contains("href=\"https://landing.example.com/page\""),
+                "should leave the landing link raw, got: {adm}"
+            );
+            assert!(
+                !adm.contains("data-tsclick") && !adm.contains("/first-party/click"),
+                "should not wrap the landing link, got: {adm}"
             );
         }
 
