@@ -142,7 +142,26 @@ gh attestation verify "$CHECK" "${checks[@]}" --signer-workflow "$WORKFLOW"
 gh attestation verify "$CHECK" "${checks[@]}" --cert-identity "$IDENTITY"
 ```
 
-The same omission performs online lookup for each binary's existing provenance and SPDX checks. For offline companion verification, first obtain its SHA-256 independently as `APPROVED_REBUILD_CHECK_SHA256SUMS`, then transfer the companion, Fastly provenance bundle and trusted roots:
+The same omission performs online lookup for each binary's provenance. For online SBOM lookup, first authenticate the published SPDX file with the release/asset checks above, then compare it only with results that `gh` has successfully verified with every existing pin:
+
+```bash
+set -euo pipefail
+checks=(--repo "$REPO" --source-ref "refs/tags/$TAG" --source-digest "$COMMIT"
+  --signer-digest "$COMMIT" --deny-self-hosted-runners
+  --predicate-type https://spdx.dev/Document/v2.3)
+for asset in "${ASSETS[@]}"; do
+  gh attestation verify "$asset" "${checks[@]}" --signer-workflow "$WORKFLOW"
+  gh attestation verify "$asset" "${checks[@]}" --cert-identity "$IDENTITY" \
+    --format json > "$asset.online-sbom-verification.json"
+  jq -e --slurpfile document "$asset.spdx.json" \
+    'any(.[]; .verificationResult.statement.predicate == $document[0])' \
+    "$asset.online-sbom-verification.json"
+done
+```
+
+Reruns or retries of signing can leave more than one valid SBOM attestation for the same binary digest, in no guaranteed order. Require a verified predicate exactly equal to the authenticated published SPDX; do not choose the first or newest record. `any` over an empty array is false, and `jq -e` exits non-zero for an empty or nonmatching result. The published-bundle checks above and below retain their single-result comparison.
+
+For offline companion verification, first obtain its SHA-256 independently as `APPROVED_REBUILD_CHECK_SHA256SUMS`, then transfer the companion, Fastly provenance bundle and trusted roots:
 
 ```bash
 shasum -a 256 --check APPROVED_REBUILD_CHECK_SHA256SUMS
@@ -155,7 +174,7 @@ gh attestation verify "$CHECK" "${checks[@]}" --signer-workflow "$WORKFLOW"
 gh attestation verify "$CHECK" "${checks[@]}" --cert-identity "$IDENTITY"
 ```
 
-Acquire the roots as described below before disconnecting. Keep the companion's profile/source/binary-digest check and the separate online immutable-membership record with the deployment evidence. Rehearsal timing and rerun-all recovery remain unproven until the Phase 2 transcript is recorded; a partial rerun fails closed on old-attempt evidence.
+Acquire the roots as described below before disconnecting. Keep the companion's profile/source/binary-digest check and the separate online immutable-membership record with the deployment evidence. The compatibility record retains measured rehearsal timing and rerun-all evidence. A partial rerun fails closed on old-attempt evidence; an existing immutable release is refused rather than published again.
 
 Stop if any check fails. Keep the outputs, reviewed source identity, bundles
 and checksums with your deployment record. These checks do not approve a
