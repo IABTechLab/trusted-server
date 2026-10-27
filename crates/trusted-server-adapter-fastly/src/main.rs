@@ -1,6 +1,4 @@
 use std::sync::Arc;
-
-use rand::Rng as _;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
@@ -15,6 +13,7 @@ use edgezero_core::response::IntoResponse;
 use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
+use rand::Rng as _;
 
 use trusted_server_core::access_telemetry::{
     AccessTelemetrySnapshot, RouteClass, RouteMetadata, access_event_row,
@@ -833,7 +832,7 @@ fn emit_access_telemetry_after_send(
         .unwrap_or_default();
     let epoch_ms = u64::try_from(since_epoch.as_millis()).unwrap_or(u64::MAX);
     let row = access_event_row(snapshot, &timings.snapshot(), epoch_ms);
-    let target = tinybird::TinybirdEventsTarget::from_access_config(settings.tinybird.clone());
+    let target = tinybird::TinybirdEventsTarget::from_access_config(&settings.tinybird);
     let result = futures::executor::block_on(tinybird::emit_access_event(
         &platform::FastlyPlatformHttpClient,
         &target,

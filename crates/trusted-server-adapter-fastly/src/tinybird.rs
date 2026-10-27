@@ -81,13 +81,13 @@ impl TinybirdEventsTarget {
     /// `access_token_secret` instead of the auction pair, so access-log
     /// emission never shares a datasource or token with auction telemetry
     /// even though both configs come from the same [`TinybirdSettings`].
-    pub(crate) fn from_access_config(config: TinybirdSettings) -> Self {
+    pub(crate) fn from_access_config(config: &TinybirdSettings) -> Self {
         let uri = tinybird_events_uri(&config.api_host, &config.access_dataset);
         let backend_spec = tinybird_backend_spec(&config.api_host);
         Self {
-            api_host: config.api_host,
-            dataset: config.access_dataset,
-            append_token: config.access_token_secret.expect(
+            api_host: config.api_host.clone(),
+            dataset: config.access_dataset.clone(),
+            append_token: config.access_token_secret.clone().expect(
                 "should contain a resolved Tinybird access token when access telemetry is enabled",
             ),
             uri,
@@ -215,7 +215,7 @@ impl AuctionTelemetrySink for FastlyTinybirdAuctionTelemetrySink {
 }
 
 // ---------------------------------------------------------------------------
-// Access telemetry: confirmed-delivery emitter
+// Access telemetry: post-send emitter
 // ---------------------------------------------------------------------------
 
 /// Decides whether one request's access-telemetry row should be emitted.
@@ -257,14 +257,15 @@ fn build_access_events_request(
         })
 }
 
-/// Sends one confirmed access-log row to the Tinybird Events API and waits
+/// Sends one post-send access-log row to the Tinybird Events API and waits
 /// for the response.
 ///
-/// Unlike [`FastlyTinybirdAuctionTelemetrySink::emit_auction_events`] (fire-
-/// and-forget, dispatched mid-request so it never adds latency to the
-/// response), this runs post-delivery: the response has already reached the
-/// client, so there is no latency budget left to protect, and the send can
-/// afford to wait for — and validate — the reply. `client` is the adapter's
+/// Unlike [`FastlyTinybirdAuctionTelemetrySink::emit_auction_events`], which
+/// dispatches without awaiting the ingest reply, this waits after the client
+/// response has been handed to the transport. It does not extend that response's
+/// measured timing, but it occupies a reused sandbox and can delay its next
+/// request. A completed transport handoff does not confirm client receipt.
+/// `client` is the adapter's
 /// stateless platform HTTP client in production
 /// ([`crate::platform::FastlyPlatformHttpClient`]); accepting it as `&dyn
 /// PlatformHttpClient` here (rather than that concrete type) is what lets
@@ -846,10 +847,32 @@ mod tests {
     }
 
     #[test]
+    fn access_target_borrows_settings_and_uses_only_access_fields() {
+        let mut config = enabled_config();
+        config.auction_token_secret = None;
+        config.max_body_bytes = 2048;
+
+        let target = TinybirdEventsTarget::from_access_config(&config);
+
+        assert_eq!(target.api_host, config.api_host);
+        assert_eq!(target.dataset, config.access_dataset);
+        assert_eq!(target.append_token.expose(), "access-append-token");
+        assert_eq!(target.max_body_bytes, config.max_body_bytes);
+        assert_eq!(
+            config
+                .access_token_secret
+                .as_ref()
+                .expect("should retain the access token in settings")
+                .expose(),
+            "access-append-token"
+        );
+    }
+
+    #[test]
     fn access_emitter_rejects_oversized_row_before_sending() {
         let mut config = enabled_config();
         config.max_body_bytes = 1024;
-        let target = TinybirdEventsTarget::from_access_config(config);
+        let target = TinybirdEventsTarget::from_access_config(&config);
         let http_client = RecordingHttpClient::respond_with(202);
         let row = "x".repeat(1025);
 
@@ -874,7 +897,7 @@ mod tests {
     fn access_emitter_accepts_row_exactly_at_body_limit_including_newline() {
         let mut config = enabled_config();
         config.max_body_bytes = 1024;
-        let target = TinybirdEventsTarget::from_access_config(config);
+        let target = TinybirdEventsTarget::from_access_config(&config);
         let http_client = RecordingHttpClient::respond_with(202);
         let row = "x".repeat(1023);
 
@@ -892,7 +915,7 @@ mod tests {
 
     #[test]
     fn access_emitter_posts_ndjson_and_validates_2xx() {
-        let target = TinybirdEventsTarget::from_access_config(enabled_config());
+        let target = TinybirdEventsTarget::from_access_config(&enabled_config());
         let http_client = RecordingHttpClient::respond_with(202);
         let row = r#"{"status":200}"#.to_owned();
 
@@ -927,7 +950,7 @@ mod tests {
 
     #[test]
     fn access_emitter_warns_and_drops_on_non_2xx() {
-        let target = TinybirdEventsTarget::from_access_config(enabled_config());
+        let target = TinybirdEventsTarget::from_access_config(&enabled_config());
         let http_client = RecordingHttpClient::respond_with(422);
 
         let result = futures::executor::block_on(emit_access_event(
