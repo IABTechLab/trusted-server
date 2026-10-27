@@ -90,3 +90,51 @@ Every new ordinary module path is Gate 1 implementation, distinct from frozen-so
 - [ ] Rehearse 30 exact assets, immutable/prerelease/not-Latest, source and transfer joins, actual A/B equality and environments, real v1 receipt, both online/offline binary predicates unchanged, companion provenance verification, all release memberships, signed sums, download/readback, SPDX equality, native smoke and pinned Fastly pack/validate/inspect/compare/runtime without deployment.
 - [ ] On a real mismatch, retain bounded diagnostics and stop for a user decision; never add exclusions or relax equality. On any other failed rehearsal, fix within scope after diagnosis and retry only at a fresh sequential tag after green CI.
 - [ ] Post full transcript/results, actual size counts and source citations on draft #1449. The user supplies the tracking issue number; do not create an issue. Keep draft and request no reviewers.
+
+## Proposed normalization amendment after `cc7df930f`
+
+**Status:** Draft for approval. The user approved drafting this amendment after the real mismatch; changing the build recipe is not yet approved. Independent review must precede the approval request and implementation. The existing comparator remains unchanged.
+
+### Observed failure and remaining uncertainty
+
+[Run 40382445644](https://github.com/IABTechLab/trusted-server/actions/runs/40382445644) built all seven assets and the second Fastly build. All four real upload archives passed the current-run identity/digest and ZIP checks. Equality then failed, and signing/publication were skipped:
+
+| Measurement | Canonical                                                          | Reproduction                                                       |
+| ----------- | ------------------------------------------------------------------ | ------------------------------------------------------------------ |
+| Size        | 80,019,161                                                         | 80,019,324                                                         |
+| SHA-256     | `5c5dc9a78db8ad2af05a37a823756277ec72600eca48912886872d64d160416e` | `14595f7709e46db8ff46778a9d4e85a36719572477d2b93d56459d68170b9f19` |
+
+The first difference is at offset 10,264,685. Read-only section analysis found identical standard sections, including code and data; differences are confined to `.debug_info`, `.debug_str` and `name`. The two checkouts' distinct absolute paths appear in debug strings. The string/name sections account for +3/+160 bytes, and 711 of 12,076 function names differ; sampled differences are LLVM-generated suffixes. This supports a path-sensitive metadata hypothesis, but does not establish that remapping will fix every suffix. A new real A/B run must settle that.
+
+### Build-side experiment for approval
+
+Preserve `debug = 1`, all Wasm sections, target/profile/default features, `--locked`, jobs/umask variation and fresh roots. Restrict the experiment to Fastly's Rust target compilation. Both jobs receive the same ordered four-map vector:
+
+| Physical prefix               | Logical prefix    |
+| ----------------------------- | ----------------- |
+| Canonical checkout            | `/trusted-server` |
+| Reproduction checkout         | `/trusted-server` |
+| Canonical target directory    | `/cargo-target`   |
+| Reproduction target directory | `/cargo-target`   |
+
+Derive the four physical prefixes from the source-owned sibling names already used by `release-build.yml`. Require canonical workspace/temp parents, the expected role's actual checkout/target roots, pairwise disjoint mappings and safely encodable text. Reject `=`, quotes, backslashes and control characters in ordinary physical prefixes; `=` would make rustc's `FROM=TO` parsing ambiguous. Do not change the controlled path grammar silently. The peer root need not exist. Require both observations to reconstruct identical raw argument bytes; unexpected differing workspace/temp bases fail rather than being silently normalized away.
+
+Use target-scoped `cargo --config target."wasm32-wasip1".rustflags=[...]`. Reuse the destinations and precedence/configuration rules from frozen `122b78664b1235c717e9208fd200f9a9b0c335df`'s `recipe/remap.rs`. Factor only its pure argument serialization if sharing is needed; preserve its controlled five-root behavior. Do not fabricate controlled vendor/tool roots or construct controlled recipe/qualified values. Reject extensionless source Cargo config, `build.rustflags` and ambient flag overrides. Preserve reviewed array-form target flags through Cargo concatenation; reject string-form or unsupported representations. Reject preexisting remap options in source target/triple/`cfg(...)` flag entries rather than guessing their effective order. The current source config contains no rustflags. Do not use `RUSTFLAGS` or `CARGO_ENCODED_RUSTFLAGS`, which would replace configured flags.
+
+### Concrete implementation steps after approval
+
+1. Add a private ordinary layout/flags planner and explicit ordinary flags command in the existing producer. It validates the fixed roles/roots and source Cargo configuration, then emits only the single target-scoped configuration value. The shell passes it as one quoted `--config` argument; no `eval` or arbitrary command is accepted.
+2. Extend only the Fastly branch of `phase1-build.sh`: create its already-checked fresh target root, obtain the validated flags from the separately built producer, and pass them to the actual locked Cargo build. Keep native procedures and all configuration-canary/SBOM/binary checks unchanged. No new release script or policy/config file is needed.
+3. Add the stable normalization-policy description to the ordinary recipe identity. Keep actual physical roots in observations. Before executing Cargo, retain the exact argument pair actually passed to it, encoded with the existing canonical JSON writer as `["--config", value]` in UTF-8 with its trailing LF. Hash those retained bytes in private CI observations; do not merely regenerate the observation after the build. Comparison independently reconstructs the expected pair from both roles' recorded roots and validates both private digests. Keep this physical-path digest outside the common semantic recipe identity and preserve the published v1 companion fields, filename, profile and `release_qualification:false` contract. Recipe/script/config changes remain bound by the source commit and `recipe_sha256`.
+4. State the narrower variation claim: filesystem/invocation roots differ, while Rust source locations are intentionally remapped to shared logical prefixes. This does not vary the normalized compiler source-path identity. Controlled path closure, tool/material qualification and alternate-user coverage remain unproven.
+5. Scan the complete final Wasm for all four physical prefixes and fail if any survives. Reuse the existing complete-byte path scan and bounded Wasm section parser where possible. Require retained `.debug_info`, `.debug_str` and `.debug_line` sections and the mapped source prefix inside `.debug_str`. Verify the target mapping in the argument vector; do not force an otherwise-unused target string into the binary. No section is rewritten or excluded.
+
+### Verification and stop conditions
+
+- Pure regressions: fixed ordering/destinations; identical four-map arguments for both roles; unexpected/overlapping/unsafe roots and unsupported configuration rejected; configured target flags preserved; semantic policy changes alter the recipe identity; private argument observations agree with both roles' roots.
+- Keep every equality regression, including custom-section mismatch rejection. Add raw-prefix survival failures without stripping or changing those tests.
+- Run the real hosted A/B procedure. If any bytes or LLVM suffixes still differ, retain bounded evidence and stop for another decision. Do not disable debug information, force crate metadata, rename symbols, rewrite Wasm, exclude sections or normalize the comparator's inputs.
+- After exact-head green CI, use a fresh fork rehearsal tag. Repeat real archive validation, unchanged binary verification and additive companion verification.
+- Exercise “re-run all jobs” and record the current-attempt/duplicate-artifact result separately from publication. Duplicate-check failure is a stop condition; do not choose a newest artifact, alter names or loosen joins. An already-published immutable tag must still refuse a new publication, so a full published-tag rerun is not expected to publish again. If the existing triggers cannot provide the desired prepublication attempt, ask for a rehearsal setup decision rather than changing triggers or settings.
+
+The rerun behavior remains unverified. The real ZIP rules passed at `cc7df930f`, and must also pass in the fork rehearsal. Neither result is a successful Phase 2 equality or publication rehearsal claim.
