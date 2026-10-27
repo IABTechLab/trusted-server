@@ -29,7 +29,86 @@ use super::types::{AuctionContext, AuctionRequest, AuctionResponse};
 
 const MAX_PLANNED_RESPONSE_BYTES: usize = 1024 * 1024;
 
-/// Evidence attached when bookkeeping fails after the platform started a request.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Exercises launch evidence through real route dispatch and collection.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum LaunchEvidenceProvider {
+        Immediate,
+        FailBeforeStart,
+        FailAfterStart,
+        Pending,
+    }
+
+    #[async_trait(?Send)]
+    impl AuctionProvider for LaunchEvidenceProvider {
+        fn provider_name(&self) -> &str {
+            "launch-evidence"
+        }
+
+        async fn request_bids(
+            &self,
+            _request: &AuctionRequest,
+            context: &AuctionContext<'_>,
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+            if *self == Self::Immediate {
+                return Ok(ProviderRequestOutcome::Immediate(AuctionResponse::no_bid(
+                    self.provider_name(),
+                    0,
+                )));
+            }
+            let failure = || {
+                Report::new(TrustedServerError::Auction {
+                    message: "Launch evidence test failure".to_string(),
+                })
+            };
+            if *self == Self::FailBeforeStart {
+                return Err(failure());
+            }
+            let outbound = Request::builder()
+                .uri("https://mediator.example.com/auction")
+                .body(EdgeBody::empty())
+                .expect("should construct mediator request");
+            let pending = context
+                .services
+                .http_client()
+                .send_async(PlatformHttpRequest::new(
+                    outbound,
+                    "launch-evidence-backend",
+                ))
+                .await
+                .change_context(TrustedServerError::Auction {
+                    message: "Launch evidence request failed".to_string(),
+                })?;
+            if *self == Self::FailAfterStart {
+                return Err(failure().attach_opaque(ProviderRequestStarted));
+            }
+            Ok(ProviderRequestOutcome::pending(pending))
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            Ok(AuctionResponse::no_bid(
+                self.provider_name(),
+                response_time_ms,
+            ))
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            1_000
+        }
+    }
+}
+
+/// Evidence attached to provider or mediator errors after a request started.
+///
+/// `Immediate` never proves launch. Implementations that fail after a successful
+/// `send_async` must attach this marker so collection retains that evidence.
 #[derive(Debug)]
 pub(crate) struct ProviderRequestStarted;
 

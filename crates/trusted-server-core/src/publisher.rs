@@ -44,7 +44,7 @@ use crate::auction::formats::sanitize_publisher_page_url;
 use crate::auction::orchestrator::{
     AuctionOrchestrator, DispatchAuctionOutcome, DispatchedAuction, ERROR_TYPE_ALL,
     ERROR_TYPE_HTTP_STATUS, ERROR_TYPE_LAUNCH_FAILED, ERROR_TYPE_PARSE_RESPONSE,
-    ERROR_TYPE_TIMEOUT, ERROR_TYPE_TRANSPORT, OrchestrationResult,
+    ERROR_TYPE_TIMEOUT, ERROR_TYPE_TRANSPORT,
 };
 use crate::auction::telemetry::{
     AuctionObservationContext, AuctionSource, AuctionTerminalOutcome, build_auction_events,
@@ -3304,7 +3304,9 @@ const fn auction_wait_placement_wire(placement: AuctionWaitPlacement) -> &'stati
 impl BrowserAuctionDiagnostics {
     fn from_request_timings(timings: &RequestTimings) -> Option<Self> {
         let snapshot = timings.snapshot();
-        snapshot.auction_dispatched_ms?;
+        if snapshot.auction_dispatched_ms.is_none() && snapshot.auction_wait_ms.is_none() {
+            return None;
+        }
         Some(Self {
             auction_dispatched_ms: snapshot.auction_dispatched_ms,
             auction_resolved_ms: snapshot.auction_resolved_ms,
@@ -4348,23 +4350,16 @@ async fn collect_non_html_auction(
         .auction_request
         .as_ref()
         .and_then(|_| diagnostics_auction_id(settings));
-    let provider_launched = dispatched.has_provider_launch();
     let placeholder = mediator_placeholder_request();
-    let wait_started = Instant::now();
-    let result = orchestrator
-        .collect_dispatched_auction(
+    let (result, auction_work_started) = orchestrator
+        .collect_dispatched_auction_with_timings(
             dispatched,
             services,
             &make_collect_context(settings, services, &placeholder),
+            &params.timings,
+            placement,
         )
         .await;
-    // Wait and resolution are meaningful only for started provider work.
-    if provider_launched {
-        params
-            .timings
-            .record_auction_wait(placement, wait_started.elapsed());
-        params.timings.mark_auction_resolved();
-    }
     let delivered_winner_slots = write_bids_to_state(
         &result.winning_bids,
         params.price_granularity,
@@ -4376,7 +4371,7 @@ async fn collect_non_html_auction(
     );
     // T0-anchored timeline mark (spec section 18): winning bids are in page
     // state, available to the response pipeline.
-    if provider_launched {
+    if auction_work_started {
         params.timings.mark_auction_committed();
     }
     params
@@ -4424,16 +4419,15 @@ async fn collect_stream_auction(
     log::info!("body_close_hold_loop: collecting dispatched auction before held body tail");
     let placeholder = mediator_placeholder_request();
     let collect_ctx = make_collect_context(settings, services, &placeholder);
-    let provider_launched = dispatched.has_provider_launch();
-    let wait_started = Instant::now();
-    let result = orchestrator
-        .collect_dispatched_auction(dispatched, services, &collect_ctx)
+    let (result, auction_work_started) = orchestrator
+        .collect_dispatched_auction_with_timings(
+            dispatched,
+            services,
+            &collect_ctx,
+            timings,
+            *placement,
+        )
         .await;
-    // Wait and resolution are meaningful only for started provider work.
-    if provider_launched {
-        timings.record_auction_wait(*placement, wait_started.elapsed());
-        timings.mark_auction_resolved();
-    }
     log::info!(
         "body_close_hold_loop: collect complete - {} winning bid(s)",
         result.winning_bids.len()
@@ -4449,7 +4443,7 @@ async fn collect_stream_auction(
     );
     // T0-anchored timeline mark (spec section 18): winning bids are in page
     // state, available to the response pipeline.
-    if provider_launched {
+    if auction_work_started {
         timings.mark_auction_committed();
     }
     ad_bids_state.set_auction_diagnostics(timings);
@@ -7400,80 +7394,16 @@ pub async fn handle_page_bids(
                 services,
             };
             let mut dispatch_failure_responses = Vec::new();
-            let result = match auction
+            let result = auction
                 .orchestrator
-                .dispatch_auction(&auction_request, &auction_context)
+                .run_auction_with_timings(&auction_request, &auction_context, &timings)
                 .await
-            {
-                DispatchAuctionOutcome::Dispatched(dispatched) => {
-                    let provider_launched = dispatched.has_provider_launch();
-                    if provider_launched {
-                        timings.mark_auction_dispatched();
-                    }
-                    let result = auction
-                        .orchestrator
-                        .collect_dispatched_auction(dispatched, services, &auction_context)
-                        .await;
-                    if provider_launched {
-                        timings.mark_auction_resolved();
-                    }
-                    Ok(result)
-                }
-                DispatchAuctionOutcome::DispatchFailed {
-                    provider_launched,
-                    provider_responses,
-                    fatal_admission_error,
-                    ..
-                } => {
-                    if provider_launched {
-                        timings.mark_auction_dispatched();
-                    }
-                    dispatch_failure_responses = provider_responses;
-                    Err(fatal_admission_error.unwrap_or_else(|| {
-                        Report::new(TrustedServerError::Auction {
-                            message: "All eligible provider requests failed to dispatch"
-                                .to_string(),
-                        })
-                    }))
-                }
-                DispatchAuctionOutcome::NotStarted if settings.auction.providers.is_empty() => {
-                    Ok(OrchestrationResult {
-                        provider_responses: Vec::new(),
-                        mediator_response: None,
-                        winning_bids: Default::default(),
-                        total_time_ms: 0,
-                        metadata: Default::default(),
-                    })
-                }
-                DispatchAuctionOutcome::NotStarted => {
-                    Err(Report::new(TrustedServerError::Auction {
-                        message: "No planned provider request was started".to_string(),
-                    }))
-                }
-            };
+                .map_err(|failure| {
+                    dispatch_failure_responses = failure.provider_responses;
+                    failure.error
+                });
             match result {
-                Ok(result) => {
-                    // A successful result can come from an empty provider set or a
-                    // routing-only skip. Browser timing diagnostics require a stamped
-                    // dispatch offset proving that a provider request started.
-                    if gpt_diagnostics.browser_session_active()
-                        && request_timing_collector_attached
-                        && timings.snapshot().auction_dispatched_ms.is_some()
-                    {
-                        let timing_snapshot = timings.snapshot();
-                        auction_diagnostics = Some(BrowserAuctionDiagnostics {
-                            auction_dispatched_ms: timing_snapshot.auction_dispatched_ms,
-                            auction_resolved_ms: timing_snapshot.auction_resolved_ms,
-                            auction_committed_ms: None,
-                            auction_wait_ms: timing_snapshot
-                                .auction_resolved_ms
-                                .zip(timing_snapshot.auction_dispatched_ms)
-                                .map(|(resolved, dispatched)| resolved.saturating_sub(dispatched)),
-                            auction_wait_placement: Some(auction_wait_placement_wire(
-                                AuctionWaitPlacement::PreHeader,
-                            )),
-                        });
-                    }
+                Ok((result, auction_work_started)) => {
                     let winning_bids = result.winning_bids.clone();
                     let diagnostics_request_id = diagnostics_auction_id(settings);
                     let bid_map = build_bid_map_with_auction_id(
@@ -7485,11 +7415,13 @@ pub async fn handle_page_bids(
                         diagnostics_request_id.as_deref(),
                     );
                     // Targeting is available to the response pipeline.
-                    if timings.snapshot().auction_dispatched_ms.is_some() {
+                    if auction_work_started {
                         timings.mark_auction_committed();
                     }
-                    if let Some(diagnostics) = auction_diagnostics.as_mut() {
-                        diagnostics.auction_committed_ms = timings.snapshot().auction_committed_ms;
+                    if gpt_diagnostics.browser_session_active() && request_timing_collector_attached
+                    {
+                        auction_diagnostics =
+                            BrowserAuctionDiagnostics::from_request_timings(&timings);
                     }
                     let delivered_winner_slots = bid_map.keys().cloned().collect();
                     emit_auction_events_best_effort_lazy(services, || {
@@ -10311,6 +10243,7 @@ mod tests {
         //! link; this tests that they connect.
 
         use super::*;
+        use crate::auction::provider::test_support::LaunchEvidenceProvider as Mediator;
         use crate::platform::ClientInfo;
         use crate::platform::test_support::{
             NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend, StubHttpClient,
@@ -11132,11 +11065,13 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn routing_only_dispatched_navigation_keeps_milestones_null() {
+        async fn routing_only_navigation_times_only_mediator_requests_that_started() {
+            // Shared-template cache misses intentionally buffer even with a streaming
+            // finalizer. Inline assembly exercises the actual lazy collection path.
             let toml = format!(
                 "{}\n[auction]\nenabled = true\n\n\
                  [auction.providers.skipped]\nprotocol = \"openrtb-2.6\"\nprofile = \"standard\"\nendpoint = \"https://bidder.example.com/auction\"\nrouting = \"explicit\"\n\n\
-                 [creative_opportunities]\ngam_network_id = \"99999\"\nassembly_mode = \"esi\"\n\n\
+                 [creative_opportunities]\ngam_network_id = \"99999\"\nassembly_mode = \"inline\"\n\n\
                  [[creative_opportunities.slot]]\nid = \"test-slot\"\npage_patterns = [\"/article\"]\nformats = [{{ width = 728, height = 90 }}]\n",
                 crate_test_settings_str()
             );
@@ -11149,53 +11084,108 @@ mod tests {
                 crate::auction::compile_auction_plan(&settings)
                     .expect("should compile explicit-routing navigation plan"),
             );
-            for finalizer in [Finalizer::Buffered, Finalizer::Streaming] {
-                let orchestrator = AuctionOrchestrator::from_plan(Arc::clone(&plan), None);
-                let stub = Arc::new(StubHttpClient::new());
-                queue_shareable_html(&stub);
-                let sink = Arc::new(RecordingTelemetrySink::default());
-                let services = services_with_cache_and_telemetry(
-                    Arc::clone(&stub),
-                    Arc::new(MemoryTemplateCache::default()),
-                    Arc::clone(&sink),
-                );
-                let mut request = navigation_request();
-                let timings = RequestTimings::new();
-                request.extensions_mut().insert(timings.handle().clone());
+            for (finalizer, placement) in [
+                (Finalizer::Buffered, AuctionWaitPlacement::PreHeader),
+                (Finalizer::Streaming, AuctionWaitPlacement::InStream),
+            ] {
+                for mediator in [
+                    None,
+                    Some(Mediator::Immediate),
+                    Some(Mediator::FailBeforeStart),
+                    Some(Mediator::FailAfterStart),
+                    Some(Mediator::Pending),
+                ] {
+                    let launched =
+                        matches!(mediator, Some(Mediator::FailAfterStart | Mediator::Pending));
+                    let orchestrator = AuctionOrchestrator::from_plan(
+                        Arc::clone(&plan),
+                        mediator.map(|mediator| Arc::new(mediator) as Arc<dyn AuctionProvider>),
+                    );
+                    let stub = Arc::new(StubHttpClient::new());
+                    stub.set_streaming_responses_supported(true);
+                    queue_shareable_html(&stub);
+                    stub.push_response(204, Vec::new());
+                    let sink = Arc::new(RecordingTelemetrySink::default());
+                    let services = services_with_cache_and_telemetry(
+                        Arc::clone(&stub),
+                        Arc::new(MemoryTemplateCache::default()),
+                        Arc::clone(&sink),
+                    );
+                    let mut request = navigation_request();
+                    let timings = RequestTimings::new();
+                    request.extensions_mut().insert(timings.handle().clone());
 
-                let response =
-                    run_with_orchestrator(&settings, &services, request, orchestrator, finalizer)
-                        .await;
-                let _ = body_of(response).await;
-                let summary = last_summary_row(&sink)
-                    .expect("should emit a summary for the routing-only dispatch");
-                assert_eq!(summary.terminal_status.as_deref(), Some("completed"));
-                assert_eq!(
-                    timings
-                        .snapshot()
-                        .auction_id
-                        .map(|id| id.to_string())
-                        .as_deref(),
-                    Some(summary.auction_id.as_str()),
-                    "should join the routing-only dispatch to its navigation summary"
-                );
-                let snapshot = timings.snapshot();
-                assert!(snapshot.auction_dispatched_ms.is_none());
-                assert!(snapshot.auction_resolved_ms.is_none());
-                assert!(snapshot.auction_committed_ms.is_none());
-                assert_eq!(
-                    snapshot.auction_wait_ms, None,
-                    "should omit wait without a provider launch"
-                );
-                assert_eq!(
-                    snapshot.auction_wait_placement, None,
-                    "should omit placement without a provider launch"
-                );
-                assert_eq!(
-                    stub.recorded_request_uris(),
-                    vec!["https://origin.test-publisher.com/article"],
-                    "should send only the origin request for the explicit routing skip"
-                );
+                    let response = run_with_orchestrator(
+                        &settings,
+                        &services,
+                        request,
+                        orchestrator,
+                        finalizer,
+                    )
+                    .await;
+                    if matches!(finalizer, Finalizer::Streaming) {
+                        assert!(
+                            response.body().is_stream(),
+                            "should return a lazy response body"
+                        );
+                        let before_poll = timings.snapshot();
+                        assert_eq!(
+                            before_poll.auction_wait_ms, None,
+                            "should not collect before the lazy body is polled"
+                        );
+                        assert_eq!(
+                            before_poll.auction_resolved_ms, None,
+                            "should not resolve before the lazy body is polled"
+                        );
+                        assert_eq!(
+                            stub.recorded_request_uris(),
+                            vec!["https://origin.test-publisher.com/article"],
+                            "should defer the mediator request until the lazy body is polled"
+                        );
+                    }
+                    let _ = body_of(response).await;
+                    let summary = last_summary_row(&sink)
+                        .expect("should emit a summary for the routing-only dispatch");
+                    assert_eq!(summary.terminal_status.as_deref(), Some("completed"));
+                    assert_eq!(
+                        timings
+                            .snapshot()
+                            .auction_id
+                            .map(|id| id.to_string())
+                            .as_deref(),
+                        Some(summary.auction_id.as_str()),
+                        "should join the routing-only dispatch to its navigation summary"
+                    );
+                    let snapshot = timings.snapshot();
+                    assert!(
+                        snapshot.auction_dispatched_ms.is_none(),
+                        "must not fabricate provider dispatch for a mediator launched during collection"
+                    );
+                    assert_eq!(
+                        snapshot.auction_resolved_ms.is_some(),
+                        launched,
+                        "{mediator:?}"
+                    );
+                    assert_eq!(
+                        snapshot.auction_committed_ms.is_some(),
+                        launched,
+                        "{mediator:?}"
+                    );
+                    assert_eq!(snapshot.auction_wait_ms.is_some(), launched, "{mediator:?}");
+                    assert_eq!(
+                        snapshot.auction_wait_placement,
+                        launched.then_some(placement)
+                    );
+                    let expected = if launched {
+                        vec![
+                            "https://origin.test-publisher.com/article",
+                            "https://mediator.example.com/auction",
+                        ]
+                    } else {
+                        vec!["https://origin.test-publisher.com/article"]
+                    };
+                    assert_eq!(stub.recorded_request_uris(), expected, "{mediator:?}");
+                }
             }
         }
 
@@ -23066,9 +23056,9 @@ mod tests {
     #[cfg(test)]
     mod creative_opportunities_tests {
         use super::super::{
-            AdBidsState, MatchedSlotsContext, build_ad_slots_script, build_auction_request,
-            build_bid_map, build_bids_script, diagnostics_auction_id, html_escape_for_script,
-            write_bids_to_state,
+            AdBidsState, BrowserAuctionDiagnostics, MatchedSlotsContext, build_ad_slots_script,
+            build_auction_request, build_bid_map, build_bids_script, diagnostics_auction_id,
+            html_escape_for_script, write_bids_to_state,
         };
         use crate::auction::types::{ApsRendererV1, ApsTagType, Bid, BidRenderer, MediaType};
         use crate::consent::ConsentContext;
@@ -24445,6 +24435,20 @@ mod tests {
         }
 
         #[test]
+        fn browser_auction_diagnostics_preserve_measured_zero_wait_instead_of_offset_difference() {
+            let timings = RequestTimings::new();
+            timings.mark_auction_dispatched();
+            std::thread::sleep(Duration::from_millis(5));
+            timings.record_auction_wait(AuctionWaitPlacement::PreHeader, Duration::ZERO);
+            timings.mark_auction_resolved();
+            let diagnostics = BrowserAuctionDiagnostics::from_request_timings(&timings)
+                .expect("should expose measured auction timing");
+            assert_eq!(diagnostics.auction_wait_ms, Some(0));
+            assert_eq!(diagnostics.auction_wait_placement, Some("pre_header"));
+            assert!(diagnostics.auction_resolved_ms > diagnostics.auction_dispatched_ms);
+        }
+
+        #[test]
         fn active_diagnostics_without_attached_collector_omits_auction_timing() {
             let timings = RequestTimings::new();
             timings.mark_auction_dispatched();
@@ -24737,6 +24741,7 @@ mod tests {
         use super::super::*;
         use super::build_services_with_http_client;
         use crate::auction::AuctionOrchestrator;
+        use crate::auction::provider::test_support::LaunchEvidenceProvider as Mediator;
         use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
         use crate::auction::types::{AuctionRequest, AuctionResponse, Bid};
         use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
@@ -25162,6 +25167,103 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn page_bids_mediator_collection_requires_actual_launch_evidence() {
+            for configured_provider in [false, true] {
+                for (mediator, wait_failure) in [
+                    (Mediator::Immediate, false),
+                    (Mediator::FailBeforeStart, false),
+                    (Mediator::FailAfterStart, false),
+                    (Mediator::Pending, false),
+                    (Mediator::Pending, true),
+                ] {
+                    let mut settings = settings_with_co();
+                    let provider = if configured_provider {
+                        "[providers.skipped]\nprotocol = \"openrtb-2.6\"\nprofile = \"standard\"\nendpoint = \"https://bidder.example.com/auction\"\nrouting = \"explicit\"\n"
+                    } else {
+                        ""
+                    };
+                    settings.auction = toml::from_str(&format!(
+                        "enabled = true\nmediator = \"adserver_mock\"\n{provider}"
+                    ))
+                    .expect("should parse mediator-only collection settings");
+                    settings
+                        .integrations
+                        .insert_config("gpt_diagnostics", &serde_json::json!({"enabled": true}))
+                        .expect("should enable diagnostics");
+                    let orchestrator = AuctionOrchestrator::from_plan(
+                        Arc::new(
+                            crate::auction::compile_auction_plan(&settings)
+                                .expect("should compile mediator collection plan"),
+                        ),
+                        Some(Arc::new(mediator)),
+                    );
+                    let http = Arc::new(StubHttpClient::new());
+                    http.push_response(204, Vec::new());
+                    if wait_failure {
+                        http.push_wait_error();
+                    }
+                    let services = build_services_with_http_client(http.clone());
+                    let slots = article_slot();
+                    let mut req = make_active_page_bids_request("/2024/01/my-article/");
+                    let timings = RequestTimings::new();
+                    req.extensions_mut().insert(timings.handle().clone());
+                    let mut ec_context = consent_allowing_ec_context();
+                    let response = handle_page_bids(
+                        &settings,
+                        &services,
+                        None,
+                        AuctionDispatch {
+                            orchestrator: &orchestrator,
+                            slots: &slots,
+                            registry: None,
+                        },
+                        &mut ec_context,
+                        req,
+                    )
+                    .await
+                    .expect("should return mediator page-bids response");
+                    let body: serde_json::Value = serde_json::from_slice(
+                        &response
+                            .into_body()
+                            .into_bytes()
+                            .expect("should read page-bids response"),
+                    )
+                    .expect("should parse mediator page-bids response");
+                    let launched = configured_provider
+                        && matches!(mediator, Mediator::FailAfterStart | Mediator::Pending);
+                    assert_eq!(
+                        http.recorded_backend_names().len(),
+                        usize::from(launched),
+                        "{configured_provider} {mediator:?}"
+                    );
+                    let snapshot = timings.snapshot();
+                    assert!(snapshot.auction_dispatched_ms.is_none());
+                    assert_eq!(snapshot.auction_resolved_ms.is_some(), launched);
+                    assert_eq!(snapshot.auction_committed_ms.is_some(), launched);
+                    assert_eq!(snapshot.auction_wait_ms.is_some(), launched);
+                    assert_eq!(
+                        snapshot.auction_wait_placement,
+                        launched.then_some(AuctionWaitPlacement::PreHeader)
+                    );
+                    assert_eq!(
+                        body.get("auctionDiagnostics").is_some(),
+                        launched,
+                        "{configured_provider} {mediator:?}"
+                    );
+                    if launched {
+                        let diagnostics = &body["auctionDiagnostics"];
+                        assert!(diagnostics.get("auctionDispatchedMs").is_none());
+                        assert_eq!(
+                            diagnostics["auctionWaitMs"].as_u64(),
+                            snapshot.auction_wait_ms.map(u64::from)
+                        );
+                        assert_eq!(diagnostics["auctionWaitPlacement"], "pre_header");
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
         async fn planned_page_bids_keeps_installed_collector_after_launch_and_transport_failure() {
             for (transport_failure, metadata_missing) in
                 [(false, false), (true, false), (false, true)]
@@ -25234,6 +25336,11 @@ mod tests {
                     snapshot.auction_id.is_some(),
                     "should stamp the observation UUID in the original handle"
                 );
+                assert_eq!(snapshot.auction_wait_ms.is_some(), !metadata_missing);
+                assert_eq!(
+                    snapshot.auction_wait_placement,
+                    (!metadata_missing).then_some(AuctionWaitPlacement::PreHeader)
+                );
                 let dispatched = snapshot
                     .auction_dispatched_ms
                     .expect("should mark dispatch");
@@ -25272,6 +25379,14 @@ mod tests {
                         body["auctionDiagnostics"]["auctionDispatchedMs"].as_u64(),
                         Some(u64::from(dispatched)),
                         "should expose the installed collector rather than a handler-local clock"
+                    );
+                    assert_eq!(
+                        body["auctionDiagnostics"]["auctionWaitMs"].as_u64(),
+                        snapshot.auction_wait_ms.map(u64::from)
+                    );
+                    assert_eq!(
+                        body["auctionDiagnostics"]["auctionWaitPlacement"],
+                        "pre_header"
                     );
                 }
             }
@@ -25421,8 +25536,12 @@ mod tests {
             );
             assert_eq!(
                 wait_ms,
-                resolved_ms.saturating_sub(dispatched_ms),
-                "auction wait should exclude page-bids pre-dispatch work"
+                u64::from(
+                    timing_snapshot
+                        .auction_wait_ms
+                        .expect("should measure collection wait")
+                ),
+                "browser wait should use the measured collection interval"
             );
             assert_eq!(auction_diagnostics["auctionWaitPlacement"], "pre_header");
             assert!(

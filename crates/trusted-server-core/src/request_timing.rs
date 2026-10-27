@@ -151,9 +151,9 @@ impl RequestTimings {
     ///
     /// Callers record only when at least one provider request actually started.
     /// A measured zero duration is retained; no-launch collection leaves the
-    /// duration and placement unset. Current publisher HTML collectors use this
-    /// method; mediator-only work and the `/auction` and `/_ts/page-bids`
-    /// endpoints leave access-row wait timing unrecorded.
+    /// duration and placement unset. Publisher collectors and the `/auction`
+    /// and `/_ts/page-bids` endpoints measure the collection interval here,
+    /// including mediator-only collection when an upstream request started.
     /// Drops the sample silently on lock contention; a poisoned lock is recovered.
     pub fn record_auction_wait(&self, placement: AuctionWaitPlacement, dur: Duration) {
         let _ = self
@@ -214,7 +214,9 @@ impl RequestTimings {
     /// Called after at least one provider starts a request.
     /// Routing-only skipped outcomes and zero-launch
     /// failures do not stamp it. A null offset alongside a non-null
-    /// `auction_id` means no provider launch was observed. Subsequent calls
+    /// `auction_id` means no provider launch was observed during dispatch.
+    /// A mediator started later during collection does not stamp this offset.
+    /// Subsequent calls
     /// are no-ops (first call wins).
     /// Drops the sample silently on lock contention; a poisoned lock is
     /// recovered.

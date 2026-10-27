@@ -24,6 +24,7 @@ use super::routing::route_auction;
 use super::telemetry::AbandonedProviderCall;
 use super::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus};
 use crate::request_signing::RequestSigner;
+use crate::request_timing::{AuctionWaitPlacement, RequestTimings};
 
 /// In-flight auction requests dispatched to SSP backends.
 ///
@@ -86,6 +87,17 @@ pub enum DispatchAuctionOutcome {
     },
     /// One or more providers produced an immediate response or started a request.
     Dispatched(DispatchedAuction),
+}
+
+/// Synchronous execution failure, including outcomes needed by route telemetry.
+pub(crate) struct AuctionExecutionFailure {
+    /// Admission or dispatch error to propagate through the route's error boundary.
+    pub error: Report<TrustedServerError>,
+    /// Provider outcomes materialized before failure, for terminal telemetry.
+    pub provider_responses: Vec<AuctionResponse>,
+    /// Elapsed dispatch time, or execution time when dispatch returned `NotStarted`.
+    /// Excludes the caller's request parsing and targeting preparation.
+    pub elapsed_ms: u64,
 }
 
 impl DispatchedAuction {
@@ -874,30 +886,100 @@ impl AuctionOrchestrator {
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
     ) -> Result<OrchestrationResult, Report<TrustedServerError>> {
+        self.execute_auction(request, context, None)
+            .await
+            .map(|(result, _)| result)
+            .map_err(|failure| failure.error)
+    }
+
+    /// Execute a synchronous route auction with request-clock collection timing.
+    ///
+    /// Returns the result and whether any provider or mediator request started.
+    /// The bool stays false for Immediate, routing-only, and empty-plan results.
+    /// Only provider launches during dispatch stamp the dispatch offset; actual
+    /// upstream work during collection records wait and resolution timing.
+    ///
+    /// # Errors
+    /// Returns admission or dispatch failures with their provider outcomes and
+    /// elapsed time for route telemetry. Failed dispatch never records collection.
+    pub(crate) async fn run_auction_with_timings(
+        &self,
+        request: &AuctionRequest,
+        context: &AuctionContext<'_>,
+        timings: &RequestTimings,
+    ) -> Result<(OrchestrationResult, bool), AuctionExecutionFailure> {
+        self.execute_auction(request, context, Some(timings)).await
+    }
+
+    async fn execute_auction(
+        &self,
+        request: &AuctionRequest,
+        context: &AuctionContext<'_>,
+        timings: Option<&RequestTimings>,
+    ) -> Result<(OrchestrationResult, bool), AuctionExecutionFailure> {
+        let started = Instant::now();
         match self.dispatch_auction(request, context).await {
-            DispatchAuctionOutcome::Dispatched(dispatched) => Ok(self
-                .collect_dispatched_auction(dispatched, context.services, context)
-                .await),
+            DispatchAuctionOutcome::Dispatched(dispatched) => {
+                if dispatched.has_provider_launch()
+                    && let Some(timings) = timings
+                {
+                    timings.mark_auction_dispatched();
+                }
+                Ok(self
+                    .collect_with_timing(
+                        dispatched,
+                        context.services,
+                        context,
+                        timings.map(|timings| (timings, AuctionWaitPlacement::PreHeader)),
+                    )
+                    .await)
+            }
             DispatchAuctionOutcome::DispatchFailed {
+                provider_launched,
+                provider_responses,
                 fatal_admission_error,
+                elapsed_ms,
                 ..
             } => {
-                if let Some(error) = fatal_admission_error {
-                    return Err(error.change_context(TrustedServerError::Auction {
-                        message: "Planned auction admission failed".to_string(),
-                    }));
+                if provider_launched && let Some(timings) = timings {
+                    timings.mark_auction_dispatched();
                 }
-                Err(Report::new(TrustedServerError::Auction {
-                    message: "All eligible planned provider requests failed to launch".to_string(),
-                }))
+                Err(AuctionExecutionFailure {
+                    error: fatal_admission_error
+                        .map(|error| {
+                            error.change_context(TrustedServerError::Auction {
+                                message: "Planned auction admission failed".to_string(),
+                            })
+                        })
+                        .unwrap_or_else(|| {
+                            Report::new(TrustedServerError::Auction {
+                                message: "All eligible planned provider requests failed to launch"
+                                    .to_string(),
+                            })
+                        }),
+                    provider_responses,
+                    elapsed_ms,
+                })
             }
             DispatchAuctionOutcome::NotStarted => {
-                if self.planned_providers.is_empty() {
-                    Ok(OrchestrationResult::no_bid())
+                #[cfg(test)]
+                let has_providers = if self.plan_backed {
+                    !self.planned_providers.is_empty()
                 } else {
-                    Err(Report::new(TrustedServerError::Auction {
-                        message: "No planned provider request was started".to_string(),
-                    }))
+                    !self.config.providers.is_empty()
+                };
+                #[cfg(not(test))]
+                let has_providers = !self.planned_providers.is_empty();
+                if has_providers {
+                    Err(AuctionExecutionFailure {
+                        error: Report::new(TrustedServerError::Auction {
+                            message: "No planned provider request was started".to_string(),
+                        }),
+                        provider_responses: Vec::new(),
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    })
+                } else {
+                    Ok((OrchestrationResult::no_bid(), false))
                 }
             }
         }
@@ -2142,6 +2224,60 @@ impl AuctionOrchestrator {
         services: &RuntimeServices,
         context: &AuctionContext<'_>,
     ) -> OrchestrationResult {
+        self.collect_with_timing(dispatched, services, context, None)
+            .await
+            .0
+    }
+
+    /// Collect with measured wait placement and explicit provider/mediator launch evidence.
+    ///
+    /// Returns the result and whether a provider or mediator request started,
+    /// including post-start failures. The bool stays false for Immediate and
+    /// routing-only outcomes. Wait and resolution are recorded only when true;
+    /// mediator-only work does not fabricate a provider dispatch offset.
+    pub(crate) async fn collect_dispatched_auction_with_timings(
+        &self,
+        dispatched: DispatchedAuction,
+        services: &RuntimeServices,
+        context: &AuctionContext<'_>,
+        timings: &RequestTimings,
+        placement: AuctionWaitPlacement,
+    ) -> (OrchestrationResult, bool) {
+        self.collect_with_timing(dispatched, services, context, Some((timings, placement)))
+            .await
+    }
+
+    async fn collect_with_timing(
+        &self,
+        dispatched: DispatchedAuction,
+        services: &RuntimeServices,
+        context: &AuctionContext<'_>,
+        timing: Option<(&RequestTimings, AuctionWaitPlacement)>,
+    ) -> (OrchestrationResult, bool) {
+        let mut auction_work_started = dispatched.has_provider_launch();
+        let wait_started = Instant::now();
+        let result = self
+            .collect_dispatched_auction_inner(
+                dispatched,
+                services,
+                context,
+                &mut auction_work_started,
+            )
+            .await;
+        if auction_work_started && let Some((timings, placement)) = timing {
+            timings.record_auction_wait(placement, wait_started.elapsed());
+            timings.mark_auction_resolved();
+        }
+        (result, auction_work_started)
+    }
+
+    async fn collect_dispatched_auction_inner(
+        &self,
+        dispatched: DispatchedAuction,
+        services: &RuntimeServices,
+        context: &AuctionContext<'_>,
+        auction_work_started: &mut bool,
+    ) -> OrchestrationResult {
         let DispatchedAuction {
             pending_requests,
             provider_launched: _,
@@ -2462,52 +2598,58 @@ impl AuctionOrchestrator {
                     Ok(ProviderRequestOutcome::Pending {
                         request: pending,
                         parse_state,
-                    }) => match services.http_client().wait(pending).await.change_context(
-                        TrustedServerError::Auction {
-                            message: format!(
-                                "Mediator {} request failed",
-                                mediator.provider_name()
-                            ),
-                        },
-                    ) {
-                        Ok(platform_resp) => {
-                            let response_time_ms = mediator_start.elapsed().as_millis() as u64;
-                            if deadline_policy.rejects_late_completion(auction_start, timeout_ms) {
-                                log::warn!(
-                                    "Mediator '{}' completed after the hard auction deadline; using local ranking ({}ms)",
-                                    mediator.provider_name(),
-                                    response_time_ms
-                                );
-                                None
-                            } else {
-                                match mediator
-                                    .parse_response_with_context_and_state(
-                                        platform_resp,
-                                        response_time_ms,
-                                        &request,
-                                        &mediator_context,
-                                        parse_state.as_deref(),
-                                    )
-                                    .await
+                    }) => {
+                        *auction_work_started = true;
+                        match services.http_client().wait(pending).await.change_context(
+                            TrustedServerError::Auction {
+                                message: format!(
+                                    "Mediator {} request failed",
+                                    mediator.provider_name()
+                                ),
+                            },
+                        ) {
+                            Ok(platform_resp) => {
+                                let response_time_ms = mediator_start.elapsed().as_millis() as u64;
+                                if deadline_policy
+                                    .rejects_late_completion(auction_start, timeout_ms)
                                 {
-                                    Ok(response) => Some(response),
-                                    Err(error) => {
-                                        log::warn!(
-                                            "Mediator '{}' parse failed: {:?}",
-                                            mediator.provider_name(),
-                                            error
-                                        );
-                                        None
+                                    log::warn!(
+                                        "Mediator '{}' completed after the hard auction deadline; using local ranking ({}ms)",
+                                        mediator.provider_name(),
+                                        response_time_ms
+                                    );
+                                    None
+                                } else {
+                                    match mediator
+                                        .parse_response_with_context_and_state(
+                                            platform_resp,
+                                            response_time_ms,
+                                            &request,
+                                            &mediator_context,
+                                            parse_state.as_deref(),
+                                        )
+                                        .await
+                                    {
+                                        Ok(response) => Some(response),
+                                        Err(error) => {
+                                            log::warn!(
+                                                "Mediator '{}' parse failed: {:?}",
+                                                mediator.provider_name(),
+                                                error
+                                            );
+                                            None
+                                        }
                                     }
                                 }
                             }
+                            Err(error) => {
+                                log::warn!("Mediator request failed: {:?}", error);
+                                None
+                            }
                         }
-                        Err(error) => {
-                            log::warn!("Mediator request failed: {:?}", error);
-                            None
-                        }
-                    },
+                    }
                     Err(error) => {
+                        *auction_work_started |= error.contains::<ProviderRequestStarted>();
                         log::warn!(
                             "Mediator '{}' failed to dispatch: {:?}",
                             mediator.provider_name(),
