@@ -2420,16 +2420,19 @@ is stripped from Prebid Server requests and never added to proxy or
 provider requests. The publisher origin is not a third party, but it gets
 only the small one:
 
-- **Publisher origin. ID cookies stripped.** The publisher proxy removes
-  `ts-eids` and `__Host-ts-eids-s` (`TS_ORIGIN_STRIPPED_COOKIE_NAMES`) from
-  the `Cookie` header it forwards (`publisher.rs:3124-3147`), and drops the
-  header when nothing is left. `ts-ec` still reaches the origin, as today,
-  because publishers' servers may read it. Without the strip the ID cookies
-  add up to about 5 KB to every origin request, and common origin servers
-  reject a header line over about 8 KB with 400 or 431, which would fail
-  the page itself. Stripping `ts-eids` from the origin is a behaviour
-  change: an origin that read it must read `x-ts-eids` or ask TS instead. A
-  metric still reports the inbound `Cookie` header size (section 14).
+- **Publisher origin. The mirror stripped.** The publisher proxy removes
+  `__Host-ts-eids-s` (`TS_ORIGIN_STRIPPED_COOKIE_NAMES`) from the `Cookie`
+  header it forwards (`publisher.rs:3124-3147`), and drops the header when
+  nothing is left. `ts-ec` and `ts-eids` still reach the origin, as today,
+  because publishers' servers may read them, and nothing else gives an
+  origin the browser's IDs: `x-ts-eids` is set only on `/auction`
+  responses and never forwarded downstream (`constants.rs:59-69`). So the
+  origin's `Cookie` header stays at today's size; only the mirror would add
+  to it, up to about 2 KB. An operator whose origin rejects large headers
+  (common servers answer 400 or 431 above about 8 KB per header line) sets
+  `[ec] strip_eids_cookie_from_origin = true`, which strips `ts-eids` too
+  (`TS_ORIGIN_STRIPPED_COOKIE_NAMES_WITH_EIDS`). A metric still reports the
+  inbound `Cookie` header size (section 14).
 - **Prebid Server.** Stripped in the Prebid transport before the
   consent-forwarding mode is checked (`integrations/prebid.rs:2091-2108`), so
   it applies in every mode, including the early return that forwards the raw
@@ -2812,8 +2815,8 @@ Rules:
 - The host must be one of the descriptor's `resolves` hosts.
 - Providers build headers from scratch. The coordinator rejects any request
   with a `Cookie` header, and TS's identity cookies are stripped from Prebid
-  Server requests. The publisher origin receives `ts-ec` but not the ID
-  cookies (section 6.2).
+  Server requests. The publisher origin receives `ts-ec` and `ts-eids` but
+  never the mirror (section 6.2).
 - Providers get only the inputs their descriptor declares (section 4.4).
   Only generic pull receives the EC ID. Location is coarse (country and
   subdivision), page URLs carry no query string, and the consent view
@@ -4233,9 +4236,10 @@ request opens or parses `ts-eids-s`.
 **Outbound requests.** Requests to Prebid Server, in every
 consent-forwarding mode, carry none of the `TS_IDENTITY_COOKIE_NAMES`
 cookies, keep every other cookie, and drop the header when nothing is left.
-Requests to the publisher origin carry neither `ts-eids` nor
-`__Host-ts-eids-s`, keep `ts-ec` and every other cookie, and drop the
-header when nothing is left.
+Requests to the publisher origin never carry `__Host-ts-eids-s`, keep
+`ts-ec`, `ts-eids` and every other cookie, and drop the header when nothing
+is left. With `strip_eids_cookie_from_origin`, they carry no `ts-eids`
+either.
 
 **Merge.**
 
@@ -4335,8 +4339,10 @@ Two steps, each shippable on its own:
 
 1. **One write, no new vendors.** This step includes:
    - the outbound cookie strips (origin and Prebid Server) and the
-     template cache's identity cookie list. Stripping `ts-eids` from origin
-     requests is a behaviour change for any origin that read it
+     template cache's identity cookie list. Stripping `ts-ec` and `ts-eids`
+     from Prebid Server requests is a behaviour change: both reach it today
+     (`integrations/prebid.rs:2088-2108`). The origin keeps both unless the
+     operator sets `strip_eids_cookie_from_origin`
    - the writer-request rule and the `IdentityMutation` single flush, with no retry except the removal-only one of section 5.2, phase 4; the new visitor's create stays before routing, as today
    - `/auction`, `/_ts/page-bids` and `/identify` stopping their writes
    - one after-send attempt for a withdrawal tombstone that failed before
@@ -4474,7 +4480,7 @@ Decisions made while writing this spec, with the user:
 | Delay on body-less routes        | Accepted: a browser ID first seen in an `/auction` body reaches KV one page view later.                                                                                                                                                  |
 | SPA views (`/_ts/page-bids`)     | Stagers. They never write KV and call no provider.                                                                                                                                                                                       |
 | Hold budget                      | `hold_budget_ms` defaults to 100 ms, reduced from 300 ms (section 4.7 gives the reasons).                                                                                                                                                |
-| Outbound cookies                 | TS's identity cookies are stripped from Prebid Server requests. The origin keeps `ts-ec` but loses `ts-eids` and `ts-eids-s`, to stay under header limits.                                                                               |
+| Outbound cookies                 | TS's identity cookies are stripped from Prebid Server requests. The origin keeps `ts-ec` and `ts-eids` and loses only `ts-eids-s`; `strip_eids_cookie_from_origin` strips `ts-eids` too. Changed after the round 14 review.              |
 | Deletion                         | A tombstone with the 24-hour `TOMBSTONE_TTL` replaces the hard delete. No extra writes.                                                                                                                                                  |
 | GPP opt-outs                     | Sharing and targeted-advertising opt-outs are decoded, and the strict policy blocks them.                                                                                                                                                |
 | `x-ts-eids`                      | Kept as a full troubleshooting header. Its exposure of server-only IDs to page scripts is accepted.                                                                                                                                      |

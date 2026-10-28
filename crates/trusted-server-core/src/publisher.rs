@@ -60,7 +60,8 @@ use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::template_cache_policy::{TemplateCookieDecision, evaluate_cookie_policy};
 use crate::cookies::{
-    TS_ORIGIN_STRIPPED_COOKIE_NAMES, handle_request_cookies, strip_cookie_headers,
+    TS_ORIGIN_STRIPPED_COOKIE_NAMES, TS_ORIGIN_STRIPPED_COOKIE_NAMES_WITH_EIDS,
+    handle_request_cookies, strip_cookie_headers,
 };
 use crate::creative_opportunities::{
     AdStackGateInput, AssemblyMode, CreativeOpportunitiesConfig, RuntimeAdStackExpected,
@@ -3124,11 +3125,13 @@ fn should_preload_ec_snapshot(input: &EcSnapshotPreloadInput) -> bool {
 ///
 /// Restricts advertised encodings to those the rewrite pipeline can handle,
 /// strips the internal `fastly-ssl` scheme signal so it never leaks to the
-/// backend, and retargets the URI and `Host` header at the origin.
+/// backend, strips the `ts-eids-s` mirror (and `ts-eids` too when
+/// `strip_eids`), and retargets the URI and `Host` header at the origin.
 fn rewrite_origin_request(
     req: &mut Request<EdgeBody>,
     target_uri: Uri,
     origin_host_header: &str,
+    strip_eids: bool,
 ) -> Result<(), Report<TrustedServerError>> {
     restrict_accept_encoding(req);
     // Layering wart: `fastly-ssl` is a vendor-specific header name. Core only
@@ -3140,9 +3143,15 @@ fn rewrite_origin_request(
     // separate change. Until then we strip it here so the edge signal never
     // reaches publisher backends.
     req.headers_mut().remove("fastly-ssl");
-    // The publisher origin keeps `ts-ec` but never receives the ID cookies,
-    // which can push its `Cookie` header past common 8 KB limits (spec 6.2).
-    strip_cookie_headers(req.headers_mut(), TS_ORIGIN_STRIPPED_COOKIE_NAMES);
+    // The publisher origin keeps `ts-ec`, and `ts-eids` unless the operator
+    // strips it too. It never receives the mirror, which would push its
+    // `Cookie` header past its size before this spec (spec 6.2).
+    let stripped = if strip_eids {
+        TS_ORIGIN_STRIPPED_COOKIE_NAMES_WITH_EIDS
+    } else {
+        TS_ORIGIN_STRIPPED_COOKIE_NAMES
+    };
+    strip_cookie_headers(req.headers_mut(), stripped);
     *req.uri_mut() = target_uri;
     req.headers_mut().insert(
         header::HOST,
@@ -4797,7 +4806,12 @@ pub async fn handle_publisher_request(
         });
     let mut template_cache_response_state = matches!(assembly_mode, AssemblyMode::Esi)
         .then_some(TemplateCacheResponseState::BypassRequest);
-    rewrite_origin_request(&mut req, target_uri, &origin_host_header)?;
+    rewrite_origin_request(
+        &mut req,
+        target_uri,
+        &origin_host_header,
+        settings.ec.strip_eids_cookie_from_origin,
+    )?;
 
     let request_method = req.method().clone();
     let mut origin_request = Some(req);
@@ -7332,8 +7346,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rewrite_origin_request_strips_id_cookies_and_keeps_ts_ec() {
+    /// The `Cookie` header `rewrite_origin_request` leaves, with the
+    /// operator's `strip_eids` choice.
+    fn origin_cookies_after_rewrite(strip_eids: bool) -> Vec<String> {
         let mut req = Request::builder()
             .uri("https://www.example.com/article")
             .header(header::COOKIE, "ts-ec=abc; ts-eids=W10; session=1")
@@ -7350,13 +7365,31 @@ mod tests {
                 .parse()
                 .expect("should parse uri"),
             "origin.example.com",
+            strip_eids,
         )
         .expect("should rewrite request");
 
-        let cookies: Vec<_> = req.headers().get_all(header::COOKIE).iter().collect();
-        assert_eq!(cookies.len(), 1, "should send one Cookie header");
+        req.headers()
+            .get_all(header::COOKIE)
+            .iter()
+            .map(|value| value.to_str().expect("should be ASCII").to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn rewrite_origin_request_strips_only_the_mirror_by_default() {
         assert_eq!(
-            cookies[0], "ts-ec=abc; session=1; ts-ec-pull-complete=v1",
+            origin_cookies_after_rewrite(false),
+            vec!["ts-ec=abc; ts-eids=W10; session=1; ts-ec-pull-complete=v1"],
+            "should keep ts-ec and ts-eids, as before the mirror existed, and drop the mirror"
+        );
+    }
+
+    #[test]
+    fn rewrite_origin_request_strips_ts_eids_when_the_operator_asks() {
+        assert_eq!(
+            origin_cookies_after_rewrite(true),
+            vec!["ts-ec=abc; session=1; ts-ec-pull-complete=v1"],
             "should keep ts-ec, the pull marker and unrelated cookies, and drop the ID cookies"
         );
     }
@@ -7375,6 +7408,7 @@ mod tests {
                 .parse()
                 .expect("should parse uri"),
             "origin.example.com",
+            true,
         )
         .expect("should rewrite request");
 

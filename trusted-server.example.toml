@@ -82,6 +82,9 @@ ec_store = "ec_identity_store"
 # Optional cluster-heuristic tuning (defaults shown):
 # cluster_trust_threshold = 10    # entries with cluster_size <= this are individual users
 # cluster_recheck_secs = 3600     # re-evaluate cluster_size after this many seconds
+# Also strip the ts-eids cookie from publisher-origin requests. The
+# __Host-ts-eids-s mirror is always stripped.
+# strip_eids_cookie_from_origin = false
 
 # Server-side identity provider policy. Every key is optional; the values
 # below are the defaults.

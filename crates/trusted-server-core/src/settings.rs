@@ -548,6 +548,13 @@ pub struct Ec {
     #[serde(default)]
     pub identity: IdentitySettings,
 
+    /// Strips the `ts-eids` cookie from publisher-origin requests, as well as
+    /// the `ts-eids-s` mirror that is always stripped. Off by default, so an
+    /// origin that reads `ts-eids` keeps receiving it. An operator whose
+    /// origin rejects large `Cookie` headers turns it on.
+    #[serde(default)]
+    pub strip_eids_cookie_from_origin: bool,
+
     /// Catches the removed `pull_sync_concurrency` key.
     ///
     /// The key was replaced by `[ec.identity].max_concurrency`. It is parsed

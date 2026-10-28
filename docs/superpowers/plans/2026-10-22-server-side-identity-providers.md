@@ -37,7 +37,7 @@ Copied from the spec and `AGENTS.md`. Every task implicitly includes these.
 - Use only example or fictional data in code, tests, comments and docs (`example.com` hosts). Public protocol source domains (`id5-sync.com`, `liveramp.com`, `uidapi.com`, `sharedid.org`) may appear where the spec uses them.
 - **Fixed values from the spec. Do not change them:**
   - `ts-eids-s` (`__Host-ts-eids-s`) is client-only: the shim writes it with `Path=/; Secure; SameSite=Lax`, no `Domain` and no `HttpOnly`, with the `Max-Age` the payload gives. The server never sets, opens, parses or trusts it. The mirror payload is `ext.ts_eids_s` on `/auction` and a `ts_eids_s` member of the `/_ts/page-bids` body: `{value, max_age}`, `{clear: true}`, or absent. `value` is base64url without padding of compact JSON `{"v":1,"eids":[...]}`, at most **2,048** bytes. `max_age` is at most **86,400** and never past the earliest `exp` in the mirrored set (spec 6.2).
-  - `TS_IDENTITY_COOKIE_NAMES` = `ts-ec`, `ts-eids`, `__Host-ts-eids-s`, stripped from Prebid Server requests. `TS_ORIGIN_STRIPPED_COOKIE_NAMES` = `ts-eids`, `__Host-ts-eids-s`, stripped from origin requests. Exact names only: there are no cookie prefixes.
+  - `TS_IDENTITY_COOKIE_NAMES` = `ts-ec`, `ts-eids`, `__Host-ts-eids-s`, stripped from Prebid Server requests. `TS_ORIGIN_STRIPPED_COOKIE_NAMES` = `__Host-ts-eids-s`, stripped from origin requests by default; `TS_ORIGIN_STRIPPED_COOKIE_NAMES_WITH_EIDS` = `ts-eids`, `__Host-ts-eids-s`, stripped instead when `[ec] strip_eids_cookie_from_origin = true`. Exact names only: there are no cookie prefixes.
   - Hashes: `ps.iv` and `ps.ov` hold the first **16** hex digits of the unkeyed SHA-256 of each UID. The consent fingerprint `fp` is a plain bitmask written as hex. The only keyed value is the rate-limit visitor key, an HMAC of the full EC ID with a key derived from `ec.passphrase` (spec 9.3). Nothing stored in the row is keyed.
   - KV: `SCHEMA_VERSION` is **2**. Every record is `{w?, rv?, at?, exp?, ra?, ru?, eids: [{uids: [{id, atype?, ext?}], inserter?, matcher?, mm?, ext?}]}`, and `eids` is never empty. A version 1 record (`{uid, ...}`) reads as one entry holding that UID, and the row's next write stores version 2. Every UID-level and EID-level `ext` is a JSON object of at most **2,048** bytes as compact JSON. `inserter` and `matcher` are not blank and at most **255** bytes. A source holds at most **8** entries and **32** UIDs, and its entry set is at most **4,096** bytes as compact JSON (`MAX_ENTRY_SET_BYTES`). `ps.st` is at most **1,024** bytes of embedded JSON, a row has at most **32** `ps` entries, and `ps.iv` and `ps.ov` are each an ordered list of at most **128** hashes (`MAX_INVALIDATED_UIDS`), oldest first, truncated from the front before validation. One function, `entry_set_bytes`, measures `MAX_ENTRY_SET_BYTES` on the stored `eids` array, for both the coordinator and `KvEntry::validate`. Expired means `now >= exp`. `rv` is **16** hex digits (64 random bits). On read, a record that breaks a limit is dropped from the row and logged with its source only; only `serialize_entry` rejects.
   - `ProviderRequest` call context: at most **1,024** bytes of JSON. `IdentityProviderId`: `^[a-z][a-z0-9_-]{0,62}$`.
@@ -486,6 +486,8 @@ git commit --signoff -S -m "Strip identity cookies from Prebid Server requests i
 
 ### Task 3: Strip the ID cookies from publisher-origin requests
 
+> Revised after the round 14 review: by default only `__Host-ts-eids-s` is stripped, and `ts-eids` keeps reaching the origin as today. `rewrite_origin_request` takes a `strip_eids: bool` from `settings.ec.strip_eids_cookie_from_origin` (`Ec` field, `#[serde(default)]`), which strips `ts-eids` too. Tests: `rewrite_origin_request_strips_only_the_mirror_by_default` and `rewrite_origin_request_strips_ts_eids_when_the_operator_asks`. The steps below are the original task; read their `ts-eids` strip as the opt-in case.
+
 **Files:**
 
 - Modify: `crates/trusted-server-core/src/publisher.rs` (`rewrite_origin_request`, around line 3124)
@@ -573,7 +575,7 @@ Expected: PASS. The strip lives in core, so every adapter gets it (spec 11). If 
 
 ```bash
 git add crates/trusted-server-core/src/publisher.rs
-git commit --signoff -S -m "Strip ID cookies from publisher origin requests" -m "The origin keeps ts-ec and every unrelated cookie. ts-eids and __Host-ts-eids-s no longer reach it. An origin that read ts-eids must read x-ts-eids instead."
+git commit --signoff -S -m "Strip the mirror cookie from publisher origin requests" -m "The origin keeps ts-ec, ts-eids and every unrelated cookie, and never receives __Host-ts-eids-s. [ec] strip_eids_cookie_from_origin strips ts-eids too, for origins that reject large Cookie headers."
 ```
 
 ### Task 4: Refuse the mirror cookie as a template-cache key, and document the strips
@@ -628,12 +630,12 @@ Expected: PASS.
 
 - [ ] **Step 5: Docs**
 
-In `docs/guide/edge-cookies.md`, in the section that lists TS cookies, add a short "Cookies forwarded to the origin" paragraph. Say that `ts-ec` still reaches the publisher origin, that `ts-eids` and `__Host-ts-eids-s` do not, and that origin code that read `ts-eids` should read the `x-ts-eids` response header instead. Also say that Prebid Server never receives any TS identity cookie.
+In `docs/guide/edge-cookies.md`, in the section that lists TS cookies, add a short "Cookies forwarded to the origin" paragraph. Say that `ts-ec` and `ts-eids` still reach the publisher origin, that `__Host-ts-eids-s` does not, and that `[ec] strip_eids_cookie_from_origin = true` strips `ts-eids` too. Also say that Prebid Server never receives any TS identity cookie.
 
 In `CHANGELOG.md` under `## [Unreleased]` / `### Changed`, add:
 
 ```markdown
-- **Breaking:** The publisher origin no longer receives the `ts-eids` cookie, and Prebid Server no longer receives any Trusted Server identity cookie (`ts-ec`, `ts-eids`, and the `__Host-ts-eids-s` mirror that this release's shim writes). The origin still receives `ts-ec`. Origin code that read `ts-eids` should read the `x-ts-eids` response header instead.
+- **Breaking:** Prebid Server no longer receives any Trusted Server identity cookie (`ts-ec`, `ts-eids`, and the `__Host-ts-eids-s` mirror that this release's shim writes); today it receives `ts-ec` and `ts-eids`. The publisher origin still receives `ts-ec` and `ts-eids` but never the mirror. `[ec] strip_eids_cookie_from_origin = true` strips `ts-eids` from origin requests too.
 ```
 
 Run: `cd docs && npm run format && cd ..` and `docs/node_modules/.bin/prettier --config docs/.prettierrc --write CHANGELOG.md`

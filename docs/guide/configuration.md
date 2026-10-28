@@ -731,13 +731,14 @@ To roll back from a release that adds vendor providers to the identity framework
 `passphrase` is a key name in `trusted_server_secrets`; the resolved value must
 be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 
-| Field                     | Type           | Required | Description                                                             |
-| ------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
-| `passphrase`              | String         | Yes      | Publisher passphrase used as HMAC key                                   |
-| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
-| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                     |
-| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
-| `partners`                | Array          | No       | Static partner registry entries                                         |
+| Field                           | Type           | Required | Description                                                                                                             |
+| ------------------------------- | -------------- | -------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `passphrase`                    | String         | Yes      | Publisher passphrase used as HMAC key                                                                                   |
+| `ec_store`                      | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state                                                         |
+| `cluster_trust_threshold`       | Integer        | No       | Cluster size threshold for identity trust decisions                                                                     |
+| `cluster_recheck_secs`          | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps                                                 |
+| `strip_eids_cookie_from_origin` | Boolean        | No       | Also strip `ts-eids` from publisher-origin requests (default `false`; the `__Host-ts-eids-s` mirror is always stripped) |
+| `partners`                      | Array          | No       | Static partner registry entries                                                                                         |
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.

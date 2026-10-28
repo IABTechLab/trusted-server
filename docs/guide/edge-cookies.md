@@ -384,11 +384,13 @@ sets `Path=/`, `Secure`, `HttpOnly`, `SameSite=Lax`, and a `Max-Age`.
 
 ## Cookies Forwarded to the Origin
 
-`ts-ec` still reaches the publisher origin. `ts-eids` and the
-`__Host-ts-eids-s` mirror cookie do not: Trusted Server strips both from
-the request before it forwards it. Origin code that read `ts-eids`
-should read the `x-ts-eids` response header instead. Prebid Server never
-receives any Trusted Server identity cookie (`ts-ec`, `ts-eids`, or
+`ts-ec` and `ts-eids` still reach the publisher origin. The
+`__Host-ts-eids-s` mirror cookie does not: Trusted Server strips it from
+the request before it forwards it, so the origin's `Cookie` header stays
+the size it was before the mirror existed. An operator whose origin
+rejects large `Cookie` headers can strip `ts-eids` as well with
+`[ec] strip_eids_cookie_from_origin = true`. Prebid Server never receives
+any Trusted Server identity cookie (`ts-ec`, `ts-eids`, or
 `__Host-ts-eids-s`).
 
 ## Operational Notes

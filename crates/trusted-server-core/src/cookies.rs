@@ -35,12 +35,16 @@ pub const CONSENT_COOKIE_NAMES: &[&str] = &[
 /// requests.
 pub const TS_IDENTITY_COOKIE_NAMES: &[&str] = &[COOKIE_TS_EC, COOKIE_TS_EIDS, COOKIE_TS_EIDS_S];
 
-/// Identity cookies removed from publisher-origin requests.
+/// Identity cookies removed from publisher-origin requests by default.
 ///
-/// `ts-ec` still reaches the origin. The ID cookies
-/// are removed so that they cannot push the origin's `Cookie` header past
-/// common 8 KB header limits.
-pub const TS_ORIGIN_STRIPPED_COOKIE_NAMES: &[&str] = &[COOKIE_TS_EIDS, COOKIE_TS_EIDS_S];
+/// `ts-ec` and `ts-eids` still reach the origin, as they did before the
+/// `ts-eids-s` mirror existed, so the origin's `Cookie` header stays at its
+/// earlier size. See [`TS_ORIGIN_STRIPPED_COOKIE_NAMES_WITH_EIDS`].
+pub const TS_ORIGIN_STRIPPED_COOKIE_NAMES: &[&str] = &[COOKIE_TS_EIDS_S];
+
+/// Identity cookies removed from publisher-origin requests when the operator
+/// sets `ec.strip_eids_cookie_from_origin`: `ts-eids` as well as the mirror.
+pub const TS_ORIGIN_STRIPPED_COOKIE_NAMES_WITH_EIDS: &[&str] = &[COOKIE_TS_EIDS, COOKIE_TS_EIDS_S];
 
 /// Parses a cookie string into a [`CookieJar`].
 ///
@@ -519,11 +523,17 @@ mod tests {
         let header =
             "ts-ec=abc; ts-eids=W10; __Host-ts-eids-s=eyJ2IjoxfQ; other=1; ts-eids-extra=keep";
 
-        let stripped = strip_cookie_pairs(header, TS_ORIGIN_STRIPPED_COOKIE_NAMES);
+        let stripped = strip_cookie_pairs(header, TS_ORIGIN_STRIPPED_COOKIE_NAMES_WITH_EIDS);
 
         assert_eq!(
             stripped, "ts-ec=abc; other=1; ts-eids-extra=keep",
             "should drop the ID cookies and keep ts-ec and a cookie that only shares a prefix"
+        );
+
+        assert_eq!(
+            strip_cookie_pairs(header, TS_ORIGIN_STRIPPED_COOKIE_NAMES),
+            "ts-ec=abc; ts-eids=W10; other=1; ts-eids-extra=keep",
+            "should drop only the mirror by default"
         );
     }
 
