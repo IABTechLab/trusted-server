@@ -33,6 +33,7 @@ pub(crate) fn opted_out(entry: &KvEntry) -> BTreeSet<IdentityProviderId> {
 #[derive(Default, Clone)]
 pub(crate) struct RequestIdentity {
     writer: bool,
+    spa_writer: bool,
     is_real_browser: bool,
     user_agent: Option<String>,
     dnt: bool,
@@ -278,6 +279,19 @@ impl RequestIdentity {
         self.user_agent = decision.user_agent;
         self.dnt = decision.dnt;
         self.page_url = decision.page_url;
+    }
+
+    /// Whether the writer is a `/_ts/page-bids` call, which the interval
+    /// since the row's last writer flush paces and which runs no hold-mode
+    /// provider (spec 5.1).
+    #[must_use]
+    pub(crate) fn spa_writer(&self) -> bool {
+        self.spa_writer
+    }
+
+    /// Marks the writer as the SPA writer.
+    pub(crate) fn set_spa_writer(&mut self, spa_writer: bool) {
+        self.spa_writer = spa_writer;
     }
 
     /// Records only the real-browser flag, for a route that is never the writer.

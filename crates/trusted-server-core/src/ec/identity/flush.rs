@@ -33,7 +33,7 @@ use crate::ec::kv_types::KvEntry;
 use crate::ec::rate_limiter::RateLimiter;
 use crate::ec::{EcContext, EcKvSnapshot, current_timestamp, log_id};
 use crate::platform::RuntimeServices;
-use crate::settings::Settings;
+use crate::settings::{ProviderMode, Settings};
 
 pub use super::removal::RemovalWriteOutcome;
 
@@ -127,6 +127,16 @@ pub fn run_after_send(input: AfterSendInput<'_>) -> FlushOutcome {
         Vec::new()
     };
     let needs_cluster_size = phase_one_entry.is_some_and(lacks_cluster_size);
+    // The SPA writer writes only on a row its auction read, and only once
+    // the interval since the last writer flush has passed (spec 5.1).
+    if context.identity().spa_writer() {
+        let interval = settings.ec.identity.spa_writer_interval_sec;
+        let waiting = phase_one_entry
+            .is_none_or(|entry| entry.wa.is_some_and(|at| now < at.saturating_add(interval)));
+        if waiting {
+            return FlushOutcome::Skipped;
+        }
+    }
     // Every returning writer reads the pending key: what earlier requests
     // could not write waits there for it (spec 5.3, Pending key).
     let phase_one_applied = phase_one_entry.and_then(|entry| entry.pg).unwrap_or(0);
@@ -262,6 +272,7 @@ pub fn run_after_send(input: AfterSendInput<'_>) -> FlushOutcome {
     if !applied.changed {
         return FlushOutcome::NoChange;
     }
+    applied.entry.wa = Some(now);
 
     match graph.write_if_generation(&ec_id, &applied.entry, generation) {
         Ok(EcKvWriteOutcome::Written) => FlushOutcome::Written,
@@ -507,9 +518,20 @@ fn due_providers(
     view: &EligibilityView,
     facts: &RequestFacts,
 ) -> Vec<IdentityProviderId> {
+    let spa_writer = context.identity().spa_writer();
     runtime
         .catalog()
         .providers()
+        // The SPA writer never runs a hold-mode provider (spec 5.1).
+        .filter(|provider| {
+            !spa_writer
+                || settings
+                    .ec
+                    .identity
+                    .provider(provider.descriptor().id())
+                    .mode
+                    == ProviderMode::AfterSend
+        })
         .filter(|provider| {
             matches!(
                 after_send_eligibility(provider.as_ref(), runtime, settings, context, view, facts),
@@ -683,7 +705,7 @@ mod tests {
     use crate::ec::kv_types::{KvNetwork, KvOptOut, KvPartnerId, KvProviderState};
     use crate::error::TrustedServerError;
     use crate::openrtb::{Eid, Uid};
-    use crate::settings::{ProviderMode, ProviderSettings};
+    use crate::settings::ProviderSettings;
     use crate::test_support::tests::create_test_settings;
 
     const PULL_HOST: &str = "sync.ssp.example.com";
@@ -1067,6 +1089,85 @@ mod tests {
         assert!(
             row.ids.contains_key(PULL_SOURCE) && row.ids.contains_key("dsp.example.com"),
             "should land both partners' UIDs in the one write"
+        );
+    }
+
+    /// A live row whose last writer flush was `age` seconds ago.
+    fn row_written_ago(age: u64) -> KvEntry {
+        let mut row = live_row(true);
+        row.wa = Some(current_timestamp().saturating_sub(age));
+        row
+    }
+
+    #[test]
+    fn spa_writer_waits_out_the_interval_since_the_last_write() {
+        let mut recent = Fixture::new(Some(&row_written_ago(10)), false);
+        recent.context.identity_mut().set_spa_writer(true);
+        recent.stage_sharedid();
+        assert_eq!(
+            recent.run(&ScriptedLimiter::allowing()),
+            FlushOutcome::Skipped,
+            "should not write within the interval"
+        );
+        assert_eq!(recent.store.writes().total(), 0, "should write nothing");
+
+        let mut unread = Fixture::new(None, false);
+        unread.context.identity_mut().set_spa_writer(true);
+        unread.stage_sharedid();
+        assert_eq!(
+            unread.run(&ScriptedLimiter::allowing()),
+            FlushOutcome::Skipped,
+            "should not read the row for an SPA writer whose auction did not"
+        );
+        assert_eq!(unread.store.writes().lookups, 0, "should read nothing");
+
+        let mut due = Fixture::new(Some(&row_written_ago(400)), false);
+        due.context.identity_mut().set_spa_writer(true);
+        due.stage_sharedid();
+        let before = current_timestamp();
+        assert_eq!(
+            due.run(&ScriptedLimiter::allowing()),
+            FlushOutcome::Written,
+            "should write once the interval has passed"
+        );
+        assert!(
+            due.row().wa.is_some_and(|at| at >= before),
+            "should store the time of this write"
+        );
+    }
+
+    #[test]
+    fn spa_writer_runs_no_hold_mode_provider() {
+        let hold = || {
+            let mut settings = Fixture::settings(true);
+            settings.ec.identity.providers.insert(
+                PULL_ID.to_owned(),
+                ProviderSettings {
+                    mode: ProviderMode::Hold,
+                    ..ProviderSettings::default()
+                },
+            );
+            settings
+        };
+        let mut spa = Fixture::with_settings(Some(&row_written_ago(400)), hold());
+        spa.context.identity_mut().set_spa_writer(true);
+        pull_answers(&spa, "pulled-uid");
+
+        spa.run(&ScriptedLimiter::allowing());
+
+        assert!(
+            spa.client.sent_hosts().is_empty(),
+            "should not call a hold-mode provider"
+        );
+
+        let mut after_send = Fixture::new(Some(&row_written_ago(400)), true);
+        after_send.context.identity_mut().set_spa_writer(true);
+        pull_answers(&after_send, "pulled-uid");
+        after_send.run(&ScriptedLimiter::allowing());
+        assert_eq!(
+            after_send.client.sent_hosts(),
+            [PULL_HOST],
+            "control: should call an after-send provider"
         );
     }
 

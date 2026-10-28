@@ -638,14 +638,15 @@ Legacy consent-store records are not read or migrated into `ec.ec_store`. Their 
 
 Policy for server-side identity providers. The table is optional; every key has a default.
 
-| Key                    | Type    | Default | Meaning                                                                                                                                                                                                    |
-| ---------------------- | ------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `max_concurrency`      | Integer | `4`     | Most providers dispatched at once (at least 1). Replaces `ec.pull_sync_concurrency`.                                                                                                                       |
-| `hold_budget_ms`       | Integer | `100`   | Total wall-clock time a navigation may wait for all hold-mode providers (at most 1000)                                                                                                                     |
-| `hold_retry_sec`       | Integer | `300`   | Seconds to wait before calling a provider again after the hold budget cut its call off                                                                                                                     |
-| `max_response_bytes`   | Integer | `65536` | Largest provider response body accepted, before and after decoding                                                                                                                                         |
-| `max_backend_requests` | Integer | `32`    | Most backend requests one Fastly execution may start, counting the origin, the auction and provider calls. A provider call past it is skipped, not counted as a failure. Set `10` on Fastly trial accounts |
-| `mirror_enabled`       | Boolean | `false` | Return the `__Host-ts-eids-s` mirror payload from `/auction` and `/_ts/page-bids`                                                                                                                          |
+| Key                       | Type    | Default | Meaning                                                                                                                                                                                                         |
+| ------------------------- | ------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `max_concurrency`         | Integer | `4`     | Most providers dispatched at once (at least 1). Replaces `ec.pull_sync_concurrency`.                                                                                                                            |
+| `hold_budget_ms`          | Integer | `100`   | Total wall-clock time a navigation may wait for all hold-mode providers (at most 1000)                                                                                                                          |
+| `hold_retry_sec`          | Integer | `300`   | Seconds to wait before calling a provider again after the hold budget cut its call off                                                                                                                          |
+| `max_response_bytes`      | Integer | `65536` | Largest provider response body accepted, before and after decoding                                                                                                                                              |
+| `max_backend_requests`    | Integer | `32`    | Most backend requests one Fastly execution may start, counting the origin, the auction and provider calls. A provider call past it is skipped, not counted as a failure. Set `10` on Fastly trial accounts      |
+| `mirror_enabled`          | Boolean | `false` | Return the `__Host-ts-eids-s` mirror payload from `/auction` and `/_ts/page-bids`                                                                                                                               |
+| `spa_writer_interval_sec` | Integer | `300`   | Seconds a same-origin `/_ts/page-bids` call from a real browser waits after the row's last write before it writes browser ingest and after-send provider results itself, for single-page apps. `0` turns it off |
 
 #### Per-provider keys
 

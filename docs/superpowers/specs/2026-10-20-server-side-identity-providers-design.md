@@ -1794,8 +1794,8 @@ navigation, which recomputes everything from KV and the same cookies.
 A new visitor's create (section 5.2, phase 1, before routing) is written
 whatever the status, as today, because the response sets the EC cookie.
 
-Every other request is a **stager**: `/auction`, `/_ts/page-bids`,
-integration proxy calls that are not navigations (including Lockr's API
+Every other request is a **stager**: `/auction`, `/_ts/page-bids` (except
+the SPA writer below), integration proxy calls that are not navigations (including Lockr's API
 proxy), prefetches, iframes, clients that send no `Sec-Fetch-Dest`, and every
 other route. Stagers read cookies and KV, run no resolving provider, and
 write KV only for a captured revocation (section 5.3).
@@ -1809,9 +1809,25 @@ one without writing when not.
 script reports each change to `/_ts/page-bids` (`publisher.rs:6890-6894`).
 An SPA view is part of the page load that loaded the document, so
 `/_ts/page-bids` is a stager. Today it ingests `ts-eids` into KV
-(`publisher.rs:6925`). Under this design it stops. A visitor who stays in an
-SPA has their `ts-eids` ingested at their next full navigation. Auctions in
-the meantime use KV and the browser's EIDs.
+(`publisher.rs:6925`).
+
+**The SPA writer.** Decided after the round 14 review (section 15,
+question 1). A visitor who stays in an SPA would otherwise wait for their
+next full navigation for browser ingest and provider refreshes. So a
+`/_ts/page-bids` call is the writer when it comes from a real browser, sends
+`Sec-Fetch-Site: same-origin` (the `X-TSJS-Page-Bids` fallback is not
+enough), and `ec.identity.spa_writer_interval_sec` (default 300, 0 turns it
+off) is above zero. Its phase 4 then:
+
+- writes only when its auction read the row in phase 1, so it adds no row
+  read, and only when the row's `wa` is older than the interval. `wa` is
+  the time of the row's last writer flush, set by every writer write
+- runs browser ingest and after-send providers, never a hold-mode provider,
+  and never holds the response
+- reads the pending key and writes once, as any writer
+
+So an SPA session writes at most once per interval, and a row whose last
+write predates `wa` (none recorded) is due at once.
 
 **Exception: consent withdrawal.** A withdrawal writes its tombstone on
 whichever request carries it, before the response is sent, as today. That
@@ -2382,6 +2398,7 @@ literals move to them. `PartnerIdUpdate` (`ec/kv.rs:75-90`) gains
 | `ps.iv` | Hashes of UIDs the owner invalidated, oldest first, at most 128, so they are not re-seeded (section 7.2)                                    |
 | `ps.ov` | Hashes of UIDs the provider's opt-out removed, oldest first, at most 128. Emptied when the opt-out clears (section 8)                       |
 | `ps.st` | The provider's private state, as embedded JSON (a raw value, not an escaped string) of at most 1,024 bytes. KV only                         |
+| `wa`    | Unix seconds of the row's last writer flush, which paces the SPA writer (section 5.1)                                                       |
 | `pg`    | The newest pending-key generation merged into the row (section 5.3, The pending key). Items at or below it are never merged again           |
 
 `KvEntry` validation (`ec/kv_types.rs:375`) adds: the entry-set limits of
@@ -4614,7 +4631,11 @@ a KV migration to version 1, which this spec does not provide.
    through `/_ts/page-bids`, which never writes KV and calls no provider
    (section 5.1). So on those sites, browser ingest and provider refreshes
    wait until the visitor's next full page load. After launch, measure how
-   long they wait, and revisit if the wait is long.
+   long they wait, and revisit if the wait is long. **Decided (round 14):**
+   a same-origin `/_ts/page-bids` call from a real browser is the writer
+   once `spa_writer_interval_sec` (300) has passed since the row's last
+   writer flush, with after-send providers only (section 5.1, The SPA
+   writer).
 2. **Lost removals.** A removal write that fails all its attempts is lost
    (sections 5.2, 5.3). After launch, watch
    `removal_lost`. If it is not close to zero, should a durable
@@ -4704,6 +4725,7 @@ review, which allowed breaking changes:
 | Reader-first rollout  | Rollout step 0, from `main`, reads version 2 rows, never rewrites them except to tombstone, and serves no stored ID from a row with a provider opt-out, so step 1 can roll back and deploy alongside old instances. Added after the round 14 review                                |
 | Global revoke minting | A global revoke also sets `ts-ec-revoked` with the consent fingerprint, and no EC is minted until the request's fingerprint differs. Decided after the round 14 review                                                                                                             |
 | Pending key           | Removals whose writes all failed, and positive captures from a request that is not the writer, go to `pending:<ec_id>` (one-day TTL, CAS append, 16 items). Every writer reads it and merges items above the row's `pg`. Auctions never read it. Decided after the round 14 review |
+| SPA writer            | A same-origin `/_ts/page-bids` call from a real browser is the writer once `spa_writer_interval_sec` (300, 0 = off) has passed since the row's `wa`; it writes only on a row its auction read and runs after-send providers only. Decided after the round 14 review                |
 | Capture               | Revoke-only: removals, opt-out and clear. Positive IDs are counted, never stored. `capture_enabled` and request-body consent are removed                                                                                                                                           |
 | Capture-only opt-out  | Also removes the records of its sources that no provider wrote, and blocks the browser's values for them. A capture-only provider cannot own a source and must list its `sources`                                                                                                  |
 | Provider denials      | A provider's `ps.iv` and `ps.ov` filter browser candidates for unowned sources too. An opt-out's removals go to `ps.ov`, which its clear empties                                                                                                                                   |

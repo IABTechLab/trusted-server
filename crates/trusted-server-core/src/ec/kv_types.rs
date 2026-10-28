@@ -102,6 +102,10 @@ pub struct KvEntry {
     /// Pending key). Items at or below it are never merged again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pg: Option<u64>,
+    /// Unix seconds of the row's last writer flush, which paces the SPA
+    /// writer (spec 5.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wa: Option<u64>,
 }
 
 /// Consent state within a KV entry.
@@ -549,6 +553,7 @@ impl KvEntry {
             ids: BTreeMap::new(),
             ps: BTreeMap::new(),
             pg: None,
+            wa: None,
         }
     }
 
@@ -581,6 +586,7 @@ impl KvEntry {
             ids,
             ps: BTreeMap::new(),
             pg: None,
+            wa: None,
         }
     }
 
@@ -615,6 +621,7 @@ impl KvEntry {
             ids: BTreeMap::new(),
             ps: BTreeMap::new(),
             pg: None,
+            wa: None,
         }
     }
 

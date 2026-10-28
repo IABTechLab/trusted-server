@@ -104,6 +104,9 @@ ec_store = "ec_identity_store"
 # Return the __Host-ts-eids-s mirror payload from /auction and
 # /_ts/page-bids. Off until a page script that reads it is named.
 # mirror_enabled = false
+# Seconds a same-origin /_ts/page-bids call from a real browser waits after the
+# row's last write before writing itself, for single-page apps. 0 turns it off.
+# spa_writer_interval_sec = 300
 
 # Per-provider policy; the table name is the identity provider ID. A pull
 # partner (`pull_sync_enabled = true`) registers as `pull-` plus its source

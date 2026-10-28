@@ -674,6 +674,12 @@ pub struct IdentitySettings {
     #[serde(default)]
     pub mirror_enabled: bool,
 
+    /// Seconds a same-origin `/_ts/page-bids` call from a real browser waits
+    /// after the row's last writer flush before it may be the writer itself,
+    /// for single-page apps (spec 5.1). 0 turns the SPA writer off.
+    #[serde(default = "IdentitySettings::default_spa_writer_interval_sec")]
+    pub spa_writer_interval_sec: u64,
+
     /// Per-provider policy, keyed by identity provider ID.
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderSettings>,
@@ -690,6 +696,12 @@ impl IdentitySettings {
     #[must_use]
     pub const fn default_max_backend_requests() -> usize {
         32
+    }
+
+    /// Default SPA writer interval: five minutes.
+    #[must_use]
+    pub const fn default_spa_writer_interval_sec() -> u64 {
+        300
     }
 
     /// Default hold budget in milliseconds.
@@ -726,6 +738,7 @@ impl Default for IdentitySettings {
             max_response_bytes: Self::default_max_response_bytes(),
             max_backend_requests: Self::default_max_backend_requests(),
             mirror_enabled: false,
+            spa_writer_interval_sec: Self::default_spa_writer_interval_sec(),
             providers: BTreeMap::new(),
         }
     }

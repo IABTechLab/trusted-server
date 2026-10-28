@@ -3063,6 +3063,54 @@ mod tests {
         }
 
         #[test]
+        fn same_origin_page_bids_is_the_spa_writer_once_the_interval_passes() {
+            let spa_request = || {
+                let mut request = page_bids_request(&returning_with_shared_id());
+                request.headers_mut().insert(
+                    "sec-fetch-site",
+                    edgezero_core::http::HeaderValue::from_static("same-origin"),
+                );
+                request
+            };
+
+            let due = full_scenario();
+            due.seed_live();
+            let (_, outcome) = due.drive(spa_request());
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::Written),
+                "should write once as the SPA writer"
+            );
+            assert_eq!(
+                stored_uid(&due.row(), "sharedid.org").as_deref(),
+                Some(SHARED_ID),
+                "should ingest the browser's sharedId"
+            );
+            assert_eq!(
+                due.network.requests_to(PULL_HOST).len(),
+                1,
+                "should run the due after-send provider"
+            );
+
+            let recent = full_scenario();
+            let mut row = live_entry();
+            row.wa = Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("should read the clock")
+                    .as_secs(),
+            );
+            recent.seed(&row);
+            let (_, outcome) = recent.drive(spa_request());
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::Skipped),
+                "should wait out the interval since the last writer flush"
+            );
+            assert_no_writes(&recent.store, "an SPA call within the interval");
+        }
+
+        #[test]
         fn no_response_sets_an_identity_cookie_other_than_ts_ec() {
             assert!(
                 is_server_identity_cookie("ts-eids")

@@ -6947,6 +6947,7 @@ pub async fn handle_page_bids(
         return Ok(page_bids_preflight_denied());
     }
     ec_context.set_eid_sync_source(EidSyncSource::PageBids);
+    ec_context.decide_spa_writer(&req, settings.ec.identity.spa_writer_interval_sec);
 
     // Deprecation signal for the transition alias. Evaluated after the
     // cross-site gate, so the count reflects genuine SPA clients still running a

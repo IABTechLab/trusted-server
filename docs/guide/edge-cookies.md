@@ -274,7 +274,7 @@ Browser EIDs are forwarded as sent; KV adds EIDs only for registered sources the
 
 At most one request per page view writes browser-driven identity changes to KV: a full page navigation from a returning visitor (a request that already carries a valid `ts-ec`). Every other route reads KV and stages its changes but never writes them:
 
-- `/auction`, `/_ts/page-bids` and `/_ts/api/v1/identify` no longer write KV.
+- `/auction` and `/_ts/api/v1/identify` no longer write KV. `/_ts/page-bids` writes only as the single-page-app writer: a same-origin call from a real browser, at most once per `spa_writer_interval_sec` (300 seconds by default) since the row's last write, with browser EIDs and after-send providers only.
 - The writer request collects every change from the page load: browser EIDs from the `ts-eids` and `sharedId` cookies, pull partner results and the cluster size. It sends the response first, then writes everything once, after send, with a generation check. A failed write is not retried as a whole.
 - A new visitor's first request still creates the row before routing, as before.
 - Two kinds of write are exempt because a withdrawal or removal must not be lost: the consent-withdrawal tombstone (with one more attempt after send when it fails before send), and a retry that writes only the removals of a failed flush.

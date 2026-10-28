@@ -710,6 +710,38 @@ impl EcContext {
         });
     }
 
+    /// Decides whether a `/_ts/page-bids` call is the SPA writer (spec 5.1):
+    /// a real browser, `Sec-Fetch-Site: same-origin` and an interval above
+    /// zero. The flush then checks the interval against the row's last
+    /// writer flush. Reads the real-browser flag set earlier with
+    /// [`set_real_browser`](Self::set_real_browser).
+    pub fn decide_spa_writer(&mut self, req: &Request<EdgeBody>, interval_sec: u64) {
+        let same_origin = req
+            .headers()
+            .get("sec-fetch-site")
+            .and_then(|value| value.to_str().ok())
+            == Some("same-origin");
+        if !(same_origin && interval_sec > 0 && self.identity.is_real_browser()) {
+            return;
+        }
+        self.identity.set_writer_decision(WriterDecision {
+            writer: true,
+            is_real_browser: true,
+            user_agent: req
+                .headers()
+                .get(header::USER_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+            dnt: req
+                .headers()
+                .get("dnt")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.trim() == "1"),
+            page_url: None,
+        });
+        self.identity.set_spa_writer(true);
+    }
+
     /// Returns the device signals, if set.
     #[must_use]
     pub fn device_signals(&self) -> Option<&DeviceSignals> {
@@ -991,6 +1023,45 @@ mod tests {
     };
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
+
+    #[test]
+    fn decide_spa_writer_needs_a_same_origin_browser_and_an_interval() {
+        let page_bids = |site: Option<&str>| {
+            let mut builder = Request::builder()
+                .uri("https://www.example.com/_ts/page-bids?path=/a")
+                .header("x-tsjs-page-bids", "1");
+            if let Some(site) = site {
+                builder = builder.header("sec-fetch-site", site);
+            }
+            builder
+                .body(EdgeBody::empty())
+                .expect("should build the request")
+        };
+        let decide = |request: &Request<EdgeBody>, browser: bool, interval: u64| {
+            let mut context = EcContext::default();
+            context.set_real_browser(browser);
+            context.decide_spa_writer(request, interval);
+            (context.identity().writer(), context.identity().spa_writer())
+        };
+
+        assert_eq!(
+            decide(&page_bids(Some("same-origin")), true, 300),
+            (true, true),
+            "should make a same-origin browser page-bids call the SPA writer"
+        );
+        for (name, request, browser, interval) in [
+            ("no Sec-Fetch-Site", page_bids(None), true, 300),
+            ("same-site", page_bids(Some("same-site")), true, 300),
+            ("not a browser", page_bids(Some("same-origin")), false, 300),
+            ("interval off", page_bids(Some("same-origin")), true, 0),
+        ] {
+            assert_eq!(
+                decide(&request, browser, interval),
+                (false, false),
+                "should not be the writer: {name}"
+            );
+        }
+    }
 
     #[test]
     fn decide_writer_needs_every_condition() {
