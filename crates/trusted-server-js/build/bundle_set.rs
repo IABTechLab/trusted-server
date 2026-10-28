@@ -4,7 +4,7 @@
 //! depends only on `std`.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Module ID of the core bundle, which is always expected and ordered first.
 pub(crate) const CORE_MODULE_ID: &str = "core";
@@ -14,44 +14,108 @@ pub(crate) fn bundle_file_name(id: &str) -> String {
     format!("tsjs-{id}.js")
 }
 
-/// Return the module IDs `build-all.mjs` builds from `lib_src`.
+/// Return the module IDs `build-all.mjs` builds.
 ///
-/// Mirrors the discovery in `build-all.mjs`: `core` plus every
-/// `integrations/<name>/index.ts`. `core` comes first, integrations follow in
-/// alphabetical order.
+/// Finds module folders by the rule of `moduleSourceDirs` in
+/// `build-module-options.mjs`, `integrations/<name>` under `lib_src` and
+/// `<type>/<crate>/js/src/<name>` under `crates_dir`, and keeps those with an
+/// `index.ts` file, as `build-all.mjs` does. `core` comes first, the rest
+/// follow in alphabetical order.
 ///
 /// # Errors
 ///
-/// Returns a message when the integrations directory cannot be read.
-pub(crate) fn expected_module_ids(lib_src: &Path) -> Result<Vec<String>, String> {
-    let integrations_dir = lib_src.join("integrations");
-    let mut integrations = Vec::new();
-    if integrations_dir.exists() {
-        let entries = fs::read_dir(&integrations_dir).map_err(|err| {
-            format!(
-                "failed to read integrations directory {}: {err}",
-                integrations_dir.display()
-            )
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|err| {
-                format!(
-                    "failed to read an entry in {}: {err}",
-                    integrations_dir.display()
-                )
-            })?;
-            let path = entry.path();
-            if path.is_dir() && path.join("index.ts").is_file() {
-                integrations.push(entry.file_name().to_string_lossy().into_owned());
-            }
+/// Returns a message when a directory cannot be read, when two folders supply
+/// a module of the same name, or when a folder is named `core`, which is the
+/// shared core's bundle.
+pub(crate) fn expected_module_ids(
+    lib_src: &Path,
+    crates_dir: &Path,
+) -> Result<Vec<String>, String> {
+    let mut roots = vec![lib_src.join("integrations")];
+    for type_dir in folders_in(crates_dir)? {
+        for crate_dir in folders_in(&type_dir)? {
+            roots.push(crate_dir.join("js").join("src"));
         }
     }
+
+    let mut folders = Vec::new();
+    for root in roots {
+        for dir in folders_in(&root)? {
+            let has_entry = dir.join("index.ts").is_file();
+            folders.push((dir, has_entry));
+        }
+    }
+    module_ids(&folders)
+}
+
+/// Return the module IDs for module folders in the order they were found,
+/// each with whether it holds an `index.ts` file.
+///
+/// Kept apart from the folder walk so its rules are tested without a file
+/// system, which the WebAssembly test run does not have.
+///
+/// # Errors
+///
+/// Returns a message when two folders supply a module of the same name, or
+/// when a folder is named `core`, which is the shared core's bundle.
+pub(crate) fn module_ids(folders: &[(PathBuf, bool)]) -> Result<Vec<String>, String> {
+    let mut seen: Vec<(String, &Path)> = Vec::new();
+    for (dir, _) in folders {
+        let name = dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name == CORE_MODULE_ID {
+            return Err(format!(
+                "module name {CORE_MODULE_ID}, used by {}, is the shared core's bundle",
+                dir.display()
+            ));
+        }
+        if let Some((_, earlier)) = seen.iter().find(|(known, _)| *known == name) {
+            return Err(format!(
+                "module {name} is in both {} and {}",
+                earlier.display(),
+                dir.display()
+            ));
+        }
+        seen.push((name, dir.as_path()));
+    }
+
+    let mut integrations: Vec<String> = seen
+        .into_iter()
+        .zip(folders)
+        .filter(|(_, (_, has_entry))| *has_entry)
+        .map(|((name, _), _)| name)
+        .collect();
     integrations.sort();
 
     let mut ids = Vec::with_capacity(integrations.len() + 1);
     ids.push(CORE_MODULE_ID.to_owned());
     ids.extend(integrations);
     Ok(ids)
+}
+
+/// The folders directly inside `dir`, or none when it is not a folder.
+///
+/// # Errors
+///
+/// Returns a message when `dir` is a folder but cannot be read.
+pub(crate) fn folders_in(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let entries = fs::read_dir(dir)
+        .map_err(|err| format!("failed to read directory {}: {err}", dir.display()))?;
+    let mut folders = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|err| format!("failed to read an entry in {}: {err}", dir.display()))?;
+        if entry.path().is_dir() {
+            folders.push(entry.path());
+        }
+    }
+    folders.sort();
+    Ok(folders)
 }
 
 /// List the `tsjs-<id>.js` bundles in `dir` as `(id, byte length)` pairs.
@@ -214,6 +278,59 @@ mod tests {
                 && err.contains(r#"empty bundles: ["core"]"#)
                 && err.contains(r#"unexpected bundles: ["extra"]"#),
             "should list missing, empty and unexpected bundles together: {err}"
+        );
+    }
+
+    /// Module folders as the folder walk finds them, each with whether it
+    /// holds an `index.ts` file.
+    fn folders(entries: &[(&str, bool)]) -> Vec<(PathBuf, bool)> {
+        entries
+            .iter()
+            .map(|(dir, has_entry)| (PathBuf::from(dir), *has_entry))
+            .collect()
+    }
+
+    #[test]
+    fn lists_core_then_each_folder_with_an_entry_in_name_order() {
+        let found = folders(&[
+            ("lib/src/integrations/zeta", true),
+            ("crates/kind/vendor/js/src/alpha", true),
+            ("crates/kind/vendor/js/src/helpers", false),
+        ]);
+
+        let ids = module_ids(&found).expect("should list the modules");
+
+        assert_eq!(
+            ids,
+            ["core", "alpha", "zeta"],
+            "should list core first, then every folder with an index.ts in name order"
+        );
+    }
+
+    #[test]
+    fn rejects_a_module_name_two_folders_supply() {
+        let found = folders(&[
+            ("lib/src/integrations/alpha", true),
+            ("crates/kind/vendor/js/src/alpha", true),
+        ]);
+
+        let err = module_ids(&found).expect_err("should refuse a module name found twice");
+
+        assert!(
+            err.contains("module alpha is in both"),
+            "should name the module and both folders: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_module_named_core() {
+        let found = folders(&[("crates/kind/vendor/js/src/core", true)]);
+
+        let err = module_ids(&found).expect_err("should refuse a module named core");
+
+        assert!(
+            err.contains("module name core"),
+            "should name the reserved name: {err}"
         );
     }
 

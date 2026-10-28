@@ -2,16 +2,20 @@
 
 `tsjs` is the browser runtime produced by
 `crates/trusted-server-js/lib`. It supplies shared registry/render behavior
-and integration modules selected by the server-side registry.
+and integration modules selected by the server-side registry. A vendor
+module's script lives in the crate that supplies the module, under
+`js/src/<module>/`, with its tests under `js/test/<module>/`, and the build
+finds it there. Prebid's shim and the APS renderer are still under
+`lib/src/integrations/`.
 
 ## Module and bundle inventory
 
-There are 12 integration source modules: `creative`, `datadome`, `didomi`,
-`google_tag_manager`, `gpt`, `gpt_diagnostics`, `lockr`, `osano`,
-`permutive`, `prebid`, `sourcepoint`, and `testlight`. The build emits
-13 named bundles because it also emits `core`.
+There are 13 integration source modules: `creative`, `datadome`, `didomi`,
+`ec_client_fixed`, `google_tag_manager`, `gpt`, `gpt_diagnostics`, `lockr`,
+`osano`, `permutive`, `prebid`, `sourcepoint`, and `testlight`. The build
+emits 14 named bundles because it also emits `core`.
 
-Those counts do not mean a page downloads 13 scripts. The server computes one
+Those counts do not mean a page downloads 14 scripts. The server computes one
 content-addressed unified bundle from `core` plus the immediate modules of the
 integrations the settings select. Its URL includes the exact module-set hash,
 so different selections do not share incorrect browser or edge-cache bytes.

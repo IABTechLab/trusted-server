@@ -69,4 +69,4 @@ enable access telemetry.
 
 The exact settings and secret-handling dispositions are in
 [Configuration](/guide/configuration#analytics-configuration). The tracked
-Tinybird project is described in [`tinybird/README.md`](https://github.com/IABTechLab/trusted-server/blob/main/tinybird/README.md).
+Tinybird project is described in [`crates/analytics/tinybird/project/README.md`](https://github.com/IABTechLab/trusted-server/blob/main/crates/analytics/tinybird/project/README.md).

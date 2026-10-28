@@ -7139,7 +7139,7 @@ pub(crate) fn build_bids_script(bid_map: &serde_json::Map<String, serde_json::Va
     // `load`, then a double `requestAnimationFrame`, pinned to navigation
     // generation 0 so a faster SPA navigation cancels it — lives in the GPT
     // bundle module as `tsjs.scheduleInitialAdInit`
-    // (crates/trusted-server-js/lib/src/integrations/gpt/index.ts), where the
+    // (crates/ad-tag/google/js/src/gpt/index.ts), where the
     // lifecycle is executable under Vitest (schedule_initial_ad_init.test.ts)
     // and the navigation-generation guard is shared with the SPA auction hook;
     // gpt_bootstrap.js installs a minimal head-injected fallback so a failed

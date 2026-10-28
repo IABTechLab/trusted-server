@@ -11,7 +11,7 @@ import { JSDOM } from 'jsdom';
 import { build } from 'vite';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
-import { moduleBuildOptions } from '../build-module-options.mjs';
+import { moduleBuildOptions, moduleSourceDirs } from '../build-module-options.mjs';
 
 const libDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const bundles = new Map();
@@ -20,11 +20,12 @@ let dom;
 
 beforeAll(async () => {
   outputDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'trusted-server-iife-state-'));
+  const moduleDirs = moduleSourceDirs();
   for (const name of ['core', 'creative', 'permutive']) {
     const entryPath =
       name === 'core'
         ? path.join(libDir, 'src', 'core', 'index.ts')
-        : path.join(libDir, 'src', 'integrations', name, 'index.ts');
+        : path.join(moduleDirs.get(name), 'index.ts');
     await build(moduleBuildOptions({ name, entryPath, outDir: outputDirectory }));
     bundles.set(name, fs.readFileSync(path.join(outputDirectory, `tsjs-${name}.js`), 'utf8'));
   }

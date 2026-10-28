@@ -460,7 +460,7 @@ IntegrationRegistration::builder(ID)
 
 ## JS Build Pipeline
 
-- `build-all.mjs` discovers `src/integrations/*/index.ts` and builds each as a separate IIFE.
+- `build-all.mjs` discovers `src/integrations/*/index.ts` and `crates/<type>/<crate>/js/src/*/index.ts`, and builds each as a separate IIFE.
 - Output: `dist/tsjs-core.js`, `dist/tsjs-{integration}.js` from `npm run build`. `build.rs` passes `--out-dir` to build the same files into a private `OUT_DIR/tsjs-dist`, validates the set, and never reads `dist/`.
 - `build.rs` auto-generates `tsjs_modules.rs` with `include_str!()` for each discovered file.
 - `bundle.rs` provides `concatenate_modules(ids)` and `concatenated_hash(ids)` APIs.
@@ -492,7 +492,7 @@ Every PR must pass:
 5. JS build and test (`cd crates/trusted-server-js/lib && npx vitest run`)
 6. JS format (`cd crates/trusted-server-js/lib && npm run format`)
 7. Docs format (`cd docs && npm run format`)
-8. Markdown format outside `docs/` (requires `cd docs && npm ci` first): `docs/node_modules/.bin/prettier --config docs/.prettierrc --check "*.md" ".claude/**/*.md" ".github/**/*.md" "crates/**/*.md" "scripts/**/*.md" "tinybird/**/*.md"`; fix with `--write` in place of `--check`
+8. Markdown format outside `docs/` (requires `cd docs && npm ci` first): `docs/node_modules/.bin/prettier --config docs/.prettierrc --check "*.md" ".claude/**/*.md" ".github/**/*.md" "crates/**/*.md" "scripts/**/*.md"`; fix with `--write` in place of `--check`
 9. Native core build-digest test and lint (`cargo test -p trusted-server-core --test template_build_digest` and `cargo clippy -p trusted-server-core --test template_build_digest -- -D warnings`)
 10. Wasm clock lint: `scripts/lint-wasm-clock.sh` (crates built into the Cloudflare Worker must use `web_time`, not the `std::time::{Instant,SystemTime}` `now`/`elapsed` methods, which panic there)
 11. Documentation proposal scripts: `shellcheck scripts/docs-proposal/*.sh && node --test scripts/docs-proposal/hunks.test.mjs && scripts/docs-proposal/test.sh`

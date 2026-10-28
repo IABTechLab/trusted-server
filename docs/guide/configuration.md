@@ -3741,7 +3741,7 @@ saying nothing about this setting.
 5. Watch the `origin_cache_shareable` breakdown in publisher summary telemetry.
    Its denominator is matching-slot candidates, including skipped auctions; it
    does not measure every publisher origin fetch or a site-wide admission rate.
-   See the [telemetry population and query](https://github.com/IABTechLab/trusted-server/blob/main/tinybird/README.md#the-denominator-is-matching-slot-candidates-not-all-requests).
+   See the [telemetry population and query](https://github.com/IABTechLab/trusted-server/blob/main/crates/analytics/tinybird/project/README.md#the-denominator-is-matching-slot-candidates-not-all-requests).
    The predicate estimates eligibility in that population before or after enablement,
    not actual cache hits.
 6. Confirm the origin's own hit rate and page correctness before widening to more

@@ -340,6 +340,10 @@ const {
   };
 });
 
+import { GptDiagnosticsStore } from '@tsjs/module/gpt_diagnostics/store';
+import { GptDiagnosticsObserver } from '@tsjs/module/gpt_diagnostics/observer';
+import { installTsAdInit } from '@tsjs/module/gpt/index';
+
 import {
   collectBidders,
   getInjectedConfig,
@@ -347,7 +351,6 @@ import {
   installPrebidNpm,
   installRefreshHandler,
 } from '../../../src/integrations/prebid/index';
-import { installTsAdInit } from '../../../src/integrations/gpt/index';
 import type { AuctionBid } from '../../../src/core/auction';
 import {
   claimFirstImpressionForTrustedServer,
@@ -361,8 +364,6 @@ import {
 } from '../../../src/core/first_impression';
 import { log } from '../../../src/core/log';
 import type { TsjsApi } from '../../../src/core/types';
-import { GptDiagnosticsObserver } from '../../../src/integrations/gpt_diagnostics/observer';
-import { GptDiagnosticsStore } from '../../../src/integrations/gpt_diagnostics/store';
 import envelope from '../../fixtures/aps-renderer-v1.json';
 
 // installPrebidNpm is a per-page no-op once the sentinel is set (the module

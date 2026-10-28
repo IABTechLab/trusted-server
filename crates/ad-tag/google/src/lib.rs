@@ -741,7 +741,7 @@ impl GptIntegration {
 /// script at `</body>` can call it before the TSJS bundle has loaded.
 ///
 /// The bundle's idempotent implementation in
-/// `crates/trusted-server-js/lib/src/integrations/gpt/index.ts` later overwrites this stub.
+/// `crates/ad-tag/google/js/src/gpt/index.ts` later overwrites this stub.
 /// Both implementations guard the one-time-per-page setup with
 /// `window.tsjs.servicesEnabled` so neither double-enables services if the
 /// publisher's own init code also calls `googletag.enableServices()`.

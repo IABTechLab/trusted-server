@@ -10,7 +10,25 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
-    "types": ["vitest/globals", "node"]
+    "types": ["vitest/globals", "node"],
+    "paths": {
+      "@tsjs/core/*": ["./src/core/*"],
+      "@tsjs/shared/*": ["./src/shared/*"],
+      "@tsjs/test/*": ["./test/*"],
+      "@tsjs/module/*": [
+        "./src/integrations/*",
+        "../../ad-tag/google/js/src/*",
+        "../../audience/permutive/js/src/*",
+        "../../bot-protection/datadome/js/src/*",
+        "../../cmp/didomi/js/src/*",
+        "../../cmp/osano/js/src/*",
+        "../../cmp/sourcepoint/js/src/*",
+        "../../identity/lockr/js/src/*",
+        "../../tag/google-tag-manager/js/src/*",
+        "../../testing/testlight/js/src/*"
+      ],
+      "vitest": ["./node_modules/vitest"]
+    }
   },
-  "include": ["src", "test"]
+  "include": ["src", "test", "../../*/*/js"]
 }

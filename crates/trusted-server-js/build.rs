@@ -16,19 +16,26 @@ use std::process::{Command, ExitStatus};
 use build_print::info;
 use sha2::{Digest as _, Sha256};
 
-use crate::bundle_set::{bundle_file_name, check_bundle_set, expected_module_ids, scan_bundle_dir};
+use crate::bundle_set::{
+    bundle_file_name, check_bundle_set, expected_module_ids, folders_in, scan_bundle_dir,
+};
 
 const PREBUILT_DIR_VAR: &str = "TSJS_PREBUILT_DIR";
 const SKIP_BUILD_VAR: &str = "TSJS_SKIP_BUILD";
 const TEST_VAR: &str = "TSJS_TEST";
 
 fn main() {
-    // Cargo scans directories recursively, so these cover every TS source.
+    // Cargo scans directories recursively, so these cover the shared TS
+    // sources, and module scripts kept in other crates are watched below.
     // Every path must exist: a missing entry makes Cargo rerun this script on
     // every build, the opposite of the intent.
     for path in [
         "lib/src",
         "lib/build-all.mjs",
+        "lib/build-module-options.mjs",
+        // Vite reads the nearest tsconfig.json when it compiles a script, and
+        // for a module script in another crate that is this one.
+        "../tsconfig.json",
         "lib/build-prebid-external.mjs",
         "lib/package.json",
         "lib/package-lock.json",
@@ -44,12 +51,24 @@ fn main() {
     let crate_dir = PathBuf::from(
         env::var("CARGO_MANIFEST_DIR").expect("should set CARGO_MANIFEST_DIR for build script"),
     );
+    let crates_dir = crate_dir
+        .parent()
+        .expect("should have the crates folder above this crate")
+        .to_path_buf();
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("should set OUT_DIR for build script"));
     let ts_dir = crate_dir.join("lib");
     // Private to this build script run: concurrent builds never share it.
     let bundle_dir = out_dir.join("tsjs-dist");
 
-    let expected = expected_module_ids(&ts_dir.join("src"))
+    // A module whose script lives in the crate that supplies it keeps the
+    // script in that crate's `js/src`, so each such folder is watched too.
+    // Only folders that exist are named, because Cargo reruns this script on
+    // every build while a watched path is missing.
+    for scripts in crate_script_folders(&crates_dir, "src") {
+        println!("cargo:rerun-if-changed={}", scripts.display());
+    }
+
+    let expected = expected_module_ids(&ts_dir.join("src"), &crates_dir)
         .unwrap_or_else(|err| panic!("tsjs: failed to discover modules: {err}"));
 
     if let Some(prebuilt_dir) = env::var_os(PREBUILT_DIR_VAR).map(PathBuf::from) {
@@ -67,7 +86,7 @@ fn main() {
         validate_bundle_dir(&expected, &prebuilt_dir);
         copy_prebuilt_bundles(&expected, &prebuilt_dir, &bundle_dir);
     } else {
-        build_bundles(&ts_dir, &bundle_dir);
+        build_bundles(&ts_dir, &crates_dir, &bundle_dir);
     }
 
     validate_bundle_dir(&expected, &bundle_dir);
@@ -80,7 +99,26 @@ fn main() {
     write_module_table(&expected, &bundle_dir, &out_dir);
 }
 
-fn build_bundles(ts_dir: &Path, bundle_dir: &Path) {
+/// Each `crates/<type>/<crate>/js/<kind>` folder that exists, `kind` being
+/// `src` for module scripts or `test` for their tests.
+fn crate_script_folders(crates_dir: &Path, kind: &str) -> Vec<PathBuf> {
+    let crates = folders_in(crates_dir)
+        .and_then(|types| {
+            types
+                .iter()
+                .map(|type_dir| folders_in(type_dir))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap_or_else(|err| panic!("tsjs: failed to list crates: {err}"));
+    crates
+        .into_iter()
+        .flatten()
+        .map(|crate_dir| crate_dir.join("js").join(kind))
+        .filter(|folder| folder.is_dir())
+        .collect()
+}
+
+fn build_bundles(ts_dir: &Path, crates_dir: &Path, bundle_dir: &Path) {
     let how_to_prebuild = format!(
         "To embed prebuilt bundles instead, run `npm run build` in {} and set \
          {PREBUILT_DIR_VAR} to the directory holding the tsjs-*.js files (by default {}).",
@@ -114,6 +152,9 @@ fn build_bundles(ts_dir: &Path, bundle_dir: &Path) {
     if env::var(TEST_VAR).is_ok_and(|value| value == "1") {
         for path in ["test", "vitest.config.ts", "build-prebid-external.mjs"] {
             println!("cargo:rerun-if-changed={}", ts_dir.join(path).display());
+        }
+        for tests in crate_script_folders(crates_dir, "test") {
+            println!("cargo:rerun-if-changed={}", tests.display());
         }
         let status = Command::new(&npm)
             .args(["run", "test", "--", "--run"])

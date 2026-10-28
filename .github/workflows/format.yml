@@ -180,7 +180,7 @@ jobs:
         working-directory: .
         run: >-
           docs/node_modules/.bin/prettier --config docs/.prettierrc --check
-          "*.md" ".claude/**/*.md" ".github/**/*.md" "crates/**/*.md" "scripts/**/*.md" "tinybird/**/*.md"
+          "*.md" ".claude/**/*.md" ".github/**/*.md" "crates/**/*.md" "scripts/**/*.md"
 
       - name: Build with VitePress (fails on dead links)
         run: npm run build

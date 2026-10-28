@@ -31,10 +31,19 @@ export default [
       unicorn,
       '@typescript-eslint': tseslint.plugin,
     },
+    // `@tsjs/...` names the shared browser code and the modules, wherever a
+    // module's script lives, so those imports order as this project's own.
+    settings: { 'import/internal-regex': '^@tsjs/' },
     rules: {
       'unicorn/prevent-abbreviations': 'off',
       'unicorn/filename-case': 'off',
-      'import/order': ['error', { 'newlines-between': 'always' }],
+      'import/order': [
+        'error',
+        {
+          groups: ['builtin', 'external', 'internal', 'parent', 'sibling', 'index'],
+          'newlines-between': 'always',
+        },
+      ],
     },
   },
   // Honor the `_`-prefix convention for intentionally unused bindings in every
@@ -52,7 +61,9 @@ export default [
   // so CommonJS-only names (__dirname, require, module) still fail no-undef
   // in these ES modules
   {
-    files: ['*.mjs', 'test/**/*.mjs'],
+    // In the crate run ESLint's base is the crates folder, so a crate's
+    // `js/test` scripts are named from there.
+    files: ['*.mjs', 'test/**/*.mjs', '*/*/js/test/**/*.mjs'],
     languageOptions: {
       globals: globals.nodeBuiltin,
     },
