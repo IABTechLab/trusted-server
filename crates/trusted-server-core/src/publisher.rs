@@ -7306,18 +7306,18 @@ pub(crate) fn template_cache_bypass_reason(
 fn single_header_value(
     headers: &edgezero_core::http::HeaderMap,
     name: header::HeaderName,
-) -> Result<Option<&str>, TemplateCacheBypassReason> {
+) -> Result<Option<&str>, KeepRefusal> {
     let mut values = headers.get_all(name).iter();
     let Some(first) = values.next() else {
         return Ok(None);
     };
     if values.next().is_some() {
-        return Err(TemplateCacheBypassReason::MalformedCachePolicy);
+        return Err(KeepRefusal::MalformedPolicy);
     }
     first
         .to_str()
         .map(Some)
-        .map_err(|_| TemplateCacheBypassReason::MalformedCachePolicy)
+        .map_err(|_| KeepRefusal::MalformedPolicy)
 }
 
 fn single_representation_header_value(
@@ -7337,21 +7337,21 @@ fn single_representation_header_value(
         .map_err(|_| TemplateCacheBypassReason::MalformedRepresentationHeaders)
 }
 
-fn parse_delta_seconds(value: &str) -> Result<u64, TemplateCacheBypassReason> {
+fn parse_delta_seconds(value: &str) -> Result<u64, KeepRefusal> {
     let value = value.trim();
     let quoted_at_start = value.starts_with('"');
     let quoted_at_end = value.ends_with('"');
     let digits = match (quoted_at_start, quoted_at_end) {
         (true, true) if value.len() >= 2 => &value[1..value.len() - 1],
         (false, false) => value,
-        _ => return Err(TemplateCacheBypassReason::MalformedCachePolicy),
+        _ => return Err(KeepRefusal::MalformedPolicy),
     };
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(TemplateCacheBypassReason::MalformedCachePolicy);
+        return Err(KeepRefusal::MalformedPolicy);
     }
     digits
         .parse::<u64>()
-        .map_err(|_| TemplateCacheBypassReason::MalformedCachePolicy)
+        .map_err(|_| KeepRefusal::MalformedPolicy)
 }
 
 /// Parse the Fastly-specific freshness policy used by template cache's hosting platform.
@@ -7364,7 +7364,7 @@ fn parse_delta_seconds(value: &str) -> Result<u64, TemplateCacheBypassReason> {
 /// Unknown directives fail closed rather than inheriting semantics from another CDN.
 fn surrogate_control_freshness(
     headers: &edgezero_core::http::HeaderMap,
-) -> Result<Option<Duration>, TemplateCacheBypassReason> {
+) -> Result<Option<Duration>, KeepRefusal> {
     let mut saw_header = false;
     let mut max_age = None;
     let mut stale_while_revalidate = None;
@@ -7372,16 +7372,14 @@ fn surrogate_control_freshness(
 
     for value in headers.get_all("surrogate-control") {
         saw_header = true;
-        let value = value
-            .to_str()
-            .map_err(|_| TemplateCacheBypassReason::MalformedCachePolicy)?;
+        let value = value.to_str().map_err(|_| KeepRefusal::MalformedPolicy)?;
         if value.trim().is_empty() {
-            return Err(TemplateCacheBypassReason::MalformedCachePolicy);
+            return Err(KeepRefusal::MalformedPolicy);
         }
         for directive in value.split(',') {
             let directive = directive.trim();
             if directive.is_empty() {
-                return Err(TemplateCacheBypassReason::MalformedCachePolicy);
+                return Err(KeepRefusal::MalformedPolicy);
             }
             let (name, value) = directive
                 .split_once('=')
@@ -7393,33 +7391,27 @@ fn surrogate_control_freshness(
                 // before reuse" is correct for an HTTP cache and too permissive for a TS-owned
                 // one. Consolidating the two would loosen this gate rather than tidy it.
                 "private" | "no-store" | "no-cache" => {
-                    return Err(TemplateCacheBypassReason::OriginNotShareable);
+                    return Err(KeepRefusal::NotShareable);
                 }
                 "max-age" => {
-                    let parsed = parse_delta_seconds(
-                        value.ok_or(TemplateCacheBypassReason::MalformedCachePolicy)?,
-                    )?;
+                    let parsed = parse_delta_seconds(value.ok_or(KeepRefusal::MalformedPolicy)?)?;
                     if max_age.replace(parsed).is_some() {
-                        return Err(TemplateCacheBypassReason::MalformedCachePolicy);
+                        return Err(KeepRefusal::MalformedPolicy);
                     }
                 }
                 "stale-while-revalidate" => {
-                    let parsed = parse_delta_seconds(
-                        value.ok_or(TemplateCacheBypassReason::MalformedCachePolicy)?,
-                    )?;
+                    let parsed = parse_delta_seconds(value.ok_or(KeepRefusal::MalformedPolicy)?)?;
                     if stale_while_revalidate.replace(parsed).is_some() {
-                        return Err(TemplateCacheBypassReason::MalformedCachePolicy);
+                        return Err(KeepRefusal::MalformedPolicy);
                     }
                 }
                 "stale-if-error" => {
-                    let parsed = parse_delta_seconds(
-                        value.ok_or(TemplateCacheBypassReason::MalformedCachePolicy)?,
-                    )?;
+                    let parsed = parse_delta_seconds(value.ok_or(KeepRefusal::MalformedPolicy)?)?;
                     if stale_if_error.replace(parsed).is_some() {
-                        return Err(TemplateCacheBypassReason::MalformedCachePolicy);
+                        return Err(KeepRefusal::MalformedPolicy);
                     }
                 }
-                _ => return Err(TemplateCacheBypassReason::MalformedCachePolicy),
+                _ => return Err(KeepRefusal::MalformedPolicy),
             }
         }
     }
@@ -7427,56 +7419,63 @@ fn surrogate_control_freshness(
     if !saw_header {
         return Ok(None);
     }
-    let max_age = max_age.ok_or(TemplateCacheBypassReason::NoPositiveFreshness)?;
+    let max_age = max_age.ok_or(KeepRefusal::NoLifetime)?;
     if max_age == 0 {
-        return Err(TemplateCacheBypassReason::NoPositiveFreshness);
+        return Err(KeepRefusal::NoLifetime);
     }
     Ok(Some(Duration::from_secs(max_age)))
 }
 
-fn origin_shared_ttl(
+/// How long the origin lets a shared cache keep a response, at most
+/// `max_lifetime`.
+///
+/// The lifetime comes from `Surrogate-Control`, else `s-maxage`, else
+/// `max-age`, else `Expires` measured from `Date`, less the response's
+/// current age, being the larger of its `Age` and the age its `Date` implies.
+///
+/// # Errors
+///
+/// [`KeepRefusal::NotShareable`] for `private`, `no-store` or `no-cache`,
+/// [`KeepRefusal::MalformedPolicy`] for a policy that cannot be read, and
+/// [`KeepRefusal::NoLifetime`] for a response that gives no lifetime, or has
+/// none left.
+pub fn origin_shared_ttl(
     headers: &edgezero_core::http::HeaderMap,
-    max_age: Duration,
-) -> Result<Duration, TemplateCacheBypassReason> {
+    max_lifetime: Duration,
+) -> Result<Duration, KeepRefusal> {
     // `httpdate` parses `Date`/`Expires` into `std::time::SystemTime`, so take
     // the wasm-safe std value rather than calling `SystemTime::now()`.
-    origin_shared_ttl_at(headers, crate::ec::std_system_time_now(), max_age)
+    origin_shared_ttl_at(headers, crate::ec::std_system_time_now(), max_lifetime)
 }
 
 fn origin_shared_ttl_at(
     headers: &edgezero_core::http::HeaderMap,
     now: SystemTime,
-    template_cache_max_age: Duration,
-) -> Result<Duration, TemplateCacheBypassReason> {
+    max_lifetime: Duration,
+) -> Result<Duration, KeepRefusal> {
     let mut max_age = None;
     let mut shared_max_age = None;
 
     for value in headers.get_all(header::CACHE_CONTROL) {
-        let value = value
-            .to_str()
-            .map_err(|_| TemplateCacheBypassReason::MalformedCachePolicy)?;
+        let value = value.to_str().map_err(|_| KeepRefusal::MalformedPolicy)?;
         for directive in value.split(',').map(str::trim).filter(|v| !v.is_empty()) {
             let (name, value) = directive
                 .split_once('=')
                 .map_or((directive, None), |(name, value)| (name, Some(value)));
             match name.trim().to_ascii_lowercase().as_str() {
                 "private" | "no-store" | "no-cache" => {
-                    return Err(TemplateCacheBypassReason::OriginNotShareable);
+                    return Err(KeepRefusal::NotShareable);
                 }
                 "max-age" => {
-                    let parsed = parse_delta_seconds(
-                        value.ok_or(TemplateCacheBypassReason::MalformedCachePolicy)?,
-                    )?;
+                    let parsed = parse_delta_seconds(value.ok_or(KeepRefusal::MalformedPolicy)?)?;
                     if max_age.replace(parsed).is_some() {
-                        return Err(TemplateCacheBypassReason::MalformedCachePolicy);
+                        return Err(KeepRefusal::MalformedPolicy);
                     }
                 }
                 "s-maxage" => {
-                    let parsed = parse_delta_seconds(
-                        value.ok_or(TemplateCacheBypassReason::MalformedCachePolicy)?,
-                    )?;
+                    let parsed = parse_delta_seconds(value.ok_or(KeepRefusal::MalformedPolicy)?)?;
                     if shared_max_age.replace(parsed).is_some() {
-                        return Err(TemplateCacheBypassReason::MalformedCachePolicy);
+                        return Err(KeepRefusal::MalformedPolicy);
                     }
                 }
                 _ => {}
@@ -7487,16 +7486,16 @@ fn origin_shared_ttl_at(
     let date = single_header_value(headers, header::DATE)?
         .map(httpdate::parse_http_date)
         .transpose()
-        .map_err(|_| TemplateCacheBypassReason::MalformedCachePolicy)?;
+        .map_err(|_| KeepRefusal::MalformedPolicy)?;
     let standard_freshness = match shared_max_age.or(max_age) {
         Some(seconds) => Some(Duration::from_secs(seconds)),
         None => single_header_value(headers, header::EXPIRES)?
             .map(|value| {
-                let expires = httpdate::parse_http_date(value)
-                    .map_err(|_| TemplateCacheBypassReason::MalformedCachePolicy)?;
+                let expires =
+                    httpdate::parse_http_date(value).map_err(|_| KeepRefusal::MalformedPolicy)?;
                 expires
                     .duration_since(date.unwrap_or(now))
-                    .map_err(|_| TemplateCacheBypassReason::NoPositiveFreshness)
+                    .map_err(|_| KeepRefusal::NoLifetime)
             })
             .transpose()?,
     };
@@ -7504,7 +7503,7 @@ fn origin_shared_ttl_at(
     // restrictive directives were still parsed above and remain hard refusals.
     let freshness = surrogate_control_freshness(headers)?
         .or(standard_freshness)
-        .ok_or(TemplateCacheBypassReason::NoPositiveFreshness)?;
+        .ok_or(KeepRefusal::NoLifetime)?;
 
     let age = single_header_value(headers, header::AGE)?
         .map(parse_delta_seconds)
@@ -7520,10 +7519,10 @@ fn origin_shared_ttl_at(
     let remaining = freshness
         .checked_sub(current_age)
         .filter(|duration| !duration.is_zero())
-        .ok_or(TemplateCacheBypassReason::NoPositiveFreshness)?;
-    let capped = remaining.min(template_cache_max_age);
+        .ok_or(KeepRefusal::NoLifetime)?;
+    let capped = remaining.min(max_lifetime);
     if capped.is_zero() {
-        return Err(TemplateCacheBypassReason::NoPositiveFreshness);
+        return Err(KeepRefusal::NoLifetime);
     }
     Ok(capped)
 }
@@ -7549,6 +7548,73 @@ fn replayable_policy_headers(
     Ok(captured)
 }
 
+/// Why an origin's response may not be kept for other readers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepRefusal {
+    /// The status is not `200`.
+    NotOk,
+    /// The response sets a cookie.
+    SetsCookie,
+    /// The response's cache policy keeps it from a shared copy, by `private`,
+    /// `no-store` or `no-cache`, or by a shared cache header core does not
+    /// read.
+    NotShareable,
+    /// The response's cache policy cannot be read.
+    MalformedPolicy,
+    /// The response gives no lifetime, or has none left.
+    NoLifetime,
+}
+
+impl From<KeepRefusal> for TemplateCacheBypassReason {
+    fn from(refusal: KeepRefusal) -> Self {
+        match refusal {
+            KeepRefusal::NotOk => Self::NonOkStatus,
+            KeepRefusal::SetsCookie => Self::OriginSetCookie,
+            KeepRefusal::NotShareable => Self::OriginNotShareable,
+            KeepRefusal::MalformedPolicy => Self::MalformedCachePolicy,
+            KeepRefusal::NoLifetime => Self::NoPositiveFreshness,
+        }
+    }
+}
+
+/// As the template cache's matching reason, so its log lines read the same.
+impl core::fmt::Display for KeepRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(&TemplateCacheBypassReason::from(*self), f)
+    }
+}
+
+/// Whether an origin's response may be kept for other readers at all.
+///
+/// # Errors
+///
+/// [`KeepRefusal::NotOk`] for a status other than `200`,
+/// [`KeepRefusal::SetsCookie`] for a response that sets a cookie, and
+/// [`KeepRefusal::NotShareable`] for a shared cache header core does not
+/// read, checked in that order.
+pub fn origin_response_may_be_kept(
+    status: StatusCode,
+    headers: &edgezero_core::http::HeaderMap,
+) -> Result<(), KeepRefusal> {
+    if status != StatusCode::OK {
+        return Err(KeepRefusal::NotOk);
+    }
+    if headers.contains_key(header::SET_COOKIE) {
+        return Err(KeepRefusal::SetsCookie);
+    }
+    // Core Cache has no HTTP semantics. Fastly's documented Surrogate-Control subset
+    // is parsed by `origin_shared_ttl`; every other vendor-specific policy remains a
+    // bypass rather than guessing that unrelated CDNs share its grammar or precedence.
+    if crate::cache_policy::EDGE_CACHE_HEADER_NAMES
+        .iter()
+        .filter(|name| **name != "surrogate-control")
+        .any(|name| headers.contains_key(*name))
+    {
+        return Err(KeepRefusal::NotShareable);
+    }
+    Ok(())
+}
+
 fn template_cache_ttl(
     mode: AssemblyMode,
     authorization_disqualifies: bool,
@@ -7567,19 +7633,7 @@ fn template_cache_ttl(
     if cookie_disqualifies {
         return Err(TemplateCacheBypassReason::CookiePolicy);
     }
-    if response_headers.contains_key(header::SET_COOKIE) {
-        return Err(TemplateCacheBypassReason::OriginSetCookie);
-    }
-    // Core Cache has no HTTP semantics. Fastly's documented Surrogate-Control subset
-    // is parsed by `origin_shared_ttl`; every other vendor-specific policy remains a
-    // bypass rather than guessing that unrelated CDNs share its grammar or precedence.
-    if crate::cache_policy::EDGE_CACHE_HEADER_NAMES
-        .iter()
-        .filter(|name| **name != "surrogate-control")
-        .any(|name| response_headers.contains_key(*name))
-    {
-        return Err(TemplateCacheBypassReason::OriginNotShareable);
-    }
+    origin_response_may_be_kept(status, response_headers)?;
     // Checked here, among the leak vectors, because storing under a key that does not
     // cover the origin's Vary is cross-serving rather than mere ineligibility: a request
     // differing only in the uncovered header would read this template.
@@ -7610,9 +7664,6 @@ fn template_cache_ttl(
             uncovered,
         )));
     }
-    if status != StatusCode::OK {
-        return Err(TemplateCacheBypassReason::NonOkStatus);
-    }
     let declared_content_type =
         single_representation_header_value(response_headers, header::CONTENT_TYPE)?;
     if declared_content_type.is_some_and(|declared| declared != content_type)
@@ -7633,7 +7684,7 @@ fn template_cache_ttl(
         return Err(TemplateCacheBypassReason::UnsupportedContentEncoding);
     }
     replayable_policy_headers(response_headers)?;
-    origin_shared_ttl(response_headers, policy.max_age)
+    Ok(origin_shared_ttl(response_headers, policy.max_age)?)
 }
 
 /// What the `<head>` seam injects, given the assembly mode.
@@ -18284,7 +18335,7 @@ mod tests {
                     one_minute_later,
                     Duration::from_secs(60),
                 ),
-                Err(TemplateCacheBypassReason::NoPositiveFreshness),
+                Err(KeepRefusal::NoLifetime),
                 "an old Date is apparent age even when an upstream omitted Age"
             );
         }
@@ -18351,8 +18402,76 @@ mod tests {
             ]);
             assert_eq!(
                 origin_shared_ttl_at(&expired, now, Duration::from_secs(60)),
-                Err(TemplateCacheBypassReason::NoPositiveFreshness)
+                Err(KeepRefusal::NoLifetime)
             );
+        }
+
+        #[test]
+        fn the_keep_checks_refuse_as_the_template_cache_reports() {
+            let cdn = || HeaderName::from_static("cdn-cache-control");
+            let surrogate = HeaderName::from_static("surrogate-control");
+            for (status, response, expected) in [
+                (StatusCode::NOT_FOUND, headers(&[]), Err(KeepRefusal::NotOk)),
+                (
+                    StatusCode::OK,
+                    headers(&[(header::SET_COOKIE, "a=b")]),
+                    Err(KeepRefusal::SetsCookie),
+                ),
+                (
+                    StatusCode::OK,
+                    headers(&[(cdn(), "max-age=60")]),
+                    Err(KeepRefusal::NotShareable),
+                ),
+                (
+                    StatusCode::OK,
+                    headers(&[(surrogate, "max-age=60")]),
+                    Ok(()),
+                ),
+                // The status is checked first, then the cookie, then the
+                // shared cache headers.
+                (
+                    StatusCode::NOT_FOUND,
+                    headers(&[(header::SET_COOKIE, "a=b")]),
+                    Err(KeepRefusal::NotOk),
+                ),
+                (
+                    StatusCode::OK,
+                    headers(&[(header::SET_COOKIE, "a=b"), (cdn(), "max-age=60")]),
+                    Err(KeepRefusal::SetsCookie),
+                ),
+            ] {
+                assert_eq!(
+                    origin_response_may_be_kept(status, &response),
+                    expected,
+                    "{status} {response:?}"
+                );
+            }
+            for (refusal, reason) in [
+                (KeepRefusal::NotOk, TemplateCacheBypassReason::NonOkStatus),
+                (
+                    KeepRefusal::SetsCookie,
+                    TemplateCacheBypassReason::OriginSetCookie,
+                ),
+                (
+                    KeepRefusal::NotShareable,
+                    TemplateCacheBypassReason::OriginNotShareable,
+                ),
+                (
+                    KeepRefusal::MalformedPolicy,
+                    TemplateCacheBypassReason::MalformedCachePolicy,
+                ),
+                (
+                    KeepRefusal::NoLifetime,
+                    TemplateCacheBypassReason::NoPositiveFreshness,
+                ),
+            ] {
+                assert_eq!(TemplateCacheBypassReason::from(refusal), reason);
+                assert_eq!(
+                    refusal.to_string(),
+                    reason.to_string(),
+                    "a refusal is logged as the template cache's matching reason"
+                );
+            }
         }
 
         #[test]
