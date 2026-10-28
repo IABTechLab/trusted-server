@@ -2033,7 +2033,7 @@ pub(crate) mod tests {
     async fn a_geo_module_is_called_with_the_request_as_evidence() {
         let settings = create_test_settings();
         let req = create_test_request(&[("user-agent", "Mozilla/5.0 Kiosk/1.0")]);
-        let services = RuntimeServices::builder()
+        let services = crate::platform::test_support::test_services_builder()
             .config_store(Arc::new(crate::platform::test_support::NoopConfigStore))
             .secret_store(Arc::new(crate::platform::test_support::NoopSecretStore))
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
