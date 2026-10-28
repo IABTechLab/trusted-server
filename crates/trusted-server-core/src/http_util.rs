@@ -521,6 +521,41 @@ pub fn enforce_max_body_size(
     Ok(())
 }
 
+/// The namespace the inspection endpoints answer under.
+pub const ROUTE_NAMESPACE: &str = "/_ts";
+
+/// Response headers that describe the deployment and not the page.
+const DEPLOYMENT_HEADERS: &[&str] = &["x-cache", "x-cache-hits", "x-served-by"];
+
+/// Removes the headers that describe the deployment from a response, unless
+/// the request was for a path in `namespace`, which is where a deployment is
+/// asked about itself.
+///
+/// An adapter calls this before it finalizes a response, so a header that
+/// finalizing writes is not removed, an operator's `[response_headers]`
+/// among them. The publisher fallback has already removed them from what the
+/// origin sent, with [`remove_deployment_headers`], so a response under
+/// `namespace` keeps them only when this server answered it.
+pub fn strip_deployment_headers<T>(path: &str, namespace: &str, response: &mut Response<T>) {
+    // A path that only starts with the namespace's text is not in it. `/_tsx`
+    // is a publisher's page.
+    let in_namespace = path == namespace
+        || path
+            .strip_prefix(namespace)
+            .is_some_and(|rest| rest.starts_with('/'));
+    if !in_namespace {
+        remove_deployment_headers(response);
+    }
+}
+
+/// Removes the headers that describe the deployment from a response, whatever
+/// path it answers.
+pub fn remove_deployment_headers<T>(response: &mut Response<T>) {
+    for name in DEPLOYMENT_HEADERS {
+        response.headers_mut().remove(*name);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1074,5 +1109,88 @@ mod tests {
             is_navigation_request(&req),
             "should match text/html case-insensitively in fallback"
         );
+    }
+
+    const STRIPPED: [&str; 3] = ["x-cache", "x-cache-hits", "x-served-by"];
+
+    fn response_with(names: &[&'static str]) -> Response<()> {
+        let mut response = Response::new(());
+        for name in names {
+            response
+                .headers_mut()
+                .insert(*name, HeaderValue::from_static("value"));
+        }
+        response
+    }
+
+    #[test]
+    fn a_publisher_page_loses_every_deployment_header() {
+        let mut response = response_with(&STRIPPED);
+
+        strip_deployment_headers("/articles/an-article", ROUTE_NAMESPACE, &mut response);
+
+        for name in STRIPPED {
+            assert!(
+                response.headers().get(name).is_none(),
+                "{name} should not reach a reader"
+            );
+        }
+    }
+
+    #[test]
+    fn the_servers_own_namespace_keeps_them() {
+        for path in ["/_ts", "/_ts/permissions", "/_ts/debug/ja4"] {
+            let mut response = response_with(&STRIPPED);
+
+            strip_deployment_headers(path, ROUTE_NAMESPACE, &mut response);
+
+            for name in STRIPPED {
+                assert!(
+                    response.headers().get(name).is_some(),
+                    "{path} should keep {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_header_outside_the_list_is_left_alone() {
+        let kept = ["x-ts-version", "x-geo-info-available", "cache-control"];
+        let mut response = response_with(&kept);
+
+        strip_deployment_headers("/articles/an-article", ROUTE_NAMESPACE, &mut response);
+
+        for name in kept {
+            assert!(
+                response.headers().get(name).is_some(),
+                "{name} should be left alone"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_that_only_starts_with_the_namespace_is_not_in_it() {
+        for path in ["/_tsx", "/_ts-archive", "/_tsfoo/bar"] {
+            let mut response = response_with(&["x-served-by"]);
+
+            strip_deployment_headers(path, ROUTE_NAMESPACE, &mut response);
+
+            assert!(
+                response.headers().get("x-served-by").is_none(),
+                "{path} is a publisher's page"
+            );
+        }
+    }
+
+    #[test]
+    fn the_boundary_is_the_namespace_passed_in() {
+        let mut kept = response_with(&["x-served-by"]);
+        let mut stripped = response_with(&["x-served-by"]);
+
+        strip_deployment_headers("/_other/permissions", "/_other", &mut kept);
+        strip_deployment_headers("/_ts/permissions", "/_other", &mut stripped);
+
+        assert!(kept.headers().get("x-served-by").is_some());
+        assert!(stripped.headers().get("x-served-by").is_none());
     }
 }

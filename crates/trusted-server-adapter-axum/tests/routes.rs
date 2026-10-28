@@ -806,7 +806,7 @@ async fn nextjs_auction_output_holds_until_the_structural_body_close() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn health_reports_git_version() {
+async fn health_carries_no_version() {
     let mut service = make_service();
     let request = Request::builder()
         .method("GET")
@@ -827,12 +827,8 @@ async fn health_reports_git_version() {
         200,
         "should return 200 on /health"
     );
-    assert_eq!(
-        response
-            .headers()
-            .get("x-ts-version")
-            .and_then(|v| v.to_str().ok()),
-        trusted_server_core::constants::TS_GIT_VERSION,
-        "should report the compiled-in git version on /health"
+    assert!(
+        response.headers().get("x-ts-version").is_none(),
+        "should write no version on /health, which the service_version middleware writes on a page"
     );
 }

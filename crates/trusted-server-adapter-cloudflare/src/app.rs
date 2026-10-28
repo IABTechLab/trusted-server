@@ -27,9 +27,9 @@ use trusted_server_core::inspect::permissions::{PERMISSIONS_PATHS, handle_permis
 use trusted_server_core::integrations::{
     IntegrationBuilder, IntegrationRegistry, ProxyDispatchInput,
 };
-use trusted_server_core::platform::RuntimeServices;
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::platform::StoreName;
+use trusted_server_core::platform::{PlatformIdentity, RuntimeServices};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
@@ -231,7 +231,8 @@ fn build_state_with_registrations_and_services(
     let plan = Arc::new(compile_auction_plan_with(&settings, integrations)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Cloudflare)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan))?;
-    let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?;
+    let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?
+        .with_platform(PlatformIdentity::named("cloudflare"));
 
     // Composition root: resolve the module selection once, before any request
     // is served, so a selection this adapter can never supply fails here rather

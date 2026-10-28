@@ -239,14 +239,16 @@ upgrading a service that was deployed before logical store links, and
 [the CLI guide](/guide/cli#lifecycle-commands) for where `<release-root>`
 comes from.
 
-The build compiles `TRUSTED_SERVER__GIT_VERSION` into the binary and reports it
-in the `x-ts-version` response header, so the variable must be set for the
-build the deploy runs, not just for the activation step. The Fastly service
-version is in `x-ts-fastly-version`. Without the variable, a build reports the
-checked-out tag, else the branch, else the first 6 characters of the commit,
-and a build outside a git checkout omits the header. The value is public on
-every response, so pass a neutral value such as the commit hash when a branch
-name is sensitive.
+The build compiles `TRUSTED_SERVER__GIT_VERSION` into the binary, so the
+variable must be set for the build the deploy runs, not just for the
+activation step. Without the variable, a build compiles in the checked-out
+tag, else the branch, else the first 6 characters of the commit, and a build
+outside a git checkout knows no version. No adapter writes it on a response.
+A deployment that names core's `service_version` middleware in a `[[serve]]`
+entry writes it as `x-ts-version` on the pages the entry covers, with the
+Fastly service version as `x-ts-service-version`, so pass a neutral value such
+as the commit hash when a branch name is sensitive. See
+[Headers that describe the deployment](/guide/configuration#headers-that-describe-the-deployment).
 
 ## Next Steps
 

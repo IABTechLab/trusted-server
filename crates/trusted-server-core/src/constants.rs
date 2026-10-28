@@ -44,11 +44,13 @@ pub const HEADER_X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-i
 pub const HEADER_X_COMPRESS_HINT: HeaderName = HeaderName::from_static("x-compress-hint");
 pub const HEADER_X_DEBUG_FASTLY_POP: HeaderName = HeaderName::from_static("x-debug-fastly-pop");
 
-// Staging / version identification headers
-/// Deployed git version: tag, else branch, else 6-char commit (see [`TS_GIT_VERSION`]).
+// Staging / version identification headers. The two version headers are
+// written by core's `service_version` middleware where a `[[serve]]` entry
+// names it, and by no adapter.
+/// The deployed git version the build compiled in (see [`TS_GIT_VERSION`]).
 pub const HEADER_X_TS_VERSION: HeaderName = HeaderName::from_static("x-ts-version");
-/// Fastly service version (`FASTLY_SERVICE_VERSION`), formerly sent as `x-ts-version`.
-pub const HEADER_X_TS_FASTLY_VERSION: HeaderName = HeaderName::from_static("x-ts-fastly-version");
+/// The version the adapter reports for the service.
+pub const HEADER_X_TS_SERVICE_VERSION: HeaderName = HeaderName::from_static("x-ts-service-version");
 pub const HEADER_X_TS_ENV: HeaderName = HeaderName::from_static("x-ts-env");
 
 /// Deployed git version compiled in by `build.rs`, from the deploy pipeline's
@@ -59,7 +61,6 @@ pub const TS_GIT_VERSION: Option<&str> = match option_env!("TRUSTED_SERVER__GIT_
 };
 
 // Fastly environment variables
-pub const ENV_FASTLY_SERVICE_VERSION: &str = "FASTLY_SERVICE_VERSION";
 pub const ENV_FASTLY_IS_STAGING: &str = "FASTLY_IS_STAGING";
 
 // Common standard header names used across modules

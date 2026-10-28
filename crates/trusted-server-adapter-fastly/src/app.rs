@@ -123,8 +123,8 @@ use trusted_server_core::integrations::{
 };
 use trusted_server_core::permissions::PermissionState;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformKvStore, PolicyOrigin, RuntimeServices, StoreName,
-    build_geo_module,
+    ClientInfo, GeoInfo, PlatformIdentity, PlatformKvStore, PolicyOrigin, RuntimeServices,
+    StoreName, UNKNOWN, build_geo_module,
 };
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
@@ -331,7 +331,8 @@ pub(crate) fn build_state_with_registrations(
     let plan = Arc::new(compile_auction_plan_with(&settings, integrations)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Fastly)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan))?;
-    let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?;
+    let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?
+        .with_platform(fastly_platform_identity());
 
     // Composition root: resolve the module selection once, before any request
     // is served, so a selection this adapter can never supply fails here rather
@@ -372,6 +373,24 @@ pub(crate) fn build_state_with_registrations(
         permission_signal_modules,
         permission_policy,
     }))
+}
+
+/// What Fastly reports about the service answering, from the environment
+/// variables Fastly gives every Compute service.
+fn fastly_platform_identity() -> PlatformIdentity {
+    let read = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| UNKNOWN.to_owned())
+    };
+    PlatformIdentity {
+        name: "fastly".to_owned(),
+        service_id: read("FASTLY_SERVICE_ID"),
+        service_version: read("FASTLY_SERVICE_VERSION"),
+        staging: std::env::var("FASTLY_IS_STAGING").is_ok_and(|value| value == "1"),
+        pop: read("FASTLY_POP"),
+    }
 }
 
 /// The permission signal modules this adapter links, in the order they run

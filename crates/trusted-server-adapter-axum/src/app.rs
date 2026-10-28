@@ -44,7 +44,7 @@ use trusted_server_core::settings_data::{
     default_config_key, default_config_store_name, get_settings_from_config_store_with,
 };
 
-use trusted_server_core::platform::{PolicyOrigin, RuntimeServices};
+use trusted_server_core::platform::{PlatformIdentity, PolicyOrigin, RuntimeServices};
 
 use crate::middleware::{FinalizeResponseMiddleware, SanitizeRequestMiddleware};
 use crate::platform::{
@@ -183,7 +183,8 @@ fn build_state_with_registrations_and_services(
     let plan = Arc::new(compile_auction_plan_with(&settings, integrations)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Axum)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan))?;
-    let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?;
+    let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?
+        .with_platform(PlatformIdentity::named("axum"));
 
     // Composition root: reject a module selection this adapter can never
     // supply, once, before any request is served. The registry is built first

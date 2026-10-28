@@ -6,7 +6,9 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Response};
 use edgezero_core::middleware::{Middleware, Next};
 use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
-use trusted_server_core::http_util::sanitize_trusted_client_ip_headers;
+use trusted_server_core::http_util::{
+    ROUTE_NAMESPACE, sanitize_trusted_client_ip_headers, strip_deployment_headers,
+};
 use trusted_server_core::settings::Settings;
 
 // ---------------------------------------------------------------------------
@@ -52,9 +54,8 @@ impl Middleware for SanitizeRequestMiddleware {
 /// Response-finalization middleware: injects all standard TS response headers.
 ///
 /// Geo lookup is unavailable in the Axum dev server — `X-Geo-Info-Available: false`
-/// is always emitted. `X-TS-Version` carries the compiled-in git version. The
-/// Fastly-specific headers (`X-TS-Fastly-Version`, `X-TS-ENV`) are skipped
-/// because the corresponding env vars are not set in a local dev context.
+/// is always emitted. The Fastly adapter's `X-TS-ENV` is skipped because its
+/// env var is not set in a local dev context.
 ///
 /// Registered directly inside [`SanitizeRequestMiddleware`], so that every
 /// outgoing response carries a consistent set of headers.
@@ -73,7 +74,10 @@ impl FinalizeResponseMiddleware {
 #[async_trait(?Send)]
 impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
+        let path = ctx.request().uri().path().to_owned();
         let mut response = next.run(ctx).await?;
+        // Before finalizing, so a header finalizing writes is kept.
+        strip_deployment_headers(&path, ROUTE_NAMESPACE, &mut response);
         apply_finalize_headers(&self.settings, &mut response);
         Ok(response)
     }
@@ -86,8 +90,7 @@ impl Middleware for FinalizeResponseMiddleware {
 /// Applies standard Trusted Server response headers to the given response.
 ///
 /// Unlike the Fastly variant, geo is always unavailable so `X-Geo-Info-Available: false`
-/// is unconditionally emitted, followed by the compiled-in `X-TS-Version`.
-/// Fastly-specific headers are omitted.
+/// is unconditionally emitted. Fastly-specific headers are omitted.
 /// Operator-configured `settings.response_headers` are applied last (with the
 /// shared cookie cache-privacy hardening) and can override any managed header.
 pub(crate) fn apply_finalize_headers(settings: &Settings, response: &mut Response) {
@@ -95,8 +98,6 @@ pub(crate) fn apply_finalize_headers(settings: &Settings, response: &mut Respons
         HEADER_X_GEO_INFO_AVAILABLE,
         HeaderValue::from_static("false"),
     );
-
-    trusted_server_core::version_header::apply_git_version_header(response);
 
     // Cookie-bearing responses stay private to shared caches and operator
     // headers cannot re-enable caching for uncacheable per-user payloads.
@@ -257,17 +258,58 @@ mod tests {
         );
     }
 
+    fn ctx_for(path: &str) -> RequestContext {
+        let req = request_builder()
+            .method(Method::GET)
+            .uri(path)
+            .body(Body::empty())
+            .expect("should build test request");
+        RequestContext::new(req, PathParams::new(HashMap::new()))
+    }
+
+    /// A response as an origin behind a cache sends it, naming the node that
+    /// answered and how the cache treated the request.
+    fn response_naming_its_node() -> Response {
+        response_builder()
+            .header("x-served-by", "cache-node-1")
+            .header("x-cache", "HIT")
+            .header("x-cache-hits", "3")
+            .body(Body::empty())
+            .expect("should build test response")
+    }
+
+    /// What the finalize middleware makes of that response for a request to
+    /// `path`.
+    fn finalized(path: &str, settings: Settings) -> Response {
+        let middleware = FinalizeResponseMiddleware::new(Arc::new(settings));
+        let handler = Arc::new(|_ctx: RequestContext| async move {
+            Ok::<Response, EdgeError>(response_naming_its_node())
+        });
+
+        block_on(middleware.handle(ctx_for(path), Next::new(&[], &*handler)))
+            .expect("should run middleware")
+    }
+
     #[test]
-    fn emits_git_version_header() {
-        let mut response = empty_response();
-        apply_finalize_headers(&settings_with_response_headers(vec![]), &mut response);
+    fn finalize_middleware_strips_deployment_headers_before_it_writes_the_operators() {
+        let response = finalized(
+            "/articles/an-article",
+            settings_with_response_headers(vec![("X-Cache", "configured")]),
+        );
+
+        for name in ["x-served-by", "x-cache-hits"] {
+            assert!(
+                !response.headers().contains_key(name),
+                "should strip {name} from a publisher's page"
+            );
+        }
         assert_eq!(
             response
                 .headers()
-                .get("x-ts-version")
+                .get("x-cache")
                 .and_then(|v| v.to_str().ok()),
-            trusted_server_core::constants::TS_GIT_VERSION,
-            "should report the compiled-in git version as x-ts-version"
+            Some("configured"),
+            "should carry the operator's header and not the origin's"
         );
     }
 }

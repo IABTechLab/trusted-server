@@ -72,6 +72,7 @@ pub mod robots_txt;
 pub mod rsc_flight;
 pub(crate) mod s3_sigv4;
 pub mod secret_resolution;
+pub mod service_version;
 pub mod settings;
 pub mod settings_data;
 pub mod streaming_processor;
@@ -81,7 +82,6 @@ pub mod test_support;
 pub mod tester_cookie;
 pub mod tsjs;
 pub mod tsjs_bundle;
-pub mod version_header;
 
 #[cfg(test)]
 mod migration_guards;

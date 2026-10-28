@@ -32,9 +32,9 @@ use trusted_server_core::inspect::permissions::{
 use trusted_server_core::integrations::{
     IntegrationBuilder, IntegrationRegistry, ProxyDispatchInput,
 };
-use trusted_server_core::platform::RuntimeServices;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use trusted_server_core::platform::{PlatformConfigStore, StoreName};
+use trusted_server_core::platform::{PlatformIdentity, RuntimeServices};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
@@ -219,7 +219,8 @@ fn build_state_with_registrations_and_services(
     let plan = Arc::new(compile_auction_plan_with(&settings, integrations)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Spin)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan))?;
-    let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?;
+    let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?
+        .with_platform(PlatformIdentity::named("spin"));
 
     // Composition root: resolve the module selection once, before any request
     // is served, so a selection this adapter can never supply fails here rather
@@ -1713,12 +1714,9 @@ mod tests {
             200,
             "GET /health must return 200 from the startup fallback"
         );
-        assert_eq!(
-            resp.headers()
-                .get("x-ts-version")
-                .and_then(|v| v.to_str().ok()),
-            trusted_server_core::constants::TS_GIT_VERSION,
-            "startup-fallback /health should report the compiled-in git version"
+        assert!(
+            resp.headers().get("x-ts-version").is_none(),
+            "startup-fallback /health should carry no version"
         );
         let body = resp.into_body().into_bytes().unwrap_or_default();
         assert_eq!(

@@ -327,10 +327,11 @@ pull_sync_concurrency = 3
 # the pages where a [[fetch]] or [[serve]] entry names it. A page takes the
 # first entry that covers it and runs that entry's middleware in the order
 # written. The two entries below name every middleware the modules further
-# down supply, in the order `ts audit` writes them. Keep the names of the
-# modules that are selected and remove the rest, because an entry that names
-# the middleware of a module no section selects refuses startup. See "Placing
-# page changes" in the configuration guide.
+# down supply, in the order `ts audit` writes them, and core's own
+# `service_version` last. Keep the names of the modules that are selected and
+# remove the rest, because an entry that names the middleware of a module no
+# section selects refuses startup. See "Placing page changes" in the
+# configuration guide.
 # [[fetch]]
 # media_type = "text/html"
 # middleware = [
@@ -349,7 +350,7 @@ pull_sync_concurrency = 3
 
 # [[serve]]
 # media_type = "text/html"
-# middleware = ["bot-protection.datadome.tag", "ad-tag.google.diagnostics"]
+# middleware = ["bot-protection.datadome.tag", "ad-tag.google.diagnostics", "service_version"]
 
 # First-party proxying of named third-party scripts. Uncomment the
 # `modules` line under [proxy] below to switch it on.
