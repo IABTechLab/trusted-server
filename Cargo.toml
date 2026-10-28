@@ -100,7 +100,7 @@ esi = "0.7.2"
 fastly = "0.13"
 fern = "0.7.1"
 # The published loading cache package, which builds for every host.
-fiftyone-caching = { version = "4.5.8-49", default-features = false }
+fiftyone-caching = { version = "4.5.13", default-features = false }
 flate2 = "1.1"
 futures = "0.3"
 # `ts dev lint domains` / `install-hooks` drive all git access through
