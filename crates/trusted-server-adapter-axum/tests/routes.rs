@@ -954,6 +954,7 @@ fn settings_refusing_every_crawler() -> trusted_server_core::settings::Settings 
         "#,
     )
     .expect("should parse robots.txt test settings")
+    .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
 }
 
 /// `/robots.txt` is the publisher path's, answered against an origin that
