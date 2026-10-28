@@ -349,14 +349,14 @@ that names each chunk with its length and SHA-256.
    `wrangler.ci.toml` bind the config store as a namespace of its own,
    `trusted_server_config`, beside `TRUSTED_SERVER_KV`, and `cloudflare.toml`
    names the same binding. The variable bridge is gone from the adapter's
-   code, manifests and `README.md`, whose test
-   `no_wrangler_manifest_carries_settings_in_a_variable` checks that no
-   manifest carries settings in a variable (`tests/config_defaults.rs`), from
-   the integration tests' Cloudflare environment, which stores its blob in the
-   local namespace with `wrangler kv key put`, from
-   `scripts/smoke-cloudflare.sh`, which pushes into the namespace with
-   `ts config push --adapter cloudflare --local`, and from
-   `docs/guide/cloudflare.md`, with its hand copy and double encoding.
+   code, manifests and `README.md`, from the integration tests' Cloudflare
+   environment, which stores its blob in the local namespace with
+   `wrangler kv key put`, from `scripts/smoke-cloudflare.sh`, which pushes
+   into the namespace with `ts config push --adapter cloudflare --local`, and
+   from `docs/guide/cloudflare.md`, with its hand copy and double encoding.
+   The adapter's test `no_wrangler_manifest_carries_settings_in_a_variable`
+   (`tests/config_defaults.rs`) checks that no manifest carries settings in a
+   variable.
 6. **One way in.** Core declares `PlatformPolicySource`
    (`platform/policy_source.rs` lines 13 to 23), a trait with one method,
    `policy_text`, that returns the text of the file a reference names, the
@@ -893,11 +893,15 @@ are the same for every publisher.
    missing, when the build stops. That check compares modification times, not
    contents. In place of a build it copies the bundles from the folder
    `TSJS_PREBUILT_DIR` names, which must hold the same set. The scripts that
-   crates carry whole with `include_str!` are the Google ad tag bootstrap
-   (`GPT_BOOTSTRAP_JS`), in core's `integrations/gpt.rs` at row 4 and in
-   `crates/ad-tag/google` at row 55, and at row 55 also InMobi's
+   the crates a release links carry whole with `include_str!` are the Google
+   ad tag bootstrap (`GPT_BOOTSTRAP_JS`), in core's `integrations/gpt.rs` at
+   row 4 and in `crates/ad-tag/google` at row 55, and at row 55 also InMobi's
    `gpp_stub.js` and `tcf_stub.js` (`GPP_STUB_SCRIPT` and `TCF_STUB_SCRIPT` in
-   `crates/cmp/inmobi/src/lib.rs`).
+   `crates/cmp/inmobi/src/lib.rs`). At row 55 the seam probe carries its
+   `js/probe.js` whole as well (`PROBE_JS` in
+   `crates/testing/iabtl/src/lib.rs`), but each adapter lists that crate as a
+   dev-dependency alone, so only test builds link it and the script never
+   reaches a release.
 3. **The Worker glue on Cloudflare.** Cloudflare's `build.sh` installs
    `worker-build` at the version of the `worker` crate that `Cargo.lock` pins
    and runs it (lines 21 to 39 at both rows). `worker-build` downloads the
@@ -925,8 +929,10 @@ are the same for every publisher.
    pipeline sets or core's `build.rs` reads from local git
    (`emit_git_version`), compiled in as `TS_GIT_VERSION` in `constants.rs`.
 6. **The template build digest.** A SHA-256 that core's `build.rs` takes over
-   core's sources, its build script and `Cargo.toml`, and the workspace's
-   `Cargo.toml`, `Cargo.lock` and `edgezero.toml` (`template_build_digest`),
+   core's sources, its build script with the `build_support/git_version.rs` it
+   includes, its `Cargo.toml`, and the workspace's `Cargo.toml`, `Cargo.lock`
+   and `edgezero.toml` (`CRATE_INPUTS`, `WORKSPACE_INPUTS` and
+   `template_build_digest`),
    compiled in as `TEMPLATE_BUILD_DIGEST` in `publisher.rs`. It is part of the
    fingerprint a stored page template is kept under, so a template stored by
    other code is never served.

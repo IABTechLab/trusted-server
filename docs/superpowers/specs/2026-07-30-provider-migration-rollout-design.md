@@ -242,9 +242,10 @@ Requirements, each marked with its implementation state:
    permission-model spec §3.1, which row 4 of the stack builds, starts no
    domain whose blob names no policy, and a build without it, as main is,
    refuses `[permissions]` as an unknown field (`deny_unknown_fields` on
-   `Settings`, main's `settings.rs` line 2964), so no one blob starts both
-   builds. The build and the blob that names its policy therefore go live
-   together, and on Fastly the pair is staged first (§6 item 1).
+   `Settings`, `settings.rs` line 2964 at `7aa5c993b` on main), so no one
+   blob starts both builds. The build and the blob that names its policy
+   therefore go live together, and on Fastly the pair is staged first (§6
+   item 1).
 
    The draft's full N+1/N+2 interim (the negative-record read/write
    matrix, the `permissions_v2` model promotion, the `m00` mirror, and the
