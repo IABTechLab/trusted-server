@@ -11,17 +11,47 @@ use tempfile::TempDir;
 use toml_edit::DocumentMut;
 use trusted_server_core::config_payload::DEFAULT_CONFIG_STORE_ID;
 use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::permissions::{PolicyReference, policy_sha256};
 use trusted_server_core::platform::{
-    PlatformConfigStore, PlatformError, PlatformSecretStore, StoreId, StoreName,
+    PlatformConfigStore, PlatformError, PlatformPolicySource, PlatformSecretStore, PolicyOrigin,
+    StoreId, StoreName, policy_entry_text, policy_key,
 };
 use trusted_server_core::settings::Settings;
-use trusted_server_core::settings_data::get_settings_from_config_store_with;
+use trusted_server_core::settings_data::{
+    get_settings_from_config_store_with, resolve_fastly_chunk_pointer,
+};
 
 const HOST: &str = "a.publisher.example";
 
+/// A second host, whose blob names the same policy file as [`HOST`]'s.
+const OTHER_HOST: &str = "b.publisher.example";
+
+/// The policy file each push supplies, in the project.
+const POLICY_FILE: &str = "sample.yaml";
+
+/// The repository's sample, which the project's app config names.
+const POLICY_TEXT: &str = include_str!("../../../config/permissions/sample.yaml");
+
 /// A project holding the repository's manifests, with only the Fastly
-/// adapter declared, and the example app config.
+/// adapter declared, the example app config naming the repository's sample
+/// policy, and that policy's file.
 fn project() -> TempDir {
+    let directory = project_naming_no_policy();
+    let path = directory.path().join("trusted-server.toml");
+    let app_config = fs::read_to_string(&path).expect("should read the app config");
+    fs::write(
+        &path,
+        format!("{app_config}\n[permissions]\npolicy = \"sample\"\n"),
+    )
+    .expect("should name the policy");
+    fs::write(directory.path().join(POLICY_FILE), POLICY_TEXT)
+        .expect("should write the policy file");
+    directory
+}
+
+/// A project holding the repository's manifests, with only the Fastly
+/// adapter declared, and the example app config, which names no policy.
+fn project_naming_no_policy() -> TempDir {
     let directory = tempfile::tempdir().expect("should create a temporary project");
     let mut manifest: toml::Value = toml::from_str(include_str!("../../../edgezero.toml"))
         .expect("should parse the repository manifest");
@@ -81,6 +111,8 @@ fn push(project: &TempDir, args: &[&str]) -> Output {
         .current_dir(project.path())
         // Do not inherit operator configuration or credentials from the test runner.
         .env_clear()
+        // The push hands its settings over in a file in the temp folder.
+        .envs(["TMPDIR", "TMP", "TEMP"].map(|name| (name, std::env::temp_dir().into_os_string())))
         .env("RUST_LOG", "info")
         .env("TRUSTED_SERVER__PUBLISHER__DOMAIN", HOST)
         .env(
@@ -170,17 +202,41 @@ impl PlatformSecretStore for FixedSecretStore {
     }
 }
 
-/// Reads the blob at `key` the way the runtime does, chunks included.
+/// Reads a host's policy file from its shared entry, as the Fastly adapter
+/// does, chunks included.
+struct SharedPolicyEntries<'a>(&'a MemoryConfigStore);
+
+impl PlatformPolicySource for SharedPolicyEntries<'_> {
+    fn policy_text(&self, reference: &PolicyReference) -> Result<String, Report<PlatformError>> {
+        let store_name = StoreName::from(DEFAULT_CONFIG_STORE_ID);
+        let value = self.0.get(&store_name, &policy_key(&reference.sha256))?;
+        let entry = resolve_fastly_chunk_pointer(self.0, &store_name, &value).map_err(|error| {
+            Report::new(PlatformError::PolicySource).attach(format!("{error:?}"))
+        })?;
+        policy_entry_text(&entry)
+    }
+}
+
+/// Reads the blob at `key` the way the runtime does, chunks included, with a
+/// host's policy file read from its shared entry.
 fn read_back(
     entries: &[(String, String)],
     key: &str,
 ) -> Result<Settings, Report<TrustedServerError>> {
+    let store = MemoryConfigStore(entries.iter().cloned().collect());
+    let shared = SharedPolicyEntries(&store);
+    let origin = if key == DEFAULT_CONFIG_STORE_ID {
+        PolicyOrigin::Blob
+    } else {
+        PolicyOrigin::Source(&shared)
+    };
     get_settings_from_config_store_with(
-        &MemoryConfigStore(entries.iter().cloned().collect()),
+        &store,
         &FixedSecretStore,
         &StoreName::from(DEFAULT_CONFIG_STORE_ID),
         key,
         &StoreName::from("trusted_server_secrets"),
+        origin,
         &trusted_server_modules::builders(),
     )
 }
@@ -189,7 +245,10 @@ fn read_back(
 fn a_local_push_of_a_host_key_writes_the_local_store() {
     let project = project();
 
-    let output = push(&project, &["--local", "--key", HOST]);
+    let output = push(
+        &project,
+        &["--local", "--key", HOST, "--permissions", POLICY_FILE],
+    );
 
     assert_success(&output);
     let entries = stored_entries(&project);
@@ -198,6 +257,11 @@ fn a_local_push_of_a_host_key_writes_the_local_store() {
         settings.publisher.domain, HOST,
         "should store the pushed app config"
     );
+    assert_eq!(
+        settings.permission_policy().map(|policy| policy.name()),
+        Some("sample"),
+        "the host should run the policy its blob names"
+    );
     assert!(
         entries
             .iter()
@@ -205,7 +269,16 @@ fn a_local_push_of_a_host_key_writes_the_local_store() {
         "a host's push should not write the logical store ID"
     );
 
-    let logical = push(&project, &["--local", "--key", DEFAULT_CONFIG_STORE_ID]);
+    let logical = push(
+        &project,
+        &[
+            "--local",
+            "--key",
+            DEFAULT_CONFIG_STORE_ID,
+            "--permissions",
+            POLICY_FILE,
+        ],
+    );
 
     assert_success(&logical);
     assert!(
@@ -222,7 +295,17 @@ fn a_long_document_is_written_as_chunks_then_a_pointer() {
     lengthen_app_config(&project);
     let before = fs::read_to_string(fastly_toml(&project)).expect("should read the manifest");
 
-    let preview = push(&project, &["--local", "--key", HOST, "--dry-run"]);
+    let preview = push(
+        &project,
+        &[
+            "--local",
+            "--key",
+            HOST,
+            "--dry-run",
+            "--permissions",
+            POLICY_FILE,
+        ],
+    );
 
     assert_success(&preview);
     assert!(
@@ -235,7 +318,10 @@ fn a_long_document_is_written_as_chunks_then_a_pointer() {
         "a dry run should write nothing"
     );
 
-    assert_success(&push(&project, &["--local", "--key", HOST]));
+    assert_success(&push(
+        &project,
+        &["--local", "--key", HOST, "--permissions", POLICY_FILE],
+    ));
 
     let mut entries = stored_entries(&project);
     let chunk_prefix = format!("{HOST}.__edgezero_chunks.");
@@ -289,12 +375,103 @@ fn a_key_whose_chunk_keys_are_too_long_is_refused_before_writing() {
     // infix, the envelope's hash and an index.
     let key = "k".repeat(200);
 
-    let output = push(&project, &["--local", "--key", &key]);
+    let output = push(
+        &project,
+        &["--local", "--key", &key, "--permissions", POLICY_FILE],
+    );
 
     assert!(!output.status.success(), "the push should be refused");
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("255-character limit"),
         "should say why: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(fastly_toml(&project)).expect("should read the manifest"),
+        before,
+        "a refused push should write nothing"
+    );
+}
+
+/// Two hosts whose blobs name one file share one entry, so the file is kept
+/// once however many hosts name it.
+#[test]
+fn two_hosts_naming_one_policy_file_keep_it_once() {
+    let project = project();
+    let policy_entry = policy_key(&policy_sha256(POLICY_TEXT));
+
+    assert_success(&push(
+        &project,
+        &["--local", "--key", HOST, "--permissions", POLICY_FILE],
+    ));
+    let first = stored_entries(&project);
+    let second = push(
+        &project,
+        &["--local", "--key", OTHER_HOST, "--permissions", POLICY_FILE],
+    );
+
+    assert_success(&second);
+    assert!(
+        String::from_utf8_lossy(&second.stdout).contains(&format!("kept `{policy_entry}`")),
+        "the second push should keep the entry the first wrote: {}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+    let entries = stored_entries(&project);
+    let held = |entries: &[(String, String)]| {
+        entries
+            .iter()
+            .filter(|(key, _)| key.starts_with(&policy_entry))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        entries.iter().any(|(key, _)| *key == policy_entry),
+        "the file should be kept under its digest"
+    );
+    assert_eq!(
+        held(&entries),
+        held(&first),
+        "the second push should write no entry of the file again"
+    );
+    let pointer_at = entries
+        .iter()
+        .position(|(key, _)| *key == policy_entry)
+        .expect("should keep the policy entry");
+    let blob_at = entries
+        .iter()
+        .position(|(key, _)| key == HOST)
+        .expect("should write the first host's blob");
+    assert!(
+        pointer_at < blob_at,
+        "the policy entry should be written before the blob that names it"
+    );
+    for host in [HOST, OTHER_HOST] {
+        let settings = read_back(&entries, host).expect("each host's blob should load");
+        assert_eq!(
+            settings.permission_policy().map(|policy| policy.sha256()),
+            Some(policy_sha256(POLICY_TEXT).as_str()),
+            "{host} should run the file both pushes supplied"
+        );
+    }
+}
+
+/// The keyed push refuses what the plain push refuses, so a host's blob
+/// always names a supplied policy file.
+#[test]
+fn a_keyed_push_refuses_settings_that_name_no_policy_and_writes_nothing() {
+    let project = project_naming_no_policy();
+    fs::write(project.path().join(POLICY_FILE), POLICY_TEXT).expect("should write the policy file");
+    let before = fs::read_to_string(fastly_toml(&project)).expect("should read the manifest");
+
+    let output = push(
+        &project,
+        &["--local", "--key", HOST, "--permissions", POLICY_FILE],
+    );
+
+    assert!(!output.status.success(), "the push should be refused");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("the settings name no permission policy"),
+        "should say what is missing: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
@@ -311,7 +488,10 @@ fn a_remote_dry_run_names_the_live_store_and_writes_nothing() {
 
     // The runner's environment is cleared, so no `fastly` CLI can be found
     // and a dry run that asked it anything would fail.
-    let output = push(&project, &["--key", HOST, "--dry-run"]);
+    let output = push(
+        &project,
+        &["--key", HOST, "--dry-run", "--permissions", POLICY_FILE],
+    );
 
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
