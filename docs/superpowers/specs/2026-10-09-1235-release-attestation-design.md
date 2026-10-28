@@ -761,3 +761,43 @@ This draft supersedes the binary-attestation direction in [the January proposal]
 - [Cloudflare binding inheritance](https://developers.cloudflare.com/workers/configuration/multipart-upload-metadata/), [worker-build pipeline](https://github.com/cloudflare/workers-rs/blob/v0.8.5/worker-build/src/main.rs), [tool versions](https://github.com/cloudflare/workers-rs/blob/v0.8.5/worker-build/src/versions.rs); existing [Axum bridge guidance](../../guide/axum-dev.md).
 
 Tool availability and API semantics MUST be revalidated at implementation pin selection. Incompatible changes require reviewed policy/spec updates rather than silent fallback.
+
+## Current baseline clarification
+
+The retained §12 investigation table records an earlier source baseline; its
+Cloudflare, Spin and Axum implementation descriptions are not current Phase 1
+release claims. At Phase 1 source `20152315c01dd5fddcfc84b969f8e9993b0bfc69`:
+
+- `Cargo.lock` selects `spin-sdk` **7.0.0** and `wasip3`
+  **0.7.1+wasi-0.3.0**, rather than the older versions recorded in that table.
+- `crates/trusted-server-adapter-cloudflare/build.sh` installs `worker-build`
+  with **`--locked`**. Its other build-input and environment questions remain
+  part of the deferred investigation.
+- The Phase 1 Axum runtime bind/default/validation notes above supersede the
+  table's older loopback/`PORT` description; container binding and both port
+  names are covered by the operator guide and runtime checks.
+
+Cloudflare and Spin distributions remain outside the seven-binary Phase 1
+cohort. These observations update the investigation baseline; they do not add
+qualification or deployment claims for either adapter.
+
+## Review log
+
+- **Round 1 (2026-10-28, fresh independent AI source review of `20152315c`):** No
+  blocking Phase 1 findings. Checked the complete phased spec against release
+  workflows, build helpers, operator guidance, configuration/build-facts paths
+  and all four adapters. Identified historical Cloudflare/Spin investigation
+  facts and an older Axum description; the append-only current-baseline note
+  above records their disposition without changing the retained destination
+  requirements. Explicitly deferred phases were assessed as deferred scope.
+  This was a read-only source review, not a new runtime qualification run.
+- **Round 2 (2026-10-28, a second fresh independent AI source review of
+  `20152315c` plus the current-baseline clarification):** No blocking Phase 1
+  findings. Rechecked the complete spec against workflows, producer helpers,
+  configuration/build facts, operator guidance, compatibility notes and all
+  four adapters. Confirmed the seven-binary/29-file contract and its signing,
+  SPDX, failure/recovery, test-scope and adapter boundaries. The baseline
+  clarification matches current source; later destination requirements remain
+  deferred as documented. This was a read-only source review, not a new runtime
+  qualification run. Human maintainer design approval and repository settings
+  remain open gates.
