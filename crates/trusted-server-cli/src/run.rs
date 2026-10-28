@@ -149,7 +149,7 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
             Some(key) => {
                 let stdout = std::io::stdout();
                 let mut out = stdout.lock();
-                keyed_push::run(&args.edgezero, key, &mut out)
+                keyed_push::run(&args, key, &mut out)
             }
             None => policy::run_push(args),
         }

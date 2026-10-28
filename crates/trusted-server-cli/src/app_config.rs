@@ -157,8 +157,7 @@ fn load_settings_with_env_overlay(
     })
 }
 
-/// `explicit`, or else `<app_name>.toml` beside the manifest.
-pub(crate) fn resolve_app_config_path(
+fn resolve_app_config_path(
     explicit: Option<&Path>,
     manifest_path: &Path,
     app_name: &str,

@@ -213,10 +213,12 @@ pub fn run_diff(args: DiffArgs) -> Result<edgezero_cli::DiffExit, String> {
 
 /// Whether the settings handed to `EdgeZero` carry the policy file itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PolicyText {
+pub(crate) enum PolicyText {
     /// For the adapters that read the policy from the blob.
     Included,
-    /// For Axum, which reads the file from its folder, and for validation.
+    /// For Axum, which reads the file from its folder, for a blob the keyed
+    /// push writes for a host, which reads it from the shared entry, and for
+    /// validation.
     Omitted,
 }
 
@@ -232,22 +234,26 @@ impl PolicyText {
 
 /// The settings `EdgeZero` is handed, with the policy they name.
 #[derive(Debug)]
-struct PreparedSettings {
+pub(crate) struct PreparedSettings {
     /// The settings file, closed so `EdgeZero` can read it, and removed
     /// when this is dropped.
-    file: TempPath,
+    pub(crate) file: TempPath,
     /// The policy's name.
-    policy: String,
+    pub(crate) policy: String,
     /// The SHA-256 of the policy file.
-    sha256: String,
+    pub(crate) sha256: String,
+    /// Every file `--permissions` supplied, the named one among them.
+    pub(crate) files: Vec<PolicyFile>,
 }
 
 /// A policy file `--permissions` supplied, read and checked.
 #[derive(Debug)]
-struct PolicyFile {
-    name: String,
+pub(crate) struct PolicyFile {
+    /// The file's stem.
+    pub(crate) name: String,
     path: PathBuf,
-    text: String,
+    /// The file itself.
+    pub(crate) text: String,
 }
 
 /// The settings a command reads, loaded with the overlay unless `no_env` is
@@ -286,7 +292,7 @@ fn load_settings(
 /// Loads the settings, checks the policy files, and writes the settings with
 /// the named file's SHA-256, and its text when `text` asks for it, to a
 /// temporary file.
-fn prepare(
+pub(crate) fn prepare(
     manifest: &Path,
     app_config: Option<&Path>,
     no_env: bool,
@@ -305,6 +311,7 @@ fn prepare(
     let files = read_policy_files(files)?;
     let policy = named_policy(&settings.permissions, &files)?;
     let sha256 = policy_sha256(&policy.text);
+    let name = policy.name.clone();
 
     let table = document
         .get_mut(PERMISSIONS_TABLE)
@@ -325,8 +332,9 @@ fn prepare(
 
     Ok(PreparedSettings {
         file: write_settings(&document)?,
-        policy: policy.name.clone(),
+        policy: name,
         sha256,
+        files,
     })
 }
 
