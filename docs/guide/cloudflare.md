@@ -59,12 +59,13 @@ them to a Wrangler manifest. Deploy only after all three bindings and the
 A successful `ts config push` alone does not configure this runtime, because
 the Worker reads its settings from `TRUSTED_SERVER_CONFIG` at startup and does
 not open `TRUSTED_SERVER_KV` for them. The adapter declares `TRUSTED_SERVER_KV`
-as its key-value store, so EdgeZero opens it for every request and the loading
-cache keeps its copies there between requests, while a copy in memory lasts one
-request because the Worker builds its state for each request. EdgeZero treats a
-declared store as required, so a Worker deployed without the binding answers
-every request with `500` before any route runs. No request-time config store is
-declared, and EC KV lookup is not available.
+as its key-value store, so EdgeZero opens it for every request, and a loading
+cache module that a deployment links keeps its copies there between requests,
+while a copy in memory lasts one request because the Worker builds its state
+for each request. EdgeZero treats a declared store as required, so a Worker
+deployed without the binding answers every request with `500` before any route
+runs. No request-time config store is declared, and EC KV lookup is not
+available.
 Forwarded client-IP headers are sanitized, but `[trusted_client_ip]` is not
 resolved. See the [API reference](./api-reference) for route-level behavior.
 
