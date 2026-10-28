@@ -2987,257 +2987,6 @@ impl Proxy {
     }
 }
 
-/// The analytics module's name in full, which is also the table holding its
-/// settings and which every message about them names.
-const ANALYTICS_MODULE: &str = "analytics.tinybird";
-
-/// Direct Tinybird Events API telemetry configuration, the settings of the
-/// module `[analytics]` selects.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TinybirdSettings {
-    /// Regional Tinybird API host, without scheme or path.
-    #[serde(default)]
-    pub api_host: String,
-    /// Deprecated feature-specific store selector accepted for migration only.
-    #[serde(default, skip_serializing)]
-    pub secret_store: Option<String>,
-    /// Auction Events API datasource name.
-    #[serde(default = "default_tinybird_auction_dataset")]
-    pub auction_dataset: String,
-    /// Secret reference containing the auction datasource APPEND token.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auction_token_secret: Option<Redacted<String>>,
-    /// Reserved for future access-log telemetry.
-    ///
-    /// `true` is rejected until an access-log emitter is wired, so operators
-    /// cannot enable a setting that silently emits nothing.
-    #[serde(default)]
-    pub access_enabled: bool,
-    /// Future access-log Events API datasource name.
-    #[serde(default = "default_tinybird_access_dataset")]
-    pub access_dataset: String,
-    /// Deprecated placeholder for the unwired access-log APPEND token.
-    #[serde(default, skip_serializing)]
-    pub access_token_secret: Option<Redacted<String>>,
-    /// Future fraction of requests to emit for optional access telemetry.
-    #[serde(default)]
-    pub access_sample_rate: f64,
-    /// Defensive maximum NDJSON body size for one Events API request.
-    #[serde(default = "default_tinybird_max_body_bytes")]
-    pub max_body_bytes: usize,
-}
-
-fn default_tinybird_auction_dataset() -> String {
-    "auction_events_raw".to_owned()
-}
-
-fn default_tinybird_access_dataset() -> String {
-    "access_logs_raw".to_owned()
-}
-
-fn default_tinybird_max_body_bytes() -> usize {
-    1024 * 1024
-}
-
-impl Default for TinybirdSettings {
-    fn default() -> Self {
-        Self {
-            api_host: String::new(),
-            secret_store: None,
-            auction_dataset: default_tinybird_auction_dataset(),
-            auction_token_secret: None,
-            access_enabled: false,
-            access_dataset: default_tinybird_access_dataset(),
-            access_token_secret: None,
-            access_sample_rate: 0.0,
-            max_body_bytes: default_tinybird_max_body_bytes(),
-        }
-    }
-}
-
-impl TinybirdSettings {
-    fn normalize(&mut self) {
-        self.api_host = self.api_host.trim().to_ascii_lowercase();
-        if self.secret_store.take().is_some() {
-            log::warn!(
-                "{ANALYTICS_MODULE}.secret_store is deprecated and ignored; static credentials resolve through the default app-config secret store"
-            );
-        }
-        self.auction_dataset = self.auction_dataset.trim().to_owned();
-        self.auction_token_secret = self.auction_token_secret.take().and_then(|value| {
-            let value = value.expose().trim().to_owned();
-            (!value.is_empty()).then(|| Redacted::new(value))
-        });
-        self.access_dataset = self.access_dataset.trim().to_owned();
-        self.access_token_secret = None;
-    }
-
-    fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
-        self.normalize();
-        if !(0.0..=1.0).contains(&self.access_sample_rate) {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "{ANALYTICS_MODULE}.access_sample_rate must be between 0.0 and 1.0"
-                ),
-            }));
-        }
-        if self.max_body_bytes < 1024 {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: format!("{ANALYTICS_MODULE}.max_body_bytes must be at least 1024"),
-            }));
-        }
-        if self.access_enabled {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "{ANALYTICS_MODULE}.access_enabled is reserved for future access-log telemetry; no emitter is currently wired"
-                ),
-            }));
-        }
-        validate_tinybird_api_host(&self.api_host)?;
-        validate_tinybird_dataset(
-            &self.auction_dataset,
-            &format!("{ANALYTICS_MODULE}.auction_dataset"),
-        )?;
-        let token = self.auction_token_secret.as_ref().ok_or_else(|| {
-            Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "{ANALYTICS_MODULE}.auction_token_secret is required when [analytics] selects the module"
-                ),
-            })
-        })?;
-        validate_tinybird_secret(
-            token.expose(),
-            &format!("{ANALYTICS_MODULE}.auction_token_secret"),
-        )
-    }
-}
-
-fn validate_tinybird_api_host(host: &str) -> Result<(), Report<TrustedServerError>> {
-    if host.is_empty()
-        || host.contains('/')
-        || host.contains(':')
-        || host.chars().any(char::is_control)
-        || host.starts_with("http://")
-        || host.starts_with("https://")
-    {
-        return Err(Report::new(TrustedServerError::Configuration {
-            message: format!(
-                "{ANALYTICS_MODULE}.api_host must be a regional host without scheme, port, or path"
-            ),
-        }));
-    }
-    validate_host_header_override_value(host).map_err(|reason| {
-        Report::new(TrustedServerError::Configuration {
-            message: format!("{ANALYTICS_MODULE}.api_host {reason}"),
-        })
-    })
-}
-
-fn validate_tinybird_dataset(value: &str, setting: &str) -> Result<(), Report<TrustedServerError>> {
-    if value.is_empty()
-        || value.len() > 128
-        || !value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-    {
-        return Err(Report::new(TrustedServerError::Configuration {
-            message: format!("{setting} must be a non-empty datasource identifier"),
-        }));
-    }
-    Ok(())
-}
-
-fn validate_tinybird_secret(value: &str, setting: &str) -> Result<(), Report<TrustedServerError>> {
-    if value.is_empty() || value.chars().any(char::is_control) {
-        return Err(Report::new(TrustedServerError::Configuration {
-            message: format!("{setting} must be non-empty after secret resolution"),
-        }));
-    }
-    Ok(())
-}
-
-/// The `[analytics]` section, selecting the module that sends auction telemetry.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct AnalyticsConfig {
-    /// The module that runs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub module: Option<String>,
-    /// The analytics module's settings.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tinybird: Option<TinybirdSettings>,
-}
-
-/// Whether `written`, selected in `[analytics]`, names the analytics module,
-/// in full or by its name within the section.
-fn names_analytics_module(written: &str) -> bool {
-    written == ANALYTICS_MODULE
-        || written == crate::module_name::short_form("analytics", ANALYTICS_MODULE)
-}
-
-/// Whether the document `data` selects the analytics module in `[analytics]`,
-/// read before the settings are, to tell which secret references are live.
-pub(crate) fn document_selects_analytics_module(data: &JsonValue) -> bool {
-    data.pointer("/analytics/module")
-        .and_then(JsonValue::as_str)
-        .is_some_and(names_analytics_module)
-}
-
-impl AnalyticsConfig {
-    /// Whether `module` selects the analytics module.
-    fn selects_analytics_module(&self) -> bool {
-        self.module.as_deref().is_some_and(names_analytics_module)
-    }
-
-    /// The analytics module's settings, when `module` selects it.
-    #[must_use]
-    pub fn analytics_module(&self) -> Option<&TinybirdSettings> {
-        if self.selects_analytics_module() {
-            self.tinybird.as_ref()
-        } else {
-            None
-        }
-    }
-
-    fn normalize(&mut self) {
-        if let Some(settings) = &mut self.tinybird {
-            settings.normalize();
-        }
-    }
-
-    /// Refuses a section that selects nothing or a module this build does
-    /// not have, and checks the selected module's settings.
-    fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
-        let short = crate::module_name::short_form("analytics", ANALYTICS_MODULE);
-        match self.module.as_deref() {
-            None => {
-                return Err(Report::new(TrustedServerError::Configuration {
-                    message: "[analytics] selects no module. A module type's section names \
-                              what runs with `module` or `modules`, so select one or remove \
-                              the section"
-                        .to_owned(),
-                }));
-            }
-            Some(written) if !self.selects_analytics_module() => {
-                return Err(Report::new(TrustedServerError::Configuration {
-                    message: format!(
-                        "[analytics] selects `{written}`, which no module this deployment \
-                         supplies. The analytics modules it supplies are [{short}]"
-                    ),
-                }));
-            }
-            Some(_) => {}
-        }
-        match &mut self.tinybird {
-            Some(settings) => settings.prepare_runtime(),
-            // Checking the defaults reports the first setting the module
-            // needs and the table does not have.
-            None => TinybirdSettings::default().prepare_runtime(),
-        }
-    }
-}
-
 /// Cache behavior configuration.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct CacheSettings {
@@ -4120,13 +3869,6 @@ refused_table! {
 }
 
 refused_table! {
-    /// The `[tinybird]` table, now `[analytics.tinybird]`.
-    MovedTinybirdTable => "Configuration table `[tinybird]` is now `[analytics.tinybird]`. \
-        Select it with `[analytics] module = \"tinybird\"`, which replaces its `enabled` \
-        line, and move its other settings there unchanged"
-}
-
-refused_table! {
     /// The `[permission_signal]` table, renamed `[permission-signal]`.
     RenamedPermissionSignalTable => "Configuration table `[permission_signal]` is now \
         `[permission-signal]`, named exactly as its folder crates/permission-signal. Move its \
@@ -4534,19 +4276,6 @@ pub struct Settings {
     pub creative_opportunities: Option<CreativeOpportunitiesConfig>,
     #[serde(default)]
     pub image_optimizer: ImageOptimizerSettings,
-    /// Analytics. `[analytics] module` selects the module that runs, with its
-    /// settings in the table at its name. Omitted from a serialized
-    /// configuration when absent, for the reason given on `trusted_client_ip`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub analytics: Option<AnalyticsConfig>,
-    /// The `[tinybird]` table, kept so a configuration carrying it is told
-    /// where it moved.
-    #[serde(rename = "tinybird", default, skip_serializing)]
-    #[allow(
-        dead_code,
-        reason = "the field exists so that reading the moved table fails with directions"
-    )]
-    moved_tinybird: MovedTinybirdTable,
     #[serde(default)]
     pub debug: DebugConfig,
     #[serde(default, skip_serializing_if = "is_default_device_config")]
@@ -4742,14 +4471,6 @@ impl Settings {
         Self::finalize_deserialized(settings, "Build-time configuration")
     }
 
-    /// The analytics module's settings, when `[analytics]` selects it.
-    #[must_use]
-    pub fn analytics_module(&self) -> Option<&TinybirdSettings> {
-        self.analytics
-            .as_ref()
-            .and_then(AnalyticsConfig::analytics_module)
-    }
-
     /// Normalize settings after deserialization.
     ///
     /// # Errors
@@ -4760,9 +4481,6 @@ impl Settings {
         self.proxy.normalize();
         self.image_optimizer.normalize()?;
         self.debug.auction_html_comment_options.normalize();
-        if let Some(analytics) = &mut self.analytics {
-            analytics.normalize();
-        }
         Ok(())
     }
 
@@ -4826,9 +4544,6 @@ impl Settings {
         self.cache.prepare_runtime()?;
         crate::source::check_selection(&self.source, crate::source::SOURCE_SECTION)?;
         self.proxy.prepare_runtime()?;
-        if let Some(analytics) = &mut self.analytics {
-            analytics.prepare_runtime()?;
-        }
         self.debug
             .auction_html_comment_options
             .validate_metadata_keys()?;
@@ -5124,9 +4839,12 @@ impl Settings {
     where
         T: IntegrationConfig,
     {
-        let Some((section, written)) = self.module_selection(name) else {
+        let Some((section, selected)) = self.module_selection(name) else {
             return Ok(None);
         };
+        // The table is keyed by the name without its type folder, however the
+        // section's selector wrote it.
+        let written = crate::module_name::short_form(section, selected);
         let table = self
             .module_sections()
             .find(|(candidate, _)| *candidate == section)
@@ -5880,8 +5598,6 @@ mod tests {
         #[serde(default)]
         image_optimizer: serde::de::IgnoredAny,
         #[serde(default)]
-        tinybird: serde::de::IgnoredAny,
-        #[serde(default)]
         debug: serde::de::IgnoredAny,
     }
 
@@ -6014,9 +5730,8 @@ module = \"none\"",
     // hand-written `Debug` impl prints only integration IDs, never values.
     //
     // Do not use `..Struct::default()` anywhere in this function. A default
-    // spread would let a new secret field be added to `EcPartner`,
-    // `TinybirdSettings`, or any other struct built here without forcing
-    // anyone to consider it. The compile break is the prompt; the canary
+    // spread would let a new secret field be added to `EcPartner` or any
+    // other struct built here without forcing anyone to consider it. The compile break is the prompt; the canary
     // list below is still maintained by hand. List every field explicitly.
     #[test]
     fn settings_debug_output_redacts_every_secret_field() {
@@ -6029,8 +5744,6 @@ module = \"none\"",
         const CANARY_S3_ACCESS_KEY_ID: &str = "CANARY-S3-ACCESS-KEY-ID-0123456789";
         const CANARY_S3_SECRET_ACCESS_KEY: &str = "CANARY-S3-SECRET-ACCESS-KEY-0123456789";
         const CANARY_S3_SESSION_TOKEN: &str = "CANARY-S3-SESSION-TOKEN-0123456789";
-        const CANARY_TINYBIRD_AUCTION_TOKEN: &str = "CANARY-TINYBIRD-AUCTION-TOKEN-0123456789";
-        const CANARY_TINYBIRD_ACCESS_TOKEN: &str = "CANARY-TINYBIRD-ACCESS-TOKEN-0123456789";
         const CANARY_MODULE_KEY: &str = "CANARY-MODULE-TABLE-KEY-0123456789";
 
         let mut settings = create_test_settings();
@@ -6072,23 +5785,6 @@ module = \"none\"",
             ..crate::source::OriginSettings::new("https://s3.canary.example")
         });
         settings.proxy.asset_routes = vec![asset_route];
-
-        settings.analytics = Some(AnalyticsConfig {
-            module: Some(ANALYTICS_MODULE.to_string()),
-            tinybird: Some(TinybirdSettings {
-                auction_token_secret: Some(Redacted::new(
-                    CANARY_TINYBIRD_AUCTION_TOKEN.to_string(),
-                )),
-                access_token_secret: Some(Redacted::new(CANARY_TINYBIRD_ACCESS_TOKEN.to_string())),
-                api_host: String::new(),
-                secret_store: None,
-                auction_dataset: String::new(),
-                access_enabled: false,
-                access_dataset: String::new(),
-                access_sample_rate: 0.0f64,
-                max_body_bytes: 0,
-            }),
-        });
 
         // A module's table is opaque JSON, and the section's hand-written
         // `Debug` impl is the only thing keeping a secret a module's table
@@ -6137,14 +5833,6 @@ module = \"none\"",
             (
                 "proxy.asset_routes[].auth.session_token",
                 CANARY_S3_SESSION_TOKEN,
-            ),
-            (
-                "analytics.tinybird.auction_token_secret",
-                CANARY_TINYBIRD_AUCTION_TOKEN,
-            ),
-            (
-                "analytics.tinybird.access_token_secret",
-                CANARY_TINYBIRD_ACCESS_TOKEN,
             ),
             ("testing.example.key_name", CANARY_MODULE_KEY),
         ];
@@ -6898,235 +6586,6 @@ module = \"none\"",
             value.get("auction_html_comment_options").is_some(),
             "non-default options must still serialize, got {value}"
         );
-    }
-
-    /// `[analytics]` selecting the analytics module, with `table` as the
-    /// lines of its settings table.
-    fn settings_str_with_analytics_module(table: &str) -> String {
-        format!(
-            "{}\n[analytics]\nmodule = \"tinybird\"\n\n[analytics.tinybird]\n{table}\n",
-            crate_test_settings_str()
-        )
-    }
-
-    /// The lines of a telemetry table that passes every check.
-    const ANALYTICS_MODULE_LINES: &str =
-        "api_host = \"api.us-east.aws.tinybird.co\"\nauction_token_secret = \"test-auction-token\"";
-
-    #[test]
-    fn settings_without_an_analytics_section_select_no_module() {
-        let settings = Settings::from_toml(&crate_test_settings_str())
-            .expect("should parse settings without an analytics section");
-
-        assert!(settings.analytics.is_none(), "should hold no section");
-        assert!(
-            settings.analytics_module().is_none(),
-            "should select no module"
-        );
-        let value = serde_json::to_value(&settings).expect("should serialize the settings");
-        assert!(
-            value.get("analytics").is_none() && value.get("tinybird").is_none(),
-            "should write neither the section nor the table it replaced: {value}"
-        );
-    }
-
-    #[test]
-    fn the_analytics_module_is_selected_by_its_short_or_full_name() {
-        for name in ["tinybird", "analytics.tinybird"] {
-            let toml = format!(
-                "{}\n[analytics]\nmodule = \"{name}\"\n\n[analytics.tinybird]\n{ANALYTICS_MODULE_LINES}\n",
-                crate_test_settings_str()
-            );
-
-            let settings = Settings::from_toml(&toml).expect("should accept the selection");
-
-            let telemetry = settings
-                .analytics_module()
-                .expect("should select the analytics module");
-            assert_eq!(telemetry.api_host, "api.us-east.aws.tinybird.co");
-            assert_eq!(telemetry.auction_dataset, "auction_events_raw");
-        }
-    }
-
-    #[test]
-    fn a_selected_analytics_module_survives_the_stored_form() {
-        let settings =
-            Settings::from_toml(&settings_str_with_analytics_module(ANALYTICS_MODULE_LINES))
-                .expect("should accept the selection");
-
-        let stored = serde_json::to_value(&settings).expect("should serialize the settings");
-
-        assert_eq!(stored["analytics"]["module"], "tinybird");
-        assert_eq!(
-            stored["analytics"]["tinybird"]["api_host"],
-            "api.us-east.aws.tinybird.co"
-        );
-        assert!(
-            stored.get("tinybird").is_none(),
-            "should not write the table that moved: {stored}"
-        );
-    }
-
-    #[test]
-    fn the_analytics_module_needs_a_regional_host() {
-        let toml =
-            settings_str_with_analytics_module("api_host = \"https://api.example.com/path\"");
-
-        let err = Settings::from_toml(&toml).expect_err("should reject invalid api host");
-
-        assert!(
-            format!("{err:?}").contains("analytics.tinybird.api_host"),
-            "should name the setting by its table: {err:?}"
-        );
-    }
-
-    #[test]
-    fn the_analytics_module_needs_its_token() {
-        let toml = settings_str_with_analytics_module("api_host = \"api.us-east.aws.tinybird.co\"");
-
-        let err = Settings::from_toml(&toml).expect_err("should require the token");
-
-        assert!(
-            format!("{err:?}").contains(
-                "analytics.tinybird.auction_token_secret is required when [analytics] selects \
-                 the module"
-            ),
-            "should say what is missing and why: {err:?}"
-        );
-    }
-
-    #[test]
-    fn a_selected_analytics_module_with_no_table_is_told_what_it_needs() {
-        let toml = format!(
-            "{}\n[analytics]\nmodule = \"tinybird\"\n",
-            crate_test_settings_str()
-        );
-
-        let err = Settings::from_toml(&toml).expect_err("should need the table's settings");
-
-        assert!(
-            format!("{err:?}").contains("analytics.tinybird.api_host"),
-            "should name the first setting the module needs: {err:?}"
-        );
-    }
-
-    #[test]
-    fn access_telemetry_is_rejected_until_an_emitter_is_wired() {
-        let toml = settings_str_with_analytics_module(&format!(
-            "{ANALYTICS_MODULE_LINES}\naccess_enabled = true"
-        ));
-
-        let err = Settings::from_toml(&toml)
-            .expect_err("should reject access telemetry before an emitter exists");
-
-        assert!(
-            format!("{err:?}").contains("analytics.tinybird.access_enabled"),
-            "should name the unsupported setting: {err:?}"
-        );
-    }
-
-    #[test]
-    fn an_analytics_section_selecting_nothing_is_refused() {
-        let toml = format!(
-            "{}\n[analytics.tinybird]\n{ANALYTICS_MODULE_LINES}\n",
-            crate_test_settings_str()
-        );
-
-        let err = Settings::from_toml(&toml).expect_err("nothing would read the table");
-
-        assert!(
-            format!("{err:?}").contains("[analytics] selects no module"),
-            "should say the section selects nothing: {err:?}"
-        );
-    }
-
-    #[test]
-    fn an_analytics_module_this_build_does_not_have_is_refused() {
-        let toml = format!(
-            "{}\n[analytics]\nmodule = \"another\"\n",
-            crate_test_settings_str()
-        );
-
-        let err = Settings::from_toml(&toml).expect_err("no such module");
-        let message = format!("{err:?}");
-
-        assert!(
-            message.contains(
-                "[analytics] selects `another`, which no module this deployment supplies"
-            ),
-            "should name what was written: {message}"
-        );
-        assert!(
-            message.contains("The analytics modules it supplies are [tinybird]"),
-            "should list what can be selected: {message}"
-        );
-    }
-
-    /// The token is a secret reference, and an empty or absent one is refused
-    /// as the settings load, before any deploy step sees the document.
-    #[test]
-    fn an_analytics_token_reference_that_is_empty_or_absent_is_refused_when_the_settings_load() {
-        for (case, table) in [
-            (
-                "an empty token",
-                "api_host = \"api.us-east.aws.tinybird.co\"\nauction_token_secret = \"\"",
-            ),
-            ("no token", "api_host = \"api.us-east.aws.tinybird.co\""),
-        ] {
-            let err = Settings::from_toml(&settings_str_with_analytics_module(table))
-                .err()
-                .unwrap_or_else(|| panic!("{case}: the settings should not load"));
-
-            assert!(
-                format!("{err:?}").contains("auction_token_secret"),
-                "{case}: should name the token: {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_analytics_module_table_refuses_a_key_it_does_not_know() {
-        let toml = settings_str_with_analytics_module(&format!(
-            "{ANALYTICS_MODULE_LINES}\nenabled = true"
-        ));
-
-        let err = Settings::from_toml(&toml).expect_err("the enabled line is gone");
-
-        assert!(
-            format!("{err:?}").contains("enabled"),
-            "should name the key it does not know: {err:?}"
-        );
-    }
-
-    #[test]
-    fn a_table_the_section_does_not_select_gives_no_analytics_module() {
-        let analytics = AnalyticsConfig {
-            module: None,
-            tinybird: Some(TinybirdSettings::default()),
-        };
-
-        assert!(
-            analytics.analytics_module().is_none(),
-            "a table nothing selects should give no settings"
-        );
-    }
-
-    #[test]
-    fn the_tinybird_table_is_refused_with_directions() {
-        for table in [
-            "enabled = true\napi_host = \"api.us-east.aws.tinybird.co\"",
-            "enabled = false",
-        ] {
-            let toml = format!("{}\n[tinybird]\n{table}\n", crate_test_settings_str());
-
-            let err = Settings::from_toml(&toml).expect_err("the table has moved");
-
-            assert!(
-                format!("{err:?}")
-                    .contains("Configuration table `[tinybird]` is now `[analytics.tinybird]`"),
-                "should say where the table went: {err:?}"
-            );
-        }
     }
 
     #[test]

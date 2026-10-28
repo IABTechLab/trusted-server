@@ -6644,6 +6644,7 @@ dependencies = [
  "trusted-server-ad-server-iabtl",
  "trusted-server-ad-tag-google",
  "trusted-server-ads-txt-iabtl",
+ "trusted-server-analytics-tinybird",
  "trusted-server-auction-aps",
  "trusted-server-auction-prebid",
  "trusted-server-auction-prebid-server",
@@ -6689,6 +6690,7 @@ dependencies = [
  "trusted-server-ad-server-iabtl",
  "trusted-server-ad-tag-google",
  "trusted-server-ads-txt-iabtl",
+ "trusted-server-analytics-tinybird",
  "trusted-server-auction-aps",
  "trusted-server-auction-prebid",
  "trusted-server-auction-prebid-server",
@@ -6740,6 +6742,7 @@ dependencies = [
  "trusted-server-ad-server-iabtl",
  "trusted-server-ad-tag-google",
  "trusted-server-ads-txt-iabtl",
+ "trusted-server-analytics-tinybird",
  "trusted-server-auction-aps",
  "trusted-server-auction-prebid",
  "trusted-server-auction-prebid-server",
@@ -6766,7 +6769,6 @@ dependencies = [
  "trusted-server-tag-google-tag-manager",
  "trusted-server-testing-iabtl",
  "trusted-server-testing-testlight",
- "urlencoding",
 ]
 
 [[package]]
@@ -6791,6 +6793,7 @@ dependencies = [
  "trusted-server-ad-server-iabtl",
  "trusted-server-ad-tag-google",
  "trusted-server-ads-txt-iabtl",
+ "trusted-server-analytics-tinybird",
  "trusted-server-auction-aps",
  "trusted-server-auction-prebid",
  "trusted-server-auction-prebid-server",
@@ -6825,6 +6828,22 @@ dependencies = [
  "error-stack",
  "serde",
  "trusted-server-core",
+ "validator",
+]
+
+[[package]]
+name = "trusted-server-analytics-tinybird"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "log",
+ "serde",
+ "serde_json",
+ "trusted-server-core",
+ "urlencoding",
  "validator",
 ]
 
@@ -7026,6 +7045,7 @@ dependencies = [
  "trusted-server-ad-server-iabtl",
  "trusted-server-ad-tag-google",
  "trusted-server-ads-txt-iabtl",
+ "trusted-server-analytics-tinybird",
  "trusted-server-auction-aps",
  "trusted-server-auction-prebid",
  "trusted-server-auction-prebid-server",

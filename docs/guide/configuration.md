@@ -1918,10 +1918,10 @@ See [Asset Routes](/guide/asset-routes) for request flow, S3 auth details, and I
 ## Analytics Configuration
 
 `[analytics]` selects the module that receives auction telemetry, the way every
-other section selects its module. `module = "tinybird"` sends auction events
-directly to the Tinybird Events API, with its settings in
-`[analytics.tinybird]`. Without the section nothing is sent. Access-log
-emission is not wired.
+other section selects its module. `module = "tinybird"` selects the module from
+`crates/analytics/tinybird`, which sends auction events directly to the
+Tinybird Events API, with its settings in `[analytics.tinybird]`. Without the
+section nothing is sent. Access-log emission is not wired.
 
 ### `[analytics]`
 
@@ -1929,14 +1929,19 @@ emission is not wired.
 | -------- | ------ | ------- | ------------------------------------------------------------------------------------------------ |
 | `module` | String | none    | Required when the section is present. `tinybird`, or the same name in full, `analytics.tinybird` |
 
-**Refused when the settings load**: a section that selects no module, a module
-this build does not have, and a key `[analytics.tinybird]` does not know.
+**Refused when the settings load**: a section that selects no module, a table
+the section does not select, and a `[tinybird]` table at the top level, which
+is read as the section of a module type nothing supplies.
 
-A configuration that still carries `[tinybird]` is refused with directions.
-Move its settings to `[analytics.tinybird]` unchanged, and select the module
-with `[analytics] module = "tinybird"`, which replaces the `enabled` line. A
-stored configuration written by an earlier version carries the `[tinybird]`
-table even where telemetry was off, so push the configuration again with this
+**Refused when the deployment starts and by `ts config validate`**: a module
+this build does not have, a key `[analytics.tinybird]` does not know, and a
+table missing a setting the module requires.
+
+A configuration written before the table moved carries `[tinybird]`. Move its
+settings to `[analytics.tinybird]` unchanged, and select the module with
+`[analytics] module = "tinybird"`, which replaces the `enabled` line. A stored
+configuration written by an earlier version carries the `[tinybird]` table
+even where telemetry was off, so push the configuration again with this
 version.
 
 ### `[analytics.tinybird]`
@@ -2061,7 +2066,7 @@ On a configured Fastly asset-rehost route, a matching rule is authoritative
 over the third-party origin's cache defaults, including `no-store`, because
 Trusted Server owns the rehosted copy. A later Trusted Server or operator-applied
 `private` or `no-store` directive still vetoes public policy reapplication and
-removes shared-cache headers.
+removes the shared-cache headers Trusted Server writes.
 
 TS-owned validated hash URLs such as `/static/tsjs=...js?v=<hash>` use their
 built-in cache policy and do not require an asset rule. Shared-cache keys for
@@ -3410,8 +3415,8 @@ positive shared freshness. `private`, `no-store`, `no-cache`, exhausted or
 malformed freshness, `Set-Cookie`, `Vary: *`, `Vary: Cookie`, uncovered `Vary`
 names, response-bound CSP nonces, pass-through or ambiguous authorization,
 diagnostics sessions, range or conditional requests, positive or malformed
-request `max-age`, `min-fresh`, and unsupported CDN-specific cache policy fields
-all bypass the template cache. Fastly
+request `max-age`, `min-fresh`, and a policy in `CDN-Cache-Control` or in the
+running platform's own cache header all bypass the template cache. Fastly
 `Surrogate-Control` is the narrow exception: the template cache accepts exactly one positive
 `max-age` plus optional valid `stale-while-revalidate` and `stale-if-error`
 delta-seconds. Restrictive, duplicated, malformed, or unknown directives fail

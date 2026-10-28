@@ -198,16 +198,6 @@ fn log_permission_baseline(policy: &PermissionPolicy) {
 }
 
 fn remove_inactive_secret_references(data: &mut serde_json::Value) {
-    // References of a table `[analytics]` does not select are cleared before resolution.
-    if !crate::settings::document_selects_analytics_module(data)
-        && let Some(table) = data
-            .pointer_mut("/analytics/tinybird")
-            .and_then(serde_json::Value::as_object_mut)
-    {
-        table.remove("auction_token_secret");
-        table.remove("access_token_secret");
-    }
-
     if let Some(partners) = data
         .pointer_mut("/ec/partners")
         .and_then(serde_json::Value::as_array_mut)
@@ -235,8 +225,7 @@ mod tests {
     use crate::platform::{PlatformError, StoreId};
     use crate::redacted::Redacted;
     use crate::settings::{
-        AnalyticsConfig, AssetOriginAuth, EcPartner, ProxyAssetRoute, S3SigV4AuthConfig,
-        TinybirdSettings, TrustedClientIpConfig,
+        AssetOriginAuth, EcPartner, ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig,
     };
     use crate::test_support::tests::{
         crate_test_settings_str, edit_origin, hmac_passphrase, sample_permissions,
@@ -484,6 +473,30 @@ mod tests {
     }
 
     #[test]
+    fn the_load_looks_up_the_secret_of_a_module_selected_by_its_full_name() {
+        let mut value = serde_json::to_value(test_settings()).expect("should serialize settings");
+        value
+            .as_object_mut()
+            .expect("settings should serialize as an object")
+            .insert(
+                "testing".to_owned(),
+                serde_json::json!({
+                    "module": "testing.probe",
+                    "probe": { "lock": true, "key_name": "module-key" },
+                }),
+            );
+        let settings = Settings::from_json_value(value).expect("should read the module's table");
+
+        let loaded = load_with_module(&settings);
+
+        assert_eq!(
+            loaded.section_table("testing", "probe").get("key_name"),
+            Some(&serde_json::json!("resolved-module-secret")),
+            "should keep the setting in the table the module reads and look it up"
+        );
+    }
+
+    #[test]
     fn a_table_s_key_name_is_left_as_written_without_its_module_s_builder() {
         let mut settings = test_settings();
         settings
@@ -612,14 +625,6 @@ mod tests {
     #[test]
     fn resolves_all_static_credentials_from_the_mapped_default_store() {
         let mut original = test_settings();
-        original.analytics = Some(AnalyticsConfig {
-            module: Some("analytics.tinybird".to_string()),
-            tinybird: Some(TinybirdSettings {
-                api_host: "api.example.com".to_string(),
-                auction_token_secret: Some(Redacted::new("tinybird-token-key".to_string())),
-                ..TinybirdSettings::default()
-            }),
-        });
         let mut route = ProxyAssetRoute::new(
             "/assets/",
             "https://examplebucket.s3.us-east-1.amazonaws.com",
@@ -649,14 +654,6 @@ mod tests {
         )
         .expect("should resolve every static credential from the mapped store");
 
-        assert_eq!(
-            reconstructed
-                .analytics_module()
-                .and_then(|module| module.auction_token_secret.as_ref())
-                .map(Redacted::expose)
-                .map(String::as_str),
-            Some("resolved-tinybird-token")
-        );
         let auth = reconstructed.proxy.asset_routes[0]
             .origin_source()
             .and_then(|origin| origin.auth)
@@ -1056,41 +1053,6 @@ mod tests {
         assert!(reconstructed.ec.partners[0].ts_pull_token.is_none());
     }
 
-    #[test]
-    fn an_unselected_analytics_module_table_is_refused_without_resolving_its_secret() {
-        let mut original = test_settings();
-        original.analytics = Some(AnalyticsConfig {
-            module: None,
-            tinybird: Some(TinybirdSettings {
-                api_host: "api.example.com".to_string(),
-                auction_token_secret: Some(Redacted::new("unused-telemetry-key".to_string())),
-                ..TinybirdSettings::default()
-            }),
-        });
-
-        let error = settings_from_config_blob(
-            &envelope_json(&original),
-            &UnifiedSecretStore,
-            &StoreName::from("ts_secrets"),
-            PolicyOrigin::Blob,
-        )
-        .expect_err("should refuse a table nothing selects");
-        let rendered = format!("{error:?}");
-
-        assert!(
-            rendered.contains("[analytics] selects no module"),
-            "should name the section and why: {rendered}"
-        );
-        assert!(
-            !rendered.contains("unused-telemetry-key") && !rendered.contains("secret reference"),
-            "should not have tried to resolve the stale secret reference: {rendered}"
-        );
-    }
-
-    /// A table for a module its section does not select is refused, and its
-    /// secret references are dropped before resolution, so the operator reads
-    /// the table's own fault rather than a secret-store failure that follows
-    /// from it.
     #[test]
     fn an_unselected_module_s_table_is_refused_without_resolving_its_secrets() {
         let original = test_settings();

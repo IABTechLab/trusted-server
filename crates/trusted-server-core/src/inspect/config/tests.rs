@@ -250,14 +250,6 @@ fn documents_holding_every_declared_secret() -> Vec<(&'static str, Value)> {
             },
         },
     }]);
-    main["analytics"] = json!({
-        "module": "tinybird",
-        "tinybird": {
-            "api_host": "api.tinybird.example.com",
-            "auction_token_secret": "telemetry",
-        },
-    });
-
     let mut host_signals = document("");
     let ec = host_signals["ec"].as_object_mut().expect("an ec table");
     ec.remove("hmac");

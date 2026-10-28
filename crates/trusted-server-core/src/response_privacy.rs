@@ -5,15 +5,15 @@
 //! never reach a shared cache. Each adapter's `apply_finalize_headers` applies
 //! operator-configured `settings.response_headers`, so the cookie-privacy
 //! downgrade and the uncacheable-operator-header guard have to live in one place
-//! and run byte-identically on Fastly, Cloudflare, Axum, and Spin — a shared
-//! cache such as Cloudflare would otherwise serve an operator/origin
-//! `Cache-Control: public` on a cookie-bearing response as-is.
+//! and run byte-identically on every adapter, because a shared cache would
+//! otherwise serve an operator/origin `Cache-Control: public` on a
+//! cookie-bearing response as-is.
 
 use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Response, header};
 
 use crate::cache_policy::{
     CacheControlPolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
-    is_edge_cache_header_name, remove_edge_cache_headers,
+    is_owned_cache_header_name, remove_owned_cache_headers,
 };
 use crate::settings::Settings;
 
@@ -78,12 +78,13 @@ pub fn apply_inactive_ad_stack_browser_cache_policy(response: &mut Response) {
 /// Reassert the terminal privacy invariant for a synthesized per-reader response.
 ///
 /// Call this after every configurable response mutation. It deliberately overwrites
-/// `Cache-Control` and strips validators, expiry metadata, and runtime edge-cache
-/// directives so a later integration cannot turn an assembled document into something a
-/// shared cache would store.
+/// `Cache-Control` and strips validators, expiry metadata, and the shared cache
+/// headers core owns so a later integration cannot turn an assembled document into
+/// something a shared cache would store.
 pub fn enforce_private_no_store(response: &mut Response) {
     CacheControlPolicy::NoStorePrivate
         .apply_to_headers(response.headers_mut(), EdgeCacheHeader::None);
+    remove_owned_cache_headers(response);
     for name in [
         header::ETAG.as_str(),
         header::LAST_MODIFIED.as_str(),
@@ -112,14 +113,15 @@ pub(crate) fn enforce_synthesized_html_cache_privacy(response: &mut Response) {
     enforce_terminal_private_cache_privacy(response);
 }
 
-/// Removes runtime edge-cache headers from a response finalized as uncacheable.
+/// Removes the shared cache headers core owns from a response finalized as
+/// uncacheable.
 ///
 /// Call this after any late response-header mutations so a final `private` or
 /// `no-store` directive cannot coexist with an independently authoritative edge
 /// cache header.
 pub fn enforce_uncacheable_cache_privacy(response: &mut Response) {
     if cache_control_is_private_or_no_store(response) {
-        remove_edge_cache_headers(response.headers_mut());
+        remove_owned_cache_headers(response);
     }
 }
 
@@ -130,18 +132,18 @@ pub fn enforce_uncacheable_cache_privacy(response: &mut Response) {
 /// `Set-Cookie` to others.
 ///
 /// Origin `private`/`no-store` policies remain unchanged, but the generated
-/// inactive-stack browser policy is downgraded to `private, max-age=0`. CDN
-/// cache headers are always stripped so a cookie response cannot retain shared
-/// cacheability.
+/// inactive-stack browser policy is downgraded to `private, max-age=0`. The
+/// shared cache headers core owns are always stripped so a cookie response
+/// cannot retain shared cacheability.
 pub fn enforce_set_cookie_cache_privacy(response: &mut Response) {
     if !response.headers().contains_key(header::SET_COOKIE) {
         return;
     }
-    // Edge-cache headers must come off every cookie-bearing response, even one
-    // already carrying a stricter `no-store`/`private` directive — they are
-    // independent of Cache-Control and would otherwise let a shared cache store
-    // and replay one visitor's Set-Cookie.
-    remove_edge_cache_headers(response.headers_mut());
+    // The shared cache headers core owns must come off every cookie-bearing
+    // response, even one already carrying a stricter `no-store`/`private`
+    // directive, because they are independent of Cache-Control and would
+    // otherwise let a shared cache store and replay one visitor's Set-Cookie.
+    remove_owned_cache_headers(response);
     // Cookie privacy takes precedence over the generated inactive-stack browser
     // policy, while unrelated origin private/no-store policies remain unchanged.
     let already_forbids_shared_storage = cache_control_forbids_shared_storage(response.headers());
@@ -168,11 +170,11 @@ pub struct RequiredHeaders(pub HeaderMap);
 /// hardening.
 ///
 /// First downgrades cookie-bearing responses via
-/// [`enforce_set_cookie_cache_privacy`], then applies operator headers — but on
+/// [`enforce_set_cookie_cache_privacy`], then applies operator headers, but on
 /// an uncacheable (`private`/`no-store`) response the cache-controlling headers
-/// (`Cache-Control` and runtime edge-cache headers) are skipped so operators
-/// cannot re-enable shared caching for per-user payloads. After the operator
-/// headers are applied the cookie-privacy downgrade runs once more, so a
+/// (`Cache-Control` and the shared cache headers core owns) are skipped so
+/// operators cannot re-enable shared caching for per-user payloads. After the
+/// operator headers are applied the cookie-privacy downgrade runs once more, so a
 /// configured `Set-Cookie` combined with public edge-cache headers cannot
 /// produce a shared-cacheable cookie-bearing response.
 ///
@@ -187,7 +189,7 @@ pub fn apply_response_headers_with_cache_privacy(settings: &Settings, response: 
     for (key, value) in &settings.response_headers {
         if response_is_uncacheable
             && (key.eq_ignore_ascii_case(header::CACHE_CONTROL.as_str())
-                || is_edge_cache_header_name(key))
+                || is_owned_cache_header_name(response, key))
         {
             continue;
         }
@@ -229,7 +231,7 @@ mod tests {
 
     use edgezero_core::http::response_builder;
 
-    use crate::cache_policy::EDGE_CACHE_HEADER_NAMES;
+    use crate::cache_policy::{CachePolicy, EDGE_CACHE_HEADER_NAMES};
 
     fn settings_with_response_headers(headers: &[(&str, &str)]) -> Settings {
         let mut s = Settings::from_toml(
@@ -270,9 +272,7 @@ mod tests {
             .header(header::ETAG, "\"origin\"")
             .header(header::LAST_MODIFIED, "Wed, 21 Oct 2015 07:28:00 GMT")
             .header("surrogate-control", "max-age=600")
-            .header("fastly-surrogate-control", "max-age=600")
             .header("cdn-cache-control", "max-age=600")
-            .header("cloudflare-cdn-cache-control", "max-age=600")
             .body(edgezero_core::body::Body::empty())
             .expect("should build response");
 
@@ -385,7 +385,6 @@ mod tests {
             .header(header::SET_COOKIE, "id=abc")
             .header("surrogate-control", "max-age=600")
             .header("cdn-cache-control", "max-age=600")
-            .header("cloudflare-cdn-cache-control", "max-age=600")
             .body(edgezero_core::body::Body::empty())
             .expect("should build response");
 
@@ -401,10 +400,7 @@ mod tests {
         );
         assert!(
             !response.headers().contains_key("surrogate-control")
-                && !response.headers().contains_key("cdn-cache-control")
-                && !response
-                    .headers()
-                    .contains_key("cloudflare-cdn-cache-control"),
+                && !response.headers().contains_key("cdn-cache-control"),
             "edge cache headers must be stripped on cookie responses"
         );
     }
@@ -418,7 +414,6 @@ mod tests {
             ("cache-control", "public, max-age=600"),
             ("surrogate-control", "max-age=600"),
             ("cdn-cache-control", "max-age=600"),
-            ("cloudflare-cdn-cache-control", "max-age=600"),
         ]);
         let mut response = response_builder()
             .body(edgezero_core::body::Body::empty())
@@ -436,10 +431,7 @@ mod tests {
         );
         assert!(
             !response.headers().contains_key("surrogate-control")
-                && !response.headers().contains_key("cdn-cache-control")
-                && !response
-                    .headers()
-                    .contains_key("cloudflare-cdn-cache-control"),
+                && !response.headers().contains_key("cdn-cache-control"),
             "edge cache headers must be stripped when operator headers add Set-Cookie"
         );
         assert!(
@@ -511,9 +503,7 @@ mod tests {
         let settings = settings_with_response_headers(&[
             ("cache-control", "public, max-age=600"),
             ("surrogate-control", "max-age=600"),
-            ("fastly-surrogate-control", "max-age=600"),
             ("cdn-cache-control", "public, max-age=600"),
-            ("cloudflare-cdn-cache-control", "public, max-age=600"),
         ]);
         let mut response = response_builder()
             .header(header::CACHE_CONTROL, "private, no-store")
@@ -537,15 +527,11 @@ mod tests {
 
     #[test]
     fn strips_edge_headers_from_uncacheable_cookieless_response() {
-        let settings = settings_with_response_headers(&[
-            ("cdn-cache-control", "max-age=600"),
-            ("cloudflare-cdn-cache-control", "max-age=600"),
-        ]);
+        let settings = settings_with_response_headers(&[("cdn-cache-control", "max-age=600")]);
         let mut response = response_builder()
             .header(header::CACHE_CONTROL, "private, max-age=0")
             .header("surrogate-control", "max-age=600")
             .header("cdn-cache-control", "max-age=600")
-            .header("cloudflare-cdn-cache-control", "max-age=600")
             .body(edgezero_core::body::Body::empty())
             .expect("should build response");
 
@@ -553,10 +539,7 @@ mod tests {
 
         assert!(
             !response.headers().contains_key("surrogate-control")
-                && !response.headers().contains_key("cdn-cache-control")
-                && !response
-                    .headers()
-                    .contains_key("cloudflare-cdn-cache-control"),
+                && !response.headers().contains_key("cdn-cache-control"),
             "uncacheable responses must not retain or receive edge-cache headers"
         );
     }
@@ -567,7 +550,6 @@ mod tests {
             .header(header::CACHE_CONTROL, "no-store")
             .header("surrogate-control", "max-age=600")
             .header("cdn-cache-control", "max-age=600")
-            .header("cloudflare-cdn-cache-control", "max-age=600")
             .body(edgezero_core::body::Body::empty())
             .expect("should build response");
 
@@ -586,6 +568,61 @@ mod tests {
                 .iter()
                 .all(|name| !response.headers().contains_key(*name)),
             "final guard should remove every edge-cache header"
+        );
+    }
+
+    #[test]
+    fn a_platform_header_core_did_not_write_is_left_on_a_cookie_response() {
+        crate::platform::declare_platform_cache_headers(&[
+            "example-cdn-cache-control",
+            "example-operator-cache-control",
+        ]);
+        let settings =
+            settings_with_response_headers(&[("example-operator-cache-control", "max-age=600")]);
+        let mut response = response_builder()
+            .header(header::CACHE_CONTROL, "private, max-age=0")
+            .header(header::SET_COOKIE, "id=abc")
+            .header("example-cdn-cache-control", "max-age=600")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build response");
+
+        apply_response_headers_with_cache_privacy(&settings, &mut response);
+
+        for name in [
+            "example-cdn-cache-control",
+            "example-operator-cache-control",
+        ] {
+            assert_eq!(
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok()),
+                Some("max-age=600"),
+                "a platform header core did not write should be left as written: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_policy_core_wrote_in_a_platform_header_leaves_a_cookie_response() {
+        let settings =
+            settings_with_response_headers(&[("example-written-cache-control", "max-age=600")]);
+        let mut response = response_builder()
+            .header(header::SET_COOKIE, "id=abc")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build response");
+        CachePolicy::public_immutable(std::time::Duration::from_secs(600)).apply_to_response(
+            &mut response,
+            EdgeCacheHeader::Platform("example-written-cache-control"),
+        );
+
+        apply_response_headers_with_cache_privacy(&settings, &mut response);
+
+        assert!(
+            !response
+                .headers()
+                .contains_key("example-written-cache-control"),
+            "the policy core wrote should come off a cookie response and stay off"
         );
     }
 

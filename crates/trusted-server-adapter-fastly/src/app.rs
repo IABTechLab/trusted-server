@@ -301,6 +301,14 @@ fn registered_integrations() -> &'static [IntegrationBuilder] {
     REGISTERED_INTEGRATIONS.get().map_or(&[], Vec::as_slice)
 }
 
+/// The second header Compute reads a shared cache policy from, beside
+/// `Surrogate-Control`. Core never writes it, and declaring it keeps an origin
+/// response with a policy in it out of the stored copies.
+pub const FASTLY_SURROGATE_CONTROL_HEADER: &str = "fastly-surrogate-control";
+
+/// The header core writes a shared cache policy in on this adapter.
+pub(crate) const EDGE_CACHE_HEADER: EdgeCacheHeader = EdgeCacheHeader::SurrogateControl;
+
 /// Build the application state from explicit settings, composing the modules
 /// this adapter links with the externally supplied builders in
 /// `integrations`.
@@ -321,6 +329,9 @@ pub(crate) fn build_state_with_registrations(
     settings: Settings,
     integrations: &[IntegrationBuilder],
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    trusted_server_core::platform::declare_platform_cache_headers(&[
+        FASTLY_SURROGATE_CONTROL_HEADER,
+    ]);
     warn_if_certificate_check_disabled(&settings);
 
     // The modules this adapter links come first and the deployment's own
@@ -364,7 +375,11 @@ pub(crate) fn build_state_with_registrations(
         )?;
     let permission_policy = settings.required_permission_policy()?;
 
-    let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
+    // The sink `[analytics] module` selected, or core's no-op sink.
+    let auction_telemetry_sink = registry.analytics_module().unwrap_or_else(|| {
+        Arc::new(trusted_server_core::auction::NoopAuctionTelemetrySink)
+            as Arc<dyn AuctionTelemetrySink>
+    });
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
     let loading_caches =
         trusted_server_core::integrations::loading_caches_from(&settings, integrations)?;
@@ -451,6 +466,8 @@ pub fn shipped_module_builders() -> Vec<IntegrationBuilder> {
         trusted_server_headers_geo::builder(),
         // Run by `[shared.51degrees]` rather than selected by a section.
         trusted_server_middleware_51degrees::builder(),
+        // The analytics module `[analytics]` selects, which changes no page.
+        trusted_server_analytics_tinybird::builder(),
         // Implementations `[demand]` and `[ad-server]` can name, which no
         // section selects.
         trusted_server_auction_protocol_openrtb::builder(),
@@ -1160,7 +1177,7 @@ async fn dispatch_fallback(
     };
 
     let result = if uses_dynamic_tsjs_fallback(&method, &path) {
-        handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SurrogateControl)
+        handle_tsjs_dynamic(&req, &state.registry, EDGE_CACHE_HEADER)
     } else if state.registry.has_route(&method, &path) {
         // Integration-proxy responses are not bounded by
         // publisher.max_buffered_body_bytes. Publisher fallback below uses the
@@ -1236,7 +1253,7 @@ async fn dispatch_fallback(
                     &mut ec.ec_context,
                     auction,
                     req,
-                    EdgeCacheHeader::SurrogateControl,
+                    EDGE_CACHE_HEADER,
                 )
                 .await
                 {
@@ -1908,6 +1925,51 @@ mod tests {
             "ts.test-publisher.com"
         );
         assert_eq!(services.public_prefix().as_str(), "ts");
+    }
+
+    /// A response core makes private carries the private policy in the
+    /// headers core owns and keeps the platform header the origin sent, which
+    /// is a fetch middleware's to remove. The adapter declares its own
+    /// platform's header and no other.
+    #[test]
+    fn a_private_response_follows_its_policy_and_keeps_the_origins_header() {
+        build_state_from_settings(test_settings()).expect("should build test state");
+        assert_eq!(
+            trusted_server_core::platform::platform_cache_headers(),
+            vec![super::FASTLY_SURROGATE_CONTROL_HEADER],
+            "should declare Compute's own header and no other platform's"
+        );
+        let mut response = edgezero_core::http::response_builder()
+            .header(super::FASTLY_SURROGATE_CONTROL_HEADER, "max-age=600")
+            .body(Body::empty())
+            .expect("should build the response");
+        trusted_server_core::cache_policy::CachePolicy::public_immutable(
+            std::time::Duration::from_secs(600),
+        )
+        .apply_to_response(&mut response, super::EDGE_CACHE_HEADER);
+
+        trusted_server_core::response_privacy::enforce_private_no_store(&mut response);
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, private"),
+            "should carry the private policy"
+        );
+        assert!(
+            !response.headers().contains_key("surrogate-control"),
+            "should remove the policy core wrote"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(super::FASTLY_SURROGATE_CONTROL_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("max-age=600"),
+            "should keep the header the origin sent"
+        );
     }
 
     #[test]
@@ -3533,6 +3595,7 @@ mod tests {
                 "ads-txt.iabtl",
                 "headers.geo",
                 "51degrees",
+                "analytics.tinybird",
                 "auction-protocol.openrtb",
                 "auction.prebid-server",
                 "auction.aps",

@@ -176,6 +176,9 @@ fn build_state_with_settings(
     build_state_with_registrations(settings, &[])
 }
 
+/// The header core writes a shared cache policy in on this adapter.
+const EDGE_CACHE_HEADER: EdgeCacheHeader = EdgeCacheHeader::SMaxageFallback;
+
 /// Build the application state from explicit settings, composing the modules
 /// this adapter links with the externally supplied builders in
 /// `integrations`.
@@ -355,6 +358,8 @@ pub fn shipped_module_builders() -> Vec<IntegrationBuilder> {
         trusted_server_headers_geo::builder(),
         // Run by `[shared.51degrees]` rather than selected by a section.
         trusted_server_middleware_51degrees::builder(),
+        // The analytics module `[analytics]` selects, which changes no page.
+        trusted_server_analytics_tinybird::builder(),
         // Implementations `[demand]` and `[ad-server]` can name, which no
         // section selects.
         trusted_server_auction_protocol_openrtb::builder(),
@@ -1128,7 +1133,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // Dynamic tsjs serving is GET-only; other methods fall through to the
             // integration/publisher fallback.
             let result = if method == Method::GET && path.starts_with("/static/tsjs=") {
-                handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SMaxageFallback)
+                handle_tsjs_dynamic(&req, &state.registry, EDGE_CACHE_HEADER)
             } else if state.registry.has_route(&method, &path) {
                 // A module route is handed what was resolved for its request,
                 // the permissions among them, as the publisher path is.
@@ -1178,7 +1183,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     &mut ec_context,
                     auction,
                     req,
-                    EdgeCacheHeader::SMaxageFallback,
+                    EDGE_CACHE_HEADER,
                 )
                 .await
                 {
@@ -1940,6 +1945,65 @@ mod tests {
         );
     }
 
+    /// A response core makes private carries the private policy, with no
+    /// `s-maxage`, and keeps a platform's header the origin sent, which is a
+    /// fetch middleware's to remove. The adapter declares no platform's header.
+    #[test]
+    fn a_private_response_follows_its_policy_and_keeps_the_origins_header() {
+        let settings = Settings::from_toml(
+            r#"
+                [source]
+                module = "origin"
+
+                [source.origin]
+                url = "https://origin.publisher.example"
+
+                [publisher]
+                domain = "www.publisher.example"
+                cookie_domain = ".publisher.example"
+                proxy_secret = "fictional-proxy-secret-32-bytes-ok"
+
+                [geo]
+                assume_single_jurisdiction = true
+            "#,
+        )
+        .expect("should parse the settings")
+        // A loaded domain carries its policy.
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
+        build_state_with_settings(settings).expect("should build the state");
+        assert!(
+            trusted_server_core::platform::platform_cache_headers().is_empty(),
+            "should declare no platform's header"
+        );
+        let mut response = edgezero_core::http::response_builder()
+            .header("example-platform-cache-control", "max-age=600")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build the response");
+        trusted_server_core::cache_policy::CachePolicy::public_immutable(
+            std::time::Duration::from_secs(600),
+        )
+        .apply_to_response(&mut response, EDGE_CACHE_HEADER);
+
+        trusted_server_core::response_privacy::enforce_private_no_store(&mut response);
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, private"),
+            "should carry the private policy"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("example-platform-cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("max-age=600"),
+            "should keep the header the origin sent"
+        );
+    }
+
     /// The modules this adapter links are offered in the order their hooks
     /// run. A module is named by what its section selects, and an
     /// implementation by what `[demand]` or `[ad-server]` names.
@@ -1976,6 +2040,7 @@ mod tests {
                 "ads-txt.iabtl",
                 "headers.geo",
                 "51degrees",
+                "analytics.tinybird",
                 "auction-protocol.openrtb",
                 "auction.prebid-server",
                 "auction.aps",

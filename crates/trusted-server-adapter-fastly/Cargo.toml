@@ -37,6 +37,7 @@ trusted-server-ad-server-iabtl = { workspace = true }
 trusted-server-ad-tag-google = { workspace = true }
 trusted-server-ads-txt-iabtl = { workspace = true }
 trusted-server-middleware-51degrees = { workspace = true }
+trusted-server-analytics-tinybird = { workspace = true }
 trusted-server-auction-aps = { workspace = true }
 trusted-server-auction-prebid = { workspace = true }
 trusted-server-auction-prebid-server = { workspace = true }
@@ -61,7 +62,6 @@ trusted-server-tag-google-tag-manager = { workspace = true }
 trusted-server-testing-testlight = { workspace = true }
 trusted-server-device-fastly = { workspace = true }
 trusted-server-geo-fastly = { workspace = true }
-urlencoding = { workspace = true }
 
 [dev-dependencies]
 bytes = { workspace = true }

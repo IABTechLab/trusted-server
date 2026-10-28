@@ -220,11 +220,20 @@ fn build_state_with_services(
     build_state_with_registrations_and_services(settings, &[], services)
 }
 
+/// The header Workers reads a shared cache policy from, which core writes
+/// the policy in. Declaring it keeps an origin response with a policy in it
+/// out of the stored copies.
+pub const CDN_CACHE_CONTROL_HEADER: &str = "cloudflare-cdn-cache-control";
+
+/// The header core writes a shared cache policy in on this adapter.
+const EDGE_CACHE_HEADER: EdgeCacheHeader = EdgeCacheHeader::Platform(CDN_CACHE_CONTROL_HEADER);
+
 fn build_state_with_registrations_and_services(
     settings: Settings,
     integrations: &[IntegrationBuilder],
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    trusted_server_core::platform::declare_platform_cache_headers(&[CDN_CACHE_CONTROL_HEADER]);
     // The modules this adapter links come first and the deployment's own
     // follow, which is the order their hooks run in.
     let integrations = module_builders_with(integrations);
@@ -343,6 +352,8 @@ pub fn shipped_module_builders() -> Vec<IntegrationBuilder> {
         trusted_server_headers_geo::builder(),
         // Run by `[shared.51degrees]` rather than selected by a section.
         trusted_server_middleware_51degrees::builder(),
+        // The analytics module `[analytics]` selects, which changes no page.
+        trusted_server_analytics_tinybird::builder(),
         // Implementations `[demand]` and `[ad-server]` can name, which no
         // section selects.
         trusted_server_auction_protocol_openrtb::builder(),
@@ -745,11 +756,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let allow_tsjs = method == Method::GET;
 
             let result = if allow_tsjs && path.starts_with("/static/tsjs=") {
-                handle_tsjs_dynamic(
-                    &req,
-                    &state.registry,
-                    EdgeCacheHeader::CloudflareCdnCacheControl,
-                )
+                handle_tsjs_dynamic(&req, &state.registry, EDGE_CACHE_HEADER)
             } else if state.registry.has_route(&method, &path) {
                 // A module route is handed what was resolved for its request,
                 // the permissions among them, as the publisher path is.
@@ -799,7 +806,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     &mut ec_context,
                     auction,
                     req,
-                    EdgeCacheHeader::CloudflareCdnCacheControl,
+                    EDGE_CACHE_HEADER,
                 )
                 .await
                 {
@@ -1335,6 +1342,74 @@ mod tests {
         );
     }
 
+    /// A response core makes private loses the policy core wrote in the
+    /// Workers header and carries the private policy, and keeps that header
+    /// where the origin sent it, which is a fetch middleware's to remove. The
+    /// adapter declares its own platform's header and no other.
+    #[test]
+    fn a_private_response_follows_its_policy_and_keeps_the_origins_header() {
+        let settings = Settings::from_toml(
+            r#"
+                [source]
+                module = "origin"
+
+                [source.origin]
+                url = "https://origin.publisher.example"
+
+                [publisher]
+                domain = "www.publisher.example"
+                cookie_domain = ".publisher.example"
+                proxy_secret = "fictional-proxy-secret-32-bytes-ok"
+
+                [geo]
+                assume_single_jurisdiction = true
+            "#,
+        )
+        .expect("should parse the settings")
+        // A loaded domain carries its policy.
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
+        build_state_with_settings(settings).expect("should build the state");
+        assert_eq!(
+            trusted_server_core::platform::platform_cache_headers(),
+            vec![CDN_CACHE_CONTROL_HEADER],
+            "should declare the Workers header and no other platform's"
+        );
+        let mut written = edgezero_core::http::response_builder()
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build the response");
+        trusted_server_core::cache_policy::CachePolicy::public_immutable(
+            std::time::Duration::from_secs(600),
+        )
+        .apply_to_response(&mut written, EDGE_CACHE_HEADER);
+        assert!(written.headers().contains_key(CDN_CACHE_CONTROL_HEADER));
+        trusted_server_core::response_privacy::enforce_private_no_store(&mut written);
+        assert_eq!(
+            written
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, private"),
+            "should carry the private policy"
+        );
+        assert!(
+            !written.headers().contains_key(CDN_CACHE_CONTROL_HEADER),
+            "should remove the policy core wrote"
+        );
+
+        let mut sent = edgezero_core::http::response_builder()
+            .header(CDN_CACHE_CONTROL_HEADER, "max-age=600")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build the response");
+        trusted_server_core::response_privacy::enforce_private_no_store(&mut sent);
+        assert_eq!(
+            sent.headers()
+                .get(CDN_CACHE_CONTROL_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("max-age=600"),
+            "should keep the header the origin sent"
+        );
+    }
+
     /// The modules this adapter links are offered in the order their hooks
     /// run. A module is named by what its section selects, and an
     /// implementation by what `[demand]` or `[ad-server]` names.
@@ -1371,6 +1446,7 @@ mod tests {
                 "ads-txt.iabtl",
                 "headers.geo",
                 "51degrees",
+                "analytics.tinybird",
                 "auction-protocol.openrtb",
                 "auction.prebid-server",
                 "auction.aps",

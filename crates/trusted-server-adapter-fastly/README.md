@@ -5,7 +5,7 @@ Production Fastly Compute adapter for Trusted Server, targeting
 
 This crate owns the Fastly entry point, dynamic backend construction, edge
 cache behavior, config and secret-store access, EC KV operations, rate limits,
-streaming template assembly, and Fastly-only Tinybird auction emission. Its
+and streaming template assembly. Its
 `/health` response is served before application construction, so liveness does
 not prove that configuration loaded. Platform-neutral routing, settings,
 auctions, integrations, and rewrites remain in `trusted-server-core`.

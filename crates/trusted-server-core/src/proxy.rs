@@ -15,7 +15,7 @@ use crate::asset_cache::{AssetAnswer, AssetCacheModule, AssetFile, AssetVia, Ori
 use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, NO_STORE_PRIVATE_CACHE_CONTROL,
     apply_no_store_private_to_headers, cache_control_headers_are_private_or_no_store,
-    remove_edge_cache_headers,
+    remove_owned_cache_headers,
 };
 use crate::constants::{
     HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE, HEADER_REFERER,
@@ -150,9 +150,9 @@ impl AssetProxyCachePolicy {
             Self::NoStorePrivate => apply_no_store_cache_control(response),
             Self::Normalized(policy) => {
                 if cache_control_headers_are_private_or_no_store(response.headers()) {
-                    remove_edge_cache_headers(response.headers_mut());
+                    remove_owned_cache_headers(response);
                 } else {
-                    policy.apply_to_headers(response.headers_mut(), edge_header);
+                    policy.apply_to_response(response, edge_header);
                 }
             }
         }
@@ -6019,7 +6019,7 @@ mod tests {
                     .get("surrogate-control")
                     .and_then(|value| value.to_str().ok()),
                 Some("max-age=31536000"),
-                "Fastly finalization should render Surrogate-Control"
+                "finalization should render Surrogate-Control"
             );
         });
     }
@@ -6031,7 +6031,6 @@ mod tests {
                 .header(header::CACHE_CONTROL, cache_control)
                 .header("surrogate-control", "max-age=31536000")
                 .header("cdn-cache-control", "max-age=31536000")
-                .header("cloudflare-cdn-cache-control", "max-age=31536000")
                 .body(EdgeBody::empty())
                 .expect("should build asset response");
 
@@ -6049,13 +6048,9 @@ mod tests {
                 "final privacy directive should veto normalized cache policy"
             );
             assert!(
-                [
-                    "surrogate-control",
-                    "cdn-cache-control",
-                    "cloudflare-cdn-cache-control",
-                ]
-                .iter()
-                .all(|name| !response.headers().contains_key(*name)),
+                ["surrogate-control", "cdn-cache-control"]
+                    .iter()
+                    .all(|name| !response.headers().contains_key(*name)),
                 "final privacy directive should remove every edge-cache header"
             );
         }

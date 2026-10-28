@@ -11,6 +11,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::asset_cache::AssetCacheModule;
 use crate::auction::AuctionPlan;
+use crate::auction::telemetry::AuctionTelemetrySink;
 use crate::constants::HEADER_X_TS_EC;
 use crate::ec::EcContext;
 use crate::ec::device::DeviceModule;
@@ -694,6 +695,12 @@ pub struct IntegrationRegistration {
     /// Declaring one does not make it serve anything, because a source is only
     /// built where `[source]` or an asset route's `source` table names it.
     pub source_module: Option<(&'static str, Arc<dyn SourceFactory>)>,
+    /// Analytics module this registration supplies, with the name
+    /// `[analytics] module` selects it by.
+    ///
+    /// Declaring one does not make it send, because core hands an auction's
+    /// rows only to the sink `[analytics] module` names.
+    pub analytics_module: Option<(&'static str, Arc<dyn AuctionTelemetrySink>)>,
     /// Identifier module this registration supplies, see
     /// [`crate::ec::identifiers`].
     ///
@@ -738,6 +745,7 @@ impl IntegrationRegistrationBuilder {
                 prefix_module: None,
                 robots_txt_contributor: None,
                 source_module: None,
+                analytics_module: None,
                 identifier_module: None,
                 asset_cache_module: None,
             },
@@ -843,6 +851,22 @@ impl IntegrationRegistrationBuilder {
         factory: Arc<dyn SourceFactory>,
     ) -> Self {
         self.registration.source_module = Some((name, factory));
+        self
+    }
+
+    /// Declare the analytics module this registration supplies, under its
+    /// `name`: the sink core hands each settled auction's rows to.
+    ///
+    /// It only receives rows when `[analytics] module` names it, and a
+    /// module the selector does not choose is logged as a warning when the
+    /// registry is built, the same as geo.
+    #[must_use]
+    pub fn with_analytics_module(
+        mut self,
+        name: &'static str,
+        sink: Arc<dyn AuctionTelemetrySink>,
+    ) -> Self {
+        self.registration.analytics_module = Some((name, sink));
         self
     }
 
@@ -1009,6 +1033,12 @@ struct IntegrationRegistryInner {
     prefix_module: SelectedPrefixModule,
     // The source modules the running registrations supply, each with its name.
     source_modules: Vec<(&'static str, Arc<dyn SourceFactory>)>,
+    // The analytics modules the running registrations supply, each with its
+    // name, in registration order. `[analytics] module` picks at most one.
+    analytics_modules: Vec<(&'static str, Arc<dyn AuctionTelemetrySink>)>,
+    // The sink `[analytics] module` resolved to, or `None` when no section
+    // selects one, so core's no-op sink stands.
+    analytics_module: Option<Arc<dyn AuctionTelemetrySink>>,
     // The publisher's source and each asset route's, in route order, built
     // from the settings. `None` for a registry built without settings.
     sources: Option<BuiltSources>,
@@ -1063,6 +1093,8 @@ impl Default for IntegrationRegistryInner {
             prefix_modules: Vec::new(),
             prefix_module: SelectedPrefixModule::default(),
             source_modules: Vec::new(),
+            analytics_modules: Vec::new(),
+            analytics_module: None,
             sources: None,
             identifier_modules: Arc::default(),
             asset_cache_module: None,
@@ -1091,6 +1123,7 @@ const DEVICE_MODULE_FASTLY: &str = "fastly";
 /// written in its section may leave off.
 const EDGECOOKIE_TYPE: &str = crate::ec::module::MODULE_TYPE;
 const DEVICE_TYPE: &str = "device";
+const ANALYTICS_TYPE: &str = "analytics";
 const GEO_TYPE: &str = "geo";
 const PREFIX_TYPE: &str = crate::prefix::MODULE_TYPE;
 const ROBOTS_TXT_TYPE: &str = crate::robots_txt::MODULE_TYPE;
@@ -1481,6 +1514,53 @@ fn resolve_geo_module(
         )?),
     };
     warn_unselected("geo", GEO_TYPE, resolved.as_ref(), &inner.geo_modules);
+    Ok(resolved)
+}
+
+/// Resolves the analytics module `[analytics] module` names, when a
+/// registered module supplies it.
+///
+/// Core has no analytics module of its own, so with no `[analytics]` section
+/// nothing is resolved and the no-op sink stands.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when the section selects
+/// more than one name, or a name no registered module answers to.
+fn resolve_analytics_module(
+    settings: &Settings,
+    inner: &IntegrationRegistryInner,
+) -> Result<Option<Arc<dyn AuctionTelemetrySink>>, Report<TrustedServerError>> {
+    let selected = settings
+        .sections
+        .section(ANALYTICS_TYPE)
+        .map(crate::provider_table::SectionModules::selected)
+        .unwrap_or_default();
+    let resolved = match selected {
+        [] => None,
+        [written] => Some(named_module(
+            ANALYTICS_TYPE,
+            ANALYTICS_TYPE,
+            written,
+            &inner.analytics_modules,
+            inner,
+        )?),
+        _ => {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[{ANALYTICS_TYPE}] selects {} modules, and an auction's rows go to \
+                     one. Select one with `module`",
+                    selected.len()
+                ),
+            }));
+        }
+    };
+    warn_unselected(
+        ANALYTICS_TYPE,
+        ANALYTICS_TYPE,
+        resolved.as_ref(),
+        &inner.analytics_modules,
+    );
     Ok(resolved)
 }
 
@@ -2330,6 +2410,10 @@ impl IntegrationRegistry {
                 )?;
                 inner.robots_txt_contributors.push((name, contributor));
             }
+            if let Some((name, sink)) = registration.analytics_module {
+                claim_module_name(&mut claimed, "analytics", name, registration.integration_id)?;
+                inner.analytics_modules.push((name, sink));
+            }
             if let Some((name, module)) = registration.asset_cache_module {
                 if asset_cache_supplier.map(|(id, _, _)| id) != Some(registration.integration_id) {
                     return Err(refuse_unselected_asset_cache(
@@ -2407,6 +2491,7 @@ impl IntegrationRegistry {
         inner.ec_module = resolve_ec_module(settings, &inner);
         inner.device_module = resolve_device_module(settings, &inner)?;
         inner.prefix_module = resolve_prefix_module(settings, &inner)?;
+        inner.analytics_module = resolve_analytics_module(settings, &inner)?;
         inner.sources = Some(build_sources(settings, &inner.source_modules)?);
         inner.identifier_modules = Arc::from(identifier_modules);
         inner.geo_module = geo_module;
@@ -2465,6 +2550,13 @@ impl IntegrationRegistry {
     #[must_use]
     pub fn device_module(&self) -> Option<Arc<dyn DeviceModule>> {
         self.inner.device_module.clone()
+    }
+
+    /// The analytics module `[analytics] module` selected, or `None` when no
+    /// section selects one and core's no-op sink stands.
+    #[must_use]
+    pub fn analytics_module(&self) -> Option<Arc<dyn AuctionTelemetrySink>> {
+        self.inner.analytics_module.clone()
     }
 
     /// The asset cache module of the builder `[asset-cache]` selects, or
@@ -3092,6 +3184,8 @@ impl IntegrationRegistry {
                 prefix_modules: Vec::new(),
                 prefix_module: SelectedPrefixModule::default(),
                 source_modules: Vec::new(),
+                analytics_modules: Vec::new(),
+                analytics_module: None,
                 sources: None,
                 identifier_modules: Arc::default(),
                 asset_cache_module: None,
@@ -3178,6 +3272,8 @@ impl IntegrationRegistry {
                 prefix_modules: Vec::new(),
                 prefix_module: SelectedPrefixModule::default(),
                 source_modules: Vec::new(),
+                analytics_modules: Vec::new(),
+                analytics_module: None,
                 sources: None,
                 identifier_modules: Arc::default(),
                 asset_cache_module: None,
@@ -7222,6 +7318,76 @@ mod tests {
                 && message.contains("It runs no geo module")
                 && message.contains("is selected and supplies no geo module"),
             "error should name the module and say it supplies no geo module: {message}"
+        );
+    }
+
+    #[test]
+    fn analytics_selector_rejects_a_module_that_declares_no_analytics_module() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.select_module("analytics", "testing.probe");
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            "probe",
+            "seam-probe",
+            probe_registration,
+            validate_nothing,
+        )
+        .with_module_name("testing.probe")];
+
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
+            .err()
+            .expect("should reject a module that declares no analytics module");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("`[analytics] module` names `testing.probe`")
+                && message.contains("It runs no analytics module")
+                && message.contains("is selected and supplies no analytics module"),
+            "error should name the module and say it supplies no analytics module: {message}"
+        );
+    }
+
+    #[test]
+    fn analytics_selector_takes_one_module() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.select_module("analytics", "testing.probe");
+        settings.select_module("analytics", "testing.probe-unnamed");
+        let extra = [
+            crate::integrations::IntegrationBuilder::new(
+                "probe",
+                "seam-probe",
+                probe_registration,
+                validate_nothing,
+            )
+            .with_module_name("testing.probe"),
+            crate::integrations::IntegrationBuilder::new(
+                "probe-unnamed",
+                "seam-probe",
+                never_registering_builder,
+                validate_nothing,
+            )
+            .with_module_name("testing.probe-unnamed"),
+        ];
+
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
+            .err()
+            .expect("should reject a section selecting two analytics modules");
+
+        assert!(
+            error.to_string().contains("[analytics] selects 2 modules"),
+            "error should say one module is selected: {error}"
+        );
+    }
+
+    #[test]
+    fn no_analytics_section_resolves_no_sink() {
+        let settings = crate::test_support::tests::create_test_settings();
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &[])
+            .expect("should build registry without an analytics section");
+
+        assert!(
+            registry.analytics_module().is_none(),
+            "nothing selected should leave the no-op sink standing"
         );
     }
 
