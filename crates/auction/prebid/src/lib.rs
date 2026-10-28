@@ -4,6 +4,8 @@
 //! `<head>`, serves the publisher's Prebid bundle from a first-party route and
 //! removes the publisher's own Prebid script from the page. The bidders it
 //! tells the browser to leave to the server are the auction plan's routes.
+//! It also reads the cookie its page script persists the browser's
+//! identifiers in, and hands core what it holds, see [`eids`].
 
 #![cfg_attr(
     test,
@@ -16,6 +18,8 @@
         reason = "tests use direct diagnostics and panic-on-failure helpers"
     )
 )]
+
+pub mod eids;
 
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -1104,6 +1108,7 @@ pub fn register_for_plan(
         IntegrationRegistration::builder(PREBID_INTEGRATION_ID)
             .with_proxy(integration.clone())
             .with_middleware(Arc::new(PageChange::new(integration)))
+            .with_identifier_module(Arc::new(eids::PrebidEids))
             .with_deferred_js()
             .build(),
     ))
@@ -1122,6 +1127,7 @@ pub fn register(
         IntegrationRegistration::builder(PREBID_INTEGRATION_ID)
             .with_proxy(integration.clone())
             .with_middleware(Arc::new(PageChange::new(integration)))
+            .with_identifier_module(Arc::new(eids::PrebidEids))
             .with_deferred_js()
             .build(),
     ))

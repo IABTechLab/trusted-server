@@ -1428,7 +1428,6 @@ mod tests {
             Some(graph),
             &PartnerRegistry::empty(),
             None,
-            None,
             &mut response,
             services,
         )
@@ -1458,7 +1457,6 @@ mod tests {
             &mut ec,
             Some(graph),
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
             services,

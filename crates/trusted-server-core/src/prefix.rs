@@ -368,12 +368,7 @@ mod tests {
 
         assert_eq!(prefixes.public().as_str(), "ts");
         assert_eq!(prefixes.server_key().as_str(), "ts.example.com");
-        for (name, cookie) in [
-            ("ec", "ts-ec"),
-            ("ecr", "ts-ecr"),
-            ("eids", "ts-eids"),
-            ("tester", "ts-tester"),
-        ] {
+        for (name, cookie) in [("ec", "ts-ec"), ("ecr", "ts-ecr"), ("tester", "ts-tester")] {
             assert_eq!(prefixes.public().cookie_name(name), cookie);
         }
     }
@@ -412,7 +407,7 @@ mod tests {
     fn a_prefix_owns_the_cookie_names_it_gives_and_no_others() {
         let prefix = TrustedServerPrefix::public();
 
-        for owned in ["ts-ec", "TS-EIDS", "ts-anything", "ts-"] {
+        for owned in ["ts-ec", "TS-ECR", "ts-anything", "ts-"] {
             assert!(prefix.owns_cookie_name(owned.as_bytes()), "{owned}");
         }
         for other in ["ts", "tsx-ec", "_ex-ec", "sharedId"] {

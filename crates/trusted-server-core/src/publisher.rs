@@ -27,7 +27,6 @@ use std::time::{Duration, SystemTime};
 use brotli::Decompressor;
 use brotli::enc::BrotliEncoderParams;
 use brotli::enc::writer::CompressorWriter;
-use cookie::CookieJar;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use flate2::read::ZlibDecoder;
@@ -58,7 +57,7 @@ use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
 };
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_permissions};
-use crate::constants::{COOKIE_EIDS, COOKIE_SHAREDID, HEADER_X_COMPRESS_HINT, HOST_SIGNAL_HEADERS};
+use crate::constants::{COOKIE_SHAREDID, HEADER_X_COMPRESS_HINT, HOST_SIGNAL_HEADERS};
 use crate::cookies::handle_request_cookies;
 use crate::cookies::template_cache_policy::{TemplateCookieDecision, evaluate_cookie_policy};
 use crate::creative_opportunities::{
@@ -3808,7 +3807,7 @@ struct EcSnapshotPreloadInput {
     has_kv: bool,
     marker_valid: bool,
     auction_needs_row: bool,
-    eid_cookie_may_need_persistence: bool,
+    eids_may_need_persistence: bool,
     privacy_needs_row: bool,
 }
 
@@ -3816,7 +3815,7 @@ fn should_preload_ec_snapshot(input: &EcSnapshotPreloadInput) -> bool {
     let eligible = input.is_navigation && input.is_get && input.has_ec_id && input.has_kv;
     let marker_can_skip = input.marker_valid
         && !input.auction_needs_row
-        && !input.eid_cookie_may_need_persistence
+        && !input.eids_may_need_persistence
         && !input.privacy_needs_row;
     eligible && !marker_can_skip
 }
@@ -5597,9 +5596,9 @@ pub async fn handle_publisher_request(
         });
     // A key cookie naming one of this request's own identity cookies would
     // make the template one reader's, so such a request shares none.
-    let identity =
-        crate::cookies::template_cache_policy::identity_cookies(services.public_prefix());
-    let keys_an_identity = key_cookie_names.iter().any(|name| identity.contains(name));
+    let keys_an_identity = key_cookie_names.iter().any(|name| {
+        crate::cookies::template_cache_policy::is_identity_cookie(services.public_prefix(), name)
+    });
     let (cookie_disqualifies, cookie_values) = match evaluate_cookie_policy(
         req.headers(),
         key_cookie_names,
@@ -5782,11 +5781,10 @@ pub async fn handle_publisher_request(
 
     let request_method = req.method().clone();
     let mut origin_request = Some(req);
-    let eid_cookie_may_need_persistence = cookie_jar.as_ref().is_some_and(|jar| {
-        jar.get(&services.public_prefix().cookie_name(COOKIE_EIDS))
-            .is_some()
-            || jar.get(COOKIE_SHAREDID).is_some()
-    });
+    let eids_may_need_persistence = !ec_context.module_eids().is_empty()
+        || cookie_jar
+            .as_ref()
+            .is_some_and(|jar| jar.get(COOKIE_SHAREDID).is_some());
     // This decision also gates the concurrent origin send below. A marker skip
     // cannot currently delay the origin behind an auction because marker
     // validation requires a non-empty registry, and every such auction sets
@@ -5801,7 +5799,7 @@ pub async fn handle_publisher_request(
             && auction
                 .registry
                 .is_some_and(|registry| !registry.is_empty()),
-        eid_cookie_may_need_persistence,
+        eids_may_need_persistence,
         privacy_needs_row: ec_context.storage_withdrawn(),
     });
     let mut pending_origin = None;
@@ -5907,7 +5905,6 @@ pub async fn handle_publisher_request(
             apply_auction_eids_and_device(
                 &mut auction_request,
                 &AuctionEidTargeting {
-                    cookie_jar: cookie_jar.as_ref(),
                     ec_id,
                     kv_snapshot: ec_context.kv_snapshot(),
                     partner_registry: auction.registry,
@@ -6711,7 +6708,6 @@ pub(crate) struct MatchedSlotsContext<'a> {
 /// Borrowed inputs for [`apply_auction_eids_and_device`], bundled to keep the
 /// helper within the project's 7-argument cap.
 struct AuctionEidTargeting<'a> {
-    cookie_jar: Option<&'a CookieJar>,
     ec_id: Option<&'a str>,
     kv_snapshot: &'a crate::ec::EcKvSnapshot,
     partner_registry: Option<&'a PartnerRegistry>,
@@ -6732,12 +6728,8 @@ fn apply_auction_eids_and_device(
     auction_request: &mut AuctionRequest,
     targeting: &AuctionEidTargeting<'_>,
 ) {
-    let ts_eids_value = targeting
-        .cookie_jar
-        .and_then(|j| j.get(&targeting.services.public_prefix().cookie_name(COOKIE_EIDS)))
-        .map(|c| c.value().to_owned());
     let client_eids = if targeting.ec_id.is_some() {
-        resolve_client_auction_eids(None, ts_eids_value.as_deref())
+        resolve_client_auction_eids(None, targeting.ec_context.module_eids())
     } else {
         None
     };
@@ -8347,7 +8339,6 @@ pub async fn handle_page_bids(
         .map(str::to_owned);
     let consent_context = ec_context.consent().clone();
     let geo = ec_context.geo_info().cloned();
-    let cookie_jar = handle_request_cookies(&req)?;
 
     // Same fail-closed jurisdiction-aware gate the publisher navigation path
     // uses — relies on the adapter's geo-aware EC context.
@@ -8427,9 +8418,9 @@ pub async fn handle_page_bids(
                 _ => crate::ec::EcKvSnapshot::NotRead,
             };
             // Hand the loaded row to the request context so response
-            // finalization — which runs on an EC context the adapter owns,
-            // after this handler returns — ingests `ts-eids`/`sharedId` updates
-            // from this read instead of paying for a second lookup.
+            // finalization, which runs on an EC context the adapter owns
+            // after this handler returns, ingests the request's identifier
+            // updates from this read instead of paying for a second lookup.
             if !matches!(page_bids_kv_snapshot, crate::ec::EcKvSnapshot::NotRead) {
                 ec_context.set_kv_snapshot(page_bids_kv_snapshot.clone());
             }
@@ -8444,7 +8435,6 @@ pub async fn handle_page_bids(
             apply_auction_eids_and_device(
                 &mut auction_request,
                 &AuctionEidTargeting {
-                    cookie_jar: cookie_jar.as_ref(),
                     ec_id: ec_id.as_deref(),
                     kv_snapshot: &page_bids_kv_snapshot,
                     partner_registry: auction.registry,
@@ -9285,7 +9275,7 @@ mod tests {
             has_kv: true,
             marker_valid: false,
             auction_needs_row: false,
-            eid_cookie_may_need_persistence: false,
+            eids_may_need_persistence: false,
             privacy_needs_row: false,
         };
         assert!(should_preload_ec_snapshot(&baseline));
@@ -9316,7 +9306,7 @@ mod tests {
             has_kv: true,
             marker_valid: true,
             auction_needs_row: false,
-            eid_cookie_may_need_persistence: false,
+            eids_may_need_persistence: false,
             privacy_needs_row: false,
         };
         assert!(!should_preload_ec_snapshot(&marker_only));
@@ -9325,7 +9315,7 @@ mod tests {
             ..marker_only
         }));
         assert!(should_preload_ec_snapshot(&EcSnapshotPreloadInput {
-            eid_cookie_may_need_persistence: true,
+            eids_may_need_persistence: true,
             ..marker_only
         }));
         assert!(should_preload_ec_snapshot(&EcSnapshotPreloadInput {
@@ -9846,11 +9836,16 @@ mod tests {
             .then(scheduling_slot)
             .into_iter()
             .collect::<Vec<_>>();
-        let mut request = navigation_request();
+        let request = navigation_request();
         if has_eid_cookie {
-            request
-                .headers_mut()
-                .insert(header::COOKIE, HeaderValue::from_static("ts-eids=present"));
+            ec_context.set_module_eids_for_test(vec![crate::openrtb::Eid {
+                source: "ssp.example.com".to_owned(),
+                uids: vec![crate::openrtb::Uid {
+                    id: "present".to_owned(),
+                    atype: Some(1),
+                    ext: None,
+                }],
+            }]);
         }
 
         let integration_registry = test_registry(&settings);
@@ -17293,7 +17288,6 @@ mod tests {
                         &mut ec_context,
                         Some(&graph),
                         &partners,
-                        None,
                         None,
                         &mut response,
                         &services,
@@ -32802,7 +32796,6 @@ mod tests {
                     &mut ec_context,
                     Some(&graph),
                     &PartnerRegistry::empty(),
-                    None,
                     None,
                     &mut response,
                     &crate::platform::test_support::noop_services(),

@@ -1496,7 +1496,7 @@ mod tests {
             ),
             (
                 "Set-Cookie",
-                "  TS-EIDS=x; Path=/",
+                "  TS-ECR=x; Path=/",
                 ReservedResponseEffect::ManagedCookie,
             ),
             ("x-ts-ec", "spoofed", ReservedResponseEffect::ReservedHeader),

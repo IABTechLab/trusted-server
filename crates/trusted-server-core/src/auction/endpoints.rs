@@ -10,14 +10,11 @@ use serde_json::Value as JsonValue;
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_permissions};
-use crate::constants::COOKIE_EIDS;
-use crate::cookies::extract_cookie_value;
 use crate::ec::EcContext;
 use crate::ec::EcKvSnapshot;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::kv_types::MAX_UID_LENGTH;
-use crate::ec::prebid_eids::parse_prebid_eids_cookie;
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
 use crate::openrtb::{Eid, Uid};
@@ -279,8 +276,8 @@ pub async fn handle_auction(
     }
 
     // Parse client-provided EIDs from the current request body. When the
-    // current request does not include them, fall back to the persisted
-    // `ts-eids` cookie so later requests can still forward the browser's
+    // current request does not include them, fall back to what the identifier
+    // modules learned, so later requests can still forward the browser's
     // full OpenRTB-style EID structure.
     //
     // Gate this on the same identity condition as the EC ID
@@ -293,20 +290,13 @@ pub async fn handle_auction(
     // `/_ts/page-bids` paths, which also resolve client EIDs only when
     // `ec_id.is_some()`.
     let client_eids = if ec_id.is_some() {
-        resolve_client_auction_eids(
-            body.eids.as_ref(),
-            extract_cookie_value(
-                &http_req,
-                &services.public_prefix().cookie_name(COOKIE_EIDS),
-            )
-            .as_deref(),
-        )
+        resolve_client_auction_eids(body.eids.as_ref(), ec_context.module_eids())
     } else {
         None
     };
     // Carry the full request-local EID set to response finalization so KV
     // ingestion uses what this request actually sent, not just whatever fits
-    // in the size-capped `ts-eids` cookie (see `ec::finalize::ec_finalize_response`).
+    // in a module's size-capped cookie (see `ec::finalize::ec_finalize_response`).
     if let Some(eids) = &client_eids {
         ec_context.set_client_eids(eids.clone());
     }
@@ -324,10 +314,10 @@ pub async fn handle_auction(
             .map_or(EcKvSnapshot::NotRead, |kv_key| graph.load_snapshot(&kv_key)),
         _ => EcKvSnapshot::NotRead,
     };
-    // Hand the loaded row to the request context so response finalization —
-    // which runs on an EC context the adapter owns, after this handler returns
-    // — ingests `ts-eids`/`sharedId` updates from this read instead of paying
-    // for a second lookup.
+    // Hand the loaded row to the request context so response finalization,
+    // which runs on an EC context the adapter owns after this handler
+    // returns, ingests the request's identifier updates from this read
+    // instead of paying for a second lookup.
     if !matches!(auction_kv_snapshot, EcKvSnapshot::NotRead) {
         ec_context.set_kv_snapshot(auction_kv_snapshot.clone());
     }
@@ -504,23 +494,14 @@ pub(crate) fn resolve_auction_eids(
     Some(to_eids(&resolved))
 }
 
+/// The EIDs the request body carries, or what the identifier modules learned
+/// when the body carries none.
 pub(crate) fn resolve_client_auction_eids(
     raw: Option<&JsonValue>,
-    cookie_value: Option<&str>,
+    module_eids: &[Eid],
 ) -> Option<Vec<Eid>> {
-    parse_client_auction_eids(raw).or_else(|| parse_cookie_auction_eids(cookie_value))
-}
-
-fn parse_cookie_auction_eids(cookie_value: Option<&str>) -> Option<Vec<Eid>> {
-    let cookie_value = cookie_value?;
-    match parse_prebid_eids_cookie(cookie_value) {
-        Ok(eids) if eids.is_empty() => None,
-        Ok(eids) => Some(eids),
-        Err(_) => {
-            log::trace!("Auction EIDs: failed to parse ts-eids cookie; dropping");
-            None
-        }
-    }
+    parse_client_auction_eids(raw)
+        .or_else(|| (!module_eids.is_empty()).then(|| module_eids.to_vec()))
 }
 
 fn parse_client_auction_eids(raw: Option<&JsonValue>) -> Option<Vec<Eid>> {
@@ -680,8 +661,6 @@ mod tests {
         PlatformResponse,
     };
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD as BASE64;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -768,7 +747,7 @@ mod tests {
     async fn auction_endpoint_snapshot_is_reused_by_response_finalization() {
         // `/auction` loads the identity-graph row to resolve server-side EIDs.
         // Finalization runs afterwards on the same EC context and ingests
-        // `ts-eids`/`sharedId` updates. Both must be served by a single billable
+        // the request's identifier updates. Both must be served by a single billable
         // read: before the snapshot was shared, finalization saw `NotRead` and
         // paid for a second lookup.
         let settings = create_test_settings();
@@ -840,7 +819,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
             Some("shared-cookie-id"),
             &mut response,
             &crate::platform::test_support::noop_services(),
@@ -942,13 +920,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auction_body_eids_reach_kv_even_when_the_ts_eids_cookie_is_absent() {
-        // Regression test for #1184: `/auction` sends every EID it has in the
-        // request body, but response finalization used to ingest identity
-        // graph updates only from the `ts-eids` cookie — which the browser
-        // caps in size and may not have sent at all. `handle_auction` must
-        // hand its parsed body EIDs to `ec_context` so finalization ingests
-        // them regardless of what the cookie carried.
+    async fn auction_body_eids_reach_kv_even_when_no_module_learned_any() {
+        // `/auction` sends every EID it has in the request body, and a
+        // module's cookie is capped in size and may not have been sent at
+        // all. `handle_auction` must hand its parsed body EIDs to
+        // `ec_context` so finalization ingests them regardless of what the
+        // modules learned.
         let settings = create_test_settings();
         let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
             enabled: true,
@@ -1026,7 +1003,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None, // No `ts-eids` cookie on this request at all.
             None,
             &mut response,
             &noop_services(),
@@ -1040,7 +1016,7 @@ mod tests {
         assert_eq!(
             stored.ids.get("id5-sync.com").map(|id| id.uid.as_str()),
             Some("ID5_from_body"),
-            "the body's EID must be ingested into KV without a ts-eids cookie"
+            "the body's EID must be ingested into KV when no module learned any"
         );
     }
 
@@ -1546,15 +1522,16 @@ mod tests {
             },
         );
 
-        // Persistent EIDs supplied in both the request body and the ts-eids cookie.
-        let cookie_payload = json!([
-            {
-                "source": "sharedid.org",
-                "uids": [{ "id": "cookie_uid", "atype": 3 }]
-            }
-        ]);
-        let encoded_cookie = BASE64
-            .encode(serde_json::to_vec(&cookie_payload).expect("should serialize cookie payload"));
+        // Persistent EIDs supplied both in the request body and by an
+        // identifier module.
+        ec_context.set_module_eids_for_test(vec![Eid {
+            source: "sharedid.org".to_owned(),
+            uids: vec![Uid {
+                id: "module_uid".to_owned(),
+                atype: Some(3),
+                ext: None,
+            }],
+        }]);
         let body = json!({
             "adUnits": [
                 {
@@ -1572,7 +1549,6 @@ mod tests {
         let req = Request::builder()
             .method("POST")
             .uri("https://test-publisher.com/auction")
-            .header("cookie", format!("ts-{COOKIE_EIDS}={encoded_cookie}"))
             .body(EdgeBody::from(
                 serde_json::to_vec(&body).expect("should serialize body"),
             ))
@@ -1669,56 +1645,66 @@ mod tests {
         );
     }
 
+    fn module_eids_for_tests() -> Vec<Eid> {
+        vec![Eid {
+            source: "sharedid.org".to_owned(),
+            uids: vec![
+                Uid {
+                    id: "shared_module".to_owned(),
+                    atype: Some(3),
+                    ext: None,
+                },
+                Uid {
+                    id: "shared_module_2".to_owned(),
+                    atype: None,
+                    ext: Some(json!({ "provider": "example" })),
+                },
+            ],
+        }]
+    }
+
     #[test]
-    fn resolve_client_auction_eids_falls_back_to_ts_eids_cookie() {
-        let cookie_payload = json!([
-            {
-                "source": "sharedid.org",
-                "uids": [
-                    { "id": "shared_cookie", "atype": 3 },
-                    { "id": "shared_cookie_2", "ext": { "provider": "example" } }
-                ]
-            }
-        ]);
-        let encoded = BASE64
-            .encode(serde_json::to_vec(&cookie_payload).expect("should serialize cookie payload"));
+    fn resolve_client_auction_eids_falls_back_to_module_eids() {
+        let resolved = resolve_client_auction_eids(None, &module_eids_for_tests())
+            .expect("should fall back to what the modules learned");
 
-        let resolved = resolve_client_auction_eids(None, Some(&encoded))
-            .expect("should fall back to structured ts-eids cookie");
-
-        assert_eq!(resolved.len(), 1, "should preserve cookie source entry");
+        assert_eq!(
+            resolved.len(),
+            1,
+            "should preserve the module's source entry"
+        );
         assert_eq!(resolved[0].source, "sharedid.org");
         assert_eq!(
             resolved[0].uids.len(),
             2,
-            "should preserve multiple cookie UIDs"
+            "should preserve multiple module UIDs"
         );
-        assert_eq!(resolved[0].uids[0].id, "shared_cookie");
+        assert_eq!(resolved[0].uids[0].id, "shared_module");
         assert_eq!(
             resolved[0].uids[1].ext,
             Some(json!({ "provider": "example" })),
-            "should preserve UID ext from cookie fallback"
+            "should preserve UID ext from the module fallback"
         );
     }
 
     #[test]
-    fn resolve_client_auction_eids_prefers_request_body_over_cookie() {
+    fn resolve_client_auction_eids_is_none_when_nothing_was_learned() {
+        assert!(
+            resolve_client_auction_eids(None, &[]).is_none(),
+            "no body and nothing learned should resolve to no EIDs"
+        );
+    }
+
+    #[test]
+    fn resolve_client_auction_eids_prefers_request_body_over_module_eids() {
         let raw = json!([
             {
                 "source": "id5-sync.com",
                 "uids": [{ "id": "body_uid", "atype": 1 }]
             }
         ]);
-        let cookie_payload = json!([
-            {
-                "source": "sharedid.org",
-                "uids": [{ "id": "cookie_uid", "atype": 3 }]
-            }
-        ]);
-        let encoded = BASE64
-            .encode(serde_json::to_vec(&cookie_payload).expect("should serialize cookie payload"));
 
-        let resolved = resolve_client_auction_eids(Some(&raw), Some(&encoded))
+        let resolved = resolve_client_auction_eids(Some(&raw), &module_eids_for_tests())
             .expect("should prefer request body EIDs");
 
         assert_eq!(resolved.len(), 1, "should use request body when present");

@@ -308,6 +308,7 @@ impl AppState {
         if let Some(module) = self.registry.device_module() {
             services = services.with_device_module(module);
         }
+        services = services.with_identifier_modules(self.registry.identifier_modules());
         if let Some(module) = self.registry.asset_cache_module() {
             services = services.with_asset_cache_module(module);
         }

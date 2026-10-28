@@ -984,7 +984,6 @@ async fn apply_edgezero_ec_finalize(
         &mut ec_state.ec_context,
         finalize_kv_graph.as_ref(),
         &partner_registry,
-        ec_state.eids_cookie.as_deref(),
         ec_state.sharedid_cookie.as_deref(),
         response,
         &ec_state.services,

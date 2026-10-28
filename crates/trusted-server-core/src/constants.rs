@@ -12,9 +12,6 @@ pub const COOKIE_EC_RESOLVED: &str = "ecr";
 
 /// Short-lived signed proof that the current EC row has every pull-partner UID.
 pub const COOKIE_EC_PULL_COMPLETE: &str = "ec-pull-complete";
-/// Cookie written by the Trusted Server JS SDK containing a standard-base64-encoded
-/// JSON array of Extended User IDs (`[{ source, uids }]`) from identity providers.
-pub const COOKIE_EIDS: &str = "eids";
 /// The cookie the tester routes set and clear.
 pub const COOKIE_TESTER: &str = "tester";
 pub const COOKIE_SHAREDID: &str = "sharedId";

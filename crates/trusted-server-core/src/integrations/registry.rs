@@ -14,6 +14,7 @@ use crate::auction::AuctionPlan;
 use crate::constants::HEADER_X_TS_EC;
 use crate::ec::EcContext;
 use crate::ec::device::DeviceModule;
+use crate::ec::identifiers::IdentifierModule;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::module::{EcModuleSelection, EdgeCookieModule};
 use crate::error::TrustedServerError;
@@ -693,6 +694,13 @@ pub struct IntegrationRegistration {
     /// Declaring one does not make it serve anything, because a source is only
     /// built where `[source]` or an asset route's `source` table names it.
     pub source_module: Option<(&'static str, Arc<dyn SourceFactory>)>,
+    /// Identifier module this registration supplies, see
+    /// [`crate::ec::identifiers`].
+    ///
+    /// No section selects one. Core asks every running registration's module
+    /// on every request, so declaring one runs it wherever the registration
+    /// itself runs.
+    pub identifier_module: Option<Arc<dyn IdentifierModule>>,
     /// Asset cache module this registration supplies, under its name.
     ///
     /// Taken only from the registration of the builder `[asset-cache]`
@@ -730,6 +738,7 @@ impl IntegrationRegistrationBuilder {
                 prefix_module: None,
                 robots_txt_contributor: None,
                 source_module: None,
+                identifier_module: None,
                 asset_cache_module: None,
             },
         }
@@ -834,6 +843,15 @@ impl IntegrationRegistrationBuilder {
         factory: Arc<dyn SourceFactory>,
     ) -> Self {
         self.registration.source_module = Some((name, factory));
+        self
+    }
+
+    /// Declare the identifier module this registration supplies, which core
+    /// asks for the identifiers it learned on every request the registration
+    /// runs for, see [`crate::ec::identifiers`].
+    #[must_use]
+    pub fn with_identifier_module(mut self, module: Arc<dyn IdentifierModule>) -> Self {
+        self.registration.identifier_module = Some(module);
         self
     }
 
@@ -994,6 +1012,10 @@ struct IntegrationRegistryInner {
     // The publisher's source and each asset route's, in route order, built
     // from the settings. `None` for a registry built without settings.
     sources: Option<BuiltSources>,
+    // The identifier modules the running registrations supply, in
+    // registration order, which core asks on every request. Shared, so a
+    // request's services take a reference count rather than a copy.
+    identifier_modules: Arc<[Arc<dyn IdentifierModule>]>,
     // The asset cache module of the builder `[asset-cache]` selects, or
     // `None` when it selects none.
     asset_cache_module: Option<Arc<dyn AssetCacheModule>>,
@@ -1042,6 +1064,7 @@ impl Default for IntegrationRegistryInner {
             prefix_module: SelectedPrefixModule::default(),
             source_modules: Vec::new(),
             sources: None,
+            identifier_modules: Arc::default(),
             asset_cache_module: None,
         }
     }
@@ -2118,6 +2141,7 @@ impl IntegrationRegistry {
         // The geo, Edge Cookie and device module names taken so far, with the
         // integration that supplies each.
         let mut claimed = Vec::new();
+        let mut identifier_modules = Vec::new();
         for registration in plan_registrations.into_iter().chain(registrations) {
             inner
                 .running_integration_ids
@@ -2240,6 +2264,15 @@ impl IntegrationRegistry {
                 claim_module_name(&mut claimed, "source", name, registration.integration_id)?;
                 inner.source_modules.push((name, factory));
             }
+            if let Some(module) = registration.identifier_module {
+                claim_module_name(
+                    &mut claimed,
+                    "identifier",
+                    module.id(),
+                    registration.integration_id,
+                )?;
+                identifier_modules.push(module);
+            }
             if let Some((name, contributor)) = registration.robots_txt_contributor {
                 claim_module_name(
                     &mut claimed,
@@ -2327,6 +2360,7 @@ impl IntegrationRegistry {
         inner.device_module = resolve_device_module(settings, &inner)?;
         inner.prefix_module = resolve_prefix_module(settings, &inner)?;
         inner.sources = Some(build_sources(settings, &inner.source_modules)?);
+        inner.identifier_modules = Arc::from(identifier_modules);
         inner.geo_module = geo_module;
         check_robots_txt_selection(settings, &inner)?;
         if let Some(config) = settings.robots_txt.as_ref() {
@@ -2397,6 +2431,14 @@ impl IntegrationRegistry {
     #[must_use]
     pub fn prefix_module(&self) -> &SelectedPrefixModule {
         &self.inner.prefix_module
+    }
+
+    /// The identifier modules the running registrations supply, in
+    /// registration order, which core asks on every request. Shared, so a
+    /// request's services take a reference count rather than a copy.
+    #[must_use]
+    pub fn identifier_modules(&self) -> Arc<[Arc<dyn IdentifierModule>]> {
+        Arc::clone(&self.inner.identifier_modules)
     }
 
     /// The prefixes of the publisher `request` was resolved to under
@@ -3003,6 +3045,7 @@ impl IntegrationRegistry {
                 prefix_module: SelectedPrefixModule::default(),
                 source_modules: Vec::new(),
                 sources: None,
+                identifier_modules: Arc::default(),
                 asset_cache_module: None,
             }),
             plan: None,
@@ -3088,6 +3131,7 @@ impl IntegrationRegistry {
                 prefix_module: SelectedPrefixModule::default(),
                 source_modules: Vec::new(),
                 sources: None,
+                identifier_modules: Arc::default(),
                 asset_cache_module: None,
             }),
             plan: None,
@@ -7522,6 +7566,154 @@ mod tests {
             message.contains("the geo module `testing.geo-probe` is declared twice")
                 && message.contains("`geo-probe`")
                 && message.contains("`geo-second`"),
+            "error should name the module and both integrations: {message}"
+        );
+    }
+
+    /// Identifier modules that learn nothing, each under a fixed name as
+    /// every module has.
+    #[derive(Debug)]
+    enum IdleIdentifiers {
+        Probe,
+        Second,
+    }
+
+    impl crate::ec::identifiers::IdentifierModule for IdleIdentifiers {
+        fn id(&self) -> &'static str {
+            match self {
+                Self::Probe => IDENTIFIER_PROBE_MODULE,
+                Self::Second => IDENTIFIER_SECOND_MODULE,
+            }
+        }
+
+        fn identifiers(
+            &self,
+            _call: crate::module_context::ModuleCall<'_>,
+        ) -> Result<Vec<crate::openrtb::Eid>, crate::module_context::Withheld> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The names the two identifier test modules run under.
+    const IDENTIFIER_PROBE_MODULE: &str = "testing.identifier-probe";
+    const IDENTIFIER_SECOND_MODULE: &str = "testing.identifier-second";
+
+    fn identifier_probe_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("identifier-probe")
+                .with_identifier_module(Arc::new(IdleIdentifiers::Probe))
+                .build(),
+        ))
+    }
+
+    fn identifier_second_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("identifier-second")
+                .with_identifier_module(Arc::new(IdleIdentifiers::Second))
+                .build(),
+        ))
+    }
+
+    /// A second registration declaring its identifier module under the
+    /// first's name.
+    fn identifier_same_name_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("identifier-second")
+                .with_identifier_module(Arc::new(IdleIdentifiers::Probe))
+                .build(),
+        ))
+    }
+
+    fn identifier_probe_builder() -> crate::integrations::IntegrationBuilder {
+        crate::integrations::IntegrationBuilder::new(
+            "identifier-probe",
+            "seam-probe",
+            identifier_probe_registration,
+            validate_nothing,
+        )
+        .with_module_name(IDENTIFIER_PROBE_MODULE)
+    }
+
+    /// No section selects an identifier module. Every running registration's
+    /// is handed out, in registration order, for core to ask on each request.
+    #[test]
+    fn identifier_modules_are_handed_out_in_registration_order() {
+        let mut settings = settings_naming(IDENTIFIER_PROBE_MODULE);
+        settings.select_module("testing", IDENTIFIER_SECOND_MODULE);
+        let extra = [
+            identifier_probe_builder(),
+            crate::integrations::IntegrationBuilder::new(
+                "identifier-second",
+                "seam-probe",
+                identifier_second_registration,
+                validate_nothing,
+            )
+            .with_module_name(IDENTIFIER_SECOND_MODULE),
+        ];
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build a registry with two identifier modules");
+
+        let ids: Vec<_> = registry
+            .identifier_modules()
+            .iter()
+            .map(|module| module.id())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![IDENTIFIER_PROBE_MODULE, IDENTIFIER_SECOND_MODULE],
+            "should hand out every running registration's module in order"
+        );
+    }
+
+    /// A registration a section does not select runs nothing, its identifier
+    /// module included.
+    #[test]
+    fn an_unselected_registration_offers_no_identifier_module() {
+        let settings = crate::test_support::tests::create_test_settings();
+
+        let registry =
+            IntegrationRegistry::with_registrations(&settings, &[identifier_probe_builder()])
+                .expect("should build a registry without the probe selected");
+
+        assert!(
+            registry.identifier_modules().is_empty(),
+            "an unselected registration's identifier module should not be asked"
+        );
+    }
+
+    /// Two registrations declaring an identifier module under one name would
+    /// leave a log unable to say which answered, so the pair is refused.
+    #[test]
+    fn two_registrations_declaring_one_identifier_module_name_are_refused() {
+        let mut settings = settings_naming(IDENTIFIER_PROBE_MODULE);
+        settings.select_module("testing", IDENTIFIER_SECOND_MODULE);
+        let extra = [
+            identifier_probe_builder(),
+            crate::integrations::IntegrationBuilder::new(
+                "identifier-second",
+                "seam-probe",
+                identifier_same_name_registration,
+                validate_nothing,
+            )
+            .with_module_name(IDENTIFIER_SECOND_MODULE),
+        ];
+
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
+            .err()
+            .expect("should refuse one identifier module name declared twice");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("the identifier module `testing.identifier-probe` is declared twice")
+                && message.contains("`identifier-probe`")
+                && message.contains("`identifier-second`"),
             "error should name the module and both integrations: {message}"
         );
     }

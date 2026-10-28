@@ -53,8 +53,8 @@
 //! - [`build_ec_request_state`] runs before every dispatched route (except
 //!   batch-sync, which uses Bearer auth)
 //!   and reproduces the legacy
-//!   pre-routing prelude: device signals, bot gate, `ts-eids`/`sharedid`
-//!   cookie capture, geo lookup, [`EcContext`] creation, and KV-graph gating.
+//!   pre-routing prelude: device signals, bot gate, `sharedId` cookie
+//!   capture, geo lookup, [`EcContext`] creation, and KV-graph gating.
 //! - `handle_auction` and integration proxy dispatch receive the same
 //!   [`EcContext`], [`KvIdentityGraph`], and [`PartnerRegistry`] inputs as
 //!   legacy; the publisher fallback generates EC IDs for browser navigations.
@@ -100,7 +100,7 @@ use trusted_server_core::auction::{
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::closed_paths::closed_path_response;
 use trusted_server_core::config_payload::DEFAULT_SECRET_STORE_ID;
-use trusted_server_core::constants::{COOKIE_EIDS, COOKIE_SHAREDID};
+use trusted_server_core::constants::COOKIE_SHAREDID;
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
@@ -532,6 +532,7 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
     if let Some(module) = state.registry.asset_cache_module() {
         services = services.with_asset_cache_module(module);
     }
+    let services = services.with_identifier_modules(state.registry.identifier_modules());
     // The publisher this request resolved to, its tenant included, names
     // every key in a shared store and every name the browser holds.
     let prefixes = state.registry.prefixes(
@@ -610,7 +611,6 @@ pub(crate) struct EcFinalizeState {
     /// in response extensions, so `edgezero_main` rebuilds the graph from
     /// settings when this is set.
     pub(crate) use_finalize_kv: bool,
-    pub(crate) eids_cookie: Option<String>,
     pub(crate) sharedid_cookie: Option<String>,
     pub(crate) is_real_browser: bool,
     /// Per-request services carried to the entry point so the pull-sync
@@ -628,7 +628,6 @@ struct EcRequestState {
     ec_context: EcContext,
     kv_graph: Option<KvIdentityGraph>,
     finalize_kv_graph: Option<KvIdentityGraph>,
-    eids_cookie: Option<String>,
     sharedid_cookie: Option<String>,
     is_real_browser: bool,
     services: RuntimeServices,
@@ -648,7 +647,6 @@ impl EcRequestState {
         EcFinalizeState {
             ec_context: self.ec_context,
             use_finalize_kv: self.finalize_kv_graph.is_some(),
-            eids_cookie: self.eids_cookie,
             sharedid_cookie: self.sharedid_cookie,
             is_real_browser: self.is_real_browser,
             services: self.services,
@@ -706,8 +704,6 @@ async fn build_ec_request_state(
         );
     }
 
-    let eids_cookie =
-        crate::extract_cookie_value(req, &services.public_prefix().cookie_name(COOKIE_EIDS));
     let sharedid_cookie = crate::extract_cookie_value(req, COOKIE_SHAREDID);
 
     let (ec_context, setup_error) =
@@ -746,7 +742,6 @@ async fn build_ec_request_state(
         ec_context,
         kv_graph,
         finalize_kv_graph,
-        eids_cookie,
         sharedid_cookie,
         is_real_browser,
         services: services.clone(),
@@ -1034,8 +1029,6 @@ async fn run_named_route(
 fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
     let device_signals = device_signals_for(&req);
     let is_real_browser = device_signals.looks_like_browser;
-    let eids_cookie =
-        crate::extract_cookie_value(&req, &services.public_prefix().cookie_name(COOKIE_EIDS));
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
     let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
@@ -1054,7 +1047,6 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
     response.extensions_mut().insert(EcFinalizeState {
         ec_context: EcContext::default(),
         use_finalize_kv: false,
-        eids_cookie,
         sharedid_cookie,
         is_real_browser,
         services: services.clone(),

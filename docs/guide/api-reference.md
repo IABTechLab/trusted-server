@@ -516,7 +516,7 @@ curl 'https://edge.example.com/_ts/page-bids?path=%2Fnews&format=json' \
 
 ## Edge Cookie Endpoints
 
-Partners are configured statically in `[[ec.partners]]` and loaded into an in-memory registry at startup. There is no runtime partner-registration endpoint and the legacy browser pixel sync endpoint has been removed; browser-resolved IDs are ingested through Prebid EID cookies.
+Partners are configured statically in `[[ec.partners]]` and loaded into an in-memory registry at startup. There is no runtime partner-registration endpoint and the legacy browser pixel sync endpoint has been removed; browser-resolved IDs are ingested through the identifier modules a build links, such as the Prebid module reading its `ts-eids` cookie.
 
 ---
 

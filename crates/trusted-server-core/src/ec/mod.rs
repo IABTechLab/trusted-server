@@ -29,6 +29,8 @@
 //! - [`rate_limiter`] — Rate limiting abstraction (implemented by adapters)
 //! - [`identify`] — Identity read endpoint (`GET /_ts/api/v1/identify`)
 //! - [`eids`] — Shared EID resolution and formatting helpers
+//! - [`identifiers`]: the identifier module interface, and the sync of what
+//!   a module learned into the identity graph
 //! - [`batch_sync`] — S2S batch sync endpoint (`POST /_ts/api/v1/batch-sync`)
 //! - [`pull_sync`] — Background pull-sync dispatcher for organic routes
 
@@ -41,13 +43,13 @@ pub mod device;
 pub mod eids;
 pub mod finalize;
 pub mod generation;
+pub mod identifiers;
 pub mod identify;
 pub mod kv;
 pub mod kv_backend;
 pub mod kv_types;
 pub mod module;
 pub mod partner;
-pub mod prebid_eids;
 pub mod pull_sync;
 pub(crate) mod pull_sync_marker;
 pub mod rate_limiter;
@@ -318,11 +320,17 @@ pub struct EcContext {
     /// and writes, from the request's services.
     public_prefix: PublicPrefix,
     /// EIDs the route resolved from the current request: the `/auction` JSON
-    /// body, or the `ts-eids` cookie when the body carried none. Carried to
-    /// response finalization so KV ingestion can use the full set the client
-    /// sent instead of being limited to whatever fits in the size-capped
-    /// `ts-eids` cookie.
+    /// body, or what the identifier modules learned when the body carried
+    /// none. Carried to response finalization so KV ingestion can use the
+    /// full set the client sent instead of being limited to whatever fits in
+    /// a module's size-capped cookie.
     client_eids: Option<Vec<Eid>>,
+    /// Identifiers the identifier modules learned for the request, asked
+    /// once when the state was read, where the request's evidence is in
+    /// hand. Carried to response finalization, which offers them to the
+    /// identity graph, and to the auction, which forwards them when the
+    /// request body carries none.
+    module_eids: Vec<Eid>,
     /// Browser-carried proof of recent pull-partner completeness.
     pull_sync_marker: PullSyncMarkerState,
     /// Allowed returning-user EID persistence source, assigned only after request filters pass.
@@ -526,6 +534,19 @@ impl EcContext {
             geo_status,
             services.permission_signal_modules(),
         );
+        // Ask the identifier modules once, here, where the request's evidence
+        // is in hand, and carry the answer to finalization and the auction,
+        // which run after routing has consumed the request. With no Edge
+        // Cookie module nothing can hold or forward an identifier, so none
+        // are asked.
+        let module_eids = if selected_module.is_some() {
+            identifiers::learn(
+                &module_context.with_permissions(&permissions),
+                services.identifier_modules(),
+            )
+        } else {
+            Vec::new()
+        };
         // A signal no module vouched for goes no further. The module for
         // its scheme has already decided what its absence means, so what is
         // forwarded is exactly what the permissions were built from.
@@ -564,6 +585,7 @@ impl EcContext {
             recovery_eligible: false,
             public_prefix: services.public_prefix().clone(),
             client_eids: None,
+            module_eids,
             pull_sync_marker: PullSyncMarkerState::from_cookie(parsed.pull_sync_marker),
             eid_sync_source: None,
         })
@@ -1038,6 +1060,18 @@ impl EcContext {
         self.client_eids.as_deref()
     }
 
+    /// The identifiers the identifier modules learned for the request.
+    #[must_use]
+    pub fn module_eids(&self) -> &[Eid] {
+        &self.module_eids
+    }
+
+    /// States what the identifier modules learned, in place of asking them.
+    #[cfg(test)]
+    pub(crate) fn set_module_eids_for_test(&mut self, eids: Vec<Eid>) {
+        self.module_eids = eids;
+    }
+
     /// Validates a browser completeness marker against the active EC and partner set.
     pub(crate) fn validate_pull_sync_marker(
         &mut self,
@@ -1219,6 +1253,7 @@ impl EcContext {
             recovery_eligible: false,
             public_prefix: PublicPrefix::default(),
             client_eids: None,
+            module_eids: Vec::new(),
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
         }
@@ -1266,6 +1301,7 @@ impl EcContext {
             recovery_eligible: false,
             public_prefix: PublicPrefix::default(),
             client_eids: None,
+            module_eids: Vec::new(),
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
         }
@@ -1302,6 +1338,7 @@ impl EcContext {
             recovery_eligible: false,
             public_prefix: PublicPrefix::default(),
             client_eids: None,
+            module_eids: Vec::new(),
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
         }
@@ -2402,7 +2439,6 @@ pub(crate) mod tests {
                 Some(&graph),
                 &registry::PartnerRegistry::empty(),
                 None,
-                None,
                 &mut response,
                 &noop_services(),
             )
@@ -2464,7 +2500,6 @@ pub(crate) mod tests {
             Some(&graph),
             &registry::PartnerRegistry::empty(),
             None,
-            None,
             &mut response,
             &noop_services(),
         )
@@ -2508,7 +2543,6 @@ pub(crate) mod tests {
             ec,
             Some(graph),
             &registry::PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
             &noop_services(),
@@ -2603,7 +2637,6 @@ pub(crate) mod tests {
             &mut ec,
             Some(&graph),
             &registry::PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
             &noop_services(),

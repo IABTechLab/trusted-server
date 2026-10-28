@@ -352,19 +352,29 @@ pub(crate) mod logs {
     use std::sync::Once;
 
     thread_local! {
-        static CAPTURED: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+        /// The least severe level this thread keeps, and the lines kept.
+        static CAPTURED: RefCell<Option<(log::Level, Vec<String>)>> =
+            const { RefCell::new(None) };
     }
 
     struct ThreadLogger;
 
     impl log::Log for ThreadLogger {
-        fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
-            CAPTURED.with(|captured| captured.borrow().is_some())
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            CAPTURED.with(|captured| {
+                captured
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|(level, _)| metadata.level() <= *level)
+            })
         }
 
         fn log(&self, record: &log::Record<'_>) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
             CAPTURED.with(|captured| {
-                if let Some(lines) = captured.borrow_mut().as_mut() {
+                if let Some((_, lines)) = captured.borrow_mut().as_mut() {
                     lines.push(format!("{} {}", record.level(), record.args()));
                 }
             });
@@ -380,13 +390,27 @@ pub(crate) mod logs {
     /// warning level or above, as the level and then the message, such as
     /// `WARN ...`. A future that runs on another thread logs nothing here.
     pub(crate) async fn logged_by<F: Future>(future: F) -> (F::Output, Vec<String>) {
+        logged_at(log::Level::Warn, future).await
+    }
+
+    /// As [`logged_by`], keeping each line at `level` or above.
+    pub(crate) async fn logged_at<F: Future>(
+        level: log::Level,
+        future: F,
+    ) -> (F::Output, Vec<String>) {
         INSTALL.call_once(|| {
             log::set_logger(&LOGGER).expect("should be the only logger the tests install");
-            log::set_max_level(log::LevelFilter::Warn);
+            log::set_max_level(log::LevelFilter::Trace);
         });
-        CAPTURED.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
+        CAPTURED.with(|captured| *captured.borrow_mut() = Some((level, Vec::new())));
         let output = future.await;
-        let lines = CAPTURED.with(|captured| captured.borrow_mut().take().unwrap_or_default());
+        let lines = CAPTURED.with(|captured| {
+            captured
+                .borrow_mut()
+                .take()
+                .map(|(_, lines)| lines)
+                .unwrap_or_default()
+        });
         (output, lines)
     }
 }

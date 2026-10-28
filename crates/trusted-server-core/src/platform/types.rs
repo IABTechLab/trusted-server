@@ -11,6 +11,7 @@ use super::{
 };
 use crate::asset_cache::AssetCacheModule;
 use crate::ec::device::DeviceModule;
+use crate::ec::identifiers::IdentifierModule;
 use crate::ec::module::EdgeCookieModule;
 use crate::evidence::HostSignals;
 use crate::permission_signal::PermissionSignalModule;
@@ -229,6 +230,11 @@ pub struct RuntimeServices {
     /// so building the services for a request bumps a reference count rather
     /// than copying the list, and cloning the services does the same.
     pub(crate) permission_signal_modules: Arc<[Arc<dyn PermissionSignalModule>]>,
+    /// The identifier modules the running registrations supply, asked once
+    /// per request for the identifiers each learned, see
+    /// [`crate::ec::identifiers`]. Empty when none is linked. Shared, as the
+    /// permission signal modules are.
+    pub(crate) identifier_modules: Arc<[Arc<dyn IdentifierModule>]>,
     /// The prefixes of the publisher this request was resolved to, from the
     /// selected prefix module, which start every name the browser holds and
     /// every key in a shared store. See [`crate::prefix`].
@@ -390,6 +396,12 @@ impl RuntimeServices {
     #[must_use]
     pub fn permission_signal_modules(&self) -> &[Arc<dyn PermissionSignalModule>] {
         &self.permission_signal_modules
+    }
+
+    /// The identifier modules the running registrations supply, in order.
+    #[must_use]
+    pub fn identifier_modules(&self) -> &[Arc<dyn IdentifierModule>] {
+        &self.identifier_modules
     }
 
     /// The device module a module supplied, when `[device] module` selected
@@ -573,6 +585,17 @@ impl RuntimeServices {
         Self { prefixes, ..self }
     }
 
+    /// Returns a clone of this instance carrying the identifier modules the
+    /// running registrations supply, through
+    /// [`IntegrationRegistry::identifier_modules`](crate::integrations::IntegrationRegistry::identifier_modules).
+    #[must_use]
+    pub fn with_identifier_modules(self, modules: Arc<[Arc<dyn IdentifierModule>]>) -> Self {
+        Self {
+            identifier_modules: modules,
+            ..self
+        }
+    }
+
     /// Returns a clone of this instance with the loading caches replaced.
     #[must_use]
     pub fn with_loading_caches(self, caches: Arc<super::LoadingCaches>) -> Self {
@@ -655,6 +678,7 @@ pub struct RuntimeServicesBuilder {
     device_module: Option<Arc<dyn DeviceModule>>,
     prefixes: Option<crate::prefix::Prefixes>,
     permission_signal_modules: Arc<[Arc<dyn PermissionSignalModule>]>,
+    identifier_modules: Arc<[Arc<dyn IdentifierModule>]>,
     permission_policy: Option<Arc<PermissionPolicy>>,
 }
 
@@ -678,6 +702,7 @@ impl RuntimeServicesBuilder {
             device_module: None,
             prefixes: None,
             permission_signal_modules: Arc::default(),
+            identifier_modules: Arc::default(),
             permission_policy: None,
         }
     }
@@ -814,6 +839,18 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Set the identifier modules the running registrations supply, which
+    /// core asks once per request.
+    ///
+    /// Optional, and empty when unset. An adapter hands in what
+    /// [`IntegrationRegistry::identifier_modules`](crate::integrations::IntegrationRegistry::identifier_modules)
+    /// gives.
+    #[must_use]
+    pub fn identifier_modules(mut self, modules: Arc<[Arc<dyn IdentifierModule>]>) -> Self {
+        self.identifier_modules = modules;
+        self
+    }
+
     /// Set the prefixes of the publisher the request was resolved to.
     ///
     /// Optional in the builder, because services built for no request, such
@@ -887,6 +924,7 @@ impl RuntimeServicesBuilder {
             asset_cache_module: None,
             prefixes: self.prefixes.unwrap_or_default(),
             permission_signal_modules: self.permission_signal_modules,
+            identifier_modules: self.identifier_modules,
             permission_policy: self
                 .permission_policy
                 .expect("should set permission_policy before building RuntimeServices"),

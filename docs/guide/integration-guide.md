@@ -468,6 +468,7 @@ builder every integration uses.
 | ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
 | `.with_proxy(...)`                                    | Routes the paths the proxy declares                                                                             |
 | `.with_request_filter(...)`                           | Inspects a request and can turn it back before it reaches the origin                                            |
+| `.with_identifier_module(...)`                        | Hands core the identifiers the module learned, asked at each Edge Cookie read when `[ec] module` names a module |
 | `.with_middleware(...)`                               | Offers a page change that an entry may place by the middleware's name                                           |
 | `.with_bundle_tag_attribute(name, value)`             | Puts an attribute on the script bundle's tag, for a browser module that reads a setting from it                 |
 | `.with_js_module(CarriedJsModule { source, sha256 })` | Carries the integration's own browser script, built outside `trusted-server-js`                                 |
@@ -883,6 +884,26 @@ in the browser from the bundle tag's `data-ts-public-prefix` attribute rather
 than holding a copy. A public prefix's parts are letters, digits, `_`, `-` and
 `.`, and the first starts with a letter or a single `_`, so every form is a
 valid cookie name and no cookie name starts with `__`.
+
+### Handing core the identifiers a request carries
+
+A crate whose page script persists identifiers in the browser, or that learns
+them for a request another way, hands them to core by declaring an
+`IdentifierModule` with `.with_identifier_module(...)`. No section selects
+one. Core asks every running registration's module once per request, when it
+reads the Edge Cookie state and `[ec] module` names a module, through a module
+call carrying the request's evidence, settings, services, consent, client
+information and resolved permissions, and its geo when the location was found,
+and the module names what it reads with `call.inject`. What it returns is a
+list of OpenRTB-style `Eid` entries, in the order it offers them, so that
+where two carry the same partner the later one is the candidate.
+
+Core syncs what every module learned to the identity graph when it finalizes
+the response, after the request body's own EIDs, and forwards it in the
+auction when the body carries none. The cookie a module reads is the module's
+own, named through `services.public_prefix().cookie_name(...)`, and core
+names it nowhere. The Prebid module, `crates/auction/prebid`, is the module
+that reads the `ts-eids` cookie its script writes.
 
 ### A vendor's shared table
 

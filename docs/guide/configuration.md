@@ -3443,8 +3443,9 @@ The optional cookie lists control both template lookup and storage:
 Cookie names match exactly and case-sensitively: `session` and `Session` are
 different names. Use nonempty ASCII HTTP token names; whitespace, `;`, `=`, and
 non-ASCII characters are invalid. Configuration rejects invalid names, duplicates
-within a list, overlap between lists, and TS identity cookies (`ts-ec`, `ts-eids`,
-`sharedId`) in the key list. Identity cookies may be listed for bypass. Wildcards,
+within a list, overlap between lists, and identity cookies in the key list, being
+any cookie under the public prefix (such as `ts-ec`) and `sharedId`. Identity
+cookies may be listed for bypass. Wildcards,
 prefixes, and regular expressions are not supported. With either list nonempty, parsing of all
 `Cookie` fields after existing request preparation bypasses duplicate key-cookie names,
 invalid names, and malformed key-cookie values. When independence is `true`,
