@@ -1324,6 +1324,8 @@ mod tests {
             "#,
         )
         .expect("should parse test settings")
+        // A loaded domain carries its policy.
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
     }
 
     /// A device module standing in for one a registration supplies. It marks
