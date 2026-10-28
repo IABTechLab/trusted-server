@@ -1,0 +1,9 @@
+[tag]
+modules = ["google-tag"]
+
+[tag.google-tag]
+analytics_tag_id = "G-XXXXXXXXXX"
+
+[[serve]]
+media_type = "text/html"
+middleware = ["tag.google-tag"]

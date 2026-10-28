@@ -191,6 +191,13 @@ pub fn seam_probe_head_marker(country: &str) -> String {
     format!("<meta name=\"seam-probe-country\" content=\"{country}\">")
 }
 
+/// The markup the probe's middleware writes immediately after the opening
+/// body tag, so a test can see that place is reached.
+#[must_use]
+pub fn seam_probe_body_marker() -> String {
+    "<!-- seam-probe body -->".to_owned()
+}
+
 /// The word the probe's middleware swaps for the country, in the text of a
 /// script that carries `data-seam-probe`.
 pub const SEAM_PROBE_SCRIPT_WORD: &str = "SEAM_PROBE_COUNTRY";
@@ -229,6 +236,7 @@ impl Middleware for SeamProbeMiddleware {
     fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
         MiddlewareAction {
             head_inserts: vec![seam_probe_head_marker(&self.country)],
+            body_open_inserts: vec![seam_probe_body_marker()],
             element_handlers: vec![Box::new(AttributeRewrite::matching(
                 "a[data-seam-probe]",
                 "href",
@@ -1169,6 +1177,15 @@ mod tests {
                 page.matches(&seam_probe_head_marker("NZ")).count(),
                 1,
                 "should mark the head once, with the country the probe is set to: {page}"
+            );
+            assert_eq!(
+                page.matches(&seam_probe_body_marker()).count(),
+                1,
+                "should mark the body once: {page}"
+            );
+            assert!(
+                page.contains(&format!("<body>{}", seam_probe_body_marker())),
+                "should mark immediately after the opening body tag: {page}"
             );
             assert!(
                 page.contains(&format!(

@@ -295,6 +295,11 @@ pub struct MiddlewareAction {
     /// deferred one, for a script that needs the bundle to have run and has
     /// to run before the page's own scripts.
     pub after_bundle_inserts: Vec<String>,
+    /// Markup to write immediately after the opening `<body>` tag, once per
+    /// document, in the order given, for a vendor's installation whose second
+    /// part goes there and nowhere else. A document with no `<body>` gets
+    /// none, and a second `<body>` in a template fragment gets nothing.
+    pub body_open_inserts: Vec<String>,
     /// Decisions about elements.
     pub element_handlers: Vec<Box<dyn ElementHandler>>,
     /// Decisions about the text inside elements.
@@ -327,6 +332,7 @@ impl MiddlewareAction {
     pub fn is_stream_only(&self) -> bool {
         self.head_inserts.is_empty()
             && self.after_bundle_inserts.is_empty()
+            && self.body_open_inserts.is_empty()
             && self.element_handlers.is_empty()
             && self.text_handlers.is_empty()
     }
@@ -361,6 +367,7 @@ impl fmt::Debug for MiddlewareAction {
             .debug_struct("MiddlewareAction")
             .field("head_inserts", &self.head_inserts)
             .field("after_bundle_inserts", &self.after_bundle_inserts)
+            .field("body_open_inserts", &self.body_open_inserts)
             .field(
                 "element_handlers",
                 &selectors_of_elements(&self.element_handlers),
@@ -937,6 +944,7 @@ impl MiddlewareChain {
             plan.head_inserts.extend(action.head_inserts);
             plan.after_bundle_inserts
                 .extend(action.after_bundle_inserts);
+            plan.body_open_inserts.extend(action.body_open_inserts);
             plan.element_handlers.extend(action.element_handlers);
             plan.text_handlers.extend(action.text_handlers);
             plan.processors.extend(action.stream);
@@ -955,6 +963,9 @@ pub struct MiddlewarePlan {
     /// Markup for straight after the main script bundle, in the order it is
     /// written.
     pub after_bundle_inserts: Vec<String>,
+    /// Markup for immediately after the opening `<body>` tag, in the order it
+    /// is written.
+    pub body_open_inserts: Vec<String>,
     /// Element handlers, in the order the middleware were named. Two that
     /// match one element are both asked, in this order.
     pub element_handlers: Vec<Box<dyn ElementHandler>>,
@@ -973,6 +984,7 @@ impl MiddlewarePlan {
     pub fn is_empty(&self) -> bool {
         self.head_inserts.is_empty()
             && self.after_bundle_inserts.is_empty()
+            && self.body_open_inserts.is_empty()
             && self.element_handlers.is_empty()
             && self.text_handlers.is_empty()
             && self.processors.is_empty()
@@ -986,6 +998,7 @@ impl fmt::Debug for MiddlewarePlan {
             .debug_struct("MiddlewarePlan")
             .field("head_inserts", &self.head_inserts)
             .field("after_bundle_inserts", &self.after_bundle_inserts)
+            .field("body_open_inserts", &self.body_open_inserts)
             .field(
                 "element_handlers",
                 &selectors_of_elements(&self.element_handlers),

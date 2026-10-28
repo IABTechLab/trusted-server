@@ -37,6 +37,7 @@ pub fn builders() -> Vec<IntegrationBuilder> {
         trusted_server_cmp_inmobi::builder(),
         trusted_server_cmp_sourcepoint::builder(),
         trusted_server_cmp_osano::builder(),
+        trusted_server_tag_google_tag::builder(),
         trusted_server_tag_google_tag_manager::builder(),
         trusted_server_bot_protection_datadome::builder(),
         trusted_server_ad_tag_google::builder(),
@@ -112,6 +113,7 @@ pub fn middleware() -> Vec<StockMiddleware> {
     use trusted_server_core::service_version;
     use trusted_server_framework_nextjs as nextjs;
     use trusted_server_identity_lockr as lockr;
+    use trusted_server_tag_google_tag as google_tag;
     use trusted_server_tag_google_tag_manager as google_tag_manager;
     use trusted_server_testing_testlight as testlight;
 
@@ -132,6 +134,7 @@ pub fn middleware() -> Vec<StockMiddleware> {
         row(didomi::builder().id(), Fetch, didomi::MODULE),
         row(inmobi::builder().id(), Fetch, inmobi::MODULE),
         row(sourcepoint::builder().id(), Fetch, sourcepoint::MODULE),
+        row(google_tag::builder().id(), Serve, google_tag::MODULE),
         row(
             google_tag_manager::builder().id(),
             Fetch,
@@ -140,6 +143,7 @@ pub fn middleware() -> Vec<StockMiddleware> {
         row(datadome::builder().id(), Fetch, datadome::MODULE),
         row(datadome::builder().id(), Serve, datadome::TAG_MIDDLEWARE),
         row(google::builder().id(), Fetch, google::MODULE),
+        row(google::builder().id(), Serve, google::LOADER_MIDDLEWARE),
         row(
             google::diagnostics::builder().id(),
             Serve,
@@ -207,6 +211,7 @@ mod tests {
         include_str!("../../cmp/didomi/src/fixtures/page-change.settings.toml"),
         include_str!("../../cmp/inmobi/src/fixtures/page-change.settings.toml"),
         include_str!("../../cmp/sourcepoint/src/fixtures/page-change.settings.toml"),
+        include_str!("../../tag/google-tag/src/fixtures/page-change.settings.toml"),
         include_str!("../../tag/google-tag-manager/src/fixtures/page-change.settings.toml"),
         include_str!("../../bot-protection/datadome/src/fixtures/page-change.settings.toml"),
         include_str!("../../ad-tag/google/src/fixtures/page-change.settings.toml"),
@@ -487,6 +492,7 @@ middleware = [\"robots_txt\"]
                 "cmp.inmobi",
                 "cmp.sourcepoint",
                 "cmp.osano",
+                "tag.google-tag",
                 "tag.google-tag-manager",
                 "bot-protection.datadome",
                 "ad-tag.google",

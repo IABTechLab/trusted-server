@@ -385,7 +385,13 @@ pull_sync_concurrency = 3
 
 # [[serve]]
 # media_type = "text/html"
-# middleware = ["bot-protection.datadome.tag", "ad-tag.google.diagnostics", "service_version"]
+# middleware = [
+#   "tag.google-tag",
+#   "bot-protection.datadome.tag",
+#   "ad-tag.google.loader",
+#   "ad-tag.google.diagnostics",
+#   "service_version",
+# ]
 
 # First-party proxying of named third-party scripts. Uncomment the
 # `modules` line under [proxy] below to switch it on.
@@ -901,7 +907,9 @@ auction_timeout_ms = 500
 # overlay can only replace a leaf the document already has, and it names a
 # section as written, so the variable for this leaf is
 # TRUSTED_SERVER__AD-TAG__GOOGLE__GAM_ATTRIBUTION_ENABLED, which a shell's
-# `export` cannot set.
+# `export` cannot set. `write_loader` writes the loader tag, for a page that
+# carries none, where a [[serve]] entry names "ad-tag.google.loader", and
+# only for a reader whose permissions allow storage on the device.
 # [ad-tag]
 # modules = ["google"]
 
@@ -910,11 +918,26 @@ auction_timeout_ms = 500
 # script_url = "https://ads.example.com/gpt.js"
 # cache_ttl_seconds = 3600
 # rewrite_script = true
+# write_loader = false
 
 # GPT runtime diagnostics browser overlay. Selected manually rather than by
 # `ts audit`, it serves a diagnostics module gated behind an activation query
 # param and a session cookie. It has nothing to set, so adding
 # "google.diagnostics" to [ad-tag] modules is the whole configuration.
+
+# Google's tag, Tag Manager container and AdSense loader written on the page
+# from these settings, for a publisher whose pages cannot carry them. The
+# consent mode defaults are written first, and the four consent types Google
+# requires for its own services default to denied. The loaders and the
+# noscript iframe reach only a reader whose permissions allow storage on the
+# device.
+# Name "google-tag" in [tag] modules and "tag.google-tag" in a [[serve]] entry
+# for "text/html". The tag and container ids below are invalid placeholders on
+# purpose, so the table is refused until real ids replace them.
+# [tag.google-tag]
+# analytics_tag_id = "G-REPLACE_ME"
+# container_id = "GTM-REPLACE-ME"
+# adsense_client_id = "ca-pub-0000000000000000"
 
 # Google Tag Manager first-party proxy. `ts audit` selects "google-tag-manager"
 # in [tag] and writes this table with the container_id it finds when it

@@ -6,3 +6,7 @@ disallowed-methods = [
     { path = "std::time::SystemTime::now", reason = "panics on wasm32-unknown-unknown; use `web_time::SystemTime::now`" },
     { path = "std::time::SystemTime::elapsed", reason = "calls `SystemTime::now`, which panics on wasm32-unknown-unknown; use `web_time::SystemTime`" },
 ]
+
+# This config replaces the workspace one for that run, so the words the
+# workspace lets documentation carry without backticks are listed here too.
+doc-valid-idents = ["AdSense", ".."]

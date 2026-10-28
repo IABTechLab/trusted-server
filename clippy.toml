@@ -14,3 +14,5 @@ allow-unwrap-in-tests = true
 # Keep current Trusted Server thresholds while strict lint cleanup is underway.
 cognitive-complexity-threshold = 30
 too-many-lines-threshold = 200
+# Words Clippy would otherwise want in backticks in documentation.
+doc-valid-idents = ["AdSense", ".."]

@@ -10,4 +10,4 @@ middleware = ["ad-tag.google"]
 
 [[serve]]
 media_type = "text/html"
-middleware = ["ad-tag.google.diagnostics"]
+middleware = ["ad-tag.google.loader", "ad-tag.google.diagnostics"]

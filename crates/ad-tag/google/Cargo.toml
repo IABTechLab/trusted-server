@@ -26,6 +26,7 @@ url = { workspace = true }
 validator = { workspace = true }
 
 [dev-dependencies]
+futures = { workspace = true }
 trusted-server-core = { workspace = true, features = ["test-utils"] }
 
 # The visible owner of this vendor crate, the way Prebid.js requires a named

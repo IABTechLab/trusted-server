@@ -1897,6 +1897,7 @@ validation knows is listed below.
 | ----------------------------- | ------------------------------------------------------------------ |
 | `[bot-protection.datadome]`   | [DataDome](/guide/integrations/datadome)                           |
 | `[cmp.didomi]`                | [Didomi](/guide/integrations/didomi)                               |
+| `[tag.google-tag]`            | The Google tag, written on the page from the settings              |
 | `[tag.google-tag-manager]`    | [Google Tag Manager](/guide/integrations/google_tag_manager)       |
 | `[ad-tag.google]`             | [GPT](/guide/integrations/gpt)                                     |
 | `[ad-tag.google.diagnostics]` | [GPT diagnostics](/guide/integrations/gpt-diagnostics)             |
@@ -1924,7 +1925,7 @@ module = "nextjs"
 ```
 
 The modules this repository ships, by section, are `[cmp]` `didomi`,
-`inmobi`, `sourcepoint` and `osano`; `[tag]` `google-tag-manager`; `[ad-tag]` `google`
+`inmobi`, `sourcepoint` and `osano`; `[tag]` `google-tag` and `google-tag-manager`; `[ad-tag]` `google`
 and `google.diagnostics`; `[bot-protection]` `datadome`; `[identity]`
 `lockr`; `[audience]` `permutive`; `[framework]` `nextjs`; `[auction]`
 `prebid` and `testing.testlight`; and `[proxy]` `js_asset_proxy`. A name
@@ -2053,25 +2054,27 @@ consent management platform's middleware runs in either phase, as the
 publisher chooses, and is listed under `[[fetch]]`, which is the phase a
 generated configuration places it in.
 
-| Middleware                    | Phase       | What it changes                                                                                                                                                                                                   |
-| ----------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `auction.prebid`              | `[[fetch]]` | Writes `window.__tsjs_prebid` and the tag that loads the bundle into the head, and removes an element whose `src` or `href` matches `script_patterns`                                                             |
-| `js_asset_proxy`              | `[[fetch]]` | Points each configured script at its first-party path and removes one that is blocked. It is asked about an address as the middleware named before it left it, so name it ahead of one that moves the same script |
-| `testing.testlight`           | `[[fetch]]` | Points a `src` or `href` that names `testlight.js` at the shim, when `rewrite_scripts` is set                                                                                                                     |
-| `framework.nextjs`            | `[[fetch]]` | Moves the origin's address to the publisher's in the data Next.js writes into a page, being the `__NEXT_DATA__` script and the React Server Components payload scripts                                            |
-| `audience.permutive`          | `[[fetch]]` | Points a `src` or `href` that is the Permutive SDK's address at `/integrations/permutive/sdk`, when `rewrite_sdk` is set                                                                                          |
-| `identity.lockr`              | `[[fetch]]` | Points a `src` or `href` that is the lockr SDK's address at `/integrations/lockr/sdk`, when `rewrite_sdk` is set                                                                                                  |
-| `cmp.didomi`                  | `[[fetch]]` | Writes `window.__tsjs_didomi` into the head, which hands the browser module the path Didomi is served under                                                                                                       |
-| `cmp.inmobi`                  | `[[fetch]]` | Writes the IAB TCF stub, InMobi's GPP stub and the deferred Choice loader into the head, in that order                                                                                                            |
-| `cmp.sourcepoint`             | `[[fetch]]` | Writes `window.__tsjs_sourcepoint` into the head and, when `rewrite_sdk` is set, the trap on `window._sp_`, and points a `src` or `href` on Sourcepoint's CDN at `/integrations/sourcepoint/cdn`                  |
-| `tag.google-tag-manager`      | `[[fetch]]` | Points Google Tag Manager and Google Analytics addresses at `/integrations/google_tag_manager`, in `src` and `href` attributes and in the text of inline scripts                                                  |
-| `bot-protection.datadome`     | `[[fetch]]` | Points a `src` or `href` that is a DataDome script's address at `/integrations/datadome`, when `rewrite_sdk` is set                                                                                               |
-| `bot-protection.datadome.tag` | `[[serve]]` | Writes DataDome's client tag into the head, unless the request filter marked the request, `inject_client_side_tag` is off or no `client_side_key` is set                                                          |
-| `ad-tag.google`               | `[[fetch]]` | Writes the `tsjs.adInit` bootstrap into the head and, when `rewrite_script` is set, points a `src` or `href` that is the GPT script's address at `/integrations/gpt/script`                                       |
-| `ad-tag.google.diagnostics`   | `[[serve]]` | For a request that activated diagnostics, writes the bootstrap ahead of the script bundle and the tag that loads the diagnostics module straight after it                                                         |
-| `ads-txt.sellers`             | `[[fetch]]` | Writes the lines `[ads-txt.sellers]` gives at the end of the publisher's `ads.txt`, on `text/plain` alone                                                                                                         |
-| `robots_txt`                  | `[[fetch]]` | Makes the `robots.txt` that `[robots-txt]` describes, in place of whatever the origin answers, on `text/plain` and at `/robots.txt` alone                                                                         |
-| `service_version`             | `[[serve]]` | Writes `X-TS-Version`, the git version the build compiled in, and `X-TS-Service-Version`, the platform's version number of the service, when each is known. Core supplies it, so no section selects it            |
+| Middleware                    | Phase       | What it changes                                                                                                                                                                                                                                                                                                                                                   |
+| ----------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `auction.prebid`              | `[[fetch]]` | Writes `window.__tsjs_prebid` and the tag that loads the bundle into the head, and removes an element whose `src` or `href` matches `script_patterns`                                                                                                                                                                                                             |
+| `js_asset_proxy`              | `[[fetch]]` | Points each configured script at its first-party path and removes one that is blocked. It is asked about an address as the middleware named before it left it, so name it ahead of one that moves the same script                                                                                                                                                 |
+| `testing.testlight`           | `[[fetch]]` | Points a `src` or `href` that names `testlight.js` at the shim, when `rewrite_scripts` is set                                                                                                                                                                                                                                                                     |
+| `framework.nextjs`            | `[[fetch]]` | Moves the origin's address to the publisher's in the data Next.js writes into a page, being the `__NEXT_DATA__` script and the React Server Components payload scripts                                                                                                                                                                                            |
+| `audience.permutive`          | `[[fetch]]` | Points a `src` or `href` that is the Permutive SDK's address at `/integrations/permutive/sdk`, when `rewrite_sdk` is set                                                                                                                                                                                                                                          |
+| `identity.lockr`              | `[[fetch]]` | Points a `src` or `href` that is the lockr SDK's address at `/integrations/lockr/sdk`, when `rewrite_sdk` is set                                                                                                                                                                                                                                                  |
+| `cmp.didomi`                  | `[[fetch]]` | Writes `window.__tsjs_didomi` into the head, which hands the browser module the path Didomi is served under                                                                                                                                                                                                                                                       |
+| `cmp.inmobi`                  | `[[fetch]]` | Writes the IAB TCF stub, InMobi's GPP stub and the deferred Choice loader into the head, in that order                                                                                                                                                                                                                                                            |
+| `cmp.sourcepoint`             | `[[fetch]]` | Writes `window.__tsjs_sourcepoint` into the head and, when `rewrite_sdk` is set, the trap on `window._sp_`, and points a `src` or `href` on Sourcepoint's CDN at `/integrations/sourcepoint/cdn`                                                                                                                                                                  |
+| `tag.google-tag`              | `[[serve]]` | Writes the consent mode defaults in the head before the script bundle's tag. For a reader whose permissions allow storage on the device, it also writes Tag Manager's container script, the gtag.js snippet and the AdSense loader after them, and Tag Manager's noscript iframe after the opening body tag. Removes the page's own loader for the configured tag |
+| `tag.google-tag-manager`      | `[[fetch]]` | Points Google Tag Manager and Google Analytics addresses at `/integrations/google_tag_manager`, in `src` and `href` attributes and in the text of inline scripts                                                                                                                                                                                                  |
+| `bot-protection.datadome`     | `[[fetch]]` | Points a `src` or `href` that is a DataDome script's address at `/integrations/datadome`, when `rewrite_sdk` is set                                                                                                                                                                                                                                               |
+| `bot-protection.datadome.tag` | `[[serve]]` | Writes DataDome's client tag into the head, unless the request filter marked the request, `inject_client_side_tag` is off or no `client_side_key` is set                                                                                                                                                                                                          |
+| `ad-tag.google`               | `[[fetch]]` | Writes the `tsjs.adInit` bootstrap into the head and, when `rewrite_script` is set, points a `src` or `href` that is the GPT script's address at `/integrations/gpt/script`                                                                                                                                                                                       |
+| `ad-tag.google.loader`        | `[[serve]]` | Writes the loader tag into the head, after the bootstrap, when `write_loader` is set, for a reader whose permissions allow storage on the device                                                                                                                                                                                                                  |
+| `ad-tag.google.diagnostics`   | `[[serve]]` | For a request that activated diagnostics, writes the bootstrap ahead of the script bundle and the tag that loads the diagnostics module straight after it                                                                                                                                                                                                         |
+| `ads-txt.sellers`             | `[[fetch]]` | Writes the lines `[ads-txt.sellers]` gives at the end of the publisher's `ads.txt`, on `text/plain` alone                                                                                                                                                                                                                                                         |
+| `robots_txt`                  | `[[fetch]]` | Makes the `robots.txt` that `[robots-txt]` describes, in place of whatever the origin answers, on `text/plain` and at `/robots.txt` alone                                                                                                                                                                                                                         |
+| `service_version`             | `[[serve]]` | Writes `X-TS-Version`, the git version the build compiled in, and `X-TS-Service-Version`, the platform's version number of the service, when each is known. Core supplies it, so no section selects it                                                                                                                                                            |
 
 An entry that could not do what it says refuses the configuration, both when
 a deployment is validated and when the settings load. That is a media type
@@ -2163,6 +2166,21 @@ fetch middleware writes ahead of the script bundle, and so is naming it for one
 page in both phases, which would write it twice. See [InMobi Choice](/guide/integrations/inmobi)
 for the tag's parts and what the module keeps to.
 
+### Google Tag Integration
+
+**Section**: `[tag.google-tag]`
+
+| Field                              | Type    | Default  | Contract                                                                                                                                 |
+| ---------------------------------- | ------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `analytics_tag_id`                 | String  | Absent   | A `G-`, `GT-`, `GTM-`, `AW-`, `DC-`, `MC-` or `UA-` tag id                                                                               |
+| `container_id`                     | String  | Absent   | `GTM-` followed by 4 to 20 capitals or digits                                                                                            |
+| `adsense_client_id`                | String  | Absent   | `ca-pub-` followed by sixteen digits                                                                                                     |
+| `consent_defaults.*`               | String  | `denied` | `ad_storage`, `ad_user_data`, `ad_personalization` and `analytics_storage`, each `denied` or `granted`                                   |
+| `consent_defaults.wait_for_update` | Integer | `500`    | Milliseconds the tag waits for a consent management platform's update before it fires with the defaults, at most `60000`                 |
+| `consent_defaults.region`          | Array   | Absent   | Country or region codes the defaults apply to, such as `GB` or `US-CA`, everywhere when absent. Every other visitor gets all four denied |
+
+At least one of the three ids is required, because a table naming none asks the module to write nothing. The module writes, in the head immediately before the script bundle's tag and so after whatever a `[[fetch]]` middleware wrote there, the consent mode defaults, then the container script, then the tag snippet, then the AdSense loader, each copied from Google's documentation, and Tag Manager's noscript iframe immediately after the opening body tag. Every reader gets the consent defaults, and only a reader whose permissions allow storage on the device (`necessary.operations.storage`) gets the rest, because each of them stores and reads Google's identifiers there. Where the Tag Manager module serves the same tag or container, the loader names the first-party path. A page that also loads gtag.js for the configured tag has that loader removed for every reader. An inline configuration call in the page is left alone and still sends a second page view.
+
 ### Google Tag Manager Integration
 
 **Section**: `[tag.google-tag-manager]`
@@ -2187,6 +2205,9 @@ See [Google Tag Manager](/guide/integrations/google_tag_manager).
 | `cache_ttl_seconds`       | Integer        | `3600`                  | `60..=86400` seconds                                   |
 | `rewrite_script`          | Boolean        | `true`                  | Rewrite matching GPT script URLs                       |
 | `slim_prebid_url`         | String or null | `null`                  | Optional tsjs-prebid bundle loaded after `window.load` |
+| `write_loader`            | Boolean        | `false`                 | Write the loader tag, for a page that carries none     |
+
+`write_loader` takes effect where a `[[serve]]` entry names `ad-tag.google.loader`, which writes the loader tag after the bootstrap and only for a reader whose permissions allow storage on the device (`necessary.operations.storage`), because GPT loaded from Google's standard address may use the device's storage at any time.
 
 See [GPT](/guide/integrations/gpt).
 

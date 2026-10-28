@@ -604,13 +604,14 @@ answers is used for that document alone, so a handler may hold state between
 the chunks of one script. The answer is a `MiddlewareAction`, which may set
 any of five things.
 
-| Field                  | What it does                                                                                             |
-| ---------------------- | -------------------------------------------------------------------------------------------------------- |
-| `head_inserts`         | Writes markup in `<head>`, ahead of the script bundle                                                    |
-| `after_bundle_inserts` | Writes markup straight after the script bundle, for a script that needs the bundle to have run           |
-| `element_handlers`     | For the elements a CSS selector matches, keeps the element, replaces one attribute's value or removes it |
-| `text_handlers`        | For the text inside the elements a CSS selector matches, keeps a chunk, replaces it or removes it        |
-| `stream`               | Runs a stream processor over the document the handlers left                                              |
+| Field                  | What it does                                                                                                              |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `head_inserts`         | Writes markup in `<head>`, ahead of the script bundle                                                                     |
+| `after_bundle_inserts` | Writes markup straight after the script bundle, for a script that needs the bundle to have run                            |
+| `body_open_inserts`    | Writes markup immediately after the opening body tag, once per document, for an installation whose second part goes there |
+| `element_handlers`     | For the elements a CSS selector matches, keeps the element, replaces one attribute's value or removes it                  |
+| `text_handlers`        | For the text inside the elements a CSS selector matches, keeps a chunk, replaces it or removes it                         |
+| `stream`               | Runs a stream processor over the document the handlers left                                                               |
 
 A middleware can rely on these rules.
 
@@ -746,10 +747,12 @@ never stored as one, and an HTML response with a body is sent
 `private, no-store`. So a module leaves a value only for a request it will
 act on, and an ordinary request stays on the shared path.
 
-A serve middleware has two places to write markup. `head_inserts` writes
-straight before the script bundle, and `after_bundle_inserts` writes straight
+A serve middleware has three places to write markup. `head_inserts` writes
+straight before the script bundle, `after_bundle_inserts` writes straight
 after it, for a script that needs the bundle to have run and has to run
-before the page's own scripts.
+before the page's own scripts, and `body_open_inserts` writes immediately
+after the opening body tag, once per document, for an installation whose
+second part goes there and nowhere else.
 
 ### A module's own secrets
 

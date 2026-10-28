@@ -1,0 +1,40 @@
+<!--
+  An invented publisher's page head, carrying its own Google Tag Manager
+  container and nothing this integration wrote.
+
+  It is here so the insertion is checked against a head shaped the way a
+  content management system writes one, with the tag manager sitting some way
+  down after the metadata, rather than only against a two-tag page written to
+  suit the test. Everything in it is made up.
+-->
+<!DOCTYPE html>
+<html lang="en-GB">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="index, follow" />
+    <title>Example Publisher</title>
+    <link rel="canonical" href="https://www.example.com/" />
+    <meta property="og:locale" content="en_GB" />
+    <link
+      rel="alternate"
+      type="application/rss+xml"
+      title="Example Publisher &raquo; Comments Feed"
+      href="https://www.example.com/comments/feed/"
+    />
+    <!-- Google Tag Manager -->
+    <script>
+      (function (w, d, s, l, i) {
+        w[l] = w[l] || [];
+        w[l].push({ 'gtm.start': new Date().getTime(), event: 'gtm.js' });
+        var f = d.getElementsByTagName(s)[0],
+          j = d.createElement(s),
+          dl = l != 'dataLayer' ? '&l=' + l : '';
+        j.async = true;
+        j.src = 'https://www.googletagmanager.com/gtm.js?id=' + i + dl;
+        f.parentNode.insertBefore(j, f);
+      })(window, document, 'script', 'dataLayer', 'GTM-EXAMPLE1');
+    </script>
+  </head>
+  <body></body>
+</html>
