@@ -1565,13 +1565,15 @@ mod tests {
     fn the_description_is_what_the_shared_table_registers() {
         trusted_server_core::test_support::middleware::assert_described_middleware_is_registered(
             &settings_with(""),
-            &stock_builders(),
+            &linked_builders(),
             BUILDER_ID,
         );
     }
 
-    /// The builders a stock build links for the two 51Degrees modules.
-    fn stock_builders() -> [IntegrationBuilder; 2] {
+    /// The builders of the two 51Degrees modules, the client hints
+    /// middleware's and the loading cache's, as a deployment that wants the
+    /// answers held links them.
+    fn linked_builders() -> [IntegrationBuilder; 2] {
         [builder(), trusted_server_loading_cache_51degrees::builder()]
     }
 
@@ -1581,7 +1583,7 @@ mod tests {
     #[test]
     fn no_entry_means_no_headers() {
         let unplaced = settings_with("");
-        let registry = IntegrationRegistry::with_registrations(&unplaced, &stock_builders())
+        let registry = IntegrationRegistry::with_registrations(&unplaced, &linked_builders())
             .expect("should build the registry");
         assert!(
             registry
@@ -1599,7 +1601,7 @@ mod tests {
         let placed = settings_with(
             "[[serve]]\nmedia_type = \"text/html\"\nmiddleware = [\"51degrees.client_hints\"]\n",
         );
-        let registry = IntegrationRegistry::with_registrations(&placed, &stock_builders())
+        let registry = IntegrationRegistry::with_registrations(&placed, &linked_builders())
             .expect("should build the registry");
         let asked: Vec<&str> = registry
             .middleware_for_path(placed.phase_entries(MiddlewarePhase::Serve), "/")
@@ -1610,12 +1612,12 @@ mod tests {
         assert_eq!(asked, [MODULE]);
     }
 
-    /// One `[shared.51degrees]` table runs the middleware, and the stock
+    /// One `[shared.51degrees]` table runs the middleware, and a linked
     /// loading cache module holds the answers it asks for, in the cache this
     /// builder declares, with no line in the document or with
     /// `[cache.51degrees-answers]` naming the module.
     #[test]
-    fn the_shared_table_runs_the_middleware_and_the_stock_cache_holds_its_answers() {
+    fn the_shared_table_runs_the_middleware_and_a_linked_cache_holds_its_answers() {
         for (case, rest) in [
             ("no cache table", ""),
             (
@@ -1624,18 +1626,18 @@ mod tests {
             ),
         ] {
             let settings = settings_with(rest);
-            let registry = IntegrationRegistry::with_registrations(&settings, &stock_builders())
+            let registry = IntegrationRegistry::with_registrations(&settings, &linked_builders())
                 .expect("should build the registry");
             let caches = trusted_server_core::integrations::loading_caches_from(
                 &settings,
-                &stock_builders(),
+                &linked_builders(),
             )
             .expect("the declared cache selects the one loading cache module");
 
             assert!(registry.integration_runs(BUILDER_ID), "{case}");
             assert!(
                 caches.for_feature(CACHE).keeps_values(),
-                "{case}: the stock loading cache should hold the answers"
+                "{case}: the linked loading cache should hold the answers"
             );
         }
     }
@@ -1648,7 +1650,7 @@ mod tests {
 
         let message = format!(
             "{:?}",
-            trusted_server_core::integrations::loading_caches_from(&settings, &stock_builders())
+            trusted_server_core::integrations::loading_caches_from(&settings, &linked_builders())
                 .expect_err("nothing declares the misspelt cache")
         );
 

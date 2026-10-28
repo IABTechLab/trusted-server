@@ -1,16 +1,19 @@
-//! The cloud service's answers, held in the loading cache core declares.
+//! The cloud service's answers, loaded through the loading cache core
+//! declares.
 //!
-//! An instance that serves one request at a time would lose a cache of its
-//! own with the request. Held in the host's shared store instead, an answer
-//! serves the next equivalent request and any second lookup in the same
-//! request.
+//! Where a deployment links a loading cache module, each answer is held in
+//! the host's shared store, which outlives an instance that serves one
+//! request at a time, so the answer serves the next equivalent request and
+//! any second lookup in the same request. A stock build links none, so there
+//! every call asks the service.
 //!
-//! Each whole call is the loader, so a question many requests ask at the same
-//! moment is asked of the service once, and every request waiting on it gets
-//! the answer or the failure. A failure is not held. The key is a hash of the
-//! endpoint, the license key, the properties named and the evidence sent, so
-//! an answer is only ever given back to the same question, and the license
-//! key is never written into a store.
+//! Each whole call is the loader, so where a loading cache module is linked a
+//! question many requests ask at the same moment is asked of the service once,
+//! and every request waiting on it gets the answer or the failure. A failure
+//! is not held. The key is a hash of the endpoint, the license key, the
+//! properties named and the evidence sent, so an answer is only ever given
+//! back to the same question, and the license key is never written into a
+//! store.
 //!
 //! The evidence is the `User-Agent` and the `Sec-CH-UA` hints, with no address
 //! and no cookie, so one entry serves every reader whose browser sends the
