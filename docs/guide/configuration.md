@@ -1856,8 +1856,9 @@ are checked against the ranges above and change nothing unless the module
 reads its own table and applies them.
 A module from `crates/geo/example` whose service answers
 once for each request's evidence declares `example-answers`, the cache that
-holds those answers, so `[cache.example-answers] module = "51degrees"` asks
-the service once however many requests carry the same evidence. A name is
+holds those answers, so in a deployment that links
+`crates/loading-cache/51degrees`, `[cache.example-answers] module = "51degrees"`
+asks the service once however many requests carry the same evidence. A name is
 the module's own: `robots-txt` and a name two modules declare are refused. A
 `[cache.<name>]` table naming a cache no linked module declares is refused by
 `ts config validate` and when the deployment starts, and the message lists
