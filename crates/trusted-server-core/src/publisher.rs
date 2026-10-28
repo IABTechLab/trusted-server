@@ -9469,7 +9469,7 @@ mod tests {
     }
 
     use std::future::Future as _;
-    use std::io::{self, Read as _, Write as _};
+    use std::io::{self, Read as _};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use brotli::Decompressor;
