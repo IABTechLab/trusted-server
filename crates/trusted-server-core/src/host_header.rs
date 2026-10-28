@@ -2,7 +2,7 @@
 //!
 //! These helpers intentionally validate only configuration values. Request input
 //! must not flow into this module because outbound `Host` controls origin
-//! routing and SigV4-style signing decisions.
+//! routing and request signing.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 

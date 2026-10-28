@@ -6665,6 +6665,7 @@ dependencies = [
  "trusted-server-permission-signal-mtm",
  "trusted-server-permission-signal-tcf",
  "trusted-server-permission-signal-us-privacy",
+ "trusted-server-shared-aws",
  "trusted-server-tag-google-tag",
  "trusted-server-tag-google-tag-manager",
  "trusted-server-testing-iabtl",
@@ -6712,6 +6713,7 @@ dependencies = [
  "trusted-server-permission-signal-mtm",
  "trusted-server-permission-signal-tcf",
  "trusted-server-permission-signal-us-privacy",
+ "trusted-server-shared-aws",
  "trusted-server-tag-google-tag",
  "trusted-server-tag-google-tag-manager",
  "trusted-server-testing-iabtl",
@@ -6766,6 +6768,7 @@ dependencies = [
  "trusted-server-permission-signal-mtm",
  "trusted-server-permission-signal-tcf",
  "trusted-server-permission-signal-us-privacy",
+ "trusted-server-shared-aws",
  "trusted-server-tag-google-tag",
  "trusted-server-tag-google-tag-manager",
  "trusted-server-testing-iabtl",
@@ -6816,6 +6819,7 @@ dependencies = [
  "trusted-server-permission-signal-mtm",
  "trusted-server-permission-signal-tcf",
  "trusted-server-permission-signal-us-privacy",
+ "trusted-server-shared-aws",
  "trusted-server-tag-google-tag",
  "trusted-server-tag-google-tag-manager",
  "trusted-server-testing-iabtl",
@@ -7062,6 +7066,7 @@ dependencies = [
  "trusted-server-headers-geo",
  "trusted-server-identity-lockr",
  "trusted-server-middleware-51degrees",
+ "trusted-server-shared-aws",
  "trusted-server-tag-google-tag",
  "trusted-server-tag-google-tag-manager",
  "trusted-server-testing-testlight",
@@ -7412,6 +7417,25 @@ dependencies = [
  "trusted-server-loading-cache-51degrees",
  "url",
  "validator",
+]
+
+[[package]]
+name = "trusted-server-shared-aws"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "hex",
+ "hmac",
+ "http",
+ "log",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "trusted-server-core",
+ "url",
 ]
 
 [[package]]

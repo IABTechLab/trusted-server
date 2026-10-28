@@ -422,6 +422,7 @@ points at the functions that do the work.
 | `.with_loading_cache(...)`                    | Optional. Offers the loading cache the crate supplies, which a feature selects by the module's name in its `[cache.<name>]` table. An adapter takes the selections with `loading_caches_from`                                                                                                                                                       |
 | `.with_cache_features(...)`                   | Optional. Declares the caches the module loads through, by name, each selected in its own `[cache.<name>]` table as `[cache.robots-txt]` is. A name core or another builder declares is refused                                                                                                                                                     |
 | `.with_shared_settings(...)`                  | Optional. Runs the builder when its vendor's `[shared.<vendor>]` table is present, for a vendor whose modules all read that one table. A builder the table runs is selected by no section                                                                                                                                                           |
+| `.with_origin_signer(...)`                    | Optional. Offers an origin signer, which a source's `auth` table names with `type`, and declares the settings of the signer's table that hold the name of a secret                                                                                                                                                                                  |
 
 ```rust
 pub fn module_name() -> &'static str {
@@ -941,6 +942,49 @@ present and refuses a table that no builder reads. A secret in the table is
 declared with `.with_secret_settings(...)` at its path inside the table, as a
 module's own secrets are, is checked at push to name a key, and is resolved
 from the secret store when the table is present.
+
+### Signing requests to an origin
+
+An origin that answers only signed reads, such as private object storage, is
+signed through an `OriginSigner`, in `trusted_server_core::origin_auth`. Core
+declares the interface and the signer comes from a crate outside core. A
+source's `auth` table names it with `type`, core reads that and
+`origin_query`, and the rest of the table is the signer's own.
+
+A crate supplies one by implementing `OriginSigner`, which signs the headers
+of a request for a method on a final address and removes every header in the
+scheme's own namespace, and offering an `OriginSignerModule` on its builder
+with `.with_origin_signer(...)`. The module names the signer, lists the
+settings of its table that hold the name of a secret, each with the key name
+it takes when left out, and builds the signer from its table. The offer is not
+a selection. The registry builds the signer where a source names it, so a
+`type` nothing offers is refused at startup naming the signers on offer, and a
+table the signer cannot use is refused naming the setting. Core checks the
+same tables when a deployment is validated, by building each signer a builder
+offers from the tables that name it, so a bad table fails `ts config validate`
+and not the first start, provided the validating build offers that signer.
+
+```rust
+pub static EXAMPLE_SIGNER: OriginSignerModule = OriginSignerModule {
+    name: "example_scheme",
+    secrets: &[SignerSecret {
+        name: "key_name",
+        default: Some("key_name"),
+    }],
+    build: build_signer,
+};
+
+pub fn builder() -> IntegrationBuilder {
+    IntegrationBuilder::new(MODULE, env!("CARGO_PKG_NAME"), no_registration, validate)
+        .with_origin_signer(&EXAMPLE_SIGNER)
+}
+```
+
+The declared secret settings are looked up in the default secret store as
+the settings load, at both places an `auth` table can be written, and masked
+on the configuration page, so the signer is handed the secret itself and reads
+no store of its own. The stock list carries `crates/shared/aws`, which offers
+`s3_sigv4`.
 
 ### Supplying a loading cache
 

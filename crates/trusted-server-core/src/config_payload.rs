@@ -108,6 +108,12 @@ pub fn settings_from_config_blob_with(
     let mut data = envelope.into_data();
     remove_inactive_secret_references(&mut data);
     crate::module_secrets::clear_unused(&mut data, &builders);
+    // A signer's secret setting left out takes its default key name, so the
+    // lookup below finds it as a written one.
+    crate::origin_auth::fill_secret_defaults(
+        &mut data,
+        &crate::origin_auth::OriginSigners::offered_by(&builders)?,
+    );
     let resolved = resolve_secret_references_with::<TrustedServerAppConfig>(
         &mut data,
         secret_store,
@@ -222,11 +228,10 @@ fn json_bool_or_string_is_true(value: Option<&serde_json::Value>) -> bool {
 mod tests {
     use super::*;
     use crate::ec::module::{HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY};
+    use crate::origin_auth::fixture;
     use crate::platform::{PlatformError, StoreId};
     use crate::redacted::Redacted;
-    use crate::settings::{
-        AssetOriginAuth, EcPartner, ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig,
-    };
+    use crate::settings::{EcPartner, ProxyAssetRoute, TrustedClientIpConfig};
     use crate::test_support::tests::{
         crate_test_settings_str, edit_origin, hmac_passphrase, sample_permissions,
         select_hmac_module, select_host_signals_module, set_route_auth,
@@ -286,9 +291,8 @@ mod tests {
             let value = match key {
                 "unit-test-proxy-secret" => "unit-test-proxy-secret-32-bytes-ok",
                 "tinybird-token-key" => "resolved-tinybird-token",
-                "access_key_id" | "s3-access-key" => "AKIAIOSFODNN7EXAMPLE",
-                "secret_access_key" | "s3-secret-key" => "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
-                "s3-session-key" => "resolved-session-token",
+                "fixture_key" | "signer-key" => "resolved-signer-key",
+                "signer-token" => "resolved-signer-token",
                 "partner-api-token-key" => "resolved-partner-api-token-32-bytes-ok",
                 "partner-pull-token-key" => "resolved-partner-pull-token-32-bytes-ok",
                 "trusted-client-ip-key" => "resolved-trusted-client-ip-secret-32-bytes",
@@ -625,20 +629,14 @@ mod tests {
     #[test]
     fn resolves_all_static_credentials_from_the_mapped_default_store() {
         let mut original = test_settings();
-        let mut route = ProxyAssetRoute::new(
-            "/assets/",
-            "https://examplebucket.s3.us-east-1.amazonaws.com",
-        );
+        let mut route = ProxyAssetRoute::new("/assets/", "https://assets.example.com");
         set_route_auth(
             &mut route,
-            Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-                region: "us-east-1".to_string(),
-                secret_store: Some("legacy-s3-store".to_string()),
-                access_key_id: Redacted::new("s3-access-key".to_string()),
-                secret_access_key: Redacted::new("s3-secret-key".to_string()),
-                session_token: Some(Redacted::new("s3-session-key".to_string())),
-                origin_query: None,
-            })),
+            Some(
+                fixture::auth("assets")
+                    .with_setting("key_name", "signer-key")
+                    .with_setting("token_name", "signer-token"),
+            ),
         );
         original.proxy.asset_routes.push(route);
         original
@@ -646,32 +644,31 @@ mod tests {
             .partners
             .push(partner_with_pull_sync(true, "partner-pull-token-key"));
 
-        let reconstructed = settings_from_config_blob(
+        let reconstructed = settings_from_config_blob_with(
             &envelope_json(&original),
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
             PolicyOrigin::Blob,
+            &[fixture::builder()],
         )
         .expect("should resolve every static credential from the mapped store");
 
         let auth = reconstructed.proxy.asset_routes[0]
             .origin_source()
             .and_then(|origin| origin.auth)
-            .expect("should preserve S3 auth");
-        let AssetOriginAuth::S3SigV4(auth) = auth;
-        assert_eq!(auth.access_key_id.expose(), "AKIAIOSFODNN7EXAMPLE");
+            .expect("should preserve the route's auth");
         assert_eq!(
-            auth.secret_access_key.expose(),
-            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+            auth.settings
+                .get("key_name")
+                .and_then(serde_json::Value::as_str),
+            Some("resolved-signer-key")
         );
         assert_eq!(
-            auth.session_token
-                .as_ref()
-                .map(Redacted::expose)
-                .map(String::as_str),
-            Some("resolved-session-token")
+            auth.settings
+                .get("token_name")
+                .and_then(serde_json::Value::as_str),
+            Some("resolved-signer-token")
         );
-        assert!(auth.secret_store.is_none());
         assert_eq!(
             reconstructed.ec.partners[0]
                 .api_token
@@ -854,54 +851,90 @@ mod tests {
     }
 
     #[test]
-    fn omitted_s3_secret_references_resolve_default_store_keys() {
+    fn a_signer_secret_setting_left_out_resolves_its_default_key_name() {
         let mut original = test_settings();
-        let mut route = ProxyAssetRoute::new(
-            "/default-s3/",
-            "https://examplebucket.s3.us-east-1.amazonaws.com",
-        );
-        set_route_auth(
-            &mut route,
-            Some(AssetOriginAuth::S3SigV4(
-                toml::from_str("region = \"us-east-1\"").expect("should apply S3 secret defaults"),
-            )),
-        );
+        let mut route = ProxyAssetRoute::new("/default-signed/", "https://assets.example.com");
+        set_route_auth(&mut route, Some(fixture::auth("assets")));
         original.proxy.asset_routes.push(route);
 
-        let reconstructed = settings_from_config_blob(
+        let reconstructed = settings_from_config_blob_with(
             &envelope_json(&original),
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
             PolicyOrigin::Blob,
+            &[fixture::builder()],
         )
-        .expect("should resolve default S3 secret keys");
+        .expect("should resolve the default key name");
 
-        let AssetOriginAuth::S3SigV4(auth) = reconstructed.proxy.asset_routes[0]
+        let auth = reconstructed.proxy.asset_routes[0]
             .origin_source()
             .and_then(|origin| origin.auth)
-            .expect("should preserve S3 auth");
-        assert_eq!(auth.access_key_id.expose(), "AKIAIOSFODNN7EXAMPLE");
+            .expect("should preserve the route's auth");
         assert_eq!(
-            auth.secret_access_key.expose(),
-            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+            auth.settings
+                .get("key_name")
+                .and_then(serde_json::Value::as_str),
+            Some("resolved-signer-key"),
+            "the default key name should be looked up"
+        );
+        assert!(
+            !auth.settings.contains_key("token_name"),
+            "a setting with no default should stay left out"
         );
     }
 
     #[test]
-    fn source_origin_auth_resolves_its_credentials_from_the_store() {
+    fn source_origin_auth_resolves_its_secret_settings_from_the_store() {
         let mut original = test_settings();
         edit_origin(&mut original, |origin| {
-            origin.url = "https://storage.example.com/bucket/site".to_string()
+            origin.url = "https://storage.example.com/bucket/site".to_string();
+            origin.auth = Some(
+                fixture::auth("site")
+                    .with_setting("key_name", "signer-key")
+                    .with_setting("token_name", "signer-token"),
+            );
         });
+
+        let reconstructed = settings_from_config_blob_with(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+            PolicyOrigin::Blob,
+            &[fixture::builder()],
+        )
+        .expect("should resolve the publisher origin credentials from the mapped store");
+
+        let auth = reconstructed
+            .origin_source()
+            .and_then(|origin| origin.auth)
+            .expect("should keep the origin auth");
+        assert_eq!(
+            auth.settings
+                .get("key_name")
+                .and_then(serde_json::Value::as_str),
+            Some("resolved-signer-key")
+        );
+        assert_eq!(
+            auth.settings
+                .get("token_name")
+                .and_then(serde_json::Value::as_str),
+            Some("resolved-signer-token")
+        );
+        assert_eq!(
+            auth.settings
+                .get("realm")
+                .and_then(serde_json::Value::as_str),
+            Some("site"),
+            "a setting that is not a secret should be left as written"
+        );
+    }
+
+    #[test]
+    fn a_signer_s_secret_settings_are_not_looked_up_without_its_builder() {
+        let mut original = test_settings();
         edit_origin(&mut original, |origin| {
-            origin.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-                region: "test-region-1".to_string(),
-                secret_store: None,
-                access_key_id: Redacted::new("s3-access-key".to_string()),
-                secret_access_key: Redacted::new("s3-secret-key".to_string()),
-                session_token: Some(Redacted::new("s3-session-key".to_string())),
-                origin_query: None,
-            }))
+            origin.url = "https://storage.example.com/bucket/site".to_string();
+            origin.auth = Some(fixture::auth("site").with_setting("key_name", "signer-key"));
         });
 
         let reconstructed = settings_from_config_blob(
@@ -910,24 +943,18 @@ mod tests {
             &StoreName::from("ts_secrets"),
             PolicyOrigin::Blob,
         )
-        .expect("should resolve the publisher origin credentials from the mapped store");
+        .expect("should load without the signer's builder");
 
-        let Some(AssetOriginAuth::S3SigV4(auth)) =
-            reconstructed.origin_source().and_then(|origin| origin.auth)
-        else {
-            panic!("should keep the origin auth");
-        };
-        assert_eq!(auth.access_key_id.expose(), "AKIAIOSFODNN7EXAMPLE");
+        let auth = reconstructed
+            .origin_source()
+            .and_then(|origin| origin.auth)
+            .expect("should keep the origin auth");
         assert_eq!(
-            auth.secret_access_key.expose(),
-            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
-        );
-        assert_eq!(
-            auth.session_token
-                .as_ref()
-                .map(Redacted::expose)
-                .map(String::as_str),
-            Some("resolved-session-token")
+            auth.settings
+                .get("key_name")
+                .and_then(serde_json::Value::as_str),
+            Some("signer-key"),
+            "the key name should be left as written"
         );
     }
 

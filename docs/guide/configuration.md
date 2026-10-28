@@ -98,8 +98,10 @@ publisher, trusted-client-IP, EC, Tinybird, DataDome, and S3 fields:
 Their values belong in the logical `trusted_server_secrets` store and are
 resolved only while an instance builds runtime settings. An adapter can map the
 logical ID to a different physical name. For example, Fastly commonly maps
-`trusted_server_secrets` to physical store `ts_secrets`. A blank
-`session_token` in either signing table is read as no token.
+`trusted_server_secrets` to physical store `ts_secrets`. A `session_token`
+that is empty or only spaces in either signing table is refused by
+`ts config validate`, naming its path, so leave the key out when there is no
+token.
 
 Two accepted secret-shaped fields are deliberately different:
 
@@ -110,7 +112,7 @@ Two accepted secret-shaped fields are deliberately different:
   `analytics.tinybird.auction_token_secret` as the store key name instead.
 
 The four deprecated `secret_store` selectors under Tinybird, DataDome, its
-protection-test bypass, and S3 route authentication are also accepted and
+protection-test bypass, and the `s3_sigv4` origin signer are also accepted and
 discarded. Store selection comes from the adapter's EdgeZero mapping.
 
 ::: warning CLI output and inline secrets
@@ -123,25 +125,24 @@ diff; it does not move inline values to a secret store.
 The following table records the independent lifecycle, key-identity,
 serialization, runtime, and secret axes for every exceptional field:
 
-| Path                                                         | Lifecycle  | Key identity                        | Serialization | Runtime                 | Secret handling          |
-| ------------------------------------------------------------ | ---------- | ----------------------------------- | ------------- | ----------------------- | ------------------------ |
-| `AssetOriginAuth.s3_sig_v4`                                  | deprecated | alias of `AssetOriginAuth.s3_sigv4` | skipped       | deserialization only    | none                     |
-| `DataDomeConfig.server_side_key_secret_name`                 | canonical  | canonical                           | serialized    | active                  | store resolved           |
-| `DataDomeConfig.server_side_key_secret_store`                | deprecated | canonical                           | serialized    | discarded by the module | none                     |
-| `DataDomeProtectionTestBypassConfig.credential_secret_name`  | canonical  | canonical                           | serialized    | active                  | store resolved           |
-| `DataDomeProtectionTestBypassConfig.credential_secret_store` | deprecated | canonical                           | serialized    | discarded by the module | none                     |
-| `Ec.passphrase`                                              | canonical  | canonical                           | serialized    | active                  | store resolved           |
-| `EcPartner.api_token`                                        | canonical  | canonical                           | serialized    | active                  | store resolved           |
-| `EcPartner.ts_pull_token`                                    | canonical  | canonical                           | serialized    | active                  | store resolved           |
-| `Publisher.proxy_secret`                                     | canonical  | canonical                           | serialized    | active                  | store resolved           |
-| `S3SigV4AuthConfig.access_key_id`                            | canonical  | canonical                           | serialized    | active                  | store resolved           |
-| `S3SigV4AuthConfig.secret_access_key`                        | canonical  | canonical                           | serialized    | active                  | store resolved           |
-| `S3SigV4AuthConfig.secret_store`                             | deprecated | canonical                           | skipped       | normalized away         | none                     |
-| `S3SigV4AuthConfig.session_token`                            | canonical  | canonical                           | serialized    | active                  | store resolved           |
-| `TinybirdSettings.access_token_secret`                       | deprecated | canonical                           | skipped       | normalized away         | accepted, then discarded |
-| `TinybirdSettings.auction_token_secret`                      | canonical  | canonical                           | serialized    | active                  | store resolved           |
-| `TinybirdSettings.secret_store`                              | deprecated | canonical                           | skipped       | normalized away         | none                     |
-| `TrustedClientIpConfig.shared_secret`                        | canonical  | canonical                           | serialized    | active                  | deliberately inline      |
+| Path                                                         | Lifecycle  | Key identity | Serialization | Runtime                 | Secret handling          |
+| ------------------------------------------------------------ | ---------- | ------------ | ------------- | ----------------------- | ------------------------ |
+| `DataDomeConfig.server_side_key_secret_name`                 | canonical  | canonical    | serialized    | active                  | store resolved           |
+| `DataDomeConfig.server_side_key_secret_store`                | deprecated | canonical    | serialized    | discarded by the module | none                     |
+| `DataDomeProtectionTestBypassConfig.credential_secret_name`  | canonical  | canonical    | serialized    | active                  | store resolved           |
+| `DataDomeProtectionTestBypassConfig.credential_secret_store` | deprecated | canonical    | serialized    | discarded by the module | none                     |
+| `Ec.passphrase`                                              | canonical  | canonical    | serialized    | active                  | store resolved           |
+| `EcPartner.api_token`                                        | canonical  | canonical    | serialized    | active                  | store resolved           |
+| `EcPartner.ts_pull_token`                                    | canonical  | canonical    | serialized    | active                  | store resolved           |
+| `Publisher.proxy_secret`                                     | canonical  | canonical    | serialized    | active                  | store resolved           |
+| `s3_sigv4.access_key_id`                                     | canonical  | canonical    | serialized    | active                  | store resolved           |
+| `s3_sigv4.secret_access_key`                                 | canonical  | canonical    | serialized    | active                  | store resolved           |
+| `s3_sigv4.secret_store`                                      | deprecated | canonical    | serialized    | discarded by the signer | none                     |
+| `s3_sigv4.session_token`                                     | canonical  | canonical    | serialized    | active                  | store resolved           |
+| `TinybirdSettings.access_token_secret`                       | deprecated | canonical    | skipped       | normalized away         | accepted, then discarded |
+| `TinybirdSettings.auction_token_secret`                      | canonical  | canonical    | serialized    | active                  | store resolved           |
+| `TinybirdSettings.secret_store`                              | deprecated | canonical    | skipped       | normalized away         | none                     |
+| `TrustedClientIpConfig.shared_secret`                        | canonical  | canonical    | serialized    | active                  | deliberately inline      |
 
 Prepare an initial reference-based deployment in this order:
 
@@ -652,8 +653,10 @@ the page pipeline, which an [asset route](#proxy-asset-routes) skips.
 **Format**: The same table as
 [`[proxy.asset_routes.source.origin.auth]`](#proxy-asset-routes-source-origin-auth),
 with the same fields, defaults and secret-store key references, signed by the
-same signer. Write `[source.origin.auth]` after the other `[source.origin]`
-keys, because a table header ends the keys of the table before it.
+same signer. `type` names the signer and `origin_query` is read by Trusted
+Server, and every other key belongs to the signer named. Write
+`[source.origin.auth]` after the other `[source.origin]` keys, because a table
+header ends the keys of the table before it.
 
 ```toml
 [source]
@@ -683,8 +686,10 @@ secret_access_key = "publisher_origin_secret_access_key"
   the signing scheme's own header namespace.
 - `origin_query = "strip"` leaves the reader's query off the origin request.
   By default the query is kept.
-- `url` must use `https`. A table the signer cannot use, such as an empty or
-  malformed `region`, is refused at startup naming `source.origin.auth`.
+- `url` must use `https`. A `type` no crate in the build offers is refused at
+  startup naming the signers on offer, and a table the signer cannot use, such
+  as an empty or malformed `region`, is refused at startup and by
+  `ts config validate` naming `source.origin.auth`.
 
 **Default**: Unset, and origin requests are sent unsigned with the reader's
 headers.
@@ -1793,11 +1798,14 @@ beneath. Core's `origin` source takes these settings:
 
 ### `[proxy.asset_routes.source.origin.auth]`
 
-The first supported origin auth type is `s3_sigv4`.
+`type` names an origin signer a crate in the build offers, and `origin_query`
+says whether the reader's query is kept on the signed request. Every other
+key in the table belongs to the signer named. A stock build offers
+`s3_sigv4`, from `crates/shared/aws`, whose table is:
 
 | Field               | Type   | Required | Default             | Description                                                  |
 | ------------------- | ------ | -------- | ------------------- | ------------------------------------------------------------ |
-| `type`              | String | Yes      | none                | Must be `s3_sigv4`                                           |
+| `type`              | String | Yes      | none                | `s3_sigv4`                                                   |
 | `region`            | String | Yes      | none                | AWS region used in the SigV4 credential scope                |
 | `access_key_id`     | String | No       | `access_key_id`     | Default-store secret reference for the AWS access key ID     |
 | `secret_access_key` | String | No       | `secret_access_key` | Default-store secret reference for the AWS secret access key |
@@ -1825,9 +1833,9 @@ secret_access_key = "s3_secret_access_key"
 # session_token = "s3_session_token"
 ```
 
-S3 auth uses header-based AWS SigV4 with `UNSIGNED-PAYLOAD`. It is scoped to read-only asset requests and expects `url` to use the S3 host that AWS validates. Credential references resolve from `trusted_server_secrets` at startup, and request signing performs no secret-store reads.
+`s3_sigv4` uses header-based AWS SigV4 with `UNSIGNED-PAYLOAD`. It is scoped to read-only asset requests and expects `url` to use the S3 host that AWS validates. Credential references resolve from `trusted_server_secrets` at startup, and request signing performs no secret-store reads.
 
-Signing requires `url` to use `https`. A table the signer cannot use, such as an empty or malformed `region`, is refused at startup naming the route, as in `proxy.asset_routes /.image/ source.origin.auth`.
+Signing requires `url` to use `https`. A `type` no crate in the build offers is refused at startup naming the signers on offer. A table the signer cannot use, such as an empty or malformed `region`, is refused at startup and by `ts config validate` naming the route, as in `proxy.asset_routes /.image/ source.origin.auth`.
 
 Effective `origin_query` precedence is auth-level `origin_query`, then enabled Image Optimizer `origin_query`, then the route default.
 

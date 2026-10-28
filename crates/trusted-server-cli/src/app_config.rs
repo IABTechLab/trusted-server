@@ -65,6 +65,9 @@ pub fn linked_builders() -> Vec<IntegrationBuilder> {
         trusted_server_auction_prebid_server::builder(),
         trusted_server_auction_aps::builder(),
         trusted_server_ad_server_iabtl::builder(),
+        // The origin signer a source's auth table can name, offered whatever
+        // the settings say, which no section selects either.
+        trusted_server_shared_aws::builder(),
     ]
 }
 
@@ -288,6 +291,7 @@ mod tests {
                 "auction.prebid-server",
                 "auction.aps",
                 "ad-server.iabtl",
+                "shared.aws",
             ],
             "should offer the linked modules in the order their hooks run"
         );

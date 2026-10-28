@@ -1013,8 +1013,9 @@ https://edge.example.com/_ts/debug/ja4`.
 ### GET or HEAD `<proxy.asset_routes[].prefix>{path}`
 
 **Contract:** Fastly-only and registered once for each
-`[[proxy.asset_routes]]` entry. Auth: optional S3 SigV4 origin credentials,
-which authenticate Trusted Server to the origin rather than the caller.
+`[[proxy.asset_routes]]` entry. Auth: optional origin signing by the signer
+the route's `auth` table names, which authenticates Trusted Server to the
+origin rather than the caller.
 Request body: not applicable. The route maps the remainder of the path and the
 configured query policy to the selected origin, preserves range and conditional
 request semantics, and returns the origin status/body after stripping unsafe

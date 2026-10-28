@@ -1,14 +1,13 @@
-//! Minimal AWS Signature Version 4 signing for `S3` asset requests.
+//! AWS Signature Version 4 over the headers of a read from S3.
 //!
-//! Asset routes use this module for read-only `S3` origins. The signer emits
-//! header-based `SigV4` authentication with `UNSIGNED-PAYLOAD`, so it does not
-//! need `AWS` SDK credential providers, request-body hashing, or presigned query
-//! parameters. The caller must provide the final origin URL and `Host` header
-//! after any path rewrite or query-strip policy has run.
+//! The signer writes header-based authentication with `UNSIGNED-PAYLOAD`, so
+//! it needs no credential provider, no request body and no presigned query.
+//! The caller gives it the final address and `Host` header, after any path
+//! rewrite or query policy has run, because the signature covers both.
 //!
-//! Canonicalization follows the URL that will be sent to `S3`. Existing percent
-//! escapes in path and query components are preserved and normalized to upper
-//! case, while raw reserved bytes are encoded using `AWS` percent-encoding rules.
+//! Canonicalization follows the address as it will be sent. A percent escape
+//! already in the path or query is kept and written in upper case, and a raw
+//! reserved byte is encoded the way the scheme requires.
 
 use std::time::SystemTime;
 
@@ -17,10 +16,9 @@ use error_stack::Report;
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use http::{HeaderMap, HeaderValue, Method, header};
 use sha2::{Digest as _, Sha256};
+use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::redacted::Redacted;
 use url::Url;
-
-use crate::error::TrustedServerError;
-use crate::redacted::Redacted;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -28,14 +26,12 @@ const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const SERVICE: &str = "s3";
 const TERMINATOR: &str = "aws4_request";
 const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
-/// Prefix of every header name in this signing scheme's namespace.
+/// Prefix of every header name in the scheme's own namespace.
 const NAMESPACE_PREFIX: &str = "x-amz-";
 
-/// Removes every header in this signing scheme's namespace.
-///
-/// [`sign_headers`] replaces the few it writes. A caller that forwards a
-/// reader's headers removes the rest first, so no header the reader chose can
-/// change how the origin reads the signed request.
+/// Removes every header in the scheme's namespace, so a header the reader
+/// chose cannot change how the origin reads the signed request.
+/// [`sign_headers`] then writes the few it needs.
 pub(crate) fn remove_namespace_headers(headers: &mut HeaderMap) {
     let names: Vec<_> = headers
         .keys()
@@ -47,42 +43,27 @@ pub(crate) fn remove_namespace_headers(headers: &mut HeaderMap) {
     }
 }
 
-/// `AWS` credentials used to sign an `S3` request.
-///
-/// Values are loaded from the configured runtime secret store by the caller and
-/// may be cached between signatures. Temporary credentials can include a session
-/// token, which becomes the signed `x-amz-security-token` header.
+/// The credentials a request is signed with. A session token, for temporary
+/// credentials, becomes the signed `x-amz-security-token` header.
 #[derive(Debug, Clone)]
-pub struct S3Credentials {
-    /// `AWS` access key ID.
-    pub access_key_id: String,
-    /// `AWS` secret access key.
-    pub secret_access_key: Redacted<String>,
-    /// Optional `AWS` session token for temporary credentials.
-    pub session_token: Option<Redacted<String>>,
+pub(crate) struct Credentials {
+    pub(crate) access_key_id: String,
+    pub(crate) secret_access_key: Redacted<String>,
+    pub(crate) session_token: Option<Redacted<String>>,
 }
 
-/// Sign an `S3` request header map using AWS Signature Version 4.
-///
-/// The request URL and header map must already reflect the final origin request
-/// that `S3` will receive, including path, query, and `Host` header. Existing
-/// `Authorization` and `x-amz-*` signing headers are replaced so forwarded
-/// client headers cannot influence the signature.
-///
-/// This signer is scoped to read-only asset proxying. It always signs with
-/// `x-amz-content-sha256: UNSIGNED-PAYLOAD`, which is valid for `GET` and
-/// `HEAD` object reads and avoids buffering or hashing a request body.
+/// Signs `headers` for `method` on `url` at `now`, replacing any earlier
+/// `Authorization` and signing headers.
 ///
 /// # Errors
 ///
-/// Returns a proxy error when a required signing header is missing or a signing
-/// header value is invalid.
-pub fn sign_headers(
+/// When a header the signature needs is missing or cannot be written.
+pub(crate) fn sign_headers(
     method: &Method,
     url: &Url,
     headers: &mut HeaderMap,
     region: &str,
-    credentials: &S3Credentials,
+    credentials: &Credentials,
     now: SystemTime,
 ) -> Result<(), Report<TrustedServerError>> {
     let datetime = DateTime::<Utc>::from(now);
@@ -154,7 +135,7 @@ fn canonical_headers(headers: &HeaderMap) -> Result<(String, String), Report<Tru
     for name in &names {
         let value = headers.get(*name).ok_or_else(|| {
             Report::new(TrustedServerError::Proxy {
-                message: format!("missing required S3 signing header `{name}`"),
+                message: format!("missing required signing header `{name}`"),
             })
         })?;
         canonical.push_str(name);
@@ -169,14 +150,14 @@ fn canonical_headers(headers: &HeaderMap) -> Result<(String, String), Report<Tru
 fn normalize_header_value(value: &HeaderValue) -> Result<String, Report<TrustedServerError>> {
     let value = value.to_str().map_err(|err| {
         Report::new(TrustedServerError::InvalidHeaderValue {
-            message: format!("S3 signing header value is not valid text: {err}"),
+            message: format!("signing header value is not valid text: {err}"),
         })
     })?;
     Ok(value.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 fn canonical_uri(url: &Url) -> String {
-    aws_percent_encode_preserving_escapes(url.path(), false)
+    percent_encode_preserving_escapes(url.path(), false)
 }
 
 fn canonical_query(url: &Url) -> String {
@@ -189,8 +170,8 @@ fn canonical_query(url: &Url) -> String {
         .map(|part| {
             let (key, value) = part.split_once('=').unwrap_or((part, ""));
             (
-                aws_percent_encode_preserving_escapes(key, true),
-                aws_percent_encode_preserving_escapes(value, true),
+                percent_encode_preserving_escapes(key, true),
+                percent_encode_preserving_escapes(value, true),
             )
         })
         .collect();
@@ -202,7 +183,7 @@ fn canonical_query(url: &Url) -> String {
         .join("&")
 }
 
-fn aws_percent_encode_preserving_escapes(value: &str, encode_slash: bool) -> String {
+fn percent_encode_preserving_escapes(value: &str, encode_slash: bool) -> String {
     let bytes = value.as_bytes();
     let mut out = String::new();
     let mut index = 0;
@@ -218,13 +199,13 @@ fn aws_percent_encode_preserving_escapes(value: &str, encode_slash: bool) -> Str
             index += 3;
             continue;
         }
-        push_aws_percent_encoded_byte(&mut out, bytes[index], encode_slash);
+        push_percent_encoded_byte(&mut out, bytes[index], encode_slash);
         index += 1;
     }
     out
 }
 
-fn push_aws_percent_encoded_byte(out: &mut String, byte: u8, encode_slash: bool) {
+fn push_percent_encoded_byte(out: &mut String, byte: u8, encode_slash: bool) {
     match byte {
         b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
             out.push(char::from(byte));
@@ -262,7 +243,7 @@ impl<T> HeaderValueResultExt<T> for Result<T, http::header::InvalidHeaderValue> 
     fn change_context_invalid_header(self, name: &str) -> Result<T, Report<TrustedServerError>> {
         self.map_err(|err| {
             Report::new(TrustedServerError::InvalidHeaderValue {
-                message: format!("invalid S3 signing header `{name}`: {err}"),
+                message: format!("invalid signing header `{name}`: {err}"),
             })
         })
     }
@@ -272,8 +253,10 @@ impl<T> HeaderValueResultExt<T> for Result<T, http::header::InvalidHeaderValue> 
 mod tests {
     use super::*;
 
+    /// The published example of a signed `GET`, whose host and credentials
+    /// are the ones the signature was published for.
     #[test]
-    fn signs_stable_s3_get_fixture() {
+    fn signs_the_published_get_example() {
         let url = Url::parse("https://examplebucket.s3.amazonaws.com/test.txt")
             .expect("should parse URL");
         let mut headers = HeaderMap::new();
@@ -281,7 +264,7 @@ mod tests {
             header::HOST,
             HeaderValue::from_static("examplebucket.s3.amazonaws.com"),
         );
-        let credentials = S3Credentials {
+        let credentials = Credentials {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
             secret_access_key: Redacted::new(
                 "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
@@ -320,8 +303,81 @@ mod tests {
     }
 
     #[test]
+    fn a_session_token_is_signed_and_a_reader_s_header_in_the_namespace_is_removed() {
+        let url = Url::parse("https://bucket.storage.example.com/site/page").expect("url");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_static("bucket.storage.example.com"),
+        );
+        headers.insert("x-amz-meta-reader", HeaderValue::from_static("chosen"));
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer reader"),
+        );
+        let credentials = Credentials {
+            access_key_id: "TESTACCESSKEYID".to_string(),
+            secret_access_key: Redacted::new("test-secret".to_string()),
+            session_token: Some(Redacted::new("test-session".to_string())),
+        };
+
+        remove_namespace_headers(&mut headers);
+        sign_headers(
+            &Method::HEAD,
+            &url,
+            &mut headers,
+            "test-region-1",
+            &credentials,
+            SystemTime::UNIX_EPOCH,
+        )
+        .expect("should sign request");
+
+        assert!(headers.get("x-amz-meta-reader").is_none());
+        assert_eq!(
+            headers.get("x-amz-security-token"),
+            Some(&HeaderValue::from_static("test-session"))
+        );
+        let authorization = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .expect("should set authorization header");
+        assert!(
+            authorization.starts_with(
+                "AWS4-HMAC-SHA256 Credential=TESTACCESSKEYID/19700101/test-region-1/s3/aws4_request, \
+                 SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token, "
+            ),
+            "should sign the token with the other headers: {authorization}"
+        );
+    }
+
+    #[test]
+    fn a_request_without_a_host_header_is_refused() {
+        let url = Url::parse("https://bucket.storage.example.com/site/page").expect("url");
+        let mut headers = HeaderMap::new();
+        let credentials = Credentials {
+            access_key_id: "TESTACCESSKEYID".to_string(),
+            secret_access_key: Redacted::new("test-secret".to_string()),
+            session_token: None,
+        };
+
+        let err = sign_headers(
+            &Method::GET,
+            &url,
+            &mut headers,
+            "test-region-1",
+            &credentials,
+            SystemTime::UNIX_EPOCH,
+        )
+        .expect_err("should refuse without a Host");
+        assert!(
+            format!("{err:?}").contains("missing required signing header `host`"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn credentials_debug_redacts_secret_material() {
-        let credentials = S3Credentials {
+        let credentials = Credentials {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
             secret_access_key: Redacted::new("debug-secret-key".to_string()),
             session_token: Some(Redacted::new("debug-session-token".to_string())),
@@ -349,7 +405,7 @@ mod tests {
 
     #[test]
     fn canonical_uri_preserves_existing_percent_encoded_path() {
-        let url = Url::parse("https://bucket.s3.us-east-1.amazonaws.com/foo%20bar/%e2%9c%93.jpg")
+        let url = Url::parse("https://bucket.storage.example.com/foo%20bar/%e2%9c%93.jpg")
             .expect("should parse URL");
 
         assert_eq!(canonical_uri(&url), "/foo%20bar/%E2%9C%93.jpg");
@@ -357,7 +413,7 @@ mod tests {
 
     #[test]
     fn canonical_uri_encodes_raw_path_bytes_without_double_encoding() {
-        let url = Url::parse("https://bucket.s3.us-east-1.amazonaws.com/image*name%20raw.jpg")
+        let url = Url::parse("https://bucket.storage.example.com/image*name%20raw.jpg")
             .expect("should parse URL");
 
         assert_eq!(canonical_uri(&url), "/image%2Aname%20raw.jpg");
@@ -365,15 +421,15 @@ mod tests {
 
     #[test]
     fn canonical_query_sorts_and_encodes() {
-        let url = Url::parse("https://bucket.s3.us-east-1.amazonaws.com/object?z=two&a=sp ace")
+        let url = Url::parse("https://bucket.storage.example.com/object?z=two&a=sp ace")
             .expect("should parse URL");
         assert_eq!(canonical_query(&url), "a=sp%20ace&z=two");
     }
 
     #[test]
     fn canonical_query_empty_query_is_empty() {
-        let url = Url::parse("https://bucket.s3.us-east-1.amazonaws.com/object?")
-            .expect("should parse URL");
+        let url =
+            Url::parse("https://bucket.storage.example.com/object?").expect("should parse URL");
 
         assert_eq!(canonical_query(&url), "");
     }
@@ -381,7 +437,7 @@ mod tests {
     #[test]
     fn canonical_query_preserves_plus_and_existing_escapes() {
         let url = Url::parse(
-            "https://bucket.s3.us-east-1.amazonaws.com/object?v=a+b&space=a%20b&slash=a/b&encoded=a%2bb&empty",
+            "https://bucket.storage.example.com/object?v=a+b&space=a%20b&slash=a/b&encoded=a%2bb&empty",
         )
         .expect("should parse URL");
 

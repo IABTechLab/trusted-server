@@ -1846,14 +1846,6 @@ fn default_request_signing_enabled() -> bool {
     false
 }
 
-fn default_s3_access_key_id() -> Redacted<String> {
-    Redacted::new("access_key_id".to_string())
-}
-
-fn default_s3_secret_access_key() -> Redacted<String> {
-    Redacted::new("secret_access_key".to_string())
-}
-
 fn default_asset_image_optimizer_enabled() -> bool {
     true
 }
@@ -1902,115 +1894,6 @@ pub enum OriginQueryPolicy {
     Preserve,
     /// Strip the incoming query string before sending to origin.
     Strip,
-}
-
-/// Authentication configuration for an asset origin or the publisher origin.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum AssetOriginAuth {
-    /// Sign asset origin requests with AWS Signature Version 4 for `S3`.
-    #[serde(rename = "s3_sigv4", alias = "s3_sig_v4")]
-    S3SigV4(S3SigV4AuthConfig),
-}
-
-impl AssetOriginAuth {
-    pub(crate) fn normalize(&mut self) {
-        match self {
-            Self::S3SigV4(config) => config.normalize(),
-        }
-    }
-
-    /// Refuses a table the signer cannot use, naming `setting` in the message.
-    pub(crate) fn prepare_runtime(&self, setting: &str) -> Result<(), Report<TrustedServerError>> {
-        match self {
-            Self::S3SigV4(config) => config.prepare_runtime(setting),
-        }
-    }
-
-    /// Return the configured origin query policy, if any.
-    #[must_use]
-    pub fn origin_query_policy(&self) -> Option<OriginQueryPolicy> {
-        match self {
-            Self::S3SigV4(config) => config.origin_query,
-        }
-    }
-}
-
-/// AWS Signature Version 4 configuration for `S3` asset origins.
-///
-/// The route `origin_url` must use the same `S3` host that `AWS` validates in
-/// the `SigV4` canonical request. Credential fields hold secret-store key names
-/// in app config and resolved values at runtime.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct S3SigV4AuthConfig {
-    /// `AWS` region used in the credential scope.
-    pub region: String,
-    /// Deprecated per-route store selector accepted for migration only.
-    #[serde(default, skip_serializing)]
-    pub secret_store: Option<String>,
-    /// Secret reference containing the `AWS` access key ID.
-    #[serde(default = "default_s3_access_key_id")]
-    pub access_key_id: Redacted<String>,
-    /// Secret reference containing the `AWS` secret access key.
-    #[serde(default = "default_s3_secret_access_key")]
-    pub secret_access_key: Redacted<String>,
-    /// Optional secret reference containing an `AWS` session token.
-    #[serde(default)]
-    pub session_token: Option<Redacted<String>>,
-    /// Query-string handling policy for the signed `S3` origin request.
-    ///
-    /// Set this to `strip` when request query parameters are transformation
-    /// inputs rather than `S3` object identity. If omitted, image-optimized routes
-    /// strip queries and plain routes preserve them.
-    #[serde(default)]
-    pub origin_query: Option<OriginQueryPolicy>,
-}
-
-fn s3_region_is_valid(region: &str) -> bool {
-    region
-        .bytes()
-        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-}
-
-impl S3SigV4AuthConfig {
-    fn normalize(&mut self) {
-        self.region = self.region.trim().to_string();
-        if self.secret_store.take().is_some() {
-            log::warn!(
-                "S3 secret_store is deprecated and ignored; static credentials resolve through the default app-config secret store"
-            );
-        }
-        self.access_key_id = Redacted::new(self.access_key_id.expose().trim().to_string());
-        self.secret_access_key = Redacted::new(self.secret_access_key.expose().trim().to_string());
-        self.session_token = self.session_token.take().and_then(|value| {
-            let value = value.expose().trim().to_string();
-            (!value.is_empty()).then(|| Redacted::new(value))
-        });
-    }
-
-    fn prepare_runtime(&self, setting: &str) -> Result<(), Report<TrustedServerError>> {
-        if self.region.is_empty() {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: format!("{setting} s3_sigv4 region must not be empty"),
-            }));
-        }
-        if !s3_region_is_valid(&self.region) {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "{setting} s3_sigv4 region must contain only lowercase letters, digits, and '-'"
-                ),
-            }));
-        }
-        if self.access_key_id.expose().is_empty() || self.secret_access_key.expose().is_empty() {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "{setting} s3_sigv4 credentials must not be empty after secret resolution"
-                ),
-            }));
-        }
-        Ok(())
-    }
 }
 
 /// Route-level Image Optimizer configuration for asset proxying.
@@ -2810,7 +2693,11 @@ impl ProxyAssetRoute {
     /// enabled Image Optimizer routes and `preserve` otherwise.
     #[must_use]
     pub fn origin_query_policy(&self) -> OriginQueryPolicy {
-        self.query_policy_with(self.origin_source().and_then(|origin| origin.auth).as_ref())
+        self.query_policy_with(
+            self.origin_source()
+                .and_then(|origin| origin.auth)
+                .and_then(|auth| auth.origin_query),
+        )
     }
 
     /// The effective origin query policy for a request to `location`, as
@@ -2821,11 +2708,15 @@ impl ProxyAssetRoute {
         &self,
         location: &crate::source::SourceLocation,
     ) -> OriginQueryPolicy {
-        self.query_policy_with(location.auth())
+        self.query_policy_with(
+            location
+                .auth()
+                .and_then(crate::origin_auth::OriginSigning::origin_query_policy),
+        )
     }
 
-    fn query_policy_with(&self, auth: Option<&AssetOriginAuth>) -> OriginQueryPolicy {
-        if let Some(policy) = auth.and_then(AssetOriginAuth::origin_query_policy) {
+    fn query_policy_with(&self, auth: Option<OriginQueryPolicy>) -> OriginQueryPolicy {
+        if let Some(policy) = auth {
             return policy;
         }
         if let Some(policy) = self
@@ -5741,9 +5632,8 @@ module = \"none\"",
         const CANARY_EC_PARTNER_TS_PULL_TOKEN: &str = "CANARY-EC-PARTNER-TS-PULL-TOKEN-0123456789";
         const CANARY_TRUSTED_CLIENT_IP_SHARED_SECRET: &str =
             "CANARY-TRUSTED-CLIENT-IP-SHARED-SECRET-0123456789";
-        const CANARY_S3_ACCESS_KEY_ID: &str = "CANARY-S3-ACCESS-KEY-ID-0123456789";
-        const CANARY_S3_SECRET_ACCESS_KEY: &str = "CANARY-S3-SECRET-ACCESS-KEY-0123456789";
-        const CANARY_S3_SESSION_TOKEN: &str = "CANARY-S3-SESSION-TOKEN-0123456789";
+        const CANARY_SIGNER_KEY: &str = "CANARY-SIGNER-KEY-0123456789";
+        const CANARY_SIGNER_TOKEN: &str = "CANARY-SIGNER-TOKEN-0123456789";
         const CANARY_MODULE_KEY: &str = "CANARY-MODULE-TABLE-KEY-0123456789";
 
         let mut settings = create_test_settings();
@@ -5772,17 +5662,15 @@ module = \"none\"",
             shared_secret: Redacted::new(CANARY_TRUSTED_CLIENT_IP_SHARED_SECRET.to_string()),
         });
 
-        let mut asset_route = ProxyAssetRoute::new("/s3-assets/", "https://s3.canary.example");
+        let mut asset_route =
+            ProxyAssetRoute::new("/signed-assets/", "https://signed.canary.example");
         asset_route.set_origin_source(&crate::source::OriginSettings {
-            auth: Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-                region: "us-east-1".to_string(),
-                secret_store: None,
-                access_key_id: Redacted::new(CANARY_S3_ACCESS_KEY_ID.to_string()),
-                secret_access_key: Redacted::new(CANARY_S3_SECRET_ACCESS_KEY.to_string()),
-                session_token: Some(Redacted::new(CANARY_S3_SESSION_TOKEN.to_string())),
-                origin_query: None,
-            })),
-            ..crate::source::OriginSettings::new("https://s3.canary.example")
+            auth: Some(
+                crate::origin_auth::fixture::auth("canary")
+                    .with_setting("key_name", CANARY_SIGNER_KEY)
+                    .with_setting("token_name", CANARY_SIGNER_TOKEN),
+            ),
+            ..crate::source::OriginSettings::new("https://signed.canary.example")
         });
         settings.proxy.asset_routes = vec![asset_route];
 
@@ -5823,16 +5711,12 @@ module = \"none\"",
                 CANARY_TRUSTED_CLIENT_IP_SHARED_SECRET,
             ),
             (
-                "proxy.asset_routes[].auth.access_key_id",
-                CANARY_S3_ACCESS_KEY_ID,
+                "proxy.asset_routes[].source.origin.auth.key_name",
+                CANARY_SIGNER_KEY,
             ),
             (
-                "proxy.asset_routes[].auth.secret_access_key",
-                CANARY_S3_SECRET_ACCESS_KEY,
-            ),
-            (
-                "proxy.asset_routes[].auth.session_token",
-                CANARY_S3_SESSION_TOKEN,
+                "proxy.asset_routes[].source.origin.auth.token_name",
+                CANARY_SIGNER_TOKEN,
             ),
             ("testing.example.key_name", CANARY_MODULE_KEY),
         ];
@@ -8137,7 +8021,10 @@ host_header = "www.example.com:8443""#,
             settings
                 .origin_source()
                 .expect("should select the origin source")
-                .location()
+                .location(
+                    &crate::origin_auth::OriginSigners::default(),
+                    "source.origin"
+                )
                 .expect("should give a location")
                 .host_header(),
             "www.example.com:8443",
@@ -8876,7 +8763,10 @@ source_domain = "partner.example.com"
             assert_eq!(origin.host_header.as_deref(), Some("www.example.com"));
             assert_eq!(
                 origin
-                    .location()
+                    .location(
+                        &crate::origin_auth::OriginSigners::default(),
+                        "source.origin"
+                    )
                     .expect("should give a location")
                     .host_header(),
                 "www.example.com"
@@ -8980,10 +8870,10 @@ source_domain = "partner.example.com"
     }
 
     #[test]
-    fn source_origin_auth_reads_the_asset_route_auth_table() {
+    fn source_origin_auth_reads_its_type_and_query_policy_and_keeps_the_rest() {
         let settings = Settings::from_toml(&origin_settings_with(
             STORAGE_ORIGIN_URL,
-            r#"auth = { type = "s3_sigv4", region = "test-region-1", access_key_id = "origin_access_key_id", secret_access_key = "origin_secret_access_key", session_token = "origin_session_token", origin_query = "strip" }
+            r#"auth = { type = " fixture_scheme ", realm = "site", key_name = "origin_key", origin_query = "strip" }
             directory_index = "index.html""#,
         ))
         .expect("should parse an origin with auth and directory_index");
@@ -8991,52 +8881,43 @@ source_domain = "partner.example.com"
             .origin_source()
             .expect("should select the origin source");
 
-        let Some(AssetOriginAuth::S3SigV4(auth)) = origin.auth.as_ref() else {
-            panic!("should read auth as the asset route auth table");
-        };
-        assert_eq!(auth.region, "test-region-1");
-        assert_eq!(auth.access_key_id.expose(), "origin_access_key_id");
-        assert_eq!(auth.secret_access_key.expose(), "origin_secret_access_key");
+        let auth = origin.auth.as_ref().expect("should read auth");
+        assert_eq!(auth.signer, "fixture_scheme", "the type should be trimmed");
+        assert_eq!(auth.origin_query, Some(OriginQueryPolicy::Strip));
         assert_eq!(
-            auth.session_token
-                .as_ref()
-                .map(Redacted::expose)
-                .map(String::as_str),
-            Some("origin_session_token")
+            auth.settings.get("realm").and_then(JsonValue::as_str),
+            Some("site")
+        );
+        assert_eq!(
+            auth.settings.get("key_name").and_then(JsonValue::as_str),
+            Some("origin_key")
         );
         assert!(
-            origin
-                .location()
-                .expect("should give a location")
-                .query_is_stripped(),
-            "origin_query = \"strip\" should leave the query off origin requests"
+            !auth.settings.contains_key("type") && !auth.settings.contains_key("origin_query"),
+            "the keys core reads should stay out of the signer's settings"
         );
         assert_eq!(origin.directory_index.as_deref(), Some("index.html"));
 
-        let defaulted = Settings::from_toml(&origin_settings_with(
-            STORAGE_ORIGIN_URL,
-            r#"auth = { type = "s3_sigv4", region = "test-region-1" }"#,
-        ))
-        .expect("should parse auth naming only its region");
-        let defaulted = defaulted
-            .origin_source()
-            .expect("should select the origin source");
-        let Some(AssetOriginAuth::S3SigV4(auth)) = defaulted.auth.as_ref() else {
-            panic!("should read auth with defaulted key references");
-        };
-        assert_eq!(
-            (
-                auth.access_key_id.expose().as_str(),
-                auth.secret_access_key.expose().as_str()
-            ),
-            ("access_key_id", "secret_access_key"),
-            "omitted key references should default as an asset route's do"
-        );
+        let location = origin
+            .location(&crate::origin_auth::fixture::signers(), "source.origin")
+            .expect("should give a location signing through the fixture");
         assert!(
-            !defaulted
-                .location()
-                .expect("should give a location")
-                .query_is_stripped(),
+            location.query_is_stripped(),
+            "origin_query = \"strip\" should leave the query off origin requests"
+        );
+
+        let kept = Settings::from_toml(&origin_settings_with(
+            STORAGE_ORIGIN_URL,
+            r#"auth = { type = "fixture_scheme", realm = "site" }"#,
+        ))
+        .expect("should parse auth naming only its type and realm");
+        let kept = kept
+            .origin_source()
+            .expect("should select the origin source")
+            .location(&crate::origin_auth::fixture::signers(), "source.origin")
+            .expect("should give a location");
+        assert!(
+            !kept.query_is_stripped(),
             "the query should be kept unless origin_query strips it"
         );
     }
@@ -9101,44 +8982,29 @@ source_domain = "partner.example.com"
     }
 
     #[test]
-    fn source_origin_auth_refuses_a_table_it_cannot_sign_with() {
+    fn source_origin_auth_refuses_a_table_core_cannot_use() {
         for (origin_url, table, expected) in [
             (
-                STORAGE_ORIGIN_URL,
-                r#"{ type = "s3_sigv4", region = "" }"#,
-                "source.origin.auth s3_sigv4 region must not be empty",
-            ),
-            (
-                STORAGE_ORIGIN_URL,
-                r#"{ type = "s3_sigv4", region = "Test_Region" }"#,
-                "source.origin.auth s3_sigv4 region must contain only lowercase letters",
-            ),
-            (
-                STORAGE_ORIGIN_URL,
-                r#"{ type = "s3_sigv4", region = "test-region-1", access_key_id = " " }"#,
-                "source.origin.auth s3_sigv4 credentials must not be empty",
-            ),
-            (
-                STORAGE_ORIGIN_URL,
-                r#"{ type = "s3_sigv4", region = "test-region-1", secret_access_key = "" }"#,
-                "source.origin.auth s3_sigv4 credentials must not be empty",
-            ),
-            (
                 "http://storage.example.com/bucket/site",
-                r#"{ type = "s3_sigv4", region = "test-region-1" }"#,
+                r#"{ type = "fixture_scheme", realm = "site" }"#,
                 "[source.origin] signs with auth, so url must use https",
             ),
             (
                 STORAGE_ORIGIN_URL,
-                r#"{ type = "unknown_scheme", region = "test-region-1" }"#,
-                "source.origin",
+                r#"{ realm = "site" }"#,
+                "[source.origin] could not be read",
             ),
             (
                 STORAGE_ORIGIN_URL,
-                r#"{ type = "s3_sigv4", region = "test-region-1", bucket = "site" }"#,
-                "bucket",
+                r#"{ type = "" }"#,
+                "[source.origin.auth] names no signer",
             ),
-            (STORAGE_ORIGIN_URL, r#""s3_sigv4""#, "source.origin"),
+            (
+                STORAGE_ORIGIN_URL,
+                r#"{ type = "Not A Name" }"#,
+                "[source.origin.auth] type `Not A Name` is not a signer's name",
+            ),
+            (STORAGE_ORIGIN_URL, r#""fixture_scheme""#, "source.origin"),
         ] {
             let err = Settings::from_toml(&origin_settings_with(
                 origin_url,
@@ -9156,44 +9022,33 @@ source_domain = "partner.example.com"
     fn asset_route_auth_refusals_name_the_asset_route() {
         let mut route = ProxyAssetRoute::new("/assets/", "https://storage.example.com");
         route.set_origin_source(&crate::source::OriginSettings {
-            auth: Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-                region: String::new(),
-                secret_store: None,
-                access_key_id: Redacted::new("access_key_id".to_owned()),
-                secret_access_key: Redacted::new("secret_access_key".to_owned()),
-                session_token: None,
-                origin_query: None,
-            })),
+            auth: Some(crate::origin_auth::OriginAuth::new("")),
             ..crate::source::OriginSettings::new("https://storage.example.com")
         });
 
         let err = route
             .prepare_runtime()
-            .expect_err("should refuse an asset route auth with no region");
+            .expect_err("should refuse an asset route auth naming no signer");
         assert!(
-            format!("{err:?}").contains(
-                "proxy.asset_routes /assets/ source.origin.auth s3_sigv4 region must not be empty"
-            ),
+            format!("{err:?}")
+                .contains("[proxy.asset_routes /assets/ source.origin.auth] names no signer"),
             "the asset route refusal should name the route: {err:?}"
         );
     }
 
     #[test]
-    fn source_origin_auth_credentials_stay_out_of_debug_output() {
+    fn source_origin_auth_settings_stay_out_of_debug_output() {
         let canaries = [
-            "canary-origin-access",
-            "canary-origin-secret",
-            "canary-origin-session",
+            "canary-origin-realm",
+            "canary-origin-key",
+            "canary-origin-token",
         ];
         let origin = crate::source::OriginSettings {
-            auth: Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-                region: "test-region-1".to_owned(),
-                secret_store: None,
-                access_key_id: Redacted::new(canaries[0].to_owned()),
-                secret_access_key: Redacted::new(canaries[1].to_owned()),
-                session_token: Some(Redacted::new(canaries[2].to_owned())),
-                origin_query: None,
-            })),
+            auth: Some(
+                crate::origin_auth::fixture::auth(canaries[0])
+                    .with_setting("key_name", canaries[1])
+                    .with_setting("token_name", canaries[2]),
+            ),
             ..crate::source::OriginSettings::new("https://storage.example.com/bucket/site")
         };
         let mut settings = Settings::default();
@@ -9202,8 +9057,8 @@ source_domain = "partner.example.com"
         let debug = format!("{origin:?} {settings:?}");
 
         assert!(
-            debug.contains("test-region-1"),
-            "should leave the region visible in debug output: {debug}"
+            debug.contains("fixture_scheme"),
+            "should leave the signer's name visible in debug output: {debug}"
         );
         for canary in canaries {
             assert!(
@@ -9515,7 +9370,7 @@ source_domain = "partner.example.com"
                 "[source.origin] directory_index",
             ),
             (
-                r#"origin_auth = { type = "s3_sigv4", region = "test-region-1" }"#,
+                r#"origin_auth = { type = "fixture_scheme", realm = "site" }"#,
                 "[source.origin] auth",
             ),
         ] {
@@ -9544,7 +9399,7 @@ source_domain = "partner.example.com"
             (
                 r#"source.module = "origin"
             source.origin.url = "https://assets.example.com"
-            auth = { type = "s3_sigv4", region = "us-east-1" }"#,
+            auth = { type = "fixture_scheme", realm = "assets" }"#,
                 "[proxy.asset_routes.source.origin] auth",
             ),
         ] {
@@ -9949,11 +9804,11 @@ source_domain = "partner.example.com"
             [[proxy.asset_routes]]
             prefix = "/.image/"
             source.module = "origin"
-            source.origin.url = "https://bucket.s3.us-east-1.amazonaws.com"
+            source.origin.url = "https://bucket.storage.example.com"
 
             [proxy.asset_routes.source.origin.auth]
-            type = "s3_sigv4"
-            region = "us-east-1"
+            type = "fixture_scheme"
+            realm = "images"
             origin_query = "strip"
 
             [proxy.asset_routes.image_optimizer]
@@ -9963,82 +9818,25 @@ source_domain = "partner.example.com"
             "#;
 
         let settings = Settings::from_toml(&toml_str)
-            .expect("should parse S3 auth and image optimizer asset route");
+            .expect("should parse a signed image optimizer asset route");
         let route = settings
             .asset_route_for_path("/.image/id/example.jpg")
             .expect("should match configured route");
         assert!(route.image_optimizer_enabled());
         assert_eq!(route.origin_query_policy(), OriginQueryPolicy::Strip);
-        match route
+        let auth = route
             .origin_source()
             .and_then(|origin| origin.auth)
-            .expect("should configure route auth")
-        {
-            AssetOriginAuth::S3SigV4(config) => {
-                assert_eq!(config.region, "us-east-1");
-                assert_eq!(config.secret_store, None);
-                assert_eq!(config.access_key_id.expose(), "access_key_id");
-                assert_eq!(config.secret_access_key.expose(), "secret_access_key");
-            }
-        }
-    }
-
-    #[test]
-    fn proxy_asset_route_validation_rejects_s3_sigv4_http_origin_url() {
-        let toml_str = crate_test_settings_str()
-            + r#"
-            [proxy]
-
-            [[proxy.asset_routes]]
-            prefix = "/.images/"
-            source.module = "origin"
-            source.origin.url = "http://bucket.s3.us-east-1.amazonaws.com"
-
-            [proxy.asset_routes.source.origin.auth]
-            type = "s3_sigv4"
-            region = "us-east-1"
-            "#;
-
-        let err = Settings::from_toml(&toml_str)
-            .expect_err("should reject cleartext S3 SigV4 origin URLs");
-
-        assert!(
-            format!("{err:?}").contains("signs with auth, so url must use https"),
-            "should mention the S3 SigV4 HTTPS requirement: {err:?}"
+            .expect("should configure route auth");
+        assert_eq!(auth.signer, "fixture_scheme");
+        assert_eq!(
+            auth.settings.get("realm").and_then(JsonValue::as_str),
+            Some("images")
         );
     }
 
     #[test]
-    fn proxy_asset_route_validation_rejects_invalid_s3_regions() {
-        for region in ["us east 1", "us/east/1", "US-EAST-1", "us-east-\\n1"] {
-            let toml_str = crate_test_settings_str()
-                + &format!(
-                    r#"
-            [proxy]
-
-            [[proxy.asset_routes]]
-            prefix = "/.images/"
-            source.module = "origin"
-            source.origin.url = "https://bucket.s3.us-east-1.amazonaws.com"
-
-            [proxy.asset_routes.source.origin.auth]
-            type = "s3_sigv4"
-            region = "{region}"
-            "#
-                );
-
-            let err = Settings::from_toml(&toml_str)
-                .expect_err("should reject malformed S3 region values");
-
-            assert!(
-                format!("{err:?}").contains("region must contain only lowercase letters"),
-                "should mention the S3 region character policy for {region:?}: {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn proxy_asset_route_validation_rejects_unknown_s3_auth_fields() {
+    fn proxy_asset_route_validation_rejects_a_signed_http_origin_url() {
         let toml_str = crate_test_settings_str()
             + r#"
             [proxy]
@@ -10046,20 +9844,19 @@ source_domain = "partner.example.com"
             [[proxy.asset_routes]]
             prefix = "/.images/"
             source.module = "origin"
-            source.origin.url = "https://bucket.s3.us-east-1.amazonaws.com"
+            source.origin.url = "http://bucket.storage.example.com"
 
             [proxy.asset_routes.source.origin.auth]
-            type = "s3_sigv4"
-            region = "us-east-1"
-            secret_access_key_name = "secret_access_key"
+            type = "fixture_scheme"
+            realm = "images"
             "#;
 
         let err = Settings::from_toml(&toml_str)
-            .expect_err("should reject unknown S3 auth config fields");
+            .expect_err("should reject a signed origin reached over cleartext");
 
         assert!(
-            format!("{err:?}").contains("secret_access_key_name"),
-            "should mention the unknown S3 auth field: {err:?}"
+            format!("{err:?}").contains("signs with auth, so url must use https"),
+            "should mention the https requirement: {err:?}"
         );
     }
 
@@ -10386,19 +10183,19 @@ source_domain = "partner.example.com"
                 format!(
                     "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}SOURCE{separator}ORIGIN{separator}URL"
                 ),
-                Some("https://bucket.s3.us-west-2.amazonaws.com"),
+                Some("https://bucket.storage.example.com"),
             ),
             (
                 format!(
                     "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}SOURCE{separator}ORIGIN{separator}AUTH{separator}TYPE"
                 ),
-                Some("s3_sigv4"),
+                Some("fixture_scheme"),
             ),
             (
                 format!(
-                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}SOURCE{separator}ORIGIN{separator}AUTH{separator}REGION"
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}SOURCE{separator}ORIGIN{separator}AUTH{separator}REALM"
                 ),
-                Some("us-west-2"),
+                Some("images"),
             ),
             (
                 format!(
@@ -10526,7 +10323,7 @@ source_domain = "partner.example.com"
             [[proxy.asset_routes]]
             prefix = "/.image/"
             source.module = "origin"
-            source.origin.url = "https://bucket.s3.us-east-1.amazonaws.com"
+            source.origin.url = "https://bucket.storage.example.com"
 
             [proxy.asset_routes.image_optimizer]
             enabled = true

@@ -23,6 +23,7 @@ members = [
     "crates/analytics/tinybird",
     "crates/headers/geo",
     "crates/loading-cache/51degrees",
+    "crates/shared/aws",
     "crates/shared/51degrees",
     "crates/middleware/51degrees",
     "crates/asset-cache/51degrees",
@@ -176,6 +177,7 @@ trusted-server-ads-txt-iabtl = { path = "crates/ads-txt/iabtl" }
 trusted-server-analytics-tinybird = { path = "crates/analytics/tinybird" }
 trusted-server-headers-geo = { path = "crates/headers/geo" }
 trusted-server-loading-cache-51degrees = { path = "crates/loading-cache/51degrees" }
+trusted-server-shared-aws = { path = "crates/shared/aws" }
 trusted-server-shared-51degrees = { path = "crates/shared/51degrees" }
 trusted-server-middleware-51degrees = { path = "crates/middleware/51degrees" }
 trusted-server-asset-cache-51degrees = { path = "crates/asset-cache/51degrees" }

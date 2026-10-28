@@ -85,10 +85,12 @@ url = "https://origin.example.com"
 # with its index file. The reader's address is unchanged.
 # directory_index = "index.html"
 # Optional: sign every origin request, for an origin such as private object
-# storage. The same table as an asset route's. Only GET and HEAD are signed,
-# other methods are refused, and the reader's cookies, Authorization, Referer,
-# conditional validators and Range are not sent. url must use https. Keep this
-# table last in [source.origin].
+# storage. The same table as an asset route's. type names an origin signer a
+# crate in the build offers, s3_sigv4 in a stock build, and the rest of the
+# table is that signer's. Only GET and HEAD are signed, other methods are
+# refused, and the reader's cookies, Authorization, Referer, conditional
+# validators and Range are not sent. url must use https. Keep this table last
+# in [source.origin].
 # [source.origin.auth]
 # type = "s3_sigv4"
 # region = "example-region-1"
@@ -483,12 +485,12 @@ pull_sync_concurrency = 3
 # [proxy.asset_routes.source.origin]
 # url = "https://assets.example.com"
 #
-# Optional S3 SigV4 auth for a private origin:
+# Optional signing for a private origin. type names an origin signer a crate
+# in the build offers, s3_sigv4 in a stock build:
 # [proxy.asset_routes.source.origin.auth]
 # type = "s3_sigv4"
 # region = "us-east-1"
 # origin_query = "strip"
-# secret_store = "s3-auth"
 # access_key_id = "access_key_id"
 # secret_access_key = "secret_access_key"
 #

@@ -50,6 +50,7 @@ trusted-server-core = { workspace = true }
 trusted-server-framework-nextjs = { workspace = true }
 trusted-server-headers-geo = { workspace = true }
 trusted-server-identity-lockr = { workspace = true }
+trusted-server-shared-aws = { workspace = true }
 trusted-server-permission-signal-gpc = { workspace = true }
 trusted-server-permission-signal-gpp = { workspace = true }
 trusted-server-permission-signal-mtm = { workspace = true }

@@ -28,8 +28,7 @@ use crate::platform::{
     DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, PlatformHttpRequest, PlatformResponse,
     RuntimeServices,
 };
-use crate::s3_sigv4::{self, S3Credentials};
-use crate::settings::{AssetOriginAuth, OriginQueryPolicy, ProxyAssetRoute, Settings};
+use crate::settings::{OriginQueryPolicy, ProxyAssetRoute, Settings};
 use crate::source::{Source, SourceLocation, SourceRequest};
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 
@@ -920,48 +919,6 @@ fn asset_origin_host_header(
     })
 }
 
-/// Signs an origin request whose address and headers are otherwise final.
-///
-/// The one signing path for origin auth, used by asset routes and by the
-/// publisher origin alike.
-pub(crate) fn apply_asset_origin_auth(
-    method: &Method,
-    target_url: &url::Url,
-    headers: &mut http::HeaderMap,
-    auth: &AssetOriginAuth,
-) -> Result<(), Report<TrustedServerError>> {
-    match auth {
-        AssetOriginAuth::S3SigV4(config) => {
-            let credentials = S3Credentials {
-                access_key_id: config.access_key_id.expose().clone(),
-                secret_access_key: config.secret_access_key.clone(),
-                session_token: config.session_token.clone(),
-            };
-            s3_sigv4::sign_headers(
-                method,
-                target_url,
-                headers,
-                &config.region,
-                &credentials,
-                // s3_sigv4 converts this via chrono's `DateTime::<Utc>::from`, which
-                // only accepts `std::time::SystemTime`.
-                crate::ec::std_system_time_now(),
-            )
-        }
-    }
-}
-
-/// Removes every header in `auth`'s signing namespace, so a header a reader
-/// sent there cannot reach the origin beside the signature.
-pub(crate) fn remove_origin_auth_namespace_headers(
-    headers: &mut http::HeaderMap,
-    auth: &AssetOriginAuth,
-) {
-    match auth {
-        AssetOriginAuth::S3SigV4(_) => s3_sigv4::remove_namespace_headers(headers),
-    }
-}
-
 fn build_asset_platform_request(
     method: &Method,
     target_url: &url::Url,
@@ -1032,17 +989,21 @@ fn apply_no_store_cache_control(response: &mut Response<EdgeBody>) {
     apply_no_store_private_to_headers(response.headers_mut());
 }
 
-fn should_preflight_s3(
+fn should_preflight_signed_origin(
     location: &SourceLocation,
     image_optimizer_enabled: bool,
     request_method: &Method,
 ) -> bool {
     image_optimizer_enabled
-        && matches!(location.auth(), Some(AssetOriginAuth::S3SigV4(_)))
+        && location.auth().is_some()
         && (request_method == Method::GET || request_method == Method::HEAD)
 }
 
-async fn preflight_s3_origin_for_image_optimizer(
+/// Asks a signed origin for the object with a `HEAD` before the image
+/// optimizer is asked for it, because the optimizer can mask or transform
+/// the origin's own error. A missing or refused object is answered with that
+/// error and the optimizer is left out of the failure path.
+async fn preflight_signed_origin_for_image_optimizer(
     services: &RuntimeServices,
     location: &SourceLocation,
     target_url: &url::Url,
@@ -1050,15 +1011,12 @@ async fn preflight_s3_origin_for_image_optimizer(
     unsigned_headers: &http::HeaderMap,
     backend_name: &str,
 ) -> Result<Option<AssetProxyResponse>, Report<TrustedServerError>> {
-    let Some(auth @ AssetOriginAuth::S3SigV4(_)) = location.auth() else {
+    let Some(auth) = location.auth() else {
         return Ok(None);
     };
 
-    // Fastly Image Optimizer can mask or transform S3 origin errors. A signed
-    // HEAD preflight lets missing or unauthorized objects return raw S3 errors
-    // without invoking IO on the failure path.
     let mut head_headers = unsigned_headers.clone();
-    apply_asset_origin_auth(&Method::HEAD, target_url, &mut head_headers, auth)?;
+    auth.sign(&Method::HEAD, target_url, &mut head_headers)?;
     let head_response = send_asset_origin_request(
         services,
         backend_name,
@@ -1081,7 +1039,7 @@ async fn preflight_s3_origin_for_image_optimizer(
     }
 
     let mut get_headers = unsigned_headers.clone();
-    apply_asset_origin_auth(&Method::GET, target_url, &mut get_headers, auth)?;
+    auth.sign(&Method::GET, target_url, &mut get_headers)?;
     let mut response = send_asset_origin_request(
         services,
         backend_name,
@@ -1104,15 +1062,15 @@ async fn preflight_s3_origin_for_image_optimizer(
 /// is path rewrite, profile-table Image Optimizer metadata extraction, optional
 /// origin query stripping, optional origin authentication, then platform send.
 ///
-/// The origin query policy is applied before S3 signing so the signature covers
+/// The origin query policy is applied before signing so the signature covers
 /// the exact URL sent to the asset origin. Image Optimizer metadata remains
 /// separate from the origin URL and is translated by the platform adapter.
 ///
 /// # Errors
 ///
 /// Returns an error if the configured origin URL is invalid, backend
-/// registration fails, S3 credentials cannot be read, signing fails, image
-/// optimizer metadata cannot be built, or the upstream request cannot be sent.
+/// registration fails, signing fails, image optimizer metadata cannot be
+/// built, or the upstream request cannot be sent.
 pub async fn handle_asset_proxy_request(
     settings: &Settings,
     services: &RuntimeServices,
@@ -1189,8 +1147,8 @@ pub async fn handle_asset_proxy_request(
     };
     outbound_headers.insert(header::HOST, host_header);
 
-    if should_preflight_s3(&location, image_optimizer.is_some(), req.method())
-        && let Some(response) = preflight_s3_origin_for_image_optimizer(
+    if should_preflight_signed_origin(&location, image_optimizer.is_some(), req.method())
+        && let Some(response) = preflight_signed_origin_for_image_optimizer(
             services,
             &location,
             &target_url,
@@ -1204,7 +1162,8 @@ pub async fn handle_asset_proxy_request(
     }
 
     if let Some(auth) = location.auth() {
-        apply_asset_origin_auth(req.method(), &target_url, &mut outbound_headers, auth)?;
+        auth.remove_namespace_headers(&mut outbound_headers);
+        auth.sign(req.method(), &target_url, &mut outbound_headers)?;
     }
 
     let mut platform_req =
@@ -2379,6 +2338,7 @@ mod tests {
     use crate::constants::{HEADER_ACCEPT, HEADER_X_FORWARDED_FOR};
     use crate::creative;
     use crate::error::{IntoHttpResponse, TrustedServerError};
+    use crate::origin_auth::fixture;
     use crate::platform::RuntimeServices;
     use crate::platform::test_support::{
         HashMapSecretStore, StubHttpClient, build_services_with_http_client,
@@ -2388,11 +2348,10 @@ mod tests {
         PlatformError, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
         PlatformResponse, PlatformSecretStore, PlatformSelectResult, StoreId, StoreName,
     };
-    use crate::redacted::Redacted;
     use crate::settings::{
-        AssetImageOptimizerConfig, AssetOriginAuth, ImageOptimizerAspectRatioConfig,
+        AssetImageOptimizerConfig, ImageOptimizerAspectRatioConfig,
         ImageOptimizerCropOffsetsConfig, ImageOptimizerProfileSet, ImageOptimizerSettings,
-        OriginQueryPolicy, ProxyAssetRoute, S3SigV4AuthConfig, Settings, UnknownProfilePolicy,
+        OriginQueryPolicy, ProxyAssetRoute, Settings, UnknownProfilePolicy,
     };
     use crate::test_support::tests::{
         crate_test_settings_str, create_test_settings, set_route_auth,
@@ -5007,16 +4966,19 @@ mod tests {
         route
             .origin_source()
             .expect("the route should select the origin source")
-            .location()
+            .location(&fixture::signers(), "proxy.asset_routes source.origin")
             .expect("the origin source should give a location")
     }
 
-    /// `route`'s `origin` source, as the registry builds it.
+    /// `route`'s `origin` source, as the registry builds it with the fixture
+    /// signer on offer.
     fn origin_source_of(route: &ProxyAssetRoute) -> crate::source::OriginSource {
         crate::source::OriginSource::new(
             &route
                 .origin_source()
                 .expect("the route should select the origin source"),
+            &fixture::signers(),
+            "proxy.asset_routes source.origin",
         )
         .expect("should build the route's source")
     }
@@ -5538,7 +5500,7 @@ mod tests {
             stub.push_response(200, b"ok".to_vec());
             let module = TestAssetCache::asking_the_origin();
             let settings = create_test_settings();
-            let mut route = test_s3_image_optimizer_route();
+            let mut route = test_signed_image_optimizer_route();
             route.image_optimizer = None;
             let mut request =
                 build_http_request(Method::GET, "https://www.example.com/.images/a.css");
@@ -5548,7 +5510,7 @@ mod tests {
             );
 
             let services = build_services_with_secret_and_http_client(
-                HashMapSecretStore::new(test_s3_secrets()),
+                HashMapSecretStore::new(test_signed_route_secrets()),
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
             )
             .with_asset_cache_module(Arc::clone(&module) as _);
@@ -5575,9 +5537,13 @@ mod tests {
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default()
                 .to_owned();
-            assert!(
-                sent.starts_with("AWS4-HMAC-SHA256"),
-                "the origin request carries the route's own credentials, not the reader's: {sent}"
+            assert_eq!(
+                sent,
+                signed_route_authorization(
+                    &Method::GET,
+                    "https://bucket.storage.example.com/.images/a.css"
+                ),
+                "the origin request carries the route's own credentials, not the reader's"
             );
             let forwarded_headers = super::ASSET_PROXY_FORWARD_HEADERS;
             let forwarded: Vec<&str> = forwarded_headers
@@ -5589,7 +5555,7 @@ mod tests {
                     forwarded.contains(&name.as_str())
                         || name == header::HOST
                         || name == header::AUTHORIZATION
-                        || name.as_str().starts_with("x-amz-"),
+                        || name.as_str().starts_with("x-fixture-"),
                     "the origin request carries only what the route forwards and signs: {name}"
                 );
             }
@@ -6140,36 +6106,30 @@ mod tests {
         }
     }
 
-    fn test_s3_secrets() -> HashMap<String, Vec<u8>> {
-        HashMap::from([
-            (
-                "access_key_id".to_string(),
-                b"AKIAIOSFODNN7EXAMPLE".to_vec(),
-            ),
-            (
-                "secret_access_key".to_string(),
-                b"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_vec(),
-            ),
-        ])
+    /// The resolved key the signed route tests sign with.
+    const SIGNED_ROUTE_KEY: &str = "resolved-route-key";
+
+    /// The address of the signed route tests' origin.
+    const SIGNED_ROUTE_ORIGIN: &str = "https://bucket.storage.example.com";
+
+    fn test_signed_route_secrets() -> HashMap<String, Vec<u8>> {
+        HashMap::from([(
+            "fixture_key".to_string(),
+            SIGNED_ROUTE_KEY.as_bytes().to_vec(),
+        )])
     }
 
-    fn test_s3_image_optimizer_route() -> ProxyAssetRoute {
-        let mut route = ProxyAssetRoute::new(
-            "/.images/",
-            "https://examplebucket.s3.us-east-1.amazonaws.com",
-        );
+    /// The `Authorization` the fixture signer writes for `method` on `uri`
+    /// sent to the signed route tests' origin.
+    fn signed_route_authorization(method: &Method, uri: &str) -> String {
+        fixture::expected_authorization(SIGNED_ROUTE_KEY, method, uri, "bucket.storage.example.com")
+    }
+
+    fn test_signed_image_optimizer_route() -> ProxyAssetRoute {
+        let mut route = ProxyAssetRoute::new("/.images/", SIGNED_ROUTE_ORIGIN);
         set_route_auth(
             &mut route,
-            Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-                region: "us-east-1".to_string(),
-                secret_store: None,
-                access_key_id: Redacted::new("AKIAIOSFODNN7EXAMPLE".to_string()),
-                secret_access_key: Redacted::new(
-                    "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
-                ),
-                session_token: None,
-                origin_query: None,
-            })),
+            Some(fixture::auth("images").with_setting("key_name", SIGNED_ROUTE_KEY)),
         );
         route.image_optimizer = Some(AssetImageOptimizerConfig {
             enabled: true,
@@ -6181,44 +6141,29 @@ mod tests {
     }
 
     #[test]
-    fn handle_asset_proxy_request_signs_s3_and_strips_transform_query() {
+    fn handle_asset_proxy_request_signs_the_final_address_and_strips_transform_query() {
         futures::executor::block_on(async {
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response(200, b"ok".to_vec());
-            let mut secrets = HashMap::new();
-            secrets.insert(
-                "access_key_id".to_string(),
-                b"AKIAIOSFODNN7EXAMPLE".to_vec(),
-            );
-            secrets.insert(
-                "secret_access_key".to_string(),
-                b"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_vec(),
-            );
             let services = build_services_with_secret_and_http_client(
-                HashMapSecretStore::new(secrets),
+                HashMapSecretStore::new(test_signed_route_secrets()),
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
             );
             let settings = create_test_settings();
-            let req = build_http_request(
+            let mut req = build_http_request(
                 Method::GET,
                 "https://www.example.com/.images/foo.jpg?profile=medium&ar=1-1",
             );
-            let mut route = ProxyAssetRoute::new(
-                "/.images/",
-                "https://examplebucket.s3.us-east-1.amazonaws.com",
-            );
+            req.headers_mut()
+                .insert("x-fixture-reader", HeaderValue::from_static("chosen"));
+            let mut route = ProxyAssetRoute::new("/.images/", SIGNED_ROUTE_ORIGIN);
             set_route_auth(
                 &mut route,
-                Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-                    region: "us-east-1".to_string(),
-                    secret_store: None,
-                    access_key_id: Redacted::new("AKIAIOSFODNN7EXAMPLE".to_string()),
-                    secret_access_key: Redacted::new(
-                        "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
-                    ),
-                    session_token: None,
-                    origin_query: Some(OriginQueryPolicy::Strip),
-                })),
+                Some(
+                    fixture::auth("images")
+                        .with_setting("key_name", SIGNED_ROUTE_KEY)
+                        .with_origin_query(Some(OriginQueryPolicy::Strip)),
+                ),
             );
 
             handle_asset_proxy_request(
@@ -6229,13 +6174,13 @@ mod tests {
                 &origin_source_of(&route),
             )
             .await
-            .expect("should proxy signed S3 asset request");
+            .expect("should proxy the signed asset request");
 
-            let uris = stub.recorded_request_uris();
+            let sent_uri = "https://bucket.storage.example.com/.images/foo.jpg";
             assert_eq!(
-                uris,
-                vec!["https://examplebucket.s3.us-east-1.amazonaws.com/.images/foo.jpg"],
-                "should strip transform query before signing and sending to S3"
+                stub.recorded_request_uris(),
+                vec![sent_uri],
+                "should strip the transform query before signing and sending"
             );
             let headers = stub.recorded_request_headers();
             let sent = &headers[0];
@@ -6244,25 +6189,24 @@ mod tests {
             };
             assert_eq!(
                 header_value("host").as_deref(),
-                Some("examplebucket.s3.us-east-1.amazonaws.com"),
-                "should sign for the S3 origin host"
-            );
-            assert!(
-                header_value("authorization")
-                    .as_deref()
-                    .is_some_and(|value| value.starts_with("AWS4-HMAC-SHA256 Credential=")),
-                "should add a SigV4 Authorization header"
+                Some("bucket.storage.example.com"),
+                "should sign for the origin host"
             );
             assert_eq!(
-                header_value("x-amz-content-sha256").as_deref(),
-                Some("UNSIGNED-PAYLOAD"),
-                "should use unsigned payload for read-only asset requests"
+                header_value("authorization").as_deref(),
+                Some(signed_route_authorization(&Method::GET, sent_uri).as_str()),
+                "should sign exactly the address and host that were sent"
+            );
+            assert_eq!(
+                header_value("x-fixture-reader"),
+                None,
+                "a reader's header in the signer's namespace should not be sent"
             );
         });
     }
 
     #[test]
-    fn handle_asset_proxy_request_uses_resolved_s3_credentials_without_store_reads() {
+    fn handle_asset_proxy_request_signs_with_the_resolved_settings_without_store_reads() {
         futures::executor::block_on(async {
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response(200, Vec::new());
@@ -6281,19 +6225,14 @@ mod tests {
                 Method::GET,
                 "https://www.example.com/.images/foo.jpg?profile=medium",
             );
-            let mut route = test_s3_image_optimizer_route();
+            let mut route = test_signed_image_optimizer_route();
             set_route_auth(
                 &mut route,
-                Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-                    region: "us-east-1".to_string(),
-                    secret_store: None,
-                    access_key_id: Redacted::new("AKIAIOSFODNN7EXAMPLE".to_string()),
-                    secret_access_key: Redacted::new(
-                        "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
-                    ),
-                    session_token: Some(Redacted::new("session-token".to_string())),
-                    origin_query: None,
-                })),
+                Some(
+                    fixture::auth("images")
+                        .with_setting("key_name", SIGNED_ROUTE_KEY)
+                        .with_setting("token_name", "resolved-token"),
+                ),
             );
 
             handle_asset_proxy_request(
@@ -6304,27 +6243,24 @@ mod tests {
                 &origin_source_of(&route),
             )
             .await
-            .expect("should proxy optimized S3 asset request");
+            .expect("should proxy the optimized signed asset request");
 
             assert_eq!(
                 stub.recorded_request_methods(),
                 vec!["HEAD", "GET"],
-                "should sign both the S3 preflight and final request"
+                "should sign both the preflight and the final request"
             );
             assert_eq!(
-                observed_secret_store.read_count("AKIAIOSFODNN7EXAMPLE"),
+                observed_secret_store.read_count("fixture_key"),
                 0,
-                "should not read S3 credentials from the runtime secret store"
+                "should not read the signer's settings from the runtime secret store"
             );
             let headers = stub.recorded_request_headers();
             assert!(
-                headers
+                headers.iter().all(|sent| sent
                     .iter()
-                    .all(|sent| sent
-                        .iter()
-                        .any(|(name, value)| name == "x-amz-security-token"
-                            && value == "session-token")),
-                "should sign both requests with the cached session token"
+                    .any(|(name, value)| name == "x-fixture-token" && value == "resolved-token")),
+                "should sign both requests with the resolved settings"
             );
         });
     }
@@ -6541,12 +6477,12 @@ mod tests {
     }
 
     #[test]
-    fn handle_asset_proxy_request_skips_s3_preflight_for_svg_image_optimizer_routes() {
+    fn handle_asset_proxy_request_skips_the_signed_preflight_for_svg_image_optimizer_routes() {
         futures::executor::block_on(async {
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response(200, b"raw-svg".to_vec());
             let services = build_services_with_secret_and_http_client(
-                HashMapSecretStore::new(test_s3_secrets()),
+                HashMapSecretStore::new(test_signed_route_secrets()),
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
             );
             let settings = create_test_settings();
@@ -6554,7 +6490,7 @@ mod tests {
                 Method::GET,
                 "https://www.example.com/.images/logo.svg?profile=medium",
             );
-            let route = test_s3_image_optimizer_route();
+            let route = test_signed_image_optimizer_route();
 
             let response = handle_asset_proxy_request(
                 &settings,
@@ -6564,7 +6500,7 @@ mod tests {
                 &origin_source_of(&route),
             )
             .await
-            .expect("should proxy raw SVG asset through S3 route")
+            .expect("should proxy raw SVG asset through the signed route")
             .into_response()
             .expect("should return buffered asset response");
 
@@ -6572,11 +6508,11 @@ mod tests {
             assert_eq!(
                 stub.recorded_request_methods(),
                 vec!["GET"],
-                "SVG IO bypass should not add an S3 preflight"
+                "SVG IO bypass should not add a signed preflight"
             );
             assert_eq!(
                 stub.recorded_request_uris(),
-                vec!["https://examplebucket.s3.us-east-1.amazonaws.com/.images/logo.svg"],
+                vec!["https://bucket.storage.example.com/.images/logo.svg"],
                 "SVG IO bypass should still strip the transform query"
             );
             assert_eq!(
@@ -6588,14 +6524,14 @@ mod tests {
     }
 
     #[test]
-    fn handle_asset_proxy_request_preflights_s3_before_image_optimizer() {
+    fn handle_asset_proxy_request_preflights_a_signed_origin_before_image_optimizer() {
         futures::executor::block_on(async {
             let stub = Arc::new(StubHttpClient::new());
             stub.set_streaming_responses_supported(true);
             stub.push_response(200, Vec::new());
             stub.push_response(200, b"optimized".to_vec());
             let services = build_services_with_secret_and_http_client(
-                HashMapSecretStore::new(test_s3_secrets()),
+                HashMapSecretStore::new(test_signed_route_secrets()),
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
             );
             let mut settings = create_test_settings();
@@ -6606,7 +6542,7 @@ mod tests {
                 Method::GET,
                 "https://www.example.com/.images/foo.jpg?profile=medium",
             );
-            let route = test_s3_image_optimizer_route();
+            let route = test_signed_image_optimizer_route();
 
             let (response, stream_body) = handle_asset_proxy_request(
                 &settings,
@@ -6616,7 +6552,7 @@ mod tests {
                 &origin_source_of(&route),
             )
             .await
-            .expect("should proxy optimized S3 asset request")
+            .expect("should proxy the optimized signed asset request")
             .into_response_and_body();
 
             assert_eq!(response.status(), StatusCode::OK, "should proxy the asset");
@@ -6634,20 +6570,35 @@ mod tests {
             assert_eq!(
                 stub.recorded_request_methods(),
                 vec!["HEAD", "GET"],
-                "should preflight S3 with HEAD before the optimized GET"
+                "should preflight the origin with HEAD before the optimized GET"
             );
+            let sent_uri = "https://bucket.storage.example.com/.images/foo.jpg";
             assert_eq!(
                 stub.recorded_request_uris(),
+                vec![sent_uri, sent_uri],
+                "should strip the transform query from both requests"
+            );
+            let signatures: Vec<Option<String>> = stub
+                .recorded_request_headers()
+                .iter()
+                .map(|sent| {
+                    sent.iter()
+                        .find(|(name, _)| name == "authorization")
+                        .map(|(_, value)| value.clone())
+                })
+                .collect();
+            assert_eq!(
+                signatures,
                 vec![
-                    "https://examplebucket.s3.us-east-1.amazonaws.com/.images/foo.jpg",
-                    "https://examplebucket.s3.us-east-1.amazonaws.com/.images/foo.jpg",
+                    Some(signed_route_authorization(&Method::HEAD, sent_uri)),
+                    Some(signed_route_authorization(&Method::GET, sent_uri)),
                 ],
-                "should strip transform query from both S3 requests"
+                "each request should be signed as its own method"
             );
             assert_eq!(
                 stub.recorded_stream_response_flags(),
                 vec![false, true],
-                "S3 HEAD preflight stays non-streaming, final asset GET stays streaming"
+                "the HEAD preflight stays non-streaming, the final asset GET stays streaming"
             );
             let options = stub.recorded_image_optimizer_options();
             assert_eq!(options.len(), 2, "should send two origin requests");
@@ -6663,7 +6614,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_asset_proxy_request_returns_raw_s3_error_before_image_optimizer() {
+    fn handle_asset_proxy_request_returns_the_origin_s_own_error_before_image_optimizer() {
         futures::executor::block_on(async {
             let stub = Arc::new(StubHttpClient::new());
             stub.set_streaming_responses_supported(true);
@@ -6679,7 +6630,7 @@ mod tests {
                 ],
             );
             let services = build_services_with_secret_and_http_client(
-                HashMapSecretStore::new(test_s3_secrets()),
+                HashMapSecretStore::new(test_signed_route_secrets()),
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
             );
             let mut settings = create_test_settings();
@@ -6690,7 +6641,7 @@ mod tests {
                 Method::GET,
                 "https://www.example.com/.images/missing.jpg?profile=medium",
             );
-            let route = test_s3_image_optimizer_route();
+            let route = test_signed_image_optimizer_route();
 
             let asset_response = handle_asset_proxy_request(
                 &settings,
@@ -6700,7 +6651,7 @@ mod tests {
                 &origin_source_of(&route),
             )
             .await
-            .expect("should return raw S3 error response");
+            .expect("should return the origin's own error response");
             assert_eq!(
                 asset_response.cache_policy(),
                 AssetProxyCachePolicy::NoStorePrivate,
@@ -6712,40 +6663,43 @@ mod tests {
             assert_eq!(
                 response_header(&response, header::CACHE_CONTROL),
                 Some("no-store, private"),
-                "S3 origin errors should not be cached"
+                "origin errors should not be cached"
             );
             assert!(
                 response.headers().get(header::SET_COOKIE).is_none(),
-                "raw S3 error should still strip unsafe response headers"
+                "the origin's error should still strip unsafe response headers"
             );
             let mut output = Vec::new();
             stream_asset_body(
-                stream_body.expect("should preserve the raw S3 error body as a stream"),
+                stream_body.expect("should preserve the origin's error body as a stream"),
                 &mut output,
             )
             .await
-            .expect("should stream the raw S3 error body");
-            let body = String::from_utf8(output).expect("should decode the S3 error body");
-            assert!(body.contains("NoSuchKey"), "should return S3 error body");
+            .expect("should stream the origin's error body");
+            let body = String::from_utf8(output).expect("should decode the error body");
+            assert!(
+                body.contains("NoSuchKey"),
+                "should return the origin's error body"
+            );
             assert!(
                 body.contains("image/upload/missing.jpg"),
-                "should expose the missing S3 key"
+                "should expose the missing key"
             );
             assert_eq!(
                 stub.recorded_request_methods(),
                 vec!["HEAD", "GET"],
-                "should fetch S3 error body after failed HEAD preflight"
+                "should fetch the error body after the failed HEAD preflight"
             );
             assert_eq!(
                 stub.recorded_stream_response_flags(),
                 vec![false, true],
-                "S3 HEAD preflight stays non-streaming, error-body GET stays streaming"
+                "the HEAD preflight stays non-streaming, the error-body GET stays streaming"
             );
             let options = stub.recorded_image_optimizer_options();
             assert_eq!(
                 options,
                 vec![None, None],
-                "should not invoke IO for S3 errors"
+                "should not invoke IO for origin errors"
             );
         });
     }
@@ -6757,7 +6711,7 @@ mod tests {
             stub.set_streaming_responses_supported(true);
             stub.push_response(200, b"raw".to_vec());
             let services = build_services_with_secret_and_http_client(
-                HashMapSecretStore::new(test_s3_secrets()),
+                HashMapSecretStore::new(test_signed_route_secrets()),
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
             );
             let mut settings = create_test_settings();
@@ -6768,7 +6722,7 @@ mod tests {
                 Method::GET,
                 "https://www.example.com/.images/foo.jpg?profile=medium&_io_debug=1",
             );
-            let route = test_s3_image_optimizer_route();
+            let route = test_signed_image_optimizer_route();
 
             let (response, stream_body) = handle_asset_proxy_request(
                 &settings,
@@ -6778,7 +6732,7 @@ mod tests {
                 &origin_source_of(&route),
             )
             .await
-            .expect("should proxy debug S3 asset request")
+            .expect("should proxy the debug signed asset request")
             .into_response_and_body();
 
             assert_eq!(response.status(), StatusCode::OK, "should proxy the asset");
@@ -6793,7 +6747,7 @@ mod tests {
             assert_eq!(
                 stub.recorded_request_methods(),
                 vec!["GET"],
-                "disabled IO should not add S3 preflight"
+                "disabled IO should not add a signed preflight"
             );
             assert_eq!(
                 stub.recorded_image_optimizer_options(),

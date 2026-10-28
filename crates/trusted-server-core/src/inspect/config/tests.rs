@@ -5,6 +5,7 @@ use edgezero_core::blob_envelope::BlobEnvelope;
 use super::*;
 use crate::config_payload::settings_from_config_blob_with;
 use crate::integrations::{IntegrationBuilder, ModuleSecretSetting};
+use crate::origin_auth::fixture;
 use crate::permissions::{SAMPLE_POLICY_NAME, SAMPLE_POLICY_TEXT, policy_sha256};
 use crate::platform::{PlatformError, PlatformSecretStore, PolicyOrigin, StoreId, StoreName};
 use crate::secret_resolution::ResolvedSecrets;
@@ -208,16 +209,16 @@ fn a_key_the_inspect_section_does_not_have_is_refused_naming_it() {
 }
 
 /// Documents that between them hold a secret at every path core declares
-/// one, each a key name the canary store resolves to a value of its own.
+/// one, and at both paths the fixture signer declares its own, each a key
+/// name the canary store resolves to a value of its own.
 fn documents_holding_every_declared_secret() -> Vec<(&'static str, Value)> {
     let mut main = document("");
     main["publisher"]["proxy_secret"] = json!("proxy");
     main["source"]["origin"]["auth"] = json!({
-        "type": "s3_sigv4",
-        "region": "test-region-1",
-        "access_key_id": "origin-access",
-        "secret_access_key": "origin-secret",
-        "session_token": "origin-session",
+        "type": fixture::SIGNER,
+        "realm": "site",
+        "key_name": "origin-key",
+        "token_name": "origin-token",
     });
     main["ec"]["hmac"]["passphrase"] = json!("hmac");
     main["ec"]["partners"] = json!([{
@@ -241,11 +242,10 @@ fn documents_holding_every_declared_secret() -> Vec<(&'static str, Value)> {
             "origin": {
                 "url": "https://assets.example.com",
                 "auth": {
-                    "type": "s3_sigv4",
-                    "region": "us-east-1",
-                    "access_key_id": "route-access",
-                    "secret_access_key": "route-secret",
-                    "session_token": "route-session",
+                    "type": fixture::SIGNER,
+                    "realm": "assets",
+                    "key_name": "route-key",
+                    "token_name": "route-token",
                 },
             },
         },
@@ -297,14 +297,16 @@ fn generalized(path: &[PathStep]) -> String {
     out
 }
 
-/// Every secret core declares, loaded the way a deployment loads it, is
-/// live in the settings and absent from both forms the endpoint serves,
-/// and wherever the view still has its path, that path is masked.
+/// Every secret core declares, and every one the fixture signer declares at
+/// the `auth` paths, loaded the way a deployment loads it, is live in the
+/// settings and absent from both forms the endpoint serves, and wherever the
+/// view still has its path, that path is masked.
 #[test]
 fn every_declared_core_secret_is_masked_and_never_served() {
     let mut covered = BTreeSet::new();
     for (name, data) in documents_holding_every_declared_secret() {
-        let settings = load(data).unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        let settings = load_with(data, &[fixture::builder()])
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
         let record = settings.resolved_secrets();
         let normal = serde_json::to_string(&settings).expect("should serialize");
         assert!(
@@ -351,6 +353,7 @@ fn every_declared_core_secret_is_masked_and_never_served() {
 
     let declared: BTreeSet<String> = TrustedServerAppConfig::secret_fields()
         .iter()
+        .chain(crate::module_secrets::secret_fields(&[fixture::builder()]).iter())
         .filter_map(|field| PathPattern::from_segments(&field.path))
         .map(|pattern| pattern.as_str().to_owned())
         .collect();
@@ -359,6 +362,17 @@ fn every_declared_core_secret_is_masked_and_never_served() {
         missing.is_empty(),
         "every declared secret should be exercised, missing {missing:?}"
     );
+    for path in [
+        "source.origin.auth.key_name",
+        "source.origin.auth.token_name",
+        "proxy.asset_routes[].source.origin.auth.key_name",
+        "proxy.asset_routes[].source.origin.auth.token_name",
+    ] {
+        assert!(
+            covered.contains(path),
+            "the signer's secret at {path} should be declared and masked"
+        );
+    }
 }
 
 /// Test settings holding a value of its own in every field marked
@@ -605,10 +619,9 @@ const ASSET_ROUTES: &str = r#"
     source.origin.url = "https://assets.example.com"
 
     [proxy.asset_routes.source.origin.auth]
-    type = "s3_sigv4"
-    region = "us-east-1"
-    access_key_id = "route-access"
-    secret_access_key = "route-secret"
+    type = "fixture_scheme"
+    realm = "assets"
+    key_name = "route-key"
 
     [[proxy.asset_routes]]
     prefix = "/media/"
@@ -659,8 +672,8 @@ fn a_pattern_not_honored_as_written_is_refused_saying_why() {
             "show names `publisher.proxy_secret`, which is a secret",
         ),
         (
-            r#"show = ["proxy.asset_routes[].source.origin.auth.secret_access_key"]"#,
-            "show names `proxy.asset_routes[].source.origin.auth.secret_access_key`, which is a secret",
+            r#"show = ["proxy.asset_routes[].source.origin.auth.key_name"]"#,
+            "show names `proxy.asset_routes[].source.origin.auth.key_name`, which is a secret",
         ),
         (
             r#"hide = ["publisher.no_such_setting"]"#,
@@ -706,10 +719,14 @@ fn a_pattern_not_honored_as_written_is_refused_saying_why() {
             "config = false publishes no page, so they change nothing",
         ),
     ] {
+        // The route's signer is on offer, so its key name is a declared secret.
         let message = format!(
             "{:?}",
-            load(document(&format!("{ASSET_ROUTES}\n[inspect]\n{section}")))
-                .expect_err("the document should be refused")
+            load_with(
+                document(&format!("{ASSET_ROUTES}\n[inspect]\n{section}")),
+                &[fixture::builder()],
+            )
+            .expect_err("the document should be refused")
         );
 
         assert!(message.contains(reason), "{section}: {message}");
