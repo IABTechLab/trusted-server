@@ -1561,6 +1561,35 @@ pub struct PrefixConfig {
     pub module: Option<String>,
 }
 
+/// The permission policy file a domain runs, mapped from the `[permissions]`
+/// table.
+///
+/// `policy` names the file by its stem. `sha256` is the SHA-256 of the file,
+/// as [`policy_sha256`](crate::permissions::policy_sha256) forms it, and
+/// `text` is the file itself, for the adapters that read the policy from the
+/// blob.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionsConfig {
+    /// The policy file's stem, so `standard.yaml` is `standard`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    /// The SHA-256 of the policy file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// The policy file itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+impl PermissionsConfig {
+    /// Whether the table sets nothing, so it is left out of a blob.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Geo / IP intelligence configuration.
 ///
 /// Mapped from the `[geo]` TOML section. Selects which module resolves a
@@ -1615,28 +1644,6 @@ impl GeoConfig {
         // registry rejects one that no module supplies, so this check cannot be
         // a closed list without shutting modules out of geo entirely.
         Ok(())
-    }
-
-    /// Validates that the compiled `permissions.yaml` parses and declares its
-    /// top node.
-    ///
-    /// The top node is required: its `group` is the permission baseline for a
-    /// request the geo module leaves unmatched, and its `jurisdiction` is the
-    /// consent handling for that same request, so there must always be one.
-    /// Checking it here turns a malformed policy into a configuration error at
-    /// startup rather than a panic on the first lookup.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TrustedServerError::Configuration`] when the compiled policy
-    /// fails to parse, most usefully when its top node omits `group` or
-    /// `jurisdiction`.
-    pub fn validate_permission_policy() -> Result<(), Report<TrustedServerError>> {
-        crate::permissions::validate_default_policy().map_err(|error| {
-            Report::new(TrustedServerError::Configuration {
-                message: format!("permissions.yaml is not usable: {error}"),
-            })
-        })
     }
 
     /// Validates that running jurisdiction consumers without geolocation is
@@ -3140,10 +3147,6 @@ pub struct CacheSettings {
         skip_serializing_if = "LoadingCacheConfig::is_default"
     )]
     pub robots_txt: LoadingCacheConfig,
-    /// How long the copies of the assets the publisher's origin sends last,
-    /// `[cache.assets]`. A `module` of [`ASSETS_CACHE_OFF`] keeps none.
-    #[serde(default, skip_serializing_if = "LoadingCacheConfig::is_default")]
-    pub assets: LoadingCacheConfig,
     /// The caches modules declare and load through, each in its own
     /// `[cache.<name>]` table with the same settings as `[cache.robots-txt]`.
     /// A name no linked module declares is refused when the deployment's
@@ -3158,19 +3161,6 @@ pub const MAX_LOADING_CACHE_SECONDS: u32 = 365 * 24 * 60 * 60;
 /// The name of the cache that holds each robots.txt module's answer, whose
 /// settings are `[cache.robots-txt]`.
 pub const ROBOTS_TXT_CACHE: &str = "robots-txt";
-
-/// The name of the cache that holds the copies of the assets the publisher's
-/// origin sends, whose settings are `[cache.assets]`.
-pub const ASSETS_CACHE: &str = "assets";
-
-/// The name of the cache that holds each asset's record of what its
-/// responses vary on, selected by the same `[cache.assets]` table as the
-/// copies, so one line selects both.
-pub const ASSETS_VARY_CACHE: &str = "assets-vary";
-
-/// The `module` that turns both asset caches off in `[cache.assets]`, so
-/// every asset is fetched from its origin for each request.
-pub const ASSETS_CACHE_OFF: &str = "none";
 
 /// How long one loading cache's copies last, each field defaulting to the
 /// cache's own default when absent.
@@ -3262,18 +3252,13 @@ impl CacheSettings {
     /// modules declare, in name order.
     #[must_use]
     pub fn loading_caches(&self) -> Vec<(&str, &LoadingCacheConfig)> {
-        [
-            (ROBOTS_TXT_CACHE, &self.robots_txt),
-            (ASSETS_CACHE, &self.assets),
-            (ASSETS_VARY_CACHE, &self.assets),
-        ]
-        .into_iter()
-        .chain(
-            self.declared
-                .iter()
-                .map(|(name, config)| (name.as_str(), config)),
-        )
-        .collect()
+        std::iter::once((ROBOTS_TXT_CACHE, &self.robots_txt))
+            .chain(
+                self.declared
+                    .iter()
+                    .map(|(name, config)| (name.as_str(), config)),
+            )
+            .collect()
     }
 
     fn normalize(&mut self) {
@@ -3291,7 +3276,6 @@ impl CacheSettings {
     /// invalid policy/matcher or cannot compile its regex/glob.
     pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
         self.robots_txt.check("cache.robots-txt")?;
-        self.assets.check("cache.assets")?;
         for (name, config) in &self.declared {
             config.check(&format!("cache.{name}"))?;
         }
@@ -4429,6 +4413,9 @@ pub struct Settings {
     )]
     #[validate(nested)]
     pub permission_signal: PermissionSignalConfig,
+    /// The permission policy file this domain runs.
+    #[serde(default, skip_serializing_if = "PermissionsConfig::is_empty")]
+    pub permissions: PermissionsConfig,
     /// The `[permission_signal]` table, kept so a configuration carrying it is
     /// told its new name.
     #[serde(rename = "permission_signal", default, skip_serializing)]
@@ -4443,15 +4430,6 @@ pub struct Settings {
         skip_serializing_if = "crate::inspect::config::InspectConfig::is_default"
     )]
     pub inspect: crate::inspect::config::InspectConfig,
-    /// The attestation endpoint, which serves evidence signed with the
-    /// operator's key at the address its `endpoint` names. See
-    /// [`crate::attestation`].
-    ///
-    /// `None` leaves the address to the publisher's origin, and stays out of
-    /// serialized config blobs for the reason given on `trusted_client_ip`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[validate(nested)]
-    pub attestation: Option<crate::attestation::AttestationConfig>,
     /// The page changes run on a document fetched from the origin, written
     /// as `[[fetch]]` entries. See [`crate::middleware`].
     #[serde(default, skip_serializing_if = "PhaseEntries::is_empty")]
@@ -4464,6 +4442,9 @@ pub struct Settings {
     /// Never read from a document and never written to one.
     #[serde(skip)]
     resolved_secrets: crate::secret_resolution::ResolvedSecrets,
+    /// The policy the runtime loader read and checked for `permissions`.
+    #[serde(skip)]
+    permission_policy: Option<std::sync::Arc<crate::permissions::PermissionPolicy>>,
 }
 
 impl Settings {
@@ -4479,6 +4460,57 @@ impl Settings {
         secrets: crate::secret_resolution::ResolvedSecrets,
     ) {
         self.resolved_secrets = secrets;
+    }
+
+    /// The permission policy this domain loaded.
+    ///
+    /// The runtime loader attaches it, and refuses a domain without one, so
+    /// only settings built some other way, as in a test, have none.
+    #[must_use]
+    pub fn permission_policy(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::permissions::PermissionPolicy>> {
+        self.permission_policy.as_ref()
+    }
+
+    /// The permission policy this domain loaded, which an adapter hands to
+    /// every request.
+    ///
+    /// # Errors
+    ///
+    /// [`TrustedServerError::Configuration`] when the settings carry no
+    /// policy, because the runtime loader did not load them.
+    pub fn required_permission_policy(
+        &self,
+    ) -> Result<std::sync::Arc<crate::permissions::PermissionPolicy>, Report<TrustedServerError>>
+    {
+        self.permission_policy.clone().ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
+                message: "the settings carry no permission policy, which the runtime loader \
+                          attaches when it loads them"
+                    .to_owned(),
+            })
+        })
+    }
+
+    /// Keeps the policy the runtime loader read for these settings.
+    pub(crate) fn attach_permission_policy(
+        &mut self,
+        policy: std::sync::Arc<crate::permissions::PermissionPolicy>,
+    ) {
+        self.permission_policy = Some(policy);
+    }
+
+    /// The same settings carrying `policy`, as the runtime loader would
+    /// attach it, for tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn with_permission_policy(
+        mut self,
+        policy: std::sync::Arc<crate::permissions::PermissionPolicy>,
+    ) -> Self {
+        self.permission_policy = Some(policy);
+        self
     }
 
     /// Creates a new [`Settings`] instance from a TOML string.
@@ -4606,26 +4638,9 @@ impl Settings {
         settings.validate_phase_entries()?;
         settings.device.validate_module_selection()?;
         settings.geo.validate_module_selection()?;
-        GeoConfig::validate_permission_policy()?;
         settings
             .geo
             .validate_jurisdiction_acknowledgment(&settings.ec)?;
-
-        // Log the policy's declared default once per settings load, so an
-        // operator can see which permissions an unmatched request is granted
-        // without a signal, and which jurisdiction its consent gates apply.
-        let maps = crate::permissions::PermissionMaps::standard();
-        let granted: Vec<String> = maps
-            .baseline(None, None)
-            .permissions()
-            .iter()
-            .map(|permission| permission.to_string())
-            .collect();
-        log::debug!(
-            "Permission baseline: permissions.yaml top node, jurisdiction {}; granted without a signal: [{}]",
-            maps.default_jurisdiction(),
-            granted.join(", ")
-        );
 
         Ok(settings)
     }
@@ -5212,9 +5227,8 @@ fn validation_error_summary(errors: &validator::ValidationErrors) -> String {
             };
             match kind {
                 validator::ValidationErrorsKind::Field(validations) => {
-                    // A validator's message, where it gives one, says what the
-                    // code cannot, such as which address an endpoint clashed
-                    // with.
+                    // A validator's message, where it gives one, says why the
+                    // value was refused, which the code alone does not.
                     for validation in validations {
                         messages.push(match &validation.message {
                             Some(message) => format!("{path}: {} ({message})", validation.code),
@@ -7187,30 +7201,28 @@ module = \"none\"",
 
     #[test]
     fn a_loading_cache_lifetime_out_of_range_is_refused_naming_it() {
-        for table in ["robots-txt", "assets"] {
-            for (field, value, least) in [
-                ("store_seconds", "0", 1),
-                ("store_idle_seconds", "0", 1),
-                ("memory_seconds", "31536001", 0),
-            ] {
-                let toml_str = format!(
-                    "{}
+        for (field, value, least) in [
+            ("store_seconds", "0", 1),
+            ("store_idle_seconds", "0", 1),
+            ("memory_seconds", "31536001", 0),
+        ] {
+            let toml_str = format!(
+                "{}
 
-[cache.{table}]
+[cache.robots-txt]
 {field} = {value}
 ",
-                    crate_test_settings_str()
-                );
-                let error = Settings::from_toml(&toml_str)
-                    .expect_err("a lifetime out of range should not load");
-                let message = format!("{error:?}");
-                assert!(
-                    message.contains(&format!(
-                        "[cache.{table}] {field} is {value}, and must be from {least} to 31536000"
-                    )),
-                    "{table} {field}: {message}"
-                );
-            }
+                crate_test_settings_str()
+            );
+            let error = Settings::from_toml(&toml_str)
+                .expect_err("a lifetime out of range should not load");
+            let message = format!("{error:?}");
+            assert!(
+                message.contains(&format!(
+                    "[cache.robots-txt] {field} is {value}, and must be from {least} to 31536000"
+                )),
+                "{field}: {message}"
+            );
         }
     }
 
@@ -7233,12 +7245,30 @@ module = \"none\"",
 
         let caches = settings.cache.loading_caches();
 
-        assert_eq!(caches.len(), 4);
-        assert_eq!(caches[3].0, "answers");
-        assert_eq!(caches[3].1.module.as_deref(), Some("51degrees"));
-        assert_eq!(caches[3].1.store_seconds, Some(3600));
+        assert_eq!(caches.len(), 2);
+        assert_eq!(caches[1].0, "answers");
+        assert_eq!(caches[1].1.module.as_deref(), Some("51degrees"));
+        assert_eq!(caches[1].1.store_seconds, Some(3600));
         let written = serde_json::to_value(&settings.cache).expect("should serialize");
         assert_eq!(written["answers"]["module"], "51degrees");
+    }
+
+    #[test]
+    fn a_cache_assets_table_is_read_as_a_cache_a_module_declares() {
+        let toml_str = format!(
+            "{}\n[cache.assets]\nstore_seconds = 3600\n",
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse the table");
+
+        assert_eq!(
+            settings.cache.loading_caches(),
+            vec![
+                (super::ROBOTS_TXT_CACHE, &settings.cache.robots_txt),
+                ("assets", &settings.cache.declared["assets"]),
+            ],
+            "core has no `[cache.assets]` of its own, so a module would declare it"
+        );
     }
 
     #[test]
@@ -7260,12 +7290,8 @@ module = \"none\"",
         assert!(!settings.cache.robots_txt.is_default());
         assert_eq!(
             settings.cache.loading_caches(),
-            vec![
-                (super::ROBOTS_TXT_CACHE, &settings.cache.robots_txt),
-                (super::ASSETS_CACHE, &settings.cache.assets),
-                (super::ASSETS_VARY_CACHE, &settings.cache.assets),
-            ],
-            "should list core's own caches by name, robots.txt then the two of assets"
+            vec![(super::ROBOTS_TXT_CACHE, &settings.cache.robots_txt)],
+            "should list the robots.txt cache by its name"
         );
         let written = serde_json::to_value(&settings.cache).expect("should serialize");
         assert_eq!(
@@ -8372,16 +8398,6 @@ passphrase = "another-test-secret-key-32-bytes"
             written["ec"]["acme"]["endpoint"],
             "https://ec.acme.example.com"
         );
-    }
-
-    #[test]
-    fn the_compiled_permission_policy_validates_at_startup() {
-        // The compiled-in sample declares its top node, so startup
-        // accepts it. A policy that omitted `group` or `jurisdiction` would be
-        // rejected here rather than panicking on the first lookup, which the
-        // parser tests in `permissions` cover directly.
-        GeoConfig::validate_permission_policy()
-            .expect("the compiled-in sample should validate at startup");
     }
 
     #[test]
@@ -11851,5 +11867,73 @@ mod permission_signal_config_tests {
             let serialized = serde_json::to_value(&settings).expect("should serialize");
             assert!(serialized.get("shared").is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod permissions_config_tests {
+    use super::*;
+
+    use crate::test_support::tests::crate_test_settings_str;
+
+    /// The test fixture's configuration with `table` written as its
+    /// `[permissions]` table.
+    fn settings_toml_with(table: &str) -> String {
+        format!("{}\n[permissions]\n{table}\n", crate_test_settings_str())
+    }
+
+    #[test]
+    fn the_table_names_the_policy_file_by_its_stem() {
+        let settings = Settings::from_toml(&settings_toml_with(r#"policy = "standard""#))
+            .expect("should parse a table naming a policy");
+
+        assert_eq!(
+            settings.permissions.policy.as_deref(),
+            Some("standard"),
+            "should read the policy's name"
+        );
+        assert_eq!(settings.permissions.sha256, None);
+        assert_eq!(settings.permissions.text, None);
+    }
+
+    #[test]
+    fn an_unknown_key_in_the_table_is_refused() {
+        let error = Settings::from_toml(&settings_toml_with(r#"file = "standard.yaml""#))
+            .expect_err("should refuse a key the table does not define");
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("unknown field `file`"),
+            "the refusal names the key: {message}"
+        );
+    }
+
+    #[test]
+    fn the_table_round_trips_through_a_blob() {
+        let mut settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.permissions = PermissionsConfig {
+            policy: Some("standard".to_owned()),
+            sha256: Some("80b7eafed0d1".to_owned()),
+            text: Some("groups: {}\n".to_owned()),
+        };
+
+        let data = serde_json::to_value(&settings).expect("should serialize settings");
+        let read: Settings = serde_json::from_value(data).expect("should read the blob back");
+
+        assert_eq!(read.permissions, settings.permissions);
+    }
+
+    #[test]
+    fn settings_that_name_no_policy_leave_the_table_out_of_a_blob() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+
+        let data = serde_json::to_value(&settings).expect("should serialize settings");
+
+        assert!(
+            data.get("permissions").is_none(),
+            "an empty table should not be written: {data}"
+        );
     }
 }
