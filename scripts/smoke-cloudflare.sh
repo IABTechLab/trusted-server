@@ -109,6 +109,8 @@ run_case() {
             --ip 127.0.0.1
     ) >"$log_path" 2>&1 &
     APP_PID=$!
+    # The Worker installs no logger, so a negative case is checked by its
+    # status alone, which smoke_wait_http waits for.
     smoke_wait_http "http://127.0.0.1:$port/" "$expected_status" \
         "$body_path" "$headers_path"
     smoke_assert_process_alive "$APP_PID" "Wrangler" "$log_path"
@@ -124,10 +126,6 @@ run_case() {
         if [ -n "$missing_binding" ] && grep --fixed-strings --quiet "$missing_binding" "$log_path"; then
             smoke_die "negative case unexpectedly exposed $missing_binding"
         fi
-        # The Worker installs no logger, so a negative case is checked by its
-        # status alone.
-        [ "$SMOKE_HTTP_STATUS" = "$expected_status" ] ||
-            smoke_die "negative case returned HTTP $SMOKE_HTTP_STATUS, expected $expected_status"
     else
         smoke_assert_success "$body_path" "$ORIGIN_PORT" "$port"
     fi
