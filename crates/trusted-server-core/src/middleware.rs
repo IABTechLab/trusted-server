@@ -29,15 +29,29 @@
 //! settings from its module's own table.
 //!
 //! [`MiddlewarePhase`] says when each phase runs.
+//!
+//! A middleware whose decision needs the request's services, or has to wait
+//! on a store or the network, prepares. Before the document is processed it
+//! is called in the request's handler, and what it answers is kept for its
+//! `create` under its phase and name. It may refuse the request instead,
+//! which is then logged and answered with the status it gives and no
+//! document, and nothing is stored.
 
+use std::any::Any;
+use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
-use http::{HeaderName, HeaderValue};
+use http::{HeaderName, HeaderValue, StatusCode};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::integrations::{AttributeRewriteAction, IntegrationDocumentState, ScriptRewriteAction};
+use crate::module_context::{ModuleCall, ModuleContext};
+use crate::permissions::PermissionSet;
 use crate::platform::PlatformIdentity;
 use crate::streaming_processor::StreamProcessor;
 
@@ -137,6 +151,18 @@ pub struct MiddlewareContext<'a> {
     pub document_state: &'a IntegrationDocumentState,
     /// The most a middleware may hold of one script while it decides.
     pub max_buffered_script_bytes: usize,
+    /// What the middleware prepared for this document, see
+    /// [`Middleware::prepare`].
+    pub prepared: &'a Prepared,
+}
+
+impl MiddlewareContext<'_> {
+    /// What the middleware named `id` prepared for this phase, see
+    /// [`Prepared::take`].
+    #[must_use]
+    pub fn take_prepared<T: Any>(&self, id: &str) -> Option<T> {
+        self.prepared.take(self.phase, id)
+    }
 }
 
 /// One attribute of one matched element, as a handler is asked about it.
@@ -360,6 +386,114 @@ fn selectors_of_text(handlers: &[Box<dyn TextHandler>]) -> Vec<String> {
         .collect()
 }
 
+/// A middleware's answer to a request it gives no document to, see
+/// [`Middleware::prepare`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// The status the request is answered with, a client or server error.
+    /// Any other is answered as `500 Internal Server Error`.
+    pub status: StatusCode,
+    /// What `Retry-After` says, for a status that asks the caller back.
+    pub retry_after: Option<Duration>,
+    /// What the response says, as plain text.
+    pub message: String,
+}
+
+impl Refusal {
+    /// A `503 Service Unavailable` asking the caller back after
+    /// `retry_after`.
+    #[must_use]
+    pub fn service_unavailable(retry_after: Duration, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            retry_after: Some(retry_after),
+            message: message.into(),
+        }
+    }
+
+    /// The refusal as the request is answered with it, logged once as a
+    /// warning naming `middleware`. A status that is not a client or server
+    /// error becomes `500 Internal Server Error`, because a refusal gives no
+    /// document.
+    fn checked(mut self, middleware: &str, phase: MiddlewarePhase) -> Self {
+        if self.status.is_client_error() || self.status.is_server_error() {
+            log::warn!(
+                "The middleware `{middleware}` refused the request in the {phase} phase with {}",
+                self.status
+            );
+        } else {
+            log::warn!(
+                "The middleware `{middleware}` refused the request in the {phase} phase with {}, \
+                 which a refusal may not use, so it is answered with {}",
+                self.status,
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+            self.status = StatusCode::INTERNAL_SERVER_ERROR;
+        }
+        self
+    }
+}
+
+/// What a middleware prepared for one document, see
+/// [`Middleware::prepare`].
+pub type Preparation<'a> = Pin<Box<dyn Future<Output = Result<Box<dyn Any + Send>, Refusal>> + 'a>>;
+
+/// What the middleware of one document prepared, each under its own name
+/// and phase, for its `create` in that phase to take.
+#[derive(Default)]
+pub struct Prepared(Mutex<PreparedValues>);
+
+/// What each middleware prepared, under its phase and name.
+type PreparedValues = HashMap<(MiddlewarePhase, &'static str), Box<dyn Any + Send>>;
+
+impl Prepared {
+    /// Keeps what the middleware named `id` prepared in `phase`.
+    pub fn insert(&self, phase: MiddlewarePhase, id: &'static str, value: Box<dyn Any + Send>) {
+        self.lock().insert((phase, id), value);
+    }
+
+    /// What the middleware named `id` prepared in `phase`, as the type it
+    /// prepared, taken out so it is used once. `None` when it prepared
+    /// nothing or something of another type.
+    #[must_use]
+    pub fn take<T: Any>(&self, phase: MiddlewarePhase, id: &str) -> Option<T> {
+        let mut values = self.lock();
+        let key = values
+            .keys()
+            .find(|(at, name)| *at == phase && *name == id)
+            .copied()?;
+        if !values.get(&key)?.is::<T>() {
+            return None;
+        }
+        let value = values.remove(&key)?;
+        value.downcast::<T>().ok().map(|value| *value)
+    }
+
+    /// Whether nothing was prepared.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, PreparedValues> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl fmt::Debug for Prepared {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names: Vec<String> = self
+            .lock()
+            .keys()
+            .map(|(phase, name)| format!("{phase} {name}"))
+            .collect();
+        formatter
+            .debug_struct("Prepared")
+            .field("names", &names)
+            .finish()
+    }
+}
+
 /// A page change a module supplies.
 ///
 /// A registered middleware holds no request state. For each document it is
@@ -380,6 +514,25 @@ pub trait Middleware: Send + Sync {
 
     /// The phases an entry may name this middleware in.
     fn phases(&self) -> &[MiddlewarePhase];
+
+    /// The permissions this middleware declares, which decide whether a
+    /// gated value is passed to it in [`prepare`](Self::prepare). None by
+    /// default.
+    fn required_permissions(&self) -> PermissionSet {
+        PermissionSet::none()
+    }
+
+    /// Work done for one document before `create` is asked, where deciding
+    /// needs the request's services or has to wait, on a store or the
+    /// network. `None`, the default, means none is needed.
+    fn prepare<'a>(
+        &'a self,
+        call: ModuleCall<'a>,
+        context: &'a MiddlewareContext<'a>,
+    ) -> Option<Preparation<'a>> {
+        let _ = (call, context);
+        None
+    }
 
     /// Decides what to do with one document.
     fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction;
@@ -672,6 +825,34 @@ impl MiddlewareChain {
         self.middleware.is_empty()
     }
 
+    /// Runs the preparation of every middleware that has one, in the order
+    /// they run, keeping what each prepared in the context's [`Prepared`].
+    /// Each is called as the module it belongs to, with the permissions it
+    /// declares.
+    ///
+    /// # Errors
+    ///
+    /// The first refusal, which ends the request. It is logged once, as a
+    /// warning naming the middleware, and one whose status is not a client
+    /// or server error is answered as `500 Internal Server Error`.
+    pub async fn prepare(
+        &self,
+        module_context: &ModuleContext<'_>,
+        context: &MiddlewareContext<'_>,
+    ) -> Result<(), Refusal> {
+        for middleware in &self.middleware {
+            let id = middleware.middleware_id();
+            let call = module_context.call(id, middleware.required_permissions());
+            if let Some(preparation) = middleware.prepare(call, context) {
+                let value = preparation
+                    .await
+                    .map_err(|refusal| refusal.checked(id, context.phase))?;
+                context.prepared.insert(context.phase, id, value);
+            }
+        }
+        Ok(())
+    }
+
     /// Asks every middleware in turn what it will do with one document.
     ///
     /// Checks each handler's selector, refusing the document when one does
@@ -818,7 +999,17 @@ pub mod test_support {
             platform,
             document_state,
             max_buffered_script_bytes: 16 * 1024 * 1024,
+            prepared: nothing_prepared(),
         }
+    }
+
+    /// A [`Prepared`](super::Prepared) with nothing in it, for a middleware
+    /// that prepares nothing.
+    #[must_use]
+    pub fn nothing_prepared() -> &'static super::Prepared {
+        static NOTHING: std::sync::LazyLock<super::Prepared> =
+            std::sync::LazyLock::new(super::Prepared::default);
+        &NOTHING
     }
 }
 

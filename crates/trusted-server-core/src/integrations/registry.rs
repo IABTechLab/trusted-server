@@ -2940,7 +2940,9 @@ pub(crate) mod test_support {
         use crate::integrations::{CORE_SOURCE, IntegrationBuilder};
         use crate::middleware::{
             AttributeRewrite, Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase,
+            Preparation, Refusal,
         };
+        use crate::module_context::ModuleCall;
         use crate::settings::Settings;
 
         /// The integration id the stand-in registers under.
@@ -2969,6 +2971,165 @@ pub(crate) mod test_support {
         pub(crate) const TEXT_MEDIA_TYPE: &str = "text/plain";
         /// The line the text middleware adds at the end of a text body.
         pub(crate) const TEXT_LINE: &str = "# added by the middleware fixture\n";
+        /// The name of the fetch middleware that prepares.
+        pub(crate) const PREPARING: &str = "testing.middleware-fixture.preparing";
+        /// The name of the fetch middleware that refuses every request.
+        pub(crate) const REFUSING: &str = "testing.middleware-fixture.refusing";
+        /// How long the refusing middleware asks the caller to wait.
+        pub(crate) const REFUSAL_RETRY_AFTER: std::time::Duration =
+            std::time::Duration::from_secs(30);
+        /// What the refusing middleware says.
+        pub(crate) const REFUSAL_MESSAGE: &str = "the middleware fixture refuses";
+        /// What the preparing middleware writes when nothing was prepared.
+        pub(crate) const NOTHING_PREPARED: &str =
+            "<meta name=\"middleware-fixture-prepared\" content=\"nothing prepared\">";
+
+        /// What the reader marker says when the preparation could read
+        /// nothing of the reader.
+        pub(crate) const NOTHING_OF_THE_READER: &str = "nothing of the reader";
+
+        /// The marker the preparing middleware writes, naming the module it
+        /// was called as and the host it was told of.
+        pub(crate) fn prepared_marker(module: &str, request_host: &str) -> String {
+            format!(
+                "<meta name=\"middleware-fixture-prepared\" content=\"{module} for {request_host}\">"
+            )
+        }
+
+        /// The marker the preparing middleware writes after
+        /// [`prepared_marker`], saying what its preparation could read of the
+        /// reader.
+        pub(crate) fn prepared_reader_marker(seen: &str) -> String {
+            format!("<meta name=\"middleware-fixture-reader\" content=\"{seen}\">")
+        }
+
+        /// What a preparation called with `call` can read of the reader,
+        /// through the services or as a value of its own.
+        fn reader_seen(call: &ModuleCall<'_>) -> String {
+            use crate::consent::ConsentContext;
+            use crate::ec::device::DeviceSignals;
+            use crate::evidence::RequestInfo;
+            use crate::geo::GeoInfo;
+            use crate::module_context::{EdgeCookie, FromModuleContext};
+            use crate::permissions::PermissionState;
+            use crate::platform::{ClientInfo, RuntimeServices};
+
+            let mut seen = Vec::new();
+            if let Ok(services) = <&RuntimeServices>::from_module_context(call) {
+                let client = services.client_info();
+                if let Some(ip) = client.client_ip {
+                    seen.push(format!("client IP {ip}"));
+                }
+                if client.tls_protocol.is_some()
+                    || client.tls_cipher.is_some()
+                    || client.tls_ja4.is_some()
+                    || client.h2_fingerprint.is_some()
+                {
+                    seen.push("TLS details".to_owned());
+                }
+                if services.host_signals().is_some() {
+                    seen.push("client signals".to_owned());
+                }
+            }
+            if let Ok(evidence) = <&dyn RequestInfo>::from_module_context(call) {
+                seen.push(format!(
+                    "evidence with user-agent {}",
+                    evidence.user_agent()
+                ));
+            }
+            for (value, handed) in [
+                (
+                    "connection",
+                    <&ClientInfo>::from_module_context(call).is_ok(),
+                ),
+                (
+                    "consent",
+                    <&ConsentContext>::from_module_context(call).is_ok(),
+                ),
+                (
+                    "permissions",
+                    <&PermissionState>::from_module_context(call).is_ok(),
+                ),
+                ("geo", <&GeoInfo>::from_module_context(call).is_ok()),
+                (
+                    "device signals",
+                    <&DeviceSignals>::from_module_context(call).is_ok(),
+                ),
+                ("Edge Cookie", EdgeCookie::from_module_context(call).is_ok()),
+            ] {
+                if handed {
+                    seen.push(value.to_owned());
+                }
+            }
+            if seen.is_empty() {
+                NOTHING_OF_THE_READER.to_owned()
+            } else {
+                seen.join(", ")
+            }
+        }
+
+        struct Preparing;
+
+        impl Middleware for Preparing {
+            fn middleware_id(&self) -> &'static str {
+                PREPARING
+            }
+
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &MiddlewarePhase::ALL
+            }
+
+            fn prepare<'a>(
+                &'a self,
+                call: ModuleCall<'a>,
+                context: &'a MiddlewareContext<'a>,
+            ) -> Option<Preparation<'a>> {
+                Some(Box::pin(async move {
+                    let marker = prepared_marker(call.module(), context.request_host)
+                        + &prepared_reader_marker(&reader_seen(&call));
+                    Ok(Box::new(marker) as Box<dyn std::any::Any + Send>)
+                }))
+            }
+
+            fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                let marker: String = context
+                    .take_prepared(PREPARING)
+                    .unwrap_or_else(|| NOTHING_PREPARED.to_owned());
+                MiddlewareAction {
+                    head_inserts: vec![marker],
+                    ..MiddlewareAction::pass()
+                }
+            }
+        }
+
+        struct Refusing;
+
+        impl Middleware for Refusing {
+            fn middleware_id(&self) -> &'static str {
+                REFUSING
+            }
+
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Fetch]
+            }
+
+            fn prepare<'a>(
+                &'a self,
+                _call: ModuleCall<'a>,
+                _context: &'a MiddlewareContext<'a>,
+            ) -> Option<Preparation<'a>> {
+                Some(Box::pin(async {
+                    Err(Refusal::service_unavailable(
+                        REFUSAL_RETRY_AFTER,
+                        REFUSAL_MESSAGE,
+                    ))
+                }))
+            }
+
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                MiddlewareAction::pass()
+            }
+        }
         /// The name of the serve middleware that writes a header on a text
         /// response.
         pub(crate) const TEXT_HEADER: &str = "testing.middleware-fixture.text-header";
@@ -3202,6 +3363,8 @@ pub(crate) mod test_support {
                     .with_middleware(Arc::new(Reader))
                     .with_middleware(Arc::new(BrokenReader))
                     .with_middleware(Arc::new(Text))
+                    .with_middleware(Arc::new(Preparing))
+                    .with_middleware(Arc::new(Refusing))
                     .with_middleware(Arc::new(TextHeader))
                     .build(),
             ))
@@ -6224,6 +6387,8 @@ mod tests {
                 fixture::READER,
                 fixture::BROKEN_READER,
                 fixture::TEXT,
+                fixture::PREPARING,
+                fixture::REFUSING,
                 fixture::TEXT_HEADER,
                 crate::service_version::MODULE,
             ],
@@ -6235,7 +6400,9 @@ mod tests {
                 fixture::HEAD,
                 fixture::LINKS,
                 fixture::BROKEN,
-                fixture::TEXT
+                fixture::TEXT,
+                fixture::PREPARING,
+                fixture::REFUSING
             ],
             "should list the middleware that run in the fetch phase"
         );
@@ -6244,6 +6411,7 @@ mod tests {
             [
                 fixture::READER,
                 fixture::BROKEN_READER,
+                fixture::PREPARING,
                 fixture::TEXT_HEADER,
                 crate::service_version::MODULE
             ],
@@ -6361,13 +6529,15 @@ mod tests {
             message.contains(
                 "[[fetch]] entry 2 names `testing.nothing`, which no module that runs supplies"
             ) && message.contains(&format!(
-                "[{}, {}, {}, {}, {}, {}, {}, {}]",
+                "[{}, {}, {}, {}, {}, {}, {}, {}, {}, {}]",
                 fixture::HEAD,
                 fixture::LINKS,
                 fixture::BROKEN,
                 fixture::READER,
                 fixture::BROKEN_READER,
                 fixture::TEXT,
+                fixture::PREPARING,
+                fixture::REFUSING,
                 fixture::TEXT_HEADER,
                 crate::service_version::MODULE
             )),
@@ -6422,6 +6592,8 @@ mod tests {
                 fixture::READER,
                 fixture::BROKEN_READER,
                 fixture::TEXT,
+                fixture::PREPARING,
+                fixture::REFUSING,
                 fixture::TEXT_HEADER,
             ],
             "should list every middleware when there are no entries"
@@ -6436,6 +6608,8 @@ mod tests {
                 fixture::READER,
                 fixture::BROKEN_READER,
                 fixture::TEXT,
+                fixture::PREPARING,
+                fixture::REFUSING,
                 fixture::TEXT_HEADER
             ],
             "should leave out a middleware any entry names"
@@ -6505,6 +6679,8 @@ mod tests {
                 fixture::BROKEN,
                 fixture::BROKEN_READER,
                 fixture::TEXT,
+                fixture::PREPARING,
+                fixture::REFUSING,
                 fixture::TEXT_HEADER
             ],
             "should count a middleware as named only by an entry of a phase it runs in"

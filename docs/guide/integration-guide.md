@@ -247,6 +247,61 @@ The entry that places it names the media type and, where the change is for
 one file, its path. See "Entries for a media type other than HTML" in the
 [configuration guide](/guide/configuration#entries-for-a-media-type-other-than-html).
 
+### A middleware that prepares, and one that refuses
+
+A middleware whose decision needs the request's services, or has to wait on
+the key-value store or the network, answers `prepare` with a future. Core
+runs it in the request's handler, before the document is processed, as the
+module the middleware belongs to and with the permissions it declares in
+`required_permissions`. What the future answers is kept under the phase and
+the middleware's name in the context's `prepared`, and `create`, which stays
+synchronous, takes it from there as the type it prepared. A middleware that
+prepares nothing leaves `prepare` at its default and is asked `create` as
+before.
+
+```rust
+impl Middleware for Sellers {
+    fn prepare<'a>(
+        &'a self,
+        call: ModuleCall<'a>,
+        context: &'a MiddlewareContext<'a>,
+    ) -> Option<Preparation<'a>> {
+        Some(Box::pin(async move {
+            let lines = self.lines_for(call, context.request_host).await?;
+            Ok(Box::new(lines) as Box<dyn Any + Send>)
+        }))
+    }
+
+    fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        let lines: Vec<String> = context.take_prepared(MODULE).unwrap_or_default();
+        MiddlewareAction {
+            stream: Some(Box::new(AppendLines::new(lines))),
+            ..MiddlewareAction::pass()
+        }
+    }
+}
+```
+
+The future may answer a `Refusal` instead, with a status, an optional
+`Retry-After` and a message. The request is then answered with that status
+and the message as plain text, no document is processed, and nothing is
+stored or served from the store, so a middleware that cannot make the
+document it is responsible for fails closed rather than letting an empty or
+unchanged one through. `Refusal::service_unavailable` is the one for a
+source that cannot answer now. The preparations of one document run in the
+order the entry names the middleware, and the first refusal ends them. Core
+logs a refusal as a warning naming the middleware, and answers a status that
+is not a client or server error with `500`.
+
+On a document that may be stored the fetch phase's preparations are handed
+the request's services with no client IP, TLS details or client signals, and
+nothing else of the reader, because what they answer is stored with the
+document. The serve phase is prepared with the reader's state on every
+document, the one fetched for this reader as much as a copy read from the
+store, so what a serve middleware finds prepared never depends on whether its
+reader was the first. On a document that is not stored both phases are
+prepared with the reader's state.
+
 ## Proxy implementation rules
 
 An `IntegrationProxy::handle` implementation receives the request and its
