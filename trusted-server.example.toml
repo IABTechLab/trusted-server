@@ -881,17 +881,3 @@ auction_timeout_ms = 500
 # provides. Find the ids by grepping your rendered HTML for `gtag/js?id=`.
 # allowed_tag_ids = ["G-EXAMPLE1", "AW-000000", "MC-EXAMPLE1"]
 
-# Signed evidence of who operates this deployment and which build it runs,
-# served at `endpoint` and at the same address with `.json`. Without this
-# table the address belongs to the publisher's origin. The signing keys are
-# compiled into the build from the file TRUSTED_SERVER_ATTESTATION_KEYS names
-# and are never configured, so a build given none answers 503 there.
-# See docs/guide/attestation.md.
-# [attestation]
-# Defaults to "/_ts/attestation".
-# endpoint = "/_ts/attestation"
-# operator = "Example Operator"
-# The text signed ahead of the evidence. A verifier must use the same text.
-# context = "example-attestation:v1"
-# Where the page sends a reader to check the claim. Must be https.
-# verify_url = "https://verifier.example/verify?host=example.com"

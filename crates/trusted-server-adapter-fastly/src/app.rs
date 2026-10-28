@@ -32,7 +32,6 @@
 //! | GET | `/_ts/permissions` and `/_ts/permissions.json` | [`handle_permissions`] |
 //! | GET | `/_ts/config` and `/_ts/config.json` | [`handle_config`] |
 //! | GET | `/_ts/data` | [`handle_data`] |
-//! | GET, HEAD | The address `[attestation] endpoint` names, and the same with `.json` | [`handle_prefix`] |
 //! | OPTIONS | `/_ts/api/v1/identify` | [`cors_preflight_identify`] |
 //! | POST | `/_ts/api/v1/ec/resolve` | [`handle_ec_resolve`] |
 //! | POST | `/auction` | [`handle_auction`] |
@@ -103,7 +102,6 @@ use edgezero_core::http::{
 };
 use edgezero_core::router::RouterService;
 use error_stack::Report;
-use trusted_server_core::attestation::{PlatformIdentity, handle_prefix, prefix_routes};
 use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{
@@ -1583,42 +1581,6 @@ fn named_route_handler(
     }
 }
 
-/// Answers the attestation pages ahead of the Edge Cookie lifecycle and the
-/// request filters, because the pages are read only and a verifier fetching
-/// one from a server must not be turned away as a bot.
-fn attestation_route_handler(
-    state: Arc<AppState>,
-) -> impl Fn(RequestContext) -> HandlerFuture + Clone + Send + Sync + 'static {
-    move |ctx: RequestContext| {
-        let state = Arc::clone(&state);
-        Box::pin(async move {
-            Ok(handle_prefix(
-                &state.settings,
-                &fastly_platform_identity(),
-                &ctx.into_request(),
-            ))
-        })
-    }
-}
-
-/// What the evidence says about the Fastly service answering, from the
-/// environment variables Fastly gives every Compute service.
-fn fastly_platform_identity() -> PlatformIdentity {
-    let read = |name: &str| {
-        std::env::var(name)
-            .ok()
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "unknown".to_owned())
-    };
-    PlatformIdentity {
-        name: "fastly".to_owned(),
-        service_id: read("FASTLY_SERVICE_ID"),
-        service_version: read("FASTLY_SERVICE_VERSION"),
-        staging: std::env::var("FASTLY_IS_STAGING").is_ok_and(|value| value == "1"),
-        pop: read("FASTLY_POP"),
-    }
-}
-
 fn fallback_route_handler(
     state: Arc<AppState>,
 ) -> impl Fn(RequestContext) -> HandlerFuture + Clone + Send + Sync + 'static {
@@ -1684,21 +1646,6 @@ impl TrustedServerApp {
             for method in publisher_fallback_methods() {
                 if !route.primary_methods.contains(&method) {
                     router = router.route(route.path, method, fallback_handler.clone());
-                }
-            }
-        }
-
-        // Routes chosen by the settings, so not in the fixed table.
-        let routes = prefix_routes(&state.settings);
-        if !routes.is_empty() {
-            let attestation = attestation_route_handler(Arc::clone(state));
-            for route in &routes {
-                for method in publisher_fallback_methods() {
-                    if matches!(method, Method::GET | Method::HEAD) || route.every_method {
-                        router = router.route(&route.path, method, attestation.clone());
-                    } else {
-                        router = router.route(&route.path, method, fallback_handler.clone());
-                    }
                 }
             }
         }
@@ -2759,230 +2706,6 @@ mod tests {
         assert!(
             response.headers().get(header::SET_COOKIE).is_none(),
             "disabled clear tester-cookie route should not set a cookie"
-        );
-    }
-
-    /// Settings whose attestation pages sit at `endpoint`.
-    fn settings_with_attestation_at(endpoint: &str) -> Settings {
-        let mut settings = test_settings();
-        settings.attestation = Some(trusted_server_core::attestation::AttestationConfig {
-            endpoint: endpoint.to_owned(),
-            operator: "Example Operator".to_owned(),
-            context: "example-attestation:v1".to_owned(),
-            verify_url: "https://verifier.example/verify".to_owned(),
-        });
-        settings
-    }
-
-    /// The router of a deployment whose attestation pages sit at `endpoint`.
-    fn router_with_attestation_at(endpoint: &str) -> RouterService {
-        let state = build_state_from_settings(settings_with_attestation_at(endpoint))
-            .expect("should build test state");
-        TrustedServerApp::routes_for_state(&state)
-    }
-
-    fn header_text(response: &Response, name: header::HeaderName) -> String {
-        response
-            .headers()
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_owned()
-    }
-
-    /// A deployment whose endpoint sits under a prefix of its own answers
-    /// everything beneath that prefix here. Reads of the two attestation
-    /// addresses reach the handler, the prefix lists its pages, and anything
-    /// else is not found rather than sent to the publisher's origin. Test
-    /// builds carry no signing key, so the handler answers 503 in JSON.
-    #[test]
-    fn an_owned_prefix_is_answered_here_and_never_by_the_origin() {
-        let router = router_with_attestation_at("/_ex/attestation");
-
-        let cases = [
-            (Method::GET, "/_ex", 200, "text/html"),
-            (Method::GET, "/_ex/", 200, "text/html"),
-            (
-                Method::GET,
-                "/_ex/attestation.json",
-                503,
-                "application/json",
-            ),
-            (
-                Method::HEAD,
-                "/_ex/attestation.json",
-                503,
-                "application/json",
-            ),
-            (Method::GET, "/_ex/attestation", 503, "application/json"),
-            (Method::POST, "/_ex/attestation", 404, "text/html"),
-            (Method::PUT, "/_ex/attestation.json", 404, "text/html"),
-            (Method::DELETE, "/_ex", 404, "text/html"),
-            (Method::GET, "/_ex/unknown/page", 404, "text/html"),
-        ];
-        for (method, path, status, content_type) in cases {
-            let case = format!("{method} {path}");
-            let response = route(&router, empty_request(method, path));
-            assert_eq!(
-                response.status().as_u16(),
-                status,
-                "should answer {case} here"
-            );
-            assert!(
-                header_text(&response, header::CONTENT_TYPE).starts_with(content_type),
-                "should answer {case} as {content_type}"
-            );
-            assert_eq!(
-                header_text(&response, header::CACHE_CONTROL),
-                "no-store",
-                "should keep the answer to {case} out of every cache"
-            );
-        }
-    }
-
-    /// When the endpoint is not the default, reads of the default address are
-    /// sent to the endpoint, keeping the nonce. With the default endpoint the
-    /// default address is answered directly, and no other address redirects.
-    #[test]
-    fn the_default_address_redirects_to_the_endpoint_the_settings_name() {
-        use trusted_server_core::attestation::DEFAULT_ENDPOINT;
-
-        let router = router_with_attestation_at("/_ex/attestation");
-        for (method, path, location) in [
-            (Method::GET, "/_ts/attestation", "/_ex/attestation"),
-            (Method::HEAD, "/_ts/attestation", "/_ex/attestation"),
-            (
-                Method::GET,
-                "/_ts/attestation.json?nonce=abc123",
-                "/_ex/attestation.json?nonce=abc123",
-            ),
-        ] {
-            let case = format!("{method} {path}");
-            let response = route(&router, empty_request(method, path));
-            assert_eq!(response.status().as_u16(), 301, "should redirect {case}");
-            assert_eq!(
-                header_text(&response, header::LOCATION),
-                location,
-                "should send {case} to the endpoint with its query kept"
-            );
-            assert_eq!(
-                header_text(&response, header::CACHE_CONTROL),
-                "no-store",
-                "should keep the redirect of {case} out of every cache"
-            );
-        }
-
-        let router = router_with_attestation_at(DEFAULT_ENDPOINT);
-        for path in ["/_ts/attestation", "/_ts/attestation.json"] {
-            let response = route(&router, empty_request(Method::GET, path));
-            assert_eq!(
-                response.status().as_u16(),
-                503,
-                "{path} should reach the handler, which has no key built in"
-            );
-            assert!(
-                response.headers().get(header::LOCATION).is_none(),
-                "{path} should not redirect under the default endpoint"
-            );
-        }
-    }
-
-    /// Without the section the two addresses belong to the publisher, so a
-    /// deployment that serves no attestation takes nothing from its origin.
-    #[test]
-    fn without_the_section_no_attestation_route_is_registered() {
-        let registered: Vec<String> = test_router()
-            .routes()
-            .iter()
-            .map(|route| route.path().to_owned())
-            .filter(|path| path.contains("attestation"))
-            .collect();
-
-        assert!(
-            registered.is_empty(),
-            "should register no attestation route, found {registered:?}"
-        );
-    }
-
-    /// Every route this router registers beneath an underscore prefix is one
-    /// of the addresses an attestation endpoint may not take, so a new fixed
-    /// route cannot leave an endpoint free to register its address twice.
-    #[test]
-    fn every_fixed_route_beneath_an_underscore_prefix_is_reserved() {
-        use trusted_server_core::attestation::RESERVED_PATHS;
-
-        for route in test_router().routes() {
-            let path = route.path();
-            if path.starts_with("/_") {
-                assert!(
-                    RESERVED_PATHS.contains(&path),
-                    "{path} should be listed in attestation::RESERVED_PATHS"
-                );
-            }
-        }
-    }
-
-    /// Every endpoint the settings accept builds a router whose attestation
-    /// pages answer, because a second route at one address panics when the
-    /// router is built.
-    #[test]
-    fn every_endpoint_the_settings_accept_builds_a_router() {
-        use trusted_server_core::attestation::{DEFAULT_ENDPOINT, validate_endpoint};
-
-        let mut candidates: Vec<String> = test_router()
-            .routes()
-            .iter()
-            .map(edgezero_core::router::RouteInfo::path)
-            .filter(|path| path.starts_with("/_"))
-            .map(|path| {
-                let page = path.strip_suffix(".json").unwrap_or(path);
-                page.split('/')
-                    .map(|segment| {
-                        if segment.starts_with('{') {
-                            "proof"
-                        } else {
-                            segment
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("/")
-            })
-            .collect();
-        candidates.extend(
-            [
-                DEFAULT_ENDPOINT,
-                "/_ts/proof",
-                "/_ts/api/v1/proof",
-                "/__ts/proof",
-            ]
-            .map(str::to_owned),
-        );
-        candidates.sort();
-        candidates.dedup();
-
-        let accepted: Vec<String> = candidates
-            .into_iter()
-            .filter(|endpoint| validate_endpoint(endpoint).is_ok())
-            .collect();
-        for endpoint in &accepted {
-            let router = router_with_attestation_at(endpoint);
-            let json = format!("{endpoint}.json");
-            let response = route(&router, empty_request(Method::GET, &json));
-            assert_eq!(
-                response.status().as_u16(),
-                503,
-                "{json} should reach the handler, which has no key built in"
-            );
-        }
-        assert_eq!(
-            accepted,
-            [
-                "/__ts/proof",
-                "/_ts/api/v1/proof",
-                DEFAULT_ENDPOINT,
-                "/_ts/proof"
-            ],
-            "should accept only the endpoints no fixed route answers"
         );
     }
 

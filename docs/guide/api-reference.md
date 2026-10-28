@@ -67,8 +67,6 @@ authority, scheme, and client-address headers in the innermost middleware.
 | normal  | `/verify-signature`                    | `POST`                                                     | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `publisher_fallback`                  | publisher fallback    | publisher fallback    | publisher fallback    | publisher fallback    |
 | normal  | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `publisher_fallback`                  | publisher fallback    | publisher fallback    | publisher fallback    | publisher fallback    |
-| normal  | `<attestation.endpoint>.json`          | `GET`, `HEAD`                                              | config derived | `settings.attestation`                | real                  | real                  | real                  | real                  |
-| normal  | `<attestation.endpoint>`               | `GET`, `HEAD`                                              | config derived | `settings.attestation`                | real                  | real                  | real                  | real                  |
 | normal  | `<proxy.asset_routes[].prefix>{*rest}` | `GET`, `HEAD`                                              | config derived | `settings.proxy.asset_routes[]`       | real                  | —                     | —                     | —                     |
 | startup | `/health`                              | `GET`                                                      | literal        | `startup_error`                       | real                  | —                     | —                     | real                  |
 | startup | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `startup_error`                       | startup error (`500`) | startup error (`500`) | startup error (`500`) | startup error (`503`) |
@@ -300,24 +298,6 @@ not run for this request, so no cookie is set and no identity row is written.
 
 ```bash
 curl -s "https://edge.example.com/_ts/permissions.json" -H "Sec-GPC: 1"
-```
-
-### GET `<attestation.endpoint>` and GET `<attestation.endpoint>.json`
-
-Signed evidence of who operates the deployment and which build it runs, as a
-page and as data. [Attestation](/guide/attestation) gives the format and how a
-relying party checks it.
-
-- **Configuration gate:** served only where the settings carry `[attestation]`. The address is `[attestation] endpoint`, which defaults to `/_ts/attestation`. Where the endpoint is not the default, a read of the default address answers `301` to the endpoint with the query kept.
-- **Auth:** none.
-- **Request:** `GET` or `HEAD`. An optional `nonce` query parameter of 1 to 64 characters from `A` to `Z`, `a` to `z`, `0` to `9`, `_` and `-` is signed back in the evidence.
-- **Response:** `200` with the page, or with the envelope as `application/json` at the `.json` address. `400` for a malformed nonce. `503` where the build carries no signing key in force, the key cannot be read or the clock cannot be read. The `400` and `503` bodies are JSON with an `error` field.
-- **Cache and CORS:** `Cache-Control: no-store` and `Access-Control-Allow-Origin: *` on every answer.
-- **Rate limiting:** none.
-- **Other methods:** reach the publisher's origin under the shared `/_ts` prefix. Under a prefix the endpoint has to itself, every other method and address beneath that prefix answers `404` from the deployment.
-
-```bash
-curl "https://publisher.example/_ts/attestation.json?nonce=Docs-Example_0929"
 ```
 
 ## Utility Endpoints

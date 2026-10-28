@@ -12,7 +12,6 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
-use trusted_server_core::attestation::{PlatformIdentity, handle_prefix, prefix_routes};
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan_with,
@@ -1213,31 +1212,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 }
             }
         }
-        // Routes chosen by the settings, so not in the fixed table.
-        let routes = prefix_routes(&state.settings);
-        if !routes.is_empty() {
-            let s = Arc::clone(&state);
-            let attestation_handler = move |ctx: RequestContext| {
-                let s = Arc::clone(&s);
-                async move {
-                    Ok::<Response, EdgeError>(handle_prefix(
-                        &s.settings,
-                        &PlatformIdentity::named("spin"),
-                        &ctx.into_request(),
-                    ))
-                }
-            };
-            for route in &routes {
-                for method in publisher_fallback_methods() {
-                    if matches!(method, Method::GET | Method::HEAD) || route.every_method {
-                        builder = builder.route(&route.path, method, attestation_handler.clone());
-                    } else {
-                        builder = builder.route(&route.path, method, fallback.clone());
-                    }
-                }
-            }
-        }
-
         for method in publisher_fallback_methods() {
             builder = builder.route("/", method.clone(), fallback.clone());
             builder = builder.route("/{*rest}", method, fallback.clone());
