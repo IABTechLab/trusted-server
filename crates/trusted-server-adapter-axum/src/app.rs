@@ -951,7 +951,9 @@ mod tests {
             trusted_server_core::test_support::tests::crate_test_settings_str(),
             trusted_server_core::test_support::template::documented_block("[analytics]")
         ))
-        .expect("should load settings selecting the documented analytics module");
+        .expect("should load settings selecting the documented analytics module")
+        // A loaded domain carries its policy.
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
 
         build_state_with_settings(settings).expect("should accept a selected analytics module");
 

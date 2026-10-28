@@ -1850,7 +1850,12 @@ mod tests {
             (base.clone(), false),
             (format!("{base}\n{analytics}"), true),
         ] {
-            let settings = Settings::from_toml(&document).expect("should load the settings");
+            let settings = Settings::from_toml(&document)
+                .expect("should load the settings")
+                // A loaded domain carries its policy.
+                .with_permission_policy(
+                    trusted_server_core::permissions::PermissionPolicy::sample(),
+                );
             let state = build_state_from_settings(settings).expect("should build state");
 
             let services = build_per_request_services(&state, &context);
