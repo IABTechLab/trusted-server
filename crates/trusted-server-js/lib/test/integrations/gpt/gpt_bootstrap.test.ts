@@ -28,6 +28,7 @@ interface MockGoogleTag {
   enableServices: () => void;
   display: (divId: string) => void;
   setConfig?: (config: Record<string, unknown>) => void;
+  sizeMapping?: () => unknown;
 }
 
 // `tsjs` is declared globally as the full `TsjsApi`; `Omit` drops it from
@@ -452,6 +453,121 @@ describe('gpt_bootstrap.js fallback', () => {
     }
   });
 
+  it.each([
+    { name: 'a band with sizes', viewportWidth: 375, defines: true },
+    { name: 'a band with no size', viewportWidth: 700, defines: false },
+  ])(
+    'the claim-expiry fallback applies the viewport bands ($name)',
+    ({ viewportWidth, defines }) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(100);
+      const originalInnerWidth = window.innerWidth;
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: viewportWidth });
+      try {
+        const builder = {
+          addSize: vi.fn().mockReturnThis(),
+          build: vi.fn().mockReturnValue('built mapping'),
+        };
+        const mockSlot = {
+          addService: vi.fn().mockReturnThis(),
+          setTargeting: vi.fn().mockReturnThis(),
+          getSlotElementId: vi.fn().mockReturnValue('banded-fallback'),
+          defineSizeMapping: vi.fn().mockReturnThis(),
+        };
+        const pubads = {
+          getSlots: vi.fn(() => []),
+          refresh: vi.fn(),
+          enableSingleRequest: vi.fn(),
+        };
+        const defineSlot = vi.fn(() => mockSlot);
+        (window as TestWindow).googletag = makeGoogleTag({
+          cmd: { push: (command: () => void) => command() },
+          defineSlot,
+          pubads: vi.fn(() => pubads),
+          sizeMapping: vi.fn(() => builder),
+        });
+        document.body.innerHTML = '<div id="banded-fallback"></div>';
+
+        runBootstrap();
+        const ts = (window as TestWindow).tsjs!;
+        const element = document.getElementById('banded-fallback')!;
+        const publisherClaim: FirstImpressionSlotClaim = {
+          generation: 0,
+          slotElementId: element.id,
+          element,
+          owner: 'publisher',
+          phase: 'auctioning',
+          expiresAt: 5_100,
+          publisherAuctions: {
+            original: {
+              token: 'original',
+              adUnitCode: element.id,
+              phase: 'auctioning',
+              expiresAt: 5_100,
+              adIds: [],
+              suppressDelivery: false,
+            },
+          },
+        };
+        ts.firstImpression = {
+          generation: 0,
+          nextToken: 1,
+          slots: { [element.id]: publisherClaim },
+          fallbackSlots: {},
+        };
+        const bands: Array<[[number, number], Array<[number, number]>]> = [
+          [[1040, 0], [[970, 250]]],
+          [[600, 0], []],
+          [[0, 0], [[320, 50]]],
+        ];
+        ts.adSlots = [
+          {
+            id: 'banded-fallback-ad',
+            gam_unit_path: '/123/banded-fallback',
+            div_id: element.id,
+            formats: [
+              [970, 250],
+              [320, 50],
+            ],
+            viewport_sizes: bands,
+            targeting: {},
+          },
+        ];
+        ts.bids = { 'banded-fallback-ad': { hb_pb: '1.00' } };
+
+        ts.adInit!();
+        expect(defineSlot).not.toHaveBeenCalled();
+
+        // The publisher's claim lapses and the fallback defines the slot.
+        vi.advanceTimersByTime(5_001);
+
+        if (defines) {
+          expect(defineSlot).toHaveBeenCalledWith(
+            '/123/banded-fallback',
+            [
+              [970, 250],
+              [320, 50],
+            ],
+            element.id
+          );
+          expect(builder.addSize.mock.calls).toEqual(bands);
+          expect(mockSlot.defineSizeMapping).toHaveBeenCalledWith('built mapping');
+          expect(ts.viewportMappedSlots?.has(mockSlot)).toBe(true);
+        } else {
+          expect(defineSlot).not.toHaveBeenCalled();
+          expect(ts.firstImpression.slots[element.id]).toBeUndefined();
+        }
+      } finally {
+        vi.clearAllTimers();
+        vi.useRealTimers();
+        Object.defineProperty(window, 'innerWidth', {
+          configurable: true,
+          value: originalInnerWidth,
+        });
+      }
+    }
+  );
+
   it.each([true, false])(
     'settles the persistent bootstrap listener on render (empty=%s)',
     (isEmpty) => {
@@ -822,25 +938,182 @@ describe('gpt_bootstrap.js fallback', () => {
     expect(ts.adSlots).toEqual([liveSlot]);
   });
 
-  it('fallback adInit defines, targets, and displays a TS slot through the command queue', () => {
+  it.each([
+    { name: 'without viewport bands', bands: undefined },
+    {
+      name: 'with viewport bands',
+      bands: [
+        [
+          [1040, 0],
+          [
+            [300, 600],
+            [300, 250],
+          ],
+        ],
+        [[0, 0], [[300, 250]]],
+      ] as Array<[[number, number], Array<[number, number]>]>,
+    },
+  ])(
+    'fallback adInit defines, targets, and displays a TS slot through the command queue ($name)',
+    ({ bands }) => {
+      const builder = {
+        addSize: vi.fn().mockReturnThis(),
+        build: vi.fn().mockReturnValue('built mapping'),
+      };
+      const sizeMapping = vi.fn().mockReturnValue(builder);
+      const mockSlot = {
+        addService: vi.fn().mockReturnThis(),
+        setTargeting: vi.fn().mockReturnThis(),
+        getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+        defineSizeMapping: vi.fn().mockReturnThis(),
+      };
+      const mockPubads = {
+        enableSingleRequest: vi.fn(),
+        getSlots: vi.fn().mockReturnValue([]),
+        refresh: vi.fn(),
+      };
+      const defineSlot = vi.fn().mockReturnValue(mockSlot);
+      const display = vi.fn();
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot,
+        pubads: vi.fn().mockReturnValue(mockPubads),
+        enableServices: vi.fn(),
+        display,
+        sizeMapping,
+      };
+      document.body.innerHTML =
+        '<div id="div-atf-sidebar-container"><div id="div-atf-sidebar"></div></div>';
+      runBootstrap();
+      const ts = (window as TestWindow).tsjs!;
+      ts.adSlots = [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          ...(bands ? { viewport_sizes: bands } : {}),
+          targeting: { ts_route: 'home' },
+        },
+      ];
+      ts.bids = { atf_sidebar_ad: { hb_pb: '1.00' } };
+
+      ts.adInit!();
+
+      expect(defineSlot).toHaveBeenCalledWith('/123/atf', [[300, 250]], 'div-atf-sidebar');
+      expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '1.00');
+      expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
+      expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_route', 'home');
+      expect(ts.prevSlotTargetingKeys).toEqual({ 'div-atf-sidebar': ['ts_route'] });
+      expect(display).toHaveBeenCalledWith('div-atf-sidebar');
+      expect(ts.servicesEnabled).toBe(true);
+
+      // The refresh auction narrows only a slot recorded as carrying the mapping.
+      const mapped = ts.viewportMappedSlots?.has(mockSlot) ?? false;
+      if (bands) {
+        expect(builder.addSize.mock.calls).toEqual(bands);
+        expect(mockSlot.defineSizeMapping).toHaveBeenCalledWith('built mapping');
+        expect(mapped).toBe(true);
+      } else {
+        expect(sizeMapping).not.toHaveBeenCalled();
+        expect(mockSlot.defineSizeMapping).not.toHaveBeenCalled();
+        expect(mapped).toBe(false);
+      }
+    }
+  );
+
+  it('fallback adInit leaves a slot alone where its viewport band asks for no size', () => {
+    const originalInnerWidth = window.innerWidth;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 700 });
+    try {
+      const mockSlot = {
+        addService: vi.fn().mockReturnThis(),
+        setTargeting: vi.fn().mockReturnThis(),
+        getSlotElementId: vi.fn().mockReturnValue('div-billboard'),
+        defineSizeMapping: vi.fn().mockReturnThis(),
+      };
+      const nativeRefresh = vi.fn();
+      const mockPubads = {
+        enableSingleRequest: vi.fn(),
+        getSlots: vi.fn().mockReturnValue([]),
+        refresh: nativeRefresh,
+      };
+      const defineSlot = vi.fn().mockReturnValue(mockSlot);
+      const display = vi.fn();
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot,
+        pubads: vi.fn().mockReturnValue(mockPubads),
+        enableServices: vi.fn(),
+        display,
+        sizeMapping: vi.fn().mockReturnValue({
+          addSize: vi.fn().mockReturnThis(),
+          build: vi.fn().mockReturnValue('built mapping'),
+        }),
+      };
+      document.body.innerHTML = '<div id="div-billboard"></div>';
+      runBootstrap();
+      const ts = (window as TestWindow).tsjs!;
+      ts.adSlots = [
+        {
+          id: 'billboard',
+          gam_unit_path: '/123/billboard',
+          div_id: 'div-billboard',
+          formats: [
+            [970, 250],
+            [320, 50],
+          ],
+          viewport_sizes: [
+            [[1040, 0], [[970, 250]]],
+            [[600, 0], []],
+            [[0, 0], [[320, 50]]],
+          ],
+          targeting: {},
+        },
+      ];
+      ts.bids = { billboard: { hb_pb: '1.00' } };
+
+      ts.adInit!();
+
+      // No ad can serve at this width, so any GPT call could only size or
+      // collapse the container after the page has painted.
+      expect(defineSlot).not.toHaveBeenCalled();
+      expect(display).not.toHaveBeenCalled();
+      expect(nativeRefresh).not.toHaveBeenCalled();
+      expect(ts.firstImpression?.slots['div-billboard']).toBeUndefined();
+    } finally {
+      Object.defineProperty(window, 'innerWidth', {
+        configurable: true,
+        value: originalInnerWidth,
+      });
+    }
+  });
+
+  it('fallback adInit keeps every format when the size mapping throws', () => {
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),
       setTargeting: vi.fn().mockReturnThis(),
       getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      defineSizeMapping: vi.fn(() => {
+        throw new Error('mapping refused');
+      }),
     };
     const mockPubads = {
       enableSingleRequest: vi.fn(),
       getSlots: vi.fn().mockReturnValue([]),
       refresh: vi.fn(),
     };
-    const defineSlot = vi.fn().mockReturnValue(mockSlot);
     const display = vi.fn();
     (window as TestWindow).googletag = {
       cmd: { push: vi.fn((fn: () => void) => fn()) },
-      defineSlot,
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
       display,
+      sizeMapping: vi.fn().mockReturnValue({
+        addSize: vi.fn().mockReturnThis(),
+        build: vi.fn().mockReturnValue('built mapping'),
+      }),
     };
     document.body.innerHTML =
       '<div id="div-atf-sidebar-container"><div id="div-atf-sidebar"></div></div>';
@@ -851,21 +1124,32 @@ describe('gpt_bootstrap.js fallback', () => {
         id: 'atf_sidebar_ad',
         gam_unit_path: '/123/atf',
         div_id: 'div-atf-sidebar',
-        formats: [[300, 250]],
-        targeting: { ts_route: 'home' },
+        formats: [
+          [300, 600],
+          [300, 250],
+        ],
+        viewport_sizes: [
+          [
+            [1040, 0],
+            [
+              [300, 600],
+              [300, 250],
+            ],
+          ],
+          [[0, 0], [[300, 250]]],
+        ],
+        targeting: {},
       },
     ];
     ts.bids = { atf_sidebar_ad: { hb_pb: '1.00' } };
 
-    ts.adInit!();
+    expect(() => ts.adInit!()).not.toThrow();
 
-    expect(defineSlot).toHaveBeenCalledWith('/123/atf', [[300, 250]], 'div-atf-sidebar');
-    expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '1.00');
-    expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
-    expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_route', 'home');
-    expect(ts.prevSlotTargetingKeys).toEqual({ 'div-atf-sidebar': ['ts_route'] });
+    // The slot is still added to the ad service and displayed, asking for
+    // every format, and the refresh auction does not narrow it.
+    expect(mockSlot.addService).toHaveBeenCalledWith(mockPubads);
     expect(display).toHaveBeenCalledWith('div-atf-sidebar');
-    expect(ts.servicesEnabled).toBe(true);
+    expect(ts.viewportMappedSlots?.has(mockSlot) ?? false).toBe(false);
   });
 
   it('fallback adInit leaves a publisher-rendered slot untouched', () => {

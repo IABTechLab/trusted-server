@@ -27,6 +27,11 @@ export interface AuctionSlot {
   div_id: string;
   formats: Array<[number, number]>;
   targeting?: Record<string, string>;
+  /**
+   * The bands of the core's `CreativeOpportunitySlot::viewport_sizes`, each
+   * with a `[width, 0]` viewport. Absent when no format names a viewport bound.
+   */
+  viewport_sizes?: Array<[[number, number], Array<[number, number]>]>;
 }
 
 /** Debug-only copy of server-side bid fields exposed for pipeline inspection. */
@@ -528,6 +533,12 @@ export interface TsjsApi {
   gptSlotHandoffs?: Record<string, GptSlotHandoff>;
   /** True only while TS calls a GPT function that the handoff wrappers observe. */
   gptSlotHandoffInternal?: boolean;
+  /**
+   * GPT slots TS defined with their viewport bands as a size mapping. Only
+   * these ask the ad server for a band's sizes, so the refresh auction offers
+   * only these the sizes of their band.
+   */
+  viewportMappedSlots?: WeakSet<object>;
   /** Per-navigation first-impression ownership shared by GPT and Prebid. */
   firstImpression?: FirstImpressionState;
   /** Guards the shared production GPT lifecycle listener installation. */

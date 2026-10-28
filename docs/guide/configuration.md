@@ -2885,6 +2885,32 @@ page_patterns = ["/", "/news", "/news/*", "/reviews", "/reviews/*"]
 formats = [{ width = 728, height = 90 }]
 ```
 
+#### Sizes by viewport width
+
+A format may name the viewport widths at which the page asks for it, so a slot
+asks for a large size only where the page has room for one. `min_viewport_width`
+is the narrowest viewport, in CSS pixels, and `max_viewport_width` the widest.
+Either may be left out, meaning no bound on that side, and `min_viewport_width`
+may not exceed `max_viewport_width`. Where no format fits the viewport, the slot
+is not defined, so its container keeps the space the page's own style gives it.
+
+```toml
+[[creative_opportunities.slot]]
+id = "billboard"
+page_patterns = ["/**"]
+formats = [
+  { width = 970, height = 250, min_viewport_width = 1040 },
+  { width = 728, height = 90, min_viewport_width = 800, max_viewport_width = 1039 },
+  { width = 300, height = 250, min_viewport_width = 600, max_viewport_width = 799 },
+  { width = 320, height = 50, max_viewport_width = 599 },
+]
+```
+
+> [!WARNING]
+> A binary released before these fields refuses a format carrying either of
+> them, and fails to load its settings, which makes every request fail. Promote
+> the binary that reads them before pushing a configuration that uses them.
+
 The same switch can be overridden through the typed CLI environment overlay.
 Because EdgeZero only replaces TOML leaves that already exist, first add
 `enabled = true` to the `[creative_opportunities]` block in the base config
