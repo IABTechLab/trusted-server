@@ -680,11 +680,6 @@ mod module_endpoints {
     fn settings_with(extra: &str) -> Settings {
         Settings::from_toml(&format!(
             r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
             [publisher]
             domain = "test-publisher.example.com"
             cookie_domain = ".test-publisher.example.com"

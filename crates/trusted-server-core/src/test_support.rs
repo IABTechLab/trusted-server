@@ -688,11 +688,6 @@ pub mod policy_failure {
     pub fn load_error() -> Report<TrustedServerError> {
         let mut settings = Settings::from_toml(
             r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "handler_password"
-
             [publisher]
             domain = "publisher.example"
             cookie_domain = ".publisher.example"

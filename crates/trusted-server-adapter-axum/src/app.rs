@@ -917,8 +917,6 @@ mod tests {
         use super::*;
         use crate::platform::{PERMISSIONS_DIR_ENV_VAR, config_env_var};
 
-        const HANDLER_PASSWORD_VAR: &str =
-            "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_HANDLER_PASSWORD";
         const PROXY_SECRET_VAR: &str =
             "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PUBLISHER_PROXY_SECRET";
 
@@ -927,11 +925,6 @@ mod tests {
         fn startup_settings() -> Settings {
             Settings::from_toml(
                 r#"
-                [[handlers]]
-                path = "^/_ts/admin"
-                username = "admin"
-                password = "handler_password"
-
                 [publisher]
                 domain = "publisher.example"
                 cookie_domain = ".publisher.example"
@@ -966,10 +959,6 @@ mod tests {
             temp_env::with_vars(
                 [
                     (config_var.as_str(), Some(blob)),
-                    (
-                        HANDLER_PASSWORD_VAR,
-                        Some("a-handler-password-for-the-startup-tests"),
-                    ),
                     (
                         PROXY_SECRET_VAR,
                         Some("a-proxy-secret-for-the-startup-tests-32-bytes"),
