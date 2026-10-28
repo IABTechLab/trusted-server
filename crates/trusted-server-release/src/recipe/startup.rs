@@ -14,7 +14,6 @@
 
 mod accepted;
 mod lifecycle;
-#[cfg(test)]
 pub(crate) use accepted::NativeStartupAccepted;
 pub(crate) mod native;
 

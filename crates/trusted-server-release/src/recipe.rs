@@ -65,7 +65,9 @@ mod sources;
 mod startup;
 mod tools;
 
-pub(crate) use ambient::{AmbientProfile, CheckedAmbient};
+pub(crate) use ambient::{
+    AmbientClaim, AmbientProfile, CheckedAmbient, Dimension, ObservedAmbient,
+};
 #[allow(
     unused_imports,
     reason = "the qualified Apple selection has no production caller yet"
@@ -73,11 +75,15 @@ pub(crate) use ambient::{AmbientProfile, CheckedAmbient};
 pub(crate) use apple::{
     AppleDeveloperTools, AppleToolEvidence, AppleToolFacts, QualifiedAppleTools,
 };
+pub(crate) use artifact::copy_artifact;
 pub(crate) use cargo_output::successful_messages as observed_cargo_messages;
+pub(crate) use compare::FastlyEqualityChecked;
 pub(crate) use completed::RecipeCompleted;
 pub(crate) use identity::{ExactInvocationDigest, RecipeDefinitionIdentity};
 pub(crate) use paths::ExecutionPaths;
 pub(crate) use plan::CargoPlan;
+pub(crate) use runtime::FastlyRuntimeAccepted;
+pub(crate) use startup::NativeStartupAccepted;
 #[allow(
     unused_imports,
     reason = "the qualified selection has no production caller yet"

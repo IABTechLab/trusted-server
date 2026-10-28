@@ -636,6 +636,50 @@ fn checks_attempt_deadlines_during_collection_and_rehash() {
     assert!(result.is_err(), "should reject a cancelled capture attempt");
 }
 
+#[test]
+fn native_spdx_join_rejects_changed_source_features_context_and_duplicate_contributors() {
+    for mutation in [
+        "source",
+        "features",
+        "context",
+        "duplicate",
+        "missing",
+        "name",
+        "version",
+        "classification",
+        "unknown",
+    ] {
+        let mut fixture = Fixture::new("ring");
+        let mut inventory = fixture
+            .collect()
+            .expect("should collect checked native input");
+        let origins = crate::composition::origin::VerifiedPackageOrigins::fixture_native_registry(
+            &fixture.observations,
+        );
+        match mutation {
+            "source" => inventory.contributors[0].original_sha256 = "b".repeat(64),
+            "features" => inventory.contributors[0]
+                .features
+                .push("changed".to_owned()),
+            "context" => inventory.contributors[0].context = UnitContext::Host,
+            "duplicate" => inventory
+                .contributors
+                .push(inventory.contributors[0].clone()),
+            "missing" => fixture.observations.packages.clear(),
+            "name" => inventory.contributors[0].name = "other".to_owned(),
+            "version" => inventory.contributors[0].version = "99.0.0".to_owned(),
+            "classification" => inventory.contributors[0].classification = "unknown",
+            "unknown" => inventory.contributors[0].package_id = "unknown opaque ID".to_owned(),
+            _ => unreachable!("should select known mutation"),
+        }
+        assert!(
+            crate::spdx::native::validate_for_tests(&inventory, &fixture.observations, &origins)
+                .is_err(),
+            "should reject native join mutation {mutation}"
+        );
+    }
+}
+
 pub(super) fn fixture_for_projection(
     name: &str,
     context: UnitContext,
@@ -661,4 +705,94 @@ pub(super) fn fixture_for_projection(
         .collect()
         .expect("should collect owner-checked native fixture");
     (inventory, fixture.observations)
+}
+
+#[test]
+fn native_spdx_requires_each_reviewed_consuming_context_and_unambiguous_features() {
+    let mut fixture = Fixture::new("ring");
+    let mut inventory = fixture.collect().expect("should collect native inputs");
+    let origins = crate::composition::origin::VerifiedPackageOrigins::fixture_native_registry(
+        &fixture.observations,
+    );
+    inventory.contributors.clear();
+    assert!(
+        crate::spdx::native::validate_for_tests(&inventory, &fixture.observations, &origins)
+            .is_err(),
+        "should reject missing measured receipt for observed native unit"
+    );
+    let inventory = fixture.collect().expect("should collect complete inputs");
+    fixture.observations.units.push(RustUnit {
+        package_id: fixture.observations.packages[0].id.clone(),
+        target_name: "ring".to_owned(),
+        target_kind: vec!["lib".to_owned()],
+        crate_types: vec!["lib".to_owned()],
+        context: UnitContext::Target,
+        features: vec!["alloc".to_owned()],
+        profile: json!({"test":false}),
+        filenames: vec![],
+        executable: None,
+    });
+    assert!(
+        crate::spdx::native::validate_for_tests(&inventory, &fixture.observations, &origins)
+            .is_err(),
+        "should reject ambiguous effective features within one native context"
+    );
+}
+
+#[test]
+fn native_spdx_rejects_aliases_of_the_same_verified_original_context() {
+    let mut fixture = Fixture::new("ring");
+    let mut inventory = fixture.collect().expect("should collect native inputs");
+    let mut alias = inventory.contributors[0].clone();
+    alias.package_id = "relocated opaque alias".to_owned();
+    fixture.observations.packages.push(RustPackage {
+        id: alias.package_id.clone(),
+        name: "ring".to_owned(),
+        version: "0.17.14".to_owned(),
+        source: Some("registry+https://example.com/index".to_owned()),
+        manifest_path: fixture.observations.packages[0].manifest_path.clone(),
+        license: None,
+    });
+    fixture.observations.units.push(RustUnit {
+        package_id: alias.package_id.clone(),
+        target_name: "ring".to_owned(),
+        target_kind: vec!["lib".to_owned()],
+        crate_types: vec!["lib".to_owned()],
+        context: UnitContext::Target,
+        features: alias.features.clone(),
+        profile: json!({"test":false}),
+        filenames: vec![],
+        executable: None,
+    });
+    inventory.contributors.push(alias);
+    let origins = crate::composition::origin::VerifiedPackageOrigins::fixture_native_registry(
+        &fixture.observations,
+    );
+    assert!(
+        crate::spdx::native::validate_for_tests(&inventory, &fixture.observations, &origins)
+            .is_err(),
+        "should reject ambiguous aliases of one stable original/context identity"
+    );
+}
+
+#[test]
+fn native_spdx_rejects_missing_or_conflicting_verified_package_facts() {
+    for mutation in ["missing", "name", "version"] {
+        let mut fixture = Fixture::new("ring");
+        let inventory = fixture.collect().expect("should collect native inputs");
+        match mutation {
+            "missing" => fixture.observations.packages.clear(),
+            "name" => fixture.observations.packages[0].name = "other".to_owned(),
+            "version" => fixture.observations.packages[0].version = "99.0.0".to_owned(),
+            _ => unreachable!("should select known mutation"),
+        }
+        let origins = crate::composition::origin::VerifiedPackageOrigins::fixture_native_registry(
+            &fixture.observations,
+        );
+        let (_, observed) = fixture_for_projection("ring", UnitContext::Target);
+        assert!(
+            crate::spdx::native::validate_for_tests(&inventory, &observed, &origins).is_err(),
+            "should reject verified facts with {mutation}"
+        );
+    }
 }

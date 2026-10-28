@@ -15,6 +15,25 @@ use crate::inspect::tests::builders::{ElfSpec, MachoSpec, elf, macho};
 const FINGERPRINT: [u8; 32] = [7; 32];
 
 #[test]
+fn a_completed_candidate_without_complete_composition_cannot_generate_spdx() {
+    let bytes = wasm_with(&[(".debug_info", b"i"), (".debug_line", b"l")]);
+    let mut build = built("trusted-server-fastly.wasm", Role::Canonical, &bytes);
+    let stdout = build.stdout(|_| {});
+    let completed = build
+        .finish(stdout)
+        .expect("should complete the accepted candidate artifact");
+    build
+        .fixture
+        .completed
+        .rehash_for_handoff()
+        .expect("should retain an unchanged owned JS handoff");
+    assert!(
+        crate::spdx::generate_from_completed(&completed, &build.fixture.completed).is_err(),
+        "should reject SPDX generation without complete owning composition inputs"
+    );
+}
+
+#[test]
 fn pure_completion_fixtures_cannot_export_measured_socket_receipts() {
     let bytes = wasm_with(&[(".debug_info", b"i"), (".debug_line", b"l")]);
     let mut build = built("trusted-server-fastly.wasm", Role::Canonical, &bytes);
@@ -47,6 +66,10 @@ fn pure_completion_fixtures_cannot_export_candidate_transfers() {
     assert!(
         completed.javascript_contributions().is_err(),
         "should refuse original JS evidence absent from the owning completion"
+    );
+    assert!(
+        crate::collection::producer::CandidateBuildExport::from_completed(&completed).is_err(),
+        "should not manufacture a measured candidate transfer from a pure fixture"
     );
 }
 

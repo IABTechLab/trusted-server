@@ -22,6 +22,7 @@ use super::super::remap::scan_remapped_bytes;
 use super::super::startup::{LINUX_CLI_ASSET, NativeStartupAccepted, StartupCopy};
 use super::candidate::js_inventory_sha256;
 use super::candidate::{CargoFixture, cargo_docker_settings, ci_build_provenance};
+use super::candidate_entry::{EntryExport, check_real_entry};
 use super::cli_candidate::{
     CliCandidateFacts, CliFixture, NativeReproduction, OPERATOR_SENTINELS, ReproductionOutcome,
     check_build_budget, cli_candidate_measurement, finish_cleanup, native_reproduction_from_env,
@@ -32,8 +33,10 @@ use super::real_fixture::{
     cargo_fixture, environment_with_operator_values, path_text, try_ordinary_ci_ambient,
     try_prepare_vendor,
 };
+use super::spdx_candidate::{candidate_spdx_measurement, check_real_candidate};
 use super::*;
 use crate::boundary::{Boundary, BoundaryRoots, ConfinedCommand, ImageSelection, ProbeProgram};
+use crate::distribution::CandidateAcceptance;
 use crate::documents::{parse_json, read_bounded};
 use crate::inspect::{ElfPolicy, inspect_elf};
 use crate::preflight::AuditedEnvironment;
@@ -240,6 +243,8 @@ fn start_everywhere(completed: &RecipeCompleted, cli: &CliFixture) -> NativeStar
     observed
 }
 
+// The reviewed esbuild lifecycle hook remains at 0.27.3 while the current
+// JS lock selects 0.28.2; this source port does not qualify the new hook.
 #[test]
 #[ignore = "requires explicit JS, Cargo and CLI ordinary CI fixtures and Linux Docker; run separately in producer CI"]
 fn linux_cli_candidate_builds_inspects_and_starts_cleanly() {
@@ -299,10 +304,15 @@ fn linux_cli_candidate_builds_inspects_and_starts_cleanly() {
             .expect("should encode the canonical measurement"),
     )
     .expect("should retain accepted canonical evidence before optional reproduction");
+    let canonical_candidate = check_real_candidate(&canonical.completed, &js.source);
     let reproduction_build = match native_reproduction {
         NativeReproduction::Measure => Some(build_cli(&inputs, Role::Reproduction)),
         NativeReproduction::Defer => None,
     };
+    let reproduction_candidate = reproduction_build
+        .as_ref()
+        .and_then(|build| build.as_ref().ok())
+        .map(|reproduction| check_real_candidate(&reproduction.completed, &js.source));
 
     let paired = reproduction_build.as_ref().map(|build| {
         reproduction_result(
@@ -331,11 +341,33 @@ fn linux_cli_candidate_builds_inspects_and_starts_cleanly() {
             .expect("should retain actual Linux startup runs"),
         reproduction,
     });
+    measurement["candidate_spdx"] =
+        candidate_spdx_measurement(&canonical_candidate, reproduction_candidate.as_ref());
     measurement["js_inventory_sha256"] = serde_json::json!(inventory_sha256);
     measurement["ci_build_provenance"] = provenance;
     retain_cli_measurement(&cli_root, &measurement);
     if let Some((_, Some(error))) = &paired {
         panic!("should pair builds over identical inputs: {error:?}");
+    }
+    let upload_directory = cli_root.join("candidate-entry");
+    let transfer_file = cli_root.join("candidate-entry-transfer.json");
+    measurement["candidate_entry"] = check_real_entry(
+        &canonical.completed,
+        &js.source,
+        &CandidateAcceptance::Native(&startup),
+        &EntryExport {
+            upload_directory: &upload_directory,
+            transfer_file: &transfer_file,
+        },
+    );
+    retain_cli_measurement(&cli_root, &measurement);
+    super::candidate::check_native_export_after_cleanup(
+        canonical,
+        |build| &build.completed,
+        &startup,
+    );
+    if let Some(Ok(reproduction)) = reproduction_build {
+        super::candidate::check_export_after_cleanup(reproduction, |build| &build.completed);
     }
 }
 
