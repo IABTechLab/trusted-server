@@ -403,6 +403,14 @@ jobs:
       - name: Retain bounded nonpublishable comparison diagnostics
         if: failure()
         run: |
+          set -euo pipefail
+          diagnostic="$RUNNER_TEMP/ordinary-diagnostics/ordinary-comparison-diagnostic.json"
+          if ! test -f "$diagnostic"; then
+            if ! node scripts/release/phase1.mjs ordinary-diagnostic "$RUNNER_TEMP/ordinary-diagnostics"; then
+              echo 'outcome=failed: ordinary diagnostic writer failed; job remains failed' >&2
+              exit 1
+            fi
+          fi
           if test -f "$RUNNER_TEMP/ordinary-comparison-failure.txt"; then
             head -c 16384 "$RUNNER_TEMP/ordinary-comparison-failure.txt" > "$RUNNER_TEMP/ordinary-comparison-diagnostic.txt"
           else
@@ -413,7 +421,9 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: fastly-comparison-failure
-          path: ${{ runner.temp }}/ordinary-comparison-diagnostic.txt
+          path: |
+            ${{ runner.temp }}/ordinary-comparison-diagnostic.txt
+            ${{ runner.temp }}/ordinary-diagnostics/ordinary-comparison-diagnostic.json
           if-no-files-found: error
           retention-days: 7
 

@@ -1,6 +1,10 @@
 # Binary attestations phases 2–4
 
-**Status:** Phase 2 port and approved ordinary Fastly integration are complete in draft #1449. Its current baseline `8a797dbcb0467b867dfbcc571597110b9254d672` has green CI and is tree-equivalent to `08e1c33b8`; later application inputs remain unrehearsed, with `.13` exclusively at `770a425df4b28caaaef68dfd930bceabd9928046`. Phase 3 currently contains only [Gate 2 complete-SPDX](binary-attestations-phase3-complete-spdx.md) and [Gate 3 seven-artifact index](binary-attestations-phase3-seven-artifact-index.md) approval proposals. Phase 3 implementation, qualification and remaining design gates stay closed.
+**Phase 2 spec:** [ordinary Fastly release equality](../specs/2026-10-28-1235-binary-attestations-phase2-design.md), with its own source-checked review rounds. Tracking issue: #1235.
+
+**Status:** Phase 2 port and approved ordinary Fastly integration are implemented in draft #1449. Current baseline `5fa3843364f247fdc261c438ab9257323637a42c` adds structured failure diagnostics and its own spec/reviews; exact-head CI and a fresh rehearsal are pending. Historical `.13` remains exclusively at `770a425df4b28caaaef68dfd930bceabd9928046`. Phase 3 contains only [Gate 2 complete-SPDX](binary-attestations-phase3-complete-spdx.md) and [Gate 3 seven-artifact index](binary-attestations-phase3-seven-artifact-index.md) design proposals. Phase 3 implementation, qualification and remaining design gates stay closed.
+
+**Tracking issue:** #1235. The earlier separate tracking-issue draft is retained as planning history, not an additional issue prerequisite.
 
 **Goal:** Land the remaining reviewed source as three stacked, independently checked draft PRs while preserving the Phase 1 release contract.
 
@@ -8,7 +12,7 @@
 
 Frozen source: `122b78664b1235c717e9208fd200f9a9b0c335df` from #1262; source-map base: `f9281917a7260b723f5f22175911c6d2147ef650`. A fresh read of #1262 on 2026-10-26 confirmed that its published head is still the frozen source. Introducing and shaping SHAs remain recorded per group in [the slice map](binary-attestations-slice-map.json); they are provenance references, not safe whole-commit cherry-pick boundaries.
 
-Phase 1 review log was added at `c9a6117dd452d8a7f9786a14a000fc48d09315ec`, followed by the web merge of main `054c7b777` at `4940928e800fed00e4bddd8f3727fb52dcb2b296`. Its tree equals the already checked synthetic merge `52978c5b`; `.15` remains evidence only for `68eef902a8bddd9024676cc3806fa5377ed67fee`. Phase 2 carries the updated ancestry with no additional file changes. PRs retain ordinary branch-based stacking and merge-only history; the native stack wrapper was removed without changing PR bases or source history.
+Current Phase 1 base: `4940928e800fed00e4bddd8f3727fb52dcb2b296`, containing later application inputs. Rehearsal `.15` remains attributed only to `68eef902a8bddd9024676cc3806fa5377ed67fee`. Phase 2 carries the updated base through tree-identical merge `8a797dbcb0467b867dfbcc571597110b9254d672`. Phase 2 `.13` stays attributed to `770a425df4b28caaaef68dfd930bceabd9928046`; the subsequent main merge is a no-release-machinery merge, with changed application inputs and no fresh Phase 2 rehearsal.
 
 | Draft PR                                                           | Branch                               | Base                                 | Intended capability                                      |
 | ------------------------------------------------------------------ | ------------------------------------ | ------------------------------------ | -------------------------------------------------------- |
@@ -16,7 +20,7 @@ Phase 1 review log was added at `c9a6117dd452d8a7f9786a14a000fc48d09315ec`, foll
 | Binary attestations: phase 3 – complete evidence and release index | `feature/binary-attestations-phase3` | Phase 2 branch                       | Complete SPDX, evidence companions and a signed index    |
 | Binary attestations: phase 4 – ts release verify                   | `feature/binary-attestations-phase4` | Phase 3 branch                       | Public online/offline verification and publication owner |
 
-Finish and rehearse each phase before the next. Keep PRs draft, without reviewers. When a lower phase merges, merge main into the stack and retarget the next base; never rebase or force-push. The intended capabilities above are acceptance criteria, not claims that the frozen source already implements their missing integrations.
+Finish and rehearse each implementation phase before the next. Design-only proposals may proceed while lower-phase CI and rehearsal finish; they do not authorize implementation. Keep PRs draft, without reviewers. When a lower phase merges, merge main into the stack and retarget the next base; never rebase or force-push. The intended capabilities above are acceptance criteria, not claims that the frozen source already implements their missing integrations.
 
 ## Assignment corrections
 
@@ -96,11 +100,13 @@ Gate 1's [ordinary-release design](binary-attestations-phase2-fastly-integration
 - [x] Re-read source/map, independently investigate capture dependencies and carried build facts.
 - [x] Assemble Phase 2 and Phase 3 scratch trees; run host check and strict clippy; correct prerequisite ownership.
 - [x] Commit this assignment and [tracking-issue draft](binary-attestations-phases-2-4-tracking-issue.md) on Phase 2 (`26d69ce95`).
-- [ ] Port source by module, preserving Phase 1 hunks and recording each current-main adaptation; update per-path landing metadata in the slice map.
-- [ ] Adapt closed producer tables to the seven Phase 1 assets and current pins without opening qualifications or changing the index schema.
-- [ ] Run explicitly selected pure tests with a nonzero-selection guard; compile platform-specific branches in CI; keep process/ignored tests CI-only.
+- [x] Port source by module, preserving Phase 1 hunks and recording each current-main adaptation; update per-path landing metadata in the slice map.
+- [x] Adapt closed producer tables to the seven Phase 1 assets and current pins without opening qualifications or changing the index schema.
+- [x] Run explicitly selected pure tests with a nonzero-selection guard; compile platform-specific branches in CI; keep process/ignored tests CI-only.
 - [ ] Obtain independent and security reviews; pass touched CI gates before pushing and rehearse only an exact green reviewed head.
 - [x] Obtain separate Fastly integration design approval and independently review the [concrete implementation plan](binary-attestations-phase2-fastly-integration-implementation.md) before implementing its missing gate/writer. Do not claim the intended Phase 2 capability is shipped by porting closed code.
+
+The following progress notes and per-path staged labels are historical snapshots of successive chunks. Current completion is recorded by the checkpoints above and the approved integration plan; an old snapshot is not an outstanding port task.
 
 ### Initial Phase 2 port
 

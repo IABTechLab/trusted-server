@@ -20,6 +20,20 @@ use crate::error::ReleaseError;
 
 const COMPANION: &str = "trusted-server-fastly.wasm.rebuild-check.json";
 
+/// Retains CI-only diagnostic JSON in a distinct private directory.
+///
+/// # Errors
+///
+/// Rejects unsafe or reused paths and any failed atomic write or readback.
+pub(super) fn diagnostic(directory: &Path, value: &Value) -> Result<PathBuf, Report<ReleaseError>> {
+    persist(
+        directory,
+        "ordinary-comparison-diagnostic.json",
+        value,
+        Role::Metadata,
+    )
+}
+
 /// Retains the exact target-scoped Cargo argument pair before compilation.
 ///
 /// # Errors

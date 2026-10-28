@@ -2,11 +2,13 @@
 
 **Status:** Design proposal awaiting approval. No implementation, production selection or qualification is authorized by this document.
 
-**Baseline:** Phase 2 `8a797dbcb0467b867dfbcc571597110b9254d672`, tree-equivalent to `08e1c33b8` after application integration `7d551777daeaee09e24bce9bf4f96edac6e5e0df`. Rehearsal `.13` remains evidence only for `770a425df4b28caaaef68dfd930bceabd9928046`.
+**Historical reviewed baseline:** Phase 2 `8a797dbcb0467b867dfbcc571597110b9254d672`, tree-equivalent to `08e1c33b8` after application integration `7d551777daeaee09e24bce9bf4f96edac6e5e0df`. Rehearsal `.13` remains evidence only for `770a425df4b28caaaef68dfd930bceabd9928046`.
 
-**Verification baseline:** [Exact Phase 2 head CI passed](https://github.com/IABTechLab/trusted-server/actions/runs/40654745582); signing/publication and manual negative canaries were skipped as configured.
+**Verification baseline:** [Historical Phase 2 `8a797dbcb` CI passed](https://github.com/IABTechLab/trusted-server/actions/runs/40654745582); signing/publication and manual negative canaries were skipped as configured.
 
-**Tracking:** Tracking issue number pending.
+**Current integration baseline:** Phase 2 `5fa3843364f247fdc261c438ab9257323637a42c`; [exact-head CI](https://github.com/IABTechLab/trusted-server/actions/runs/40664514307) and readiness work are tracked in #1449. Historical `.13` does not cover later application inputs; the newly authorized rehearsal is not yet recorded.
+
+**Tracking:** Part of #1235.
 
 ## Decision requested
 

@@ -1,12 +1,13 @@
 //! Explicit ordinary command assembly, without authenticated or qualified authority.
 
 use std::ffi::OsString;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use error_stack::Report;
 use serde_json::{Value, json};
 
-use super::{inputs, normalization, output, require, root, run, transfer};
+use super::{diagnostic, inputs, normalization, output, require, root, run, transfer};
 use crate::documents::{self, Role};
 use crate::error::ReleaseError;
 
@@ -44,11 +45,38 @@ fn directory(path: &Path) -> Result<(), Report<ReleaseError>> {
 }
 
 fn bind(input: &Path) -> Result<run::Bindings, Report<ReleaseError>> {
-    directory(input)?;
-    let context = documents::read_bounded(&input.join("context.json"), Role::Metadata)?;
-    let jobs = documents::read_bounded(&input.join("jobs.json"), Role::Metadata)?;
-    let artifacts = documents::read_bounded(&input.join("artifacts.json"), Role::Metadata)?;
+    transfer_root(input)?;
+    let context = transfer_read(&input.join("context.json"), Role::Metadata)?;
+    let jobs = transfer_read(&input.join("jobs.json"), Role::Metadata)?;
+    let artifacts = transfer_read(&input.join("artifacts.json"), Role::Metadata)?;
     run::bind(&context.bytes, &jobs.bytes, &artifacts.bytes)
+        .map_err(|report| diagnostic::tag(report, diagnostic::Code::IdentityMismatch))
+}
+
+fn available(path: &Path) -> Result<(), Report<ReleaseError>> {
+    std::fs::symlink_metadata(path)
+        .map(|_| ())
+        .map_err(|error| {
+            let code = if error.kind() == ErrorKind::NotFound {
+                diagnostic::Code::TransferUnavailable
+            } else {
+                diagnostic::Code::TransferRejected
+            };
+            Report::new(ReleaseError::Document)
+                .attach(error)
+                .attach(diagnostic::Failure::new(code))
+        })
+}
+
+fn transfer_root(path: &Path) -> Result<(), Report<ReleaseError>> {
+    available(path)?;
+    directory(path).map_err(|report| diagnostic::tag(report, diagnostic::Code::TransferRejected))
+}
+
+fn transfer_read(path: &Path, role: Role) -> Result<documents::RawBytes, Report<ReleaseError>> {
+    available(path)?;
+    documents::read_bounded(path, role)
+        .map_err(|report| diagnostic::tag(report, diagnostic::Code::TransferRejected))
 }
 
 /// Plans exact-ID downloads only after joining direct outputs and service records.
@@ -87,8 +115,35 @@ pub(crate) fn compare_transfers(
     source: &Path,
     output: &Path,
 ) -> Result<PathBuf, Report<ReleaseError>> {
+    let mut artifact_ids = None;
+    let result = compare_retained(input, archives, source, output, &mut artifact_ids);
+    result.map_err(|report| {
+        let report = diagnostic::tag(report, diagnostic::Code::TransferUnavailable);
+        if diagnostic::retain(&report, output, artifact_ids).is_err() {
+            return report.attach(
+                "outcome=failed: ordinary diagnostic writer failed; no successful comparison",
+            );
+        }
+        report
+    })
+}
+
+fn compare_retained(
+    input: &Path,
+    archives: &Path,
+    source: &Path,
+    output: &Path,
+    artifact_ids: &mut Option<[u64; 4]>,
+) -> Result<PathBuf, Report<ReleaseError>> {
     let bindings = bind(input)?;
-    directory(archives)?;
+    let [canonical, reproduction] = bindings.builds();
+    *artifact_ids = Some([
+        canonical.artifact.id,
+        canonical.observation.id,
+        reproduction.artifact.id,
+        reproduction.observation.id,
+    ]);
+    transfer_root(archives)?;
     let retained = ARCHIVES
         .into_iter()
         .enumerate()
@@ -98,7 +153,7 @@ pub(crate) fn compare_transfers(
             } else {
                 Role::ObservationArchive
             };
-            documents::read_bounded(&archives.join(name), role)
+            transfer_read(&archives.join(name), role)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let checked = transfer::check(
@@ -109,17 +164,27 @@ pub(crate) fn compare_transfers(
             &retained[2].bytes,
             &retained[3].bytes,
         ]),
-    )?;
+    )
+    .map_err(|report| diagnostic::tag(report, diagnostic::Code::InputsRejected))?;
     let receipt = checked.receipt();
-    let identity = inputs::source_identity(source, &checked_source(&receipt)?)?;
+    let source_commit = checked_source(&receipt).map_err(|report| {
+        diagnostic::tag_equal(report, diagnostic::Code::InputsRejected, &checked)
+    })?;
+    let identity = inputs::source_identity(source, &source_commit).map_err(|report| {
+        diagnostic::tag_equal(report, diagnostic::Code::InputsRejected, &checked)
+    })?;
     require(
         receipt["recipe_sha256"] == identity.recipe_sha256
             && receipt["cargo_lock_sha256"] == identity.cargo_lock_sha256
             && receipt["npm_lock_sha256"] == identity.npm_lock_sha256,
         "ordinary observations disagree with the independent comparison source",
-    )?;
-    inputs::verify_versions(source, &receipt["tools"])?;
+    )
+    .map_err(|report| diagnostic::tag_equal(report, diagnostic::Code::InputsRejected, &checked))?;
+    inputs::verify_versions(source, &receipt["tools"]).map_err(|report| {
+        diagnostic::tag_equal(report, diagnostic::Code::InputsRejected, &checked)
+    })?;
     output::companion(&checked, output)
+        .map_err(|report| diagnostic::tag_equal(report, diagnostic::Code::OutputRejected, &checked))
 }
 
 fn checked_source(receipt: &Value) -> Result<String, Report<ReleaseError>> {

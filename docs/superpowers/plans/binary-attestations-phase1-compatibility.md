@@ -383,3 +383,11 @@ After main advanced, GitHub's stack CI evaluated Phase 2 against the newer trunk
 Phase 1 stays at docs head `20152315c01dd5fddcfc84b969f8e9993b0bfc69`, with `.15` still attributed to `68eef902a8bddd9024676cc3806fa5377ed67fee`. The additional Phase 2 integration changes application inputs, with no release-machinery changes and no new Phase 2 rehearsal. `.13` remains exclusively at `770a425df4b28caaaef68dfd930bceabd9928046`.
 
 This exact-SHA record is docs-only after `7d551777daeaee09e24bce9bf4f96edac6e5e0df`; the later application inputs remain unrehearsed.
+
+## Phase 2 final review follow-up (2026-10-28)
+
+The parent tracking issue is #1235; the earlier separate-issue draft is historical. Phase 2 now has its own [spec and review log](../specs/2026-10-28-1235-binary-attestations-phase2-design.md), distinct from the Phase 1 review rounds. Current readiness work does not expand historical `.13` attribution. A fresh exact-head rehearsal is authorized after final review and green CI.
+
+The structured failure diagnostic completion preserves all release contracts: canonical JSON is capped at 4,096 bytes, classified at actual typed checks and retained only as `ordinary-diagnostics/ordinary-comparison-diagnostic.json` in the failed comparison CI artifact, alongside bounded stderr. Unobserved facts are explicitly `unavailable`. A failure writes no matched companion; a diagnostic-writer error remains a failed job. These diagnostics are never signed or published. The existing companion filename, profile and exact-byte comparison are unchanged.
+
+The final risk-based security review also identified a dormant limitation in macOS survivor enumeration: a saturated PID buffer can be treated as a complete snapshot, and failed per-process identity queries become nonmatches. This is not part of the ordinary Fastly release path; it must be addressed before any later macOS containment qualification opens. Darwin startup currently provides scrubbed/supervised host execution, not filesystem/network confinement. Qualified selectors remain uninhabited; this batch does not enable or modify that dormant path.

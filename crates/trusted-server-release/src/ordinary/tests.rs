@@ -334,3 +334,57 @@ fn invalid_observation_diagnostics_do_not_echo_arbitrary_field_names() {
         "should keep diagnostics bounded without echoing untrusted field names"
     );
 }
+
+#[test]
+fn typed_failure_stages_distinguish_identity_size_digest_and_complete_bytes() {
+    for (stage, code) in [
+        ("identity", "identity_mismatch"),
+        ("size", "observed_size_mismatch"),
+        ("digest", "observed_digest_mismatch"),
+        ("bytes", "final_bytes_mismatch"),
+    ] {
+        let mut right = reproduction();
+        let different = [WASM, b"\0\x02\x01x"].concat();
+        let bytes = if stage == "bytes" {
+            different.as_slice()
+        } else {
+            WASM
+        };
+        match stage {
+            "identity" => right["source_commit"] = json!("b".repeat(40)),
+            "size" => right["artifact"]["size"] = json!(WASM.len() + 1),
+            "digest" => right["artifact"]["sha256"] = json!("b".repeat(64)),
+            "bytes" => {
+                right["artifact"] =
+                    json!({"size":bytes.len(),"sha256":hex::encode(Sha256::digest(bytes))})
+            }
+            _ => unreachable!("should use a fixed test case"),
+        }
+        let error = compare(parse(&fixture()), parse(&right), WASM, bytes)
+            .err()
+            .expect("should reject the selected actual failure boundary");
+        let value = error
+            .downcast_ref::<super::diagnostic::Failure>()
+            .expect("should retain typed failure facts rather than parsing stderr")
+            .value();
+        assert_eq!(
+            value["stage"], stage,
+            "should identify actual rejecting stage"
+        );
+        assert_eq!(
+            value["code"], code,
+            "should retain fixed code for the stage"
+        );
+        if stage == "bytes" {
+            assert_eq!(
+                value["outcome"], "mismatched",
+                "should recognize nondeterminism"
+            );
+            assert_eq!(
+                value["facts"]["first_difference_offset"],
+                WASM.len(),
+                "should retain actual first difference"
+            );
+        }
+    }
+}
