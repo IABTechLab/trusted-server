@@ -1,7 +1,7 @@
 # Server-side identity providers
 
 Status: Draft, revision 15. Revised after review rounds 1 to 14. Revision 14
-made `ts-eids-s` a client-only cookie, at the user's request. Revision 15
+made `ts-eids-s` a client-only cookie, at the spec author's request. Revision 15
 removes the `ts-eids-r` removal cookies, runs providers only on writer
 navigations, makes capture revoke-only and moves KV to schema version 2,
 accepting breaking changes. Section 16 lists the decisions.
@@ -4728,7 +4728,7 @@ a KV migration to version 1, which this spec does not provide.
 
 ## 16. Decisions log
 
-Decisions made while writing this spec, with the user:
+Decisions made while writing this spec, with the spec author (dhruv8sh):
 
 | Decision                         | Choice                                                                                                                                                                                                                                   |
 | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -4751,7 +4751,7 @@ Decisions made while writing this spec, with the user:
 | Deletion                         | A tombstone with the 24-hour `TOMBSTONE_TTL` replaces the hard delete. No extra writes.                                                                                                                                                  |
 | GPP opt-outs                     | Sharing and targeted-advertising opt-outs are decoded, and the strict policy blocks them.                                                                                                                                                |
 | `x-ts-eids`                      | Kept as a full troubleshooting header. Its exposure of server-only IDs to page scripts is accepted.                                                                                                                                      |
-| Consent withdrawal               | Synchronous tombstone on any request, a G4 exception with the two removal writes. Revision 15 adds one after-send attempt when it fails. Proposed in review; not yet confirmed.                                                          |
+| Consent withdrawal               | Synchronous tombstone on any request, a G4 exception with the two removal writes. Revision 15 adds one after-send attempt when it fails. Confirmed by the spec author after the round 14 review.                                         |
 | Equal-second ties                | A removal or opt-out wins a tie with an acquisition or clear. An ID re-acquired in that second is resolved again later. Confirmed after round 10.                                                                                        |
 | Complete provider EIDs           | A provider can return several EID entries per source, several UIDs each, with UID-level and EID-level fields. The set is stored and sent whole. Added in revision 13.                                                                    |
 | Entry-set writer                 | One writer per source. A result replaces the source's set whole, and one `rv` covers it, so ownership, revisions and removals stay per source.                                                                                           |
@@ -4760,7 +4760,7 @@ Decisions made while writing this spec, with the user:
 | Provenance default               | Applied only to an entry that sets no EID-level field, so vendor and config provenance never mix in one entry. Added in round 13.                                                                                                        |
 | Mirror lifetime                  | `ts-eids-s` lives at most a day and never past the earliest `exp` it holds.                                                                                                                                                              |
 
-Revision 15 applies these decisions, made by the user after the round 14
+Revision 15 applies these decisions, made by the spec author (dhruv8sh) after the round 14
 review, which allowed breaking changes:
 
 | Decision                  | Choice                                                                                                                                                                                                                                                                             |
