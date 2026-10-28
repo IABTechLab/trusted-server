@@ -26,6 +26,8 @@
 //!     req: &req,
 //!     config: &settings.consent,
 //!     geo: geo.as_ref(),
+//!     default_jurisdiction,
+//!     permission_maps: policy.maps(),
 //! });
 //! ```
 
@@ -84,6 +86,9 @@ pub struct ConsentPipelineInput<'a> {
     /// Pass [`Jurisdiction::Unknown`] where no declaration applies, for example
     /// after a failed geo lookup.
     pub default_jurisdiction: jurisdiction::Jurisdiction,
+    /// The rules of the policy the request's domain loaded, which place a
+    /// located request in its jurisdiction.
+    pub permission_maps: &'a crate::permissions::PermissionMaps,
 }
 
 /// Extracts, decodes, and normalizes consent signals from a request.
@@ -156,7 +161,7 @@ pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext
 /// the same way.
 fn request_jurisdiction(input: &ConsentPipelineInput<'_>) -> jurisdiction::Jurisdiction {
     match input.geo {
-        Some(_) => jurisdiction::detect_jurisdiction(input.geo),
+        Some(_) => jurisdiction::detect_jurisdiction(input.permission_maps, input.geo),
         None => input.default_jurisdiction.clone(),
     }
 }
@@ -809,6 +814,7 @@ mod tests {
             config: &config,
             geo: None,
             default_jurisdiction: Jurisdiction::Unknown,
+            permission_maps: crate::permissions::PermissionMaps::sample(),
         });
 
         assert_eq!(
@@ -833,6 +839,7 @@ mod tests {
             config: &config,
             geo: None,
             default_jurisdiction: Jurisdiction::Unknown,
+            permission_maps: crate::permissions::PermissionMaps::sample(),
         });
 
         assert!(
@@ -862,6 +869,7 @@ mod tests {
             config: &config,
             geo: None,
             default_jurisdiction: Jurisdiction::Unknown,
+            permission_maps: crate::permissions::PermissionMaps::sample(),
         });
 
         assert!(
@@ -975,7 +983,7 @@ mod tests {
         // US maps to us-opt-out, where necessary.operations.storage and advertising_marketing.first_party.targeted
         // are granted with no signal, so bidstream EIDs are transmitted.
         let permissions =
-            crate::permissions::PermissionMaps::standard().resolve(Some("US"), |_| false);
+            crate::permissions::PermissionMaps::sample().resolve(Some("US"), |_| false);
         let eids = Some(vec!["eid-1".to_owned()]);
         assert!(
             gate_eids_by_permissions(eids, &permissions).is_some(),
@@ -988,7 +996,7 @@ mod tests {
         // FR maps to gdpr-eu, where every purpose is requires_signal, so with no
         // signal neither required permission is set and EIDs are stripped.
         let permissions =
-            crate::permissions::PermissionMaps::standard().resolve(Some("FR"), |_| false);
+            crate::permissions::PermissionMaps::sample().resolve(Some("FR"), |_| false);
         let eids = Some(vec!["eid-1".to_owned()]);
         assert!(
             gate_eids_by_permissions(eids, &permissions).is_none(),
@@ -999,7 +1007,7 @@ mod tests {
     #[test]
     fn gate_eids_returns_none_for_empty_input() {
         let permissions =
-            crate::permissions::PermissionMaps::standard().resolve(Some("US"), |_| false);
+            crate::permissions::PermissionMaps::sample().resolve(Some("US"), |_| false);
         assert!(
             gate_eids_by_permissions::<String>(None, &permissions).is_none(),
             "no EIDs should resolve to None"

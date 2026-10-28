@@ -46,6 +46,22 @@ const PATTERN_FORM: &str = "A pattern is keys joined by `.`, with `[]` for every
                             list or `[N]` for one, such as \
                             `proxy.asset_routes[0].origin_url`";
 
+/// The settings table that names the domain's permission policy.
+const PERMISSIONS_TABLE: &str = "permissions";
+
+/// The policy file's SHA-256, which the push writes into every blob.
+const POLICY_SHA256_KEY: &str = "sha256";
+
+/// The policy file itself, which the push writes into the blob on the
+/// adapters that read it from there, and which the runtime loader takes out of
+/// the settings when it loads the policy.
+const POLICY_TEXT_KEY: &str = "text";
+
+/// What the pattern checks see in place of a SHA-256 the push has not written
+/// yet, so a pattern naming it is judged as it is once the push has run.
+const SHA256_BEFORE_THE_PUSH: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
 /// The `[inspect]` section, which says what the configuration page shows.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -216,6 +232,21 @@ impl PathPattern {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.text
+    }
+
+    /// Whether the pattern names the policy file in `permissions.text`, or
+    /// anything beneath it.
+    fn names_policy_text(&self) -> bool {
+        matches!(
+            self.steps.as_slice(),
+            [PatternStep::Key(table), PatternStep::Key(key), ..]
+                if table == PERMISSIONS_TABLE && key == POLICY_TEXT_KEY
+        )
+    }
+
+    /// Whether the pattern is `permissions.text` itself.
+    fn is_policy_text(&self) -> bool {
+        self.names_policy_text() && self.steps.len() == 2
     }
 
     /// Whether the concrete path `path` is one the pattern names.
@@ -552,8 +583,13 @@ fn select(marked: &Value, pattern: &PathPattern) -> Vec<Vec<PathStep>> {
 /// Refuses an `[inspect]` pattern that would not be honored as written,
 /// being one that matches nothing, a `show` naming a secret, one another
 /// pattern of its list already covers, a `show` a `hide` covers, one that
-/// changes nothing the view shows, and any pattern beside `config = false`.
-/// Costs nothing when the section has no patterns.
+/// changes nothing the view shows, one under `permissions.text`, which the
+/// view never shows, and any pattern beside `config = false`. Costs nothing
+/// when the section has no patterns.
+///
+/// The settings are checked as the view sees a domain the push wrote, with
+/// `permissions.sha256` present and `permissions.text` gone, so a pattern is
+/// judged alike before the push, by the push and when the settings load.
 ///
 /// # Errors
 ///
@@ -570,7 +606,21 @@ pub(crate) fn validate_patterns(settings: &Settings) -> Result<(), Report<Truste
                 .to_owned(),
         ));
     }
-    let marked = marked_settings(settings)?;
+    for (list, patterns) in [(List::Show, &inspect.show), (List::Hide, &inspect.hide)] {
+        if let Some(pattern) = patterns.iter().find(|pattern| pattern.names_policy_text()) {
+            let under = if pattern.is_policy_text() {
+                ""
+            } else {
+                ", which is under `permissions.text`"
+            };
+            return Err(configuration(format!(
+                "[inspect] {list} names `{pattern}`{under}, the policy file the push writes. The \
+                 configuration page never shows the file, so the pattern changes nothing"
+            )));
+        }
+    }
+    let mut marked = marked_settings(settings)?;
+    as_the_view_sees_a_pushed_domain(&mut marked);
     let rules = Rules::new(settings);
     let full = rules.render(&marked);
     for (list, patterns) in [(List::Show, &inspect.show), (List::Hide, &inspect.hide)] {
@@ -623,6 +673,23 @@ pub(crate) fn validate_patterns(settings: &Settings) -> Result<(), Report<Truste
         }
     }
     Ok(())
+}
+
+/// `marked` with `permissions.sha256` present and `permissions.text` gone,
+/// as the view shows a domain the push wrote and the runtime loader loaded.
+fn as_the_view_sees_a_pushed_domain(marked: &mut Value) {
+    let Value::Object(settings) = marked else {
+        return;
+    };
+    let permissions = settings
+        .entry(PERMISSIONS_TABLE)
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Value::Object(permissions) = permissions {
+        permissions.remove(POLICY_TEXT_KEY);
+        permissions
+            .entry(POLICY_SHA256_KEY)
+            .or_insert_with(|| Value::String(SHA256_BEFORE_THE_PUSH.to_owned()));
+    }
 }
 
 /// [`validate_patterns`] for a deployment's settings before they are pushed,

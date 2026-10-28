@@ -1924,12 +1924,12 @@ mod tests {
     #[test]
     fn a_page_for_a_reader_who_has_not_agreed_carries_no_gpt_loader() {
         // Arrange
-        // Under the policy core ships, a reader in Germany whose request
-        // carries no signal is still waiting to allow storage on the device,
-        // and a reader in California who sends an opt-out, such as Global
-        // Privacy Control, has it revoked.
+        // Under the repository's sample policy, a reader in Germany whose
+        // request carries no signal is still waiting to allow storage on the
+        // device, and a reader in California who sends an opt-out, such as
+        // Global Privacy Control, has it revoked.
         let settings = settings_writing_the_loader();
-        let policy = PermissionMaps::standard();
+        let policy = PermissionMaps::sample();
         let readers = [
             ("not yet agreed", policy.baseline(Some("DE"), None)),
             (
@@ -1963,10 +1963,10 @@ mod tests {
     #[test]
     fn a_page_for_a_reader_who_allows_storage_carries_the_loader_after_the_bootstrap() {
         // Arrange
-        // Under the policy core ships, a reader in the United States who
-        // sends no opt-out allows storage on the device.
+        // Under the repository's sample policy, a reader in the United States
+        // who sends no opt-out allows storage on the device.
         let settings = settings_writing_the_loader();
-        let permissions = PermissionMaps::standard().baseline(Some("US"), None);
+        let permissions = PermissionMaps::sample().baseline(Some("US"), None);
 
         // Act
         let processed = process_for(&settings, PAGE_WITHOUT_A_LOADER, &permissions);
