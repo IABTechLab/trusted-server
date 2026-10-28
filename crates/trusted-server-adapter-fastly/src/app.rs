@@ -27,7 +27,6 @@
 //! | GET | `/_ts/permissions` and `/_ts/permissions.json` | [`handle_permissions`] |
 //! | GET | `/_ts/config` and `/_ts/config.json` | [`handle_config`] |
 //! | GET | `/_ts/data` | [`handle_data`] |
-//! | GET, HEAD | The address `[attestation] endpoint` names, and the same with `.json` | [`handle_prefix`] |
 //! | OPTIONS | `/_ts/api/v1/identify` | [`cors_preflight_identify`] |
 //! | POST | `/_ts/api/v1/ec/resolve` | [`handle_ec_resolve`] |
 //! | POST | `/auction` | [`handle_auction`] |
@@ -93,7 +92,6 @@ use edgezero_core::http::{
 };
 use edgezero_core::router::RouterService;
 use error_stack::Report;
-use trusted_server_core::attestation::{PlatformIdentity, handle_prefix, prefix_routes};
 use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{
@@ -126,8 +124,8 @@ use trusted_server_core::integrations::{
 use trusted_server_core::module_context::ModuleRequest;
 use trusted_server_core::permissions::PermissionState;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, LoadingCaches, PlatformKvStore, RuntimeServices, StoreName,
-    build_geo_module,
+    ClientInfo, GeoInfo, LoadingCaches, PlatformIdentity, PlatformKvStore, PolicyOrigin,
+    RuntimeServices, StoreName, UNKNOWN, build_geo_module,
 };
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
@@ -151,7 +149,7 @@ use trusted_server_device_fastly::FastlyHostSignals;
 use crate::middleware::FinalizeResponseMiddleware;
 use crate::platform::{
     FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo, FastlyPlatformHttpClient,
-    FastlyPlatformSecretStore, UnavailableKvStore,
+    FastlyPlatformSecretStore, FastlyPolicyEntries, UnavailableKvStore,
 };
 
 // ---------------------------------------------------------------------------
@@ -219,6 +217,9 @@ pub(crate) struct AppState {
     /// builders, taken when this state is built and handed to every request's
     /// services.
     pub(crate) loading_caches: Arc<LoadingCaches>,
+    /// The permission policy the domain's settings loaded, which every
+    /// request is given.
+    pub(crate) permission_policy: Arc<trusted_server_core::permissions::PermissionPolicy>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -236,6 +237,12 @@ pub(crate) fn build_state(
 pub(crate) fn load_settings_from_config_store(
     stores: &RuntimeStoreConfig,
 ) -> Result<Settings, Report<TrustedServerError>> {
+    let entries = FastlyPolicyEntries::new(&FastlyPlatformConfigStore, &stores.config_store_name);
+    let policy_origin = if blob_carries_its_policy(&stores.config_key) {
+        PolicyOrigin::Blob
+    } else {
+        PolicyOrigin::Source(&entries)
+    };
     // The settings are validated as they load, so the stock builders and the
     // ones a deployment registered are supplied here as well as to the state
     // build. Without them a `[demand]` or `[ad-server]` name one of them
@@ -246,8 +253,17 @@ pub(crate) fn load_settings_from_config_store(
         &stores.config_store_name,
         &stores.config_key,
         &stores.secret_store_name,
+        policy_origin,
         &trusted_server_modules::builders_with(registered_integrations()),
     )
+}
+
+/// Whether the blob under `config_key` carries its policy file, which a blob
+/// at the logical store ID does, as `EdgeZero`'s push writes it. The keyed
+/// push writes every other key, and its blobs name a shared policy entry
+/// instead.
+fn blob_carries_its_policy(config_key: &str) -> bool {
+    config_key == DEFAULT_CONFIG_STORE_ID
 }
 
 /// Build the application state from explicit settings.
@@ -346,6 +362,7 @@ pub(crate) fn build_state_with_registrations(
             &settings,
             &shipped_signal_modules(),
         )?;
+    let permission_policy = settings.required_permission_policy()?;
 
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
@@ -361,7 +378,26 @@ pub(crate) fn build_state_with_registrations(
         ec_module,
         permission_signal_modules,
         loading_caches,
+        permission_policy,
     }))
+}
+
+/// What Fastly reports about the service answering, from the environment
+/// variables Fastly gives every Compute service.
+fn fastly_platform_identity() -> PlatformIdentity {
+    let read = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| UNKNOWN.to_owned())
+    };
+    PlatformIdentity {
+        name: "fastly".to_owned(),
+        service_id: read("FASTLY_SERVICE_ID"),
+        service_version: read("FASTLY_SERVICE_VERSION"),
+        staging: std::env::var("FASTLY_IS_STAGING").is_ok_and(|value| value == "1"),
+        pop: read("FASTLY_POP"),
+    }
 }
 
 /// The permission signal modules this adapter links, in the order they run
@@ -464,6 +500,9 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         // crates this adapter links, so every request asks exactly the ones
         // configuration named, in that order.
         .permission_signal_modules(Arc::clone(&state.permission_signal_modules))
+        // The policy the domain's settings loaded decides the request's
+        // permissions.
+        .permission_policy(Arc::clone(&state.permission_policy))
         .host_signals(Arc::new(FastlyHostSignals::new(tls_ja4, h2_fingerprint)));
 
     // Hand every request the module resolved at the composition root, so the
@@ -507,12 +546,15 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
 /// middleware builds this once and clones it per request with
 /// [`RuntimeServices::with_client_info`], and the entry point rebuilds it per
 /// call.
+///
+/// The settings are ones the runtime loader loaded, so they carry the
+/// permission policy their domain names, which every services graph holds.
 pub(crate) fn build_finalize_services(
     settings: &Settings,
     kv_store: Arc<dyn PlatformKvStore>,
     loading_caches: Arc<LoadingCaches>,
 ) -> RuntimeServices {
-    RuntimeServices::builder()
+    let mut builder = RuntimeServices::builder()
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
         .kv_store(kv_store)
@@ -521,8 +563,11 @@ pub(crate) fn build_finalize_services(
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .geo(build_geo_module(settings, Arc::new(FastlyPlatformGeo)))
-        .client_info(ClientInfo::default())
-        .build()
+        .client_info(ClientInfo::default());
+    if let Some(policy) = settings.permission_policy() {
+        builder = builder.permission_policy(Arc::clone(policy));
+    }
+    builder.build()
 }
 
 fn publisher_fallback_methods() -> [Method; 7] {
@@ -1519,42 +1564,6 @@ fn named_route_handler(
     }
 }
 
-/// Answers the attestation pages ahead of the Edge Cookie lifecycle and the
-/// request filters, because the pages are read only and a verifier fetching
-/// one from a server must not be turned away as a bot.
-fn attestation_route_handler(
-    state: Arc<AppState>,
-) -> impl Fn(RequestContext) -> HandlerFuture + Clone + Send + Sync + 'static {
-    move |ctx: RequestContext| {
-        let state = Arc::clone(&state);
-        Box::pin(async move {
-            Ok(handle_prefix(
-                &state.settings,
-                state.registry.platform(),
-                &ctx.into_request(),
-            ))
-        })
-    }
-}
-
-/// What the evidence says about the Fastly service answering, from the
-/// environment variables Fastly gives every Compute service.
-fn fastly_platform_identity() -> PlatformIdentity {
-    let read = |name: &str| {
-        std::env::var(name)
-            .ok()
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "unknown".to_owned())
-    };
-    PlatformIdentity {
-        name: "fastly".to_owned(),
-        service_id: read("FASTLY_SERVICE_ID"),
-        service_version: read("FASTLY_SERVICE_VERSION"),
-        staging: std::env::var("FASTLY_IS_STAGING").is_ok_and(|value| value == "1"),
-        pop: read("FASTLY_POP"),
-    }
-}
-
 fn fallback_route_handler(
     state: Arc<AppState>,
 ) -> impl Fn(RequestContext) -> HandlerFuture + Clone + Send + Sync + 'static {
@@ -1629,21 +1638,6 @@ impl TrustedServerApp {
             }
         }
 
-        // Routes chosen by the settings, so not in the fixed table.
-        let routes = prefix_routes(&state.settings);
-        if !routes.is_empty() {
-            let attestation = attestation_route_handler(Arc::clone(state));
-            for route in &routes {
-                for method in publisher_fallback_methods() {
-                    if matches!(method, Method::GET | Method::HEAD) || route.every_method {
-                        router = router.route(&route.path, method, attestation.clone());
-                    } else {
-                        router = router.route(&route.path, method, fallback_handler.clone());
-                    }
-                }
-            }
-        }
-
         // matchit's `/{*rest}` does not match the bare root `/` — register
         // explicit root routes so `/` reaches the publisher fallback too.
         for method in publisher_fallback_methods() {
@@ -1691,9 +1685,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        AppState, EidSyncSource, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH,
-        PAGE_BIDS_PATH, RuntimeStoreConfig, TrustedServerApp, build_per_request_services,
-        build_state_from_settings, startup_error_router,
+        AppState, DEFAULT_CONFIG_STORE_ID, EidSyncSource, NAMED_ROUTES, NamedRouteHandler,
+        PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, RuntimeStoreConfig, TrustedServerApp,
+        blob_carries_its_policy, build_per_request_services, build_state_from_settings,
+        startup_error_router,
     };
     use bytes::Bytes;
     use edgezero_core::app::Hooks as _;
@@ -1836,6 +1831,9 @@ mod tests {
             "#,
         )
         .expect("should parse test settings")
+        // A loaded domain carries its policy, and these tests decide under the
+        // repository's sample.
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
     }
 
     fn test_router() -> RouterService {
@@ -1861,6 +1859,34 @@ mod tests {
             "ts.test-publisher.com"
         );
         assert_eq!(services.public_prefix().as_str(), "ts");
+    }
+
+    #[test]
+    fn only_the_blob_at_the_logical_store_id_carries_its_policy_file() {
+        assert!(blob_carries_its_policy(DEFAULT_CONFIG_STORE_ID));
+        assert!(
+            !blob_carries_its_policy("a.publisher.example"),
+            "a blob the keyed push wrote for a host names a shared entry"
+        );
+    }
+
+    #[test]
+    fn each_request_is_given_the_policy_its_domain_loaded() {
+        let policy = trusted_server_core::test_support::policies::open();
+        let state =
+            build_state_from_settings(test_settings().with_permission_policy(Arc::clone(&policy)))
+                .expect("should build test state");
+        let context = RequestContext::new(
+            empty_request(Method::GET, "/article"),
+            PathParams::default(),
+        );
+
+        let services = build_per_request_services(&state, &context);
+
+        assert!(
+            Arc::ptr_eq(services.permission_policy(), &policy),
+            "the request should decide under its domain's policy, not the sample"
+        );
     }
 
     #[test]
@@ -1910,7 +1936,12 @@ mod tests {
             (base.clone(), false),
             (format!("{base}\n{analytics}"), true),
         ] {
-            let settings = Settings::from_toml(&document).expect("should load the settings");
+            let settings = Settings::from_toml(&document)
+                .expect("should load the settings")
+                // A loaded domain carries its policy.
+                .with_permission_policy(
+                    trusted_server_core::permissions::PermissionPolicy::sample(),
+                );
             let state = build_state_from_settings(settings).expect("should build state");
 
             let services = build_per_request_services(&state, &context);
@@ -1958,6 +1989,7 @@ mod tests {
             ec_module,
             permission_signal_modules: Arc::default(),
             loading_caches: Arc::default(),
+            permission_policy: trusted_server_core::permissions::PermissionPolicy::sample(),
         });
         TrustedServerApp::routes_for_state(&state)
     }
@@ -2107,6 +2139,28 @@ mod tests {
     }
 
     #[test]
+    fn the_startup_router_answers_500_to_a_policy_load_error() {
+        use trusted_server_core::test_support::policy_failure;
+
+        let error = policy_failure::load_error();
+        assert!(
+            format!("{error:?}").contains(&format!("`{}`", policy_failure::POLICY_NAME)),
+            "the startup error should name the policy: {error:?}"
+        );
+
+        let router = startup_error_router(&error);
+        for method in super::publisher_fallback_methods() {
+            for path in ["/", "/article"] {
+                assert_eq!(
+                    route(&router, empty_request(method.clone(), path)).status(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "{method} {path} should answer 500"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn dynamic_tsjs_fallback_is_get_only() {
         assert!(
             super::uses_dynamic_tsjs_fallback(&Method::GET, "/static/tsjs=tsjs-unified.js"),
@@ -2218,7 +2272,8 @@ mod tests {
             assume_single_jurisdiction = true
             "#,
         )
-        .expect("should parse production-shaped settings");
+        .expect("should parse production-shaped settings")
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
         let state = build_state_from_settings(settings).expect("should build state");
         let router = TrustedServerApp::routes_for_state(&state);
 
@@ -2527,230 +2582,6 @@ mod tests {
         assert!(
             response.headers().get(header::SET_COOKIE).is_none(),
             "disabled clear tester-cookie route should not set a cookie"
-        );
-    }
-
-    /// Settings whose attestation pages sit at `endpoint`.
-    fn settings_with_attestation_at(endpoint: &str) -> Settings {
-        let mut settings = test_settings();
-        settings.attestation = Some(trusted_server_core::attestation::AttestationConfig {
-            endpoint: endpoint.to_owned(),
-            operator: "Example Operator".to_owned(),
-            context: "example-attestation:v1".to_owned(),
-            verify_url: "https://verifier.example/verify".to_owned(),
-        });
-        settings
-    }
-
-    /// The router of a deployment whose attestation pages sit at `endpoint`.
-    fn router_with_attestation_at(endpoint: &str) -> RouterService {
-        let state = build_state_from_settings(settings_with_attestation_at(endpoint))
-            .expect("should build test state");
-        TrustedServerApp::routes_for_state(&state)
-    }
-
-    fn header_text(response: &Response, name: header::HeaderName) -> String {
-        response
-            .headers()
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_owned()
-    }
-
-    /// A deployment whose endpoint sits under a prefix of its own answers
-    /// everything beneath that prefix here. Reads of the two attestation
-    /// addresses reach the handler, the prefix lists its pages, and anything
-    /// else is not found rather than sent to the publisher's origin. Test
-    /// builds carry no signing key, so the handler answers 503 in JSON.
-    #[test]
-    fn an_owned_prefix_is_answered_here_and_never_by_the_origin() {
-        let router = router_with_attestation_at("/_ex/attestation");
-
-        let cases = [
-            (Method::GET, "/_ex", 200, "text/html"),
-            (Method::GET, "/_ex/", 200, "text/html"),
-            (
-                Method::GET,
-                "/_ex/attestation.json",
-                503,
-                "application/json",
-            ),
-            (
-                Method::HEAD,
-                "/_ex/attestation.json",
-                503,
-                "application/json",
-            ),
-            (Method::GET, "/_ex/attestation", 503, "application/json"),
-            (Method::POST, "/_ex/attestation", 404, "text/html"),
-            (Method::PUT, "/_ex/attestation.json", 404, "text/html"),
-            (Method::DELETE, "/_ex", 404, "text/html"),
-            (Method::GET, "/_ex/unknown/page", 404, "text/html"),
-        ];
-        for (method, path, status, content_type) in cases {
-            let case = format!("{method} {path}");
-            let response = route(&router, empty_request(method, path));
-            assert_eq!(
-                response.status().as_u16(),
-                status,
-                "should answer {case} here"
-            );
-            assert!(
-                header_text(&response, header::CONTENT_TYPE).starts_with(content_type),
-                "should answer {case} as {content_type}"
-            );
-            assert_eq!(
-                header_text(&response, header::CACHE_CONTROL),
-                "no-store",
-                "should keep the answer to {case} out of every cache"
-            );
-        }
-    }
-
-    /// When the endpoint is not the default, reads of the default address are
-    /// sent to the endpoint, keeping the nonce. With the default endpoint the
-    /// default address is answered directly, and no other address redirects.
-    #[test]
-    fn the_default_address_redirects_to_the_endpoint_the_settings_name() {
-        use trusted_server_core::attestation::DEFAULT_ENDPOINT;
-
-        let router = router_with_attestation_at("/_ex/attestation");
-        for (method, path, location) in [
-            (Method::GET, "/_ts/attestation", "/_ex/attestation"),
-            (Method::HEAD, "/_ts/attestation", "/_ex/attestation"),
-            (
-                Method::GET,
-                "/_ts/attestation.json?nonce=abc123",
-                "/_ex/attestation.json?nonce=abc123",
-            ),
-        ] {
-            let case = format!("{method} {path}");
-            let response = route(&router, empty_request(method, path));
-            assert_eq!(response.status().as_u16(), 301, "should redirect {case}");
-            assert_eq!(
-                header_text(&response, header::LOCATION),
-                location,
-                "should send {case} to the endpoint with its query kept"
-            );
-            assert_eq!(
-                header_text(&response, header::CACHE_CONTROL),
-                "no-store",
-                "should keep the redirect of {case} out of every cache"
-            );
-        }
-
-        let router = router_with_attestation_at(DEFAULT_ENDPOINT);
-        for path in ["/_ts/attestation", "/_ts/attestation.json"] {
-            let response = route(&router, empty_request(Method::GET, path));
-            assert_eq!(
-                response.status().as_u16(),
-                503,
-                "{path} should reach the handler, which has no key built in"
-            );
-            assert!(
-                response.headers().get(header::LOCATION).is_none(),
-                "{path} should not redirect under the default endpoint"
-            );
-        }
-    }
-
-    /// Without the section the two addresses belong to the publisher, so a
-    /// deployment that serves no attestation takes nothing from its origin.
-    #[test]
-    fn without_the_section_no_attestation_route_is_registered() {
-        let registered: Vec<String> = test_router()
-            .routes()
-            .iter()
-            .map(|route| route.path().to_owned())
-            .filter(|path| path.contains("attestation"))
-            .collect();
-
-        assert!(
-            registered.is_empty(),
-            "should register no attestation route, found {registered:?}"
-        );
-    }
-
-    /// Every route this router registers beneath an underscore prefix is one
-    /// of the addresses an attestation endpoint may not take, so a new fixed
-    /// route cannot leave an endpoint free to register its address twice.
-    #[test]
-    fn every_fixed_route_beneath_an_underscore_prefix_is_reserved() {
-        use trusted_server_core::attestation::RESERVED_PATHS;
-
-        for route in test_router().routes() {
-            let path = route.path();
-            if path.starts_with("/_") {
-                assert!(
-                    RESERVED_PATHS.contains(&path),
-                    "{path} should be listed in attestation::RESERVED_PATHS"
-                );
-            }
-        }
-    }
-
-    /// Every endpoint the settings accept builds a router whose attestation
-    /// pages answer, because a second route at one address panics when the
-    /// router is built.
-    #[test]
-    fn every_endpoint_the_settings_accept_builds_a_router() {
-        use trusted_server_core::attestation::{DEFAULT_ENDPOINT, validate_endpoint};
-
-        let mut candidates: Vec<String> = test_router()
-            .routes()
-            .iter()
-            .map(edgezero_core::router::RouteInfo::path)
-            .filter(|path| path.starts_with("/_"))
-            .map(|path| {
-                let page = path.strip_suffix(".json").unwrap_or(path);
-                page.split('/')
-                    .map(|segment| {
-                        if segment.starts_with('{') {
-                            "proof"
-                        } else {
-                            segment
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("/")
-            })
-            .collect();
-        candidates.extend(
-            [
-                DEFAULT_ENDPOINT,
-                "/_ts/proof",
-                "/_ts/api/v1/proof",
-                "/__ts/proof",
-            ]
-            .map(str::to_owned),
-        );
-        candidates.sort();
-        candidates.dedup();
-
-        let accepted: Vec<String> = candidates
-            .into_iter()
-            .filter(|endpoint| validate_endpoint(endpoint).is_ok())
-            .collect();
-        for endpoint in &accepted {
-            let router = router_with_attestation_at(endpoint);
-            let json = format!("{endpoint}.json");
-            let response = route(&router, empty_request(Method::GET, &json));
-            assert_eq!(
-                response.status().as_u16(),
-                503,
-                "{json} should reach the handler, which has no key built in"
-            );
-        }
-        assert_eq!(
-            accepted,
-            [
-                "/__ts/proof",
-                "/_ts/api/v1/proof",
-                DEFAULT_ENDPOINT,
-                "/_ts/proof"
-            ],
-            "should accept only the endpoints no fixed route answers"
         );
     }
 
@@ -3136,7 +2967,8 @@ mod tests {
             origin_url = "https://assets.example.com"
             "#,
         )
-        .expect("should parse asset-route settings");
+        .expect("should parse asset-route settings")
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
         let state = build_state_from_settings(settings).expect("should build state");
         let router = TrustedServerApp::routes_for_state(&state);
 
@@ -3227,6 +3059,7 @@ mod tests {
             .http_client(Arc::new(StreamingHttpClient))
             .geo(Arc::new(crate::platform::FastlyPlatformGeo))
             .client_info(ClientInfo::default())
+            .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
             .build()
     }
 
@@ -3264,7 +3097,8 @@ mod tests {
             origin_url = "https://assets.example.com"
             "#,
         )
-        .expect("should parse asset-route settings");
+        .expect("should parse asset-route settings")
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
         let state = build_state_from_settings(settings).expect("should build state");
 
         let services = streaming_runtime_services();
@@ -3366,7 +3200,9 @@ mod tests {
             middleware = ["robots_txt"]
             "#,
         )
-        .expect("should parse robots.txt test settings");
+        .expect("should parse robots.txt test settings")
+        // A loaded domain carries its policy.
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
         let state = build_state_from_settings(settings).expect("should build state");
         let origin = Arc::new(StubHttpClient::new());
         origin.push_response_with_headers(
