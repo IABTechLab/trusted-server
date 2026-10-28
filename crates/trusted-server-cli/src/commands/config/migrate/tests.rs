@@ -7,7 +7,7 @@ use tempfile::TempDir;
 use trusted_server_core::closed_paths::closed_path_response;
 use trusted_server_core::settings::Settings;
 
-use super::rules::Migration;
+use super::rules::{Migration, POLICY_TO_DO};
 use super::{Adapter, ConfigMigrateArgs, migrate, run_with_writers};
 use crate::RunOutcome;
 use crate::commands::audit::generate::validate::validate_source_config;
@@ -82,6 +82,33 @@ fn main_document(rest: &str) -> String {
 
 fn reported(lines: &[String], fragment: &str) -> bool {
     lines.iter().any(|line| line.contains(fragment))
+}
+
+/// The items `migration` leaves to do besides naming a permission policy,
+/// which a document written for main always leaves.
+fn left_to_do(migration: &Migration) -> Vec<&str> {
+    migration
+        .report
+        .to_do
+        .iter()
+        .map(String::as_str)
+        .filter(|line| *line != POLICY_TO_DO)
+        .collect()
+}
+
+/// A document written for main, migrated, with the publisher's permission
+/// policy file named, as the guide says to do after migrating. It is
+/// migrated once more, so it is a document the command changes nothing in.
+fn migrated_main_naming_a_policy() -> String {
+    let migrated = migrate(MAIN_BASE, Adapter::Fastly)
+        .expect("should migrate")
+        .text;
+    migrate(
+        &format!("{migrated}\n[permissions]\npolicy = \"standard\"\n"),
+        Adapter::Fastly,
+    )
+    .expect("should migrate the named document")
+    .text
 }
 
 #[test]
@@ -365,7 +392,7 @@ fn a_handler_is_removed_only_where_every_path_it_matches_is_closed() {
             migration.text
         );
         assert!(
-            migration.report.to_do.is_empty(),
+            left_to_do(&migration).is_empty(),
             "`{pattern}`: {:?}",
             migration.report.to_do
         );
@@ -1234,6 +1261,77 @@ privacy_states = ["CA"]
 }
 
 #[test]
+fn a_document_written_for_main_that_names_its_policy_migrates_as_main() {
+    let without = migrated(MAIN_BASE);
+    let with = migrated(&main_document("[permissions]\npolicy = \"standard\"\n"));
+
+    assert_eq!(
+        with.report.changed, without.report.changed,
+        "should make the same rewrites"
+    );
+    assert_eq!(
+        left_to_do(&with),
+        left_to_do(&without),
+        "should leave the same items apart from naming a policy"
+    );
+    assert!(
+        without.report.to_do.iter().any(|line| line == POLICY_TO_DO)
+            && !with.report.to_do.iter().any(|line| line == POLICY_TO_DO),
+        "only the document naming no policy should leave naming one to do"
+    );
+    assert_eq!(with.report.check, without.report.check);
+
+    let mut named = parsed(&with.text);
+    let permissions = named
+        .as_table_mut()
+        .and_then(|root| root.remove("permissions"))
+        .expect("should keep the policy's table");
+    assert_eq!(
+        permissions.get("policy").and_then(toml::Value::as_str),
+        Some("standard")
+    );
+    assert_eq!(
+        named,
+        parsed(&without.text),
+        "should migrate the rest as the same document without the policy"
+    );
+    // The migrated document holds `[source]`, which main did not read, so
+    // it is not taken as written for main again.
+    assert!(named.get("source").is_some());
+    assert!(validate_source_config(&with.text).is_ok());
+}
+
+#[test]
+fn a_document_that_names_no_policy_leaves_naming_one_to_do() {
+    let migration = migrated(MAIN_BASE);
+
+    assert!(
+        migration
+            .report
+            .to_do
+            .iter()
+            .any(|line| line == POLICY_TO_DO),
+        "should leave naming a policy to do: {:?}",
+        migration.report.to_do
+    );
+    assert!(
+        parsed(&migration.text).get("permissions").is_none(),
+        "should name no policy itself"
+    );
+    assert!(
+        validate_source_config(&migration.text).is_ok(),
+        "the command's validation should run no policy check"
+    );
+
+    let named = migrated(&migrated_main_naming_a_policy());
+    assert!(
+        !named.report.to_do.iter().any(|line| line == POLICY_TO_DO),
+        "a document naming a policy should leave nothing about it: {:?}",
+        named.report.to_do
+    );
+}
+
+#[test]
 fn a_template_key_cookie_under_the_public_prefix_is_left_to_do() {
     let input = main_document(
         r#"[creative_opportunities]
@@ -1250,7 +1348,7 @@ template_cache_key_cookies = ["ab_bucket", "ts-tester"]
     let clean = migrated(&main_document(
         "[creative_opportunities]\ngam_network_id = \"123456789\"\ntemplate_cache_key_cookies = [\"ab_bucket\"]\n",
     ));
-    assert!(clean.report.to_do.is_empty());
+    assert!(left_to_do(&clean).is_empty());
 }
 
 #[test]
@@ -1264,7 +1362,7 @@ fn a_document_for_main_keeps_the_location_lookup() {
     assert!(reported(&migration.report.check, "`x-ts-version`"));
     assert!(reported(&migration.report.check, "Flight response"));
     assert!(
-        migration.report.to_do.is_empty(),
+        left_to_do(&migration).is_empty(),
         "{:?}",
         migration.report.to_do
     );
@@ -1281,7 +1379,7 @@ fn the_location_lookup_is_the_one_each_adapter_accepts() {
             migration.text
         );
         assert!(
-            migration.report.to_do.is_empty(),
+            left_to_do(&migration).is_empty(),
             "{adapter:?}: {:?}",
             migration.report.to_do
         );
@@ -1328,7 +1426,7 @@ fn the_location_lookup_is_the_one_each_adapter_accepts() {
             .unwrap_or_else(|error| panic!("{adapter:?} should pass the startup check: {error:?}"));
         let again = migrate(&done, adapter).expect("should migrate the document");
         assert!(
-            again.report.to_do.is_empty() && again.report.changed.is_empty(),
+            left_to_do(&again).is_empty() && again.report.changed.is_empty(),
             "{adapter:?}: {:?}",
             again.report
         );
@@ -1353,7 +1451,7 @@ fn the_location_settings_startup_refuses_are_left_to_do_in_any_document() {
     for adapter in [Adapter::Fastly, Adapter::Cloudflare] {
         let migration = migrated_on(adapter, platform);
         assert!(
-            migration.report.to_do.is_empty(),
+            left_to_do(&migration).is_empty(),
             "{adapter:?}: {:?}",
             migration.report.to_do
         );
@@ -1373,7 +1471,7 @@ fn the_location_settings_startup_refuses_are_left_to_do_in_any_document() {
         );
         let migration = migrated_on(adapter, &acknowledged);
         assert!(
-            migration.report.to_do.is_empty(),
+            left_to_do(&migration).is_empty(),
             "{adapter:?}: {:?}",
             migration.report.to_do
         );
@@ -1635,7 +1733,7 @@ fn mains_example_migrates_into_a_document_that_validates() {
         )
     });
     assert!(
-        migration.report.to_do.is_empty(),
+        left_to_do(&migration).is_empty(),
         "{:?}",
         migration.report.to_do
     );
@@ -1919,10 +2017,7 @@ fn check_changes_nothing_and_says_whether_the_document_needs_migrating() {
         "{report}"
     );
 
-    let migrated = migrate(MAIN_BASE, Adapter::Fastly)
-        .expect("should migrate")
-        .text;
-    fs::write(&file, &migrated).expect("should write the migrated document");
+    fs::write(&file, migrated_main_naming_a_policy()).expect("should write the migrated document");
     let mut report = Vec::new();
     let outcome = run_with_writers(&args(file, false, true), &mut Vec::new(), &mut report)
         .expect("should check");
@@ -1939,8 +2034,9 @@ fn check_changes_nothing_and_says_whether_the_document_needs_migrating() {
 fn write_rewrites_the_file_and_the_default_prints_the_document() {
     let temp = TempDir::new().expect("should make a folder");
     let file = temp.path().join("trusted-server.toml");
-    fs::write(&file, MAIN_BASE).expect("should write the document");
-    let expected = migrate(MAIN_BASE, Adapter::Fastly)
+    let input = MAIN_BASE;
+    fs::write(&file, input).expect("should write the document");
+    let expected = migrate(input, Adapter::Fastly)
         .expect("should migrate")
         .text;
 
@@ -1949,9 +2045,15 @@ fn write_rewrites_the_file_and_the_default_prints_the_document() {
     let outcome = run_with_writers(&args(file.clone(), false, false), &mut out, &mut report)
         .expect("should migrate");
     assert_eq!(String::from_utf8(out).expect("should print text"), expected);
-    assert_eq!(fs::read_to_string(&file).expect("should read"), MAIN_BASE);
-    assert_eq!(outcome, RunOutcome::Success);
+    assert_eq!(fs::read_to_string(&file).expect("should read"), input);
+    // A document written for main names no policy, so naming one is left
+    // to do and the run fails, though the migrated document validates.
+    assert_eq!(outcome, RunOutcome::AssertionFailed);
     let report = String::from_utf8(report).expect("should report text");
+    assert!(
+        report.contains(&format!("to do: {POLICY_TO_DO}\n")),
+        "{report}"
+    );
     assert!(
         report.ends_with("the migrated document passes validation\n"),
         "{report}"

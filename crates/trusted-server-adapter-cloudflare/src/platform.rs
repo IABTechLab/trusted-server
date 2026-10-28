@@ -112,19 +112,20 @@ pub(crate) fn auction_target() -> AuctionTargetDescriptor {
 
 // ---------------------------------------------------------------------------
 // edgezero handle adapters — no #[cfg] needed; platform-specific store
-// construction is handled by edgezero's run_app before we receive the ctx.
+// construction is handled by EdgeZero's dispatch before we receive the ctx.
 // ---------------------------------------------------------------------------
 
-/// Bridges edgezero's [`ConfigStoreHandle`] to [`PlatformConfigStore`].
+/// Bridges edgezero's [`ConfigStoreHandle`], which `EdgeZero`'s dispatch
+/// registers for a request from the stores the application declares, to
+/// [`PlatformConfigStore`].
 ///
-/// `run_app` hands a request a config handle only for a config store the app
-/// declares, and [`TrustedServerApp`](crate::app::TrustedServerApp) declares
-/// none, because startup reads the settings from the `TRUSTED_SERVER_CONFIG`
-/// variable. A request is therefore given [`NoopConfigStore`] instead.
+/// [`TrustedServerApp`](crate::app::TrustedServerApp) declares no config
+/// store, because startup reads the settings from the config store's
+/// namespace itself, so a request is given [`NoopConfigStore`] instead.
 ///
 /// Reads delegate through the handle. Writes are unsupported on all current
-/// adapter targets and return errors. The `store_name` argument is ignored,
-/// because one handle answers for every name.
+/// adapter targets and return errors. The handle opens one Workers KV
+/// namespace, so the `store_name` argument is ignored.
 struct ConfigStoreHandleAdapter(ConfigStoreHandle);
 
 impl PlatformConfigStore for ConfigStoreHandleAdapter {
@@ -148,8 +149,8 @@ impl PlatformConfigStore for ConfigStoreHandleAdapter {
     }
 }
 
-/// Bridges edgezero's [`KvHandle`] (injected by `run_app` from the
-/// `TRUSTED_SERVER_KV` KV namespace binding, the store
+/// Bridges edgezero's [`KvHandle`] (registered by `EdgeZero`'s dispatch from
+/// the `TRUSTED_SERVER_KV` KV namespace binding, the store
 /// [`TrustedServerApp`](crate::app::TrustedServerApp) declares) to
 /// [`PlatformKvStore`].
 ///
@@ -160,7 +161,7 @@ impl PlatformConfigStore for ConfigStoreHandleAdapter {
 /// inside the `KvHandle` that `RuntimeServices::kv_handle()` constructs from
 /// this adapter. The overhead is negligible (string length checks only) and
 /// avoided by the fact that we reuse the already-opened `env.kv()` handle from
-/// `run_app` rather than opening a new one.
+/// the dispatch rather than opening a new one.
 struct KvHandleAdapter(KvHandle);
 
 #[async_trait::async_trait(?Send)]
@@ -620,12 +621,12 @@ impl PlatformSecretStore for CloudflareSecretStoreAdapter {
 
 /// Construct [`RuntimeServices`] for an incoming Cloudflare Workers request.
 ///
-/// The key-value store is the handle `run_app` opens before routing from the
-/// `TRUSTED_SERVER_KV` namespace binding, because
+/// The key-value store is the handle `EdgeZero`'s dispatch opens before
+/// routing from the `TRUSTED_SERVER_KV` namespace binding, because
 /// [`TrustedServerApp`](crate::app::TrustedServerApp) declares that store. It
 /// declares no config store, so the config store is the no-op one, and
-/// startup reads the settings from the `TRUSTED_SERVER_CONFIG` variable
-/// instead. No platform-specific `#[cfg]` is required for these two stores.
+/// startup reads the settings from the config store's namespace itself. No
+/// platform-specific `#[cfg]` is required for these two stores.
 ///
 /// Secrets still require direct `worker::Env` access because
 /// `SecretHandle::get_bytes` is async while `PlatformSecretStore::get_bytes`
@@ -640,6 +641,7 @@ pub fn build_runtime_services(
     permission_signal_modules: &Arc<
         [Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>],
     >,
+    permission_policy: &Arc<trusted_server_core::permissions::PermissionPolicy>,
 ) -> RuntimeServices {
     let client_ip = extract_client_ip(ctx);
 
@@ -648,16 +650,16 @@ pub fn build_runtime_services(
     #[cfg(not(target_arch = "wasm32"))]
     let http_client: Arc<dyn PlatformHttpClient> = Arc::new(UnavailableHttpClient);
 
-    // Config: no config store is declared, so run_app injects no handle and
-    // the no-op store answers.
+    // Config: no config store is declared, so the dispatch registers no
+    // handle and the no-op store answers.
     let config_store: Arc<dyn PlatformConfigStore> = ctx
         .config_store_default()
         .map(|h| Arc::new(ConfigStoreHandleAdapter(h)) as Arc<dyn PlatformConfigStore>)
         .unwrap_or_else(|| Arc::new(NoopConfigStore));
 
-    // KV: the handle run_app opens for the declared store. A Worker without
-    // the binding fails in run_app before routing, so the unavailable store
-    // only answers where no run_app ran, as in host tests.
+    // KV: the handle the dispatch opens for the declared store. A Worker
+    // without the binding fails in the dispatch before routing, so the
+    // unavailable store only answers where no dispatch ran, as in host tests.
     let kv_store: Arc<dyn PlatformKvStore> = ctx
         .kv_store_default()
         .map(|h| Arc::new(KvHandleAdapter(h)) as Arc<dyn PlatformKvStore>)
@@ -693,6 +695,9 @@ pub fn build_runtime_services(
         // crates this adapter links, so every request asks exactly the ones
         // configuration named, in that order.
         .permission_signal_modules(Arc::clone(permission_signal_modules))
+        // The policy the domain's settings loaded decides the request's
+        // permissions.
+        .permission_policy(Arc::clone(permission_policy))
         .client_info(ClientInfo {
             client_ip,
             tls_protocol: None,
@@ -901,6 +906,7 @@ mod tests {
             &ctx,
             &trusted_server_core::settings::Settings::default(),
             &Arc::default(),
+            &trusted_server_core::permissions::PermissionPolicy::sample(),
         )
     }
 
@@ -953,8 +959,10 @@ mod tests {
             "the ISO 3166-2 subdivision code should reach the geo info"
         );
 
-        let jurisdiction =
-            trusted_server_core::consent::jurisdiction::detect_jurisdiction(Some(&geo));
+        let jurisdiction = trusted_server_core::consent::jurisdiction::detect_jurisdiction(
+            trusted_server_core::permissions::PermissionMaps::sample(),
+            Some(&geo),
+        );
         assert_eq!(
             jurisdiction,
             trusted_server_core::consent::jurisdiction::Jurisdiction::UsState("CA".to_owned()),
@@ -985,7 +993,10 @@ mod tests {
             "no region header should mean no region, not an invented one"
         );
         assert_eq!(
-            trusted_server_core::consent::jurisdiction::detect_jurisdiction(Some(&geo)),
+            trusted_server_core::consent::jurisdiction::detect_jurisdiction(
+                trusted_server_core::permissions::PermissionMaps::sample(),
+                Some(&geo),
+            ),
             trusted_server_core::consent::jurisdiction::Jurisdiction::NonRegulated,
             "with no region a US visitor cannot be placed in a privacy state"
         );

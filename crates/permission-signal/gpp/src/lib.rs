@@ -193,8 +193,8 @@ mod tests {
     use trusted_server_core::permission_signal::SignalInput;
     use trusted_server_core::permissions::{Acquisition, PermissionMaps, SignalPolicy};
 
-    fn shipped_policy() -> &'static SignalPolicy {
-        PermissionMaps::standard().signals()
+    fn sample_policy() -> &'static SignalPolicy {
+        PermissionMaps::sample().signals()
     }
 
     fn with_sale_opt_out(value: Option<bool>) -> ConsentContext {
@@ -295,14 +295,14 @@ mod tests {
     #[test]
     fn an_unreadable_gpp_string_is_read_as_the_opt_out_it_may_have_carried() {
         assert_eq!(
-            answer(&unreadable(), shipped_policy(), Permission::StoreOnDevice),
+            answer(&unreadable(), sample_policy(), Permission::StoreOnDevice),
             ConsentSignal::Revoke,
             "an unreadable string refuses what the policy lets an opt-out revoke"
         );
         assert_eq!(
             answer(
                 &unreadable(),
-                shipped_policy(),
+                sample_policy(),
                 Permission::MeasureAdPerformance
             ),
             ConsentSignal::Neutral,
@@ -312,7 +312,7 @@ mod tests {
             SignalRecord::new(SCHEME, SignalStatus::NotDecoded).with_value("DBABMA~x"),
         );
         assert_eq!(
-            answer(&not_decoded, shipped_policy(), Permission::StoreOnDevice),
+            answer(&not_decoded, sample_policy(), Permission::StoreOnDevice),
             ConsentSignal::Revoke,
             "a string left as received is a preference this module cannot see"
         );
@@ -323,7 +323,7 @@ mod tests {
         let read = read_with("__gpp=not-a-gpp-string", &Settings::default()).expect("should read");
         assert_eq!(read.status(), SignalStatus::Unreadable);
         let consent = ConsentContext::default().with_record(read);
-        let policy = shipped_policy();
+        let policy = sample_policy();
         let covered: Vec<Permission> = Permission::all()
             .filter(|permission| policy.opt_out_revokes(*permission))
             .collect();
@@ -364,11 +364,11 @@ mod tests {
         assert_eq!(
             answer(
                 &with_sale_opt_out(Some(true)),
-                shipped_policy(),
+                sample_policy(),
                 Permission::StoreOnDevice
             ),
             ConsentSignal::Revoke,
-            "the shipped policy revokes device storage on an opt-out"
+            "the sample policy revokes device storage on an opt-out"
         );
     }
 
@@ -377,11 +377,11 @@ mod tests {
         assert_eq!(
             answer(
                 &with_sale_opt_out(Some(true)),
-                shipped_policy(),
+                sample_policy(),
                 Permission::MeasureAdPerformance
             ),
             ConsentSignal::Neutral,
-            "measurement is not on the shipped revoke list"
+            "measurement is not on the sample's revoke list"
         );
     }
 
@@ -390,7 +390,7 @@ mod tests {
         assert_eq!(
             answer(
                 &with_sale_opt_out(Some(false)),
-                shipped_policy(),
+                sample_policy(),
                 Permission::StoreOnDevice
             ),
             ConsentSignal::Neutral,
@@ -399,7 +399,7 @@ mod tests {
         assert_eq!(
             answer(
                 &with_sale_opt_out(None),
-                shipped_policy(),
+                sample_policy(),
                 Permission::StoreOnDevice
             ),
             ConsentSignal::Neutral,
@@ -412,7 +412,7 @@ mod tests {
         assert_eq!(
             answer(
                 &ConsentContext::default(),
-                shipped_policy(),
+                sample_policy(),
                 Permission::StoreOnDevice
             ),
             ConsentSignal::Neutral,
@@ -441,7 +441,7 @@ mod tests {
         let input = SignalInput::new(
             &consent,
             &evidence,
-            shipped_policy(),
+            sample_policy(),
             Acquisition::RequiresSignal,
         );
         assert!(

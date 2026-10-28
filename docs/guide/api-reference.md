@@ -22,7 +22,7 @@ Quick reference for all Trusted Server HTTP endpoints.
 | `axum`       | development    | real       | `500`          | no             | multiple         | outermost sanitize             | none                             |
 | `cloudflare` | development    | absent     | `500`          | no             | single           | outermost sanitize             | none                             |
 | `fastly`     | production     | pre router | `500`          | yes            | multiple         | entry-point resolve + sanitize | none                             |
-| `spin`       | experimental   | real       | `503`          | yes            | single           | outermost sanitize             | innermost Spin-header derivation |
+| `spin`       | experimental   | real       | `500`          | yes            | single           | outermost sanitize             | innermost Spin-header derivation |
 
 `trusted client IP handling` describes the optional
 `[trusted_client_ip]` configuration. Fastly resolves the authenticated header
@@ -61,12 +61,10 @@ authority, scheme, and client-address headers in the innermost middleware.
 | normal  | `/verify-signature`                    | `POST`                                                     | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `publisher_fallback`                  | publisher fallback    | publisher fallback    | publisher fallback    | publisher fallback    |
 | normal  | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `publisher_fallback`                  | publisher fallback    | publisher fallback    | publisher fallback    | publisher fallback    |
-| normal  | `<attestation.endpoint>.json`          | `GET`, `HEAD`                                              | config derived | `settings.attestation`                | real                  | real                  | real                  | real                  |
-| normal  | `<attestation.endpoint>`               | `GET`, `HEAD`                                              | config derived | `settings.attestation`                | real                  | real                  | real                  | real                  |
 | normal  | `<proxy.asset_routes[].prefix>{*rest}` | `GET`, `HEAD`                                              | config derived | `settings.proxy.asset_routes[]`       | real                  | —                     | —                     | —                     |
 | startup | `/health`                              | `GET`                                                      | literal        | `startup_error`                       | real                  | —                     | —                     | real                  |
-| startup | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `startup_error`                       | startup error (`500`) | startup error (`500`) | startup error (`500`) | startup error (`503`) |
-| startup | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `startup_error`                       | startup error (`500`) | startup error (`500`) | startup error (`500`) | startup error (`503`) |
+| startup | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `startup_error`                       | startup error (`500`) | startup error (`500`) | startup error (`500`) | startup error (`500`) |
+| startup | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `startup_error`                       | startup error (`500`) | startup error (`500`) | startup error (`500`) | startup error (`500`) |
 
 `real`, `unsupported`, `guarded`, `publisher fallback`, and `startup error` are
 distinct observable dispositions. An em dash means that the adapter has no
@@ -144,6 +142,11 @@ Endpoint-specific CORS: `Access-Control-Allow-Origin: *`.
 A secret is masked twice over. The settings loader records each value it fills
 from the secret store, and those paths are masked. Then any string that still
 contains one of those values is masked wherever it sits, a key included.
+
+`permissions` shows the policy file's name as `policy` and its SHA-256 as
+`sha256`, neither masked by default, so a publisher can check which exact file
+a domain runs. The file itself is never shown, because the settings loader
+takes it out of the settings when it loads the policy.
 
 **Example:**
 
@@ -262,6 +265,7 @@ that page reads the resolution of a request with no stored signal.
 {
   "awaiting": [],
   "modules": { "configured": ["gpc", "tcf"], "contributed": ["tcf"] },
+  "policy": "standard",
   "set": ["necessary.operations.storage"],
   "signals": [{ "module": "tcf", "scheme": "tcf", "value": "CP..." }],
   "storageWithdrawn": false,
@@ -279,10 +283,15 @@ that page reads the resolution of a request with no stored signal.
 | `storageWithdrawn`    | Whether the request explicitly withdrew device storage, as distinct from not setting it                   |
 | `modules.contributed` | The signal modules that produced a signal used in this resolution                                         |
 | `modules.configured`  | The signal modules the publisher configured, or `null` when it named none and the adapter's own list runs |
+| `policy`              | The permission policy file whose rules the answer resolved, by the name `[permissions] policy` gives it   |
 | `version`             | The version of the core crate that answered                                                               |
 
 A module in `configured` and not in `contributed` ran and found nothing to
 work with, which is a different fact from a module that was never configured.
+
+A policy's name is its file's stem, which two versions of one file share, so
+the SHA-256 that `/_ts/config` shows is what matches the answer to one exact
+copy of the file.
 
 Nothing is created or written for the reader. The Edge Cookie lifecycle does
 not run for this request, so no cookie is set and no identity row is written.
@@ -291,24 +300,6 @@ not run for this request, so no cookie is set and no identity row is written.
 
 ```bash
 curl -s "https://edge.example.com/_ts/permissions.json" -H "Sec-GPC: 1"
-```
-
-### GET `<attestation.endpoint>` and GET `<attestation.endpoint>.json`
-
-Signed evidence of who operates the deployment and which build it runs, as a
-page and as data. [Attestation](/guide/attestation) gives the format and how a
-relying party checks it.
-
-- **Configuration gate:** served only where the settings carry `[attestation]`. The address is `[attestation] endpoint`, which defaults to `/_ts/attestation`. Where the endpoint is not the default, a read of the default address answers `301` to the endpoint with the query kept.
-- **Auth:** none.
-- **Request:** `GET` or `HEAD`. An optional `nonce` query parameter of 1 to 64 characters from `A` to `Z`, `a` to `z`, `0` to `9`, `_` and `-` is signed back in the evidence.
-- **Response:** `200` with the page, or with the envelope as `application/json` at the `.json` address. `400` for a malformed nonce. `503` where the build carries no signing key in force, the key cannot be read or the clock cannot be read. The `400` and `503` bodies are JSON with an `error` field.
-- **Cache and CORS:** `Cache-Control: no-store` and `Access-Control-Allow-Origin: *` on every answer.
-- **Rate limiting:** none.
-- **Other methods:** reach the publisher's origin under the shared `/_ts` prefix. Under a prefix the endpoint has to itself, every other method and address beneath that prefix answers `404` from the deployment.
-
-```bash
-curl "https://publisher.example/_ts/attestation.json?nonce=Docs-Example_0929"
 ```
 
 ## Utility Endpoints
@@ -1047,10 +1038,11 @@ effects. CORS is therefore the sanitized publisher-origin policy, not a global
 Trusted Server policy. There is no built-in endpoint rate limiter. Example:
 `curl -i https://edge.example.com/article`.
 
-When startup fails, the degraded router replaces normal routing: Fastly,
-Axum, and Cloudflare return `500` for both fallback shapes and all seven
-methods; Spin returns a generic `503`. Only the health behavior shown in the
-table survives.
+When startup fails, the degraded router replaces normal routing. Every
+adapter answers both fallback shapes and all seven methods with the status of
+the startup error's kind, which is `500` for a configuration or settings
+error and `503` for a key-value store error, and Spin's body names only the
+status. Only the health behavior shown in the table survives.
 
 ---
 
