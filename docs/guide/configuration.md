@@ -1194,7 +1194,7 @@ A module with settings of its own reads them from its own block, `[robots-txt.<n
 1. With `refuse_all` selected the file is the refusal and nothing else, whatever else is selected, and every response the deployment finalizes carries `X-Robots-Tag: noindex, nofollow`.
 2. A path in `always_allow` stays open to every crawler a module's rules refuse the whole site to, `*` included. A narrower rule is kept as the module gave it, so `Disallow: /ads` still closes off `/ads.txt`.
 3. The rules appear in the order `modules` names them, between `top_text` above and the `Sitemap` line and `bottom_text` below.
-4. A module is asked for the host the request was addressed to, never one that `Forwarded` or `X-Forwarded-Host` names, and is given nothing of the crawler's connection. Holding is the normal case. A module's answer is held for that host in the loading cache of the one loading cache module the build links, or of the module `[cache.robots-txt]` names, briefly in memory and in the shared store outside it, so a module is asked again only when no copy young enough is held, rather than by every request, and `[cache.robots-txt]` sets how long the copies last, as described under [Loading caches](#loading-caches). The last answer is also kept apart for 30 days, in the value cache on Fastly and in the key-value store on Cloudflare and Spin, and Axum, which has no key-value store, keeps none. A value cache can drop an entry early, so on Fastly an answer past its age is likely, rather than certain, to be there when a module cannot answer.
+4. A module is asked for the host the request was addressed to, never one that `Forwarded` or `X-Forwarded-Host` names, and is given nothing of the crawler's connection. A stock build links no loading cache module, so there every request for the file asks each module. In a build that links one, a module's answer is held for that host in the loading cache of the one loading cache module the build links, or of the module `[cache.robots-txt]` names, briefly in memory and in the shared store outside it, so a module is asked again only when no copy young enough is held, rather than by every request, and `[cache.robots-txt]` sets how long the copies last, as described under [Loading caches](#loading-caches). The last answer is also kept apart for 30 days, in the value cache on Fastly and in the key-value store on Cloudflare and Spin, and Axum, which has no key-value store, keeps none. A value cache can drop an entry early, so on Fastly an answer past its age is likely, rather than certain, to be there when a module cannot answer.
 5. A module that cannot answer has its last answer served past its age. With no answer kept at all, or with no rule anywhere in the file, the file is `503` with `Retry-After: 600`, never an empty file, which a crawler would read as permission to crawl everything. Select `allow_all` to allow every crawler.
 6. Spin's key-value store gives an entry no lifetime, so there a kept answer stays until it is replaced, and one kept for settings that have since changed stays until it is deleted from the store. With no loading cache module linked, or several linked and none named in `[cache.robots-txt]`, no copy is held, so every request for the file asks each module, and a deployment whose key-value store cannot be opened keeps no last answer either.
 7. The file is made by the `robots_txt` middleware, which runs on `text/plain` at `/robots.txt` alone, in the phase the entry places it in, prepares the file before the document is processed, and replaces the origin's `text/plain` file with it. The origin is asked for its whole file, without a crawler's conditional or range headers. Any other answer to a `GET` or `HEAD`, such as a `404`, a page from a single-page application's catch-all, a redirect or a `401` from a staging site behind a login, has the file made in its place with status `200`. An origin that cannot be reached gives `502`, which a crawler reads as refusing everything. The response takes the deployment's cache policy for the path, as every file does, so where the response is stored a module is asked only when the stored copy has ended, however soon its refresh is due. A refusal, as in point 5, is answered before any document is processed, and nothing is stored.
@@ -1849,12 +1849,15 @@ a leading `www.` dropped, so publishers sharing a store never share a copy.
 
 Each feature that holds answers this way selects the cache that holds them,
 by naming in its own `[cache.<name>]` table a module that offers a loading
-cache, with the module's short name or its name in full. A stock build links
-`loading-cache.51degrees`, from `crates/loading-cache/51degrees`, so
-`module = "51degrees"` selects it. A feature that names no module takes the
-one loading cache module the build links, so a stock build holds answers
-without a line in the document, and keeps no copy when the build links none
-or several, making each answer every time it is asked for. A name that no
+cache, with the module's short name or its name in full. A feature that names
+no module takes the one loading cache module the build links, and keeps no
+copy when the build links none or several, making each answer every time it
+is asked for. A stock build links none, so there no feature keeps a copy and
+every `module` is refused. A deployment that wants copies kept links a
+loading cache module itself, handing its builder to the adapter as the
+[integration guide](/guide/integration-guide#supplying-a-loading-cache)
+describes. `crates/loading-cache/51degrees` offers `loading-cache.51degrees`,
+which `module = "51degrees"` selects in a build that links it. A name that no
 linked crate offers a cache from is refused by `ts config validate` and when
 the service starts, with the names that could be written.
 
@@ -1898,8 +1901,9 @@ are checked against the ranges above and change nothing unless the module
 reads its own table and applies them.
 A module from `crates/geo/example` whose service answers
 once for each request's evidence declares `example-answers`, the cache that
-holds those answers, so `[cache.example-answers] module = "51degrees"` asks
-the service once however many requests carry the same evidence. A name is
+holds those answers, so in a deployment that links
+`crates/loading-cache/51degrees`, `[cache.example-answers] module = "51degrees"`
+asks the service once however many requests carry the same evidence. A name is
 the module's own: `robots-txt` and a name two modules declare are refused. A
 `[cache.<name>]` table naming a cache no linked module declares is refused by
 `ts config validate` and when the deployment starts, and the message lists
@@ -1915,6 +1919,7 @@ instances back.
 
 ```toml
 [cache.robots-txt]
+# Refused unless the build links crates/loading-cache/51degrees.
 module = "51degrees"
 memory_seconds = 60
 store_seconds = 604800
@@ -1977,9 +1982,10 @@ behind after a module is switched off is caught rather than sitting unread.
 `ad-server.mock` supply demand and ad server implementations only. They are
 not page integrations, so a section that names one refuses startup like any
 name no module supplies. Their settings live in `[demand.<name>]` and
-`[ad-server.<name>]`. `loading-cache.51degrees` supplies a loading cache,
-which a feature selects in its own `[cache.<name>]` table, described under
-[Loading caches](#loading-caches), and no section selects it either.
+`[ad-server.<name>]`. `loading-cache.51degrees` supplies a loading cache
+that a feature selects in its own `[cache.<name>]` table, described under
+[Loading caches](#loading-caches), and no section selects it either. No
+stock build links it, so it is offered only to a deployment that does.
 
 ### Placing page changes
 

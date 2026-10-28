@@ -955,8 +955,9 @@ pub fn loading_caches_from(
         caches.insert(table, cache);
     }
     // A declared cache with no table at all takes the one loading cache
-    // module the build links, as a table naming no module does, so a stock
-    // build holds a module's answers without a line in the document.
+    // module the build links, as a table naming no module does, so a
+    // deployment that links one holds a module's answers without a line in
+    // the document.
     if let [(_, factory)] = offered.as_slice() {
         let tabled: Vec<&str> = settings
             .cache
