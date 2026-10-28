@@ -10,7 +10,7 @@
 //! scheme. Why is set out once, in `permission_signal/README.md` in core.
 
 use trusted_server_core::consent::{ConsentContext, PrivacyFlag};
-use trusted_server_core::evidence::RequestInfo;
+use trusted_server_core::module_context::ModuleCall;
 use trusted_server_core::permission_signal::{PermissionSignalModule, SignalInput};
 use trusted_server_core::permissions::{ConsentSignal, OptOutSource, Permission, ValidSignal};
 
@@ -39,6 +39,14 @@ impl UsPrivacyModule {
     #[must_use]
     pub const fn new() -> Self {
         Self
+    }
+
+    /// The signal this scheme reads from the request's consent record, when
+    /// it can use one.
+    fn read_signal(&self, consent: &ConsentContext) -> Option<ValidSignal> {
+        consent.us_privacy.as_ref()?;
+        let raw = consent.raw_us_privacy.as_deref()?;
+        Some(ValidSignal::new(short(), "us_privacy", raw))
     }
 }
 
@@ -78,14 +86,8 @@ impl PermissionSignalModule for UsPrivacyModule {
     }
 
     /// The US Privacy string, when it decoded.
-    fn valid_signal(
-        &self,
-        consent: &ConsentContext,
-        _evidence: &dyn RequestInfo,
-    ) -> Option<ValidSignal> {
-        consent.us_privacy.as_ref()?;
-        let raw = consent.raw_us_privacy.as_deref()?;
-        Some(ValidSignal::new(short(), "us_privacy", raw))
+    fn valid_signal(&self, call: ModuleCall<'_>) -> Option<ValidSignal> {
+        call.inject(self, Self::read_signal).ok().flatten()
     }
 }
 
@@ -157,13 +159,12 @@ mod tests {
 
     #[test]
     fn vouches_for_the_us_privacy_string_only_when_it_decoded() {
-        let evidence = OwnedRequestInfo::default();
         let decoded = ConsentContext {
             raw_us_privacy: Some("1YNN".to_owned()),
             ..with_sale_flag(PrivacyFlag::No)
         };
         assert_eq!(
-            UsPrivacyModule::new().valid_signal(&decoded, &evidence),
+            UsPrivacyModule::new().read_signal(&decoded),
             Some(ValidSignal::new(short(), "us_privacy", "1YNN")),
             "a decoded string is vouched for as received, whatever it says"
         );
@@ -172,7 +173,7 @@ mod tests {
             ..ConsentContext::default()
         };
         assert_eq!(
-            UsPrivacyModule::new().valid_signal(&unreadable, &evidence),
+            UsPrivacyModule::new().read_signal(&unreadable),
             None,
             "an unreadable string is not"
         );

@@ -32,6 +32,7 @@ use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::evidence::{BorrowedRequestInfo, HostSignals};
 use trusted_server_core::integrations::RequestFilterEffects;
+use trusted_server_core::module_context::{ModuleContext, ModuleRequest};
 use trusted_server_core::platform::build_geo_module;
 use trusted_server_core::platform::{
     ClientInfo, PlatformKvStore, RuntimeServices, UnavailableKvStore,
@@ -967,7 +968,9 @@ pub(crate) fn extract_cookie_value(req: &HttpRequest, name: &str) -> Option<Stri
 /// User-Agent, or the Fastly module, which also reads the TLS/H2 signals
 /// captured into a [`FastlyHostSignals`]. The Fastly module, and so the
 /// signal capture, is built only when selected, so the default request path
-/// makes no Fastly-specific signal call.
+/// makes no Fastly-specific signal call. The module is handed a module
+/// context carrying the request, that evidence, the settings and the
+/// services.
 pub(crate) async fn derive_device_signals(
     settings: &Settings,
     registered: Option<Arc<dyn DeviceModule>>,
@@ -992,18 +995,46 @@ pub(crate) async fn derive_device_signals(
         .map(|ip| ip.to_string())
         .unwrap_or_default();
     let request_info = BorrowedRequestInfo::new(&client_ip, None).with_headers(&headers);
-    match registered {
-        Some(module) => module.detect(&request_info, services).await,
+    let built;
+    let module: &dyn DeviceModule = match registered.as_deref() {
+        Some(module) => module,
         None => {
-            build_device_module(settings, || {
+            built = build_device_module(settings, || {
                 let host_signals: Arc<dyn HostSignals> =
                     Arc::new(FastlyHostSignals::from_request(req));
                 Box::new(FastlyDeviceModule::new(host_signals)) as Box<dyn DeviceModule>
-            })
-            .detect(&request_info, services)
-            .await
+            });
+            built.as_ref()
         }
-    }
+    };
+    let context = ModuleContext::new(entry_request(req))
+        .with_evidence(&request_info)
+        .with_settings(settings)
+        .with_services(services);
+    module
+        .detect(context.call(module.id(), module.required_permissions()))
+        .await
+}
+
+/// What the client's request resolved to, read off the Fastly request before
+/// it is converted.
+///
+/// The scheme is `https` when the entry point marked the request as arriving
+/// over TLS, which it does from Fastly's own TLS metadata.
+fn entry_request(req: &FastlyRequest) -> ModuleRequest<'_> {
+    let scheme = if req.get_header_str("fastly-ssl").is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    ModuleRequest::new(
+        req.get_method(),
+        req.get_header_str(header::HOST.as_str())
+            .unwrap_or_default(),
+        scheme,
+        req.get_path(),
+    )
+    .with_query(req.get_query_str().unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -1050,9 +1081,29 @@ mod tests {
     }
 
     /// A device module standing in for one a registration supplies. It marks
-    /// the signals it returns with the cookie header it was shown, so a test
-    /// can tell both that it ran and what it saw.
+    /// the signals it returns with the cookie header, the host, the scheme
+    /// and the address it was shown, so a test can tell both that it ran and
+    /// what it saw.
     struct MarkedDeviceModule;
+
+    impl MarkedDeviceModule {
+        fn mark(
+            &self,
+            request: ModuleRequest<'_>,
+            request_info: &dyn trusted_server_core::evidence::RequestInfo,
+        ) -> DeviceSignals {
+            let mut signals = DeviceSignals::derive_ua_only(request_info.user_agent());
+            signals.platform_class = Some(format!(
+                "marked:{}:{}://{}{}?{}",
+                request_info.header("cookie").unwrap_or_default(),
+                request.scheme(),
+                request.host(),
+                request.path(),
+                request.query(),
+            ));
+            signals
+        }
+    }
 
     #[async_trait::async_trait(?Send)]
     impl DeviceModule for MarkedDeviceModule {
@@ -1062,22 +1113,20 @@ mod tests {
 
         async fn detect(
             &self,
-            request_info: &dyn trusted_server_core::evidence::RequestInfo,
-            _services: &RuntimeServices,
+            call: trusted_server_core::module_context::ModuleCall<'_>,
         ) -> DeviceSignals {
-            let mut signals = DeviceSignals::derive_ua_only(request_info.user_agent());
-            signals.platform_class = Some(format!(
-                "marked:{}",
-                request_info.header("cookie").unwrap_or_default()
-            ));
-            signals
+            call.inject(self, Self::mark)
+                .unwrap_or_else(|_| DeviceSignals::unknown())
         }
     }
 
     fn page_request() -> FastlyRequest {
-        let mut req = FastlyRequest::get("https://example.com/");
+        let mut req = FastlyRequest::get("https://example.com/article?page=2");
+        req.set_header("host", "example.com");
         req.set_header("user-agent", "Mozilla/5.0 (X11; Linux x86_64) Chrome/140.0");
         req.set_header("cookie", "example_width=1280");
+        // The entry point marks a request that arrived over TLS this way.
+        req.set_header("fastly-ssl", "1");
         req
     }
 
@@ -1096,8 +1145,9 @@ mod tests {
 
         assert_eq!(
             signals.platform_class.as_deref(),
-            Some("marked:example_width=1280"),
-            "the registered module should run and see the page's cookies"
+            Some("marked:example_width=1280:https://example.com/article?page=2"),
+            "the registered module should run and see the page's cookies and the request \
+             it classifies"
         );
     }
 

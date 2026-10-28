@@ -58,9 +58,9 @@ use trusted_server_core::openrtb::{
     Banner, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs, RegsExt, Site, User,
     UserExt, to_openrtb_i32,
 };
+use trusted_server_core::platform::PlatformResponse;
 #[cfg(test)]
-use trusted_server_core::platform::PlatformHttpRequest;
-use trusted_server_core::platform::{PlatformResponse, RuntimeServices};
+use trusted_server_core::platform::{PlatformHttpRequest, RuntimeServices};
 use trusted_server_core::settings::Settings;
 
 pub(crate) const APS_INTEGRATION_ID: &str = "aps";
@@ -2048,10 +2048,11 @@ impl IntegrationProxy for ApsRendererIntegration {
             .collect()
     }
 
+    // The renderer page is the same for every request, so the route takes
+    // nothing from its module call.
     async fn handle(
         &self,
-        _settings: &Settings,
-        _services: &RuntimeServices,
+        _call: trusted_server_core::module_context::ModuleCall<'_>,
         request: http::Request<EdgeBody>,
     ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
         if request.method() != Method::GET || request.uri().path() != APS_RENDERER_ROUTE {
@@ -3206,16 +3207,16 @@ mod tests {
         assert_eq!(routes[0].method, Method::GET);
         assert_eq!(routes[0].path, APS_RENDERER_ROUTE);
 
-        let settings = create_test_settings();
-        let services = noop_services();
         let request = http::Request::builder()
             .method(Method::GET)
             .uri(APS_RENDERER_ROUTE)
             .body(EdgeBody::empty())
             .expect("should build renderer request");
-        let response =
-            futures::executor::block_on(integration.handle(&settings, &services, request))
-                .expect("should serve renderer");
+        let response = futures::executor::block_on(integration.handle(
+            trusted_server_core::module_context::ModuleCall::empty(),
+            request,
+        ))
+        .expect("should serve renderer");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers()[header::CONTENT_TYPE],
@@ -3233,8 +3234,11 @@ mod tests {
             .uri(APS_RENDERER_ROUTE)
             .body(EdgeBody::empty())
             .expect("should build method rejection request");
-        let response = futures::executor::block_on(integration.handle(&settings, &services, post))
-            .expect("should reject unsupported method");
+        let response = futures::executor::block_on(integration.handle(
+            trusted_server_core::module_context::ModuleCall::empty(),
+            post,
+        ))
+        .expect("should reject unsupported method");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 

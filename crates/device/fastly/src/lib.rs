@@ -3,7 +3,8 @@
 //! [`FastlyDeviceModule`] strengthens the built-in User-Agent classification
 //! with the host's TLS (JA4) and HTTP/2 signals, for deployments on Fastly
 //! Compute. It is selected by `[device] module = "fastly"` and wired in by the
-//! Fastly adapter, which injects the request info and the captured host signals.
+//! Fastly adapter, which injects the captured host signals and hands the module
+//! the request's module context.
 //!
 //! [`FastlyHostSignals`] captures those signals from a live Fastly request
 //! (`get_tls_ja4()`, `get_client_h2_fingerprint()`) into owned values, so it can
@@ -20,6 +21,7 @@ use std::sync::Arc;
 use fastly::Request as FastlyRequest;
 use trusted_server_core::ec::device::{DeviceModule, DeviceSignals};
 use trusted_server_core::evidence::{HostSignals, RequestInfo};
+use trusted_server_core::module_context::ModuleCall;
 
 /// Host-computed client signals captured from a live Fastly request.
 ///
@@ -68,9 +70,9 @@ impl HostSignals for FastlyHostSignals {
 ///
 /// Classifies a request with [`DeviceSignals::derive`], which strengthens the
 /// User-Agent classification with the host signals. It reads the User-Agent
-/// from its injected [`RequestInfo`] and the TLS and HTTP/2 signals from its
-/// injected [`HostSignals`], so the browser/bot gate is backed by the live
-/// request.
+/// from the [`RequestInfo`] it names in the module context and the TLS and
+/// HTTP/2 signals from its injected [`HostSignals`], so the browser/bot gate
+/// is backed by the live request.
 pub struct FastlyDeviceModule {
     host_signals: Arc<dyn HostSignals>,
 }
@@ -81,6 +83,15 @@ impl FastlyDeviceModule {
     pub fn new(host_signals: Arc<dyn HostSignals>) -> Self {
         Self { host_signals }
     }
+
+    /// The signals the User-Agent and the host signals give together.
+    fn classify(&self, request_info: &dyn RequestInfo) -> DeviceSignals {
+        DeviceSignals::derive(
+            request_info.user_agent(),
+            self.host_signals.ja4(),
+            self.host_signals.h2(),
+        )
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -89,15 +100,8 @@ impl DeviceModule for FastlyDeviceModule {
         "fastly"
     }
 
-    async fn detect(
-        &self,
-        request_info: &dyn RequestInfo,
-        _services: &trusted_server_core::platform::RuntimeServices,
-    ) -> DeviceSignals {
-        DeviceSignals::derive(
-            request_info.user_agent(),
-            self.host_signals.ja4(),
-            self.host_signals.h2(),
-        )
+    async fn detect(&self, call: ModuleCall<'_>) -> DeviceSignals {
+        call.inject(self, Self::classify)
+            .unwrap_or_else(|_| DeviceSignals::unknown())
     }
 }

@@ -874,6 +874,27 @@ impl DataDomeIntegration {
     }
 }
 
+impl DataDomeIntegration {
+    async fn route(
+        &self,
+        req: http::Request<EdgeBody>,
+        services: &RuntimeServices,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        let path = req.uri().path().to_string();
+
+        if path == "/integrations/datadome/tags.js" {
+            self.handle_tags_js(services, req).await
+        } else if path.starts_with("/integrations/datadome/js/") {
+            self.handle_js_api(services, req).await
+        } else {
+            Err(Report::new(Self::error(format!(
+                "Unknown DataDome route: {}",
+                path
+            ))))
+        }
+    }
+}
+
 #[async_trait(?Send)]
 impl IntegrationProxy for DataDomeIntegration {
     fn integration_name(&self) -> &'static str {
@@ -895,22 +916,10 @@ impl IntegrationProxy for DataDomeIntegration {
 
     async fn handle(
         &self,
-        _settings: &Settings,
-        services: &RuntimeServices,
+        call: trusted_server_core::module_context::ModuleCall<'_>,
         req: http::Request<EdgeBody>,
     ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
-        let path = req.uri().path().to_string();
-
-        if path == "/integrations/datadome/tags.js" {
-            self.handle_tags_js(services, req).await
-        } else if path.starts_with("/integrations/datadome/js/") {
-            self.handle_js_api(services, req).await
-        } else {
-            Err(Report::new(Self::error(format!(
-                "Unknown DataDome route: {}",
-                path
-            ))))
-        }
+        call.inject_with(self, req, Self::route)?.await
     }
 }
 
@@ -1718,7 +1727,6 @@ mod tests {
         let services = build_services_with_http_client(
             Arc::clone(&stub) as Arc<dyn trusted_server_core::platform::PlatformHttpClient>
         );
-        let settings = create_test_settings();
         let integration = DataDomeIntegration::new(test_config());
         let req = http::Request::builder()
             .method(http::Method::GET)
@@ -1726,7 +1734,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
-        let response = futures::executor::block_on(integration.handle(&settings, &services, req))
+        let response = futures::executor::block_on(integration.route(req, &services))
             .expect("should proxy request");
 
         assert_eq!(

@@ -39,9 +39,9 @@
 
 use std::sync::OnceLock;
 
-use trusted_server_core::consent::ConsentContext;
 use trusted_server_core::constants::COOKIE_MTM_PREF;
 use trusted_server_core::evidence::RequestInfo;
+use trusted_server_core::module_context::ModuleCall;
 use trusted_server_core::permission_signal::{PermissionSignalModule, SignalInput};
 use trusted_server_core::permissions::{
     ConsentSignal, Permission, PermissionSet, SignalPolicy, ValidSignal,
@@ -147,6 +147,19 @@ impl MtmModule {
     pub const fn new() -> Self {
         Self
     }
+
+    /// The word in the request's evidence, when one is present.
+    fn read_signal(&self, evidence: &dyn RequestInfo) -> Option<ValidSignal> {
+        preference(evidence).map(|word| ValidSignal::new(short(), SCHEME, word.as_str()))
+    }
+
+    /// The Model Terms, when the request's evidence carries a word.
+    fn read_tdls(&self, evidence: &dyn RequestInfo) -> Vec<Tdl> {
+        if preference(evidence).is_none() {
+            return Vec::new();
+        }
+        Tdl::new(TERMS).into_iter().collect()
+    }
 }
 
 /// Every Data Use either word says something about, computed once.
@@ -219,21 +232,14 @@ impl PermissionSignalModule for MtmModule {
 
     /// The word, when one is present. There is nothing else to validate,
     /// because a value that is not one of the two words is not an answer.
-    fn valid_signal(
-        &self,
-        _consent: &ConsentContext,
-        evidence: &dyn RequestInfo,
-    ) -> Option<ValidSignal> {
-        preference(evidence).map(|word| ValidSignal::new(short(), SCHEME, word.as_str()))
+    fn valid_signal(&self, call: ModuleCall<'_>) -> Option<ValidSignal> {
+        call.inject(self, Self::read_signal).ok().flatten()
     }
 
     /// The Model Terms, whenever a word is present, because either answer is
     /// given under them. Nothing is declared without an answer.
-    fn tdls(&self, _consent: &ConsentContext, evidence: &dyn RequestInfo) -> Vec<Tdl> {
-        if preference(evidence).is_none() {
-            return Vec::new();
-        }
-        Tdl::new(TERMS).into_iter().collect()
+    fn tdls(&self, call: ModuleCall<'_>) -> Vec<Tdl> {
+        call.inject(self, Self::read_tdls).unwrap_or_default()
     }
 }
 
@@ -242,6 +248,7 @@ mod tests {
     use http::HeaderMap;
 
     use super::*;
+    use trusted_server_core::consent::ConsentContext;
     use trusted_server_core::evidence::OwnedRequestInfo;
     use trusted_server_core::permissions::Acquisition;
 
@@ -510,29 +517,21 @@ mod tests {
 
     #[test]
     fn vouches_for_the_word_and_declares_the_terms_only_when_one_is_present() {
-        let consent = ConsentContext::default();
         let module = MtmModule::new();
         assert_eq!(
-            module.valid_signal(&consent, &with_cookie("standard")),
+            module.read_signal(&with_cookie("standard")),
             Some(ValidSignal::new(short(), SCHEME, "standard"))
         );
-        let declared = module.tdls(&consent, &with_cookie("personalized"));
+        let declared = module.read_tdls(&with_cookie("personalized"));
         assert_eq!(
             declared.iter().map(Tdl::as_str).collect::<Vec<_>>(),
             vec![TERMS],
             "an answer is given under the Model Terms"
         );
-        assert_eq!(module.valid_signal(&consent, &with_cookie("maybe")), None);
-        assert!(module.tdls(&consent, &with_cookie("maybe")).is_empty());
-        assert_eq!(
-            module.valid_signal(&consent, &OwnedRequestInfo::default()),
-            None
-        );
-        assert!(
-            module
-                .tdls(&consent, &OwnedRequestInfo::default())
-                .is_empty()
-        );
+        assert_eq!(module.read_signal(&with_cookie("maybe")), None);
+        assert!(module.read_tdls(&with_cookie("maybe")).is_empty());
+        assert_eq!(module.read_signal(&OwnedRequestInfo::default()), None);
+        assert!(module.read_tdls(&OwnedRequestInfo::default()).is_empty());
     }
 
     /// `non-marketing` changes nothing, so every Data Use the Model Terms
@@ -556,15 +555,14 @@ mod tests {
     #[test]
     fn non_marketing_is_still_a_recorded_answer_under_the_terms() {
         let evidence = with_cookie("non-marketing");
-        let consent = ConsentContext::default();
         let module = MtmModule::new();
 
         let signal = module
-            .valid_signal(&consent, &evidence)
+            .read_signal(&evidence)
             .expect("a decline is a valid answer");
         assert_eq!(signal.value, "non-marketing");
         assert_eq!(
-            module.tdls(&consent, &evidence).len(),
+            module.read_tdls(&evidence).len(),
             1,
             "the answer was given under the Model Terms whatever it said",
         );

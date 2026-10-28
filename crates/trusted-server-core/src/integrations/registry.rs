@@ -18,6 +18,7 @@ use crate::ec::module::{EcModuleSelection, EdgeCookieModule};
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
+use crate::module_context::{ModuleCall, ModuleContext, ResolvedRequest};
 use crate::platform::{DisabledGeo, PlatformGeo, RuntimeServices};
 use crate::settings::Settings;
 use crate::streaming_processor::StreamProcessor;
@@ -416,11 +417,21 @@ pub trait IntegrationProxy: Send + Sync {
     /// or define routes manually for backwards compatibility.
     fn routes(&self) -> Vec<IntegrationEndpoint>;
 
+    /// The permissions this route declares, which decide whether a gated
+    /// value, such as the Edge Cookie identifier, is passed to it. None by
+    /// default.
+    fn required_permissions(&self) -> crate::permissions::PermissionSet {
+        crate::permissions::PermissionSet::none()
+    }
+
     /// Handle the proxied request.
+    ///
+    /// Hand a function to [`ModuleCall::inject_with`] with `req` as its
+    /// argument. A route whose use needs a permission declares it and checks
+    /// it is granted, because nothing gates the route itself.
     async fn handle(
         &self,
-        settings: &Settings,
-        services: &RuntimeServices,
+        call: ModuleCall<'_>,
         req: Request<EdgeBody>,
     ) -> Result<Response<EdgeBody>, Report<TrustedServerError>>;
 
@@ -1916,7 +1927,20 @@ impl IntegrationRegistry {
             // Remove any caller-supplied EC header rather than forwarding it.
             req.headers_mut().remove(HEADER_X_TS_EC.clone());
 
-            Some(proxy.handle(settings, services, req).await)
+            // The route takes the request, so the context holds a copy of
+            // what it resolved to, beside what was resolved for it.
+            let resolved = ResolvedRequest::of(&req, services.client_info());
+            let context = ModuleContext::new(resolved.view())
+                .with_settings(settings)
+                .with_request_state(ec_context, services);
+            Some(
+                proxy
+                    .handle(
+                        context.call(proxy.integration_name(), proxy.required_permissions()),
+                        req,
+                    )
+                    .await,
+            )
         } else {
             None
         }
@@ -3327,8 +3351,7 @@ mod tests {
 
         async fn handle(
             &self,
-            _settings: &Settings,
-            _services: &RuntimeServices,
+            _call: crate::module_context::ModuleCall<'_>,
             _req: Request<EdgeBody>,
         ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
             Ok(Response::new(EdgeBody::empty()))
@@ -3410,8 +3433,7 @@ mod tests {
 
         async fn handle(
             &self,
-            _settings: &Settings,
-            _services: &RuntimeServices,
+            _call: crate::module_context::ModuleCall<'_>,
             req: http::Request<EdgeBody>,
         ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
             let response = http::Response::builder()
@@ -3903,8 +3925,7 @@ mod tests {
 
         async fn handle(
             &self,
-            _settings: &Settings,
-            _services: &RuntimeServices,
+            _call: crate::module_context::ModuleCall<'_>,
             req: Request<EdgeBody>,
         ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
             let mut response = Response::builder()
@@ -3967,6 +3988,118 @@ mod tests {
         assert!(
             response.headers().get("x-echo-ts-ec").is_none(),
             "should not have x-ts-ec header on integration request"
+        );
+    }
+
+    /// A route that answers with what its module call handed it.
+    struct StateRoute {
+        declared: PermissionSet,
+    }
+
+    impl StateRoute {
+        fn report(
+            &self,
+            _req: Request<EdgeBody>,
+            request: crate::module_context::ModuleRequest<'_>,
+            permissions: &PermissionState,
+            edge_cookie: Option<crate::module_context::EdgeCookie<'_>>,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+            let body = format!(
+                "{} storage={} id={}",
+                request.host(),
+                permissions.is_set(Permission::StoreOnDevice),
+                edge_cookie.map_or("none", |id| id.as_str()),
+            );
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(EdgeBody::from(body))
+                .expect("should build the response"))
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl IntegrationProxy for StateRoute {
+        fn integration_name(&self) -> &'static str {
+            "state"
+        }
+
+        fn routes(&self) -> Vec<IntegrationEndpoint> {
+            vec![IntegrationEndpoint::get("/integrations/test/state")]
+        }
+
+        fn required_permissions(&self) -> PermissionSet {
+            self.declared
+        }
+
+        async fn handle(
+            &self,
+            call: ModuleCall<'_>,
+            req: Request<EdgeBody>,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+            call.inject_with(self, req, Self::report)?
+        }
+    }
+
+    /// A route is handed the permissions resolved for its request, and the
+    /// request's Edge Cookie identifier when it declares the permission the
+    /// identifier's use needs.
+    #[test]
+    fn a_route_is_handed_its_requests_permissions_and_identity() {
+        let settings = create_test_settings();
+        let storage = PermissionSet::none().with(Permission::StoreOnDevice);
+        let answer = |declared: PermissionSet| {
+            let registry = IntegrationRegistry::from_routes(vec![(
+                Method::GET,
+                "/integrations/test/state",
+                (
+                    Arc::new(StateRoute { declared }) as Arc<dyn IntegrationProxy>,
+                    "state",
+                ),
+            )]);
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri("https://test-publisher.com/integrations/test/state")
+                .header(header::HOST, "test-publisher.com")
+                .body(EdgeBody::empty())
+                .expect("should build request");
+            let mut ec_context = EcContext::new_for_test(
+                Some("an-id".to_owned()),
+                crate::consent::ConsentContext::default(),
+            )
+            .with_module_for_test(Arc::new(crate::ec::module::HmacModule::new(
+                crate::redacted::Redacted::new("test-secret-key-32-bytes-minimum".to_owned()),
+            )));
+            let services = noop_services();
+            let response = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
+                method: &Method::GET,
+                path: "/integrations/test/state",
+                settings: &settings,
+                kv: None,
+                ec_context: &mut ec_context,
+                services: &services,
+                req,
+            }))
+            .expect("should find the route")
+            .expect("the route should answer");
+            String::from_utf8(
+                response
+                    .into_body()
+                    .into_bytes()
+                    .unwrap_or_default()
+                    .to_vec(),
+            )
+            .expect("the answer is text")
+        };
+
+        assert_eq!(
+            answer(storage),
+            "test-publisher.com storage=true id=an-id",
+            "a route declaring storage is handed the identifier"
+        );
+        assert_eq!(
+            answer(PermissionSet::none()),
+            "test-publisher.com storage=true id=none",
+            "and one declaring nothing still sees the permissions but not the identifier"
         );
     }
 
@@ -5184,8 +5317,7 @@ mod tests {
 
         async fn detect(
             &self,
-            _request_info: &dyn crate::evidence::RequestInfo,
-            _services: &crate::platform::RuntimeServices,
+            _call: crate::module_context::ModuleCall<'_>,
         ) -> crate::ec::device::DeviceSignals {
             crate::ec::device::DeviceSignals {
                 is_mobile: 2,
@@ -5507,8 +5639,7 @@ mod tests {
 
         async fn detect(
             &self,
-            _request_info: &dyn crate::evidence::RequestInfo,
-            _services: &crate::platform::RuntimeServices,
+            _call: crate::module_context::ModuleCall<'_>,
         ) -> crate::ec::device::DeviceSignals {
             crate::ec::device::DeviceSignals {
                 is_mobile: 1,
@@ -5537,9 +5668,7 @@ mod tests {
 
         async fn generate(
             &self,
-            _request_info: &dyn crate::evidence::RequestInfo,
-            _input: &crate::ec::module::IdentityInput<'_>,
-            _services: &crate::platform::RuntimeServices,
+            _call: crate::module_context::ModuleCall<'_>,
         ) -> Result<crate::ec::module::GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(crate::ec::module::GeneratedEdgeCookie::default())
         }

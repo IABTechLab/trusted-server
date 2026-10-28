@@ -152,18 +152,30 @@ impl RequestInfo {
     /// [`sanitize_forwarded_headers`] at the edge, so `Host` and
     /// [`ClientInfo`] TLS detection are the only sources that fire.
     pub fn from_request(req: &Request<EdgeBody>, client_info: &ClientInfo) -> Self {
-        let host = extract_request_host(req);
-        let scheme = detect_request_scheme(
-            req,
-            client_info.tls_protocol.as_deref(),
-            client_info.tls_cipher.as_deref(),
-        );
-
-        Self { host, scheme }
+        Self {
+            host: request_host(req).to_owned(),
+            scheme: request_scheme(req, client_info).to_owned(),
+        }
     }
 }
 
-fn extract_request_host(req: &Request<EdgeBody>) -> String {
+/// The host a request was made for, read as [`RequestInfo::from_request`]
+/// reads it, borrowed from the request.
+pub(crate) fn request_host(req: &Request<EdgeBody>) -> &str {
+    extract_request_host(req)
+}
+
+/// The scheme a request was made over, read as
+/// [`RequestInfo::from_request`] reads it.
+pub(crate) fn request_scheme(req: &Request<EdgeBody>, client_info: &ClientInfo) -> &'static str {
+    detect_request_scheme(
+        req,
+        client_info.tls_protocol.as_deref(),
+        client_info.tls_cipher.as_deref(),
+    )
+}
+
+fn extract_request_host(req: &Request<EdgeBody>) -> &str {
     req.headers()
         .get("forwarded")
         .and_then(|h| h.to_str().ok())
@@ -180,7 +192,6 @@ fn extract_request_host(req: &Request<EdgeBody>) -> String {
                 .and_then(|h| h.to_str().ok())
         })
         .unwrap_or_default()
-        .to_owned()
 }
 
 fn parse_forwarded_param<'a>(forwarded: &'a str, param: &str) -> Option<&'a str> {
@@ -221,9 +232,15 @@ fn strip_quotes(value: &str) -> &str {
     }
 }
 
-fn normalize_scheme(value: &str) -> Option<String> {
-    let scheme = value.trim().to_ascii_lowercase();
-    (scheme == "https" || scheme == "http").then_some(scheme)
+fn normalize_scheme(value: &str) -> Option<&'static str> {
+    let scheme = value.trim();
+    if scheme.eq_ignore_ascii_case("https") {
+        Some("https")
+    } else if scheme.eq_ignore_ascii_case("http") {
+        Some("http")
+    } else {
+        None
+    }
 }
 
 /// Detects the request scheme (HTTP or HTTPS) using Fastly SDK methods and headers.
@@ -238,17 +255,17 @@ fn detect_request_scheme(
     req: &Request<EdgeBody>,
     tls_protocol: Option<&str>,
     tls_cipher: Option<&str>,
-) -> String {
+) -> &'static str {
     // 1. First try ClientInfo TLS fields populated at the adapter entry point.
     if let Some(tls_protocol) = tls_protocol {
         log::debug!("TLS protocol detected: {tls_protocol}");
-        return "https".to_owned();
+        return "https";
     }
 
     // Also check TLS cipher - if present, connection is HTTPS.
     if tls_cipher.is_some() {
         log::debug!("TLS cipher detected, using HTTPS");
-        return "https".to_owned();
+        return "https";
     }
 
     // 2. Try the Forwarded header (RFC 7239)
@@ -284,11 +301,11 @@ fn detect_request_scheme(
         && let Ok(ssl_str) = ssl.to_str()
         && (ssl_str == "1" || ssl_str.to_lowercase() == "true")
     {
-        return "https".to_owned();
+        return "https";
     }
 
     // Default to HTTP
-    "http".to_owned()
+    "http"
 }
 
 /// Build a static text response with strong `ETag` and standard caching headers.

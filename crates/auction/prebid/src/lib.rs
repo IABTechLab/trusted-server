@@ -1126,6 +1126,33 @@ pub fn register(
     ))
 }
 
+impl PrebidIntegration {
+    async fn route(
+        &self,
+        req: http::Request<EdgeBody>,
+        settings: &Settings,
+        services: &RuntimeServices,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        let path = req.uri().path().to_string();
+        let method = req.method().clone();
+
+        match method {
+            Method::GET if self.is_managed_external() && path == PREBID_BUNDLE_ROUTE => {
+                self.handle_external_bundle(settings, services, req).await
+            }
+            // Serve empty JS for matching script patterns
+            Method::GET if self.matches_script_pattern(&path) => self.handle_script_handler(),
+            _ => http::Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(EdgeBody::from("Not Found"))
+                .change_context(TrustedServerError::Integration {
+                    integration: PREBID_INTEGRATION_ID.to_string(),
+                    message: "Failed to build Prebid not found response".to_string(),
+                }),
+        }
+    }
+}
+
 #[async_trait(?Send)]
 impl IntegrationProxy for PrebidIntegration {
     fn integration_name(&self) -> &'static str {
@@ -1152,27 +1179,10 @@ impl IntegrationProxy for PrebidIntegration {
 
     async fn handle(
         &self,
-        settings: &Settings,
-        services: &RuntimeServices,
+        call: trusted_server_core::module_context::ModuleCall<'_>,
         req: http::Request<EdgeBody>,
     ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
-        let path = req.uri().path().to_string();
-        let method = req.method().clone();
-
-        match method {
-            Method::GET if self.is_managed_external() && path == PREBID_BUNDLE_ROUTE => {
-                self.handle_external_bundle(settings, services, req).await
-            }
-            // Serve empty JS for matching script patterns
-            Method::GET if self.matches_script_pattern(&path) => self.handle_script_handler(),
-            _ => http::Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(EdgeBody::from("Not Found"))
-                .change_context(TrustedServerError::Integration {
-                    integration: PREBID_INTEGRATION_ID.to_string(),
-                    message: "Failed to build Prebid not found response".to_string(),
-                }),
-        }
+        call.inject_with(self, req, Self::route)?.await
     }
 }
 
