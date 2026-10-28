@@ -260,10 +260,10 @@ After migrating:
 4. Push the configuration and the policy file with the new build, because a
    build from before this release refuses the migrated configuration and this
    release refuses the old one. On Fastly, `ts deploy --staging` and
-   `ts config push --staging` let you check the pair together first. On
-   Cloudflare and Spin, keep the key-value store this release requires, the
-   Workers KV binding `TRUSTED_SERVER_KV` and Spin's `default` store, or every
-   request fails.
+   `ts config push --staging --permissions <file>` let you check the pair
+   together first. On Cloudflare and Spin, keep the key-value store this
+   release requires, the Workers KV binding `TRUSTED_SERVER_KV` and Spin's
+   `default` store, or every request fails.
 5. Expect the stored pages and the publisher's stored assets to be fetched
    again once after the upgrade, because their keys hold a code worked out from
    the settings.
