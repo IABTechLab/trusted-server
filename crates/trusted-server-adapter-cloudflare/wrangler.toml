@@ -21,11 +21,15 @@ binding = "TRUSTED_SERVER_KV"
 # `wrangler dev --local` (Miniflare default) tolerates this placeholder.
 id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
 
-[vars]
-# TRUSTED_SERVER_CONFIG is required at startup. Replace this intentionally
-# invalid placeholder with JSON containing the manifest-default app-config blob
-# envelope before deploying or running `wrangler dev` against real traffic.
-TRUSTED_SERVER_CONFIG = '{"trusted_server_config":""}'
+# The config store. `ts config push --adapter cloudflare` writes the settings
+# blob into this namespace and the Worker reads it when it builds its
+# application. The binding is the store's platform name, which
+# EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME changes, and
+# `ts provision --adapter cloudflare` creates the namespace and writes its id
+# here.
+[[kv_namespaces]]
+binding = "trusted_server_config"
+id = "REPLACE_WITH_YOUR_CONFIG_KV_NAMESPACE_ID"
 
 # App-config secret values are provisioned as Worker secrets with
 # `wrangler secret put <key-name>`. The pushed blob contains only those key
