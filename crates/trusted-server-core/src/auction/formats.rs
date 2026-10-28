@@ -316,14 +316,16 @@ pub(crate) struct OpenRtbResponseConversion {
 ///
 /// Creative HTML in the `adm` field is optionally sanitized and optionally
 /// rewritten according to the auction configuration
-/// ([`AuctionConfig::sanitize_creatives`], opt-in, and
-/// [`AuctionConfig::rewrite_creatives`], default-on); with both disabled the
-/// creative ships exactly as the bidder returned it, subject to the 1 MiB
-/// per-creative cap. Typed renderers are serialized in the response extension
+/// ([`AuctionConfig::sanitize_creatives`], opt-in;
+/// [`AuctionConfig::rewrite_creatives`] for assets, default-on; and
+/// [`AuctionConfig::rewrite_clicks`] for links, following `rewrite_creatives`
+/// when unset); with all disabled the creative ships exactly as the bidder
+/// returned it, subject to the 1 MiB per-creative cap. Typed renderers are serialized in the response extension
 /// instead of entering that pipeline at all.
 ///
 /// [`AuctionConfig::sanitize_creatives`]: crate::auction_config_types::AuctionConfig::sanitize_creatives
 /// [`AuctionConfig::rewrite_creatives`]: crate::auction_config_types::AuctionConfig::rewrite_creatives
+/// [`AuctionConfig::rewrite_clicks`]: crate::auction_config_types::AuctionConfig::rewrite_clicks
 ///
 /// # Errors
 ///
@@ -373,9 +375,10 @@ pub(crate) fn convert_to_openrtb_response_with_report(
         let height = to_openrtb_i32(bid.height, "height", &bid_context);
 
         // Ordinary markup goes through the configured creative processing:
-        // sanitization is opt-in, rewriting is on by default, and with both
-        // disabled the creative ships exactly as the bidder returned it. A typed
-        // renderer is serialized separately and never enters that pipeline.
+        // sanitization is opt-in, asset rewriting and click wrapping are on by
+        // default, and with all three disabled the creative ships exactly as
+        // the bidder returned it. A typed renderer is serialized separately and
+        // never enters that pipeline.
         let serialize_renderer = |renderer: &BidRenderer| {
             (BidExt {
                 trusted_server: BidTrustedServerExt { renderer },
@@ -398,12 +401,13 @@ pub(crate) fn convert_to_openrtb_response_with_report(
             let processed = creative::process_auction_creative(settings, raw_creative);
 
             log::debug!(
-                "Processed creative for auction {} slot {} bidder {} (sanitize {}, rewrite {}, raw {} bytes, output {} bytes)",
+                "Processed creative for auction {} slot {} bidder {} (sanitize {}, rewrite {}, clicks {}, raw {} bytes, output {} bytes)",
                 auction_request.id,
                 slot_id,
                 bid.bidder,
                 settings.auction.sanitize_creatives,
                 rewrite_creatives,
+                settings.auction.rewrites_auction_clicks(),
                 raw_creative.len(),
                 processed.len()
             );
@@ -1410,6 +1414,37 @@ mod tests {
         assert!(
             adm.contains("auction-handler-marker"),
             "should preserve event handlers when sanitization is disabled: {adm}"
+        );
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_wraps_clicks_without_rewriting_assets() {
+        let mut settings = make_settings();
+        settings.auction.sanitize_creatives = false;
+        settings.auction.rewrite_creatives = false;
+        settings.auction.rewrite_clicks = Some(true);
+        let auction_request = make_auction_request();
+        let result = make_result(make_complete_creative_bid());
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
+            .expect("should convert creative with click rewriting only");
+        let adm = response_adm(response);
+
+        assert!(
+            adm.contains("/first-party/click?tsurl=") && adm.contains("data-tsclick"),
+            "should wrap the landing link: {adm}"
+        );
+        assert!(
+            !adm.contains("/first-party/proxy?tsurl="),
+            "should not proxy any asset: {adm}"
+        );
+        assert!(
+            adm.contains(r#"src="https://cdn.example.com/ad.png""#),
+            "should keep the image URL direct: {adm}"
+        );
+        assert!(
+            adm.contains("tsjs-unified.min.js"),
+            "should inject the creative runtime for the click guard: {adm}"
         );
     }
 
