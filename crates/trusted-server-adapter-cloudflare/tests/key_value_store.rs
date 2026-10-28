@@ -16,6 +16,7 @@ use edgezero_core::params::PathParams;
 use edgezero_core::store_registry::KvRegistry;
 use trusted_server_adapter_cloudflare::app::TrustedServerApp;
 use trusted_server_adapter_cloudflare::platform::build_runtime_services;
+use trusted_server_core::permissions::PermissionPolicy;
 use trusted_server_core::settings::Settings;
 
 /// A key-value store kept in memory, standing in for the Workers KV
@@ -97,7 +98,12 @@ async fn the_declared_store_is_the_key_value_store_a_request_is_given() {
     request.extensions_mut().insert(registry);
     let ctx = RequestContext::new(request, PathParams::default());
 
-    let services = build_runtime_services(&ctx, &Settings::default(), &Arc::default());
+    let services = build_runtime_services(
+        &ctx,
+        &Settings::default(),
+        &Arc::default(),
+        &PermissionPolicy::sample(),
+    );
     services
         .kv_store()
         .put_bytes("a-key", Bytes::from_static(b"a value"))

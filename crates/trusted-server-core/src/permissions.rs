@@ -23,9 +23,10 @@
 //! How a permission is acquired varies by place, so the policy is written as a
 //! tree of places: the top of the tree stands for the whole world, countries
 //! sit under it keyed by ISO 3166-1 alpha-2 code, and a country's regions sit
-//! under that country keyed by ISO 3166-2 subdivision code.
-//! [`PermissionMaps::standard`] loads that tree from the embedded
-//! `permissions.yaml` (see `DEFAULT_PERMISSION_RULES`).
+//! under that country keyed by ISO 3166-2 subdivision code. The tree is
+//! the publisher's policy file, which a domain's settings name in
+//! `[permissions] policy` and [`load_policy`] checks and parses when the
+//! domain loads. No build carries a policy.
 //!
 //! Resolution takes the most specific match and falls back to the node above:
 //! the request's region when it is listed, otherwise its country, otherwise
@@ -39,12 +40,15 @@
 //! [`PermissionMaps::floor_with`]).
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
+use error_stack::Report;
 use serde::Deserialize;
 use serde_yaml_ng::Value;
+use sha2::{Digest as _, Sha256};
 
 use crate::consent::jurisdiction::Jurisdiction;
+use crate::error::TrustedServerError;
 use crate::tdl::Tdl;
 
 /// A technical permission a module may require, labeled with its Privacy
@@ -524,14 +528,6 @@ pub struct PermissionMaps {
     signals: SignalPolicy,
 }
 
-/// The default permission rules, compiled into the build from the repository's
-/// sample in `config/permissions`.
-///
-/// That sample is for testing and evaluation only and is not a production
-/// policy. A deployer chooses or replaces the compiled-in file to set the
-/// default policy, which is not read at runtime.
-const DEFAULT_PERMISSION_RULES: &str = include_str!("../../../config/permissions/sample.yaml");
-
 /// Builds the upper-cased `COUNTRY:REGION` key for [`PermissionMaps::by_region`].
 fn region_key(country: &str, region: &str) -> String {
     format!(
@@ -553,8 +549,8 @@ impl PermissionMaps {
     /// any signal policy in the code.
     #[must_use]
     // Public because the permission signal module crates live outside core
-    // and read the deployment's policy, in their tests and where a module
-    // needs the shipped decisions rather than a policy built by hand.
+    // and their tests read the decisions of the repository's sample
+    // rather than a policy built by hand.
     pub fn signals(&self) -> &SignalPolicy {
         &self.signals
     }
@@ -635,25 +631,6 @@ impl PermissionMaps {
             return jurisdiction.clone();
         }
         self.default_jurisdiction()
-    }
-
-    /// The built-in default rules, parsed from the embedded `permissions.yaml`
-    /// (see `DEFAULT_PERMISSION_RULES`).
-    ///
-    /// The parse runs once per instance and the result is cached.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the embedded `permissions.yaml` fails to parse. The file is a
-    /// build-time constant covered by tests, so a panic means the committed file
-    /// is malformed, not a runtime condition.
-    #[must_use]
-    pub fn standard() -> &'static Self {
-        static CACHE: OnceLock<PermissionMaps> = OnceLock::new();
-        CACHE.get_or_init(|| {
-            Self::from_yaml(DEFAULT_PERMISSION_RULES)
-                .expect("should parse the embedded default permissions.yaml")
-        })
     }
 
     /// Builds the maps from a `permissions.yaml` document: named `groups`, the
@@ -814,6 +791,190 @@ impl PermissionMaps {
                 ConsentSignal::Neutral
             }
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The policy file a domain runs
+// ---------------------------------------------------------------------------
+
+/// The SHA-256 that pins a policy file: the digest of its exact bytes, in
+/// lower-case hexadecimal.
+///
+/// A checkout that converts line endings changes the bytes and so the
+/// digest, so the file has to reach the push byte for byte.
+#[must_use]
+pub fn policy_sha256(text: &str) -> String {
+    hex::encode(Sha256::digest(text.as_bytes()))
+}
+
+/// The policy file a domain's settings name, pinned to the exact bytes the
+/// push supplied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyReference {
+    /// The file's stem, as `[permissions] policy` names it.
+    pub policy: String,
+    /// The SHA-256 of the file, as [`policy_sha256`] forms it.
+    pub sha256: String,
+}
+
+/// A domain's permission policy: the file its settings name, checked
+/// against the digest they pin and parsed.
+#[derive(Debug)]
+pub struct PermissionPolicy {
+    reference: PolicyReference,
+    maps: Arc<PermissionMaps>,
+}
+
+/// The name of the policy [`PermissionPolicy::granting_nothing`] builds.
+const GRANTING_NOTHING_NAME: &str = "granting-nothing";
+
+impl PermissionPolicy {
+    /// The policy's name, the stem of its file.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.reference.policy
+    }
+
+    /// The SHA-256 of the policy's file.
+    #[must_use]
+    pub fn sha256(&self) -> &str {
+        &self.reference.sha256
+    }
+
+    /// The rules and signal decisions the policy declares.
+    #[must_use]
+    pub fn maps(&self) -> &PermissionMaps {
+        &self.maps
+    }
+
+    /// A policy that grants nothing, for a services graph that decides no
+    /// request's permissions and carries a policy only because every graph
+    /// does. It is built from the types rather than loaded, so no policy
+    /// text exists for it, and its digest is that of empty text.
+    #[must_use]
+    pub fn granting_nothing() -> Arc<Self> {
+        Arc::new(Self {
+            reference: PolicyReference {
+                policy: GRANTING_NOTHING_NAME.to_owned(),
+                sha256: policy_sha256(""),
+            },
+            maps: Arc::new(
+                PermissionMaps::empty()
+                    .with_default_rules(CountryRules::with_default(Acquisition::Denied))
+                    .with_default_jurisdiction(Jurisdiction::NonRegulated),
+            ),
+        })
+    }
+}
+
+/// Checks `text` against the digest `reference` pins and parses it into a
+/// domain's policy.
+///
+/// A digest never changes what it names, so the parsed rules are kept for
+/// as long as the instance runs, and a later load of the same digest parses
+/// nothing.
+///
+/// # Errors
+///
+/// [`TrustedServerError::Configuration`] when the SHA-256 of `text` is not
+/// the one `reference` pins, or `text` is not a valid policy.
+pub fn load_policy(
+    reference: PolicyReference,
+    text: &str,
+) -> Result<Arc<PermissionPolicy>, Report<TrustedServerError>> {
+    let sha256 = policy_sha256(text);
+    if sha256 != reference.sha256 {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "the permission policy `{}` is not the file that was pushed: its SHA-256 is {sha256}, and the configuration pins {}",
+                reference.policy, reference.sha256
+            ),
+        }));
+    }
+    let maps = parsed_policy(&sha256, text).map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "the permission policy `{}` is not valid: {error}",
+                reference.policy
+            ),
+        })
+    })?;
+    Ok(Arc::new(PermissionPolicy { reference, maps }))
+}
+
+/// The rules of the policy file whose SHA-256 is `sha256`, parsed from
+/// `text` the first time this instance meets the digest.
+fn parsed_policy(sha256: &str, text: &str) -> Result<Arc<PermissionMaps>, PermissionsError> {
+    static PARSED: OnceLock<Mutex<BTreeMap<String, Arc<PermissionMaps>>>> = OnceLock::new();
+    let parsed = PARSED.get_or_init(Mutex::default);
+    if let Some(maps) = parsed
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(sha256)
+    {
+        return Ok(Arc::clone(maps));
+    }
+    // Parsed outside the lock, so a long parse holds up no other load.
+    let maps = Arc::new(PermissionMaps::from_yaml(text)?);
+    Ok(Arc::clone(
+        parsed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(sha256.to_owned())
+            .or_insert(maps),
+    ))
+}
+
+/// The repository's sample policy, for tests. No build a deployment runs
+/// carries it.
+#[cfg(any(test, feature = "test-utils"))]
+pub const SAMPLE_POLICY_TEXT: &str = include_str!("../../../config/permissions/sample.yaml");
+
+/// The name a test's settings give the repository's sample policy.
+#[cfg(any(test, feature = "test-utils"))]
+pub const SAMPLE_POLICY_NAME: &str = "sample";
+
+/// The repository's sample, loaded once as a domain that names it would load
+/// it.
+#[cfg(any(test, feature = "test-utils"))]
+fn sample_policy() -> &'static Arc<PermissionPolicy> {
+    static SAMPLE: OnceLock<Arc<PermissionPolicy>> = OnceLock::new();
+    SAMPLE.get_or_init(|| {
+        load_policy(
+            PolicyReference {
+                policy: SAMPLE_POLICY_NAME.to_owned(),
+                sha256: policy_sha256(SAMPLE_POLICY_TEXT),
+            },
+            SAMPLE_POLICY_TEXT,
+        )
+        .expect("should load the repository's sample policy")
+    })
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl PermissionPolicy {
+    /// The repository's sample policy, for tests.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the sample does not load, which its own tests catch.
+    #[must_use]
+    pub fn sample() -> Arc<Self> {
+        Arc::clone(sample_policy())
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl PermissionMaps {
+    /// The rules of the repository's sample policy, for tests.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the sample does not load, which its own tests catch.
+    #[must_use]
+    pub fn sample() -> &'static Self {
+        sample_policy().maps()
     }
 }
 
@@ -1187,7 +1348,7 @@ fn parse_acquisition(value: &str) -> Result<Acquisition, PermissionsError> {
 /// Builds a group's [`CountryRules`] from its flag map. Each key names a
 /// permission and its flag; an optional `default` key sets any permission the
 /// group omits. A group without a `default` must list every permission, so its
-/// meaning is fully explicit (this is how the shipped groups are written).
+/// meaning is fully explicit (this is how the sample's groups are written).
 fn group_rules(
     name: &str,
     flags: &BTreeMap<String, String>,
@@ -1435,18 +1596,6 @@ fn check_duplicate<'a>(
         });
     }
     Ok(())
-}
-
-/// Parses the compiled `permissions.yaml`, so startup validation can reject a
-/// malformed policy with a configuration error instead of panicking on the
-/// first lookup.
-///
-/// # Errors
-///
-/// Returns the same [`PermissionsError`] values [`PermissionMaps::from_yaml`]
-/// does, most usefully a top node that omits `group` or `jurisdiction`.
-pub fn validate_default_policy() -> Result<(), PermissionsError> {
-    PermissionMaps::from_yaml(DEFAULT_PERMISSION_RULES).map(|_| ())
 }
 
 /// An error parsing a `permissions.yaml` document.
@@ -1876,8 +2025,8 @@ mod tests {
     }
 
     #[test]
-    fn standard_maps_eu_requires_signal_and_uk_grants_storage() {
-        let maps = PermissionMaps::standard();
+    fn sample_maps_eu_requires_signal_and_uk_grants_storage() {
+        let maps = PermissionMaps::sample();
         assert!(
             !maps
                 .resolve(Some("DE"), |_| false)
@@ -1897,8 +2046,8 @@ mod tests {
     }
 
     #[test]
-    fn standard_maps_us_and_australia_grant_storage_by_default() {
-        let maps = PermissionMaps::standard();
+    fn sample_maps_us_and_australia_grant_storage_by_default() {
+        let maps = PermissionMaps::sample();
         for code in ["US", "AU"] {
             assert!(
                 maps.resolve(Some(code), |_| false)
@@ -1919,7 +2068,7 @@ mod tests {
     #[test]
     fn resolve_with_revokes_a_granted_permission_on_opt_out() {
         // US grants necessary.operations.storage by default; an opt-out signal revokes it.
-        let maps = PermissionMaps::standard();
+        let maps = PermissionMaps::sample();
         assert!(
             maps.baseline(Some("US"), None)
                 .is_set(Permission::StoreOnDevice),
@@ -1941,7 +2090,7 @@ mod tests {
     #[test]
     fn a_region_entry_overrides_the_country_baseline() {
         // US grants by default; a state can require a signal instead.
-        let maps = PermissionMaps::standard().clone().with_region(
+        let maps = PermissionMaps::sample().clone().with_region(
             "US",
             "CA",
             CountryRules::with_default(Acquisition::RequiresSignal),
@@ -2390,11 +2539,11 @@ rules:
     }
 
     #[test]
-    fn the_shipped_policy_reproduces_the_retired_consent_lists() {
+    fn the_sample_policy_reproduces_the_retired_consent_lists() {
         // The policy tree carries the 31 GDPR countries and the 20 US
         // privacy states, in place of compiled defaults in the consent
-        // configuration, so the shipped file must resolve each to its regime.
-        let maps = PermissionMaps::standard();
+        // configuration, so the sample must resolve each to its regime.
+        let maps = PermissionMaps::sample();
         let gdpr_countries = [
             "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE",
             "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE", "IS",
@@ -2455,7 +2604,7 @@ rules:
     fn a_us_state_keeps_the_country_permission_baseline() {
         // Each listed state carries the same group as the country node, so
         // adding the states for the jurisdiction changed no permission.
-        let maps = PermissionMaps::standard();
+        let maps = PermissionMaps::sample();
         for state in ["CA", "TX", "DE", "RI", "WY"] {
             assert!(
                 maps.baseline(Some("US"), Some(state))
@@ -2467,7 +2616,7 @@ rules:
 
     #[test]
     fn from_yaml_accepts_an_explicit_group_listing_every_permission() {
-        // The shipped style: no `default`, every permission spelled out.
+        // The sample's style: no `default`, every permission spelled out.
         let mut group = String::from("groups:\n  everything:\n");
         for permission in Permission::all() {
             group.push_str(&format!("    {permission}: granted\n"));
@@ -2504,10 +2653,10 @@ rules:
 
     #[test]
     fn every_eu_and_eea_member_requires_a_signal_for_storage() {
-        // The shipped permissions.yaml must cover all 27 EU member states and
+        // The sample must cover all 27 EU member states and
         // the three EEA members, each resolving storage as requires-signal, so
         // no member state silently falls to the top of the tree.
-        let maps = PermissionMaps::standard();
+        let maps = PermissionMaps::sample();
         for country in [
             "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE",
             "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE", "IS",
@@ -2565,5 +2714,153 @@ signals:
             !signals.opt_out_revokes(Permission::StoreOnDevice),
             "an unlisted Data Use is not revoked by the opt-out"
         );
+    }
+
+    /// A small valid policy whose digest no other test uses.
+    fn policy_only_this_test_loads(group: &str) -> String {
+        format!(
+            "groups:\n  {group}:\n    default: requires_signal\nrules:\n  group: {group}\n  jurisdiction: unknown\n"
+        )
+    }
+
+    #[test]
+    fn the_policy_digest_is_the_lower_case_hex_sha256_of_the_exact_bytes() {
+        assert_eq!(
+            policy_sha256("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "should be the SHA-256 of the bytes in lower-case hexadecimal"
+        );
+        assert_ne!(
+            policy_sha256("groups: {}\n"),
+            policy_sha256("groups: {}\r\n"),
+            "a converted line ending should change the digest"
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_the_pinned_file_does_not_load() {
+        let reference = PolicyReference {
+            policy: "standard".to_owned(),
+            sha256: policy_sha256("a different file"),
+        };
+
+        let error = load_policy(reference, SAMPLE_POLICY_TEXT)
+            .expect_err("a file the digest does not pin should not load");
+
+        let message = format!("{error:?}");
+        assert!(
+            matches!(
+                error.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "should be a configuration error: {message}"
+        );
+        assert!(
+            message.contains("`standard`")
+                && message.contains(&policy_sha256(SAMPLE_POLICY_TEXT))
+                && message.contains(&policy_sha256("a different file")),
+            "should name the policy and both digests: {message}"
+        );
+    }
+
+    #[test]
+    fn a_pinned_file_that_is_not_a_valid_policy_does_not_load() {
+        // The top of the tree names no jurisdiction.
+        let text = "groups:\n  open:\n    default: granted\nrules:\n  group: open\n";
+        let reference = PolicyReference {
+            policy: "broken".to_owned(),
+            sha256: policy_sha256(text),
+        };
+
+        let error = load_policy(reference, text).expect_err("an invalid policy should not load");
+
+        let message = format!("{error:?}");
+        assert!(
+            matches!(
+                error.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "should be a configuration error: {message}"
+        );
+        assert!(
+            message.contains("`broken` is not valid") && message.contains("jurisdiction"),
+            "should name the policy and the parser's reason: {message}"
+        );
+    }
+
+    #[test]
+    fn two_loads_of_one_digest_parse_the_file_once() {
+        let text = policy_only_this_test_loads("parsed-once");
+        let reference = |policy: &str| PolicyReference {
+            policy: policy.to_owned(),
+            sha256: policy_sha256(&text),
+        };
+
+        let first = load_policy(reference("parsed-once"), &text).expect("should load");
+        let second = load_policy(reference("parsed-once"), &text).expect("should load again");
+
+        assert!(
+            Arc::ptr_eq(&first.maps, &second.maps),
+            "the second load should keep the rules the first one parsed"
+        );
+    }
+
+    #[test]
+    fn one_file_under_two_names_keeps_each_name() {
+        let text = policy_only_this_test_loads("two-names");
+        let load = |policy: &str| {
+            load_policy(
+                PolicyReference {
+                    policy: policy.to_owned(),
+                    sha256: policy_sha256(&text),
+                },
+                &text,
+            )
+            .expect("should load")
+        };
+
+        let first = load("standard");
+        let second = load("copy-of-standard");
+
+        assert_eq!(first.name(), "standard", "should keep the first name");
+        assert_eq!(
+            second.name(),
+            "copy-of-standard",
+            "should keep the second name"
+        );
+        assert!(
+            Arc::ptr_eq(&first.maps, &second.maps),
+            "one digest should parse once whatever it is called"
+        );
+    }
+
+    #[test]
+    fn the_sample_policy_loads_under_its_own_digest() {
+        let sample = PermissionPolicy::sample();
+
+        assert_eq!(sample.name(), SAMPLE_POLICY_NAME);
+        assert_eq!(sample.sha256(), policy_sha256(SAMPLE_POLICY_TEXT));
+        assert!(
+            std::ptr::eq(sample.maps(), PermissionMaps::sample()),
+            "the sample's rules should be parsed once for every test"
+        );
+    }
+
+    #[test]
+    fn the_policy_granting_nothing_grants_nothing() {
+        let policy = PermissionPolicy::granting_nothing();
+        let maps = policy.maps();
+
+        assert!(
+            maps.baseline(None, None).permissions().is_empty(),
+            "no permission should be set without a signal"
+        );
+        assert!(
+            maps.resolve(Some("GB"), |_| true).permissions().is_empty(),
+            "no permission should be set when every signal grants"
+        );
+        assert_eq!(maps.default_jurisdiction(), Jurisdiction::NonRegulated);
+        assert_eq!(policy.name(), GRANTING_NOTHING_NAME);
+        assert_eq!(policy.sha256(), policy_sha256(""));
     }
 }
