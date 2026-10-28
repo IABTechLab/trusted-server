@@ -1261,6 +1261,47 @@ privacy_states = ["CA"]
 }
 
 #[test]
+fn a_document_written_for_main_that_names_its_policy_migrates_as_main() {
+    let without = migrated(MAIN_BASE);
+    let with = migrated(&main_document("[permissions]\npolicy = \"standard\"\n"));
+
+    assert_eq!(
+        with.report.changed, without.report.changed,
+        "should make the same rewrites"
+    );
+    assert_eq!(
+        left_to_do(&with),
+        left_to_do(&without),
+        "should leave the same items apart from naming a policy"
+    );
+    assert!(
+        without.report.to_do.iter().any(|line| line == POLICY_TO_DO)
+            && !with.report.to_do.iter().any(|line| line == POLICY_TO_DO),
+        "only the document naming no policy should leave naming one to do"
+    );
+    assert_eq!(with.report.check, without.report.check);
+
+    let mut named = parsed(&with.text);
+    let permissions = named
+        .as_table_mut()
+        .and_then(|root| root.remove("permissions"))
+        .expect("should keep the policy's table");
+    assert_eq!(
+        permissions.get("policy").and_then(toml::Value::as_str),
+        Some("standard")
+    );
+    assert_eq!(
+        named,
+        parsed(&without.text),
+        "should migrate the rest as the same document without the policy"
+    );
+    // The migrated document holds `[source]`, which main did not read, so
+    // it is not taken as written for main again.
+    assert!(named.get("source").is_some());
+    assert!(validate_source_config(&with.text).is_ok());
+}
+
+#[test]
 fn a_document_that_names_no_policy_leaves_naming_one_to_do() {
     let migration = migrated(MAIN_BASE);
 

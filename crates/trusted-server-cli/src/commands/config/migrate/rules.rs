@@ -13,11 +13,14 @@ use trusted_server_core::prefix::PublicPrefix;
 use super::Adapter;
 use super::layout::{Layout, Step, TablePath, path, prefix_of, set_prefix, to_crlf, uses_crlf};
 
-/// The tables main read at the top level of a document. Main refused any
-/// other, so a document with `[publisher]` and only these tables was written
+/// The tables main read at the top level of a document, and `[permissions]`,
+/// which main did not read and which an operator may add before migrating to
+/// name the policy file this release requires. Main refused any other
+/// table, so a document with `[publisher]` and only these tables was written
 /// for main.
 const MAIN_TABLES: &[&str] = &[
     "publisher",
+    "permissions",
     "tester_cookie",
     "trusted_client_ip",
     "ec",
