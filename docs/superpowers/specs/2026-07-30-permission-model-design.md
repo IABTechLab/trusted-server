@@ -219,7 +219,7 @@ build its state from settings that carry none, through
 request is decided without a policy and nothing stands in for a missing one.
 The tests read the sample through `PermissionPolicy::sample()` and
 `PermissionMaps::sample()`, which only test builds and core's `test-utils`
-feature compile (`permissions.rs` lines 870 to 918), and the `gpc`, `gpp`,
+feature compile (`permissions.rs` lines 895 to 943), and the `gpc`, `gpp`,
 `tcf` and `us-privacy` crates list core with `test-utils` under their
 `[dev-dependencies]` for them.
 
@@ -305,7 +305,7 @@ that names each chunk with its length and SHA-256.
    and no reader of its own, and hands the runtime loader `PolicyOrigin::Blob`
    (the Fastly adapter's `app.rs` lines 232 to 238, Spin's `app.rs` line 137
    and Cloudflare's `app.rs` line 144). The loader,
-   `settings_from_config_blob` (`config_payload.rs` lines 51 to 83), takes
+   `settings_from_config_blob` (`config_payload.rs` lines 52 to 84), takes
    `text` out of the settings, checks its SHA-256 against `sha256`, parses it,
    and keeps the policy with the settings, which keep only its name and digest
    (`load_domain_policy`, lines 89 to 129), so a blob there without `text`
@@ -367,8 +367,9 @@ that names each chunk with its length and SHA-256.
    text arrives inside the blob. `load_policy` (`permissions.rs` line 821)
    checks the SHA-256 of the text against `sha256`, parses it, and keeps one
    parsed copy for each digest for the life of the instance, under whatever
-   name it is loaded (`parsed_policy`, lines 847 to 866), so two domains that
-   pin one digest share one copy.
+   name it is loaded (`parsed_policy`, lines 862 to 875), so two domains that
+   pin one digest share one copy. The runtime loader asks for that copy
+   (`held_policy`, lines 851 to 858) before it asks a source for the text.
 7. **Never started without a valid file.** A domain fails to load when its
    settings name no policy, or name one with no `sha256`, when the file is
    absent, which on Fastly, Cloudflare and Spin means a blob without `text`,
@@ -626,7 +627,7 @@ The draft's specific complaints are answered:
 No build compiles the sample in, so core's library code reads no policy file
 above the crate root, which settles the packaging concern the draft raised
 about the `include_str!` path. Only test builds and core's `test-utils`
-feature read the sample (`permissions.rs` lines 870 and 871, and §3.5), and
+feature read the sample (`permissions.rs` lines 895 and 896, and §3.5), and
 core's build script still reads the workspace's `Cargo.toml`, `Cargo.lock` and
 `edgezero.toml` above the crate root (`WORKSPACE_INPUTS` in `build.rs`).
 
@@ -1000,19 +1001,20 @@ instance is differs by adapter.
 | Spin       | Inside the blob, in the `default` key-value store the settings come from, read with it                                                                                                                                                                        | A component instance, which builds its state for each request and serves one request or several as Spin decides                                                                           |
 | Axum       | `<folder>/<name>.yaml`                                                                                                                                                                                                                                        | The process, which loads its settings once when it starts                                                                                                                                 |
 
-An instance takes the SHA-256 of the text on every load, and parses the text
-the first time it meets the digest. An instance that already holds the digest
-a blob names parses nothing, but it still reads the file and hashes it. The
-runtime loader asks its source for the text before anything looks for a
-parsed copy (`load_domain_policy`, `config_payload.rs` lines 131 to 171 at
-IABTechLab/trusted-server#1352), and `load_policy` takes the SHA-256 of the
-text it is handed before `parsed_policy` finds the copy the instance holds
-(`permissions.rs`). So from row 11 a host's blob costs an instance that
-already holds its digest the reads of its policy entry, through
-`FastlyPolicyEntries::policy_text` (the Fastly adapter's `platform.rs`),
-being the pointer and its chunks, five for the sample, and a hash of the
-text, and no parse. Checking the per-digest cache before asking the source is
-a change left for the measurement on Fastly staging that this section names.
+An instance reads, hashes and parses a policy file the first time it meets
+the file's digest. An instance that already holds the digest a blob names
+reads nothing, hashes nothing and parses nothing, because the runtime loader
+asks for the rules held for that digest before it asks its source for the
+text (`load_domain_policy` in `config_payload.rs`, through `held_policy` in
+`permissions.rs`). Every file that is read is still checked against the
+digest, and a file that is refused leaves nothing held, so the next load
+reads and checks that file again. Text that travels inside the blob is
+always checked, because it is already in hand, and a blob that should carry
+its policy's text and carries none is refused whatever the instance holds. So from row 11 a host's blob
+costs an instance that already holds its digest no read of its policy entry,
+and the reads of that entry, through `FastlyPolicyEntries::policy_text` (the
+Fastly adapter's `platform.rs`), being the pointer and its chunks, five for
+the sample, are paid once for each digest an instance meets.
 The parsed copies stay until the instance ends, with no lifetime of their
 own, because a digest never changes what it names. An instance keeps one
 copy for each digest its domains' blobs pin, so the hundred hosts that name
@@ -1024,10 +1026,10 @@ instance meets its digest (`parsed_policy` in `permissions.rs`), so on Fastly,
 where an instance serves one request unless the opt-in feature is built, a
 request parses its domain's file once, where before row 4 it parsed the
 compiled sample twice, once to check it and once on first use. What is new on
-Fastly is the digest, taken on every load, and the three to five reads that a
-blob carrying the sample adds, and from row 11, for a host's blob, five reads
-of its policy entry on every load, whether or not the instance already holds
-the digest.
+Fastly is the digest, taken on every load of a blob that carries its policy,
+and the three to five reads that such a blob adds, and from row 11, for a
+host's blob, five reads of its policy entry the first time an instance meets
+its digest.
 
 On Cloudflare, at row 4 (IABTechLab/trusted-server#1345), the Worker's fetch
 entry point `main` (the Cloudflare adapter's `lib.rs`) calls `build_app` for
@@ -2030,6 +2032,7 @@ include the changes that followed the first revision of this section on
 | 2026-10-15 | Fixes from review round 1. An unreadable record answered by its own module with nothing ahead of the modules, the fifth module `mtm` with its own section, registration through each adapter, the four members of the page state, the sharing pair on navigation and page-bids, the persisted consent, resolve endpoint and device module check named as built by other rows or not at all, what the policy parser does not reject, the Data Uses a signal reaches, the raw strings removed after assembly, a table of what each adapter runs, the upgrade list, the open questions and the review log. |
 | 2026-10-16 | Review round 2, approved with one minor point recorded in the Review log.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | 2026-10-27 | The policy file is never compiled into a build, as agreed with IAB Tech Lab at the Touchbase on 2026-10-23, and is selected and supplied when a service is deployed, as decided by 51Degrees after the Touchbase (§3.1). What row 4 builds and later rows add, Cloudflare reading its blob from the config store, the push, answers that follow the error's kind, and a blob's propagation (§3.1). What the build carries (§3.6), the cost of the fetch (§3.7), the failure modes (§6), the upgrade list (§6.1), the tests (§8), the records in §10 and §11, and the sample named as the sample.        |
+| 2026-10-27 | A load asks for the rules held for a pinned digest before it reads a source, so an instance that already holds a host's digest reads and hashes nothing for it (§3.7, item 6 of §3.1), a fix found in review. The line numbers of `permissions.rs` and `config_payload.rs` follow the fix.                                                                                                                                                                                                                                                                                                              |
 
 ## Review log
 
