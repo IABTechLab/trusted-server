@@ -1,4 +1,4 @@
-use crate::common::config::cloudflare_config_json;
+use crate::common::config::integration_app_config_envelope;
 use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult, origin_port,
 };
@@ -6,6 +6,7 @@ use error_stack::{Report, ResultExt as _};
 use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use trusted_server_core::config_payload::{CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_ID};
 
 /// Cloudflare Workers runtime via `wrangler dev`.
 ///
@@ -23,41 +24,55 @@ pub struct CloudflareWorkers;
 
 /// Fallback port when dynamic allocation fails.
 const CLOUDFLARE_DEFAULT_PORT: u16 = 8787;
-const CI_CONFIG_TEMPLATE: &str = "wrangler.ci.toml";
-const GENERATED_CI_CONFIG: &str = "wrangler.integration.generated.toml";
-const TRUSTED_SERVER_CONFIG_PLACEHOLDER: &str = "TRUSTED_SERVER_CONFIG = \"{}\"";
+const CI_CONFIG: &str = "wrangler.ci.toml";
 
-fn write_generated_ci_config(wrangler_dir: &Path, config_json: &str) -> TestResult<String> {
-    let template_path = wrangler_dir.join(CI_CONFIG_TEMPLATE);
-    let template = std::fs::read_to_string(&template_path)
-        .change_context(TestError::RuntimeSpawn)
-        .attach(format!(
-            "failed to read Cloudflare CI wrangler config at {}",
-            template_path.display()
-        ))?;
-    let generated = inject_cloudflare_config(&template, config_json)?;
-    let output_path = wrangler_dir.join(GENERATED_CI_CONFIG);
-    std::fs::write(&output_path, generated)
-        .change_context(TestError::RuntimeSpawn)
-        .attach(format!(
-            "failed to write generated Cloudflare CI wrangler config at {}",
-            output_path.display()
-        ))?;
-    Ok(GENERATED_CI_CONFIG.to_string())
+/// The arguments that store `envelope_path`'s contents in the Worker's local
+/// config store, the namespace bound as the store's default platform name in
+/// `config`.
+fn seed_config_store_args<'a>(config: &'a str, envelope_path: &'a str) -> Vec<&'a str> {
+    vec![
+        "kv",
+        "key",
+        "put",
+        CONFIG_BLOB_KEY,
+        "--path",
+        envelope_path,
+        "--binding",
+        DEFAULT_CONFIG_STORE_ID,
+        "--local",
+        "--config",
+        config,
+    ]
 }
 
-fn inject_cloudflare_config(template: &str, config_json: &str) -> TestResult<String> {
-    let placeholder_count = template.matches(TRUSTED_SERVER_CONFIG_PLACEHOLDER).count();
-    if placeholder_count != 1 {
+/// Stores `envelope` as the settings blob in the local config store that
+/// `wrangler dev --config <config>` reads.
+fn seed_config_store(wrangler_dir: &Path, config: &str, envelope: &str) -> TestResult<()> {
+    let envelope_path =
+        std::env::temp_dir().join(format!("ts-integration-config-{}.json", std::process::id()));
+    std::fs::write(&envelope_path, envelope)
+        .change_context(TestError::RuntimeSpawn)
+        .attach(format!(
+            "failed to write the settings blob to {}",
+            envelope_path.display()
+        ))?;
+    let envelope_arg = envelope_path.to_string_lossy().into_owned();
+    let output = Command::new("wrangler")
+        .args(seed_config_store_args(config, &envelope_arg))
+        .current_dir(wrangler_dir)
+        .output();
+    let _ = std::fs::remove_file(&envelope_path);
+    let output = output
+        .change_context(TestError::RuntimeSpawn)
+        .attach("failed to run `wrangler kv key put` for the config store")?;
+    if !output.status.success() {
         return Err(Report::new(TestError::RuntimeSpawn).attach(format!(
-            "Cloudflare CI wrangler config must contain exactly one `{TRUSTED_SERVER_CONFIG_PLACEHOLDER}` placeholder, found {placeholder_count}"
+            "`wrangler kv key put` exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-
-    Ok(template.replace(
-        TRUSTED_SERVER_CONFIG_PLACEHOLDER,
-        &format!("TRUSTED_SERVER_CONFIG = '''{config_json}'''"),
-    ))
+    Ok(())
 }
 
 impl RuntimeEnvironment for CloudflareWorkers {
@@ -68,11 +83,16 @@ impl RuntimeEnvironment for CloudflareWorkers {
     fn spawn(&self, _wasm_path: &Path) -> TestResult<RuntimeProcess> {
         let wrangler_dir = self.wrangler_dir();
         let config = if std::env::var("CI").is_ok() {
-            write_generated_ci_config(&wrangler_dir, &cloudflare_config_json(origin_port())?)?
+            seed_config_store(
+                &wrangler_dir,
+                CI_CONFIG,
+                &integration_app_config_envelope(origin_port())?,
+            )?;
+            CI_CONFIG
         } else {
-            "wrangler.toml".to_string()
+            "wrangler.toml"
         };
-        self.spawn_wrangler(&wrangler_dir, &config)
+        self.spawn_wrangler(&wrangler_dir, config)
     }
 
     fn health_check_path(&self) -> &str {
@@ -81,21 +101,22 @@ impl RuntimeEnvironment for CloudflareWorkers {
 }
 
 impl CloudflareWorkers {
-    /// Start `wrangler dev` with a test-specific `TRUSTED_SERVER_CONFIG` binding.
+    /// Start `wrangler dev` with a test-specific settings blob in its config
+    /// store.
     ///
-    /// Unlike [`RuntimeEnvironment::spawn`], this always renders the CI
-    /// wrangler template, so tests can enable features the shared fixture
+    /// Unlike [`RuntimeEnvironment::spawn`], this always runs the CI
+    /// wrangler config, so tests can enable features the shared fixture
     /// leaves off without changing the other runtimes' configuration.
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::RuntimeSpawn`] if the wrangler config cannot be
-    /// written or `wrangler dev` cannot be started, and
+    /// Returns [`TestError::RuntimeSpawn`] if the config store cannot be
+    /// seeded or `wrangler dev` cannot be started, and
     /// [`TestError::RuntimeNotReady`] if the health check times out.
-    pub fn spawn_with_config_json(&self, config_json: &str) -> TestResult<RuntimeProcess> {
+    pub fn spawn_with_config_envelope(&self, envelope: &str) -> TestResult<RuntimeProcess> {
         let wrangler_dir = self.wrangler_dir();
-        let config = write_generated_ci_config(&wrangler_dir, config_json)?;
-        self.spawn_wrangler(&wrangler_dir, &config)
+        seed_config_store(&wrangler_dir, CI_CONFIG, envelope)?;
+        self.spawn_wrangler(&wrangler_dir, CI_CONFIG)
     }
 
     fn spawn_wrangler(&self, wrangler_dir: &Path, config: &str) -> TestResult<RuntimeProcess> {
@@ -219,37 +240,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inject_cloudflare_config_replaces_single_placeholder() {
-        let template = format!("[vars]\n{TRUSTED_SERVER_CONFIG_PLACEHOLDER}\n");
+    fn the_seed_writes_the_blob_key_through_the_config_store_binding() {
+        let args = seed_config_store_args(CI_CONFIG, "/tmp/blob.json");
 
-        let generated = inject_cloudflare_config(&template, r#"{"app_config":"blob"}"#)
-            .expect("should inject Cloudflare config");
-
-        assert!(
-            generated.contains("TRUSTED_SERVER_CONFIG = '''{\"app_config\":\"blob\"}'''"),
-            "should inject generated config JSON"
-        );
-        assert!(
-            !generated.contains(TRUSTED_SERVER_CONFIG_PLACEHOLDER),
-            "should remove placeholder"
+        assert_eq!(
+            args,
+            [
+                "kv",
+                "key",
+                "put",
+                "trusted_server_config",
+                "--path",
+                "/tmp/blob.json",
+                "--binding",
+                "trusted_server_config",
+                "--local",
+                "--config",
+                "wrangler.ci.toml",
+            ],
+            "should store the blob where the Worker reads its settings"
         );
     }
 
     #[test]
-    fn inject_cloudflare_config_rejects_missing_placeholder() {
-        let result = inject_cloudflare_config("[vars]\n", r#"{"app_config":"blob"}"#);
+    fn the_ci_config_binds_the_config_store_the_seed_writes() {
+        let config: toml::Value = toml::from_str(include_str!(
+            "../../../trusted-server-adapter-cloudflare/wrangler.ci.toml"
+        ))
+        .expect("should parse the CI wrangler config");
 
-        assert!(result.is_err(), "should reject missing placeholder");
-    }
+        let bound = config["kv_namespaces"]
+            .as_array()
+            .expect("should declare KV namespaces")
+            .iter()
+            .any(|namespace| namespace["binding"].as_str() == Some(DEFAULT_CONFIG_STORE_ID));
 
-    #[test]
-    fn inject_cloudflare_config_rejects_duplicate_placeholders() {
-        let template = format!(
-            "[vars]\n{TRUSTED_SERVER_CONFIG_PLACEHOLDER}\n{TRUSTED_SERVER_CONFIG_PLACEHOLDER}\n"
+        assert!(
+            bound,
+            "the CI config should bind the config store's namespace"
         );
-
-        let result = inject_cloudflare_config(&template, r#"{"app_config":"blob"}"#);
-
-        assert!(result.is_err(), "should reject duplicate placeholders");
     }
 }

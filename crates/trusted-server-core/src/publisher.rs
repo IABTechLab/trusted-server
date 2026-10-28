@@ -2484,7 +2484,17 @@ fn template_fingerprint_with_build_digest(
     // Array order is preserved: set-valued settings must serialize deterministically
     // themselves (for example, `allowed_context_keys` uses a `BTreeSet`).
     let canonical = serde_json::to_value(settings)
-        .map(|value| edgezero_core::canonical_form::canonical_data_sha256(&value))
+        .map(|mut value| {
+            // The SHA-256 already names the policy file, so settings that pin
+            // one file fingerprint the same whether or not they carry its text.
+            if let Some(permissions) = value
+                .get_mut("permissions")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                permissions.remove("text");
+            }
+            edgezero_core::canonical_form::canonical_data_sha256(&value)
+        })
         .expect("should serialize typed settings infallibly");
     hasher.update(canonical);
     hex::encode(hasher.finalize())
@@ -10566,6 +10576,32 @@ mod tests {
                 "a change to compiled-in markup must select a different template"
             );
         }
+
+        #[test]
+        fn the_policy_file_counts_by_its_digest_and_not_its_text() {
+            let with_policy = |sha256: &str, text: &str| {
+                let mut settings = create_test_settings();
+                settings.permissions = crate::settings::PermissionsConfig {
+                    policy: Some("standard".to_owned()),
+                    sha256: Some(sha256.to_owned()),
+                    text: Some(text.to_owned()),
+                };
+                settings
+            };
+
+            let registry = test_registry(&create_test_settings());
+
+            assert_eq!(
+                template_fingerprint(&with_policy("digest-a", "groups: {}\n"), &registry),
+                template_fingerprint(&with_policy("digest-a", "a different text\n"), &registry),
+                "the text should not reach the fingerprint"
+            );
+            assert_ne!(
+                template_fingerprint(&with_policy("digest-a", "groups: {}\n"), &registry),
+                template_fingerprint(&with_policy("digest-b", "groups: {}\n"), &registry),
+                "a different policy file should select a different template"
+            );
+        }
     }
 
     mod seam_script_tests {
@@ -11193,7 +11229,7 @@ mod tests {
             http_client: Arc<StubHttpClient>,
             cache: Arc<MemoryTemplateCache>,
         ) -> RuntimeServices {
-            RuntimeServices::builder()
+            crate::platform::test_support::test_services_builder()
                 .config_store(Arc::new(NoopConfigStore))
                 .secret_store(Arc::new(NoopSecretStore))
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -11225,7 +11261,7 @@ mod tests {
         ) -> RuntimeServices {
             let telemetry_sink: Arc<dyn crate::auction::telemetry::AuctionTelemetrySink> =
                 telemetry_sink;
-            RuntimeServices::builder()
+            crate::platform::test_support::test_services_builder()
                 .config_store(Arc::new(NoopConfigStore))
                 .secret_store(Arc::new(NoopSecretStore))
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -12653,9 +12689,9 @@ mod tests {
             ));
             let registry = IntegrationRegistry::new(settings)
                 .expect("should create integration registry")
-                .with_platform(crate::attestation::PlatformIdentity {
+                .with_platform(crate::platform::PlatformIdentity {
                     service_version: version.to_owned(),
-                    ..crate::attestation::PlatformIdentity::named("example-platform")
+                    ..crate::platform::PlatformIdentity::named("example-platform")
                 });
             let consent = crate::consent::ConsentContext {
                 jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
@@ -14320,7 +14356,7 @@ mod tests {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let settings = Arc::new(settings_with_mode("esi"));
-            let services = RuntimeServices::builder()
+            let services = crate::platform::test_support::test_services_builder()
                 .config_store(Arc::new(NoopConfigStore))
                 .secret_store(Arc::new(NoopSecretStore))
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -18325,7 +18361,7 @@ mod tests {
             telemetry_sink: Arc<RecordingTelemetrySink>,
         ) -> RuntimeServices {
             let telemetry_sink: Arc<dyn AuctionTelemetrySink> = telemetry_sink;
-            RuntimeServices::builder()
+            crate::platform::test_support::test_services_builder()
                 .config_store(Arc::new(NoopConfigStore))
                 .secret_store(Arc::new(NoopSecretStore))
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -18877,9 +18913,9 @@ mod tests {
         ) -> IntegrationRegistry {
             IntegrationRegistry::new(settings)
                 .expect("should create integration registry")
-                .with_platform(crate::attestation::PlatformIdentity {
+                .with_platform(crate::platform::PlatformIdentity {
                     service_version: version.to_owned(),
-                    ..crate::attestation::PlatformIdentity::named("example-platform")
+                    ..crate::platform::PlatformIdentity::named("example-platform")
                 })
         }
 
@@ -28433,7 +28469,7 @@ mod tests {
             telemetry_sink: Arc<RecordingTelemetrySink>,
         ) -> RuntimeServices {
             let telemetry_sink: Arc<dyn AuctionTelemetrySink> = telemetry_sink;
-            RuntimeServices::builder()
+            crate::platform::test_support::test_services_builder()
                 .config_store(Arc::new(NoopConfigStore))
                 .secret_store(Arc::new(NoopSecretStore))
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
