@@ -566,15 +566,16 @@ impl EcContext {
     }
 
     /// Asks finalize to run the consent-withdrawal tombstone path for this
-    /// request, as a `revoke_scope = "global"` capture from a real browser
-    /// does (spec 8).
+    /// request, as a `revoke_scope = "global"` capture does from any client
+    /// (spec 8).
     pub(crate) fn request_global_revoke(&mut self) {
         self.identity.request_global_revoke();
     }
 
     /// Whether a capture asked for the consent-withdrawal tombstone path.
+    /// The adapter gives finalize the identity graph when it did.
     #[must_use]
-    pub(crate) fn global_revoke_requested(&self) -> bool {
+    pub fn global_revoke_requested(&self) -> bool {
         self.identity.global_revoke_requested()
     }
 

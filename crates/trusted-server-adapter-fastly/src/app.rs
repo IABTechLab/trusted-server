@@ -457,6 +457,11 @@ struct EcRequestState {
     ec_context: EcContext,
     kv_graph: Option<KvIdentityGraph>,
     finalize_kv_graph: Option<KvIdentityGraph>,
+    /// The graph integration proxy dispatch gets, for every client: a
+    /// proxied capture's removals and opt-outs are revocations and keep the
+    /// write path, as consent withdrawals do (spec 4.7). EC generation on
+    /// that route checks the real-browser flag itself.
+    proxy_kv_graph: Option<KvIdentityGraph>,
     eids_cookie: Option<String>,
     sharedid_cookie: Option<String>,
     is_real_browser: bool,
@@ -474,9 +479,12 @@ struct EcRequestState {
 
 impl EcRequestState {
     fn into_finalize_state(self) -> EcFinalizeState {
+        // A global revoke is a withdrawal from any client (spec 8).
+        let use_finalize_kv =
+            self.finalize_kv_graph.is_some() || self.ec_context.global_revoke_requested();
         EcFinalizeState {
             ec_context: self.ec_context,
-            use_finalize_kv: self.finalize_kv_graph.is_some(),
+            use_finalize_kv,
             eids_cookie: self.eids_cookie,
             sharedid_cookie: self.sharedid_cookie,
             is_real_browser: self.is_real_browser,
@@ -595,6 +603,11 @@ fn build_ec_request_state(
     // consent withdrawals. Revocations keep the write path so tombstones stay
     // authoritative even for privacy-extension-heavy clients.
     let kv_graph = state.identity_graph.clone();
+    let proxy_kv_graph = if setup_error.is_none() {
+        kv_graph.clone()
+    } else {
+        None
+    };
     let finalize_kv_graph = if setup_error.is_none()
         && (is_real_browser || ec_consent_withdrawn(ec_context.consent()))
     {
@@ -608,6 +621,7 @@ fn build_ec_request_state(
         ec_context,
         kv_graph,
         finalize_kv_graph,
+        proxy_kv_graph,
         eids_cookie,
         sharedid_cookie,
         is_real_browser,
@@ -987,7 +1001,7 @@ async fn dispatch_fallback(
                 method: &method,
                 path: &path,
                 settings: &state.settings,
-                kv: ec.kv_graph.as_ref(),
+                kv: ec.proxy_kv_graph.as_ref(),
                 ec_context: &mut ec.ec_context,
                 services,
                 is_real_browser: ec.is_real_browser,

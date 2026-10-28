@@ -904,7 +904,6 @@ struct CaptureExchange<'a> {
     ec_context: &'a mut EcContext,
     method: &'a Method,
     path: &'a str,
-    is_real_browser: bool,
 }
 
 /// A proxied body, buffered for capture or left alone.
@@ -964,7 +963,6 @@ async fn capture_proxied_response(
         ec_context,
         method,
         path,
-        is_real_browser,
     } = exchange;
     if !response.status().is_success() {
         return response;
@@ -1011,7 +1009,6 @@ async fn capture_proxied_response(
                 &CaptureCall {
                     method,
                     path,
-                    is_real_browser,
                     status: parts.status,
                     headers: &parts.headers,
                     body: &decoded,
@@ -1314,7 +1311,6 @@ impl IntegrationRegistry {
                         ec_context,
                         method,
                         path,
-                        is_real_browser,
                     },
                     response,
                 )
@@ -3424,17 +3420,13 @@ mod tests {
         }
 
         #[test]
-        fn capture_with_replayed_ec_cookie_changes_no_kv_row() {
+        fn capture_from_a_non_browser_writes_only_removals() {
             let mut seeded = live_row();
             seeded.ids.insert(
                 FIRST.to_owned(),
                 record_for_test("secret-uid-a", Some("lockr"), 500),
             );
-            for body in [
-                json!({"invalidate": [FIRST]}),
-                json!({"opted_out": true}),
-                token_body(),
-            ] {
+            for body in [json!({"invalidate": [FIRST]}), json!({"opted_out": true})] {
                 let mut request = call(
                     answering_capture_provider("lockr", &[FIRST], None),
                     "/integrations/lockr/api/token",
@@ -3445,17 +3437,36 @@ mod tests {
 
                 let result = exchange(request);
 
+                let row = result.row.as_ref().expect("should hold the row");
+                assert!(
+                    !row.ids.contains_key(FIRST),
+                    "should apply the removal for {body}"
+                );
                 assert_eq!(
                     result.store.writes().total(),
-                    0,
-                    "should record zero writes for {body}"
-                );
-                assert_eq!(
-                    result.row.as_ref(),
-                    Some(&seeded),
-                    "should change no row for {body}"
+                    1,
+                    "should write once for {body}"
                 );
             }
+
+            let mut request = call(
+                answering_capture_provider("lockr", &[FIRST], None),
+                "/integrations/lockr/api/token",
+                Upstream::json(&token_body()),
+            );
+            request.real_browser = false;
+            request.row = Some(&seeded);
+            let result = exchange(request);
+            assert_eq!(
+                result.store.writes().total(),
+                0,
+                "should write nothing for a positive result"
+            );
+            assert_eq!(
+                result.row.as_ref(),
+                Some(&seeded),
+                "should change no row for a positive result"
+            );
         }
     }
 }

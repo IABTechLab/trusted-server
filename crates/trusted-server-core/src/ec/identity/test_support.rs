@@ -2878,7 +2878,6 @@ pub(crate) mod capture_fixture {
 
         /// Runs the capture for a response with `status` holding `bytes`.
         pub(crate) fn capture_bytes(&mut self, path: &str, status: StatusCode, bytes: &[u8]) {
-            let real_browser = self.context.identity().is_real_browser();
             let random = ThreadRandom;
             let deps = self
                 .runtime
@@ -2891,7 +2890,6 @@ pub(crate) mod capture_fixture {
                 &CaptureCall {
                     method: &Method::POST,
                     path,
-                    is_real_browser: real_browser,
                     status,
                     headers: &headers,
                     body: bytes,

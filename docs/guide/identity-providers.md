@@ -232,7 +232,7 @@ More rules:
 - `CaptureInput` never exposes request bodies or request headers.
 - **Real-browser gate.** A capture from a client that fails the real-browser check writes nothing: its removals, opt-outs and global revokes are dropped and logged by provider and source only. A script replaying a copied `ts-ec` cookie through the proxy cannot strip or tombstone a row.
 - **A capture-only provider must list its `sources`** in `[ec.identity.providers.<id>]`, and it **cannot own a source**. Its opt-out removes browser-ingested records of every listed source, so the operator names only the sources it is the delivery path for.
-- `revoke_scope` controls how far a captured opt-out reaches (see [Configuration Reference](/guide/configuration#per-provider-keys)). With `"provider"` (the default) it removes only that provider's records and, for a capture-only provider, the records of its listed sources that no provider wrote. With `"global"`, a captured opt-out from a real browser runs the consent-withdrawal tombstone.
+- `revoke_scope` controls how far a captured opt-out reaches (see [Configuration Reference](/guide/configuration#per-provider-keys)). With `"provider"` (the default) it removes only that provider's records and, for a capture-only provider, the records of its listed sources that no provider wrote. With `"global"`, a captured opt-out runs the consent-withdrawal tombstone, from any client.
 
 ## Registering a provider
 

@@ -5079,37 +5079,54 @@ mod tests {
             );
         }
 
+        /// A proxied navigation from a client that fails the real-browser
+        /// check: no `Sec-Fetch-Dest`, a non-browser user agent.
+        fn non_browser_didomi_navigation() -> HttpRequest {
+            let mut request = didomi_navigation(Some(&returning_with_shared_id()));
+            request.extensions_mut().clear();
+            request.headers_mut().remove("sec-fetch-dest");
+            request
+                .headers_mut()
+                .insert("user-agent", HeaderValue::from_static("curl/8.0"));
+            request
+        }
+
         #[test]
-        fn non_browser_capture_writes_nothing() {
-            for body in [CAPTURE_INVALIDATION, r#"{"opted_out":true}"#] {
-                let scenario = registered_capture_scenario(body, true);
-                let before = scenario.row();
-                let mut request = didomi_navigation(Some(&returning_with_shared_id()));
-                request.extensions_mut().clear();
-                request.headers_mut().remove("sec-fetch-dest");
-                request
-                    .headers_mut()
-                    .insert("user-agent", HeaderValue::from_static("curl/8.0"));
+        fn non_browser_capture_writes_its_removal() {
+            let scenario = registered_capture_scenario(CAPTURE_INVALIDATION, false);
+            assert!(
+                scenario.row().ids.contains_key("ssp.example.com"),
+                "control: the seeded row holds the record"
+            );
 
-                let (response, _) = scenario.drive(request);
+            let (response, _) = scenario.drive(non_browser_didomi_navigation());
 
-                assert_eq!(response.status(), 200, "should serve the proxied answer");
-                assert_no_writes(
-                    &scenario.store,
-                    "a capture from a client that is no browser",
-                );
-                assert_eq!(
-                    scenario.row(),
-                    before,
-                    "should leave the row as it was, whatever the body asks: {body}"
-                );
-                assert!(
-                    !set_cookies(&response).iter().any(
-                        |cookie| cookie_name(cookie) == "ts-ec" && cookie.contains("Max-Age=0")
-                    ),
-                    "should not expire the EC cookie"
-                );
-            }
+            assert_eq!(response.status(), 200, "should serve the proxied answer");
+            assert!(
+                !scenario.row().ids.contains_key("ssp.example.com"),
+                "should apply the removal whatever the client"
+            );
+            assert!(
+                !set_cookies(&response)
+                    .iter()
+                    .any(|cookie| cookie_name(cookie) == "ts-ec" && cookie.contains("Max-Age=0")),
+                "should not expire the EC cookie"
+            );
+        }
+
+        #[test]
+        fn non_browser_global_revoke_writes_as_withdrawal() {
+            let scenario = registered_capture_scenario(r#"{"opted_out":true}"#, true);
+
+            let (response, _) = scenario.drive(non_browser_didomi_navigation());
+
+            assert!(!scenario.row().consent.ok, "should tombstone the row");
+            assert!(
+                set_cookies(&response).iter().any(|cookie| {
+                    cookie_name(cookie) == "ts-ec" && cookie.contains("Max-Age=0")
+                }),
+                "should expire the EC cookie"
+            );
         }
 
         #[test]

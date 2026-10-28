@@ -60,7 +60,7 @@ pub fn ec_finalize_response(
     response: &mut Response<EdgeBody>,
 ) {
     let consent_allows_ec = ec_consent_granted(ec_context.consent());
-    // A global revoke captured from a real browser (spec 8) is a withdrawal:
+    // A global revoke captured from any client (spec 8) is a withdrawal:
     // the same tombstone, cookie expiry and after-send run, with whatever the
     // request staged dropped.
     let global_revoke = ec_context.global_revoke_requested();

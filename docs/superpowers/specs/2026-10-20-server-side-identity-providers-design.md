@@ -178,8 +178,7 @@ can be written, and each extra write is another CAS race between tabs.
   that fails is not retried. This is strict. The only page-load exceptions
   are a consent withdrawal's tombstone (section 5.1), which also covers a
   capture provider's global revoke (section 8), and the two removal writes:
-  the capture removal write a proxied revocation from a real browser makes
-  (section 5.3), and the removal-only retry of a failed flush (section 5.2,
+  the capture removal write a proxied revocation makes (section 5.3), and the removal-only retry of a failed flush (section 5.2,
   phase 4). All are rare and removal-only. Writers outside page loads keep
   their own
   writes: batch sync, the admin endpoints and the deferred deletion
@@ -1671,14 +1670,22 @@ matching the request:
   eligibility steps 1 to 3 pass, and the provider has a sticky `ps.o` that
   only a capture can clear (a capture-only provider without a GVL ID,
   section 8). The same capture removal write stores it as `ps.oc = now`.
-- **The real-browser gate.** A client that fails `looks_like_browser()`
-  makes no capture removal write and no clear. Its removals, opt-outs and
-  global revokes are dropped and logged with the provider ID and source
-  only. Earlier revisions staged them in that client's own cookie, where
-  they reached KV only if the same client later made a real-browser
-  navigation, which in practice never happens. So a script replaying a
-  copied `ts-ec` cookie through the proxy can neither strip nor tombstone a
-  row. Consent withdrawal keeps its own exception (section 5.1).
+- **The real-browser gate applies to clears only.** Removals, opt-outs and
+  global revokes apply whatever the client, as consent withdrawals do: the
+  bot gate keeps the write path for revocations so tombstones stay
+  authoritative for privacy-extension-heavy clients
+  (`adapter-fastly/src/app.rs:595-605`), and `looks_like_browser()` fails
+  whenever the JA4 class or the UA platform is missing
+  (`ec/device.rs:84-86`), for example under a UA-spoofing extension.
+  Dropping their revocations would leave their IDs in KV, served again on
+  their next request that passes the check (G12). A script replaying a
+  copied `ts-ec` cookie can make TS forget IDs this way, but it can already
+  tombstone the row through the withdrawal path with a denying consent
+  cookie, and it never discloses or re-enables an ID (section 9.5). A clear
+  re-enables IDs, so a client that fails `looks_like_browser()` makes no
+  clear. The adapter gives integration proxy dispatch the identity graph
+  for every client for this; EC generation on that route still requires a
+  real browser.
 
 Capture never touches `ps.n`, `ps.f` or the breaker: a proxied call that
 held nothing is not a provider failure. Capture never changes provider
@@ -1765,7 +1772,7 @@ completion-marker write, for each withdrawn EC ID (one or two;
 spec: when those attempts fail before send, the path runs once more after
 send, by which time Fastly's per-key limit has usually passed. The same
 exception covers a captured opt-out from a provider with
-`revoke_scope = "global"` (section 8), from a real browser only: it runs this
+`revoke_scope = "global"` (section 8), from any client: it runs this
 path on the request that carries it. It and the two removal writes (sections
 5.2, phase 4, and 5.3) are the only page-load exceptions to G4. The
 tombstone is not
@@ -1907,8 +1914,8 @@ With no `ps.n` or `ps.f` stored on a stager, a provider that answered
 `no_match` or a 4xx was called again once a minute on every `/auction`, for
 the whole of an SPA session. Revision 15 removes that.
 
-**The capture removal write.** A revocation captured from a real browser
-(section 4.7) is written to KV on the proxied request that carries it. It is one of the page-load exceptions to G4 (section 5.1). The write:
+**The capture removal write.** A captured revocation, from any client
+(section 4.7), is written to KV on the proxied request that carries it. It is one of the page-load exceptions to G4 (section 5.1). The write:
 
 - reads the row and applies only the capture's removals (with the `ps.iv` or `ps.ov` hashes they derive), its opt-out and its clear, under the rules of
   section 5.4
@@ -2127,8 +2134,8 @@ cookie.
   removals, opt-outs and clears are written by the writer's own flush, or
   by the capture removal write for a proxied call (section 5.3). They
   apply whatever the consent and whether or not their provider is still
-  enabled, and no cookie or config change can strand one. The one gate a
-  removal faces is the real-browser gate on capture (section 4.7).
+  enabled, and no cookie or config change can strand one. No client gate
+  applies to them (section 4.7).
 - **A missing row carries no positive ID.** Any KV read that finds the row
   missing (outside a recovery in the same request) treats it like a
   tombstone for the server set: an `/auction` or `/_ts/page-bids` response
@@ -2658,7 +2665,7 @@ write (section 5.3), and nothing else.
 | Breaker open                                                                   | not dispatched                                                                                                                                         | unchanged                                                                              | debug |
 | Burst cap exceeded (section 4.7 step 8)                                        | not dispatched                                                                                                                                         | `n = max(n, now + 60 s)`; never a failure                                              | debug |
 | Capture: any result or error                                                   | removals as above; positive IDs counted in `capture_unpersisted`, never stored                                                                         | only `o`, `oc`, `iv` and `ov`; never `n`, `f` or the breaker                           | debug |
-| Captured `opted_out`, `revoke_scope = "global"`, real browser                  | the withdrawal tombstone removes the row (section 5.1)                                                                                                 | removed with the row                                                                   | info  |
+| Captured `opted_out`, `revoke_scope = "global"`, any client                    | the withdrawal tombstone removes the row (section 5.1)                                                                                                 | removed with the row                                                                   | info  |
 
 **Sticky opt-outs.** `ps.o = {at, fp}` records a provider-reported opt-out
 and the consent fingerprint at that time. Server-side calls do not carry the
@@ -2696,12 +2703,11 @@ visitor starts again with a new EC.
 **Revoke scope.** A provider that declares `captures` has a `revoke_scope`
 (section 10.1), default `"provider"`. With `"provider"`, a captured
 `opted_out` is the provider opt-out above. With `"global"`, a captured
-`opted_out` from a real browser runs today's consent-withdrawal tombstone
-path on that request instead (section 5.1): the row is tombstoned, the EC
-cookie is cleared, and everything is removed, provider opt-outs included.
-It uses the withdrawal's existing exception, so it adds no page-load exception to G4. From a client that fails `looks_like_browser()`, a
-global revoke is dropped (section 4.7), so a replayed `ts-ec` cannot
-tombstone another browser's row. An opt-out from `resolves` is always
+`opted_out` runs today's consent-withdrawal tombstone path on that request
+instead (section 5.1): the row is tombstoned, the EC cookie is cleared, and
+everything is removed, provider opt-outs included. It uses the withdrawal's
+existing exception, so it adds no page-load exception to G4, and like a
+withdrawal it applies whatever the client (section 4.7). An opt-out from `resolves` is always
 provider-scoped.
 
 The **consent fingerprint** `fp` is a bitmask, written as hex, of the
@@ -2780,8 +2786,7 @@ Rules:
 - **On withdrawal:** the tombstone is written synchronously on whichever
   request carries it (section 5.1), and the next `/auction` or
   `/_ts/page-bids` response tells the shim to clear `ts-eids-s` (section
-  6.2). A global revoke from a real browser takes the same path (section
-  8).
+  6.2). A global revoke takes the same path (section 8).
 
 ### 9.2 Outbound requests
 
@@ -3475,7 +3480,7 @@ What this shows:
   Lockr never writes a record in v1, so without the browser-ingest part the
   revoke would remove nothing (section 5.4). An operator who sets
   `revoke_scope = "global"` makes it a full withdrawal that tombstones the
-  row, from real browsers only (section 8). Lockr's plan settles which
+  row, from any client (section 8). Lockr's plan settles which
   scope Lockr's revocation means.
 - **Capture sees a token once, and v1 does not keep it.** Lockr returns a
   token only when it first issues one. On a reload its SDK sends the saved
@@ -4045,11 +4050,10 @@ token.
 - A writer navigation whose phase 1 snapshot predates a capture removal
   write of the same page load fails its CAS and is not retried; the next
   navigation re-derives its browser ingest.
-- A capture from a client that fails `looks_like_browser()` writes nothing,
-  drops its removals, opt-outs and global revoke, and logs them without
-  values. A replayed `ts-ec` on the proxy changes no KV row.
-- With `revoke_scope = "global"`, a captured opt-out from a real browser
-  tombstones the row and clears the EC cookie on that request, as a consent
+- A capture from a client that fails `looks_like_browser()` writes its
+  removals and opt-out, and its global revoke tombstones the row, as from a
+  real browser. Its positive result never clears an opt-out.
+- With `revoke_scope = "global"`, a captured opt-out tombstones the row and clears the EC cookie on that request, as a consent
   withdrawal does. With `"provider"`, it removes only that provider's
   records and, for a capture-only provider, the records of its sources no
   provider wrote.
@@ -4110,9 +4114,9 @@ so adapter tests can use it. `KvIdentityGraph::counting` counts reads only
 | Integration-proxy navigation that mints an EC                       | 1 (create)                                                                              |
 | `/auction`, `/_ts/page-bids`, `/identify`, assets                   | 0                                                                                       |
 | Lockr API proxy, no revocation                                      | 0                                                                                       |
-| Captured revocation from a real browser                             | CAS removal write (up to 5 attempts), once more after send                              |
+| Captured revocation, from any client                                | CAS removal write (up to 5 attempts), once more after send                              |
 | Consent withdrawal, on any request                                  | CAS tombstone (up to 5 attempts) plus marker, per ID; once more after send              |
-| Global revoke captured from a real browser                          | as a consent withdrawal                                                                 |
+| Global revoke captured, from any client                             | as a consent withdrawal                                                                 |
 | Capture removal, opt-out or global revoke from a non-browser client | 0                                                                                       |
 | CAS conflict or per-key limit on the flush                          | 1 attempt; its removals, if any, then written alone after a 1 s wait (up to 5 attempts) |
 
@@ -4345,7 +4349,7 @@ Two steps, each shippable on its own:
    validation, hold mode, revoke-only passive capture with `revoke_scope`
    defaulting to `"provider"`, the capture removal write with its
    `capture_unpersisted` and `removal_lost` counters, the
-   real-browser gate on capture effects, provider state, the rate-limiter
+   real-browser gate on capture clears, provider state, the rate-limiter
    `record` and `count` methods and the circuit breaker, the consent
    decoder extensions of section 9.1, and the first full-set writes, from
    provider results with more than one entry or UID or with EID-level
@@ -4467,7 +4471,7 @@ review, which allowed breaking changes:
 | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Stager providers     | None. Resolving providers run only on writer navigations, so every outcome, backoff included, is stored. Stagers serve KV                                                         |
 | Removals             | Written to KV on the request that carries them. `ts-eids-r`, its keyring and secrets, the overflow write and the strips-only rollout step are removed                             |
-| Non-browser removals | Dropped, since earlier revisions could apply them only through a later real-browser navigation from the same client                                                               |
+| Non-browser removals | Applied, as consent withdrawals are; only clears need a real browser. Changed after the round 14 review from dropping them                                                        |
 | Capture              | Revoke-only: removals, opt-out and clear. Positive IDs are counted, never stored. `capture_enabled` and request-body consent are removed                                          |
 | Capture-only opt-out | Also removes the records of its sources that no provider wrote, and blocks the browser's values for them. A capture-only provider cannot own a source and must list its `sources` |
 | Provider denials     | A provider's `ps.iv` and `ps.ov` filter browser candidates for unowned sources too. An opt-out's removals go to `ps.ov`, which its clear empties                                  |

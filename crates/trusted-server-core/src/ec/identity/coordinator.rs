@@ -1801,7 +1801,6 @@ pub(crate) async fn run_hold(deps: &IdentityDeps<'_>, context: &mut EcContext) -
 pub(crate) struct CaptureCall<'a> {
     pub(crate) method: &'a http::Method,
     pub(crate) path: &'a str,
-    pub(crate) is_real_browser: bool,
     pub(crate) status: StatusCode,
     pub(crate) headers: &'a http::HeaderMap,
     /// The decoded body, at most `max_response_bytes`.
@@ -1992,11 +1991,12 @@ fn capture_ask(
 /// Offers a proxied 2xx response to each provider whose capture rule matches
 /// (spec 4.7).
 ///
-/// Capture is revoke-only. A real browser's removals, opt-outs and clears are
-/// written at once with the removal write, whatever the consent; a request
-/// that is not a real browser writes and stages nothing. A positive ID is
-/// counted and never stored. A `revoke_scope = "global"` opt-out asks
-/// finalize for the consent-withdrawal tombstone path instead.
+/// Capture is revoke-only. Removals and opt-outs are written at once with the
+/// removal write, whatever the consent and whatever the client, as a consent
+/// withdrawal is. A clear re-enables IDs, so only a real browser's clear is
+/// written ([`passes_consent_steps`]). A positive ID is counted and never
+/// stored. A `revoke_scope = "global"` opt-out asks finalize for the
+/// consent-withdrawal tombstone path instead.
 pub(crate) fn run_capture(
     deps: &IdentityDeps<'_>,
     graph: Option<&KvIdentityGraph>,
@@ -2021,15 +2021,7 @@ pub(crate) fn run_capture(
         view,
         unreadable,
         reads: view_reads,
-    } = if call.is_real_browser {
-        capture_view(graph, context, ec_id.as_deref())
-    } else {
-        CaptureView {
-            view: EligibilityView::empty(),
-            unreadable: false,
-            reads: 0,
-        }
-    };
+    } = capture_view(graph, context, ec_id.as_deref());
     context.identity_mut().record_capture_kv(view_reads, 0);
     let response =
         ProviderResponse::new(call.status, call.headers.clone(), call.body.to_vec(), None);
@@ -2074,19 +2066,6 @@ pub(crate) fn run_capture(
             context
                 .identity_mut()
                 .record_unpersisted(id.clone(), source.clone());
-        }
-        if !call.is_real_browser {
-            for source in resolution.invalidated() {
-                log::debug!(
-                    "Dropping a capture removal of provider '{id}', source '{source}': the client is not a real browser"
-                );
-            }
-            if resolution.is_opted_out() {
-                log::debug!(
-                    "Dropping a capture opt-out of provider '{id}': the client is not a real browser"
-                );
-            }
-            continue;
         }
         if resolution.is_opted_out()
             && deps.settings.ec.identity.provider(id).revoke_scope() == RevokeScope::Global
@@ -6129,45 +6108,55 @@ mod tests {
         }
 
         #[test]
-        fn capture_from_a_non_browser_writes_nothing() {
+        fn capture_from_a_non_browser_applies_its_removals_and_opt_out() {
             let seeded = row_with(&[(FIRST, "secret-uid-a", Some("lockr"))]);
-            for body in [
-                json!({"invalidate": [FIRST]}),
-                json!({"opted_out": true}),
-                json!({"tokens": [{"source": FIRST, "value": "secret-uid-z"}]}),
-            ] {
-                let mut fixture =
-                    CaptureFixture::with_scopes(vec![lockr()], Some(&seeded), &["lockr"])
-                        .not_a_browser();
 
-                fixture.capture(&lockr_path(), &body);
-
-                assert_eq!(
-                    fixture.store.writes().total(),
-                    0,
-                    "should write nothing for {body}"
-                );
-                assert_eq!(fixture.row(), seeded, "should change no row for {body}");
-                assert!(
-                    !fixture.context.global_revoke_requested(),
-                    "should request no global revoke for {body}"
-                );
-                assert!(
-                    fixture.context.identity().pending_removals().is_none(),
-                    "should stage nothing for {body}"
-                );
-                assert!(
-                    fixture.context.identity().mutation().is_empty(),
-                    "should add nothing to the mutation for {body}"
-                );
-            }
-            let mut positive = CaptureFixture::new(vec![lockr()], Some(&seeded)).not_a_browser();
-            positive.capture(
-                &lockr_path(),
-                &json!({"tokens": [{"source": FIRST, "value": "secret-uid-z"}]}),
+            let mut invalidated = CaptureFixture::new(vec![lockr()], Some(&seeded)).not_a_browser();
+            invalidated.capture(&lockr_path(), &json!({"invalidate": [FIRST]}));
+            assert!(
+                !invalidated.row().ids.contains_key(FIRST),
+                "should remove the invalidated record"
             );
             assert_eq!(
-                positive.context.identity().capture_unpersisted().len(),
+                invalidated.store.writes().if_generation_match,
+                1,
+                "should write the removal at once"
+            );
+
+            let mut opted_out = CaptureFixture::new(vec![lockr()], Some(&seeded)).not_a_browser();
+            opted_out.capture(&lockr_path(), &json!({"opted_out": true}));
+            let row = opted_out.row();
+            assert!(row.ps["lockr"].o.is_some(), "should store the opt-out");
+            assert!(
+                !row.ids.contains_key(FIRST),
+                "should remove what the provider wrote"
+            );
+
+            let mut global = CaptureFixture::with_scopes(vec![lockr()], Some(&seeded), &["lockr"])
+                .not_a_browser();
+            global.capture(&lockr_path(), &json!({"opted_out": true}));
+            assert!(
+                global.context.global_revoke_requested(),
+                "should request the global revoke, as a withdrawal from any client does"
+            );
+        }
+
+        #[test]
+        fn capture_from_a_non_browser_never_clears_an_opt_out() {
+            let seeded = opted_out_row(100);
+            let positive = json!({"tokens": [{"source": FIRST, "value": "secret-uid-a"}]});
+
+            let mut fixture = CaptureFixture::new(vec![lockr()], Some(&seeded)).not_a_browser();
+            fixture.capture(&lockr_path(), &positive);
+
+            assert_eq!(
+                fixture.row().ps["lockr"].oc,
+                None,
+                "should not clear the opt-out"
+            );
+            assert_eq!(fixture.store.writes().total(), 0, "should write nothing");
+            assert_eq!(
+                fixture.context.identity().capture_unpersisted().len(),
                 1,
                 "should still count the positive ID"
             );

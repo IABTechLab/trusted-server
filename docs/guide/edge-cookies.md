@@ -311,7 +311,7 @@ A capture provider reads responses that Trusted Server proxies for a vendor. It 
 
 `revoke_scope` in `[ec.identity.providers.<id>]` decides how far a captured opt-out reaches. The default, `provider`, removes only that provider's records and, for a capture-only provider, the records of its listed sources that no provider wrote.
 
-With `revoke_scope = "global"`, a captured opt-out from a real browser runs the consent-withdrawal tombstone: the row is tombstoned, the `ts-ec` cookie is cleared, and everything is removed, provider opt-outs included. The visitor then starts again with a new EC. A client that is not a real browser, such as a script replaying a copied `ts-ec` cookie, never changes the KV row: its capture is dropped and logged by provider and source only.
+With `revoke_scope = "global"`, a captured opt-out runs the consent-withdrawal tombstone: the row is tombstoned, the `ts-ec` cookie is cleared, and everything is removed, provider opt-outs included. The visitor then starts again with a new EC. Like a consent withdrawal, a captured removal or opt-out applies whatever the client, including one that fails the bot check. Only clearing an opt-out needs a real browser, because a clear re-enables IDs.
 
 ### Complete Provider EIDs
 
