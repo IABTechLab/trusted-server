@@ -10,6 +10,8 @@ use http::{HeaderValue, Request, Response, StatusCode, header};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
 use url::Url;
 use uuid::Uuid;
 
@@ -20,11 +22,15 @@ use crate::creative;
 use crate::ec::eids::encode_eids_header;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
+use crate::module_context::{ModuleContext, ModuleRequest};
 use crate::openrtb::{
     BidExt, BidTrustedServerExt, OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt,
     to_openrtb_i32,
 };
-use crate::platform::RuntimeServices;
+use crate::permissions::PermissionState;
+use crate::platform::{
+    BackendNamingPolicy, PlatformBackend, PlatformBackendSpec, PlatformError, RuntimeServices,
+};
 use crate::settings::Settings;
 
 use super::orchestrator::OrchestrationResult;
@@ -224,6 +230,8 @@ pub fn convert_tsjs_to_auction_request(
             .map(str::to_string),
         ip: services.client_info().client_ip.map(|ip| ip.to_string()),
         geo,
+        // Filled by `attach_device_attributes`.
+        attributes: None,
     });
 
     // Forward allowed config entries from the JS request into the context map.
@@ -552,6 +560,104 @@ pub(crate) fn convert_to_openrtb_response_with_report(
     Ok(OpenRtbResponseConversion { response, delivery })
 }
 
+/// Fills the bid request's device attributes from the selected device module,
+/// after each request that makes an outbound auction call is built.
+///
+/// The module's call carries `permissions`, those resolved for the request,
+/// so the module can do nothing the reader has not agreed to. A backend the
+/// module registers during the call waits no longer than `timeout_ms`, the
+/// auction's own timeout, for its service. Values a bidder cannot read are
+/// dropped before the answer is attached.
+pub async fn attach_device_attributes(
+    request: &mut AuctionRequest,
+    http_req: &http::Request<EdgeBody>,
+    permissions: &PermissionState,
+    settings: &Settings,
+    services: &RuntimeServices,
+    timeout_ms: u32,
+) {
+    let Some(module) = services.device_module() else {
+        return;
+    };
+    let client_ip = services
+        .client_info()
+        .client_ip
+        .map_or_else(String::new, |address| address.to_string());
+    let request_info =
+        crate::evidence::BorrowedRequestInfo::new(&client_ip, Some(http_req.headers()));
+    let module_services = services.clone().with_backend(Arc::new(CappedBackend {
+        inner: Arc::clone(&services.backend),
+        limit: Duration::from_millis(u64::from(timeout_ms)),
+    }));
+    let context = ModuleContext::new(ModuleRequest::of(http_req, services.client_info()))
+        .with_evidence(&request_info)
+        .with_permissions(permissions)
+        .with_settings(settings)
+        .with_services(&module_services);
+    let Some(attributes) = module
+        .advertising_attributes(context.call(module.id(), module.required_permissions()))
+        .await
+    else {
+        return;
+    };
+    let attributes = attributes.checked(module.id());
+    // An empty object and an absent one say the same to a bidder, and the
+    // absent one is smaller.
+    if attributes.is_empty() {
+        return;
+    }
+
+    request
+        .device
+        .get_or_insert(DeviceInfo {
+            user_agent: None,
+            ip: None,
+            geo: None,
+            attributes: None,
+        })
+        .attributes = Some(attributes);
+}
+
+/// Registers backends through `inner` with both transport timers capped at
+/// `limit`.
+///
+/// The timers bound the wait for the first byte and between two bytes, not
+/// the whole call, so connecting and a slow trickle can still lengthen the
+/// call, as they can an auction provider's.
+struct CappedBackend {
+    inner: Arc<dyn PlatformBackend>,
+    limit: Duration,
+}
+
+impl CappedBackend {
+    fn capped(&self, spec: &PlatformBackendSpec) -> PlatformBackendSpec {
+        PlatformBackendSpec {
+            first_byte_timeout: spec.first_byte_timeout.min(self.limit),
+            between_bytes_timeout: spec.between_bytes_timeout.min(self.limit),
+            ..spec.clone()
+        }
+    }
+}
+
+impl PlatformBackend for CappedBackend {
+    fn naming_policy(&self) -> BackendNamingPolicy {
+        self.inner.naming_policy()
+    }
+
+    fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+        self.inner.predict_name(&self.capped(spec))
+    }
+
+    fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+        self.inner.ensure(&self.capped(spec))
+    }
+
+    fn canonicalize_transport_timeout_ms(&self, remaining_ms: u32, configured_ms: u32) -> u32 {
+        self.inner
+            .canonicalize_transport_timeout_ms(remaining_ms, configured_ms)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,6 +692,236 @@ mod tests {
         )]);
         config.timeout_ms = 900;
         AuctionPlan::compile(config).expect("should compile plan")
+    }
+
+    /// A device module that resolves fixed attributes, standing in for a
+    /// vendor that reaches a service.
+    #[derive(Debug)]
+    struct StubDeviceModule {
+        attributes: Option<crate::ec::device::DeviceAttributes>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::ec::device::DeviceModule for StubDeviceModule {
+        fn id(&self) -> &'static str {
+            "stub"
+        }
+
+        async fn detect(
+            &self,
+            _call: crate::module_context::ModuleCall<'_>,
+        ) -> crate::ec::device::DeviceSignals {
+            crate::ec::device::DeviceSignals::unknown()
+        }
+
+        async fn advertising_attributes(
+            &self,
+            _call: crate::module_context::ModuleCall<'_>,
+        ) -> Option<crate::ec::device::DeviceAttributes> {
+            self.attributes.clone()
+        }
+    }
+
+    fn empty_request() -> http::Request<EdgeBody> {
+        http::Request::builder()
+            .uri("https://www.example.com/")
+            .body(EdgeBody::empty())
+            .expect("should build the request")
+    }
+
+    fn stub_attributes() -> crate::ec::device::DeviceAttributes {
+        crate::ec::device::DeviceAttributes {
+            device_type: Some(4),
+            make: Some("ExampleCorp".to_owned()),
+            model: Some("EX-1".to_owned()),
+            os: Some("Android".to_owned()),
+            os_version: Some("15.0".to_owned()),
+            screen_width: Some(1080),
+            screen_height: Some(2400),
+        }
+    }
+
+    fn request_with_device(device: Option<DeviceInfo>) -> AuctionRequest {
+        let mut request = make_auction_request();
+        request.device = device;
+        request
+    }
+
+    /// The auction timeout the device calls in these tests run under.
+    const TIMEOUT_MS: u32 = 2000;
+
+    #[tokio::test]
+    async fn an_answer_with_no_value_a_bidder_can_read_adds_no_device_object() {
+        let services = crate::platform::test_support::noop_services_with_device_module(
+            std::sync::Arc::new(StubDeviceModule {
+                attributes: Some(crate::ec::device::DeviceAttributes {
+                    device_type: Some(0),
+                    make: Some(" ".to_owned()),
+                    screen_width: Some(-1),
+                    ..crate::ec::device::DeviceAttributes::default()
+                }),
+            }),
+        );
+        let mut request = request_with_device(None);
+
+        attach_device_attributes(
+            &mut request,
+            &empty_request(),
+            &PermissionState::default(),
+            &crate::test_support::tests::create_test_settings(),
+            &services,
+            TIMEOUT_MS,
+        )
+        .await;
+
+        assert!(
+            request.device.is_none(),
+            "an answer whose every value is dropped should add no device object"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_selected_module_fills_the_device_object() {
+        let services = crate::platform::test_support::noop_services_with_device_module(
+            std::sync::Arc::new(StubDeviceModule {
+                attributes: Some(stub_attributes()),
+            }),
+        );
+        let mut request = request_with_device(Some(DeviceInfo {
+            user_agent: Some("Mozilla/5.0".to_owned()),
+            ip: None,
+            geo: None,
+            attributes: None,
+        }));
+
+        attach_device_attributes(
+            &mut request,
+            &empty_request(),
+            &PermissionState::default(),
+            &crate::test_support::tests::create_test_settings(),
+            &services,
+            TIMEOUT_MS,
+        )
+        .await;
+
+        assert_eq!(
+            request
+                .device
+                .as_ref()
+                .and_then(|device| device.attributes.as_ref()),
+            Some(&stub_attributes()),
+            "a resolved device must reach the request the bidder is sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_module_that_resolves_an_empty_device_adds_no_device_object() {
+        let services = crate::platform::test_support::noop_services_with_device_module(
+            std::sync::Arc::new(StubDeviceModule {
+                attributes: Some(crate::ec::device::DeviceAttributes::default()),
+            }),
+        );
+        let mut request = request_with_device(None);
+
+        attach_device_attributes(
+            &mut request,
+            &empty_request(),
+            &PermissionState::default(),
+            &crate::test_support::tests::create_test_settings(),
+            &services,
+            TIMEOUT_MS,
+        )
+        .await;
+
+        assert!(
+            request.device.is_none(),
+            "an empty device object says nothing a bidder cannot read from its absence"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_device_module_leaves_the_request_untouched() {
+        let services = crate::platform::test_support::noop_services();
+        let mut request = request_with_device(Some(DeviceInfo {
+            user_agent: Some("Mozilla/5.0".to_owned()),
+            ip: None,
+            geo: None,
+            attributes: None,
+        }));
+
+        attach_device_attributes(
+            &mut request,
+            &empty_request(),
+            &PermissionState::default(),
+            &crate::test_support::tests::create_test_settings(),
+            &services,
+            TIMEOUT_MS,
+        )
+        .await;
+
+        assert!(
+            request
+                .device
+                .as_ref()
+                .is_some_and(|device| device.attributes.is_none()),
+            "the default deployment supplies no device module and must send no attributes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_module_that_resolves_nothing_adds_no_device_object() {
+        let services = crate::platform::test_support::noop_services_with_device_module(
+            std::sync::Arc::new(StubDeviceModule { attributes: None }),
+        );
+        let mut request = request_with_device(None);
+
+        attach_device_attributes(
+            &mut request,
+            &empty_request(),
+            &PermissionState::default(),
+            &crate::test_support::tests::create_test_settings(),
+            &services,
+            TIMEOUT_MS,
+        )
+        .await;
+
+        assert!(
+            request.device.is_none(),
+            "an unresolved device must not become an empty device object, which a bidder \
+             reads as a claim that the fields are absent rather than unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_attributes_create_the_device_object_when_there_was_none() {
+        let services = crate::platform::test_support::noop_services_with_device_module(
+            std::sync::Arc::new(StubDeviceModule {
+                attributes: Some(stub_attributes()),
+            }),
+        );
+        // The publisher path leaves the device object out entirely when the
+        // request carried no User-Agent, so this is a real state and not a
+        // contrived one.
+        let mut request = request_with_device(None);
+
+        attach_device_attributes(
+            &mut request,
+            &empty_request(),
+            &PermissionState::default(),
+            &crate::test_support::tests::create_test_settings(),
+            &services,
+            TIMEOUT_MS,
+        )
+        .await;
+
+        assert_eq!(
+            request
+                .device
+                .as_ref()
+                .and_then(|device| device.attributes.as_ref()),
+            Some(&stub_attributes()),
+            "attributes that were resolved must not be dropped for want of a device object"
+        );
     }
 
     fn make_auction_request() -> AuctionRequest {

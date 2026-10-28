@@ -36,7 +36,9 @@ use trusted_server_core::auction::demand::{
 };
 use trusted_server_core::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use trusted_server_core::auction::types::{AuctionContext, AuctionRequest, AuctionResponse};
-use trusted_server_core::ec::device::{DeviceModule, DeviceSignals};
+use trusted_server_core::ec::device::{
+    DeviceAttributes, DeviceModule, DeviceSignals, HumanConfidence,
+};
 use trusted_server_core::ec::module::{EdgeCookieModule, GeneratedEdgeCookie, ModuleCode};
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::evidence::RequestInfo;
@@ -425,6 +427,30 @@ impl DeviceModule for SeamProbeDevice {
             looks_like_browser: true,
             ja4_class: None,
             h2_fp_hash: None,
+            // A scoring module's answer, which core's own modules never give.
+            human_confidence: HumanConfidence::Medium,
+        }
+    }
+
+    async fn advertising_attributes(&self, _call: ModuleCall<'_>) -> Option<DeviceAttributes> {
+        Some(SeamProbeDevice::attributes())
+    }
+}
+
+impl SeamProbeDevice {
+    /// What the probe tells a bidder about the device, fixed so a test can
+    /// read it back.
+    #[must_use]
+    pub fn attributes() -> DeviceAttributes {
+        DeviceAttributes {
+            // A tablet, as the module gives `OpenRTB`'s own code.
+            device_type: Some(5),
+            make: Some("Probe".to_owned()),
+            model: Some("P-1".to_owned()),
+            os: Some("ProbeOS".to_owned()),
+            os_version: Some("1.0".to_owned()),
+            screen_width: Some(800),
+            screen_height: Some(1280),
         }
     }
 }

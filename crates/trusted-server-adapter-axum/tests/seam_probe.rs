@@ -1027,6 +1027,53 @@ async fn a_requests_services_carry_the_selected_modules_prefixes() {
     );
 }
 
+/// The device module `[device] module` resolves answers the confidence that
+/// a person is there and what a bidder is told about the device, through the
+/// call it is handed, so both reach core from a module it does not know.
+#[tokio::test]
+async fn the_resolved_device_module_answers_a_confidence_and_the_devices_attributes() {
+    let settings = settings_selecting_module(
+        r#"
+            [device]
+            module = "testing.seam-probe"
+        "#,
+    );
+    let registry = registry_with_probe(&settings);
+    let module = registry
+        .device_module()
+        .expect("`[device] module = \"testing.seam-probe\"` should resolve the module's module");
+    let request = ModuleRequest::new(
+        &axum::http::Method::GET,
+        "www.publisher.example",
+        "https",
+        "/",
+    );
+    let context = ModuleContext::new(request).with_settings(&settings);
+
+    let signals = module
+        .detect(context.call(module.id(), module.required_permissions()))
+        .await;
+    let attributes = module
+        .advertising_attributes(context.call(module.id(), module.required_permissions()))
+        .await;
+
+    assert_eq!(
+        signals.human_confidence,
+        trusted_server_core::ec::device::HumanConfidence::Medium,
+        "the scoring module's answer should reach core unchanged"
+    );
+    assert_eq!(
+        attributes,
+        Some(seam_probe::SeamProbeDevice::attributes()),
+        "the attributes the module resolved should reach core unchanged"
+    );
+    assert_eq!(
+        attributes.and_then(|found| found.device_type),
+        Some(5),
+        "a tablet is OpenRTB device type 5"
+    );
+}
+
 /// `[ec] module` naming a module resolves a module that, when driven
 /// through `generate`, produces an identifier the built-in HMAC module can
 /// never make.

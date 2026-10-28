@@ -1149,3 +1149,79 @@ fn an_implementation_sees_each_impression_beside_the_slot_it_came_from() {
         );
     }
 }
+
+fn request_with_device_attributes() -> crate::auction::types::AuctionRequest {
+    let mut request = canonical_parity_auction_request();
+    request
+        .device
+        .as_mut()
+        .expect("the parity request carries a device")
+        .attributes = Some(crate::ec::device::DeviceAttributes {
+        device_type: Some(4),
+        make: Some("ExampleCorp".to_owned()),
+        model: Some("EX-1".to_owned()),
+        os: Some("Android".to_owned()),
+        os_version: Some("15.0".to_owned()),
+        screen_width: Some(1080),
+        screen_height: Some(2400),
+    });
+    request
+}
+
+/// The device object is the driver's, so attributes a device module
+/// resolved reach every implementation without any of them mapping a field.
+#[test]
+fn the_driver_carries_resolved_device_attributes_to_every_implementation() {
+    for implementation in ["auction.fixture", "auction.plain-fixture"] {
+        let request = build_with_request(
+            implementation,
+            json!({}),
+            request_with_device_attributes(),
+            None,
+        );
+        let device = request
+            .device
+            .as_ref()
+            .expect("should carry a device object");
+        assert_eq!(
+            device.devicetype,
+            Some(4),
+            "{implementation}: a bidder prices on the device type"
+        );
+        assert_eq!(
+            device.make.as_deref(),
+            Some("ExampleCorp"),
+            "{implementation}"
+        );
+        assert_eq!(device.model.as_deref(), Some("EX-1"), "{implementation}");
+        assert_eq!(device.os.as_deref(), Some("Android"), "{implementation}");
+        assert_eq!(device.osv.as_deref(), Some("15.0"), "{implementation}");
+        assert_eq!(
+            device.w,
+            Some(1080),
+            "{implementation}: screen width decides which creative fits"
+        );
+        assert_eq!(device.h, Some(2400), "{implementation}");
+    }
+}
+
+#[test]
+fn the_driver_omits_device_attributes_nothing_resolved() {
+    let request = build_with_request(
+        "auction.fixture",
+        json!({}),
+        canonical_parity_auction_request(),
+        None,
+    );
+    let device = request
+        .device
+        .as_ref()
+        .expect("should carry a device object");
+    assert_eq!(
+        device.devicetype, None,
+        "an absent field is what a bidder reads as unknown, and an invented default would \
+         misprice the inventory"
+    );
+    assert_eq!(device.make, None);
+    assert_eq!(device.w, None);
+}

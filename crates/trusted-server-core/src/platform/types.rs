@@ -440,6 +440,14 @@ impl RuntimeServices {
         }
     }
 
+    /// Returns a clone of this instance with backend registration replaced
+    /// by `backend`, for a caller that bounds what a module it calls may
+    /// register.
+    #[must_use]
+    pub(crate) fn with_backend(self, backend: Arc<dyn PlatformBackend>) -> Self {
+        Self { backend, ..self }
+    }
+
     /// Returns a clone of this instance with the resolved Edge Cookie module
     /// replaced.
     ///

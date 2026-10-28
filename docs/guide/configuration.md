@@ -844,7 +844,7 @@ These `TRUSTED_SERVER__` overrides apply where deployment tooling merges environ
 
 ## Device Configuration
 
-Selects how a request is classified into the coarse device signals the Edge Cookie bot gate uses, mirroring the Edge Cookie module selection. These signals serve identifier gating and bot detection, not bid enrichment.
+Selects how a request is classified into the coarse device signals the Edge Cookie bot gate uses, mirroring the Edge Cookie module selection. These signals serve identifier gating and bot detection. The same module may score how confident it is that a person is looking at the page, which nothing reads yet and which is not stored in the identity graph with the other signals, and may tell a bidder what the device is, which reaches the bid request's device object. Redirect middlewares that act on the score follow this set of changes.
 
 ### `[device]`
 

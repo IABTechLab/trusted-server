@@ -18,12 +18,116 @@
 //! - **`known_browser`** — `true` if `ja4_class` + `h2_fp_hash` match a known
 //!   browser pattern; `false` for known bots; `None` for unknown
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::kv_types::KvDevice;
 use crate::evidence::RequestInfo;
 use crate::module_context::ModuleCall;
 use crate::settings::Settings;
+
+/// Device attributes for the bid request, as distinct from the gate signals.
+///
+/// Kept apart from [`DeviceSignals`] on purpose. Those signals answer one
+/// question, whether this request looks like a browser, and are stored in the
+/// identity graph. These answer a different one, what a bidder is being asked
+/// to price, and are stored nowhere.
+///
+/// Every field is optional because every source is partial. A module that
+/// resolves a device type but not a model fills what it has, and the `OpenRTB`
+/// device object simply omits the rest, which is what a bidder expects.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceAttributes {
+    /// `OpenRTB` device type, from the device types list of `AdCOM` 1.0,
+    /// which `OpenRTB` 2.6 refers to: 1 mobile or tablet, 2 personal
+    /// computer, 3 connected television, 4 phone, 5 tablet, 6 connected
+    /// device, 7 set top box, 8 out-of-home device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_type: Option<i32>,
+    /// Hardware vendor, the `make` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub make: Option<String>,
+    /// Hardware model, the `model` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Operating system name, the `os` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    /// Operating system version, the `osv` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_version: Option<String>,
+    /// Screen width in pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_width: Option<i32>,
+    /// Screen height in pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_height: Option<i32>,
+}
+
+/// The values of the device types list of `AdCOM` 1.0.
+const DEVICE_TYPES: std::ops::RangeInclusive<i32> = 1..=8;
+
+impl DeviceAttributes {
+    /// Whether anything was resolved.
+    ///
+    /// A module that resolved nothing should not put an empty device object
+    /// on the request, because an empty object and an absent one mean the same
+    /// thing to a bidder and the absent one is smaller.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The same attributes without the values a bidder cannot read, being a
+    /// device type outside the list, a screen size that is not positive and a
+    /// blank string. Each value dropped is logged with the id of `module`, the
+    /// module that answered it.
+    #[must_use]
+    pub(crate) fn checked(self, module: &str) -> Self {
+        Self {
+            device_type: kept_number(module, "device_type", self.device_type, |found| {
+                DEVICE_TYPES.contains(&found)
+            }),
+            make: kept_text(module, "make", self.make),
+            model: kept_text(module, "model", self.model),
+            os: kept_text(module, "os", self.os),
+            os_version: kept_text(module, "os_version", self.os_version),
+            screen_width: kept_number(module, "screen_width", self.screen_width, |found| found > 0),
+            screen_height: kept_number(module, "screen_height", self.screen_height, |found| {
+                found > 0
+            }),
+        }
+    }
+}
+
+/// `value` when `readable` holds for it, and otherwise nothing.
+fn kept_number(
+    module: &str,
+    field: &str,
+    value: Option<i32>,
+    readable: fn(i32) -> bool,
+) -> Option<i32> {
+    value.filter(|&found| {
+        let keep = readable(found);
+        if !keep {
+            log::warn!(
+                "device module `{module}`: omitting {field}={found}, which a bidder cannot read"
+            );
+        }
+        keep
+    })
+}
+
+/// `value` unless it is blank, and otherwise nothing.
+fn kept_text(module: &str, field: &str, value: Option<String>) -> Option<String> {
+    value.filter(|found| {
+        let keep = !found.trim().is_empty();
+        if !keep {
+            log::warn!("device module `{module}`: omitting a blank {field}");
+        }
+        keep
+    })
+}
 
 /// Device signals derived from a single request.
 ///
@@ -47,7 +151,44 @@ pub struct DeviceSignals {
     /// writes. Computed by the producing module: the built-in module uses a
     /// User-Agent-only heuristic, while the Fastly module strengthens it with
     /// the TLS and HTTP/2 signals.
+    ///
+    /// [`human_confidence`](Self::human_confidence) is the module's answer
+    /// about a person, which nothing reads yet.
     pub looks_like_browser: bool,
+
+    /// How confident the device module is that a person is looking at the
+    /// page. A module that scores the request writes it, and every other
+    /// module leaves it `Unknown`. Nothing reads it yet, and it is not stored
+    /// in the identity graph with the other signals.
+    ///
+    /// Unlike [`looks_like_browser`](Self::looks_like_browser) this is not a
+    /// guess about the shape of a header. It is the module's answer from the
+    /// evidence it weighs, and a person the module cannot place answers
+    /// `Unknown` rather than being guessed at.
+    pub human_confidence: HumanConfidence,
+}
+
+/// The confidence that a person is looking at the page.
+///
+/// The four answers a scoring device module can give, with `Unknown` kept
+/// apart from `Low` because a request alone cannot establish a person.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum HumanConfidence {
+    /// High confidence that a person is viewing the page.
+    High,
+
+    /// The evidence is mixed and the request cannot be placed either way. A
+    /// person may be viewing the page.
+    Medium,
+
+    /// Almost certainly no person is directly involved in viewing the content.
+    Low,
+
+    /// Not established. **This is not the same as `Low`.** A request alone
+    /// cannot establish a person, and treating it as `Low` would call every
+    /// first-time visitor a machine.
+    #[default]
+    Unknown,
 }
 
 impl DeviceSignals {
@@ -77,6 +218,8 @@ impl DeviceSignals {
             h2_fp_hash: None,
             known_browser: None,
             looks_like_browser,
+            // Unknown, because the request alone cannot establish a person.
+            human_confidence: HumanConfidence::Unknown,
         }
     }
 
@@ -109,6 +252,8 @@ impl DeviceSignals {
             h2_fp_hash,
             known_browser,
             looks_like_browser,
+            // As above: the request alone cannot establish this.
+            human_confidence: HumanConfidence::Unknown,
         }
     }
 
@@ -134,8 +279,11 @@ impl DeviceSignals {
 /// These signals serve identity gating and bot detection, not bid enrichment.
 /// [`DeviceSignals`] deliberately carries only the coarse browser and bot
 /// classification the Edge Cookie gate needs, not a full device-detection
-/// result such as make, model, OS version, or screen size. A richer device
-/// model for the ad request is a separate concern.
+/// result such as make, model, OS version, or screen size. Those are
+/// [`DeviceAttributes`], answered by
+/// [`advertising_attributes`](DeviceModule::advertising_attributes) on this
+/// same trait, and the two answers stay separate types with separate
+/// lifetimes.
 /// Uses `#[async_trait(?Send)]` for the same reason as
 /// [`PlatformHttpClient`](crate::platform::PlatformHttpClient): the trait
 /// object stays `Send + Sync` so it can be shared and run multi-threaded,
@@ -169,6 +317,21 @@ pub trait DeviceModule: Send + Sync {
     /// no permission.
     fn required_permissions(&self) -> crate::permissions::PermissionSet {
         crate::permissions::PermissionSet::none()
+    }
+
+    /// Attributes for the bid request, when this module can resolve them.
+    ///
+    /// The call carries the permissions resolved for the request, so a module
+    /// whose use of the evidence needs a permission the reader has not given
+    /// answers `None` without using it. A backend the module registers during
+    /// the call has its transport timers capped at the auction's timeout, and
+    /// core drops a device type outside the list, a screen size that is not
+    /// positive and a blank string before it attaches the answer.
+    ///
+    /// The default returns nothing, so no existing module changes. A module
+    /// that resolves nothing returns `None` rather than an empty value.
+    async fn advertising_attributes(&self, _call: ModuleCall<'_>) -> Option<DeviceAttributes> {
+        None
     }
 }
 
@@ -790,6 +953,67 @@ mod tests {
             assert!(
                 !DeviceSignals::derive_ua_only(ua).looks_like_browser,
                 "a non-browser client should fail the UA-only gate: {ua:?}"
+            );
+        }
+    }
+
+    /// A request alone cannot establish a person, so the signals read from
+    /// one say `Unknown`, which is not `Low`, and nothing calls a first-time
+    /// visitor a machine.
+    #[test]
+    fn a_request_alone_establishes_no_person() {
+        for signals in [
+            DeviceSignals::derive_ua_only(CHROME_MAC_UA),
+            DeviceSignals::derive_ua_only("curl/8.0"),
+            DeviceSignals::derive(CHROME_MAC_UA, Some("t13d1516h2"), Some("abc123def456")),
+            DeviceSignals::derive("curl/8.0", None, None),
+            DeviceSignals::unknown(),
+        ] {
+            assert_eq!(signals.human_confidence, HumanConfidence::Unknown);
+        }
+        assert_eq!(HumanConfidence::default(), HumanConfidence::Unknown);
+    }
+
+    #[test]
+    fn checked_keeps_only_the_values_a_bidder_can_read() {
+        for (device_type, kept) in [(0, None), (1, Some(1)), (8, Some(8)), (9, None)] {
+            let attributes = DeviceAttributes {
+                device_type: Some(device_type),
+                ..DeviceAttributes::default()
+            };
+            assert_eq!(
+                attributes.checked("test").device_type,
+                kept,
+                "device type {device_type} should be kept only when it is in the list"
+            );
+        }
+        for (size, kept) in [(-1, None), (0, None), (1, Some(1))] {
+            let attributes = DeviceAttributes {
+                screen_width: Some(size),
+                screen_height: Some(size),
+                ..DeviceAttributes::default()
+            };
+            let checked = attributes.checked("test");
+            assert_eq!(
+                (checked.screen_width, checked.screen_height),
+                (kept, kept),
+                "screen size {size} should be kept only when it is positive"
+            );
+        }
+        for (text, kept) in [("", None), (" \t", None), ("Android", Some("Android"))] {
+            let attributes = DeviceAttributes {
+                make: Some(text.to_owned()),
+                model: Some(text.to_owned()),
+                os: Some(text.to_owned()),
+                os_version: Some(text.to_owned()),
+                ..DeviceAttributes::default()
+            };
+            let checked = attributes.checked("test");
+            let kept = kept.map(str::to_owned);
+            assert_eq!(
+                [checked.make, checked.model, checked.os, checked.os_version],
+                [kept.clone(), kept.clone(), kept.clone(), kept],
+                "{text:?} should be kept only when it is not blank"
             );
         }
     }

@@ -5685,6 +5685,17 @@ pub async fn handle_publisher_request(
                     path_label: "Server-side",
                 },
             );
+
+            // Fill the device object the bidder prices on.
+            crate::auction::formats::attach_device_attributes(
+                &mut auction_request,
+                &auction_client_request,
+                ec_context.permissions(),
+                settings,
+                services,
+                auction_timeout_ms,
+            )
+            .await;
             let auction_context = AuctionContext {
                 settings,
                 request: &auction_client_request,
@@ -6458,6 +6469,7 @@ fn apply_auction_eids_and_device(
             user_agent: None,
             ip: None,
             geo: None,
+            attributes: None,
         });
         device.ip = client_ip;
         device.geo = targeting.geo.cloned();
@@ -6508,6 +6520,7 @@ pub(crate) fn build_auction_request(
             user_agent: Some(ua.to_string()),
             ip: None,
             geo: None,
+            attributes: None,
         }),
         site: Some(SiteInfo {
             domain: publisher_domain.to_owned(),
@@ -8081,9 +8094,20 @@ pub async fn handle_page_bids(
                     path_label: "Page-bids",
                 },
             );
+
             let timeout_ms = co_config
                 .auction_timeout_ms
                 .unwrap_or(settings.auction.timeout_ms);
+            // Fill the device object the bidder prices on.
+            crate::auction::formats::attach_device_attributes(
+                &mut auction_request,
+                &req,
+                ec_context.permissions(),
+                settings,
+                services,
+                timeout_ms,
+            )
+            .await;
             let auction_context = AuctionContext {
                 settings,
                 request: &req,
@@ -29537,9 +29561,11 @@ mod tests {
         use crate::auction::types::AuctionRequest;
         use crate::auction::{AuctionContext, AuctionOrchestrator};
         use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
+        use crate::ec::device::{DeviceAttributes, DeviceModule};
         use crate::ec::tests::{CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY, CanonicalizingModule};
+        use crate::permissions::{Permission, PermissionSet, PermissionState};
         use crate::platform::test_support::{
-            NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend,
+            DetectionServiceDevice, NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend,
         };
         use crate::platform::{ClientInfo, PlatformResponse};
         use crate::test_support::tests::crate_test_settings_str;
@@ -30336,6 +30362,211 @@ mod tests {
             .expect("should return ok response");
 
             assert_auction_used_the_canonical_row(&captured, &ec_context);
+        }
+
+        fn tablet() -> DeviceAttributes {
+            DeviceAttributes {
+                device_type: Some(5),
+                make: Some("ExampleCorp".to_owned()),
+                ..DeviceAttributes::default()
+            }
+        }
+
+        /// A device module whose use needs limited-data ad selection.
+        fn device_needing_basic_ads() -> Arc<DetectionServiceDevice> {
+            Arc::new(DetectionServiceDevice::new(
+                PermissionSet::none().with(Permission::SelectBasicAds),
+                Some(tablet()),
+            ))
+        }
+
+        /// The same context, with the reader also giving limited-data ad
+        /// selection.
+        fn selecting_basic_ads(ec_context: EcContext) -> EcContext {
+            let set = ec_context
+                .permissions()
+                .permissions()
+                .with(Permission::SelectBasicAds);
+            ec_context.with_permissions_for_test(PermissionState::new(set))
+        }
+
+        /// Runs the initial navigation for `ec_context` with `module` selected,
+        /// and returns the auction request it dispatched, if it dispatched one.
+        async fn navigation_with_device_module(
+            mut ec_context: EcContext,
+            module: &Arc<DetectionServiceDevice>,
+        ) -> Option<AuctionRequest> {
+            let settings = settings_with_capturing_provider();
+            let captured = Arc::new(Mutex::new(None));
+            let orchestrator = orchestrator_capturing_request(&settings, &captured);
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"<html><head></head><body>ok</body></html>".to_vec());
+            let services = services_with(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                Arc::new(RecordingTelemetrySink::default()),
+            )
+            .with_device_module(Arc::clone(module) as Arc<dyn DeviceModule>);
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(format!("https://{EDGE_HOST}/2024/01/my-article/"))
+                .header(header::HOST, EDGE_HOST)
+                .header("sec-fetch-dest", "document")
+                .body(EdgeBody::empty())
+                .expect("should build test request");
+
+            let registry = test_registry(&settings);
+            let _ = handle_publisher_request(
+                AppContext {
+                    settings: &settings,
+                    integration_registry: &registry,
+                },
+                &services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &article_slot(),
+                    registry: None,
+                },
+                req,
+                EdgeCacheHeader::SMaxageFallback,
+            )
+            .await
+            .expect("should proxy publisher request");
+
+            captured
+                .lock()
+                .expect("should lock captured request")
+                .clone()
+        }
+
+        /// Runs page-bids for `ec_context` with `module` selected, and returns
+        /// the auction request it dispatched, if it dispatched one.
+        async fn page_bids_with_device_module(
+            mut ec_context: EcContext,
+            module: &Arc<DetectionServiceDevice>,
+        ) -> Option<AuctionRequest> {
+            let settings = settings_with_capturing_provider();
+            let captured = Arc::new(Mutex::new(None));
+            let orchestrator = orchestrator_capturing_request(&settings, &captured);
+            let services = services_with(
+                Arc::new(crate::platform::test_support::NoopHttpClient),
+                Arc::new(RecordingTelemetrySink::default()),
+            )
+            .with_device_module(Arc::clone(module) as Arc<dyn DeviceModule>);
+            let mut req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "https://{EDGE_HOST}/_ts/page-bids?path=/2024/01/my-article/"
+                ))
+                .header(header::HOST, EDGE_HOST)
+                .body(EdgeBody::empty())
+                .expect("should build test request");
+            req.headers_mut().insert(
+                header::HeaderName::from_static("sec-fetch-site"),
+                HeaderValue::from_static("same-origin"),
+            );
+
+            let _ = handle_page_bids(
+                &settings,
+                &services,
+                None,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &article_slot(),
+                    registry: None,
+                },
+                &mut ec_context,
+                req,
+            )
+            .await
+            .expect("should return ok response");
+
+            captured
+                .lock()
+                .expect("should lock captured request")
+                .clone()
+        }
+
+        #[tokio::test]
+        async fn initial_navigation_asks_the_device_module_with_the_readers_permissions() {
+            let module = device_needing_basic_ads();
+
+            let request = navigation_with_device_module(
+                selecting_basic_ads(consent_allowing_ec_context()),
+                &module,
+            )
+            .await
+            .expect("should dispatch an auction request");
+
+            assert_eq!(
+                module.asked(),
+                1,
+                "the navigation should ask the device module"
+            );
+            assert_eq!(
+                request.device.and_then(|device| device.attributes),
+                Some(tablet()),
+                "a module whose permission the reader gave should describe the device to the bidder"
+            );
+        }
+
+        #[tokio::test]
+        async fn initial_navigation_does_not_ask_the_device_module_when_consent_denies_the_auction()
+        {
+            let module = device_needing_basic_ads();
+            // An unknown jurisdiction with no TCF signal fails the auction gate.
+            let denied = EcContext::new_for_test(None, crate::consent::ConsentContext::default());
+
+            let request = navigation_with_device_module(selecting_basic_ads(denied), &module).await;
+
+            assert!(
+                request.is_none(),
+                "a denied auction should dispatch nothing"
+            );
+            assert_eq!(
+                module.asked(),
+                0,
+                "a request on the consent-denied path should not reach the device module"
+            );
+        }
+
+        #[tokio::test]
+        async fn page_bids_asks_the_device_module_with_the_readers_permissions() {
+            let module = device_needing_basic_ads();
+
+            let request = page_bids_with_device_module(
+                selecting_basic_ads(consent_allowing_ec_context()),
+                &module,
+            )
+            .await
+            .expect("should dispatch an auction request");
+
+            assert_eq!(module.asked(), 1, "page-bids should ask the device module");
+            assert_eq!(
+                request.device.and_then(|device| device.attributes),
+                Some(tablet()),
+                "a module whose permission the reader gave should describe the device to the bidder"
+            );
+        }
+
+        #[tokio::test]
+        async fn page_bids_does_not_ask_the_device_module_when_consent_denies_the_auction() {
+            let module = device_needing_basic_ads();
+            // An unknown jurisdiction with no TCF signal fails the auction gate.
+            let denied = EcContext::new_for_test(None, crate::consent::ConsentContext::default());
+
+            let request = page_bids_with_device_module(selecting_basic_ads(denied), &module).await;
+
+            assert!(
+                request.is_none(),
+                "a denied auction should dispatch nothing"
+            );
+            assert_eq!(
+                module.asked(),
+                0,
+                "a request on the consent-denied path should not reach the device module"
+            );
         }
     }
 }

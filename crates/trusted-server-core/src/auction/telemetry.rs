@@ -1173,6 +1173,7 @@ mod tests {
             user_agent: Some(TEST_USER_AGENT.to_owned()),
             ip: None,
             geo: None,
+            attributes: None,
         });
 
         let from_request = AuctionObservationContext::from_auction_request(

@@ -118,6 +118,7 @@ pub fn canonical_parity_auction_request() -> AuctionRequest {
                 region: Some("CA".to_string()),
                 asn: None,
             }),
+            attributes: None,
         }),
         site: None,
         context: HashMap::new(),

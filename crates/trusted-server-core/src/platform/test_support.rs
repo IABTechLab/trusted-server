@@ -1044,6 +1044,105 @@ pub fn build_services_with_geo(geo: Arc<dyn PlatformGeo>) -> RuntimeServices {
         .build()
 }
 
+/// Build a [`RuntimeServices`] carrying a device module, so a test can drive
+/// the device seam rather than setting the resolved attributes by hand.
+///
+/// Setting the attributes directly would prove the `OpenRTB` mapping and
+/// nothing about whether any module is ever asked, which is the half of the
+/// chain that breaks.
+pub fn noop_services_with_device_module(
+    device_module: Arc<dyn crate::ec::device::DeviceModule>,
+) -> RuntimeServices {
+    test_services_builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo::default())
+        .build()
+        .with_device_module(device_module)
+}
+
+/// The address of the service [`DetectionServiceDevice`] reaches.
+pub const DETECTION_SERVICE_URL: &str = "https://detect.example/";
+
+/// A device module standing in for one that reaches a detection service, so a
+/// test can drive the call core makes to it through a real handler.
+///
+/// For a reader whose permissions include every one in `needs`, it registers
+/// a backend for the service with the default transport timers, through the
+/// services its call carries, and answers `answer`. For any other reader it
+/// answers `None` and uses nothing. It counts how often core asks it.
+pub struct DetectionServiceDevice {
+    needs: crate::permissions::PermissionSet,
+    answer: Option<crate::ec::device::DeviceAttributes>,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+impl DetectionServiceDevice {
+    pub fn new(
+        needs: crate::permissions::PermissionSet,
+        answer: Option<crate::ec::device::DeviceAttributes>,
+    ) -> Self {
+        Self {
+            needs,
+            answer,
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// How many times core asked the module for attributes.
+    pub fn asked(&self) -> usize {
+        self.asked.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn resolve(
+        &self,
+        permissions: Option<&crate::permissions::PermissionState>,
+        services: &RuntimeServices,
+    ) -> Option<crate::ec::device::DeviceAttributes> {
+        let agreed =
+            self.needs.is_empty() || permissions.is_some_and(|state| state.all_set(self.needs));
+        if !agreed {
+            return None;
+        }
+        // A test reads the registration off the backend it supplied, so a
+        // refused one is not this module's to report.
+        let _ = crate::integrations::ensure_integration_backend(
+            services,
+            DETECTION_SERVICE_URL,
+            "detection-service",
+            None,
+        );
+        self.answer.clone()
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl crate::ec::device::DeviceModule for DetectionServiceDevice {
+    fn id(&self) -> &'static str {
+        "detection-service"
+    }
+
+    async fn detect(
+        &self,
+        _call: crate::module_context::ModuleCall<'_>,
+    ) -> crate::ec::device::DeviceSignals {
+        crate::ec::device::DeviceSignals::unknown()
+    }
+
+    async fn advertising_attributes(
+        &self,
+        call: crate::module_context::ModuleCall<'_>,
+    ) -> Option<crate::ec::device::DeviceAttributes> {
+        self.asked
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        call.inject(self, Self::resolve).ok().flatten()
+    }
+}
+
 /// Build a [`RuntimeServices`] carrying an Edge Cookie module, threaded the
 /// way a composition root threads the module it resolved, so a test can
 /// exercise the seam a vendor module reaches core through and check that the
