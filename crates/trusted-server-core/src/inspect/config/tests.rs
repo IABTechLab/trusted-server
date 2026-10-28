@@ -9,7 +9,7 @@ use crate::platform::{PlatformError, PlatformSecretStore, PolicyOrigin, StoreId,
 use crate::redacted::Redacted;
 use crate::secret_resolution::ResolvedSecrets;
 use crate::settings::{ProxyAssetRoute, RequestSigning};
-use crate::test_support::tests::crate_test_settings_str;
+use crate::test_support::tests::{crate_test_settings_str, sample_permissions};
 
 /// Every value this store hands back starts with this, so a view can be
 /// searched for all of them at once.
@@ -53,10 +53,12 @@ fn document(extra: &str) -> Value {
 }
 
 /// `toml` as a stored document holds it, with the allowed domains a load
-/// needs for the test settings' asset hosts.
+/// needs for the test settings' asset hosts and the permission policy the
+/// push writes.
 fn document_from(toml: &str) -> Value {
     let mut settings = Settings::from_toml(toml).expect("should parse the document");
     settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
+    settings.permissions = sample_permissions();
     serde_json::to_value(&settings).expect("should serialize the document")
 }
 
@@ -914,6 +916,7 @@ fn a_secret_a_module_declares_is_masked() {
     .with_secret_settings(MODULE_SECRETS);
     let mut settings = settings();
     settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
+    settings.permissions = sample_permissions();
     settings
         .insert_module_config(
             "testing",
