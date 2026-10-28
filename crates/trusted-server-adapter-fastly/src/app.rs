@@ -440,7 +440,8 @@ fn shipped_signal_modules()
 ///
 /// A deployment that wants a different set links a different set, and one
 /// that adds a module of its own hands its builder to [`crate::run_with`], which
-/// runs it after these.
+/// runs it after these. None of these offers a loading cache, so a
+/// deployment that wants copies kept hands one the same way.
 #[must_use]
 pub fn shipped_module_builders() -> Vec<IntegrationBuilder> {
     vec![
@@ -472,11 +473,8 @@ pub fn shipped_module_builders() -> Vec<IntegrationBuilder> {
         trusted_server_auction_prebid_server::builder(),
         trusted_server_auction_aps::builder(),
         trusted_server_ad_server_iabtl::builder(),
-        // The loading cache a stock build caches with, offered whatever the
-        // settings say, which no section selects either.
-        trusted_server_loading_cache_51degrees::builder(),
-        // The origin signer a source's auth table can name, offered the same
-        // way.
+        // The origin signer a source's auth table can name, offered whatever
+        // the settings say, which no section selects either.
         trusted_server_shared_aws::builder(),
     ]
 }
@@ -3789,10 +3787,26 @@ mod tests {
                 "auction.prebid-server",
                 "auction.aps",
                 "ad-server.iabtl",
-                "loading-cache.51degrees",
                 "shared.aws",
             ],
             "should offer the linked modules in the order their hooks run"
+        );
+    }
+
+    /// This adapter links no loading cache module, so every feature loads
+    /// through `NoLoadingCache`, which keeps no copy, and a deployment that
+    /// wants copies kept hands a loading cache module's builder to it.
+    #[test]
+    fn the_stock_build_links_no_loading_cache() {
+        let offering: Vec<&str> = shipped_module_builders()
+            .iter()
+            .filter(|builder| builder.loading_cache().is_some())
+            .map(IntegrationBuilder::id)
+            .collect();
+
+        assert!(
+            offering.is_empty(),
+            "a stock build should link no loading cache, and links {offering:?}"
         );
     }
 
