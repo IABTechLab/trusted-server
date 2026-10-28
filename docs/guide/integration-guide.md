@@ -862,8 +862,12 @@ the builders it is given with `loading_caches_from` when it builds its state,
 which refuses a name no builder offers a cache from, and hands them to every
 request's services as `LoadingCaches`. A feature whose table names no module
 takes the one loading cache module the build links, and loads through
-`NoLoadingCache` when the build links none or several. The stock list carries
-`crates/loading-cache/51degrees`.
+`NoLoadingCache` when the build links none or several. No stock list carries a
+loading cache module, so a stock build loads every value through
+`NoLoadingCache`. A deployment that wants copies kept hands a loading cache
+module's builder to its adapter, through `run_with` on Fastly or
+`routes_with_registrations` on Axum, Cloudflare and Spin, as it does for any
+crate of its own. `crates/loading-cache/51degrees` is one such module.
 
 ```rust
 pub fn builder() -> IntegrationBuilder {
