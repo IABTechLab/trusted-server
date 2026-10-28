@@ -658,10 +658,15 @@ mod module_endpoints {
     fn settings_with(extra: &str) -> Settings {
         Settings::from_toml(&format!(
             r#"
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.test-publisher.example.com"
+
             [publisher]
             domain = "test-publisher.example.com"
             cookie_domain = ".test-publisher.example.com"
-            origin_url = "https://origin.test-publisher.example.com"
             proxy_secret = "route-test-proxy-secret"
 
             [ec]

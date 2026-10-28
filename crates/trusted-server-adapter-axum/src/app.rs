@@ -1098,10 +1098,15 @@ mod tests {
         fn startup_settings() -> Settings {
             Settings::from_toml(
                 r#"
+                [source]
+                module = "origin"
+
+                [source.origin]
+                url = "https://origin.publisher.example"
+
                 [publisher]
                 domain = "publisher.example"
                 cookie_domain = ".publisher.example"
-                origin_url = "https://origin.publisher.example"
                 proxy_secret = "publisher_proxy_secret"
                 "#,
             )

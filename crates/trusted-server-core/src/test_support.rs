@@ -892,10 +892,15 @@ pub mod policy_failure {
     pub fn load_error() -> Report<TrustedServerError> {
         let mut settings = Settings::from_toml(
             r#"
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.publisher.example"
+
             [publisher]
             domain = "publisher.example"
             cookie_domain = ".publisher.example"
-            origin_url = "https://origin.publisher.example"
             proxy_secret = "publisher_proxy_secret"
             "#,
         )
