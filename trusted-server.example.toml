@@ -28,9 +28,10 @@
 #   setting = "value"
 #
 # The types are ec, geo, device, permission-signal, demand, ad-server,
-# robots-txt and integration. A settings table its type's selector does not
-# name refuses startup, so there is no stale block to misread. The complete
-# rules, and what is checked when, are in docs/guide/configuration-rules.md.
+# robots-txt, analytics and integration. A settings table its type's selector
+# does not name refuses startup, so there is no stale block to misread. The
+# complete rules, and what is checked when, are in
+# docs/guide/configuration-rules.md.
 #
 # `TRUSTED_SERVER__` env vars can override values when the `ts` CLI builds and
 # validates this config for push (e.g. TRUSTED_SERVER__PUBLISHER__DOMAIN=...;
@@ -648,11 +649,13 @@ auction_timeout_ms = 500
 #   "/news/x"    -> /123456789/example/news
 #   "/reviews/y" -> /123456789/example/reviews
 
-# Direct Tinybird auction telemetry (off by default). When enabled, `api_host`
-# is required and must be a bare host (no scheme or path).
-# [tinybird]
-# enabled = true
-# api_host = "api.us-east.tinybird.example"   # required when enabled; host only
+# Direct Tinybird auction telemetry, sent only when [analytics] selects it.
+# `api_host` is required and must be a bare host (no scheme or path).
+# [analytics]
+# module = "tinybird"
+#
+# [analytics.tinybird]
+# api_host = "api.us-east.tinybird.example"   # required; host only
 # auction_dataset = "auction_events"          # Events API datasource name
 # auction_token_secret = "tinybird_auction_append_token"  # Key in trusted_server_secrets
 

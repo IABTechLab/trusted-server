@@ -83,7 +83,7 @@ publisher, trusted-client-IP, EC, Tinybird, DataDome, and S3 fields:
 - `ec.host_signals.passphrase`, when `[ec] module = "host_signals"`
 - `ec.partners[*].api_token`, when inbound identify or batch sync is used
 - `ec.partners[*].ts_pull_token`, when pull sync is enabled
-- `tinybird.auction_token_secret`, when Tinybird auction telemetry is enabled
+- `analytics.tinybird.auction_token_secret`, when `[analytics] module = "tinybird"`
 - `bot-protection.datadome.server_side_key_secret_name`, when protection is enabled
 - `bot-protection.datadome.protection_test_bypass.credential_secret_name`, when the bypass is enabled
 - `proxy.asset_routes[*].auth.access_key_id`, `secret_access_key`, and optional `session_token`
@@ -97,9 +97,9 @@ Two accepted secret-shaped fields are deliberately different:
 
 - `trusted_client_ip.shared_secret` is an inline value in the app-config blob;
   it is redacted by debug formatting but is not resolved from a secret store.
-- `tinybird.access_token_secret` is deprecated input. It is accepted for
-  migration, then discarded and omitted from serialized config; use
-  `tinybird.auction_token_secret` as the store key name instead.
+- `analytics.tinybird.access_token_secret` is deprecated input. It is accepted
+  for migration, then discarded and omitted from serialized config; use
+  `analytics.tinybird.auction_token_secret` as the store key name instead.
 
 The four deprecated `secret_store` selectors under Tinybird, DataDome, its
 protection-test bypass, and S3 route authentication are also accepted and
@@ -180,8 +180,10 @@ Tinybird uses the same typed secret-reference path as the other static
 credentials. Do not configure a feature-specific store:
 
 ```toml
-[tinybird]
-enabled = true
+[analytics]
+module = "tinybird"
+
+[analytics.tinybird]
 api_host = "api.example.com"
 auction_dataset = "auction_events_raw"
 auction_token_secret = "tinybird_auction_append_token"
@@ -189,9 +191,9 @@ auction_token_secret = "tinybird_auction_append_token"
 
 Store the APPEND token value under `tinybird_auction_append_token` in the
 physical store mapped from `trusted_server_secrets`. The token is resolved once
-at startup. Disabled Tinybird telemetry does not require or resolve the token.
-The legacy `tinybird.secret_store` field is accepted for one migration release,
-but it is ignored and omitted from newly pushed config.
+at startup. Settings that do not select the module neither require nor resolve
+the token. The legacy `analytics.tinybird.secret_store` field is accepted for
+one migration release, but it is ignored and omitted from newly pushed config.
 
 ### Generate Secure Secrets
 
@@ -219,7 +221,7 @@ fail and the service will return its startup-error response.
 
 ## Key Sections
 
-10 of these sections select what runs, with `module` where one runs and
+11 of these sections select what runs, with `module` where one runs and
 `modules` where several run, and each gives every selected name its own
 `[<type>.<name>]` settings table, as
 [Configuration Rules](/guide/configuration-rules) describes.
@@ -227,6 +229,7 @@ fail and the service will return its startup-error response.
 | Section                                                                                                           | Selects               | Purpose                                                                                       |
 | ----------------------------------------------------------------------------------------------------------------- | --------------------- | --------------------------------------------------------------------------------------------- |
 | `[ad-server]`                                                                                                     | one module            | The ad server that picks the winner                                                           |
+| `[analytics]`                                                                                                     | one module            | The module that receives auction telemetry                                                    |
 | `[auction]`                                                                                                       | several modules       | Auction orchestration, bidder routes, and the modules the auction runs, `prebid` among them   |
 | `[cache]`                                                                                                         | nothing               | Static and rehosted asset cache policy                                                        |
 | `[consent]`                                                                                                       | nothing               | Consent interpretation, forwarding, and conflict resolution                                   |
@@ -249,7 +252,6 @@ fail and the service will return its startup-error response.
 | `[robots-txt]`                                                                                                    | several modules       | What `/robots.txt` answers, and `X-Robots-Tag` on its responses when every crawler is refused |
 | `[[serve]]`                                                                                                       | nothing               | Which page changes run on each reader's copy of a page, and in what order                     |
 | `[tester_cookie]`                                                                                                 | nothing               | Optional tester-cookie endpoints                                                              |
-| `[tinybird]`                                                                                                      | nothing               | Direct Tinybird auction telemetry                                                             |
 | `[trusted_client_ip]`                                                                                             | nothing               | Authenticated front-door client-IP forwarding                                                 |
 | `[<type>]`, such as `[cmp]`, `[tag]`, `[ad-tag]`, `[bot-protection]`, `[identity]`, `[audience]` or `[framework]` | one module or several | The section of a module type, selecting the modules of that type that run                     |
 
@@ -1566,30 +1568,48 @@ when_missing = "smart"
 
 See [Asset Routes](/guide/asset-routes) for request flow, S3 auth details, and Image Optimizer behavior.
 
-## Tinybird Configuration
+## Analytics Configuration
 
-`[tinybird]` sends auction events directly to the Tinybird Events API. The
-emitter is active only when `enabled = true`; access-log emission is not wired.
+`[analytics]` selects the module that receives auction telemetry, the way every
+other section selects its module. `module = "tinybird"` sends auction events
+directly to the Tinybird Events API, with its settings in
+`[analytics.tinybird]`. Without the section nothing is sent. Access-log
+emission is not wired.
 
-### `[tinybird]`
+### `[analytics]`
 
-| Field                  | Type           | Default                | Contract                                                           |
-| ---------------------- | -------------- | ---------------------- | ------------------------------------------------------------------ |
-| `enabled`              | Boolean        | `false`                | Enable auction telemetry                                           |
-| `api_host`             | String         | `""`                   | Required when enabled; regional host without scheme, port, or path |
-| `auction_dataset`      | String         | `"auction_events_raw"` | 1–128 ASCII letters, digits, or `_`                                |
-| `auction_token_secret` | String or null | `null`                 | Store key required when enabled; resolved value must be nonempty   |
-| `access_enabled`       | Boolean        | `false`                | Reserved; `true` fails startup because no emitter is wired         |
-| `access_dataset`       | String         | `"access_logs_raw"`    | Reserved access-log dataset name                                   |
-| `access_sample_rate`   | Number         | `0.0`                  | `0.0..=1.0`; reserved while access emission is disabled            |
-| `max_body_bytes`       | Integer        | `1048576`              | At least `1024` bytes                                              |
+| Field    | Type   | Default | Contract                                                                                         |
+| -------- | ------ | ------- | ------------------------------------------------------------------------------------------------ |
+| `module` | String | none    | Required when the section is present. `tinybird`, or the same name in full, `analytics.tinybird` |
+
+**Refused when the settings load**: a section that selects no module, a module
+this build does not have, and a key `[analytics.tinybird]` does not know.
+
+A configuration that still carries `[tinybird]` is refused with directions.
+Move its settings to `[analytics.tinybird]` unchanged, and select the module
+with `[analytics] module = "tinybird"`, which replaces the `enabled` line. A
+stored configuration written by an earlier version carries the `[tinybird]`
+table even where telemetry was off, so push the configuration again with this
+version.
+
+### `[analytics.tinybird]`
+
+| Field                  | Type           | Default                | Contract                                                   |
+| ---------------------- | -------------- | ---------------------- | ---------------------------------------------------------- |
+| `api_host`             | String         | `""`                   | Required; regional host without scheme, port, or path      |
+| `auction_dataset`      | String         | `"auction_events_raw"` | 1–128 ASCII letters, digits, or `_`                        |
+| `auction_token_secret` | String or null | `null`                 | Store key, required; resolved value must be nonempty       |
+| `access_enabled`       | Boolean        | `false`                | Reserved; `true` fails startup because no emitter is wired |
+| `access_dataset`       | String         | `"access_logs_raw"`    | Reserved access-log dataset name                           |
+| `access_sample_rate`   | Number         | `0.0`                  | `0.0..=1.0`; reserved while access emission is disabled    |
+| `max_body_bytes`       | Integer        | `1048576`              | At least `1024` bytes                                      |
 
 `secret_store` and `access_token_secret` are deprecated compatibility inputs.
 Both are removed during normalization; neither reaches runtime or serialized
 output. New configurations use only `auction_token_secret`, whose value is
 resolved through `trusted_server_secrets`.
 
-The complete enabled example appears in
+The complete example appears in
 [Tinybird auction telemetry](#tinybird-auction-telemetry).
 
 ## Cache Configuration

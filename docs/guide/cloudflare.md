@@ -74,5 +74,8 @@ Request-time store registries are unwired, so EC KV lookup is not available.
 Forwarded client-IP headers are sanitized, but `[trusted_client_ip]` is not
 resolved. See the [API reference](./api-reference) for route-level behavior.
 
+The Worker sends no [auction telemetry](./telemetry#adapter-support), and warns
+at startup when `[analytics]` selects a module.
+
 Compare the [Fastly](./fastly), [Spin](./spin), and [Axum](./axum-dev)
 adapter journeys.

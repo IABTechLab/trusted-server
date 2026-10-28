@@ -80,6 +80,9 @@ unavailable. Forwarded client-IP headers are sanitized, and Spin derives its
 runtime authority, scheme, and client-address headers in the innermost
 normalization layer.
 
+Spin sends no [auction telemetry](./telemetry#adapter-support), and warns at
+startup when `[analytics]` selects a module.
+
 Spin is not installed in the integration CI environment. The recurring manual
 smoke therefore needs a named owner, tested commit, exact tool versions, and an
 expiry; those details are recorded with each run in the documentation-refresh

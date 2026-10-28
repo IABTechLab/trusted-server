@@ -72,5 +72,8 @@ Axum sanitizes forwarded client-IP headers but does not resolve
 `[trusted_client_ip]`; see the
 [adapter matrix](./api-reference#adapter-and-startup-support).
 
+Axum sends no [auction telemetry](./telemetry#adapter-support), and warns at
+startup when `[analytics]` selects a module.
+
 For an edge deployment, use the [Fastly](./fastly),
 [Cloudflare](./cloudflare), or [Spin](./spin) guide.

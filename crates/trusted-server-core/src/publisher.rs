@@ -27036,7 +27036,9 @@ mod tests {
     /// The same capturing setup also covers how both paths key the identity
     /// graph. A module whose canonical form differs from the cookie value has
     /// its row read under the canonical key, so the partner ID stored there
-    /// reaches the dispatched auction request.
+    /// reaches the dispatched auction request. It also covers that neither
+    /// path sends a telemetry row about a reader the consent gate refuses and
+    /// who has not permitted ad performance measurement.
     mod navigation_publisher_domain_tests {
         use super::*;
         use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
@@ -27193,6 +27195,26 @@ mod tests {
                 ..Default::default()
             };
             EcContext::new_for_test(None, consent)
+        }
+
+        /// [`EcContext`] in an unknown jurisdiction with no consent record,
+        /// which the server-side auction gate refuses, for a reader who has
+        /// set no permission, ad performance measurement included.
+        fn consent_denying_ec_context() -> EcContext {
+            EcContext::new_for_test_gated(None, crate::consent::ConsentContext::default(), false)
+        }
+
+        /// Asserts the sink received no telemetry row at all.
+        fn assert_no_telemetry(telemetry_sink: &RecordingTelemetrySink) {
+            let batches = telemetry_sink
+                .batches
+                .lock()
+                .expect("should lock telemetry batches");
+            assert!(
+                batches.is_empty(),
+                "should send no row about a reader who has not permitted ad measurement, got {:?}",
+                *batches
+            );
         }
 
         fn services_with(
@@ -27366,6 +27388,94 @@ mod tests {
             .expect("should return ok response");
 
             assert_configured_domain(&captured, &telemetry_sink);
+        }
+
+        #[tokio::test]
+        async fn navigation_sends_no_row_when_consent_denies_without_ad_measurement() {
+            let settings = settings_with_capturing_provider();
+            let captured = Arc::new(Mutex::new(None));
+            let orchestrator = orchestrator_capturing_request(&settings, &captured);
+            let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"<html><head></head><body>ok</body></html>".to_vec());
+            let services = services_with(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                Arc::clone(&telemetry_sink),
+            );
+            let mut ec_context = consent_denying_ec_context();
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(format!("https://{EDGE_HOST}/2024/01/my-article/"))
+                .header(header::HOST, EDGE_HOST)
+                .header(header::USER_AGENT, "FictionalBrowser/1.0 (FictionalOS)")
+                .header("sec-fetch-dest", "document")
+                .body(EdgeBody::empty())
+                .expect("should build test request");
+
+            let registry = test_registry(&settings);
+            let _ = handle_publisher_request(
+                AppContext {
+                    settings: &settings,
+                    integration_registry: &registry,
+                },
+                &services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &article_slot(),
+                    registry: None,
+                },
+                req,
+                EdgeCacheHeader::SMaxageFallback,
+            )
+            .await
+            .expect("should proxy publisher request");
+
+            assert_no_telemetry(&telemetry_sink);
+        }
+
+        #[tokio::test]
+        async fn page_bids_sends_no_row_when_consent_denies_without_ad_measurement() {
+            let settings = settings_with_capturing_provider();
+            let captured = Arc::new(Mutex::new(None));
+            let orchestrator = orchestrator_capturing_request(&settings, &captured);
+            let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+            let services = services_with(
+                Arc::new(crate::platform::test_support::NoopHttpClient),
+                Arc::clone(&telemetry_sink),
+            );
+            let mut ec_context = consent_denying_ec_context();
+            let mut req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "https://{EDGE_HOST}/_ts/page-bids?path=/2024/01/my-article/"
+                ))
+                .header(header::HOST, EDGE_HOST)
+                .header(header::USER_AGENT, "FictionalBrowser/1.0 (FictionalOS)")
+                .body(EdgeBody::empty())
+                .expect("should build test request");
+            req.headers_mut().insert(
+                header::HeaderName::from_static("sec-fetch-site"),
+                HeaderValue::from_static("same-origin"),
+            );
+
+            let _ = handle_page_bids(
+                &settings,
+                &services,
+                None,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &article_slot(),
+                    registry: None,
+                },
+                &mut ec_context,
+                req,
+            )
+            .await
+            .expect("should return ok response");
+
+            assert_no_telemetry(&telemetry_sink);
         }
 
         #[tokio::test]

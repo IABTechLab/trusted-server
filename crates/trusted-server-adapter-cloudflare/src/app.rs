@@ -1,6 +1,7 @@
 use core::future::Future;
 use core::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
@@ -9,6 +10,7 @@ use edgezero_core::http::{HeaderValue, Method, Request, Response, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
+use trusted_server_core::auction::telemetry::warn_once_when_analytics_is_unsent;
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan_with,
 };
@@ -257,6 +259,14 @@ fn build_state_with_registrations_and_services(
             &settings,
             &shipped_signal_modules(),
         )?;
+    // This adapter builds no telemetry sink, so a module `[analytics]` selects
+    // sends nothing unless the caller's services carry a sink.
+    warn_once_when_analytics_is_unsent(
+        &settings,
+        services.as_ref(),
+        "Cloudflare",
+        &UNSENT_ANALYTICS_LOGGED,
+    );
     let permission_policy = settings.required_permission_policy()?;
 
     Ok(Arc::new(AppState {
@@ -269,6 +279,11 @@ fn build_state_with_registrations_and_services(
         services,
     }))
 }
+
+/// Set once startup has logged that this adapter sends no auction telemetry.
+/// The state is built for every request, so the flag keeps the warning to
+/// one for each instance.
+static UNSENT_ANALYTICS_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// The permission signal modules this adapter links, in the order they run
 /// when configuration names none. Global Privacy Control is first because it
@@ -1130,5 +1145,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `[analytics]` selecting a module still loads on this adapter, which
+    /// sends no auction telemetry, and startup says so.
+    #[test]
+    fn startup_logs_that_this_adapter_sends_no_auction_telemetry() {
+        let settings = Settings::from_toml(&format!(
+            "{}\n{}",
+            trusted_server_core::test_support::tests::crate_test_settings_str(),
+            trusted_server_core::test_support::template::documented_block("[analytics]")
+        ))
+        .expect("should load settings selecting the documented analytics module")
+        // A loaded domain carries its policy.
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
+
+        build_state_with_settings(settings).expect("should accept a selected analytics module");
+
+        assert!(
+            UNSENT_ANALYTICS_LOGGED.load(std::sync::atomic::Ordering::Relaxed),
+            "startup should log that this adapter sends no auction telemetry"
+        );
     }
 }

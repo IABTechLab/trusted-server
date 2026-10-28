@@ -275,6 +275,31 @@ pub mod template {
 
         out.join("\n")
     }
+
+    /// Only the block of [`EXAMPLE_TEMPLATE`] that begins at the line
+    /// `# {header}`, uncommented, for a test that adds a documented section to
+    /// settings of its own. The block ends at the first line that is not a
+    /// comment.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the template documents no such block.
+    #[must_use]
+    pub fn documented_block(header: &str) -> String {
+        let header_line = format!("# {header}");
+        let block: Vec<&str> = EXAMPLE_TEMPLATE
+            .lines()
+            .skip_while(|line| *line != header_line)
+            .take_while(|line| line.trim_start().starts_with('#'))
+            .map(|line| {
+                line.strip_prefix("# ")
+                    .or_else(|| line.strip_prefix('#'))
+                    .unwrap_or(line)
+            })
+            .collect();
+        assert!(!block.is_empty(), "the template should document {header}");
+        block.join("\n")
+    }
 }
 
 /// Shared Next.js + auction origin fixture.

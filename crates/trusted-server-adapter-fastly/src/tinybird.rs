@@ -20,21 +20,18 @@ const TINYBIRD_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(2);
 const TINYBIRD_BETWEEN_BYTES_TIMEOUT: Duration = Duration::from_secs(2);
 const TINYBIRD_MAX_ROWS_PER_AUCTION_BATCH: usize = 512;
 
-/// Build the configured auction telemetry sink.
+/// Build the auction telemetry sink, which sends only when `[analytics]`
+/// selects the analytics module.
 #[must_use]
 pub(crate) fn auction_sink_from_settings(settings: &Settings) -> Arc<dyn AuctionTelemetrySink> {
-    if settings.tinybird.enabled {
-        Arc::new(FastlyTinybirdAuctionTelemetrySink::new(
-            settings.tinybird.clone(),
-        ))
-    } else {
-        Arc::new(NoopAuctionTelemetrySink)
+    match settings.analytics_module() {
+        Some(telemetry) => Arc::new(FastlyTinybirdAuctionTelemetrySink::new(telemetry.clone())),
+        None => Arc::new(NoopAuctionTelemetrySink),
     }
 }
 
 #[derive(Debug, Clone)]
 struct FastlyTinybirdAuctionTelemetrySink {
-    enabled: bool,
     target: TinybirdEventsTarget,
 }
 
@@ -57,7 +54,7 @@ impl TinybirdEventsTarget {
             dataset: config.auction_dataset,
             append_token: config
                 .auction_token_secret
-                .expect("should contain a resolved Tinybird auction token when enabled"),
+                .expect("should contain a resolved Tinybird auction token when selected"),
             uri,
             backend_spec,
             max_body_bytes: config.max_body_bytes,
@@ -67,9 +64,7 @@ impl TinybirdEventsTarget {
 
 impl FastlyTinybirdAuctionTelemetrySink {
     fn new(config: TinybirdSettings) -> Self {
-        let enabled = config.enabled;
         Self {
-            enabled,
             target: TinybirdEventsTarget::from_config(config),
         }
     }
@@ -149,16 +144,12 @@ impl FastlyTinybirdAuctionTelemetrySink {
 
 #[async_trait::async_trait(?Send)]
 impl AuctionTelemetrySink for FastlyTinybirdAuctionTelemetrySink {
-    fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-
     async fn emit_auction_events(
         &self,
         services: &RuntimeServices,
         batch: AuctionEventBatch,
     ) -> Result<(), Report<TrustedServerError>> {
-        if !self.enabled || batch.is_empty() {
+        if batch.is_empty() {
             return Ok(());
         }
 
@@ -431,9 +422,8 @@ mod tests {
             .build()
     }
 
-    fn enabled_config() -> TinybirdSettings {
+    fn tinybird_settings() -> TinybirdSettings {
         TinybirdSettings {
-            enabled: true,
             api_host: "api.us-east.aws.tinybird.co".to_owned(),
             secret_store: None,
             auction_dataset: "auction_events_raw".to_owned(),
@@ -480,7 +470,7 @@ mod tests {
             Arc::clone(&http_client),
             HashMap::new(),
         );
-        let sink = FastlyTinybirdAuctionTelemetrySink::new(enabled_config());
+        let sink = FastlyTinybirdAuctionTelemetrySink::new(tinybird_settings());
 
         futures::executor::block_on(
             sink.emit_auction_events(&services, AuctionEventBatch::new(vec![test_row()])),
@@ -528,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_sink_does_not_dispatch() {
+    fn settings_selecting_no_analytics_module_build_a_sink_that_sends_nothing() {
         let backend = Arc::new(RecordingBackend::default());
         let http_client = Arc::new(RecordingHttpClient::default());
         let services = services(
@@ -536,18 +526,17 @@ mod tests {
             Arc::clone(&http_client),
             HashMap::new(),
         );
-        let mut config = enabled_config();
-        config.enabled = false;
-        let sink = FastlyTinybirdAuctionTelemetrySink::new(config);
+        let sink = auction_sink_from_settings(&Settings::default());
+        assert!(!sink.is_enabled(), "should build the no-op sink");
 
         futures::executor::block_on(
             sink.emit_auction_events(&services, AuctionEventBatch::new(vec![test_row()])),
         )
-        .expect("should ignore disabled sink");
+        .expect("the no-op sink should accept the batch");
 
         assert!(
             backend.specs.lock().expect("should lock specs").is_empty(),
-            "should not ensure backend when disabled"
+            "should not ensure a backend when nothing is selected"
         );
         assert!(
             http_client
@@ -555,8 +544,21 @@ mod tests {
                 .lock()
                 .expect("should lock recorded requests")
                 .is_empty(),
-            "should not send when disabled"
+            "should not send when nothing is selected"
         );
+    }
+
+    #[test]
+    fn settings_selecting_the_analytics_module_build_a_sink_that_sends() {
+        let mut settings = Settings::default();
+        settings.analytics = Some(trusted_server_core::settings::AnalyticsConfig {
+            module: Some("tinybird".to_owned()),
+            tinybird: Some(tinybird_settings()),
+        });
+
+        let sink = auction_sink_from_settings(&settings);
+
+        assert!(sink.is_enabled(), "should build the sink that sends");
     }
 
     #[test]
@@ -568,7 +570,7 @@ mod tests {
             Arc::clone(&http_client),
             HashMap::new(),
         );
-        let sink = FastlyTinybirdAuctionTelemetrySink::new(enabled_config());
+        let sink = FastlyTinybirdAuctionTelemetrySink::new(tinybird_settings());
 
         futures::executor::block_on(
             sink.emit_auction_events(&services, AuctionEventBatch::new(Vec::new())),
@@ -601,7 +603,7 @@ mod tests {
                 b"append-token".to_vec(),
             )]),
         );
-        let sink = FastlyTinybirdAuctionTelemetrySink::new(enabled_config());
+        let sink = FastlyTinybirdAuctionTelemetrySink::new(tinybird_settings());
         let rows = vec![test_row(); TINYBIRD_MAX_ROWS_PER_AUCTION_BATCH + 1];
 
         let result = futures::executor::block_on(

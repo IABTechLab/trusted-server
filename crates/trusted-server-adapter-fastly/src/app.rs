@@ -1840,6 +1840,41 @@ mod tests {
         );
     }
 
+    /// The sink startup builds from `[analytics]` is the one each request's
+    /// services carry, so a selected module sends from the request path and a
+    /// deployment that selects none sends nothing.
+    #[test]
+    fn per_request_services_carry_the_sink_analytics_selects() {
+        let base = trusted_server_core::test_support::tests::crate_test_settings_str();
+        let analytics =
+            trusted_server_core::test_support::template::documented_block("[analytics]");
+        let context = RequestContext::new(
+            empty_request(Method::GET, "/article"),
+            PathParams::default(),
+        );
+
+        for (document, sends) in [
+            (base.clone(), false),
+            (format!("{base}\n{analytics}"), true),
+        ] {
+            let settings = Settings::from_toml(&document)
+                .expect("should load the settings")
+                // A loaded domain carries its policy.
+                .with_permission_policy(
+                    trusted_server_core::permissions::PermissionPolicy::sample(),
+                );
+            let state = build_state_from_settings(settings).expect("should build state");
+
+            let services = build_per_request_services(&state, &context);
+
+            assert_eq!(
+                services.auction_telemetry_sink().is_enabled(),
+                sends,
+                "a request's sink should send exactly when [analytics] selects a module"
+            );
+        }
+    }
+
     /// Builds a router whose `AppState` uses a registry containing the given
     /// request filters (and no routes), so dispatch-level request-filter
     /// behavior can be exercised without a real integration.

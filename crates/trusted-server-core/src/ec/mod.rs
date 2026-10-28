@@ -1302,15 +1302,20 @@ impl EcContext {
     }
 }
 
-/// The permissions a test context stands in for: storage and personalised-ad
-/// selection when the gate is open, none when it is closed.
+/// The permissions a test context stands in for: storage, personalised-ad
+/// selection and ad performance measurement when the gate is open, none when
+/// it is closed.
 #[cfg(test)]
 fn permissions_for_test(ec_allowed: bool) -> PermissionState {
     if ec_allowed {
         PermissionState::new(
-            [Permission::StoreOnDevice, Permission::SelectPersonalisedAds]
-                .into_iter()
-                .collect(),
+            [
+                Permission::StoreOnDevice,
+                Permission::SelectPersonalisedAds,
+                Permission::MeasureAdPerformance,
+            ]
+            .into_iter()
+            .collect(),
         )
     } else {
         PermissionState::default()
