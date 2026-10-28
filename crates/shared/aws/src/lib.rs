@@ -570,13 +570,17 @@ mod tests {
     /// Loads `settings` as a deployment does, with the signer's builder, so
     /// its secret settings are looked up in the canary store.
     fn load(settings: &Settings) -> Settings {
-        let data = serde_json::to_value(settings).expect("should serialize");
+        let mut pushed = settings.clone();
+        // The blob a push writes names the policy and carries its file.
+        pushed.permissions = trusted_server_core::test_support::tests::sample_permissions();
+        let data = serde_json::to_value(&pushed).expect("should serialize");
         let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
         let envelope = serde_json::to_string(&envelope).expect("should serialize the envelope");
         settings_from_config_blob_with(
             &envelope,
             &CanaryStore,
             &StoreName::from("ts_secrets"),
+            trusted_server_core::platform::PolicyOrigin::Blob,
             &[builder()],
         )
         .expect("should load the settings")

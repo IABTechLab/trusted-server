@@ -9,7 +9,7 @@ use http::{Method, Request, Response};
 use matchit::Router;
 use sha2::{Digest as _, Sha256};
 
-use crate::attestation::PlatformIdentity;
+use crate::asset_cache::AssetCacheModule;
 use crate::auction::AuctionPlan;
 use crate::auction::telemetry::AuctionTelemetrySink;
 use crate::constants::HEADER_X_TS_EC;
@@ -25,7 +25,9 @@ use crate::http_util::is_navigation_request;
 use crate::middleware::{Middleware, MiddlewareChain, MiddlewarePhase, PhaseEntries};
 use crate::module_context::{ModuleCall, ModuleContext, ModuleRequest, ResolvedRequest};
 use crate::origin_auth::OriginSigners;
-use crate::platform::{DisabledGeo, GeoModule, PlatformGeoModule, RuntimeServices};
+use crate::platform::{
+    DisabledGeo, GeoModule, PlatformGeoModule, PlatformIdentity, RuntimeServices,
+};
 use crate::prefix::{PrefixModule, Prefixes, SelectedPrefixModule};
 use crate::robots_txt::{ALLOW_ALL, REFUSE_ALL, RobotsTxtContributor};
 use crate::settings::Settings;
@@ -707,6 +709,11 @@ pub struct IntegrationRegistration {
     /// on every request, so declaring one runs it wherever the registration
     /// itself runs.
     pub identifier_module: Option<Arc<dyn IdentifierModule>>,
+    /// Asset cache module this registration supplies, under its name.
+    ///
+    /// Taken only from the registration of the builder `[asset-cache]`
+    /// selects, and refused from any other.
+    pub asset_cache_module: Option<(&'static str, Arc<dyn AssetCacheModule>)>,
 }
 
 impl IntegrationRegistration {
@@ -741,6 +748,7 @@ impl IntegrationRegistrationBuilder {
                 source_module: None,
                 analytics_module: None,
                 identifier_module: None,
+                asset_cache_module: None,
             },
         }
     }
@@ -887,6 +895,22 @@ impl IntegrationRegistrationBuilder {
         self
     }
 
+    /// Declare the asset cache module this registration supplies, under its
+    /// `name`, which may answer for a file before core asks its origin, see
+    /// [`crate::asset_cache`].
+    ///
+    /// The registry takes it only when `[asset-cache]` selects the builder
+    /// that made this registration, and refuses it from any other builder.
+    #[must_use]
+    pub fn with_asset_cache_module(
+        mut self,
+        name: &'static str,
+        module: Arc<dyn AssetCacheModule>,
+    ) -> Self {
+        self.registration.asset_cache_module = Some((name, module));
+        self
+    }
+
     /// Mark this integration's JS module for deferred loading via
     /// `<script defer>` instead of the main synchronous bundle.
     #[must_use]
@@ -1025,6 +1049,9 @@ struct IntegrationRegistryInner {
     // registration order, which core asks on every request. Shared, so a
     // request's services take a reference count rather than a copy.
     identifier_modules: Arc<[Arc<dyn IdentifierModule>]>,
+    // The asset cache module of the builder `[asset-cache]` selects, or
+    // `None` when it selects none.
+    asset_cache_module: Option<Arc<dyn AssetCacheModule>>,
 }
 
 /// The sources a deployment's settings name, built once.
@@ -1074,6 +1101,7 @@ impl Default for IntegrationRegistryInner {
             analytics_module: None,
             sources: None,
             identifier_modules: Arc::default(),
+            asset_cache_module: None,
         }
     }
 }
@@ -1892,6 +1920,74 @@ fn build_sources(
     Ok(BuiltSources { publisher, routes })
 }
 
+/// Refuses an `[asset-cache]` that selects more than one module, because
+/// core offers each file to one asset cache module.
+///
+/// # Errors
+///
+/// Naming the first two modules selected.
+fn check_asset_cache_selection(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    let section = crate::asset_cache::MODULE_TYPE;
+    let selected = settings
+        .sections
+        .section(section)
+        .map_or(&[][..], |modules| modules.selected());
+    if let [first, second, ..] = selected {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "[{section}] selects `{first}` and `{second}`, and core offers each file to \
+                 one asset cache module, so select one"
+            ),
+        }));
+    }
+    Ok(())
+}
+
+/// The crate whose builder made `integration`, for a refusal.
+fn builder_source(integration: &str, inner: &IntegrationRegistryInner) -> &'static str {
+    inner
+        .builder_ids
+        .iter()
+        .find(|(id, _)| *id == integration)
+        .map_or("an unknown crate", |(_, source)| *source)
+}
+
+/// The refusal of an asset cache module that `integration` supplies under
+/// `name` in what it registers for the auction plan, which is made whatever
+/// `[asset-cache]` selects.
+fn refuse_plan_asset_cache(
+    integration: &'static str,
+    name: &str,
+    inner: &IntegrationRegistryInner,
+) -> Report<TrustedServerError> {
+    let source = builder_source(integration, inner);
+    Report::new(TrustedServerError::Configuration {
+        message: format!(
+            "integration `{integration}` from `{source}` supplies the asset cache module \
+             `{name}` in what it registers for the auction plan, which is made whatever \
+             `[asset-cache]` selects. Only the module `[asset-cache]` selects may supply \
+             one, from its own registration"
+        ),
+    })
+}
+
+/// The refusal of an asset cache module that `integration` supplies under
+/// `name`, when `[asset-cache]` does not select the builder that made it.
+fn refuse_unselected_asset_cache(
+    integration: &'static str,
+    name: &str,
+    inner: &IntegrationRegistryInner,
+) -> Report<TrustedServerError> {
+    let source = builder_source(integration, inner);
+    Report::new(TrustedServerError::Configuration {
+        message: format!(
+            "integration `{integration}` from `{source}` supplies the asset cache module \
+             `{name}`, and `[asset-cache]` does not select it. Only the module \
+             `[asset-cache]` selects may supply one"
+        ),
+    })
+}
+
 impl IntegrationRegistry {
     /// The publisher's source, built when the registry was built from the
     /// settings, or built now from `settings` with core's sources alone for a
@@ -2042,6 +2138,10 @@ impl IntegrationRegistry {
         // hooks run ahead of every module a section selects.
         let mut plan_registrations: Vec<IntegrationRegistration> = Vec::new();
         let mut registrations: Vec<IntegrationRegistration> = Vec::new();
+        // The one builder whose registration may supply the asset cache
+        // module, being the one `[asset-cache]` selects, with its source and
+        // the name the section wrote.
+        let mut asset_cache_supplier: Option<(&'static str, &'static str, &str)> = None;
 
         // A vendor's shared table is read by that vendor's builder alone, so
         // one no builder reads is a table the deployment cannot use.
@@ -2135,6 +2235,14 @@ impl IntegrationRegistry {
             if let Some(name) = builder.module_name() {
                 inner.builder_modules.push((name, selected));
             }
+            if selected
+                && let Some((section, written)) = builder
+                    .module_name()
+                    .and_then(|name| settings.module_selection(name))
+                && section == crate::asset_cache::MODULE_TYPE
+            {
+                asset_cache_supplier = Some((builder.id(), builder.source(), written));
+            }
             // A builder a vendor's shared table runs is built when the table
             // is present, whatever any section selects.
             let runs = match builder.shared_settings() {
@@ -2168,6 +2276,23 @@ impl IntegrationRegistry {
         // settings. Deploy validation deliberately does not make this check,
         // because a vendor crate the CLI never links may supply the name.
         check_section_selections(settings, extra, &inner)?;
+        check_asset_cache_selection(settings)?;
+        // What the auction plan registers is made whatever any section
+        // selects, so none of it may supply the asset cache module.
+        if let Some((registration, (name, _))) =
+            plan_registrations.iter().find_map(|registration| {
+                registration
+                    .asset_cache_module
+                    .as_ref()
+                    .map(|module| (registration, module))
+            })
+        {
+            return Err(refuse_plan_asset_cache(
+                registration.integration_id,
+                name,
+                &inner,
+            ));
+        }
 
         // The geo, Edge Cookie and device module names taken so far, with the
         // integration that supplies each.
@@ -2317,6 +2442,22 @@ impl IntegrationRegistry {
                 claim_module_name(&mut claimed, "analytics", name, registration.integration_id)?;
                 inner.analytics_modules.push((name, sink));
             }
+            if let Some((name, module)) = registration.asset_cache_module {
+                if asset_cache_supplier.map(|(id, _, _)| id) != Some(registration.integration_id) {
+                    return Err(refuse_unselected_asset_cache(
+                        registration.integration_id,
+                        name,
+                        &inner,
+                    ));
+                }
+                claim_module_name(
+                    &mut claimed,
+                    "asset cache",
+                    name,
+                    registration.integration_id,
+                )?;
+                inner.asset_cache_module = Some(module);
+            }
             if registration.js_disabled {
                 inner.disabled_js_ids.push(registration.integration_id);
             } else if registration.js_deferred {
@@ -2345,6 +2486,18 @@ impl IntegrationRegistry {
                 }
                 inner.carried_js.push((registration.integration_id, module));
             }
+        }
+        // A builder `[asset-cache]` selects that supplies no module would
+        // leave every file to its origin with nothing said.
+        if let Some((integration, source, written)) = asset_cache_supplier
+            && inner.asset_cache_module.is_none()
+        {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[asset-cache] selects `{written}`, and integration `{integration}` from \
+                     `{source}` supplies no asset cache module"
+                ),
+            }));
         }
 
         // A client-cycle Edge Cookie module ships a page script that posts its
@@ -2434,6 +2587,13 @@ impl IntegrationRegistry {
     #[must_use]
     pub fn analytics_module(&self) -> Option<Arc<dyn AuctionTelemetrySink>> {
         self.inner.analytics_module.clone()
+    }
+
+    /// The asset cache module of the builder `[asset-cache]` selects, or
+    /// `None` when it selects none.
+    #[must_use]
+    pub fn asset_cache_module(&self) -> Option<Arc<dyn AssetCacheModule>> {
+        self.inner.asset_cache_module.clone()
     }
 
     /// The prefix module `[prefix] module` selects, or core's own when nothing
@@ -3059,6 +3219,7 @@ impl IntegrationRegistry {
                 analytics_module: None,
                 sources: None,
                 identifier_modules: Arc::default(),
+                asset_cache_module: None,
             }),
             plan: None,
             platform: Arc::default(),
@@ -3147,6 +3308,7 @@ impl IntegrationRegistry {
                 analytics_module: None,
                 sources: None,
                 identifier_modules: Arc::default(),
+                asset_cache_module: None,
             }),
             plan: None,
             platform: Arc::default(),
@@ -5895,6 +6057,121 @@ mod tests {
         );
     }
 
+    /// A path outside `/integrations/` that the route clash test declares.
+    const OWN_ENDPOINT_PATH: &str = "/own-endpoint";
+
+    /// A proxy that declares the routes it holds and answers each with an
+    /// empty body.
+    struct DeclaredRoutes {
+        name: &'static str,
+        routes: Vec<IntegrationEndpoint>,
+    }
+
+    #[async_trait(?Send)]
+    impl IntegrationProxy for DeclaredRoutes {
+        fn integration_name(&self) -> &'static str {
+            self.name
+        }
+
+        fn routes(&self) -> Vec<IntegrationEndpoint> {
+            self.routes.clone()
+        }
+
+        async fn handle(
+            &self,
+            _call: crate::module_context::ModuleCall<'_>,
+            _req: Request<EdgeBody>,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+            Ok(Response::new(EdgeBody::empty()))
+        }
+    }
+
+    /// A registration under `id` whose proxy declares `methods` on
+    /// [`OWN_ENDPOINT_PATH`], one route for each.
+    fn declaring(id: &'static str, methods: &[Method]) -> Option<IntegrationRegistration> {
+        let routes = methods
+            .iter()
+            .map(|method| IntegrationEndpoint::new(method.clone(), OWN_ENDPOINT_PATH))
+            .collect();
+        Some(
+            IntegrationRegistration::builder(id)
+                .with_proxy(Arc::new(DeclaredRoutes { name: id, routes }))
+                .build(),
+        )
+    }
+
+    /// A test module, as its integration id, its module name and its build
+    /// function.
+    type RouteModule = (
+        &'static str,
+        &'static str,
+        crate::integrations::IntegrationBuilderFn,
+    );
+
+    const GETS: RouteModule = ("gets", "testing.gets", |_| {
+        Ok(declaring("gets", &[Method::GET]))
+    });
+    const ALSO_GETS: RouteModule = ("also-gets", "testing.also-gets", |_| {
+        Ok(declaring("also-gets", &[Method::GET]))
+    });
+    const GETS_TWICE: RouteModule = ("gets-twice", "testing.gets-twice", |_| {
+        Ok(declaring("gets-twice", &[Method::GET, Method::GET]))
+    });
+    const POSTS: RouteModule = ("posts", "testing.posts", |_| {
+        Ok(declaring("posts", &[Method::POST]))
+    });
+
+    /// Builds a registry from `modules`, with every one of them selected.
+    fn registry_selecting(
+        modules: &[RouteModule],
+    ) -> Result<IntegrationRegistry, Report<TrustedServerError>> {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        let mut builders = Vec::new();
+        for &(id, module, register) in modules {
+            settings.select_module("testing", module);
+            builders.push(
+                crate::integrations::IntegrationBuilder::new(
+                    id,
+                    "route-clash-test",
+                    register,
+                    validate_nothing,
+                )
+                .with_module_name(module),
+            );
+        }
+        IntegrationRegistry::with_registrations(&settings, &builders)
+    }
+
+    #[test]
+    fn two_routes_on_one_method_and_path_are_refused_when_the_registry_is_built() {
+        let expected = format!("Integration route registration failed for GET {OWN_ENDPOINT_PATH}");
+        // Two modules declaring one route each, and one module declaring the
+        // route twice.
+        for modules in [&[GETS, ALSO_GETS][..], &[GETS_TWICE]] {
+            let Err(error) = registry_selecting(modules) else {
+                panic!("should refuse a second GET route on {OWN_ENDPOINT_PATH}");
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains(&expected),
+                "should name the method and the path: {message}"
+            );
+        }
+
+        let registry =
+            registry_selecting(&[GETS, POSTS]).expect("should accept two methods on one path");
+        let routed_to = |method: &Method| {
+            registry
+                .find_route(method, OWN_ENDPOINT_PATH)
+                .map(|(_, integration)| *integration)
+        };
+        assert_eq!(
+            (routed_to(&Method::GET), routed_to(&Method::POST)),
+            (Some("gets"), Some("posts")),
+            "should route each method to the module that declares it"
+        );
+    }
+
     /// Selects core's stand-in, which registers a deferred browser module.
     fn enable_deferred_module(settings: &mut Settings) {
         settings.select_module("testing", test_support::deferred_fixture::MODULE);
@@ -8559,5 +8836,239 @@ mod tests {
                 && message.contains("runs in no phase"),
             "should name the supplier and the middleware: {message}"
         );
+    }
+
+    const ASSET_CACHE_ONE: &str = "asset-cache.one";
+    const ASSET_CACHE_TWO: &str = "asset-cache.two";
+    const TESTING_SUPPLIER: &str = "testing.supplier";
+    const ASSET_CACHE_EMPTY: &str = "asset-cache.empty";
+
+    fn asset_cache_module() -> Arc<dyn AssetCacheModule> {
+        crate::asset_cache::test_support::TestAssetCache::asking_the_origin()
+    }
+
+    fn supplies_asset_cache_one(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("asset_cache_one")
+                .with_asset_cache_module(ASSET_CACHE_ONE, asset_cache_module())
+                .build(),
+        ))
+    }
+
+    fn supplies_asset_cache_two(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("asset_cache_two")
+                .with_asset_cache_module(ASSET_CACHE_TWO, asset_cache_module())
+                .build(),
+        ))
+    }
+
+    fn testing_supplies_an_asset_cache(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("testing_supplier")
+                .with_asset_cache_module(TESTING_SUPPLIER, asset_cache_module())
+                .build(),
+        ))
+    }
+
+    fn supplies_no_asset_cache(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("asset_cache_empty").build(),
+        ))
+    }
+
+    fn shared_table_supplies_an_asset_cache(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("shared_supplier")
+                .with_asset_cache_module("shared.supplier", asset_cache_module())
+                .build(),
+        ))
+    }
+
+    /// Two asset cache modules, a module of another type and a builder its
+    /// shared table runs, each supplying an asset cache module, and a module
+    /// of the asset cache type that supplies none.
+    fn asset_cache_builders() -> [crate::integrations::IntegrationBuilder; 5] {
+        use crate::integrations::IntegrationBuilder;
+        [
+            IntegrationBuilder::new(
+                "asset_cache_one",
+                "asset-cache-one",
+                supplies_asset_cache_one,
+                validate_nothing,
+            )
+            .with_module_name(ASSET_CACHE_ONE),
+            IntegrationBuilder::new(
+                "asset_cache_two",
+                "asset-cache-two",
+                supplies_asset_cache_two,
+                validate_nothing,
+            )
+            .with_module_name(ASSET_CACHE_TWO),
+            IntegrationBuilder::new(
+                "testing_supplier",
+                "testing-supplier",
+                testing_supplies_an_asset_cache,
+                validate_nothing,
+            )
+            .with_module_name(TESTING_SUPPLIER),
+            IntegrationBuilder::new(
+                "shared_supplier",
+                "shared-supplier",
+                shared_table_supplies_an_asset_cache,
+                validate_nothing,
+            )
+            .with_shared_settings(SHARED_VENDOR),
+            IntegrationBuilder::new(
+                "asset_cache_empty",
+                "asset-cache-empty",
+                supplies_no_asset_cache,
+                validate_nothing,
+            )
+            .with_module_name(ASSET_CACHE_EMPTY),
+        ]
+    }
+
+    fn asset_cache_refusal(settings: &Settings) -> String {
+        IntegrationRegistry::with_registrations(settings, &asset_cache_builders())
+            .err()
+            .expect("should refuse the asset cache selection")
+            .to_string()
+    }
+
+    #[test]
+    fn the_registry_keeps_the_asset_cache_module_asset_cache_selects() {
+        let selected = IntegrationRegistry::with_registrations(
+            &settings_naming(ASSET_CACHE_ONE),
+            &asset_cache_builders(),
+        )
+        .expect("should build the registry");
+        let unselected = IntegrationRegistry::with_registrations(
+            &crate::test_support::tests::create_test_settings(),
+            &asset_cache_builders(),
+        )
+        .expect("should build the registry");
+
+        assert!(
+            selected.asset_cache_module().is_some(),
+            "should keep the module of the builder [asset-cache] selects"
+        );
+        assert!(
+            unselected.asset_cache_module().is_none(),
+            "a linked asset cache module is not used until [asset-cache] selects it"
+        );
+    }
+
+    #[test]
+    fn asset_cache_naming_a_module_the_build_does_not_link_is_refused() {
+        let message = asset_cache_refusal(&settings_naming("asset-cache.absent"));
+
+        assert!(
+            message.contains("[asset-cache] selects `absent`")
+                && message.contains("which no module this deployment supplies"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn asset_cache_selecting_two_modules_is_refused() {
+        let mut settings = settings_naming(ASSET_CACHE_ONE);
+        settings.select_module("asset-cache", ASSET_CACHE_TWO);
+
+        let message = asset_cache_refusal(&settings);
+
+        assert!(
+            message.contains("[asset-cache] selects `one` and `two`"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn an_asset_cache_module_from_a_builder_asset_cache_does_not_select_is_refused() {
+        let mut settings = settings_naming(ASSET_CACHE_ONE);
+        settings.select_module("testing", TESTING_SUPPLIER);
+        let message = asset_cache_refusal(&settings);
+        assert!(
+            message.contains("integration `testing_supplier` from `testing-supplier`")
+                && message.contains("supplies the asset cache module `testing.supplier`"),
+            "should name the builder that is not selected: {message}"
+        );
+
+        let message = asset_cache_refusal(&with_shared_table(settings_naming(ASSET_CACHE_ONE)));
+        assert!(
+            message.contains("integration `shared_supplier` from `shared-supplier`"),
+            "should refuse a builder its shared table runs: {message}"
+        );
+    }
+
+    #[test]
+    fn asset_cache_selecting_a_builder_that_supplies_no_module_is_refused() {
+        let message = asset_cache_refusal(&settings_naming(ASSET_CACHE_EMPTY));
+
+        assert!(
+            message.contains("[asset-cache] selects `empty`")
+                && message.contains("integration `asset_cache_empty` from `asset-cache-empty`")
+                && message.contains("supplies no asset cache module"),
+            "should name the builder that supplies nothing: {message}"
+        );
+    }
+
+    #[test]
+    fn an_asset_cache_module_from_the_auction_plan_is_refused() {
+        const PLAN_SUPPLIER: &str = "asset-cache.plan";
+        fn no_registration(
+            _settings: &Settings,
+        ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+            Ok(None)
+        }
+        fn the_plan_supplies_an_asset_cache(
+            _settings: &Settings,
+            _plan: &crate::auction::plan::AuctionPlan,
+        ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+            Ok(Some(
+                IntegrationRegistration::builder("plan_supplier")
+                    .with_asset_cache_module(PLAN_SUPPLIER, asset_cache_module())
+                    .build(),
+            ))
+        }
+        let plan_builder = crate::integrations::IntegrationBuilder::new(
+            "plan_supplier",
+            "plan-supplier",
+            no_registration,
+            validate_nothing,
+        )
+        .with_module_name(PLAN_SUPPLIER)
+        .with_plan_registration(the_plan_supplies_an_asset_cache);
+        let mut builders = asset_cache_builders().to_vec();
+        builders.push(plan_builder);
+
+        // Refused when [asset-cache] selects the builder, which only this
+        // check catches, and when it selects another.
+        for selected in [PLAN_SUPPLIER, ASSET_CACHE_ONE] {
+            let message =
+                IntegrationRegistry::with_registrations(&settings_naming(selected), &builders)
+                    .err()
+                    .expect("what the plan registers is made whatever [asset-cache] selects")
+                    .to_string();
+
+            assert!(
+                message.contains("integration `plan_supplier` from `plan-supplier`")
+                    && message.contains(
+                        "supplies the asset cache module `asset-cache.plan` in what it \
+                         registers for the auction plan"
+                    ),
+                "with `{selected}` selected: {message}"
+            );
+        }
     }
 }

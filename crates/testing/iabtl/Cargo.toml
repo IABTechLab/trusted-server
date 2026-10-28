@@ -25,9 +25,9 @@ validator = { workspace = true }
 
 [dev-dependencies]
 hex = { workspace = true }
-trusted-server-core = { workspace = true, features = ["test-utils"] }
 sha2 = { workspace = true }
 tokio = { workspace = true }
+trusted-server-core = { workspace = true, features = ["test-utils"] }
 
 # The visible owner of this crate, the way Prebid.js requires a named
 # maintainer of every adapter. The seam probe is a test fixture the project

@@ -105,10 +105,6 @@ fn resolve_from_local_git() -> Option<String> {
     })
 }
 
-mod build_time;
-mod key_schedule;
-mod signing_key;
-
 fn main() {
     // Watching the directory also catches newly added and removed source files.
     println!("cargo:rerun-if-changed=src");
@@ -157,81 +153,7 @@ fn main() {
     )
     .expect("should write the template build digest");
 
-    write_build_time();
-    write_build_identity();
-    write_attestation_keys();
     emit_git_version();
-}
-
-/// Embeds the attestation signing key schedule in the file
-/// `TRUSTED_SERVER_ATTESTATION_KEYS` names, or an empty schedule.
-///
-/// The schedule is compiled into the binary, so no signing key sits in a
-/// store the service reads when it runs. See [`key_schedule::constant_source`]
-/// for what a schedule holds.
-fn write_attestation_keys() {
-    println!("cargo:rerun-if-env-changed=TRUSTED_SERVER_ATTESTATION_KEYS");
-    let schedule = env::var_os("TRUSTED_SERVER_ATTESTATION_KEYS")
-        .filter(|path| !path.is_empty())
-        .map(|path| {
-            let path = PathBuf::from(path);
-            println!("cargo:rerun-if-changed={}", path.display());
-            fs::read_to_string(&path).expect("should read the attestation key schedule")
-        });
-    let source = match key_schedule::constant_source(schedule.as_deref()) {
-        Ok(source) => source,
-        Err(reason) => {
-            println!("cargo::error=the attestation key schedule is refused, because {reason}");
-            std::process::exit(1);
-        }
-    };
-    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("should read OUT_DIR"));
-    fs::write(out_dir.join("attestation_keys.rs"), source)
-        .expect("should write the attestation key schedule");
-}
-
-/// Bakes the build time into the binary as `TRUSTED_SERVER_BUILT_AT`.
-///
-/// `SOURCE_DATE_EPOCH` is honored where it is set, so a reproducible build
-/// stays reproducible rather than differing only by this string.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "a build script runs on the host, where the std clock is sound"
-)]
-fn write_build_time() {
-    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
-    let seconds = env::var("SOURCE_DATE_EPOCH")
-        .ok()
-        .and_then(|value| value.trim().parse::<i64>().ok())
-        .unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or_default())
-                .unwrap_or_default()
-        });
-    println!(
-        "cargo:rustc-env=TRUSTED_SERVER_BUILT_AT={}",
-        build_time::rfc3339_utc(seconds)
-    );
-}
-
-/// Bakes in the commit, the build run and the tag the builder names, as
-/// `TRUSTED_SERVER_COMMIT`, `TRUSTED_SERVER_BUILD_RUN` and
-/// `TRUSTED_SERVER_BUILD_TAG`, or `unknown`.
-fn write_build_identity() {
-    for name in [
-        "TRUSTED_SERVER_COMMIT",
-        "TRUSTED_SERVER_BUILD_RUN",
-        "TRUSTED_SERVER_BUILD_TAG",
-    ] {
-        println!("cargo:rerun-if-env-changed={name}");
-        let value = env::var(name)
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
-            .unwrap_or_else(|| "unknown".to_owned());
-        println!("cargo:rustc-env={name}={value}");
-    }
 }
 
 /// Compiles the deployed git version in as `TRUSTED_SERVER__GIT_VERSION`.

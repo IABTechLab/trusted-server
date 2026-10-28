@@ -484,6 +484,9 @@ impl EcContext {
             .client_ip
             .map(generation::normalize_ip);
 
+        // The policy the request's domain loaded decides its permissions.
+        let maps = services.permission_policy().maps();
+
         // The modules see the request as evidence, the same abstraction the
         // Edge Cookie and device modules read, so a scheme core has never
         // heard of can read its own signal from it.
@@ -510,7 +513,11 @@ impl EcContext {
         let consent = consent_mod::read_consent(
             &module_context,
             services.permission_signal_modules(),
-            consent_mod::request_jurisdiction(geo_info, consent::default_jurisdiction(geo_status)),
+            consent_mod::request_jurisdiction(
+                maps,
+                geo_info,
+                consent::default_jurisdiction(maps, geo_status),
+            ),
         );
 
         // Assemble the permission state once, here, through the permission
@@ -521,6 +528,7 @@ impl EcContext {
         // re-deriving it.
         let module_context = module_context.with_consent(&consent);
         let permissions = consent::assemble_permissions(
+            maps,
             &module_context,
             geo_status,
             services.permission_signal_modules(),
@@ -2000,7 +2008,7 @@ pub(crate) mod tests {
         // supplied.
         let settings = create_test_settings();
         let req = create_test_request(&[]);
-        let services = RuntimeServices::builder()
+        let services = crate::platform::test_support::test_services_builder()
             .config_store(Arc::new(FixedConfigStore {
                 store: "vendor_store",
                 key: "country",
@@ -2063,7 +2071,7 @@ pub(crate) mod tests {
     async fn a_geo_module_is_called_with_the_request_as_evidence() {
         let settings = create_test_settings();
         let req = create_test_request(&[("user-agent", "Mozilla/5.0 Kiosk/1.0")]);
-        let services = RuntimeServices::builder()
+        let services = crate::platform::test_support::test_services_builder()
             .config_store(Arc::new(crate::platform::test_support::NoopConfigStore))
             .secret_store(Arc::new(crate::platform::test_support::NoopSecretStore))
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
