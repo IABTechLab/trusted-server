@@ -3,13 +3,12 @@
 //! route in the cycle, and their response effects after the finalize headers,
 //! without making the response less private, the route's module call carries
 //! the device classification, an Edge Cookie context that cannot be read
-//! answers before the filters, robots.txt, the inspection endpoints and the
-//! attestation pages are answered without them, the Edge Cookie is created
-//! and written for a real browser's page view, set by the resolve route for a
-//! client-side module and expired on a withdrawal, and a request under an
-//! asset route is answered from the route's own source, with the route's
-//! cache rule written after the finalize headers, an error that no cache
-//! stores and no Edge Cookie.
+//! answers before the filters, robots.txt and the inspection endpoints are
+//! answered without them, the Edge Cookie is created and written for a real
+//! browser's page view, set by the resolve route for a client-side module and
+//! expired on a withdrawal, and a request under an asset route is answered
+//! from the route's own source, with the route's cache rule written after the
+//! finalize headers, an error that no cache stores and no Edge Cookie.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -400,6 +399,9 @@ fn settings_with(extra: &str) -> Settings {
         "#
     ))
     .expect("should parse the request cycle test settings")
+    // A loaded domain carries its policy, and these tests decide under the
+    // repository's sample.
+    .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
 }
 
 /// The router built through the composition root with `builders`, every
@@ -732,6 +734,7 @@ fn services_for_a_reader(origin: &Arc<StubHttpClient>) -> RuntimeServices {
             ..ClientInfo::default()
         })
         .permission_signal_modules(super::shipped_signal_modules().into())
+        .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
         .build()
 }
 
@@ -1414,18 +1417,13 @@ async fn platform_classifies_the_request_with_the_built_in_module() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_inspection_endpoints_and_the_attestation_pages_skip_the_request_filters() {
+async fn the_inspection_endpoints_skip_the_request_filters() {
     let origin = Arc::new(StubHttpClient::new());
     let router = router_with(
         settings_with(
             r#"
             [testing]
             modules = ["answering-filter"]
-
-            [attestation]
-            operator = "Example Operator"
-            context = "example-attestation:v1"
-            verify_url = "https://verifier.example/verify?host=test-publisher.example.com"
             "#,
         ),
         &[answering_builder()],
@@ -1444,8 +1442,6 @@ async fn the_inspection_endpoints_and_the_attestation_pages_skip_the_request_fil
         "/_ts/config",
         "/_ts/config.json",
         "/_ts/data",
-        "/_ts/attestation",
-        "/_ts/attestation.json",
     ] {
         let response = route(&router, get(path, None)).await;
         assert_eq!(

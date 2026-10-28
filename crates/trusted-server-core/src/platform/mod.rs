@@ -11,6 +11,7 @@
 //! - [`PlatformBackend`] — dynamic backend registration
 //! - [`PlatformHttpClient`] — outbound HTTP client
 //! - [`PlatformGeo`] — geographic information lookup
+//! - [`PlatformPolicySource`] (permission policy files kept outside the blob)
 //! - [`PlatformTemplateAssembler`] — cold-response shared-template assembly
 //! - [`PlatformTemplateCache`] — shared transformed-template caching
 //! - [`PlatformValueCache`], a shared cache of small values with lifetimes
@@ -40,9 +41,11 @@ mod cache_headers;
 mod error;
 mod geo;
 mod http;
+mod identity;
 mod image_optimizer;
 mod kv;
 mod loading_cache;
+mod policy_source;
 mod request_headers;
 mod server_key;
 mod staging;
@@ -70,6 +73,7 @@ pub use http::{
     PlatformCacheIntent, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
     PlatformResponse, PlatformSelectResult, UnavailableHttpClient,
 };
+pub use identity::{PlatformIdentity, UNKNOWN};
 pub use image_optimizer::{
     PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions,
     PlatformImageOptimizerParams, PlatformImageOptimizerRegion,
@@ -78,6 +82,10 @@ pub use kv::UnavailableKvStore;
 pub use loading_cache::{
     CacheLifetimes, CacheSpec, LoadError, LoadFuture, LoadedValue, Loader, LoadingCaches,
     NoLoadingCache, PlatformLoadingCache, StoreKey,
+};
+pub use policy_source::{
+    POLICY_KEY_PREFIX, PlatformPolicySource, PolicyEntry, PolicyOrigin, policy_entry_text,
+    policy_key,
 };
 pub use request_headers::{
     declare_platform_internal_headers, declare_platform_spoofable_headers,
@@ -90,7 +98,6 @@ pub use template_assembly::{
     PlatformTemplateAssembler, TemplateAssemblyError, UnavailableTemplateAssembler,
     contains_publisher_esi_directive,
 };
-pub(crate) use template_cache::hash_length_prefixed;
 pub use template_cache::{
     PlatformTemplateCache, PlatformTemplateCacheReservation, REPLAYABLE_POLICY_HEADERS,
     TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY, TEMPLATE_SCHEMA_VERSION, TemplateCacheError,
