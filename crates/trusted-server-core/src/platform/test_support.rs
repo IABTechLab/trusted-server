@@ -1053,7 +1053,7 @@ pub fn build_services_with_geo(geo: Arc<dyn PlatformGeo>) -> RuntimeServices {
 pub fn noop_services_with_device_module(
     device_module: Arc<dyn crate::ec::device::DeviceModule>,
 ) -> RuntimeServices {
-    RuntimeServices::builder()
+    test_services_builder()
         .config_store(Arc::new(NoopConfigStore))
         .secret_store(Arc::new(NoopSecretStore))
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
