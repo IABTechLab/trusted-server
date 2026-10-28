@@ -12,7 +12,7 @@ use toml_edit::DocumentMut;
 use trusted_server_core::config_payload::DEFAULT_CONFIG_STORE_ID;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::platform::{
-    PlatformConfigStore, PlatformError, PlatformSecretStore, StoreId, StoreName,
+    PlatformConfigStore, PlatformError, PlatformSecretStore, PolicyOrigin, StoreId, StoreName,
 };
 use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings_from_config_store_with;
@@ -181,6 +181,7 @@ fn read_back(
         &StoreName::from(DEFAULT_CONFIG_STORE_ID),
         key,
         &StoreName::from("trusted_server_secrets"),
+        PolicyOrigin::Blob,
         &trusted_server_modules::builders(),
     )
 }

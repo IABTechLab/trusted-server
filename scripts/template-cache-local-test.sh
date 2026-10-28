@@ -275,8 +275,8 @@ s = replace_once(
     'cookie_domain = ".local-harness.example"',
     "publisher cookie domain",
 )
-# The permission baseline and consent handling come from the permissions.yaml
-# rules tree compiled into the binary. The Viceroy geolocation block appended
+# The permission baseline and consent handling come from the rules tree of
+# the sample policy the push supplies. The Viceroy geolocation block appended
 # to the harness fastly.toml below maps the loopback client to US/CA, and the
 # platform geo module is selected here, so the auction runs under the US
 # state opt-out rules with no consent signal.
@@ -344,6 +344,9 @@ origin_is_cookie_independent = true'''
 lines = s.split("\n")
 lines.insert(lines.index("[creative_opportunities]") + 1, scalars)
 lines.append('''
+[permissions]
+policy = "sample"
+
 [[creative_opportunities.slot]]
 id = "ts-slot-header"
 div_id = "ts-slot-header"
@@ -353,7 +356,9 @@ formats = [{ width = 728, height = 90 }]
 open(out, "w").write("\n".join(lines))
 PYEOF
 
-"$TS" config validate --app-config "$WORK/app.toml" >/dev/null
+POLICY_FILE="$REPO_ROOT/config/permissions/sample.yaml"
+"$TS" config validate --app-config "$WORK/app.toml" \
+  --permissions "$POLICY_FILE" >/dev/null
 
 info "Seeding an isolated config store (tracked fastly.toml remains untouched)"
 # `config push --local` edits the adapter manifest. Give it a complete temporary
@@ -457,7 +462,7 @@ PYEOF
 ln -s "$REPO_ROOT/crates" "$WORK/crates"
 (cd "$WORK" && "$TS" config push --adapter fastly --local \
   --manifest "$WORK/edgezero.toml" --app-config "$WORK/app.toml" \
-  --no-diff --yes >/dev/null)
+  --permissions "$POLICY_FILE" --no-diff --yes >/dev/null)
 
 info "Starting Trusted Server on :$TS_PORT"
 # Deliberately not wrapped in a subshell: `$!` would then be the subshell's pid, so
