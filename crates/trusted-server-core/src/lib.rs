@@ -31,10 +31,8 @@
 pub mod addressing;
 pub mod asset_cache;
 pub(crate) mod asset_image_optimizer;
-pub mod attestation;
 pub mod auction;
 pub mod auction_config_types;
-pub mod build_info;
 pub mod cache_policy;
 pub mod closed_paths;
 pub mod config;
@@ -81,7 +79,6 @@ pub mod service_version;
 pub mod settings;
 pub mod settings_data;
 pub mod source;
-pub mod source_cache;
 pub mod streaming_processor;
 pub mod streaming_replacer;
 pub mod tdl;
