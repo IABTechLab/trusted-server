@@ -457,6 +457,9 @@ impl EcContext {
             .client_ip
             .map(generation::normalize_ip);
 
+        // The policy the request's domain loaded decides its permissions.
+        let maps = services.permission_policy().maps();
+
         // Build consent context from request-local cookies, headers, and geo.
         // Jurisdiction detection follows the permission model's fallback: with
         // no location resolved the policy's declared jurisdiction stands in, so
@@ -468,7 +471,8 @@ impl EcContext {
             req,
             config: &settings.consent,
             geo: geo_info,
-            default_jurisdiction: consent::default_jurisdiction(geo_status),
+            default_jurisdiction: consent::default_jurisdiction(maps, geo_status),
+            permission_maps: maps,
         });
 
         // Assemble the permission state once, here, through the permission
@@ -485,6 +489,7 @@ impl EcContext {
         )
         .with_request_target(req.uri().path(), req.uri().query().unwrap_or_default());
         let permissions = consent::assemble_permissions(
+            maps,
             &consent,
             &evidence,
             geo_status,

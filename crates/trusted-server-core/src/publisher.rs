@@ -10502,7 +10502,7 @@ mod tests {
             http_client: Arc<StubHttpClient>,
             cache: Arc<MemoryTemplateCache>,
         ) -> RuntimeServices {
-            RuntimeServices::builder()
+            crate::platform::test_support::test_services_builder()
                 .config_store(Arc::new(NoopConfigStore))
                 .secret_store(Arc::new(NoopSecretStore))
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -10534,7 +10534,7 @@ mod tests {
         ) -> RuntimeServices {
             let telemetry_sink: Arc<dyn crate::auction::telemetry::AuctionTelemetrySink> =
                 telemetry_sink;
-            RuntimeServices::builder()
+            crate::platform::test_support::test_services_builder()
                 .config_store(Arc::new(NoopConfigStore))
                 .secret_store(Arc::new(NoopSecretStore))
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -13192,7 +13192,7 @@ mod tests {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let settings = Arc::new(settings_with_mode("esi"));
-            let services = RuntimeServices::builder()
+            let services = crate::platform::test_support::test_services_builder()
                 .config_store(Arc::new(NoopConfigStore))
                 .secret_store(Arc::new(NoopSecretStore))
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -17120,7 +17120,7 @@ mod tests {
             telemetry_sink: Arc<RecordingTelemetrySink>,
         ) -> RuntimeServices {
             let telemetry_sink: Arc<dyn AuctionTelemetrySink> = telemetry_sink;
-            RuntimeServices::builder()
+            crate::platform::test_support::test_services_builder()
                 .config_store(Arc::new(NoopConfigStore))
                 .secret_store(Arc::new(NoopSecretStore))
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -25409,7 +25409,7 @@ mod tests {
             telemetry_sink: Arc<RecordingTelemetrySink>,
         ) -> RuntimeServices {
             let telemetry_sink: Arc<dyn AuctionTelemetrySink> = telemetry_sink;
-            RuntimeServices::builder()
+            crate::platform::test_support::test_services_builder()
                 .config_store(Arc::new(NoopConfigStore))
                 .secret_store(Arc::new(NoopSecretStore))
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))

@@ -613,6 +613,7 @@ pub fn build_runtime_services(
     permission_signal_modules: &Arc<
         [Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>],
     >,
+    permission_policy: &Arc<trusted_server_core::permissions::PermissionPolicy>,
 ) -> RuntimeServices {
     static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     KV_WARNED.get_or_init(|| {
@@ -665,6 +666,9 @@ pub fn build_runtime_services(
         // crates this adapter links, so every request asks exactly the ones
         // configuration named, in that order.
         .permission_signal_modules(Arc::clone(permission_signal_modules))
+        // The policy the domain's settings loaded decides the request's
+        // permissions.
+        .permission_policy(Arc::clone(permission_policy))
         .client_info(ClientInfo {
             client_ip,
             tls_protocol: None,

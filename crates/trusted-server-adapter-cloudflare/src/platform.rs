@@ -601,6 +601,7 @@ pub fn build_runtime_services(
     permission_signal_modules: &Arc<
         [Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>],
     >,
+    permission_policy: &Arc<trusted_server_core::permissions::PermissionPolicy>,
 ) -> RuntimeServices {
     let client_ip = extract_client_ip(ctx);
 
@@ -652,6 +653,9 @@ pub fn build_runtime_services(
         // crates this adapter links, so every request asks exactly the ones
         // configuration named, in that order.
         .permission_signal_modules(Arc::clone(permission_signal_modules))
+        // The policy the domain's settings loaded decides the request's
+        // permissions.
+        .permission_policy(Arc::clone(permission_policy))
         .client_info(ClientInfo {
             client_ip,
             tls_protocol: None,
@@ -856,8 +860,10 @@ mod tests {
             "the ISO 3166-2 subdivision code should reach the geo info"
         );
 
-        let jurisdiction =
-            trusted_server_core::consent::jurisdiction::detect_jurisdiction(Some(&geo));
+        let jurisdiction = trusted_server_core::consent::jurisdiction::detect_jurisdiction(
+            trusted_server_core::permissions::PermissionMaps::sample(),
+            Some(&geo),
+        );
         assert_eq!(
             jurisdiction,
             trusted_server_core::consent::jurisdiction::Jurisdiction::UsState("CA".to_owned()),
@@ -887,7 +893,10 @@ mod tests {
             "no region header should mean no region, not an invented one"
         );
         assert_eq!(
-            trusted_server_core::consent::jurisdiction::detect_jurisdiction(Some(&geo)),
+            trusted_server_core::consent::jurisdiction::detect_jurisdiction(
+                trusted_server_core::permissions::PermissionMaps::sample(),
+                Some(&geo),
+            ),
             trusted_server_core::consent::jurisdiction::Jurisdiction::NonRegulated,
             "with no region a US visitor cannot be placed in a privacy state"
         );

@@ -20,9 +20,10 @@
 //! How a permission is acquired varies by place, so the policy is written as a
 //! tree of places: the top of the tree stands for the whole world, countries
 //! sit under it keyed by ISO 3166-1 alpha-2 code, and a country's regions sit
-//! under that country keyed by ISO 3166-2 subdivision code.
-//! [`PermissionMaps::standard`] loads that tree from the embedded
-//! `permissions.yaml` (see `DEFAULT_PERMISSION_RULES`).
+//! under that country keyed by ISO 3166-2 subdivision code. The tree is
+//! the publisher's policy file, which a domain's settings name in
+//! `[permissions] policy` and [`load_policy`] checks and parses when the
+//! domain loads. No build carries a policy.
 //!
 //! Resolution takes the most specific match and falls back to the node above:
 //! the request's region when it is listed, otherwise its country, otherwise
@@ -488,14 +489,6 @@ pub struct PermissionMaps {
     signals: SignalPolicy,
 }
 
-/// The default permission rules, compiled into the build from the repository's
-/// sample in `config/permissions`.
-///
-/// That sample is for testing and evaluation only and is not a production
-/// policy. A deployer chooses or replaces the compiled-in file to set the
-/// default policy, which is not read at runtime.
-const DEFAULT_PERMISSION_RULES: &str = include_str!("../../../config/permissions/sample.yaml");
-
 /// Builds the upper-cased `COUNTRY:REGION` key for [`PermissionMaps::by_region`].
 fn region_key(country: &str, region: &str) -> String {
     format!(
@@ -517,8 +510,8 @@ impl PermissionMaps {
     /// any signal policy in the code.
     #[must_use]
     // Public because the permission signal module crates live outside core
-    // and read the deployment's policy, in their tests and where a module
-    // needs the shipped decisions rather than a policy built by hand.
+    // and their tests read the decisions of the repository's sample
+    // rather than a policy built by hand.
     pub fn signals(&self) -> &SignalPolicy {
         &self.signals
     }
@@ -599,25 +592,6 @@ impl PermissionMaps {
             return jurisdiction.clone();
         }
         self.default_jurisdiction()
-    }
-
-    /// The built-in default rules, parsed from the embedded `permissions.yaml`
-    /// (see `DEFAULT_PERMISSION_RULES`).
-    ///
-    /// The parse runs once per instance and the result is cached.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the embedded `permissions.yaml` fails to parse. The file is a
-    /// build-time constant covered by tests, so a panic means the committed file
-    /// is malformed, not a runtime condition.
-    #[must_use]
-    pub fn standard() -> &'static Self {
-        static CACHE: OnceLock<PermissionMaps> = OnceLock::new();
-        CACHE.get_or_init(|| {
-            Self::from_yaml(DEFAULT_PERMISSION_RULES)
-                .expect("should parse the embedded default permissions.yaml")
-        })
     }
 
     /// Builds the maps from a `permissions.yaml` document: named `groups`, the
@@ -1315,7 +1289,7 @@ fn parse_acquisition(value: &str) -> Result<Acquisition, PermissionsError> {
 /// Builds a group's [`CountryRules`] from its flag map. Each key names a
 /// permission and its flag; an optional `default` key sets any permission the
 /// group omits. A group without a `default` must list every permission, so its
-/// meaning is fully explicit (this is how the shipped groups are written).
+/// meaning is fully explicit (this is how the sample's groups are written).
 fn group_rules(
     name: &str,
     flags: &BTreeMap<String, String>,
@@ -1563,18 +1537,6 @@ fn check_duplicate<'a>(
         });
     }
     Ok(())
-}
-
-/// Parses the compiled `permissions.yaml`, so startup validation can reject a
-/// malformed policy with a configuration error instead of panicking on the
-/// first lookup.
-///
-/// # Errors
-///
-/// Returns the same [`PermissionsError`] values [`PermissionMaps::from_yaml`]
-/// does, most usefully a top node that omits `group` or `jurisdiction`.
-pub fn validate_default_policy() -> Result<(), PermissionsError> {
-    PermissionMaps::from_yaml(DEFAULT_PERMISSION_RULES).map(|_| ())
 }
 
 /// An error parsing a `permissions.yaml` document.
@@ -2004,8 +1966,8 @@ mod tests {
     }
 
     #[test]
-    fn standard_maps_eu_requires_signal_and_uk_grants_storage() {
-        let maps = PermissionMaps::standard();
+    fn sample_maps_eu_requires_signal_and_uk_grants_storage() {
+        let maps = PermissionMaps::sample();
         assert!(
             !maps
                 .resolve(Some("DE"), |_| false)
@@ -2025,8 +1987,8 @@ mod tests {
     }
 
     #[test]
-    fn standard_maps_us_and_australia_grant_storage_by_default() {
-        let maps = PermissionMaps::standard();
+    fn sample_maps_us_and_australia_grant_storage_by_default() {
+        let maps = PermissionMaps::sample();
         for code in ["US", "AU"] {
             assert!(
                 maps.resolve(Some(code), |_| false)
@@ -2047,7 +2009,7 @@ mod tests {
     #[test]
     fn resolve_with_revokes_a_granted_permission_on_opt_out() {
         // US grants necessary.operations.storage by default; an opt-out signal revokes it.
-        let maps = PermissionMaps::standard();
+        let maps = PermissionMaps::sample();
         assert!(
             maps.baseline(Some("US"), None)
                 .is_set(Permission::StoreOnDevice),
@@ -2069,7 +2031,7 @@ mod tests {
     #[test]
     fn a_region_entry_overrides_the_country_baseline() {
         // US grants by default; a state can require a signal instead.
-        let maps = PermissionMaps::standard().clone().with_region(
+        let maps = PermissionMaps::sample().clone().with_region(
             "US",
             "CA",
             CountryRules::with_default(Acquisition::RequiresSignal),
@@ -2518,11 +2480,11 @@ rules:
     }
 
     #[test]
-    fn the_shipped_policy_reproduces_the_retired_consent_lists() {
+    fn the_sample_policy_reproduces_the_retired_consent_lists() {
         // The policy tree carries the 31 GDPR countries and the 20 US
         // privacy states, in place of compiled defaults in the consent
-        // configuration, so the shipped file must resolve each to its regime.
-        let maps = PermissionMaps::standard();
+        // configuration, so the sample must resolve each to its regime.
+        let maps = PermissionMaps::sample();
         let gdpr_countries = [
             "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE",
             "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE", "IS",
@@ -2583,7 +2545,7 @@ rules:
     fn a_us_state_keeps_the_country_permission_baseline() {
         // Each listed state carries the same group as the country node, so
         // adding the states for the jurisdiction changed no permission.
-        let maps = PermissionMaps::standard();
+        let maps = PermissionMaps::sample();
         for state in ["CA", "TX", "DE", "RI", "WY"] {
             assert!(
                 maps.baseline(Some("US"), Some(state))
@@ -2595,7 +2557,7 @@ rules:
 
     #[test]
     fn from_yaml_accepts_an_explicit_group_listing_every_permission() {
-        // The shipped style: no `default`, every permission spelled out.
+        // The sample's style: no `default`, every permission spelled out.
         let mut group = String::from("groups:\n  everything:\n");
         for permission in Permission::all() {
             group.push_str(&format!("    {permission}: granted\n"));
@@ -2632,10 +2594,10 @@ rules:
 
     #[test]
     fn every_eu_and_eea_member_requires_a_signal_for_storage() {
-        // The shipped permissions.yaml must cover all 27 EU member states and
+        // The sample must cover all 27 EU member states and
         // the three EEA members, each resolving storage as requires-signal, so
         // no member state silently falls to the top of the tree.
-        let maps = PermissionMaps::standard();
+        let maps = PermissionMaps::sample();
         for country in [
             "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE",
             "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE", "IS",

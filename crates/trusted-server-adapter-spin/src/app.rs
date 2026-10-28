@@ -83,6 +83,9 @@ pub struct AppState {
     /// than the first request, and handed to every request's services.
     permission_signal_modules:
         Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>]>,
+    /// The permission policy the domain's settings loaded, which every
+    /// request is given.
+    permission_policy: Arc<trusted_server_core::permissions::PermissionPolicy>,
     /// Services a caller supplied for every request, rather than services built
     /// from the request context. `None` in a deployment.
     services: Option<RuntimeServices>,
@@ -183,6 +186,7 @@ fn build_state_with_services(
             &settings,
             &shipped_signal_modules(),
         )?;
+    let permission_policy = settings.required_permission_policy()?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -190,6 +194,7 @@ fn build_state_with_services(
         registry: Arc::new(registry),
         ec_module,
         permission_signal_modules,
+        permission_policy,
         services,
     }))
 }
@@ -219,14 +224,21 @@ impl AppState {
     /// composition root already resolved so the request path does not resolve
     /// `[ec] module` a second time. Nothing is carried when the composition
     /// root found nothing safe to keep, and the request path resolves for
-    /// itself.
+    /// itself. The services also carry the permission policy the domain's
+    /// settings loaded, whichever services the request is given.
     fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
         self.services
             .clone()
             .unwrap_or_else(|| {
-                build_runtime_services(ctx, &self.settings, &self.permission_signal_modules)
+                build_runtime_services(
+                    ctx,
+                    &self.settings,
+                    &self.permission_signal_modules,
+                    &self.permission_policy,
+                )
             })
             .with_resolved_ec_module(self.ec_module.clone())
+            .with_permission_policy(Arc::clone(&self.permission_policy))
     }
 }
 
@@ -1106,7 +1118,8 @@ mod tests {
                 assume_single_jurisdiction = true
             "#,
         )
-        .expect("should parse startup test settings");
+        .expect("should parse startup test settings")
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
         settings.auction.enabled = true;
         settings.auction.providers =
             std::iter::IntoIterator::into_iter(["provider-a", "provider-b"])
@@ -1129,6 +1142,27 @@ mod tests {
                 })
                 .collect();
         settings
+    }
+
+    #[test]
+    fn each_request_is_given_the_policy_its_domain_loaded() {
+        let policy = trusted_server_core::test_support::policies::open();
+        let mut settings = multi_provider_settings();
+        settings.auction.enabled = false;
+        let state = build_state_with_settings(settings.with_permission_policy(Arc::clone(&policy)))
+            .expect("should build the state");
+        let req = request_builder()
+            .method("GET")
+            .uri("https://publisher.example/article")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build test request");
+
+        let services = state.services_for_request(&RequestContext::new(req, PathParams::default()));
+
+        assert!(
+            Arc::ptr_eq(services.permission_policy(), &policy),
+            "the request should decide under its domain's policy, not the sample"
+        );
     }
 
     #[test]
@@ -1254,7 +1288,12 @@ mod tests {
         // No resolved module is threaded here, so the request path resolves
         // the selection itself, which is what an embedder driving core
         // directly does and where the loud failure has to stay.
-        let services = build_runtime_services(&ctx, &settings, &Arc::default());
+        let services = build_runtime_services(
+            &ctx,
+            &settings,
+            &Arc::default(),
+            &trusted_server_core::permissions::PermissionPolicy::sample(),
+        );
         let req = ctx.into_request();
 
         let error = build_ec_context(&settings, &services, &req)

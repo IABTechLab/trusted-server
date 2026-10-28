@@ -292,7 +292,9 @@ pub mod nextjs_auction {
             )
             .expect("should parse fixture creative opportunities"),
         );
-        settings
+        // A loaded domain carries its policy, and the fixture decides under
+        // the repository's sample.
+        settings.with_permission_policy(crate::permissions::PermissionPolicy::sample())
     }
 
     /// Flight payload content the fixture must carry once its origin URL has been
@@ -518,7 +520,37 @@ pub mod nextjs_auction {
             .http_client(client)
             .geo(Arc::new(FixtureGeo))
             .client_info(ClientInfo::default())
+            .permission_policy(crate::permissions::PermissionPolicy::sample())
             .build()
+    }
+}
+
+/// Loaded permission policies other than the repository's sample.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod policies {
+    use std::sync::Arc;
+
+    use crate::permissions::{PermissionPolicy, PolicyReference, load_policy, policy_sha256};
+
+    /// A policy whose whole world sets every permission without a signal.
+    const OPEN_POLICY_TEXT: &str = "groups:\n  open:\n    default: granted\nrules:\n  group: open\n  jurisdiction: non-regulated\n";
+
+    /// The open policy, loaded as a domain that names it would load it, so a
+    /// test can tell the policy a request was given from the sample.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the open policy does not load.
+    #[must_use]
+    pub fn open() -> Arc<PermissionPolicy> {
+        load_policy(
+            PolicyReference {
+                policy: "open".to_owned(),
+                sha256: policy_sha256(OPEN_POLICY_TEXT),
+            },
+            OPEN_POLICY_TEXT,
+        )
+        .expect("should load the open policy")
     }
 }
 

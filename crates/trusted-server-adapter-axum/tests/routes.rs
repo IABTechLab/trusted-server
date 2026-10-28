@@ -44,6 +44,9 @@ fn test_settings() -> trusted_server_core::settings::Settings {
         "#,
     )
     .expect("should parse route test settings")
+    // A loaded domain carries its policy, and these tests decide under the
+    // repository's sample.
+    .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
 }
 
 fn test_router() -> edgezero_core::router::RouterService {

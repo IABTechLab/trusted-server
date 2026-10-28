@@ -60,6 +60,9 @@ pub struct AppState {
     /// than the first request, and handed to every request's services.
     permission_signal_modules:
         Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>]>,
+    /// The permission policy the domain's settings loaded, which every
+    /// request is given.
+    permission_policy: Arc<trusted_server_core::permissions::PermissionPolicy>,
     /// Services a caller supplied for every request, rather than services built
     /// from the request context. `None` in a deployment.
     services: Option<RuntimeServices>,
@@ -151,21 +154,33 @@ fn build_state_with_services(
             &settings,
             &shipped_signal_modules(),
         )?;
+    let permission_policy = settings.required_permission_policy()?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
         permission_signal_modules,
+        permission_policy,
         services,
     }))
 }
 
 impl AppState {
+    /// Builds the per-request services, carrying the permission policy the
+    /// domain's settings loaded whichever services the request is given.
     fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
-        self.services.clone().unwrap_or_else(|| {
-            build_runtime_services(ctx, &self.settings, &self.permission_signal_modules)
-        })
+        self.services
+            .clone()
+            .unwrap_or_else(|| {
+                build_runtime_services(
+                    ctx,
+                    &self.settings,
+                    &self.permission_signal_modules,
+                    &self.permission_policy,
+                )
+            })
+            .with_permission_policy(Arc::clone(&self.permission_policy))
     }
 }
 
@@ -833,6 +848,7 @@ mod tests {
             // These tests exercise the Edge Cookie module path, and a
             // request with no signal module resolves at the place baseline.
             permission_signal_modules: Arc::default(),
+            permission_policy: trusted_server_core::permissions::PermissionPolicy::sample(),
             // This test drives the per-request path, which builds its services
             // from the request context.
             services: None,
@@ -854,8 +870,12 @@ mod tests {
             .body(edgezero_core::body::Body::empty())
             .expect("should build test request");
         let ctx = RequestContext::new(req, PathParams::default());
-        let services =
-            build_runtime_services(&ctx, &state.settings, &state.permission_signal_modules);
+        let services = build_runtime_services(
+            &ctx,
+            &state.settings,
+            &state.permission_signal_modules,
+            &state.permission_policy,
+        );
         let req = ctx.into_request();
 
         let error = build_ec_context(&state, &services, &req)
@@ -883,10 +903,10 @@ mod tests {
         const PROXY_SECRET_VAR: &str =
             "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PUBLISHER_PROXY_SECRET";
 
-        /// The blob the Axum push writes for settings naming `standard`,
-        /// pinned to `policy_text` and carrying no text of its own.
-        fn blob_naming_standard(policy_text: &str) -> String {
-            let mut settings = Settings::from_toml(
+        /// Settings whose secrets are the key names the tests' variables
+        /// resolve.
+        fn startup_settings() -> Settings {
+            Settings::from_toml(
                 r#"
                 [[handlers]]
                 path = "^/_ts/admin"
@@ -900,7 +920,13 @@ mod tests {
                 proxy_secret = "publisher_proxy_secret"
                 "#,
             )
-            .expect("should parse the startup settings");
+            .expect("should parse the startup settings")
+        }
+
+        /// The blob the Axum push writes for settings naming `standard`,
+        /// pinned to `policy_text` and carrying no text of its own.
+        fn blob_naming_standard(policy_text: &str) -> String {
+            let mut settings = startup_settings();
             settings.permissions = PermissionsConfig {
                 policy: Some("standard".to_owned()),
                 sha256: Some(policy_sha256(policy_text)),
@@ -942,6 +968,28 @@ mod tests {
                 ],
                 build_state,
             )
+        }
+
+        #[test]
+        fn each_request_is_given_the_policy_its_domain_loaded() {
+            let policy = trusted_server_core::test_support::policies::open();
+            let state = build_state_with_settings(
+                startup_settings().with_permission_policy(Arc::clone(&policy)),
+            )
+            .expect("should build the state");
+            let request = request_builder()
+                .method("GET")
+                .uri("https://publisher.example/article")
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build the request");
+
+            let services =
+                state.services_for_request(&RequestContext::new(request, PathParams::default()));
+
+            assert!(
+                Arc::ptr_eq(services.permission_policy(), &policy),
+                "the request should decide under its domain's policy, not the sample"
+            );
         }
 
         #[test]

@@ -46,7 +46,9 @@ fn test_router() -> RouterService {
             assume_single_jurisdiction = true
         "#,
     )
-    .expect("should parse route test settings");
+    .expect("should parse route test settings")
+    // A loaded domain carries its policy.
+    .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
 
     TrustedServerApp::routes_with_settings(settings)
         .expect("should build router from test settings")
@@ -101,7 +103,9 @@ fn make_router() -> RouterService {
             passphrase = "test-secret-key-32-bytes-minimum"
         "#,
     )
-    .expect("should parse route test settings");
+    .expect("should parse route test settings")
+    // A loaded domain carries its policy.
+    .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
 
     TrustedServerApp::routes_with_settings(settings)
         .expect("should build router from test settings")

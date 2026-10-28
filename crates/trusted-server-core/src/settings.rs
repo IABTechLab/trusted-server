@@ -1428,28 +1428,6 @@ impl GeoConfig {
         }
     }
 
-    /// Validates that the compiled `permissions.yaml` parses and declares its
-    /// top node.
-    ///
-    /// The top node is required: its `group` is the permission baseline for a
-    /// request the geo module leaves unmatched, and its `jurisdiction` is the
-    /// consent handling for that same request, so there must always be one.
-    /// Checking it here turns a malformed policy into a configuration error at
-    /// startup rather than a panic on the first lookup.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TrustedServerError::Configuration`] when the compiled policy
-    /// fails to parse, most usefully when its top node omits `group` or
-    /// `jurisdiction`.
-    pub fn validate_permission_policy() -> Result<(), Report<TrustedServerError>> {
-        crate::permissions::validate_default_policy().map_err(|error| {
-            Report::new(TrustedServerError::Configuration {
-                message: format!("permissions.yaml is not usable: {error}"),
-            })
-        })
-    }
-
     /// Validates that running jurisdiction consumers without geolocation is
     /// explicitly acknowledged.
     ///
@@ -3948,6 +3926,26 @@ impl Settings {
         self.permission_policy.as_ref()
     }
 
+    /// The permission policy this domain loaded, which an adapter hands to
+    /// every request.
+    ///
+    /// # Errors
+    ///
+    /// [`TrustedServerError::Configuration`] when the settings carry no
+    /// policy, because the runtime loader did not load them.
+    pub fn required_permission_policy(
+        &self,
+    ) -> Result<std::sync::Arc<crate::permissions::PermissionPolicy>, Report<TrustedServerError>>
+    {
+        self.permission_policy.clone().ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
+                message: "the settings carry no permission policy, which the runtime loader \
+                          attaches when it loads them"
+                    .to_owned(),
+            })
+        })
+    }
+
     /// Keeps the policy the runtime loader read for these settings.
     pub(crate) fn attach_permission_policy(
         &mut self,
@@ -4081,7 +4079,6 @@ impl Settings {
         settings.ec.validate_module_selection()?;
         settings.device.validate_module_selection()?;
         settings.geo.validate_module_selection()?;
-        GeoConfig::validate_permission_policy()?;
         settings
             .geo
             .validate_jurisdiction_acknowledgment(&settings.ec)?;
@@ -6943,16 +6940,6 @@ passphrase = "another-test-secret-key-32-bytes"
             written["ec"]["acme"]["endpoint"],
             "https://ec.acme.example.com"
         );
-    }
-
-    #[test]
-    fn the_compiled_permission_policy_validates_at_startup() {
-        // The compiled-in sample declares its top node, so startup
-        // accepts it. A policy that omitted `group` or `jurisdiction` would be
-        // rejected here rather than panicking on the first lookup, which the
-        // parser tests in `permissions` cover directly.
-        GeoConfig::validate_permission_policy()
-            .expect("the compiled-in sample should validate at startup");
     }
 
     #[test]

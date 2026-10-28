@@ -275,8 +275,8 @@ s = replace_once(
     'cookie_domain = ".local-harness.example"',
     "publisher cookie domain",
 )
-# The permission baseline and consent handling come from the permissions.yaml
-# rules tree compiled into the binary. The Viceroy geolocation block appended
+# The permission baseline and consent handling come from the rules tree of
+# the sample policy the push supplies. The Viceroy geolocation block appended
 # to the harness fastly.toml below maps the loopback client to US/CA, and the
 # platform geo module is selected here, so the auction runs under the US
 # state opt-out rules with no consent signal.
