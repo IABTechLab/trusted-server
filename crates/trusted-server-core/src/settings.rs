@@ -1405,6 +1405,35 @@ impl<'de> Deserialize<'de> for PermissionSignalConfig {
     }
 }
 
+/// The permission policy file a domain runs, mapped from the `[permissions]`
+/// table.
+///
+/// `policy` names the file by its stem. `sha256` is the SHA-256 of the file,
+/// as [`policy_sha256`](crate::permissions::policy_sha256) forms it, and
+/// `text` is the file itself, for the adapters that read the policy from the
+/// blob.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionsConfig {
+    /// The policy file's stem, so `standard.yaml` is `standard`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    /// The SHA-256 of the policy file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// The policy file itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+impl PermissionsConfig {
+    /// Whether the table sets nothing, so it is left out of a blob.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Geo / IP intelligence configuration.
 ///
 /// Mapped from the `[geo]` TOML section. Selects which module resolves a
@@ -1459,28 +1488,6 @@ impl GeoConfig {
         // registry rejects one that no module supplies, so this check cannot be
         // a closed list without shutting modules out of geo entirely.
         Ok(())
-    }
-
-    /// Validates that the compiled `permissions.yaml` parses and declares its
-    /// top node.
-    ///
-    /// The top node is required: its `group` is the permission baseline for a
-    /// request the geo module leaves unmatched, and its `jurisdiction` is the
-    /// consent handling for that same request, so there must always be one.
-    /// Checking it here turns a malformed policy into a configuration error at
-    /// startup rather than a panic on the first lookup.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TrustedServerError::Configuration`] when the compiled policy
-    /// fails to parse, most usefully when its top node omits `group` or
-    /// `jurisdiction`.
-    pub fn validate_permission_policy() -> Result<(), Report<TrustedServerError>> {
-        crate::permissions::validate_default_policy().map_err(|error| {
-            Report::new(TrustedServerError::Configuration {
-                message: format!("permissions.yaml is not usable: {error}"),
-            })
-        })
     }
 
     /// Validates that running jurisdiction consumers without geolocation is
@@ -4222,6 +4229,9 @@ pub struct Settings {
     )]
     #[validate(nested)]
     pub permission_signal: PermissionSignalConfig,
+    /// The permission policy file this domain runs.
+    #[serde(default, skip_serializing_if = "PermissionsConfig::is_empty")]
+    pub permissions: PermissionsConfig,
     /// The `[permission_signal]` table, kept so a configuration carrying it is
     /// told its new name.
     #[serde(rename = "permission_signal", default, skip_serializing)]
@@ -4236,15 +4246,6 @@ pub struct Settings {
         skip_serializing_if = "crate::inspect::config::InspectConfig::is_default"
     )]
     pub inspect: crate::inspect::config::InspectConfig,
-    /// The attestation endpoint, which serves evidence signed with the
-    /// operator's key at the address its `endpoint` names. See
-    /// [`crate::attestation`].
-    ///
-    /// `None` leaves the address to the publisher's origin, and stays out of
-    /// serialized config blobs for the reason given on `trusted_client_ip`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[validate(nested)]
-    pub attestation: Option<crate::attestation::AttestationConfig>,
     /// The page changes run on a document fetched from the origin, written
     /// as `[[fetch]]` entries. See [`crate::middleware`].
     #[serde(default, skip_serializing_if = "PhaseEntries::is_empty")]
@@ -4257,6 +4258,9 @@ pub struct Settings {
     /// Never read from a document and never written to one.
     #[serde(skip)]
     resolved_secrets: crate::secret_resolution::ResolvedSecrets,
+    /// The policy the runtime loader read and checked for `permissions`.
+    #[serde(skip)]
+    permission_policy: Option<std::sync::Arc<crate::permissions::PermissionPolicy>>,
 }
 
 impl Settings {
@@ -4272,6 +4276,57 @@ impl Settings {
         secrets: crate::secret_resolution::ResolvedSecrets,
     ) {
         self.resolved_secrets = secrets;
+    }
+
+    /// The permission policy this domain loaded.
+    ///
+    /// The runtime loader attaches it, and refuses a domain without one, so
+    /// only settings built some other way, as in a test, have none.
+    #[must_use]
+    pub fn permission_policy(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::permissions::PermissionPolicy>> {
+        self.permission_policy.as_ref()
+    }
+
+    /// The permission policy this domain loaded, which an adapter hands to
+    /// every request.
+    ///
+    /// # Errors
+    ///
+    /// [`TrustedServerError::Configuration`] when the settings carry no
+    /// policy, because the runtime loader did not load them.
+    pub fn required_permission_policy(
+        &self,
+    ) -> Result<std::sync::Arc<crate::permissions::PermissionPolicy>, Report<TrustedServerError>>
+    {
+        self.permission_policy.clone().ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
+                message: "the settings carry no permission policy, which the runtime loader \
+                          attaches when it loads them"
+                    .to_owned(),
+            })
+        })
+    }
+
+    /// Keeps the policy the runtime loader read for these settings.
+    pub(crate) fn attach_permission_policy(
+        &mut self,
+        policy: std::sync::Arc<crate::permissions::PermissionPolicy>,
+    ) {
+        self.permission_policy = Some(policy);
+    }
+
+    /// The same settings carrying `policy`, as the runtime loader would
+    /// attach it, for tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn with_permission_policy(
+        mut self,
+        policy: std::sync::Arc<crate::permissions::PermissionPolicy>,
+    ) -> Self {
+        self.permission_policy = Some(policy);
+        self
     }
 
     /// Creates a new [`Settings`] instance from a TOML string.
@@ -4398,26 +4453,9 @@ impl Settings {
         settings.validate_phase_entries()?;
         settings.device.validate_module_selection()?;
         settings.geo.validate_module_selection()?;
-        GeoConfig::validate_permission_policy()?;
         settings
             .geo
             .validate_jurisdiction_acknowledgment(&settings.ec)?;
-
-        // Log the policy's declared default once per settings load, so an
-        // operator can see which permissions an unmatched request is granted
-        // without a signal, and which jurisdiction its consent gates apply.
-        let maps = crate::permissions::PermissionMaps::standard();
-        let granted: Vec<String> = maps
-            .baseline(None, None)
-            .permissions()
-            .iter()
-            .map(|permission| permission.to_string())
-            .collect();
-        log::debug!(
-            "Permission baseline: permissions.yaml top node, jurisdiction {}; granted without a signal: [{}]",
-            maps.default_jurisdiction(),
-            granted.join(", ")
-        );
 
         Ok(settings)
     }
@@ -4883,9 +4921,8 @@ fn validation_error_summary(errors: &validator::ValidationErrors) -> String {
             };
             match kind {
                 validator::ValidationErrorsKind::Field(validations) => {
-                    // A validator's message, where it gives one, says what the
-                    // code cannot, such as which address an endpoint clashed
-                    // with.
+                    // A validator's message, where it gives one, says why the
+                    // value was refused, which the code alone does not.
                     for validation in validations {
                         messages.push(match &validation.message {
                             Some(message) => format!("{path}: {} ({message})", validation.code),
@@ -7946,16 +7983,6 @@ passphrase = "another-test-secret-key-32-bytes"
     }
 
     #[test]
-    fn the_compiled_permission_policy_validates_at_startup() {
-        // The compiled-in sample declares its top node, so startup
-        // accepts it. A policy that omitted `group` or `jurisdiction` would be
-        // rejected here rather than panicking on the first lookup, which the
-        // parser tests in `permissions` cover directly.
-        GeoConfig::validate_permission_policy()
-            .expect("the compiled-in sample should validate at startup");
-    }
-
-    #[test]
     fn ec_without_geo_requires_the_single_jurisdiction_acknowledgment() {
         // The base test settings acknowledge single-jurisdiction operation.
         // Removing the acknowledgment while an EC module is configured and
@@ -10981,6 +11008,74 @@ mod permission_signal_config_tests {
             message.contains("unknown field `gpc` in [permission-signal]")
                 && message.contains("[permission-signal.<name>] block is not accepted"),
             "the refusal names the block and says why it is refused: {message}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod permissions_config_tests {
+    use super::*;
+
+    use crate::test_support::tests::crate_test_settings_str;
+
+    /// The test fixture's configuration with `table` written as its
+    /// `[permissions]` table.
+    fn settings_toml_with(table: &str) -> String {
+        format!("{}\n[permissions]\n{table}\n", crate_test_settings_str())
+    }
+
+    #[test]
+    fn the_table_names_the_policy_file_by_its_stem() {
+        let settings = Settings::from_toml(&settings_toml_with(r#"policy = "standard""#))
+            .expect("should parse a table naming a policy");
+
+        assert_eq!(
+            settings.permissions.policy.as_deref(),
+            Some("standard"),
+            "should read the policy's name"
+        );
+        assert_eq!(settings.permissions.sha256, None);
+        assert_eq!(settings.permissions.text, None);
+    }
+
+    #[test]
+    fn an_unknown_key_in_the_table_is_refused() {
+        let error = Settings::from_toml(&settings_toml_with(r#"file = "standard.yaml""#))
+            .expect_err("should refuse a key the table does not define");
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("unknown field `file`"),
+            "the refusal names the key: {message}"
+        );
+    }
+
+    #[test]
+    fn the_table_round_trips_through_a_blob() {
+        let mut settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.permissions = PermissionsConfig {
+            policy: Some("standard".to_owned()),
+            sha256: Some("80b7eafed0d1".to_owned()),
+            text: Some("groups: {}\n".to_owned()),
+        };
+
+        let data = serde_json::to_value(&settings).expect("should serialize settings");
+        let read: Settings = serde_json::from_value(data).expect("should read the blob back");
+
+        assert_eq!(read.permissions, settings.permissions);
+    }
+
+    #[test]
+    fn settings_that_name_no_policy_leave_the_table_out_of_a_blob() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+
+        let data = serde_json::to_value(&settings).expect("should serialize settings");
+
+        assert!(
+            data.get("permissions").is_none(),
+            "an empty table should not be written: {data}"
         );
     }
 }

@@ -13,7 +13,6 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
-use trusted_server_core::attestation::{PlatformIdentity, handle_prefix, prefix_routes};
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::telemetry::warn_once_when_analytics_is_unsent;
 use trusted_server_core::auction::{
@@ -35,9 +34,9 @@ use trusted_server_core::inspect::permissions::{
 use trusted_server_core::integrations::{
     IntegrationBuilder, IntegrationRegistry, ProxyDispatchInput,
 };
-use trusted_server_core::platform::RuntimeServices;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use trusted_server_core::platform::{PlatformConfigStore, StoreName};
+use trusted_server_core::platform::{PlatformIdentity, RuntimeServices};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
@@ -94,6 +93,9 @@ pub struct AppState {
     /// than the first request, and handed to every request's services.
     permission_signal_modules:
         Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>]>,
+    /// The permission policy the domain's settings loaded, which every
+    /// request is given.
+    permission_policy: Arc<trusted_server_core::permissions::PermissionPolicy>,
     /// Services a caller supplied for every request, rather than services built
     /// from the request context. `None` in a deployment.
     services: Option<RuntimeServices>,
@@ -148,6 +150,7 @@ fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
         &raw_envelope,
         &secret_store,
         &default_secret_store_name(),
+        trusted_server_core::platform::PolicyOrigin::Blob,
         &trusted_server_modules::builders(),
     )
 }
@@ -258,6 +261,7 @@ fn build_state_with_registrations_and_services(
         "Spin",
         &UNSENT_ANALYTICS_LOGGED,
     );
+    let permission_policy = settings.required_permission_policy()?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -265,6 +269,7 @@ fn build_state_with_registrations_and_services(
         registry: Arc::new(registry),
         ec_module,
         permission_signal_modules,
+        permission_policy,
         services,
         loading_caches,
     }))
@@ -299,7 +304,8 @@ impl AppState {
     /// Build per-request [`RuntimeServices`], carrying the Edge Cookie module
     /// the composition root already resolved and applying the module-supplied
     /// geo, Edge Cookie and device modules selected by `[geo]`, `[ec]` and
-    /// `[device] module`.
+    /// `[device] module`. The services also carry the permission policy the
+    /// domain's settings loaded, whichever services the request is given.
     ///
     /// No Edge Cookie module is carried when the composition root found
     /// nothing safe to keep, so the request path resolves the selection for
@@ -315,10 +321,16 @@ impl AppState {
             .services
             .clone()
             .unwrap_or_else(|| {
-                build_runtime_services(ctx, &self.settings, &self.permission_signal_modules)
-                    .with_loading_caches(Arc::clone(&self.loading_caches))
+                build_runtime_services(
+                    ctx,
+                    &self.settings,
+                    &self.permission_signal_modules,
+                    &self.permission_policy,
+                )
+                .with_loading_caches(Arc::clone(&self.loading_caches))
             })
-            .with_resolved_ec_module(self.ec_module.clone());
+            .with_resolved_ec_module(self.ec_module.clone())
+            .with_permission_policy(Arc::clone(&self.permission_policy));
         if let Some(module) = self.registry.geo_module() {
             services = services.with_geo(module);
         }
@@ -631,16 +643,20 @@ pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
 // Startup error fallback
 // ---------------------------------------------------------------------------
 
-/// Returns a [`RouterService`] that responds to every route with a generic
-/// 503 Service Unavailable. The startup error is logged but not echoed in the
-/// response body so that deployment state is not leaked to anonymous callers.
+/// Returns a [`RouterService`] that responds to every route with the status
+/// of the startup error's kind, as the other adapters do: 500 for a
+/// configuration or settings error and 503 for a key-value store error. The
+/// startup error is logged but not echoed in the response body so that
+/// deployment state is not leaked to anonymous callers.
 fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
     log::error!("startup failed, serving error fallback: {:?}", e);
 
-    let handler = |_ctx: RequestContext| {
-        let body = edgezero_core::body::Body::from("Service Unavailable\n");
+    let status = e.current_context().status_code();
+    let reason = status.canonical_reason().unwrap_or("Error");
+    let handler = move |_ctx: RequestContext| {
+        let body = edgezero_core::body::Body::from(format!("{reason}\n"));
         let mut resp = Response::new(body);
-        *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+        *resp.status_mut() = status;
         resp.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/plain; charset=utf-8"),
@@ -650,8 +666,8 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
 
     // Cover the full publisher fallback method set (GET, POST, HEAD, OPTIONS,
     // PUT, PATCH, DELETE) so degraded behaviour stays consistent with the
-    // healthy router: every method on `/` and `/{*rest}` returns the generic
-    // 503 instead of a router-level 405 for HEAD/OPTIONS/PATCH.
+    // healthy router: every method on `/` and `/{*rest}` returns the startup
+    // error's status instead of a router-level 405 for HEAD/OPTIONS/PATCH.
     let mut builder = RouterService::builder().middleware(FinalizeResponseMiddleware::new(
         Arc::new(Settings::default()),
     ));
@@ -721,8 +737,8 @@ impl TrustedServerApp {
     /// Build the full application router from explicit settings.
     ///
     /// Testing seam: cross-adapter parity tests use this to drive the router
-    /// with known-good settings instead of the baked `get_settings()` result,
-    /// whose embedded placeholder secrets fail validation by design.
+    /// with settings they build, where the component reads its settings from
+    /// its config store when it starts.
     ///
     /// # Errors
     ///
@@ -1132,31 +1148,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 }
             }
         }
-        // Routes chosen by the settings, so not in the fixed table.
-        let routes = prefix_routes(&state.settings);
-        if !routes.is_empty() {
-            let s = Arc::clone(&state);
-            let attestation_handler = move |ctx: RequestContext| {
-                let s = Arc::clone(&s);
-                async move {
-                    Ok::<Response, EdgeError>(handle_prefix(
-                        &s.settings,
-                        s.registry.platform(),
-                        &ctx.into_request(),
-                    ))
-                }
-            };
-            for route in &routes {
-                for method in publisher_fallback_methods() {
-                    if matches!(method, Method::GET | Method::HEAD) || route.every_method {
-                        builder = builder.route(&route.path, method, attestation_handler.clone());
-                    } else {
-                        builder = builder.route(&route.path, method, fallback.clone());
-                    }
-                }
-            }
-        }
-
         // Only when the settings carry `[robots-txt]`.
         if state.settings.robots_txt.is_some() {
             let s = Arc::clone(&state);
@@ -1212,7 +1203,8 @@ mod tests {
                 assume_single_jurisdiction = true
             "#,
         )
-        .expect("should parse startup test settings");
+        .expect("should parse startup test settings")
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
         settings.auction.enabled = true;
         let names = ["provider_a", "provider_b"];
         settings.demand = trusted_server_core::provider_table::ProviderList::new(
@@ -1238,6 +1230,27 @@ mod tests {
                 .collect(),
         );
         settings
+    }
+
+    #[test]
+    fn each_request_is_given_the_policy_its_domain_loaded() {
+        let policy = trusted_server_core::test_support::policies::open();
+        let mut settings = multi_provider_settings();
+        settings.auction.enabled = false;
+        let state = build_state_with_settings(settings.with_permission_policy(Arc::clone(&policy)))
+            .expect("should build the state");
+        let req = request_builder()
+            .method("GET")
+            .uri("https://publisher.example/article")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build test request");
+
+        let services = state.services_for_request(&RequestContext::new(req, PathParams::default()));
+
+        assert!(
+            Arc::ptr_eq(services.permission_policy(), &policy),
+            "the request should decide under its domain's policy, not the sample"
+        );
     }
 
     #[test]
@@ -1364,7 +1377,12 @@ mod tests {
         // No resolved module is threaded here, so the request path resolves
         // the selection itself, which is what an embedder driving core
         // directly does and where the loud failure has to stay.
-        let services = build_runtime_services(&ctx, &settings, &Arc::default());
+        let services = build_runtime_services(
+            &ctx,
+            &settings,
+            &Arc::default(),
+            &trusted_server_core::permissions::PermissionPolicy::sample(),
+        );
         let req = ctx.into_request();
 
         let error = build_ec_context(&settings, &services, &req)
@@ -1644,33 +1662,78 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn startup_error_router_serves_503_for_all_fallback_methods() {
+    async fn startup_error_router_answers_the_error_kinds_status_for_all_fallback_methods() {
         // The degraded router must answer every publisher-fallback method
         // (including HEAD/OPTIONS/PATCH) on both "/" and nested paths with the
-        // generic 503, never a router-level 405, so startup-failure behaviour
-        // stays consistent with the healthy router.
-        let report = Report::new(TrustedServerError::BadRequest {
-            message: "startup failure".to_string(),
+        // status of the startup error's kind, never a router-level 405, so
+        // startup-failure behaviour stays consistent with the healthy router.
+        let configuration = Report::new(TrustedServerError::Configuration {
+            message: "the configuration names no permission policy".to_string(),
         });
-        let router = startup_error_router(&report);
+        let kv_store = Report::new(TrustedServerError::KvStore {
+            store_name: "trusted_server_kv".to_string(),
+            message: "unavailable".to_string(),
+        });
 
-        for method in ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
-            for path in ["/", "/some/nested/page"] {
+        for (report, expected, reason) in [
+            (configuration, 500, "Internal Server Error\n"),
+            (kv_store, 503, "Service Unavailable\n"),
+        ] {
+            let router = startup_error_router(&report);
+            for method in ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+                for path in ["/", "/some/nested/page"] {
+                    let req = edgezero_core::http::request_builder()
+                        .method(method)
+                        .uri(path)
+                        .body(edgezero_core::body::Body::empty())
+                        .expect("should build request");
+                    let resp = router
+                        .oneshot(req)
+                        .await
+                        .expect("should route startup-error request");
+                    let status = resp.status().as_u16();
+                    assert_eq!(
+                        status, expected,
+                        "{method} {path} must return {expected} from the startup fallback, got {status}"
+                    );
+                    if method != "HEAD" {
+                        let body = resp.into_body().into_bytes().unwrap_or_default();
+                        assert_eq!(
+                            &body[..],
+                            reason.as_bytes(),
+                            "{method} {path} should answer the status's reason and not the error"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_startup_router_answers_500_to_a_policy_load_error() {
+        use trusted_server_core::test_support::policy_failure;
+
+        let error = policy_failure::load_error();
+        assert!(
+            format!("{error:?}").contains(&format!("`{}`", policy_failure::POLICY_NAME)),
+            "the startup error should name the policy: {error:?}"
+        );
+
+        let router = startup_error_router(&error);
+        for method in publisher_fallback_methods() {
+            for path in ["/", "/article"] {
                 let req = edgezero_core::http::request_builder()
-                    .method(method)
+                    .method(method.clone())
                     .uri(path)
                     .body(edgezero_core::body::Body::empty())
                     .expect("should build request");
                 let status = router
                     .oneshot(req)
                     .await
-                    .expect("should route startup-error request")
+                    .expect("should route the request")
                     .status()
                     .as_u16();
-                assert_eq!(
-                    status, 503,
-                    "{method} {path} must return 503 from the startup fallback, got {status}"
-                );
+                assert_eq!(status, 500, "{method} {path} should answer 500");
             }
         }
     }
@@ -1720,7 +1783,9 @@ mod tests {
             trusted_server_core::test_support::tests::crate_test_settings_str(),
             trusted_server_core::test_support::template::documented_block("[analytics]")
         ))
-        .expect("should load settings selecting the documented analytics module");
+        .expect("should load settings selecting the documented analytics module")
+        // A loaded domain carries its policy.
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
 
         build_state_with_settings(settings).expect("should accept a selected analytics module");
 
