@@ -526,8 +526,14 @@ impl AuctionIdentity {
     ///
     /// The mirror carries the same server set as the bidstream, provenance
     /// defaults included, and never an ID consent would strip.
+    ///
+    /// `None` while `[ec.identity] mirror_enabled` is off or the request has
+    /// no identity runtime: the response then carries no mirror member.
     #[must_use]
     pub(crate) fn mirror_member(&self, ec_context: &EcContext) -> Option<serde_json::Value> {
+        if !mirror_enabled(ec_context) {
+            return None;
+        }
         let sources = match self.mirror {
             MirrorState::NotRead | MirrorState::Cleared => Vec::new(),
             MirrorState::Live if allows_eid_persistence(ec_context.consent()) => self
@@ -547,6 +553,13 @@ impl AuctionIdentity {
         let now = self.now.unwrap_or_else(current_timestamp);
         mirror_payload(read, now).map(|payload| payload.to_json())
     }
+}
+
+/// Whether the operator turned the `ts-eids-s` mirror on (spec 6.2, 15).
+pub(crate) fn mirror_enabled(ec_context: &EcContext) -> bool {
+    ec_context
+        .identity_runtime()
+        .is_some_and(|runtime| runtime.identity().mirror_enabled)
 }
 
 /// One [`MirrorSource`] per source of `server`, ranked by its writer's
@@ -2583,6 +2596,7 @@ mod tests {
         let ec_id = merge_ec_id();
         let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
         ec_context.set_identity_runtime(runtime);
+        ec_context.enable_mirror_for_test();
         let snapshot = EcKvSnapshot::Present {
             ec_id,
             entry: Box::new(entry),
@@ -3454,7 +3468,9 @@ mod tests {
 
         fn live_context(ec_id: &str, graph: &KvIdentityGraph) -> EcContext {
             let _ = graph;
-            make_ec_context(Jurisdiction::NonRegulated, Some(ec_id))
+            let mut context = make_ec_context(Jurisdiction::NonRegulated, Some(ec_id));
+            context.enable_mirror_for_test();
+            context
         }
 
         #[tokio::test]
@@ -3514,6 +3530,31 @@ mod tests {
                     json!([{ "source": MIRROR_SOURCE_A, "uids": [{ "id": "body-uid", "atype": 1 }] }])
                 ),
                 "should still send the body's UID to the bidder"
+            );
+        }
+
+        #[tokio::test]
+        async fn auction_omits_the_mirror_while_it_is_disabled() {
+            let ec_id = ec_id_for("mirror-off");
+            let graph = KvIdentityGraph::in_memory("test_store");
+            graph
+                .create(&ec_id, &row_with(&[(MIRROR_SOURCE_A, "uid-a", None)]))
+                .expect("should seed the live row");
+            let registry = mirror_registry();
+            let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+
+            let response = run_auction(
+                &mut ec_context,
+                Some(&graph),
+                Some(&registry),
+                ad_units_only_body(),
+            )
+            .await;
+
+            assert_eq!(
+                mirror_of(&response),
+                None,
+                "should return no mirror member while [ec.identity] mirror_enabled is off"
             );
         }
 
@@ -3632,6 +3673,7 @@ mod tests {
             let registry = mirror_registry();
             let mut ec_context =
                 EcContext::new_for_test(Some(ec_id.clone()), gdpr_consent_with_purposes(&[1], 4));
+            ec_context.enable_mirror_for_test();
 
             let response = run_auction(
                 &mut ec_context,
@@ -3744,6 +3786,7 @@ mod tests {
             let ec_id = ec_id_for("noread");
             let registry = mirror_registry();
             let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+            ec_context.enable_mirror_for_test();
 
             let response =
                 run_auction(&mut ec_context, None, Some(&registry), ad_units_only_body()).await;

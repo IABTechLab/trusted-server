@@ -38,7 +38,7 @@ use sha2::Digest as _;
 use web_time::Instant;
 
 use crate::auction::endpoints::{
-    AuctionIdentity, auction_identity, mirror_member, resolve_client_auction_eids,
+    AuctionIdentity, auction_identity, mirror_enabled, mirror_member, resolve_client_auction_eids,
 };
 use crate::auction::formats::sanitize_publisher_page_url;
 use crate::auction::orchestrator::{
@@ -7273,7 +7273,7 @@ pub async fn handle_page_bids(
             ),
         }
     } else {
-        Some(MirrorPayload::Clear.to_json())
+        mirror_enabled(ec_context).then(|| MirrorPayload::Clear.to_json())
     };
     if let Some(mirror) = mirror {
         body["ts_eids_s"] = mirror;
@@ -24783,13 +24783,15 @@ mod tests {
         }
 
         fn consenting_context_with_ec() -> EcContext {
-            EcContext::new_for_test(
+            let mut context = EcContext::new_for_test(
                 Some(mirror_ec_id()),
                 crate::consent::ConsentContext {
                     jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
                     ..Default::default()
                 },
-            )
+            );
+            context.enable_mirror_for_test();
+            context
         }
 
         async fn page_bids_body(
@@ -24923,6 +24925,43 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn page_bids_omits_the_mirror_while_it_is_disabled() {
+            let settings = auction_settings();
+            let graph = seeded_graph(&[(MIRROR_SOURCE, "uid-mirror")]);
+            let consent = |gdpr_applies| crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                gdpr_applies,
+                ..Default::default()
+            };
+            let mut granted = EcContext::new_for_test(Some(mirror_ec_id()), consent(false));
+            let mut denied = EcContext::new_for_test(Some(mirror_ec_id()), consent(true));
+
+            let granted_body = page_bids_body(
+                &settings,
+                &graph,
+                &mut granted,
+                make_page_bids_request("/2024/01/my-article/"),
+            )
+            .await;
+            let denied_body = page_bids_body(
+                &settings,
+                &graph,
+                &mut denied,
+                make_page_bids_request("/2024/01/my-article/"),
+            )
+            .await;
+
+            assert!(
+                granted_body.get("ts_eids_s").is_none(),
+                "should return no mirror value while the mirror is off"
+            );
+            assert!(
+                denied_body.get("ts_eids_s").is_none(),
+                "should return no mirror clear while the mirror is off"
+            );
+        }
+
+        #[tokio::test]
         async fn page_bids_clears_the_mirror_when_consent_denies_the_auction() {
             let settings = auction_settings();
             let graph = seeded_graph(&[(MIRROR_SOURCE, "uid-mirror")]);
@@ -24936,6 +24975,7 @@ mod tests {
                     ..Default::default()
                 },
             );
+            ec_context.enable_mirror_for_test();
             assert!(ec_context.ec_allowed(), "should allow EC use");
 
             let body = page_bids_body(

@@ -214,9 +214,10 @@ curl -X POST https://edge.example.com/auction \
 
 #### `ts_eids_s` mirror payload
 
-The endpoint never writes KV. The response may carry `ext.ts_eids_s`, the
-payload for the client-only `__Host-ts-eids-s` mirror cookie that the shim
-writes for page scripts. It has one of three forms:
+The endpoint never writes KV. When `[ec.identity] mirror_enabled` is on
+(it is off by default), the response may carry `ext.ts_eids_s`, the payload
+for the client-only `__Host-ts-eids-s` mirror cookie that the shim writes
+for page scripts. It has one of three forms:
 
 - `{ "value": "<base64url>", "max_age": 86400 }` when the request read a live,
   consenting row and the servable server IDs are not empty. `value` is the
@@ -348,8 +349,8 @@ any `OPTIONS` returns `403`; missing `[creative_opportunities]` returns `404`.
 The `200`, `400`, and `403` terminal responses are `private, no-store`. The
 endpoint has no built-in authentication, CORS grant, or rate limiter.
 
-**Identity:** the endpoint never writes KV. Its JSON body may carry a
-`ts_eids_s` member, the payload for the client-only `__Host-ts-eids-s` mirror
+**Identity:** the endpoint never writes KV. When `[ec.identity]
+mirror_enabled` is on, its JSON body may carry a `ts_eids_s` member, the payload for the client-only `__Host-ts-eids-s` mirror
 cookie (see [`ext.ts_eids_s`](#ts-eids-s-mirror-payload) under `POST /auction`
 for its shape):
 

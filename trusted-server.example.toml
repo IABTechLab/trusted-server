@@ -98,6 +98,9 @@ ec_store = "ec_identity_store"
 # hold_retry_sec = 300
 # Largest provider response body accepted, in bytes.
 # max_response_bytes = 65536
+# Return the __Host-ts-eids-s mirror payload from /auction and
+# /_ts/page-bids. Off until a page script that reads it is named.
+# mirror_enabled = false
 
 # Per-provider policy; the table name is the identity provider ID. A pull
 # partner (`pull_sync_enabled = true`) registers as `pull-` plus its source

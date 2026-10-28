@@ -597,6 +597,23 @@ impl EcContext {
         self.identity.set_runtime(runtime);
     }
 
+    /// Turns the `ts-eids-s` mirror on for this request, keeping its provider
+    /// catalog, or with no provider when it has no runtime yet.
+    #[cfg(test)]
+    pub(crate) fn enable_mirror_for_test(&mut self) {
+        let runtime = match self.identity_runtime() {
+            Some(runtime) => runtime.with_mirror_enabled(),
+            None => IdentityRuntime::from_settings_with_providers(
+                &crate::test_support::tests::create_test_settings(),
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+            )
+            .expect("should build an empty runtime")
+            .with_mirror_enabled(),
+        };
+        self.set_identity_runtime(Arc::new(runtime));
+    }
+
     /// Gives the request the limiter that counts provider calls for the burst
     /// cap and the circuit breaker before the response is sent.
     pub fn set_identity_rate_limiter(&mut self, limiter: Arc<dyn RateLimiter + Send + Sync>) {

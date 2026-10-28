@@ -84,6 +84,20 @@ impl IdentityRuntime {
     }
 
     /// The enabled providers.
+    /// A copy of this runtime with the `ts-eids-s` mirror turned on, for
+    /// tests that exercise the mirror.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_mirror_enabled(&self) -> Self {
+        let mut identity = self.identity.clone();
+        identity.mirror_enabled = true;
+        Self {
+            catalog: self.catalog.clone(),
+            keys: self.keys.clone(),
+            identity,
+        }
+    }
+
     #[must_use]
     pub(crate) fn catalog(&self) -> &ProviderCatalog {
         &self.catalog

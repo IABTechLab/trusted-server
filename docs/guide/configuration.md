@@ -644,6 +644,7 @@ Policy for server-side identity providers. The table is optional; every key has 
 | `hold_budget_ms`     | Integer | `100`   | Total wall-clock time a navigation may wait for all hold-mode providers (at most 1000) |
 | `hold_retry_sec`     | Integer | `300`   | Seconds to wait before calling a provider again after the hold budget cut its call off |
 | `max_response_bytes` | Integer | `65536` | Largest provider response body accepted, before and after decoding                     |
+| `mirror_enabled`     | Boolean | `false` | Return the `__Host-ts-eids-s` mirror payload from `/auction` and `/_ts/page-bids`      |
 
 #### Per-provider keys
 

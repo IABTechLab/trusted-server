@@ -2334,8 +2334,11 @@ because every removal now reaches KV on the request that carries it
 (section 5.3).
 
 **Readers.** The mirror is for page scripts that need the server IDs. This
-spec names no consumer yet. Section 15 asks for one before rollout step 1
-ships the mirror; without one, step 1 ships without it.
+spec names no consumer yet, so the mirror ships off: `/auction` and
+`/_ts/page-bids` return no mirror member unless the operator sets
+`[ec.identity] mirror_enabled = true` (default `false`). Off, the responses
+look as they did before this spec, and the shim neither writes nor clears
+the cookie. Section 15 asks for a consumer before the default changes.
 
 **Attributes.** `__Host-ts-eids-s`, with `Path=/; Secure; SameSite=Lax`,
 and no `Domain`. It is not `HttpOnly`, because the shim writes it with
@@ -4348,9 +4351,9 @@ Two steps, each shippable on its own:
    - one after-send attempt for a withdrawal tombstone that failed before
      send (section 5.1)
    - the `ts-eids-s` mirror payload in `/auction` and `/_ts/page-bids`
-     responses, and the shim code that writes and clears the cookie, once
-     section 15 names a consumer; without one, this step ships without the
-     mirror
+     responses, and the shim code that writes and clears the cookie, behind
+     `[ec.identity] mirror_enabled`, off by default until section 15 names
+     a consumer
    - the shim's registered-only, per-source merge of `ts-eids`, with the
      registered source list in the injected configuration (section 5.3)
    - a metric for the inbound `Cookie` header size
@@ -4446,10 +4449,12 @@ a KV migration to version 1, which this spec does not provide.
    product rule is that provider IDs go to a first-party cookie and to KV,
    with the cookie read first. Since revision 14 the server never reads the
    cookie, and no page script is named as its reader (section 6.2). Before
-   rollout step 1 ships the mirror, name its consumer and confirm with the
+   `mirror_enabled` defaults to on, name its consumer and confirm with the
    product lead that a client-only mirror meets the rule. Without a
    consumer, the mirror costs about 2 KB on every request to the host and
-   exposes server-only IDs to page scripts for nothing.
+   exposes server-only IDs to page scripts for nothing. **Decided (round
+   14):** hold the mirror. It ships gated off (`mirror_enabled = false`)
+   until a consumer is named.
 6. **Providers on a new visitor's first navigation.** No provider runs on
    a first navigation (section 4.7, step 7), so a visitor who leaves after
    one page never gets a provider ID. One option keeps one write and never

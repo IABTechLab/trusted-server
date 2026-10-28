@@ -8805,6 +8805,8 @@ git commit --signoff -S -m "Queue browser ingest in the writer's mutation and st
 
 ### Task 26: `/auction` and `/_ts/page-bids` stop ingesting and return the mirror payload
 
+> Revised after the round 14 review (spec 15, question 5): the mirror ships gated off. `IdentitySettings::mirror_enabled` (`[ec.identity] mirror_enabled`, `#[serde(default)]`, `false`) is read by `mirror_enabled(ec_context)` in `auction/endpoints.rs`. `AuctionIdentity::mirror_member` returns `None` while it is off, and `/_ts/page-bids` sends its consent-denial `clear` only while it is on. Tests: `auction_omits_the_mirror_while_it_is_disabled` and `page_bids_omits_the_mirror_while_it_is_disabled`. Tests that exercise the mirror turn it on with `EcContext::enable_mirror_for_test`, and the adapter's identity scenarios set `settings.ec.identity.mirror_enabled = true`.
+
 **Files:**
 
 - Modify: `crates/trusted-server-core/src/auction/endpoints.rs` (the client EID plumbing at about lines 290-302, and the response build)

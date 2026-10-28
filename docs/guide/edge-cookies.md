@@ -287,7 +287,7 @@ Each request also logs one `identity request measurement: ...` line after the re
 
 ### The `ts-eids-s` Mirror Cookie
 
-`__Host-ts-eids-s` is a client-only mirror of the server-side IDs for page scripts. The shim writes it from the `ext.ts_eids_s` member of `/auction` responses and the `ts_eids_s` member of `/_ts/page-bids` responses (see the [API Reference](/guide/api-reference)). The server never sets, reads or trusts it, and it strips it from requests to the origin and to Prebid Server.
+`__Host-ts-eids-s` is a client-only mirror of the server-side IDs for page scripts. It is off by default; `[ec.identity] mirror_enabled = true` turns it on. The shim writes it from the `ext.ts_eids_s` member of `/auction` responses and the `ts_eids_s` member of `/_ts/page-bids` responses (see the [API Reference](/guide/api-reference)). The server never sets, reads or trusts it, and it strips it from requests to the origin and to Prebid Server.
 
 - Attributes: `Path=/; Secure; SameSite=Lax`, no `Domain`, and not `HttpOnly`, because the shim writes it with `document.cookie`.
 - Lifetime: a `Max-Age` of at most one day, and never past the earliest expiry of an ID it holds.

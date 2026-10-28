@@ -2036,7 +2036,10 @@ mod tests {
                 graph: KvIdentityGraph,
                 store: Arc<WriteCountingEcKv>,
             ) -> Self {
-                let settings = Settings::from_toml(toml).expect("should parse the settings");
+                let mut settings = Settings::from_toml(toml).expect("should parse the settings");
+                // These scenarios exercise the mirror; its default-off gate
+                // has its own test.
+                settings.ec.identity.mirror_enabled = true;
                 let network = Arc::new(ScriptedNetwork::new());
                 network.respond(
                     ORIGIN_HOST,

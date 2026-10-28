@@ -661,6 +661,12 @@ pub struct IdentitySettings {
     #[serde(default = "IdentitySettings::default_max_response_bytes")]
     pub max_response_bytes: usize,
 
+    /// Whether `/auction` and `/_ts/page-bids` return the `ts-eids-s` mirror
+    /// payload the shim writes. Off until a page script that reads the
+    /// mirror is named (spec 15, question 5).
+    #[serde(default)]
+    pub mirror_enabled: bool,
+
     /// Per-provider policy, keyed by identity provider ID.
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderSettings>,
@@ -705,6 +711,7 @@ impl Default for IdentitySettings {
             hold_budget_ms: Self::default_hold_budget_ms(),
             hold_retry_sec: Self::default_hold_retry_sec(),
             max_response_bytes: Self::default_max_response_bytes(),
+            mirror_enabled: false,
             providers: BTreeMap::new(),
         }
     }
