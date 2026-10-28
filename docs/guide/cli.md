@@ -264,9 +264,8 @@ After migrating:
    together first. On Cloudflare and Spin, keep the key-value store this
    release requires, the Workers KV binding `TRUSTED_SERVER_KV` and Spin's
    `default` store, or every request fails.
-5. Expect the stored pages and the publisher's stored assets to be fetched
-   again once after the upgrade, because their keys hold a code worked out from
-   the settings.
+5. Expect the stored pages to be fetched again once after the upgrade, because
+   their keys hold a code worked out from the settings.
 
 ### Diagnose ad-template configuration
 
