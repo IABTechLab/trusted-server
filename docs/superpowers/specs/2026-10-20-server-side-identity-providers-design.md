@@ -191,8 +191,10 @@ can be written, and each extra write is another CAS race between tabs.
 - **G6.** Each source has at most one owning provider, configured by the
   operator. A valid ID the owner wrote wins in the auction over the
   browser's.
-- **G7.** IDs that expire (LiveRamp envelopes) are refreshed, and are never
-  sent to bidders or returned by `/_ts/api/v1/identify` after expiry.
+- **G7.** For a source with an owning provider that declares its IDs as
+  expiring (LiveRamp envelopes), the IDs are refreshed and are never sent to
+  bidders or returned by `/_ts/api/v1/identify` after expiry. Unowned
+  sources are outside G7 (section 2.3).
 - **G8.** Today's pull sync becomes one implementation of the trait. Its
   protocol and fill-missing contract are unchanged. It runs only on writer
   navigations, so it holds for clients that make them (section 2.3). Section 10.4 lists the
@@ -311,6 +313,15 @@ these costs for it:
   `fetch()` can send both.
 - **Rollback past rollout step 1 is unsupported.** Step 1 writes KV schema
   version 2, which older builds reject (sections 6.1, 14).
+- **Unowned IDs keep no lifetime.** Expiry is declared by the writing
+  provider (`is_expiring`), and browser ingest, batch sync and a provider
+  that gives no expiry carry no `exp`. So an unowned `liveramp.com`
+  envelope or `uidapi.com` token from one of them is served from KV until
+  it is replaced or removed, as it is today, and a browser value equal to
+  an owner record TS knows has expired is still forwarded. G7 covers owned
+  sources only. A per-source lifetime on `[[ec.partners]]` would close
+  this for every writer; it changes what today's writers store, so it is
+  left for a later spec.
 
 ## 3. Background
 
@@ -730,6 +741,12 @@ impl Resolves {
     /// This provider keeps private state in KV (`ps.st`, section 6.1). It
     /// can then read [`ResolveInput::state`] and return a state change.
     pub fn with_private_state(self) -> Self;
+    /// Keeps an expired record this provider wrote for a source it owns as
+    /// a refresh anchor until `exp` plus `grace` (section 5.4, step 4), for
+    /// a provider without private state whose refresh accepts an expired
+    /// ID. `build()` rejects it without the `Refresh` kind or with a zero
+    /// grace.
+    pub fn with_refresh_grace(self, grace: Duration) -> Self;
 }
 
 impl Captures {
@@ -2082,14 +2099,21 @@ Applying the mutation to a live entry, in order:
    (section
    14). Such an entry still counts toward the 32-provider cap, and is the
    first dropped when the cap is exceeded.
-   Drop expired records, except **refresh anchors**: an expired record of an
-   owned source whose owner still holds `ps.st` and whose `ru` has not
-   passed. An anchor is never served (section 7.1), but it keeps the
-   owner's kind `Refresh` (section 4.7), so an unrelated mutation cannot
-   strand refresh credentials that are still valid. It is dropped when its
-   `ru` passes, when the owner's state is cleared (an `InvalidState`
-   included) or missing, or when the owner is no longer configured. A
-   record without `ru` is dropped at expiry, as before. After a drop the
+   Drop expired records, except **refresh anchors**, an expired record of an
+   owned source whose owner is configured and either:
+   - still holds `ps.st`, and the record's `ru` has not passed (a stateful
+     owner, such as UID2), or
+   - wrote the record and declares `with_refresh_grace`, and `exp` plus the
+     grace has not passed (a stateless owner, such as LiveRamp, whose
+     refresh accepts an expired envelope).
+
+   An anchor is never served (section 7.1), but it keeps the owner's kind
+   `Refresh` (section 4.7), so an unrelated mutation, a backoff or an open
+   breaker cannot strand refresh credentials that are still valid. A
+   stateful anchor is dropped when its `ru` passes or the owner's state is
+   cleared (an `InvalidState` included) or missing; a stateless one when its
+   grace passes. Either is dropped when the owner is no longer configured. A
+   record with neither is dropped at expiry, as before. After a drop the
    owner sees no record and selects `Initial`.
 
 5. Validate the result with `KvEntry::validate`. If it fails, keep only the
@@ -3331,6 +3355,12 @@ What this shows:
 - A `Refresh` is attempted for an expired envelope too (section 4.4,
   `ResolveKind`). LiveRamp answers 204 for one it no longer accepts, and the
   record is invalidated.
+- LiveRamp keeps no private state, so it cannot set `refresh_until`. Its
+  descriptor declares `with_refresh_grace`, for as long as LiveRamp accepts
+  an expired envelope for refresh, so an envelope that expires while
+  LiveRamp is backed off or no navigation runs it stays a refresh anchor
+  rather than falling back to `Initial`, which needs a HEM v1 does not
+  have. The vendor plan (#1461) sets the length.
 - `Input::HashedEmail` is declared only for `Initial`, so in v1 an owned
   `liveramp.com` source is resolved only by `Refresh`, of an envelope that
   browser ingest seeded (section 7.2). For an `Initial`, eligibility step 4
@@ -4501,17 +4531,18 @@ Decisions made while writing this spec, with the user:
 Revision 15 applies these decisions, made by the user after the round 14
 review, which allowed breaking changes:
 
-| Decision             | Choice                                                                                                                                                                            |
-| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Stager providers     | None. Resolving providers run only on writer navigations, so every outcome, backoff included, is stored. Stagers serve KV                                                         |
-| Removals             | Written to KV on the request that carries them. `ts-eids-r`, its keyring and secrets, the overflow write and the strips-only rollout step are removed                             |
-| Non-browser removals | Applied, as consent withdrawals are; only clears need a real browser. Changed after the round 14 review from dropping them                                                        |
-| Capture              | Revoke-only: removals, opt-out and clear. Positive IDs are counted, never stored. `capture_enabled` and request-body consent are removed                                          |
-| Capture-only opt-out | Also removes the records of its sources that no provider wrote, and blocks the browser's values for them. A capture-only provider cannot own a source and must list its `sources` |
-| Provider denials     | A provider's `ps.iv` and `ps.ov` filter browser candidates for unowned sources too. An opt-out's removals go to `ps.ov`, which its clear empties                                  |
-| Mirror feedback      | The shim never copies `ts-eids-s` into `ts-eids` or the `/auction` body                                                                                                           |
-| Dry run              | Removed, with `is_dry_run`                                                                                                                                                        |
-| KV schema            | Version 2 with one record shape. Version 1 rows are read and upgraded on write. Rollback past rollout step 1 is unsupported                                                       |
-| Stored hashes        | `ps.iv` hashes are unkeyed and the consent fingerprint is a plain bitmask, because the row already holds the raw values. No legacy revision hash                                  |
-| Pull sync            | The pull-complete marker and the legacy pull sync config keys are removed                                                                                                         |
-| Withdrawal retry     | A tombstone that fails before send gets one more attempt after send                                                                                                               |
+| Decision             | Choice                                                                                                                                                                                                                      |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Stager providers     | None. Resolving providers run only on writer navigations, so every outcome, backoff included, is stored. Stagers serve KV                                                                                                   |
+| Removals             | Written to KV on the request that carries them. `ts-eids-r`, its keyring and secrets, the overflow write and the strips-only rollout step are removed                                                                       |
+| Non-browser removals | Applied, as consent withdrawals are; only clears need a real browser. Changed after the round 14 review from dropping them                                                                                                  |
+| Expiry scope         | G7 covers owned expiring sources. A stateless owner keeps its expired record as a refresh anchor until `exp` plus its declared refresh grace. Unowned IDs keep no lifetime (section 2.3). Changed after the round 14 review |
+| Capture              | Revoke-only: removals, opt-out and clear. Positive IDs are counted, never stored. `capture_enabled` and request-body consent are removed                                                                                    |
+| Capture-only opt-out | Also removes the records of its sources that no provider wrote, and blocks the browser's values for them. A capture-only provider cannot own a source and must list its `sources`                                           |
+| Provider denials     | A provider's `ps.iv` and `ps.ov` filter browser candidates for unowned sources too. An opt-out's removals go to `ps.ov`, which its clear empties                                                                            |
+| Mirror feedback      | The shim never copies `ts-eids-s` into `ts-eids` or the `/auction` body                                                                                                                                                     |
+| Dry run              | Removed, with `is_dry_run`                                                                                                                                                                                                  |
+| KV schema            | Version 2 with one record shape. Version 1 rows are read and upgraded on write. Rollback past rollout step 1 is unsupported                                                                                                 |
+| Stored hashes        | `ps.iv` hashes are unkeyed and the consent fingerprint is a plain bitmask, because the row already holds the raw values. No legacy revision hash                                                                            |
+| Pull sync            | The pull-complete marker and the legacy pull sync config keys are removed                                                                                                                                                   |
+| Withdrawal retry     | A tombstone that fails before send gets one more attempt after send                                                                                                                                                         |

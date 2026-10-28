@@ -1,5 +1,6 @@
 //! What a provider is, may write, needs and must respect.
 
+use core::time::Duration;
 use std::collections::{BTreeMap, BTreeSet};
 
 use error_stack::Report;
@@ -237,6 +238,14 @@ impl ProviderDescriptorBuilder {
             if resolves.hosts.is_empty() {
                 return Err(fail("resolves declares no endpoint or host"));
             }
+            if let Some(grace) = resolves.refresh_grace {
+                if !resolves.kinds.contains(&ResolveKind::Refresh) {
+                    return Err(fail("declares a refresh grace but not the refresh kind"));
+                }
+                if grace.is_zero() {
+                    return Err(fail("declares a zero refresh grace"));
+                }
+            }
             for host in &resolves.hosts {
                 if normalize_partner_source_domain(host).ok().as_deref() != Some(host.as_str()) {
                     return Err(fail(&format!(
@@ -287,6 +296,7 @@ pub struct Resolves {
     wants: BTreeSet<Input>,
     kinds: Vec<ResolveKind>,
     private_state: bool,
+    refresh_grace: Option<Duration>,
     ec_id: bool,
 }
 
@@ -308,6 +318,7 @@ impl Resolves {
             wants: BTreeSet::new(),
             kinds: vec![ResolveKind::Initial, ResolveKind::Refresh],
             private_state: false,
+            refresh_grace: None,
             ec_id: false,
         }
     }
@@ -369,6 +380,19 @@ impl Resolves {
         self
     }
 
+    /// Keeps an expired record this provider wrote for a source it owns as
+    /// a refresh anchor until `exp` plus `grace` (spec 5.4, step 4). The
+    /// record is never served, but the next eligible request still selects
+    /// `Refresh` for it rather than `Initial`. For providers whose refresh
+    /// call accepts an expired ID and that keep no private state, so cannot
+    /// set `refresh_until`. `build()` requires `Refresh` among the kinds and a
+    /// grace above zero.
+    #[must_use]
+    pub fn with_refresh_grace(mut self, grace: Duration) -> Self {
+        self.refresh_grace = Some(grace);
+        self
+    }
+
     /// Gives the provider the full EC ID. Only generic pull may use this.
     #[must_use]
     pub(in crate::ec::identity) fn with_ec_id(mut self) -> Self {
@@ -413,6 +437,13 @@ impl Resolves {
     #[must_use]
     pub(crate) fn kinds(&self) -> &[ResolveKind] {
         &self.kinds
+    }
+
+    /// How long an expired record this provider wrote stays a refresh
+    /// anchor, if it declared a grace.
+    #[must_use]
+    pub(crate) fn refresh_grace(&self) -> Option<Duration> {
+        self.refresh_grace
     }
 
     /// Whether the provider keeps private state.
@@ -826,6 +857,27 @@ mod tests {
                     .with_provenance(
                         &source("other.example.com"),
                         EidProvenance::new().with_mm(2),
+                    ),
+            ),
+            (
+                "refresh grace without refresh",
+                ProviderDescriptor::builder(id("p"))
+                    .with_source(source("example.com"))
+                    .with_resolves(
+                        Resolves::new()
+                            .with_endpoint("https://a.example.com")
+                            .with_kinds([ResolveKind::Initial])
+                            .with_refresh_grace(core::time::Duration::from_secs(60)),
+                    ),
+            ),
+            (
+                "zero refresh grace",
+                ProviderDescriptor::builder(id("p"))
+                    .with_source(source("example.com"))
+                    .with_resolves(
+                        Resolves::new()
+                            .with_endpoint("https://a.example.com")
+                            .with_refresh_grace(core::time::Duration::ZERO),
                     ),
             ),
             (

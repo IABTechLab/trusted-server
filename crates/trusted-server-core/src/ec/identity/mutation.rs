@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::catalog::ProviderCatalog;
+use super::descriptor::Resolves;
 use super::ids::{IdentityProviderId, SourceDomain};
 use super::input::RandomSource;
 use super::revision::{
@@ -897,15 +898,31 @@ fn drop_expired_records(entry: &mut KvEntry, context: &ApplyContext<'_>) {
         if !is_expired(record, context.now) {
             return true;
         }
-        let anchored = source.parse::<SourceDomain>().ok().is_some_and(|source| {
-            context.catalog.owner_of(&source).is_some_and(|owner| {
-                context.catalog.is_configured(owner)
-                    && ps
-                        .get(owner.as_str())
-                        .is_some_and(|state| state.st.is_some())
-            })
-        });
-        anchored && record.ru.is_some_and(|ru| context.now < ru)
+        let Some(owner) = source
+            .parse::<SourceDomain>()
+            .ok()
+            .and_then(|source| context.catalog.owner_of(&source).cloned())
+            .filter(|owner| context.catalog.is_configured(owner))
+        else {
+            return false;
+        };
+        // A stateful owner anchors the record until its `ru`.
+        let state_anchor = ps
+            .get(owner.as_str())
+            .is_some_and(|state| state.st.is_some())
+            && record.ru.is_some_and(|ru| context.now < ru);
+        // A stateless owner anchors a record it wrote until `exp` plus the
+        // refresh grace its descriptor declares.
+        let grace_anchor = record.w.as_deref() == Some(owner.as_str())
+            && record.exp.is_some_and(|exp| {
+                context
+                    .catalog
+                    .get(&owner)
+                    .and_then(|provider| provider.descriptor().resolves())
+                    .and_then(Resolves::refresh_grace)
+                    .is_some_and(|grace| context.now < exp.saturating_add(grace.as_secs()))
+            });
+        state_anchor || grace_anchor
     });
 }
 
@@ -915,10 +932,11 @@ mod tests {
 
     use super::*;
     use crate::ec::identity::catalog::ProviderCatalog;
+    use crate::ec::identity::descriptor::{ConsentPolicy, ProviderDescriptor};
     use crate::ec::identity::input::SeededRandom;
     use crate::ec::identity::revision::{RecordRevision, StateRevision, set_hashes, uid_hash};
     use crate::ec::identity::test_support::{
-        example_entry_set, fixed_capture_provider, fixed_provider, full_record,
+        example_entry_set, fixed_capture_provider, fixed_provider, full_record, provider_from,
     };
     use crate::ec::kv_types::{
         KvEntry, KvOptOut, KvPartnerId, KvProviderState, MAX_INVALIDATED_UIDS, MAX_PROVIDER_STATES,
@@ -1825,6 +1843,79 @@ mod tests {
                 .ids
                 .contains_key("a.example.com"),
             "should drop it"
+        );
+    }
+
+    /// Runs `mutation` with an owner of `a.example.com` that keeps no
+    /// private state and declares `grace` as its refresh grace.
+    fn run_with_graced_owner(
+        mutation: &IdentityMutation,
+        live: &KvEntry,
+        grace: Option<u64>,
+    ) -> Option<Applied> {
+        let mut resolves = Resolves::new().with_endpoint("https://api.example.com");
+        if let Some(grace) = grace {
+            resolves = resolves.with_refresh_grace(core::time::Duration::from_secs(grace));
+        }
+        let owner = provider_from(
+            ProviderDescriptor::builder(pid("owner"))
+                .with_source(src("a.example.com"))
+                .with_resolves(resolves)
+                .with_consent_policy(ConsentPolicy::eid_persistence_only())
+                .build()
+                .expect("should build the owner"),
+        );
+        let catalog = ProviderCatalog::new(
+            vec![owner, fixed_provider("other", &["b.example.com"])],
+            [(src("a.example.com"), pid("owner"))].into_iter().collect(),
+        );
+        let random = SeededRandom::new(1);
+        apply(
+            mutation,
+            live,
+            &ApplyContext {
+                now: NOW,
+                random: &random,
+                catalog: &catalog,
+            },
+        )
+    }
+
+    fn keeps_expired_owned_record(writer: &str, expired_for: u64, grace: Option<u64>) -> bool {
+        let mut live = KvEntry::minimal("b.example.com", "x", 1);
+        live.ids.insert(
+            "a.example.com".to_owned(),
+            KvPartnerId {
+                exp: Some(NOW - expired_for),
+                ..written(writer, "expired", "1111111111111111")
+            },
+        );
+        let mut unrelated = IdentityMutation::default();
+        unrelated.set_cluster_size(1);
+        run_with_graced_owner(&unrelated, &live, grace)
+            .expect("should apply")
+            .entry
+            .ids
+            .contains_key("a.example.com")
+    }
+
+    #[test]
+    fn stateless_refresh_anchor_survives_until_exp_plus_grace() {
+        assert!(
+            keeps_expired_owned_record("owner", 50, Some(100)),
+            "should keep the owner's expired record inside its refresh grace"
+        );
+        assert!(
+            !keeps_expired_owned_record("owner", 100, Some(100)),
+            "should drop it once exp plus the grace has passed"
+        );
+        assert!(
+            !keeps_expired_owned_record("owner", 50, None),
+            "should drop it when the owner declares no grace, as before"
+        );
+        assert!(
+            !keeps_expired_owned_record("other", 50, Some(100)),
+            "should drop an expired record another provider wrote"
         );
     }
 
