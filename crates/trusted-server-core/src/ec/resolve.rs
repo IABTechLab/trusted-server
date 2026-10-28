@@ -1400,7 +1400,7 @@ mod tests {
     /// needs a signal.
     fn services_with_record(record: StorageRecord) -> RuntimeServices {
         let modules: Vec<Arc<dyn PermissionSignalModule>> = vec![Arc::new(record)];
-        RuntimeServices::builder()
+        crate::platform::test_support::test_services_builder()
             .config_store(Arc::new(NoopConfigStore))
             .secret_store(Arc::new(NoopSecretStore))
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
