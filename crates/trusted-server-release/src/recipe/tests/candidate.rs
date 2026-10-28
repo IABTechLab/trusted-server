@@ -36,6 +36,205 @@ pub(super) enum FixtureHost {
 /// How the fixture inputs were acquired.
 const ACQUISITION: &str = "unauthenticated-ordinary-ci";
 
+/// Checks that a real candidate export outlives all owned build storage.
+pub(super) fn check_export_after_cleanup<T>(build: T, completed: fn(&T) -> &RecipeCompleted) {
+    check_owned_export_after_cleanup(build, completed, None);
+}
+
+/// Checks an export carrying the actual final-byte Fastly runtime acceptance.
+pub(super) fn check_fastly_export_after_cleanup<T>(
+    build: T,
+    completed: fn(&T) -> &RecipeCompleted,
+    accepted: &super::super::runtime::FastlyRuntimeAccepted,
+) {
+    check_owned_export_after_cleanup(build, completed, Some(RuntimeAcceptance::Fastly(accepted)));
+}
+
+/// Checks retained canonical native startup evidence after every build root is removed.
+pub(super) fn check_native_export_after_cleanup<T>(
+    build: T,
+    completed: fn(&T) -> &RecipeCompleted,
+    accepted: &super::super::NativeStartupAccepted,
+) {
+    check_owned_export_after_cleanup(build, completed, Some(RuntimeAcceptance::Native(accepted)));
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeAcceptance<'a> {
+    Fastly(&'a super::super::FastlyRuntimeAccepted),
+    Native(&'a super::super::NativeStartupAccepted),
+}
+
+impl RuntimeAcceptance<'_> {
+    fn diagnostic_for(&self, completed: &RecipeCompleted) -> Value {
+        match self {
+            Self::Fastly(accepted) => accepted.diagnostic_for(completed),
+            Self::Native(accepted) => accepted.diagnostic_for(completed),
+        }
+        .expect("should retain exact owning runtime observations")
+    }
+}
+
+fn check_owned_export_after_cleanup<T>(
+    build: T,
+    completed: fn(&T) -> &RecipeCompleted,
+    accepted: Option<RuntimeAcceptance<'_>>,
+) {
+    let completed = completed(&build);
+    let artifact = completed.artifact().path().to_owned();
+    let view = completed
+        .composition_view()
+        .expect("should expose sealed typed receipts after working-root cleanup");
+    assert_eq!(
+        view.receipt_sha256(),
+        completed
+            .composition_export()
+            .expect("should export the same sealed receipt")
+            .sha256(),
+        "should bind the typed view to the exact original retained receipt bytes"
+    );
+    assert!(
+        !view.observations().units().is_empty(),
+        "should retain actual compiler units through the typed view"
+    );
+    for package in view.observations().packages() {
+        let origin = view
+            .package_origins()
+            .package(package.id())
+            .expect("should retain an exact verified origin for every observed package");
+        assert_eq!(
+            origin.name(),
+            package.name(),
+            "should retain the joined name"
+        );
+        assert_eq!(
+            origin.version(),
+            package.version(),
+            "should retain the joined version"
+        );
+    }
+    let projected = crate::spdx::cargo::CargoProjection::from_completed(completed)
+        .expect("should project verified Rust packages after working-root cleanup");
+    assert_eq!(
+        projected.component_count(),
+        view.observations().packages().len(),
+        "should project precisely the observed packages rather than the potential graph"
+    );
+    assert_eq!(
+        projected.observations().units().len(),
+        view.observations().units().len(),
+        "should retain the original per-unit feature and context evidence"
+    );
+    let javascript = completed
+        .javascript_contributions()
+        .expect("should retain checked original JS evidence without its preparation lease");
+    let inventory = javascript.raw_inventory().to_vec();
+    let javascript_projection =
+        crate::spdx::javascript::JavascriptProjection::from_completed(completed)
+            .expect("should project original JS evidence joined to final-byte membership");
+    assert!(
+        javascript_projection.component_count() > 0,
+        "should project actual checked JS material even when CLI discards complete bundles"
+    );
+    let native = crate::spdx::native::NativeProjection::from_completed(completed).expect(
+        "should project exact observed native contexts through verified original materials",
+    );
+    assert_eq!(
+        native.component_count(),
+        view.native().contributors().len(),
+        "should preserve measured native membership rather than every prepared dependency"
+    );
+    let platform = crate::spdx::platform::PlatformProjection::from_completed(completed)
+        .expect("should project artifact-bound installed tools and logical runtime requirements");
+    assert!(
+        platform.component_count() > 0,
+        "should retain measured platform facts"
+    );
+    assert_eq!(
+        platform.receipt_sha256(),
+        view.receipt_sha256(),
+        "should project the exact retained composition receipt"
+    );
+    let composition = completed
+        .composition_export()
+        .expect("should export the sealed composition receipt");
+    crate::collection::check_composition_receipt(
+        composition.bytes(),
+        &crate::collection::ReceiptFacts {
+            artifact_sha256: completed.artifact().sha256(),
+            source_commit: completed.commit().as_str(),
+            inventory_sha256: javascript.inventory_sha256(),
+            materials_sha256: completed.materials_digest(),
+            asset: completed.artifact().name(),
+        },
+    )
+    .unwrap_or_else(|error| {
+        panic!("should accept the real producer composition receipt: {error:?}")
+    });
+    let expected_runtime = accepted.map(|accepted| accepted.diagnostic_for(completed));
+    let export = match accepted {
+        Some(RuntimeAcceptance::Fastly(runtime)) => {
+            crate::collection::producer::CandidateBuildExport::with_fastly_runtime(
+                completed, runtime,
+            )
+        }
+        Some(RuntimeAcceptance::Native(startup)) => {
+            crate::collection::producer::CandidateBuildExport::with_native_startup(
+                completed, startup,
+            )
+        }
+        None => crate::collection::producer::CandidateBuildExport::from_completed(completed),
+    }
+    .expect("should export actual candidate receipts before closing their owners");
+    drop(build);
+    assert!(
+        !artifact.exists(),
+        "should remove the original artifact with its owning build storage"
+    );
+    let root = export
+        .rehash_for_handoff()
+        .expect("should retain exact exported bytes after all original build storage is removed");
+    assert_eq!(
+        std::fs::read(root.join("tsjs-inventory.json"))
+            .expect("should retain original JS inventory"),
+        inventory,
+        "should preserve original observer bytes after source, target and JS owners disappear"
+    );
+    let record: Value = serde_json::from_slice(
+        &std::fs::read(root.join("candidate-build-record.json"))
+            .expect("should retain build record"),
+    )
+    .expect("should parse exported diagnostic record");
+    let gaps = record["gaps"]
+        .as_array()
+        .expect("should list remaining gaps");
+    match expected_runtime {
+        Some(runtime) => {
+            assert_eq!(
+                record["runtime_acceptance"], runtime,
+                "should retain exact final-byte runtime observations after working-root cleanup"
+            );
+            assert!(
+                !gaps
+                    .iter()
+                    .any(|gap| gap == "runtime-acceptance-not-exported"),
+                "should remove only a gap satisfied by actual owning acceptance"
+            );
+        }
+        None => {
+            assert!(
+                record["runtime_acceptance"].is_null(),
+                "should not invent unobserved runtime acceptance"
+            );
+            assert!(
+                gaps.iter()
+                    .any(|gap| gap == "runtime-acceptance-not-exported"),
+                "should preserve the missing runtime gap"
+            );
+        }
+    }
+}
+
 /// Every field `fixture.json` must hold, and nothing else.
 const FIXTURE_FIELDS: [&str; 10] = [
     "acquisition",

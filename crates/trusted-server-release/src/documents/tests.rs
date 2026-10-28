@@ -881,3 +881,48 @@ fn index_role_checks_require_role_specific_companion_names() {
         "should reject companion names not derived from their asset"
     );
 }
+
+#[test]
+fn phase3_preserves_frozen_v1_policy_and_release_index_schema() {
+    for (bytes, expected) in [
+        (
+            include_bytes!("../../../trusted-server-cli/release-policy.json").as_slice(),
+            "f08ce10cd16ff2d1acc482db2b85eb53b667ec2b4753792f277d12f41d1f636c",
+        ),
+        (
+            include_bytes!(
+                "../../../../docs/superpowers/specs/schemas/release-index-v1.schema.json"
+            )
+            .as_slice(),
+            "06a7e598f1d14b499d087ec0c894829b3aab26a690b35e5922d96987a877bb9e",
+        ),
+    ] {
+        assert_eq!(
+            hex::encode(Sha256::digest(bytes)),
+            expected,
+            "should preserve the frozen v1 contract bytes during the Phase 3 source port"
+        );
+    }
+}
+
+#[test]
+fn phase3_restores_exact_frozen_v1_release_index_fixtures() {
+    for (bytes, expected) in [
+        (
+            include_bytes!("../../../trusted-server-cli/tests/fixtures/release/release-index.json")
+                .as_slice(),
+            "4ff7a4b64e2724172e19d8ef0b02f500f133719411a15b0ce74d8fce4c8b7034",
+        ),
+        (
+            include_bytes!("../../tests/fixtures/index/candidate/candidate-release-index.json")
+                .as_slice(),
+            "2e35dd6998ec958eae1f23454c50a5b6306be29d2f5eabdb60fd7360f0ca4203",
+        ),
+    ] {
+        assert_eq!(
+            hex::encode(Sha256::digest(bytes)),
+            expected,
+            "should restore the exact frozen v1 index fixture bytes"
+        );
+    }
+}

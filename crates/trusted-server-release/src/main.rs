@@ -1,3 +1,9 @@
+#[allow(dead_code, reason = "candidate source port has no production caller")]
+mod collection;
+#[allow(dead_code, reason = "candidate source port has no production caller")]
+mod distribution;
+#[allow(dead_code, reason = "candidate source port has no production caller")]
+mod spdx;
 // consumed by Task 7 preparation and Task 9 recipes
 #[allow(dead_code)]
 mod boundary;

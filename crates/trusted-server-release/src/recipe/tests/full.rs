@@ -21,12 +21,15 @@ use super::candidate::{
     CargoFixture, SCHEMA_VERSION, cargo_docker_settings, cargo_measurement, ci_build_provenance,
     denial_measurement, equality_measurement, reported_errno,
 };
+use super::candidate_entry::{EntryExport, check_real_entry};
 use super::real_fixture::{
     ATTEMPTS, DenialCase, DenialSelection, bind_denial_case, cargo_fixture, ordinary_ci_ambient,
     path_text, try_prepare_vendor,
 };
+use super::spdx_candidate::{candidate_spdx_measurement, check_real_candidate};
 use super::*;
 use crate::boundary::{Boundary, DenialProof, ImageSelection, ProbeProgram};
+use crate::distribution::CandidateAcceptance;
 use crate::materials::{LockedMaterials, resolution_differences};
 use crate::preparation::tests::full::{JsFixtureRun, run_two_fresh_js_builds};
 use crate::process::{Cancellation, ProcessLimits};
@@ -384,6 +387,8 @@ fn scan_final_bytes(fixture: &CargoFixture, builds: [&FastlyBuild; 2]) -> RemapS
         .unwrap_or_else(|error| panic!("should prove remapping in the final bytes: {error:?}"))
 }
 
+// The reviewed esbuild lifecycle hook remains at 0.27.3 while the current
+// JS lock selects 0.28.2; this source port does not qualify the new hook.
 #[test]
 #[ignore = "requires explicit JS and Cargo ordinary CI fixtures, Linux Docker and the pinned Viceroy; run separately in producer CI"]
 fn fastly_canonical_and_reproduction_builds_are_byte_identical() {
@@ -431,6 +436,10 @@ fn fastly_canonical_and_reproduction_builds_are_byte_identical() {
         "forbidden": ["/boundary/", "host build roots", "fixture root", "RUNNER_TEMP"],
         "found": scan.found(),
     });
+    let canonical_candidate = check_real_candidate(&canonical.completed, &js.source);
+    let reproduction_candidate = check_real_candidate(&reproduction.completed, &js.source);
+    measurement["candidate_spdx"] =
+        candidate_spdx_measurement(&canonical_candidate, Some(&reproduction_candidate));
     measurement["js_inventory_sha256"] =
         serde_json::json!(js_inventory_sha256(&canonical.completed));
     measurement["ci_build_provenance"] = ci_build_provenance(&fixture);
@@ -453,6 +462,31 @@ fn fastly_canonical_and_reproduction_builds_are_byte_identical() {
             .diagnostic_for(&canonical.completed)
             .is_err(),
         "should reject attaching reproduction acceptance to the equal-byte canonical role"
+    );
+    let upload_directory = fixture.root.join("candidate-entry");
+    let transfer_file = fixture.root.join("candidate-entry-transfer.json");
+    measurement["candidate_entry"] = check_real_entry(
+        &canonical.completed,
+        &js.source,
+        &CandidateAcceptance::Fastly {
+            runtime: &canonical_runtime,
+            equality: &checked,
+        },
+        &EntryExport {
+            upload_directory: &upload_directory,
+            transfer_file: &transfer_file,
+        },
+    );
+    retain_equality_measurement(&fixture, &measurement);
+    super::candidate::check_fastly_export_after_cleanup(
+        canonical,
+        |build| &build.completed,
+        &canonical_runtime,
+    );
+    super::candidate::check_fastly_export_after_cleanup(
+        reproduction,
+        |build| &build.completed,
+        &reproduction_runtime,
     );
 }
 
