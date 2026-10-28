@@ -271,9 +271,9 @@ staged version:
 
 ```bash
 EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<staging-config-store> \
-  ts config push --adapter fastly --staging
+  ts config push --adapter fastly --staging --permissions standard.yaml
 EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<staging-config-store> \
-  ts config diff --adapter fastly --staging
+  ts config diff --adapter fastly --staging --permissions standard.yaml
 ```
 
 The config key is fixed on Fastly: production, staging, and local Viceroy all
@@ -636,7 +636,7 @@ not fall back to a fabricated default ad unit.
 When a run reports that it wrote a `{section}` template:
 
 1. Deploy the template-aware binary **first**.
-2. Then `ts config push`.
+2. Then `ts config push --permissions <file>`.
 3. Do **not** roll that binary back while the config is live.
 
 A run that did not template writes neither key, and leaves the config exactly as

@@ -47,11 +47,13 @@ With Spin 4.1.0 or newer installed, run:
 ```
 
 The script creates an isolated manifest and strictly validates a fresh app
-config. It maps the logical EdgeZero store with
+config, which names the repository's sample permission policy. It maps the
+logical EdgeZero store with
 `EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=default`, then runs `ts
-config push --adapter spin --local`. Without that mapping, the push can land in
-a store the runtime never reads. Local push writes the temporary
-`.spin/sqlite_key_value.db`; no repository-local Spin state is used.
+config push --adapter spin --local` with the sample through `--permissions`.
+Without that mapping, the push can land in a store the runtime never reads.
+Local push writes the temporary `.spin/sqlite_key_value.db`; no
+repository-local Spin state is used.
 
 Spin encodes `v_<store>_v_<key>` names. The smoke supplies these exact
 variables:

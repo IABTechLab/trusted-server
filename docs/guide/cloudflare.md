@@ -41,7 +41,8 @@ Install the Wrangler version pinned in `.tool-versions`, then run:
 The smoke refuses an absent pin or a different Wrangler executable. It creates
 an isolated Worker manifest and launches `wrangler dev` before any settings
 are pushed, which must answer 500 because the config store holds no blob. It
-then runs `ts config push --adapter cloudflare --local`, which writes the blob
+then runs `ts config push --adapter cloudflare --local` with the repository's
+sample permission policy through `--permissions`, which writes the blob
 into the local `trusted_server_config` namespace, and reads it back with
 `wrangler kv key get`.
 
@@ -63,11 +64,12 @@ the checked-in manifests.
 
 Local `[vars]` are only for the isolated smoke. For a deployed Worker, run
 `ts provision --adapter cloudflare` once, then `ts config push --adapter
-cloudflare`, which writes the settings into the remote config store. Store the
-three credential values with `wrangler secret put handler_password`,
-`wrangler secret put publisher_proxy_secret`, and `wrangler secret put
-ec_passphrase`; do not commit them to a Wrangler manifest. Deploy only after
-the config store holds the blob and the three secrets are set.
+cloudflare --permissions <file>`, which writes the settings and the policy file
+they name into the remote config store. Store the three credential values with
+`wrangler secret put handler_password`, `wrangler secret put
+publisher_proxy_secret`, and `wrangler secret put ec_passphrase`; do not
+commit them to a Wrangler manifest. Deploy only after the config store holds
+the blob and the three secrets are set.
 
 Request-time store registries are unwired, so EC KV lookup and key rotation
 are not available. The read-only `/_ts/admin/eids` diagnostic remains

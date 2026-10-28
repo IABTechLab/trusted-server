@@ -36,7 +36,8 @@ ts --help
 # Create local config, then edit placeholders before validation
 ts config init
 # Edit trusted-server.toml. Server auctions use map-shaped
-# [auction.providers.<id>] and [auction.bidders.<id>] tables.
+# [auction.providers.<id>] and [auction.bidders.<id>] tables, and
+# [permissions] policy names your permission policy file.
 ts config validate
 
 # Audit a public page with Chrome/Chromium to bootstrap a draft config
