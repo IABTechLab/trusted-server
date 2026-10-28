@@ -805,7 +805,7 @@ mod tests {
         }
     }
 
-    /// A plan with one ordinary `OpenRTB` source called `one`.
+    /// A plan with one plain source called `one`.
     fn one_source() -> AuctionPlanConfig {
         config(vec![("one", table("auction.plain-fixture"))])
     }

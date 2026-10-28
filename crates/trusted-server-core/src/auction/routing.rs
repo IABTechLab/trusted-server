@@ -7,6 +7,7 @@ use edgezero_core::body::Body as EdgeBody;
 use http::{HeaderValue, Request, header};
 use serde_json::Value;
 
+use super::demand::DemandTransport;
 use super::plan::{AuctionPlan, BidderId, ProviderId, RoutingMode};
 use super::types::{AdSlot, AuctionRequest, MediaType};
 
@@ -22,7 +23,7 @@ pub(crate) const MAX_ZONE_BYTES: usize = 256;
 
 /// Immutable provider-local routing output in deterministic provider-ID order.
 #[derive(Debug, Clone)]
-pub(crate) struct RoutedAuction {
+pub struct RoutedAuction {
     inputs: Vec<ProviderAuctionInput>,
     skipped_no_eligible_provider_ids: Vec<ProviderId>,
     diagnostics: RoutingDiagnostics,
@@ -32,8 +33,20 @@ pub(crate) struct RoutedAuction {
 }
 
 impl RoutedAuction {
-    pub(crate) fn inputs(&self) -> &[ProviderAuctionInput] {
+    /// The input each demand source that takes a slot receives.
+    #[must_use]
+    pub fn inputs(&self) -> &[ProviderAuctionInput] {
         &self.inputs
+    }
+
+    /// The request facts every source may use beside its input.
+    #[must_use]
+    pub fn transport(&self) -> DemandTransport<'_> {
+        DemandTransport {
+            headers: &self.transport_headers,
+            attested_client_ip: self.attested_client_ip,
+            dnt: self.dnt,
+        }
     }
 
     /// Providers skipped because they had no eligible banner slots.
@@ -48,17 +61,21 @@ impl RoutedAuction {
     }
 
     /// Request headers approved for forwarding to a demand source.
-    pub(crate) fn transport_headers(&self) -> &TransportHeaders {
+    #[must_use]
+    pub fn transport_headers(&self) -> &TransportHeaders {
         &self.transport_headers
     }
 
     /// Platform-attested client IP for transport forwarding.
-    pub(crate) fn attested_client_ip(&self) -> Option<IpAddr> {
+    #[must_use]
+    pub fn attested_client_ip(&self) -> Option<IpAddr> {
         self.attested_client_ip
     }
 
-    /// Normalized Do Not Track fact; raw request headers are not exposed to profiles.
-    pub(crate) fn dnt(&self) -> Option<bool> {
+    /// Normalized Do Not Track fact; raw request headers are not exposed to
+    /// sources.
+    #[must_use]
+    pub fn dnt(&self) -> Option<bool> {
         self.dnt
     }
 }
@@ -267,7 +284,7 @@ pub(crate) struct TrustedProviderRoutes {
 }
 
 impl TrustedProviderRoutes {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn new(routes_by_slot: Vec<Vec<ProviderId>>) -> Self {
         Self { routes_by_slot }
     }
@@ -618,7 +635,7 @@ mod tests {
                 provider("auction.fixture", RoutingMode::Explicit),
             ),
             (
-                "openrtb_direct",
+                "plain_direct",
                 provider("auction.plain-fixture", RoutingMode::Explicit),
             ),
         ]);
@@ -638,7 +655,7 @@ mod tests {
             (
                 BidderId::from_str("beta").expect("should parse bidder"),
                 BidderRouteConfig {
-                    module: ProviderId::from_str("openrtb_direct").expect("should parse provider"),
+                    module: ProviderId::from_str("plain_direct").expect("should parse provider"),
                 },
             ),
         ]);
@@ -937,7 +954,7 @@ mod tests {
                 "{name} should not produce stored or inline demand"
             );
             assert_eq!(
-                input(&routed, "openrtb_direct").slots()[0]
+                input(&routed, "plain_direct").slots()[0]
                     .bidder_params()
                     .len(),
                 1,
@@ -1117,7 +1134,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             ids,
-            vec!["open_primary", "stored_a", "stored_b", "openrtb_direct"],
+            vec!["open_primary", "stored_a", "stored_b", "plain_direct"],
             "inputs should follow deterministic provider-ID order"
         );
         let open = input(&routed, "open_primary")
@@ -1143,7 +1160,7 @@ mod tests {
         let stored_b = &input(&routed, "stored_b").slots()[0];
         assert!(stored_b.bidder_params().is_empty());
         assert!(stored_b.allows_stored_fallback_without_candidates());
-        let direct = &input(&routed, "openrtb_direct").slots()[0];
+        let direct = &input(&routed, "plain_direct").slots()[0];
         assert_eq!(direct.bidder_params().len(), 1);
         assert!(direct.zone().is_none());
         for provider in routed.inputs() {
@@ -1222,7 +1239,7 @@ mod tests {
                 .iter()
                 .map(ProviderId::as_str)
                 .collect::<Vec<_>>(),
-            vec!["open_primary", "stored_a", "stored_b", "openrtb_direct"],
+            vec!["open_primary", "stored_a", "stored_b", "plain_direct"],
             "no-banner auction should retain every provider's deterministic skip outcome"
         );
     }
@@ -1244,7 +1261,7 @@ mod tests {
                 .iter()
                 .map(ProviderId::as_str)
                 .collect::<Vec<_>>(),
-            vec!["stored_a", "stored_b", "openrtb_direct"],
+            vec!["stored_a", "stored_b", "plain_direct"],
             "explicit providers with no routed demand should be retained as skipped"
         );
     }
@@ -1253,7 +1270,7 @@ mod tests {
     fn trusted_routes_admit_explicit_sources_and_ignore_unknown_provider() {
         let trusted_routes = TrustedProviderRoutes::new(vec![vec![
             ProviderId::from_str("open_primary").expect("should parse provider"),
-            ProviderId::from_str("openrtb_direct").expect("should parse provider"),
+            ProviderId::from_str("plain_direct").expect("should parse provider"),
             ProviderId::from_str("unknown_provider").expect("should parse provider"),
         ]]);
         let routed = route_auction_with_trusted_routes(
@@ -1272,7 +1289,7 @@ mod tests {
                 .iter()
                 .map(|input| input.provider_id().as_str())
                 .collect::<Vec<_>>(),
-            vec!["open_primary", "openrtb_direct"],
+            vec!["open_primary", "plain_direct"],
             "only known server-owned provider routes should admit explicit providers"
         );
         assert_eq!(

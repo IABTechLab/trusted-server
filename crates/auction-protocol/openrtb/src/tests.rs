@@ -1,30 +1,172 @@
+//! Tests of the driver over the plain implementation and over a stand-in
+//! that departs from it.
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::str::FromStr as _;
-use std::sync::Arc;
 
-use base64::Engine as _;
 use edgezero_core::body::Body as EdgeBody;
 use http::{Request, header};
 use serde_json::{Value, json};
+use trusted_server_core::auction::demand::{
+    CompiledDemand, DemandResponse, ProviderAuctionInput, RequestFinalization, RoutedAuction,
+};
+use trusted_server_core::auction::plan::{
+    AuctionPlan, AuctionPlanConfig, BidderId, BidderRouteConfig, NotificationPolicy, ProviderId,
+    ProviderPlan,
+};
+use trusted_server_core::auction::provider::apply_notification_policy;
+use trusted_server_core::auction::test_support::{
+    canonical_parity_auction_request, demand_table, deterministic_signer, parse_as_first_source,
+    plan_config_with, route_for_test, route_with_trusted_routes_for_test,
+};
+use trusted_server_core::auction::types::{
+    AdFormat, AdSlot, AuctionResponse, BidStatus, MediaType,
+};
+use trusted_server_core::consent::jurisdiction::Jurisdiction;
+use trusted_server_core::consent::{ConsentContext, SignalRecord, SignalStatus};
+use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::platform::PlatformResponse;
+use trusted_server_core::request_signing::{RequestSigner, SigningParams};
 
-use super::test_executor::execute_standard_fixture;
-use super::*;
-use crate::auction::demand::DemandResponse;
-use crate::auction::plan::{
-    AuctionPlan, AuctionPlanConfig, BidderId, BidderRouteConfig, ProviderId,
-};
-use crate::auction::provider::{GenericOpenRtbProvider, ProviderRequestOutcome};
-use crate::auction::routing::route_auction;
-use crate::auction::test_support::{canonical_parity_auction_request, demand_table, plan_config};
-use crate::auction::types::{AdFormat, AdSlot, BidStatus, MediaType};
-use crate::consent::jurisdiction::Jurisdiction;
-use crate::consent::{ConsentContext, SignalRecord, SignalStatus};
-use crate::platform::test_support::{
-    HashMapConfigStore, HashMapSecretStore, NoopHttpClient, StubBackend, StubHttpClient,
-    build_services_with_backend_and_http_client, build_services_with_config_secret_and_http_client,
-};
-use crate::platform::{PlatformHttpClient, PlatformResponse};
-use crate::request_signing::RequestSigner;
+use crate::demand::{DemandFieldPolicy, OpenRtbDemand, OpenRtbDriver, RequestExtensions};
+use crate::request::build_request;
+use crate::response::extract_standard_response;
+use crate::wire::BidRequest;
+use crate::{MODULE as PLAIN, PlainDemand, builder as plain_builder};
+
+/// A stand-in demand implementation that departs from the plain one. It
+/// serves stored requests, forbids all-eligible routing, takes bidder
+/// parameters, keeps the unsigned request identity and completes an endpoint
+/// that names a host alone.
+///
+/// It writes each impression's usable bidder parameters under
+/// `ext.fixture.bidder`, or the slot id under `ext.fixture.stored` where the
+/// slot allows a stored request, and leaves out an impression that has
+/// neither.
+mod fixture {
+    use core::any::Any;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use error_stack::Report;
+    use serde_json::{Map, Value, json};
+    use trusted_server_core::auction::demand::{
+        CompiledDemand, DemandImplementation, DemandResponse, DemandTimeoutDefault,
+        ProviderAuctionInput,
+    };
+    use trusted_server_core::auction::types::AuctionResponse;
+    use trusted_server_core::error::TrustedServerError;
+    use trusted_server_core::integrations::IntegrationBuilder;
+    use trusted_server_core::platform::PlatformResponse;
+    use url::Url;
+
+    use crate::demand::{
+        DemandFieldPolicy, OpenRtbDemand, OpenRtbDriver, RegsPolicy, RequestExtensions,
+    };
+    use crate::response::parse_openrtb_response;
+
+    pub(super) const MODULE: &str = "auction-protocol.fixture";
+    pub(super) const AUCTION_PATH: &str = "/fixture/auction";
+
+    pub(super) static DEMAND: DemandImplementation = DemandImplementation {
+        id: MODULE,
+        default_timeout: DemandTimeoutDefault::Fixed(1000),
+        allows_all_eligible: false,
+        serves_stored_requests: true,
+        canonicalize_endpoint,
+        compile,
+    };
+
+    pub(super) fn builder() -> IntegrationBuilder {
+        IntegrationBuilder::implementations(MODULE, "fixture").with_demand(&DEMAND)
+    }
+
+    #[derive(Debug, Clone, Default)]
+    pub(super) struct FixtureDemand;
+
+    fn compile(
+        _settings: &Map<String, Value>,
+    ) -> Result<Arc<dyn CompiledDemand>, Report<TrustedServerError>> {
+        Ok(Arc::new(OpenRtbDriver::new(FixtureDemand)))
+    }
+
+    fn canonicalize_endpoint(endpoint: &mut Url) -> Result<(), String> {
+        if matches!(endpoint.path(), "" | "/") {
+            endpoint.set_path(AUCTION_PATH);
+        }
+        Ok(())
+    }
+
+    #[async_trait(?Send)]
+    impl OpenRtbDemand for FixtureDemand {
+        fn field_policy(&self) -> DemandFieldPolicy {
+            DemandFieldPolicy {
+                imp_tagid: true,
+                site_ref: true,
+                precise_geo: true,
+                unsigned_request_identity: true,
+                consumes_bidder_params: true,
+                regs: RegsPolicy::Jurisdiction,
+                ..DemandFieldPolicy::default()
+            }
+        }
+
+        fn augment_request(
+            &self,
+            extensions: &mut RequestExtensions<'_>,
+            _input: &ProviderAuctionInput,
+        ) -> Result<(), Report<TrustedServerError>> {
+            for impression in &mut extensions.impressions {
+                let slot = impression.slot;
+                let bidder = slot
+                    .bidder_params()
+                    .iter()
+                    .filter(|(_, params)| {
+                        params.as_object().is_some_and(|params| !params.is_empty())
+                    })
+                    .map(|(bidder, params)| (bidder.as_str().to_string(), params.clone()))
+                    .collect::<Map<_, _>>();
+                let mut fixture = Map::new();
+                if !bidder.is_empty() {
+                    fixture.insert("bidder".to_string(), Value::Object(bidder));
+                } else if slot.allows_stored_fallback() {
+                    fixture.insert("stored".to_string(), json!(slot.slot().id));
+                }
+                if fixture.is_empty() {
+                    impression.omitted = true;
+                    continue;
+                }
+                *impression.ext = Some(Map::from_iter([(
+                    "fixture".to_string(),
+                    Value::Object(fixture),
+                )]));
+            }
+            *extensions.request = Some(Map::from_iter([(
+                "fixture".to_string(),
+                Value::Object(Map::new()),
+            )]));
+            Ok(())
+        }
+
+        async fn parse_response(
+            &self,
+            context: DemandResponse<'_>,
+            response: PlatformResponse,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            parse_openrtb_response(context, response).await
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+}
+
+const FIXTURE: &str = fixture::MODULE;
+
+fn builders() -> [trusted_server_core::integrations::IntegrationBuilder; 2] {
+    [plain_builder(), fixture::builder()]
+}
 
 fn config(implementation: &str, settings: Value) -> AuctionPlanConfig {
     config_with_endpoint(
@@ -41,7 +183,7 @@ fn config_with_endpoint(
 ) -> AuctionPlanConfig {
     let provider_id = ProviderId::from_str("fictional_provider").expect("should parse provider ID");
     // The stand-in forbids all-eligible routing, so a bidder is routed to it.
-    let routed_by_bidder = implementation == "auction.fixture";
+    let routed_by_bidder = implementation == FIXTURE;
     let mut table = demand_table(implementation, endpoint);
     table.insert("timeout_ms".to_string(), json!(321));
     if !routed_by_bidder {
@@ -50,7 +192,7 @@ fn config_with_endpoint(
     if let Value::Object(settings) = settings {
         table.extend(settings);
     }
-    let mut config = plan_config(vec![("fictional_provider", table)]);
+    let mut config = plan_config_with(vec![("fictional_provider", table)], &builders());
     config.timeout_ms = 321;
     if routed_by_bidder {
         config.bidders = BTreeMap::from([(
@@ -75,14 +217,14 @@ fn routed(implementation: &str, settings: Value) -> (AuctionPlan, RoutedAuction)
         .header("dnt", "1")
         .body(EdgeBody::empty())
         .expect("should build inbound request");
-    let routed = route_auction(canonical_parity_auction_request(), &inbound, &plan, None);
+    let routed = route_for_test(&plan, canonical_parity_auction_request(), &inbound, None);
     (plan, routed)
 }
 
 fn routed_with_request(
     implementation: &str,
     settings: Value,
-    request: crate::auction::types::AuctionRequest,
+    request: trusted_server_core::auction::types::AuctionRequest,
     accept_language: Option<&str>,
 ) -> (AuctionPlan, RoutedAuction) {
     let plan = AuctionPlan::compile(config(implementation, settings)).expect("should compile plan");
@@ -93,29 +235,18 @@ fn routed_with_request(
     let inbound = builder
         .body(EdgeBody::empty())
         .expect("should build inbound request");
-    let routed = route_auction(request, &inbound, &plan, None);
+    let routed = route_for_test(&plan, request, &inbound, None);
     (plan, routed)
 }
 
-fn build_with_request(
-    implementation: &str,
-    settings: Value,
-    request: crate::auction::types::AuctionRequest,
-    accept_language: Option<&str>,
-) -> OpenRtbRequest {
-    let (plan, routed) = routed_with_request(implementation, settings, request, accept_language);
-    match build_request(
-        &routed.inputs()[0],
-        &routed,
-        &plan.providers()[0],
-        321,
-        &finalization(None),
-    )
-    .expect("should build request")
-    {
-        OpenRtbBuildOutcome::Ready(request) => request,
-        OpenRtbBuildOutcome::NoImpressions => panic!("should retain impression"),
+/// The source a provider plan runs, as the driver sees it.
+fn demand_of(provider: &ProviderPlan) -> &dyn OpenRtbDemand {
+    let any = provider.demand.as_any();
+    if let Some(plain) = any.downcast_ref::<PlainDemand>() {
+        return plain;
     }
+    any.downcast_ref::<fixture::FixtureDemand>()
+        .expect("the plan should run one of the two implementations under test")
 }
 
 fn finalization<'a>(signer: Option<&'a RequestSigner>) -> RequestFinalization<'a> {
@@ -130,38 +261,46 @@ fn finalization<'a>(signer: Option<&'a RequestSigner>) -> RequestFinalization<'a
     }
 }
 
-fn build(implementation: &str, settings: Value, signer: Option<&RequestSigner>) -> OpenRtbRequest {
-    let (plan, routed) = routed(implementation, settings);
-    match build_request(
+fn build_routed(
+    plan: &AuctionPlan,
+    routed: &RoutedAuction,
+    signer: Option<&RequestSigner>,
+) -> Result<Option<BidRequest>, error_stack::Report<TrustedServerError>> {
+    build_request(
+        demand_of(&plan.providers()[0]),
         &routed.inputs()[0],
-        &routed,
-        &plan.providers()[0],
+        routed.transport(),
         321,
         &finalization(signer),
     )
-    .expect("should build request")
-    {
-        OpenRtbBuildOutcome::Ready(request) => request,
-        OpenRtbBuildOutcome::NoImpressions => panic!("should retain impression"),
-    }
 }
 
-fn deterministic_signer() -> RequestSigner {
-    let mut config_data = HashMap::new();
-    config_data.insert("current-kid".to_string(), "fictional-kid".to_string());
-    let mut secret_data = HashMap::new();
-    secret_data.insert(
-        "fictional-kid".to_string(),
-        base64::engine::general_purpose::STANDARD
-            .encode([7_u8; 32])
-            .into_bytes(),
-    );
-    let services = build_services_with_config_secret_and_http_client(
-        HashMapConfigStore::new(config_data),
-        HashMapSecretStore::new(secret_data),
-        Arc::new(NoopHttpClient),
-    );
-    RequestSigner::from_services(&services).expect("should load deterministic signer")
+fn build(implementation: &str, settings: Value, signer: Option<&RequestSigner>) -> BidRequest {
+    let (plan, routed) = routed(implementation, settings);
+    build_routed(&plan, &routed, signer)
+        .expect("should build request")
+        .expect("should retain impression")
+}
+
+fn build_with_request(
+    implementation: &str,
+    settings: Value,
+    request: trusted_server_core::auction::types::AuctionRequest,
+    accept_language: Option<&str>,
+) -> BidRequest {
+    let (plan, routed) = routed_with_request(implementation, settings, request, accept_language);
+    build_routed(&plan, &routed, None)
+        .expect("should build request")
+        .expect("should retain impression")
+}
+
+fn response(status: u16, body: Vec<u8>) -> PlatformResponse {
+    PlatformResponse::new(
+        edgezero_core::http::response_builder()
+            .status(status)
+            .body(EdgeBody::from(body))
+            .expect("should build the upstream response"),
+    )
 }
 
 #[test]
@@ -198,7 +337,7 @@ fn consent_matrix_holds_under_each_implementation() {
         ),
     ];
     for (name, consent) in cases {
-        for implementation in ["auction.plain-fixture", "auction.fixture"] {
+        for implementation in [PLAIN, FIXTURE] {
             let mut canonical = canonical_parity_auction_request();
             canonical.user.consent = Some(consent.clone());
             let value = serde_json::to_value(build_with_request(
@@ -245,10 +384,7 @@ fn consent_matrix_holds_under_each_implementation() {
 #[test]
 fn language_limits_are_profile_specific() {
     let language = "abcdefghijk";
-    for (implementation, expected) in [
-        ("auction.fixture", Some(language)),
-        ("auction.plain-fixture", None),
-    ] {
+    for (implementation, expected) in [(FIXTURE, Some(language)), (PLAIN, None)] {
         let request = build_with_request(
             implementation,
             json!({}),
@@ -260,7 +396,7 @@ fn language_limits_are_profile_specific() {
             expected
         );
     }
-    for implementation in ["auction.fixture", "auction.plain-fixture"] {
+    for implementation in [FIXTURE, PLAIN] {
         let request = build_with_request(
             implementation,
             json!({}),
@@ -275,9 +411,23 @@ fn language_limits_are_profile_specific() {
 }
 
 #[test]
+fn the_identifiers_the_request_carries_are_sent_as_eids() {
+    let request = build(PLAIN, json!({}), None);
+    let value = serde_json::to_value(request).expect("should serialize request");
+    assert_eq!(
+        value["user"]["ext"]["eids"],
+        json!([{"source": "identity.example", "uids": [{"atype": 1, "id": "fictional-uid"}]}]),
+        "the identifiers core routed should be formatted as the user's eids"
+    );
+    assert_eq!(
+        value["user"]["id"], "fictional-user",
+        "the user id travels beside them"
+    );
+}
+
+#[test]
 fn filtering_keeps_slot_pairs_and_drops_demandless_trusted_routes() {
-    let plan =
-        AuctionPlan::compile(config("auction.fixture", json!({}))).expect("should compile plan");
+    let plan = AuctionPlan::compile(config(FIXTURE, json!({}))).expect("should compile plan");
     let mut request = canonical_parity_auction_request();
     let template = request.slots[0].clone();
     request.slots = [
@@ -306,31 +456,20 @@ fn filtering_keeps_slot_pairs_and_drops_demandless_trusted_routes() {
     })
     .collect();
     let inbound = Request::new(EdgeBody::empty());
-    let routes = crate::auction::routing::TrustedProviderRoutes::new(vec![
-        vec![],
-        vec![],
-        vec![plan.providers()[0].id.clone()],
-        vec![],
-    ]);
-    let routed = crate::auction::routing::route_auction_with_trusted_routes(
-        request, &inbound, &plan, None, &routes,
+    let routed = route_with_trusted_routes_for_test(
+        &plan,
+        request,
+        &inbound,
+        &[&[], &[], &["fictional_provider"], &[]],
     );
     assert_eq!(
         routed.inputs()[0].slots().len(),
         4,
         "should preserve server-owned route admission"
     );
-    let result = build_request(
-        &routed.inputs()[0],
-        &routed,
-        &plan.providers()[0],
-        321,
-        &finalization(None),
-    )
-    .expect("should build request");
-    let OpenRtbBuildOutcome::Ready(request) = result else {
-        panic!("should retain siblings")
-    };
+    let request = build_routed(&plan, &routed, None)
+        .expect("should build request")
+        .expect("should retain siblings");
     let wire = serde_json::to_value(request).expect("should serialize request");
     assert_eq!(
         wire["imp"]
@@ -350,9 +489,9 @@ fn filtering_keeps_slot_pairs_and_drops_demandless_trusted_routes() {
 
 #[test]
 fn a_disabled_empty_candidate_does_not_become_stored_demand() {
-    let mut raw = config("auction.fixture", json!({"routing": "explicit"}));
+    let mut raw = config(FIXTURE, json!({"routing": "explicit"}));
     raw.bidders.insert(
-        crate::auction::plan::BidderId::from_str("exampleBidder").expect("should parse bidder"),
+        BidderId::from_str("exampleBidder").expect("should parse bidder"),
         BidderRouteConfig {
             module: ProviderId::from_str("fictional_provider").expect("should parse provider"),
         },
@@ -367,39 +506,31 @@ fn a_disabled_empty_candidate_does_not_become_stored_demand() {
         .uri("https://publisher.example.com/auction")
         .body(EdgeBody::empty())
         .expect("should build inbound request");
-    let routed = route_auction(request, &inbound, &plan, None);
+    let routed = route_for_test(&plan, request, &inbound, None);
     assert_eq!(
         routed.inputs().len(),
         1,
         "should route candidate for overrides"
     );
-    assert!(matches!(
-        build_request(
-            &routed.inputs()[0],
-            &routed,
-            &plan.providers()[0],
-            321,
-            &finalization(None),
-        )
-        .expect("should build request"),
-        OpenRtbBuildOutcome::NoImpressions
-    ));
+    assert!(
+        build_routed(&plan, &routed, None)
+            .expect("should build request")
+            .is_none(),
+        "a source left with no impression asks for nothing"
+    );
 }
 
 #[test]
 fn signing_finalization_is_after_profiles_and_asserts_every_owned_key() {
     let signer = deterministic_signer();
     for (implementation, config) in [
-        (
-            "auction.plain-fixture",
-            json!({"request_ext": {"fictional": true}}),
-        ),
-        ("auction.fixture", json!({})),
+        (PLAIN, json!({"request_ext": {"fictional": true}})),
+        (FIXTURE, json!({})),
     ] {
         let unsigned = serde_json::to_value(build(implementation, config.clone(), None))
             .expect("should serialize unsigned request");
         let unsigned_ts = unsigned["ext"].get("trusted_server");
-        if implementation == "auction.fixture" {
+        if implementation == FIXTURE {
             assert_eq!(
                 unsigned_ts,
                 Some(&json!({"request_host": "publisher.example", "request_scheme": "https"})),
@@ -435,66 +566,10 @@ fn signing_finalization_is_after_profiles_and_asserts_every_owned_key() {
     }
 }
 
-#[test]
-fn signed_profiles_and_unsigned_standard_have_exact_full_goldens() {
-    let signer = deterministic_signer();
-    let cases = [(
-        "auction.plain-fixture",
-        json!({"request_ext": {"fictional": true}}),
-        r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"fictional":true,"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
-    )];
-    for (implementation, config, expected) in cases {
-        assert_eq!(
-            serde_json::to_string(&build(implementation, config, Some(&signer)))
-                .expect("should serialize signed request"),
-            expected,
-            "{implementation} signed wire fixture should stay exact"
-        );
-    }
-
-    assert_eq!(
-        serde_json::to_string(&build(
-            "auction.plain-fixture",
-            json!({"request_ext": {"fictional": true}}),
-            None,
-        ))
-        .expect("should serialize unsigned standard request"),
-        r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"fictional":true}}"#,
-        "unsigned standard wire fixture should stay exact"
-    );
-}
-
-#[test]
-fn defensive_no_impression_outcome_does_not_build_transportable_request() {
-    let (plan, mut routed) = routed("auction.plain-fixture", json!({}));
-    let mut common = routed.inputs()[0].common_request().clone();
-    common.slots = vec![AdSlot {
-        id: "video-only".to_string(),
-        formats: vec![AdFormat {
-            media_type: MediaType::Video,
-            width: 640,
-            height: 480,
-        }],
-        floor_price: None,
-        targeting: HashMap::new(),
-        bidders: HashMap::new(),
-    }];
-    let inbound = Request::builder()
-        .uri("https://publisher.example/auction")
-        .body(EdgeBody::empty())
-        .expect("should build inbound request");
-    routed = route_auction(common, &inbound, &plan, None);
-    assert!(
-        routed.inputs().is_empty(),
-        "should omit provider input before build"
-    );
-}
-
-fn standard_fixture_with_formats(
-    formats: Vec<AdFormat>,
-) -> (AuctionPlan, RoutedAuction, OpenRtbRequest) {
+/// The plain source over one bidder-routed slot of the given formats.
+fn standard_input_with_formats(formats: Vec<AdFormat>) -> ProviderAuctionInput {
     let mut raw = config(
-        "auction.plain-fixture",
+        PLAIN,
         json!({"request_ext": {"fixture": true}, "imp_ext": {"slot_fixture": true}}),
     );
     raw.bidders.insert(
@@ -510,24 +585,11 @@ fn standard_fixture_with_formats(
         .expect("should build inbound request");
     let mut auction_request = canonical_parity_auction_request();
     auction_request.slots[0].formats = formats;
-    let routed = route_auction(auction_request, &inbound, &plan, None);
-    let request = match build_request(
-        &routed.inputs()[0],
-        &routed,
-        &plan.providers()[0],
-        321,
-        &finalization(None),
-    )
-    .expect("should build standard fixture request")
-    {
-        OpenRtbBuildOutcome::Ready(request) => request,
-        OpenRtbBuildOutcome::NoImpressions => panic!("should retain impression"),
-    };
-    (plan, routed, request)
+    route_for_test(&plan, auction_request, &inbound, None).inputs()[0].clone()
 }
 
-fn standard_fixture() -> (AuctionPlan, RoutedAuction, OpenRtbRequest) {
-    standard_fixture_with_formats(vec![AdFormat {
+fn standard_input() -> ProviderAuctionInput {
+    standard_input_with_formats(vec![AdFormat {
         media_type: MediaType::Banner,
         width: 300,
         height: 250,
@@ -536,10 +598,10 @@ fn standard_fixture() -> (AuctionPlan, RoutedAuction, OpenRtbRequest) {
 
 #[test]
 fn standard_response_extraction_isolates_malformed_siblings_and_ignores_response_id() {
-    let (_plan, routed, _request) = standard_fixture();
+    let input = standard_input();
     let response = extract_standard_response(
         "fictional_provider",
-        &routed.inputs()[0],
+        &input,
         &json!({
             "id": "informational-mismatch",
             "seatbid": [{"seat": "fictional-seat", "bid": [
@@ -559,7 +621,7 @@ fn standard_response_extraction_isolates_malformed_siblings_and_ignores_response
 
 #[test]
 fn standard_response_currency_accepts_omitted_and_usd_but_rejects_other_or_malformed_values() {
-    let (_plan, routed, _request) = standard_fixture();
+    let input = standard_input();
     let bid = json!({"seatbid": [{"seat": "seat", "bid": [
         {"id":"good","impid":"fictional-slot","price":1.0,"adm":"ok","w":300,"h":250}
     ]}]});
@@ -569,8 +631,7 @@ fn standard_response_currency_accepts_omitted_and_usd_but_rejects_other_or_malfo
         if let Some(currency) = currency {
             value["cur"] = currency;
         }
-        let response =
-            extract_standard_response("fictional_provider", &routed.inputs()[0], &value, 0);
+        let response = extract_standard_response("fictional_provider", &input, &value, 0);
         assert_eq!(
             response.status,
             BidStatus::Success,
@@ -581,24 +642,23 @@ fn standard_response_currency_accepts_omitted_and_usd_but_rejects_other_or_malfo
 
     let mut eur = bid.clone();
     eur["cur"] = json!("EUR");
-    let response = extract_standard_response("fictional_provider", &routed.inputs()[0], &eur, 0);
+    let response = extract_standard_response("fictional_provider", &input, &eur, 0);
     assert_eq!(response.status, BidStatus::NoBid);
     assert_eq!(response.metadata["unsupported_currency"], "EUR");
 
     let mut malformed = bid;
     malformed["cur"] = json!(["USD"]);
-    let response =
-        extract_standard_response("fictional_provider", &routed.inputs()[0], &malformed, 0);
+    let response = extract_standard_response("fictional_provider", &input, &malformed, 0);
     assert_eq!(response.status, BidStatus::Error);
     assert_eq!(response.metadata["error_type"], "parse_response");
 }
 
 #[test]
 fn standard_response_rejects_unknown_impressions_and_dimensions_but_keeps_siblings() {
-    let (_plan, routed, _request) = standard_fixture();
+    let input = standard_input();
     let response = extract_standard_response(
         "fictional_provider",
-        &routed.inputs()[0],
+        &input,
         &json!({"seatbid": [{"seat": "seat", "bid": [
             {"id":"good","impid":"fictional-slot","price":1.0,"adm":"ok","w":300,"h":250},
             {"id":"unknown","impid":"unknown-slot","price":2.0,"adm":"bad","w":300,"h":250},
@@ -625,10 +685,10 @@ fn standard_response_rejects_unknown_impressions_and_dimensions_but_keeps_siblin
 
 #[test]
 fn standard_response_infers_only_unambiguous_missing_dimensions() {
-    let (_plan, routed, _request) = standard_fixture();
+    let input = standard_input();
     let inferred = extract_standard_response(
         "fictional_provider",
-        &routed.inputs()[0],
+        &input,
         &json!({"seatbid": [{"bid": [
             {"id":"inferred","impid":"fictional-slot","price":1.0,"adm":"ok"}
         ]}]}),
@@ -650,10 +710,10 @@ fn standard_response_infers_only_unambiguous_missing_dimensions() {
             height: 50,
         },
     ];
-    let (_plan, routed, _request) = standard_fixture_with_formats(formats);
+    let input = standard_input_with_formats(formats);
     let ambiguous = extract_standard_response(
         "fictional_provider",
-        &routed.inputs()[0],
+        &input,
         &json!({"seatbid": [{"bid": [
             {"id":"ambiguous","impid":"fictional-slot","price":1.0,"adm":"ok"}
         ]}]}),
@@ -684,11 +744,11 @@ fn standard_response_infers_dimensions_from_partial_unique_matches() {
             height: 50,
         },
     ];
-    let (_plan, routed, _request) = standard_fixture_with_formats(formats);
+    let input = standard_input_with_formats(formats);
 
     let response = extract_standard_response(
         "fictional_provider",
-        &routed.inputs()[0],
+        &input,
         &json!({"seatbid": [{"bid": [
             {"id":"width-only","impid":"fictional-slot","price":1.0,"adm":"width","w":300},
             {"id":"height-only","impid":"fictional-slot","price":2.0,"adm":"height","h":50}
@@ -716,11 +776,11 @@ fn standard_response_infers_dimensions_from_partial_unique_matches() {
 
 #[test]
 fn standard_response_accepts_null_and_integral_float_dimensions() {
-    let (_plan, routed, _request) = standard_fixture();
+    let input = standard_input();
 
     let response = extract_standard_response(
         "fictional_provider",
-        &routed.inputs()[0],
+        &input,
         &json!({"seatbid": [{"bid": [
             {"id":"null","impid":"fictional-slot","price":1.0,"adm":"null","w":null,"h":null},
             {"id":"integral-float","impid":"fictional-slot","price":2.0,"adm":"float","w":300.0,"h":250.0}
@@ -766,11 +826,11 @@ fn standard_response_rejects_partial_dimension_mismatch_and_ambiguity() {
             height: 50,
         },
     ];
-    let (_plan, routed, _request) = standard_fixture_with_formats(formats);
+    let input = standard_input_with_formats(formats);
 
     let response = extract_standard_response(
         "fictional_provider",
-        &routed.inputs()[0],
+        &input,
         &json!({"seatbid": [{"bid": [
             {"id":"ambiguous","impid":"fictional-slot","price":1.0,"adm":"ambiguous","w":300},
             {"id":"mismatch","impid":"fictional-slot","price":2.0,"adm":"mismatch","w":999}
@@ -795,11 +855,11 @@ fn standard_response_rejects_partial_dimension_mismatch_and_ambiguity() {
 
 #[test]
 fn standard_response_rejects_invalid_numeric_dimension_shapes() {
-    let (_plan, routed, _request) = standard_fixture();
+    let input = standard_input();
 
     let response = extract_standard_response(
         "fictional_provider",
-        &routed.inputs()[0],
+        &input,
         &json!({"seatbid": [{"bid": [
             {"id":"fractional","impid":"fictional-slot","price":1.0,"adm":"bad","w":300.5},
             {"id":"zero","impid":"fictional-slot","price":1.0,"adm":"bad","w":0},
@@ -827,10 +887,10 @@ fn standard_response_rejects_invalid_numeric_dimension_shapes() {
 
 #[test]
 fn notification_suppression_matrix_uses_only_exact_valid_returned_seat() {
-    let (_plan, routed, _request) = standard_fixture();
+    let input = standard_input();
     let response = extract_standard_response(
         "fictional_provider",
-        &routed.inputs()[0],
+        &input,
         &json!({"seatbid": [
             {"seat": "exact", "bid": [{"id":"exact","impid":"fictional-slot","price":1.0,"adm":"ok","w":300,"h":250,"nurl":"https://n.example","burl":"https://b.example"}]},
             {"seat": "Exact", "bid": [{"id":"case","impid":"fictional-slot","price":1.0,"adm":"ok","w":300,"h":250,"nurl":"https://n.example","burl":"https://b.example"}]},
@@ -869,186 +929,120 @@ fn notification_suppression_matrix_uses_only_exact_valid_returned_seat() {
     );
 }
 
+/// The driver hands core the body and headers the source sends, and the
+/// responses an exchange may answer with are each read as the ordinary
+/// reader classifies them.
 #[test]
-fn fictional_standard_executor_covers_bid_no_bid_malformed_unused_and_redirect() {
+fn the_driver_builds_what_core_sends_and_classifies_every_answer() {
     futures::executor::block_on(async {
-        let (plan, routed, request) = standard_fixture();
-        let provider = &plan.providers()[0];
-        let client = Arc::new(StubHttpClient::new());
-        client.push_response(
+        let mut raw = config(
+            PLAIN,
+            json!({"request_ext": {"fixture": true}, "imp_ext": {"slot_fixture": true}}),
+        );
+        raw.bidders.insert(
+            BidderId::from_str("exampleBidder").expect("should parse bidder"),
+            BidderRouteConfig {
+                module: ProviderId::from_str("fictional_provider").expect("should parse provider"),
+            },
+        );
+        let plan = AuctionPlan::compile(raw).expect("should compile the plan");
+        let inbound = Request::new(EdgeBody::empty());
+        let routed = route_for_test(&plan, canonical_parity_auction_request(), &inbound, None);
+        let outbound = plan.providers()[0]
+            .demand
+            .build_request(
+                &routed.inputs()[0],
+                routed.transport(),
+                321,
+                &finalization(None),
+            )
+            .expect("should build the request")
+            .expect("should keep the impression");
+        assert_eq!(
+            outbound
+                .headers
+                .get(header::CONTENT_TYPE)
+                .map(http::HeaderValue::as_bytes),
+            Some(b"application/json".as_slice())
+        );
+        assert_eq!(
+            outbound
+                .headers
+                .get(header::ACCEPT)
+                .map(http::HeaderValue::as_bytes),
+            Some(b"application/json".as_slice()),
+            "the plain implementation asks for JSON"
+        );
+        assert!(
+            !outbound.headers.contains_key(header::AUTHORIZATION),
+            "the plain implementation adds no authentication"
+        );
+        assert_eq!(
+            outbound.slot_ids,
+            HashSet::from(["fictional-slot".to_string()]),
+            "the slots the request asks for are the impressions it carries"
+        );
+        let body: Value = serde_json::from_slice(&outbound.body).expect("should parse the body");
+        assert_eq!(body["ext"]["fixture"], true, "should send static extension");
+        assert_eq!(body["imp"][0]["ext"]["slot_fixture"], true);
+
+        let good = response(
             200,
             serde_json::to_vec(&json!({"id":"mismatch","seatbid":[{"seat":"fictional-seat","bid":[
                 {"id":"good","impid":"fictional-slot","price":1.25,"adm":"<div>fictional</div>","w":300,"h":250},
                 {"id":"bad","impid":"fictional-slot","price":null,"adm":"bad","w":300,"h":250}
-            ]}]})).expect("should serialize response"),
+            ]}]}))
+            .expect("should serialize response"),
         );
-        let response = execute_standard_fixture(
-            provider,
-            &routed.inputs()[0],
-            &request,
-            &StubBackend,
-            client.as_ref(),
+        let parsed = parse_as_first_source(&plan, canonical_parity_auction_request(), good, 5)
+            .await
+            .expect("should read the response");
+        assert_eq!(parsed.status, BidStatus::Success);
+        assert_eq!(parsed.bids.len(), 1, "should isolate malformed sibling");
+        assert_eq!(
+            parsed.metadata["routing"]["unused_bidder_params_count"], 1,
+            "the plain implementation ignores the bidder parameters it is routed"
+        );
+
+        let no_bid = parse_as_first_source(
+            &plan,
+            canonical_parity_auction_request(),
+            response(204, Vec::new()),
+            5,
         )
         .await
-        .expect("should execute ordinary fixture");
-        assert_eq!(response.status, BidStatus::Success);
-        assert_eq!(response.bids.len(), 1, "should isolate malformed sibling");
-        assert_eq!(
-            response.metadata["routing"]["unused_bidder_params_count"],
-            1
-        );
-        assert_eq!(
-            client.recorded_request_uris(),
-            vec![provider.endpoint.as_str()]
-        );
-        let headers = &client.recorded_request_headers()[0];
-        assert!(
-            !headers.iter().any(|(name, _)| name == "authorization"),
-            "fixture must add no authentication"
-        );
-        let body: Value = serde_json::from_slice(&client.recorded_request_bodies()[0])
-            .expect("should parse recorded body");
-        assert_eq!(body["ext"]["fixture"], true, "should send static extension");
+        .expect("should read the no-bid");
+        assert_eq!(no_bid.status, BidStatus::NoBid);
 
-        let no_bid = Arc::new(StubHttpClient::new());
-        no_bid.push_response(204, Vec::new());
-        let response = execute_standard_fixture(
-            provider,
-            &routed.inputs()[0],
-            &request,
-            &StubBackend,
-            no_bid.as_ref(),
-        )
-        .await
-        .expect("should execute no-bid fixture");
-        assert_eq!(response.status, BidStatus::NoBid);
-
-        let malformed = Arc::new(StubHttpClient::new());
-        malformed.push_response(200, b"not-json".to_vec());
-        let response = execute_standard_fixture(
-            provider,
-            &routed.inputs()[0],
-            &request,
-            &StubBackend,
-            malformed.as_ref(),
+        let malformed = parse_as_first_source(
+            &plan,
+            canonical_parity_auction_request(),
+            response(200, b"not-json".to_vec()),
+            5,
         )
         .await
         .expect("should classify malformed response");
-        assert_eq!(response.status, BidStatus::Error);
-        assert_eq!(response.metadata["error_type"], "parse_response");
+        assert_eq!(malformed.status, BidStatus::Error);
+        assert_eq!(malformed.metadata["error_type"], "parse_response");
 
-        let redirect = Arc::new(StubHttpClient::new());
-        redirect.push_response_with_headers(
-            302,
-            Vec::new(),
-            vec![("location", "https://redirect.example.test/openrtb")],
-        );
-        let response = execute_standard_fixture(
-            provider,
-            &routed.inputs()[0],
-            &request,
-            &StubBackend,
-            redirect.as_ref(),
+        let redirect = parse_as_first_source(
+            &plan,
+            canonical_parity_auction_request(),
+            response(302, Vec::new()),
+            5,
         )
         .await
         .expect("should classify redirect");
-        assert_eq!(response.status, BidStatus::Error);
-        assert_eq!(response.metadata["error_type"], "http_status");
-        assert_eq!(response.metadata["http_status"], 302);
-        assert_eq!(
-            redirect.recorded_request_uris(),
-            vec![provider.endpoint.as_str()],
-            "a 3xx Location must not trigger a second HTTP request"
-        );
-        assert_eq!(
-            redirect.recorded_backend_names(),
-            vec!["stub-backend"],
-            "the common driver must perform exactly one underlying send for a 3xx"
-        );
-        let spec = provider.backend_spec();
-        assert_eq!(spec.host, "exchange.example.test");
-        assert_eq!(spec.discriminator.as_deref(), Some("fictional_provider"));
-    });
-}
-
-#[test]
-fn a_completed_endpoint_reaches_generic_execution_and_a_custom_path_is_kept() {
-    futures::executor::block_on(async {
-        for (configured_endpoint, expected_endpoint) in [
-            (
-                "https://exchange.example",
-                "https://exchange.example/fixture/auction",
-            ),
-            (
-                "https://exchange.example/bid",
-                "https://exchange.example/bid",
-            ),
-        ] {
-            let plan = AuctionPlan::compile(config_with_endpoint(
-                "auction.fixture",
-                json!({}),
-                configured_endpoint,
-            ))
-            .expect("should compile the endpoint");
-            let inbound = Request::builder()
-                .uri("https://publisher.example/auction")
-                .body(EdgeBody::empty())
-                .expect("should build inbound request");
-            let routed = route_auction(canonical_parity_auction_request(), &inbound, &plan, None);
-            let provider_plan = plan.providers()[0].clone();
-            let provider = GenericOpenRtbProvider::new(provider_plan.clone());
-            let client = Arc::new(StubHttpClient::new());
-            client.push_response(204, Vec::new());
-            let services = build_services_with_backend_and_http_client(
-                Arc::new(StubBackend),
-                Arc::clone(&client) as Arc<dyn PlatformHttpClient>,
-            );
-            let mut reserved_backend_names = HashSet::new();
-
-            let outcome = provider
-                .request_bids_routed(
-                    &routed.inputs()[0],
-                    &routed,
-                    321,
-                    321,
-                    None,
-                    &services,
-                    &mut reserved_backend_names,
-                )
-                .await
-                .expect("should launch one request");
-            let ProviderRequestOutcome::Pending { request, .. } = outcome else {
-                panic!("should launch a pending request");
-            };
-            let selected = services
-                .http_client()
-                .select(vec![request])
-                .await
-                .expect("should select one response");
-            let response = selected.ready.expect("should receive the response");
-
-            assert_eq!(response.response.status(), http::StatusCode::NO_CONTENT);
-            assert_eq!(client.recorded_backend_names(), vec!["stub-backend"]);
-            assert_eq!(client.recorded_request_methods(), vec!["POST"]);
-            assert_eq!(client.recorded_request_uris(), vec![expected_endpoint]);
-            assert_eq!(provider_plan.backend_spec().host, "exchange.example");
-            let body: Value = serde_json::from_slice(&client.recorded_request_bodies()[0])
-                .expect("should parse the recorded body");
-            assert!(
-                !body
-                    .as_object()
-                    .expect("should serialize an object")
-                    .is_empty()
-            );
-        }
+        assert_eq!(redirect.status, BidStatus::Error);
+        assert_eq!(redirect.metadata["error_type"], "http_status");
+        assert_eq!(redirect.metadata["http_status"], 302);
     });
 }
 
 #[test]
 fn malformed_top_level_standard_response_is_error() {
-    let (_plan, routed, _request) = standard_fixture();
-    let response =
-        extract_standard_response("fictional_provider", &routed.inputs()[0], &json!([]), 0);
+    let input = standard_input();
+    let response = extract_standard_response("fictional_provider", &input, &json!([]), 0);
     assert_eq!(response.status, BidStatus::Error);
     assert_eq!(response.metadata["error_type"], "parse_response");
 }
@@ -1057,7 +1051,7 @@ fn malformed_top_level_standard_response_is_error() {
 struct ForgingDemand;
 
 #[async_trait::async_trait(?Send)]
-impl CompiledDemand for ForgingDemand {
+impl OpenRtbDemand for ForgingDemand {
     fn field_policy(&self) -> DemandFieldPolicy {
         DemandFieldPolicy::default()
     }
@@ -1066,7 +1060,7 @@ impl CompiledDemand for ForgingDemand {
         &self,
         extensions: &mut RequestExtensions<'_>,
         _input: &ProviderAuctionInput,
-    ) -> Result<(), Report<TrustedServerError>> {
+    ) -> Result<(), error_stack::Report<TrustedServerError>> {
         *extensions.request = Some(serde_json::Map::from_iter([(
             "trusted_server".to_string(),
             json!({"signature": "forged"}),
@@ -1078,7 +1072,7 @@ impl CompiledDemand for ForgingDemand {
         &self,
         context: DemandResponse<'_>,
         _response: PlatformResponse,
-    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+    ) -> Result<AuctionResponse, error_stack::Report<TrustedServerError>> {
         Ok(AuctionResponse::error(
             context.provider_id,
             context.response_time_ms,
@@ -1092,14 +1086,12 @@ impl CompiledDemand for ForgingDemand {
 
 #[test]
 fn the_driver_refuses_an_implementation_that_claims_the_trusted_server_extension() {
-    let (plan, routed) = routed("auction.plain-fixture", json!({}));
-    let mut provider = plan.providers()[0].clone();
-    provider.demand = Arc::new(ForgingDemand);
+    let (_plan, routed) = routed(PLAIN, json!({}));
 
     let error = match build_request(
+        &ForgingDemand,
         &routed.inputs()[0],
-        &routed,
-        &provider,
+        routed.transport(),
         321,
         &finalization(None),
     ) {
@@ -1114,20 +1106,24 @@ fn the_driver_refuses_an_implementation_that_claims_the_trusted_server_extension
 }
 
 #[test]
+fn the_driver_answers_as_any_with_the_source_it_runs() {
+    let driver = OpenRtbDriver::new(ForgingDemand);
+    assert!(
+        driver.as_any().is::<ForgingDemand>(),
+        "an implementation reads its own source back through the driver"
+    );
+    assert!(
+        !driver.consumes_bidder_params(),
+        "the policy of the source it runs decides"
+    );
+}
+
+#[test]
 fn an_implementation_sees_each_impression_beside_the_slot_it_came_from() {
-    let (plan, routed) = routed("auction.fixture", json!({}));
-    let request = match build_request(
-        &routed.inputs()[0],
-        &routed,
-        &plan.providers()[0],
-        321,
-        &finalization(None),
-    )
-    .expect("should build the request")
-    {
-        OpenRtbBuildOutcome::Ready(request) => request,
-        OpenRtbBuildOutcome::NoImpressions => panic!("should keep the routed impression"),
-    };
+    let (plan, routed) = routed(FIXTURE, json!({}));
+    let request = build_routed(&plan, &routed, None)
+        .expect("should build the request")
+        .expect("should keep the routed impression");
 
     let slots = routed.inputs()[0].slots();
     assert_eq!(request.imp.len(), slots.len());
@@ -1143,13 +1139,13 @@ fn an_implementation_sees_each_impression_beside_the_slot_it_came_from() {
     }
 }
 
-fn request_with_device_attributes() -> crate::auction::types::AuctionRequest {
+fn request_with_device_attributes() -> trusted_server_core::auction::types::AuctionRequest {
     let mut request = canonical_parity_auction_request();
     request
         .device
         .as_mut()
         .expect("the parity request carries a device")
-        .attributes = Some(crate::ec::device::DeviceAttributes {
+        .attributes = Some(trusted_server_core::ec::device::DeviceAttributes {
         device_type: Some(4),
         make: Some("ExampleCorp".to_owned()),
         model: Some("EX-1".to_owned()),
@@ -1165,7 +1161,7 @@ fn request_with_device_attributes() -> crate::auction::types::AuctionRequest {
 /// resolved reach every implementation without any of them mapping a field.
 #[test]
 fn the_driver_carries_resolved_device_attributes_to_every_implementation() {
-    for implementation in ["auction.fixture", "auction.plain-fixture"] {
+    for implementation in [FIXTURE, PLAIN] {
         let request = build_with_request(
             implementation,
             json!({}),
@@ -1200,12 +1196,7 @@ fn the_driver_carries_resolved_device_attributes_to_every_implementation() {
 
 #[test]
 fn the_driver_omits_device_attributes_nothing_resolved() {
-    let request = build_with_request(
-        "auction.fixture",
-        json!({}),
-        canonical_parity_auction_request(),
-        None,
-    );
+    let request = build_with_request(FIXTURE, json!({}), canonical_parity_auction_request(), None);
     let device = request
         .device
         .as_ref()

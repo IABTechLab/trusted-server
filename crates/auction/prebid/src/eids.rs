@@ -13,10 +13,10 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 
+use trusted_server_core::ec::eids::{Eid, Uid};
 use trusted_server_core::ec::identifiers::IdentifierModule;
 use trusted_server_core::evidence::RequestInfo;
 use trusted_server_core::module_context::{ModuleCall, Withheld};
-use trusted_server_core::openrtb::{Eid, Uid};
 use trusted_server_core::platform::RuntimeServices;
 
 /// The cookie the script writes, named after the public prefix with

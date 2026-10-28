@@ -9838,9 +9838,9 @@ mod tests {
             .collect::<Vec<_>>();
         let request = navigation_request();
         if has_eid_cookie {
-            ec_context.set_module_eids_for_test(vec![crate::openrtb::Eid {
+            ec_context.set_module_eids_for_test(vec![crate::ec::eids::Eid {
                 source: "ssp.example.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+                uids: vec![crate::ec::eids::Uid {
                     id: "present".to_owned(),
                     atype: Some(1),
                     ext: None,

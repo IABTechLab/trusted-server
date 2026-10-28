@@ -204,19 +204,20 @@ Convert OrchestrationResult → OpenRTB 2.x Response
 
 The orchestrator is composed of several modules:
 
-| Module            | Path                                      | Purpose                                      |
-| ----------------- | ----------------------------------------- | -------------------------------------------- |
-| `orchestrator.rs` | `crates/trusted-server-core/src/auction/` | Parallel execution and bid selection         |
-| `plan.rs`         | `crates/trusted-server-core/src/auction/` | Plan compilation and validation              |
-| `demand.rs`       | `crates/trusted-server-core/src/auction/` | The demand and ad server implementation seam |
-| `routing.rs`      | `crates/trusted-server-core/src/auction/` | Bidder ownership and demand routing          |
-| `openrtb.rs`      | `crates/trusted-server-core/src/auction/` | Shared OpenRTB request and response handling |
-| `provider.rs`     | `crates/trusted-server-core/src/auction/` | `AuctionProvider` trait and planned provider |
-| `telemetry.rs`    | `crates/trusted-server-core/src/auction/` | Auction event construction                   |
-| `types.rs`        | `crates/trusted-server-core/src/auction/` | Auction request, response, and bid types     |
-| `formats.rs`      | `crates/trusted-server-core/src/auction/` | TSJS and OpenRTB format conversions          |
-| `endpoints.rs`    | `crates/trusted-server-core/src/auction/` | HTTP handler for `POST /auction`             |
-| `config.rs`       | `crates/trusted-server-core/src/auction/` | Auction configuration types                  |
+| Module                                   | Path                                      | Purpose                                                                                              |
+| ---------------------------------------- | ----------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `orchestrator.rs`                        | `crates/trusted-server-core/src/auction/` | Parallel execution and bid selection                                                                 |
+| `plan.rs`                                | `crates/trusted-server-core/src/auction/` | Plan compilation and validation                                                                      |
+| `demand.rs`                              | `crates/trusted-server-core/src/auction/` | The demand and ad server implementation seam                                                         |
+| `routing.rs`                             | `crates/trusted-server-core/src/auction/` | Bidder ownership and demand routing                                                                  |
+| `admission.rs`                           | `crates/trusted-server-core/src/auction/` | Admission of a bid against the slots asked for                                                       |
+| `provider.rs`                            | `crates/trusted-server-core/src/auction/` | `AuctionProvider` trait and planned provider                                                         |
+| `telemetry.rs`                           | `crates/trusted-server-core/src/auction/` | Auction event construction                                                                           |
+| `types.rs`                               | `crates/trusted-server-core/src/auction/` | Auction request, response, and bid types                                                             |
+| `formats.rs`                             | `crates/trusted-server-core/src/auction/` | TSJS and OpenRTB format conversions                                                                  |
+| `endpoints.rs`                           | `crates/trusted-server-core/src/auction/` | HTTP handler for `POST /auction`                                                                     |
+| `config.rs`                              | `crates/trusted-server-core/src/auction/` | Auction configuration types                                                                          |
+| `request.rs`, `response.rs`, `demand.rs` | `crates/auction-protocol/openrtb/src/`    | The OpenRTB 2.6 request builder, response reader and the hook trait a demand implementation fills in |
 
 ### Configuration-first plan
 
@@ -234,9 +235,16 @@ Three demand implementations ship in this repository:
   behavior; and
 - `auction.aps` for APS account/SDK fields, response eligibility, and renderer output.
 
-Each `[demand.<name>]` table is one instance of the shared OpenRTB path.
-Several tables may name the same implementation or endpoint and stay distinct
-through their names, which is what the optional `implementation` line is for.
+Each `[demand.<name>]` table is one source running its implementation. Core
+routes a source the slots, the publisher, the permission state and the
+identifiers, sends the request the source builds and hands the answer back to
+the source to read, so core names no protocol. The three implementations above
+speak OpenRTB 2.6 through `crates/auction-protocol/openrtb`, which builds every
+standard field the same way for all of them and reads an ordinary bid
+response, and an implementation decides only its field policy, its own
+extensions, its outbound headers and how its answer is read. Several tables
+may name the same implementation or endpoint and stay distinct through their
+names, which is what the optional `implementation` line is for.
 The `ad-server.iabtl` ad server is selected the same way, by
 `[ad-server] module`, and supplies an ad server implementation rather than a
 demand one. See [Configuration Rules](/guide/configuration-rules) for the
@@ -824,8 +832,9 @@ Until that callback lands, startup remains the mandatory target-aware gate.
 ### Timeout behavior
 
 For each demand source, Trusted Server uses the smaller of its resolved timeout
-and the remaining auction budget for launch decisions and OpenRTB `tmax`. The
-ad server is not called after the logical auction budget is exhausted.
+and the remaining auction budget for launch decisions, and hands that budget to
+the source, which an OpenRTB source sends as `tmax`. The ad server is not
+called after the logical auction budget is exhausted.
 
 No current adapter claims an abortable total-request deadline across demand
 sources.

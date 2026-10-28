@@ -20,6 +20,7 @@ http = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+trusted-server-auction-protocol-openrtb = { workspace = true }
 trusted-server-core = { workspace = true }
 trusted-server-permission-signal-gpc = { workspace = true }
 trusted-server-permission-signal-gpp = { workspace = true }
@@ -36,6 +37,7 @@ futures = { workspace = true }
 tokio = { workspace = true }
 validator = { workspace = true }
 web-time = { workspace = true }
+trusted-server-auction-protocol-openrtb = { workspace = true, features = ["test-utils"] }
 trusted-server-core = { workspace = true, features = ["test-utils"] }
 
 # The visible owner of this vendor crate, the way Prebid.js requires a named

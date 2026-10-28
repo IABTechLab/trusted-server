@@ -40,13 +40,21 @@ use url::{Url, Url as ParsedUrl};
 #[cfg(test)]
 use validator::Validate;
 
-use trusted_server_core::auction::demand::{
-    CompiledDemand, DemandFieldPolicy, DemandImplementation, DemandResponse, DemandTimeoutDefault,
-    DemandTransport, ProviderAuctionInput, RegsPolicy, RequestExtensions, TransportHeaders,
+use trusted_server_auction_protocol_openrtb::demand::{
+    DemandFieldPolicy, OpenRtbDemand, OpenRtbDriver, RegsPolicy, RequestExtensions,
 };
-use trusted_server_core::auction::openrtb::{
+#[cfg(test)]
+use trusted_server_auction_protocol_openrtb::wire::{
+    Banner, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs, RegsExt, Site, ToExt,
+    TrustedServerExt, User, UserExt, format_eids, to_openrtb_i32,
+};
+use trusted_server_core::auction::admission::{
     BidDimensionIndex, BidRejectionReason, ResponseAdmissionDiagnostics, build_bid_dimension_index,
     parse_optional_bid_dimension, resolve_bid_dimensions,
+};
+use trusted_server_core::auction::demand::{
+    CompiledDemand, DemandImplementation, DemandResponse, DemandTimeoutDefault, DemandTransport,
+    ProviderAuctionInput, TransportHeaders,
 };
 use trusted_server_core::auction::orchestrator::ERROR_TYPE_HTTP_STATUS;
 #[cfg(test)]
@@ -65,11 +73,6 @@ use trusted_server_core::integrations::{
 #[cfg(test)]
 use trusted_server_core::integrations::{
     ensure_integration_backend_with_timeout, predict_integration_backend_name,
-};
-#[cfg(test)]
-use trusted_server_core::openrtb::{
-    Banner, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs, RegsExt, Site, ToExt,
-    TrustedServerExt, User, UserExt, to_openrtb_i32,
 };
 #[cfg(test)]
 use trusted_server_core::platform::PlatformHttpRequest;
@@ -164,13 +167,13 @@ fn compile(
         &settings.bid_param_overrides,
         &settings.bid_param_override_rules,
     )?;
-    Ok(Arc::new(PrebidServerDemand {
+    Ok(Arc::new(OpenRtbDriver::new(PrebidServerDemand {
         debug: settings.debug,
         test_mode: settings.test_mode,
         debug_query_params: settings.debug_query_params,
         override_engine,
         consent_forwarding: settings.consent_forwarding,
-    }))
+    })))
 }
 
 /// Complete an endpoint that names the host alone with the auction path.
@@ -238,7 +241,7 @@ fn carries_policy_default(consent: &ConsentContext) -> bool {
 }
 
 #[async_trait(?Send)]
-impl CompiledDemand for PrebidServerDemand {
+impl OpenRtbDemand for PrebidServerDemand {
     fn field_policy(&self) -> DemandFieldPolicy {
         DemandFieldPolicy {
             imp_tagid: true,
@@ -1889,7 +1892,7 @@ impl PrebidAuctionProvider {
                 // EIDs resolved from the KV identity graph and gated on the
                 // resolved permission state in `handle_auction` via
                 // `gate_eids_by_permissions`.
-                eids: request.user.eids.clone(),
+                eids: request.user.eids.as_deref().map(format_eids),
             }
             .to_ext(),
             ..Default::default()
@@ -4257,25 +4260,25 @@ assume_single_jurisdiction = true
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
         auction_request.user.eids = Some(vec![
-            trusted_server_core::openrtb::Eid {
+            trusted_server_core::ec::eids::Eid {
                 source: "liveramp.com".to_owned(),
-                uids: vec![trusted_server_core::openrtb::Uid {
+                uids: vec![trusted_server_core::ec::eids::Uid {
                     id: "LR_xyz".to_owned(),
                     atype: Some(3),
                     ext: None,
                 }],
             },
-            trusted_server_core::openrtb::Eid {
+            trusted_server_core::ec::eids::Eid {
                 source: "id5-sync.com".to_owned(),
-                uids: vec![trusted_server_core::openrtb::Uid {
+                uids: vec![trusted_server_core::ec::eids::Uid {
                     id: "ID5_abc".to_owned(),
                     atype: Some(1),
                     ext: None,
                 }],
             },
-            trusted_server_core::openrtb::Eid {
+            trusted_server_core::ec::eids::Eid {
                 source: "google.com".to_owned(),
-                uids: vec![trusted_server_core::openrtb::Uid {
+                uids: vec![trusted_server_core::ec::eids::Uid {
                     id: "pair-id".to_owned(),
                     atype: Some(571187),
                     ext: None,
@@ -6483,7 +6486,7 @@ set = { networkId = 42 }
             assert!(bid.returned_seat.is_none());
         }
 
-        trusted_server_core::auction::openrtb::apply_notification_policy(
+        trusted_server_core::auction::provider::apply_notification_policy(
             &mut parsed.bids,
             &trusted_server_core::auction::plan::NotificationPolicy {
                 suppress_all: false,
@@ -7433,19 +7436,19 @@ mod engine_tests {
     use edgezero_core::body::Body as EdgeBody;
     use http::{Request, header};
     use serde_json::{Value, json};
+    use trusted_server_auction_protocol_openrtb::test_support::build_for_first_source;
+    use trusted_server_auction_protocol_openrtb::wire::OpenRtbRequest;
     use trusted_server_core::auction::orchestrator::AuctionOrchestrator;
     use trusted_server_core::auction::plan::{AuctionPlan, AuctionPlanConfig, NotificationConfig};
     use trusted_server_core::auction::test_support::{
-        build_for_first_source, canonical_parity_auction_request, demand_table,
-        deterministic_signer, golden_inbound_request, golden_plan_config, plan_config_with,
-        route_to_first_source,
+        canonical_parity_auction_request, demand_table, deterministic_signer,
+        golden_inbound_request, golden_plan_config, plan_config_with, route_to_first_source,
     };
     use trusted_server_core::auction::types::{
         AdFormat, AdSlot, AuctionContext, AuctionRequest, MediaType, PublisherInfo, UserInfo,
     };
     use trusted_server_core::consent::jurisdiction::Jurisdiction;
     use trusted_server_core::consent::{ConsentContext, ConsentSource, SignalRecord, SignalStatus};
-    use trusted_server_core::openrtb::OpenRtbRequest;
     use trusted_server_core::platform::BackendNamingPolicy;
     use trusted_server_core::platform::test_support::{
         NamingBackend, StubHttpClient, build_services_with_backend_and_http_client,

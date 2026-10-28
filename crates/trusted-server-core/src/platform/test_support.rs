@@ -1057,7 +1057,7 @@ pub fn build_services_with_geo(geo: Arc<dyn PlatformGeo>) -> RuntimeServices {
 /// Build a [`RuntimeServices`] carrying a device module, so a test can drive
 /// the device seam rather than setting the resolved attributes by hand.
 ///
-/// Setting the attributes directly would prove the `OpenRTB` mapping and
+/// Setting the attributes directly would prove a source's mapping of them and
 /// nothing about whether any module is ever asked, which is the half of the
 /// chain that breaks.
 pub fn noop_services_with_device_module(

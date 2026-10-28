@@ -3,7 +3,9 @@
 //!
 //! `[demand] modules` selects the demand sources and `[ad-server] module`
 //! the optional ad server. Their implementations are registered by
-//! integrations through [`demand`], so this module names no vendor.
+//! integrations through [`demand`], so this module names no vendor and no
+//! protocol. Each source builds its own request and reads its own answer,
+//! and [`admission`] holds the rules every reader admits a bid by.
 
 use error_stack::Report;
 
@@ -12,12 +14,12 @@ use crate::integrations::IntegrationBuilder;
 use crate::settings::Settings;
 use std::sync::Arc;
 
+pub mod admission;
 pub mod config;
 pub mod context;
 pub mod demand;
 pub mod endpoints;
 pub mod formats;
-pub mod openrtb;
 pub mod orchestrator;
 pub mod plan;
 pub mod provider;

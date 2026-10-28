@@ -10,8 +10,8 @@ use http::{Request, Response, StatusCode};
 use url::Url;
 
 use super::auth::authenticate_bearer;
+use crate::ec::eids::{Eid, Uid};
 use crate::error::TrustedServerError;
-use crate::openrtb::{Eid, Uid};
 use crate::settings::Settings;
 
 use super::EcContext;

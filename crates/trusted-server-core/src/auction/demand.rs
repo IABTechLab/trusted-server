@@ -4,12 +4,13 @@
 //! A deployment selects its demand sources with `[demand] modules = [...]` and
 //! its ad server with `[ad-server] module = "..."`. Each selected name resolves
 //! to an implementation that an integration builder registers, so core names no
-//! vendor. The common `OpenRTB` driver builds every standard request field, sends
-//! the request and enforces privacy. An implementation decides only the choices
-//! this module exposes, which are its field policy, its own extensions, its
-//! outbound headers and how its responses are read.
+//! vendor and no protocol. Core routes each source the facts it may use, sends
+//! the request the source builds from them and hands the answer back to the
+//! source to read. The protocol a source speaks is the source's own, through
+//! the crate of the standard it speaks.
 
 use core::any::Any;
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -19,18 +20,15 @@ use http::HeaderMap;
 use serde_json::{Map, Value};
 use url::Url;
 
-use crate::consent::ConsentContext;
 use crate::error::TrustedServerError;
 use crate::platform::PlatformResponse;
+use crate::request_signing::{RequestSigner, SigningParams};
 
 use super::provider::AuctionProvider;
-pub use super::routing::{ProviderAuctionInput, ProviderSlotInput, TransportHeaders};
+pub use super::routing::{
+    ProviderAuctionInput, ProviderSlotInput, RoutedAuction, TransportHeaders,
+};
 use super::types::AuctionResponse;
-
-/// The longest primary `Accept-Language` tag a conservative source receives.
-///
-/// A source that sets no limit receives the whole primary tag.
-pub const CONSERVATIVE_LANGUAGE_MAX_BYTES: usize = 8;
 
 /// Where a demand source's timeout comes from when its table sets none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,158 +39,78 @@ pub enum DemandTimeoutDefault {
     Fixed(u32),
 }
 
-/// How the `regs` object is derived from the consent the auction admitted.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum RegsPolicy {
-    /// No `regs` without consent data, and GDPR set from the applicability bit
-    /// or from a GDPR jurisdiction.
-    #[default]
-    Jurisdiction,
-    /// `regs` for any admitted consent, and GDPR set from the applicability bit
-    /// alone.
-    ApplicabilityBit,
-}
-
-/// The standard `OpenRTB` field choices one demand source makes.
-///
-/// The common driver constructs every standard field and reads this policy
-/// while it does. A policy can leave data out of what central privacy
-/// enforcement approved, and it cannot add data that enforcement removed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DemandFieldPolicy {
-    /// Send the slot id as `imp.tagid`.
-    pub imp_tagid: bool,
-    /// Copy the first banner format into `banner.w` and `banner.h`, and send
-    /// `banner.topframe` as not in the top frame.
-    pub primary_banner_size: bool,
-    /// Send the accepted `Referer` header as `site.ref`.
-    pub site_ref: bool,
-    /// Send precise latitude and longitude with the coarse geo.
-    pub precise_geo: bool,
-    /// The longest primary `Accept-Language` tag sent, or `None` for no limit.
-    pub language_max_bytes: Option<usize>,
-    /// How `regs` is derived from consent.
-    pub regs: RegsPolicy,
-    /// Mark the request as a test request.
-    pub test: bool,
-    /// Keep the Trusted Server host and scheme in `ext.trusted_server` when the
-    /// request is not signed.
-    pub unsigned_request_identity: bool,
-    /// Send `Accept: application/json`.
-    pub accept_json: bool,
-    /// Treat routed bidder parameters as request data rather than reporting
-    /// them as parameters the source ignored.
-    pub consumes_bidder_params: bool,
-}
-
-/// Facts an implementation may use when it adjusts the outbound request.
+/// The request facts a source may use beside its routed input.
 #[derive(Debug, Clone, Copy)]
 pub struct DemandTransport<'a> {
     /// The request headers admitted for forwarding.
     pub headers: &'a TransportHeaders,
     /// The client address the platform attested, never one a client supplied.
     pub attested_client_ip: Option<IpAddr>,
+    /// Whether the request asked not to be tracked.
+    pub dnt: Option<bool>,
 }
 
-/// Facts an implementation reads while it parses a response.
+/// The signing input core settles before a source builds its request. No
+/// signer is loaded here.
+pub struct RequestFinalization<'a> {
+    /// The signer the auction admitted, or `None` for an unsigned request.
+    pub signer: Option<&'a RequestSigner>,
+    /// What the signature is made over.
+    pub signing_params: SigningParams,
+}
+
+/// The request one source built from its routed input, ready to send.
+pub struct OutboundRequest {
+    /// The body as it is sent.
+    pub body: Vec<u8>,
+    /// The headers the source sets, `Content-Type` included.
+    pub headers: HeaderMap,
+    /// The ids of the slots the request asks for. The response is read
+    /// against these slots alone.
+    pub slot_ids: HashSet<String>,
+    /// State the source keeps from the request for reading the response.
+    pub captured: Option<Box<dyn Any + Send + Sync>>,
+}
+
+/// Facts a source reads while it parses a response.
 #[derive(Clone, Copy)]
 pub struct DemandResponse<'a> {
     /// The configured name of the demand source.
     pub provider_id: &'a str,
     /// The canonical endpoint the request was sent to.
     pub endpoint: &'a str,
-    /// The routed input the request was built from.
+    /// The routed input the request was built from, with the slots the
+    /// request asked for.
     pub input: &'a ProviderAuctionInput,
     /// How long the request took, in milliseconds.
     pub response_time_ms: u64,
-    /// State [`CompiledDemand::capture_request`] returned for this request.
+    /// State the source kept in [`OutboundRequest::captured`].
     pub captured: Option<&'a (dyn Any + Send + Sync)>,
-}
-
-/// The extension objects an implementation may add to a request the driver
-/// built, one for the request and one for each impression.
-///
-/// This is the only part of the request an implementation writes. Every
-/// standard field is the driver's, chosen through [`DemandFieldPolicy`], so an
-/// implementation can add what its exchange needs and cannot change what
-/// privacy enforcement decided. The `trusted_server` request extension is the
-/// driver's too, and a request that claims it is refused.
-pub struct RequestExtensions<'a> {
-    /// The request-level `ext` object.
-    pub request: &'a mut Option<Map<String, Value>>,
-    /// The impressions the driver built, each beside the slot it came from.
-    pub impressions: Vec<ImpressionExtension<'a>>,
-}
-
-/// One impression's `ext` object beside the routed slot it was built from.
-pub struct ImpressionExtension<'a> {
-    /// The routed slot, with its bidder parameters and zone.
-    pub slot: &'a ProviderSlotInput,
-    /// The impression's `ext` object.
-    pub ext: &'a mut Option<Map<String, Value>>,
-    /// Set by an implementation that has no demand to send for this slot.
-    /// The driver leaves the impression out of the request, and makes no
-    /// request at all when every impression is left out.
-    pub omitted: bool,
 }
 
 /// The request and response behavior of one selected demand source, compiled
 /// from its `[demand.<name>]` table at startup.
 ///
-/// Every method except [`augment_request`](Self::augment_request) and
-/// [`parse_response`](Self::parse_response) has a default that suits a source
-/// with no special handling.
+/// A source builds its request from the facts core routed to it, which are
+/// the slots and their formats, the publisher, the permission state the
+/// auction resolved and the identifiers the request may carry, and reads the
+/// answer into core's bids. What the request looks like on the wire is the
+/// source's own, through the crate of the protocol it speaks.
 #[async_trait(?Send)]
 pub trait CompiledDemand: Send + Sync {
-    /// The standard field choices this source makes.
-    fn field_policy(&self) -> DemandFieldPolicy;
-
-    /// The domain sent as `site.domain` and `site.publisher.domain`.
-    fn site_domain(&self, publisher_domain: &str) -> String {
-        publisher_domain.to_owned()
-    }
-
-    /// The page sent as `site.page`, given the publisher's page and the site
-    /// domain [`site_domain`](Self::site_domain) chose.
-    fn site_page(&self, publisher_page: Option<&str>, site_domain: &str) -> Option<String> {
-        let _ = site_domain;
-        publisher_page.map(str::to_owned)
-    }
-
-    /// The consent that may travel in the request body.
-    fn body_consent<'c>(&self, consent: Option<&'c ConsentContext>) -> Option<&'c ConsentContext> {
-        consent
-    }
-
-    /// Adds this source's own request and impression extensions.
+    /// Builds the request for the routed input, or `None` when the source has
+    /// nothing to ask for, in which case core makes no request.
     ///
     /// # Errors
     ///
-    /// Returns an error when an extension cannot be built for this request.
-    fn augment_request(
+    /// Returns an error when the request cannot be built for this input.
+    fn build_request(
         &self,
-        extensions: &mut RequestExtensions<'_>,
         input: &ProviderAuctionInput,
-    ) -> Result<(), Report<TrustedServerError>>;
-
-    /// Adds to the outbound headers before the request is sent, for example to
-    /// forward admitted headers. The driver has already set `Content-Type`,
-    /// and `Accept` when the field policy asks for it.
-    fn prepare_outbound(&self, headers: &mut HeaderMap, transport: DemandTransport<'_>) {
-        let _ = (headers, transport);
-    }
-
-    /// Keeps request-local state the response parser needs, taken from the
-    /// serialized body and the outbound headers as they will be sent, after
-    /// [`prepare_outbound`](Self::prepare_outbound) has run.
-    fn capture_request(
-        &self,
-        body: &[u8],
-        headers: &HeaderMap,
-    ) -> Option<Box<dyn Any + Send + Sync>> {
-        let _ = (body, headers);
-        None
-    }
+        transport: DemandTransport<'_>,
+        timeout_ms: u32,
+        finalization: &RequestFinalization<'_>,
+    ) -> Result<Option<OutboundRequest>, Report<TrustedServerError>>;
 
     /// Reads the upstream response into an auction response.
     ///
@@ -207,6 +125,12 @@ pub trait CompiledDemand: Send + Sync {
         response: PlatformResponse,
     ) -> Result<AuctionResponse, Report<TrustedServerError>>;
 
+    /// Whether routed bidder parameters are request data for this source,
+    /// rather than parameters it was routed and ignores.
+    fn consumes_bidder_params(&self) -> bool {
+        false
+    }
+
     /// This compiled source as [`Any`], so the implementation that created it
     /// can read its own settings back, for example while it registers routes.
     fn as_any(&self) -> &dyn Any;
@@ -215,8 +139,8 @@ pub trait CompiledDemand: Send + Sync {
 /// Compiles one demand source from its settings.
 ///
 /// The map holds the table's own settings, without `implementation` and the
-/// common keys the driver reads, which are `endpoint`, `timeout_ms`, `routing`
-/// and `notifications`.
+/// common keys core reads, which are `endpoint`, `timeout_ms`, `routing` and
+/// `notifications`.
 pub type CompileDemandFn =
     fn(&Map<String, Value>) -> Result<Arc<dyn CompiledDemand>, Report<TrustedServerError>>;
 

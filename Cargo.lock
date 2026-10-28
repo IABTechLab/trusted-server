@@ -6862,6 +6862,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "trusted-server-auction-protocol-openrtb",
  "trusted-server-core",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
@@ -6907,6 +6908,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "trusted-server-auction-protocol-openrtb",
  "trusted-server-core",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
@@ -6923,10 +6925,16 @@ name = "trusted-server-auction-protocol-openrtb"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "edgezero-core",
  "error-stack",
+ "futures",
+ "http",
+ "log",
  "serde",
  "serde_json",
  "trusted-server-core",
+ "trusted-server-openrtb",
+ "url",
 ]
 
 [[package]]
@@ -7435,6 +7443,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "tokio",
+ "trusted-server-auction-protocol-openrtb",
  "trusted-server-core",
  "validator",
 ]

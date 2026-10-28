@@ -1,17 +1,48 @@
-//! Shared EID resolution and formatting helpers.
+//! The identifiers partners hold for a visitor, and the helpers that resolve
+//! them from a KV entry and carry them in a response header.
 //!
 //! Used by both `/_ts/api/v1/identify` and `/auction` to resolve source-domain
-//! keyed IDs from KV entries, convert them to `OpenRTB` EID structures, and
-//! build base64-encoded response headers.
+//! keyed IDs from KV entries, turn them into [`Eid`] entries, and build
+//! base64-encoded response headers.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use error_stack::{Report, ResultExt as _};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::TrustedServerError;
-use crate::openrtb::{Eid, Uid};
 
 use super::kv_types::KvEntry;
 use super::registry::PartnerRegistry;
+
+/// The identifiers one identity provider holds for the visitor.
+///
+/// This is the shape the identity cookie, the `x-ts-eids` response header,
+/// the identify API and the auction request body carry, and the shape an
+/// auction protocol formats into its own request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Eid {
+    /// The identity provider's source domain (for example `"id5-sync.com"`).
+    pub source: String,
+    /// One or more identifiers from this provider.
+    pub uids: Vec<Uid>,
+}
+
+/// A single identifier within an [`Eid`] entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Uid {
+    /// The identifier value.
+    pub id: String,
+    /// The agent type the identity provider declares for this identifier,
+    /// including vendor-specific values such as PAIR's `571187`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub atype: Option<i32>,
+    /// Provider-specific extension data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<Value>,
+}
 
 /// Maximum size (in bytes) for the base64-encoded `x-ts-eids` header value.
 pub const MAX_EIDS_HEADER_BYTES: usize = 4096;
@@ -24,7 +55,8 @@ pub struct ResolvedPartnerId {
     pub source_domain: String,
     /// The synced user ID value.
     pub uid: String,
-    /// `OpenRTB` agent type for this partner's identifiers.
+    /// The agent type this partner's identifiers carry, as `openrtb_atype`
+    /// in the partner's table sets it.
     pub openrtb_atype: i32,
 }
 
@@ -59,7 +91,7 @@ pub fn resolve_partner_ids(registry: &PartnerRegistry, entry: &KvEntry) -> Vec<R
     resolved
 }
 
-/// Converts resolved partner IDs to `OpenRTB` `Eid` entries.
+/// Converts resolved partner IDs to [`Eid`] entries.
 #[must_use]
 pub fn to_eids(resolved: &[ResolvedPartnerId]) -> Vec<Eid> {
     resolved
@@ -259,6 +291,49 @@ mod tests {
         assert!(
             encoded.len() <= MAX_EIDS_HEADER_BYTES,
             "should cap encoded header bytes"
+        );
+    }
+
+    #[test]
+    fn eid_serializes_correctly() {
+        let eid = Eid {
+            source: "id5-sync.com".to_owned(),
+            uids: vec![Uid {
+                id: "ID5-abc123".to_owned(),
+                atype: Some(1),
+                ext: None,
+            }],
+        };
+
+        let serialized = serde_json::to_value(&eid).expect("should serialize");
+        assert_eq!(serialized["source"], "id5-sync.com", "source should match");
+        assert_eq!(
+            serialized["uids"][0]["id"], "ID5-abc123",
+            "uid id should match"
+        );
+        assert_eq!(serialized["uids"][0]["atype"], 1, "atype should be 1");
+        assert!(
+            serialized["uids"][0].get("ext").is_none(),
+            "ext should be omitted when None"
+        );
+    }
+
+    #[test]
+    fn eid_serializes_vendor_specific_atype() {
+        let eid = Eid {
+            source: "google.com".to_owned(),
+            uids: vec![Uid {
+                id: "pair-id".to_owned(),
+                atype: Some(571187),
+                ext: None,
+            }],
+        };
+
+        let serialized = serde_json::to_value(&eid).expect("should serialize");
+
+        assert_eq!(
+            serialized["uids"][0]["atype"], 571187,
+            "should preserve PAIR's vendor-specific atype"
         );
     }
 

@@ -19,6 +19,7 @@ http = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+trusted-server-auction-protocol-openrtb = { workspace = true }
 trusted-server-core = { workspace = true }
 validator = { workspace = true }
 

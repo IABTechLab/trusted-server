@@ -16,8 +16,8 @@
 
 use std::sync::Arc;
 
+use crate::ec::eids::{Eid, Uid};
 use crate::module_context::{ModuleCall, ModuleContext, Withheld};
-use crate::openrtb::{Eid, Uid};
 use crate::permissions::PermissionSet;
 
 use super::kv::PartnerIdUpdate;
