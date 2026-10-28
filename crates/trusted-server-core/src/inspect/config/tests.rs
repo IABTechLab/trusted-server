@@ -5,10 +5,11 @@ use edgezero_core::blob_envelope::BlobEnvelope;
 use super::*;
 use crate::config_payload::settings_from_config_blob_with;
 use crate::integrations::{IntegrationBuilder, ModuleSecretSetting};
-use crate::platform::{PlatformError, PlatformSecretStore, StoreId, StoreName};
+use crate::permissions::{SAMPLE_POLICY_NAME, SAMPLE_POLICY_TEXT, policy_sha256};
+use crate::platform::{PlatformError, PlatformSecretStore, PolicyOrigin, StoreId, StoreName};
 use crate::secret_resolution::ResolvedSecrets;
 use crate::settings::ProxyAssetRoute;
-use crate::test_support::tests::crate_test_settings_str;
+use crate::test_support::tests::{crate_test_settings_str, sample_permissions};
 
 /// Every value this store hands back starts with this, so a view can be
 /// searched for all of them at once.
@@ -52,10 +53,12 @@ fn document(extra: &str) -> Value {
 }
 
 /// `toml` as a stored document holds it, with the allowed domains a load
-/// needs for the test settings' asset hosts.
+/// needs for the test settings' asset hosts and the permission policy the
+/// push writes.
 fn document_from(toml: &str) -> Value {
     let mut settings = Settings::from_toml(toml).expect("should parse the document");
     settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
+    settings.permissions = sample_permissions();
     serde_json::to_value(&settings).expect("should serialize the document")
 }
 
@@ -69,6 +72,7 @@ fn load_with(
         &envelope,
         &CanaryStore,
         &StoreName::from("ts_secrets"),
+        PolicyOrigin::Blob,
         builders,
     )
 }
@@ -802,6 +806,117 @@ show = [\"ec.primary.passphrase\"]
     }
 }
 
+/// A loaded domain shows its policy file's name and SHA-256, which nothing
+/// masks, so a publisher can check which exact file runs. The file itself is
+/// never shown, because the loader takes it out of the settings.
+#[test]
+fn the_view_shows_the_policy_by_name_and_digest_and_never_its_file() {
+    let loaded = load(document("")).expect("should load the document");
+    let shown = view(&loaded);
+
+    assert_eq!(
+        at(&shown.settings, "permissions.policy"),
+        Some(&json!(SAMPLE_POLICY_NAME))
+    );
+    assert_eq!(
+        at(&shown.settings, "permissions.sha256"),
+        Some(&json!(policy_sha256(SAMPLE_POLICY_TEXT)))
+    );
+    assert_eq!(at(&shown.settings, "permissions.text"), None);
+    assert!(
+        !shown
+            .masked
+            .iter()
+            .any(|path| path.starts_with("permissions")),
+        "neither the name nor the digest should be masked: {:?}",
+        shown.masked
+    );
+    let (json, page) = served(&loaded);
+    for served in [json, page] {
+        assert!(
+            !served.contains("groups:"),
+            "the policy file should never be served"
+        );
+    }
+}
+
+/// The view never shows `permissions.text`, so a pattern naming it, or
+/// anything beneath it, is refused by the deploy check and by the load alike.
+#[test]
+fn a_pattern_under_the_policy_file_is_refused() {
+    for (section, reason) in [
+        (
+            r#"show = ["permissions.text"]"#,
+            "show names `permissions.text`, the policy file the push writes",
+        ),
+        (
+            r#"hide = ["permissions.text"]"#,
+            "hide names `permissions.text`, the policy file the push writes",
+        ),
+        (
+            r#"hide = ["permissions.text[]"]"#,
+            "hide names `permissions.text[]`, which is under `permissions.text`, the policy \
+             file the push writes",
+        ),
+    ] {
+        let toml = format!("{}\n[inspect]\n{section}\n", crate_test_settings_str());
+        let mut settings = Settings::from_toml(&toml).expect("should parse the document");
+        settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
+        settings.permissions = sample_permissions();
+
+        let deployed = format!(
+            "{:?}",
+            crate::config::validate_settings_for_deploy_with(&settings, &[])
+                .expect_err("the deploy check should refuse the pattern")
+        );
+        let loaded = format!(
+            "{:?}",
+            load(document(&format!("[inspect]\n{section}")))
+                .expect_err("the load should refuse the pattern")
+        );
+
+        assert!(deployed.contains(reason), "deploy: {deployed}");
+        assert!(loaded.contains(reason), "load: {loaded}");
+    }
+}
+
+/// The push always writes `permissions.sha256`, so a pattern naming it is
+/// judged before the push, which has not written it yet, as it is when the
+/// pushed settings load.
+#[test]
+fn a_pattern_naming_the_policy_digest_is_judged_alike_before_and_after_the_push() {
+    let before_the_push = |section: &str| {
+        let toml = format!(
+            "{}\n[permissions]\npolicy = \"{SAMPLE_POLICY_NAME}\"\n\n[inspect]\n{section}\n",
+            crate_test_settings_str()
+        );
+        let mut settings = Settings::from_toml(&toml).expect("should parse the document");
+        settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
+        crate::config::validate_settings_for_deploy_with(&settings, &[])
+    };
+
+    let hide = r#"hide = ["permissions.sha256"]"#;
+    before_the_push(hide).expect("hiding the digest should be honored before the push");
+    let loaded = load(document(&format!("[inspect]\n{hide}")))
+        .expect("hiding the digest should be honored when the settings load");
+    assert!(is_masked(&view(&loaded), "permissions.sha256"));
+
+    let show = r#"show = ["permissions.sha256"]"#;
+    let reason = "show names `permissions.sha256`, which changes nothing, because nothing it \
+                  names is masked by default";
+    let before = format!(
+        "{:?}",
+        before_the_push(show).expect_err("showing the digest changes nothing before the push")
+    );
+    let after = format!(
+        "{:?}",
+        load(document(&format!("[inspect]\n{show}")))
+            .expect_err("showing the digest changes nothing when the settings load")
+    );
+    assert!(before.contains(reason), "before the push: {before}");
+    assert!(after.contains(reason), "at the load: {after}");
+}
+
 #[test]
 fn the_page_answers_not_found_when_the_publisher_does_not_publish() {
     let settings = load(document("[inspect]\nconfig = false")).expect("should load");
@@ -929,6 +1044,7 @@ fn a_secret_a_module_declares_is_masked() {
     .with_secret_settings(MODULE_SECRETS);
     let mut settings = settings();
     settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
+    settings.permissions = sample_permissions();
     settings
         .insert_module_config(
             "testing",
