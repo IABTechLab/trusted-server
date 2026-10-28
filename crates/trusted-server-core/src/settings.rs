@@ -2053,7 +2053,8 @@ impl TinybirdSettings {
         if !self.enabled {
             return Ok(());
         }
-        tinybird_events_endpoint(&self.api_host)?;
+        // Validation does not return endpoint metadata through the error path.
+        tinybird_events_endpoint(&self.api_host).map(|_| ())?;
         validate_tinybird_dataset(&self.auction_dataset, "tinybird.auction_dataset")?;
         if let Some(token) = &self.auction_token_secret {
             validate_tinybird_secret(token.expose(), "tinybird.auction_token_secret")?;
