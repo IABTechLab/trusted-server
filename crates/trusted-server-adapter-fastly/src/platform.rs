@@ -7,6 +7,7 @@ use fastly::geo::{Geo, geo_lookup};
 use fastly::{ConfigStore, Request, SecretStore};
 use std::io::Read as _;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::backend::BackendConfig;
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
@@ -493,7 +494,13 @@ fn apply_fastly_cache_intent(request: &mut fastly::Request, intent: &PlatformCac
 /// environment cannot register a real Fastly backend, so the common
 /// `StubHttpClient` driver test records the one-send 3xx behavior while adapter
 /// tests cover request conversion and the single-send boundary.
-pub struct FastlyPlatformHttpClient;
+///
+/// One client is built per request, so it counts the backend requests the
+/// execution has started, for Fastly's per-execution backend request limit.
+#[derive(Default)]
+pub struct FastlyPlatformHttpClient {
+    started: AtomicUsize,
+}
 
 #[async_trait::async_trait(?Send)]
 impl PlatformHttpClient for FastlyPlatformHttpClient {
@@ -505,10 +512,15 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         true
     }
 
+    fn requests_started(&self) -> Option<usize> {
+        Some(self.started.load(Ordering::Relaxed))
+    }
+
     async fn send(
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
+        self.started.fetch_add(1, Ordering::Relaxed);
         let backend_name = request.backend_name.clone();
         let image_optimizer = request.image_optimizer;
         let stream_response = request.stream_response;
@@ -529,6 +541,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+        self.started.fetch_add(1, Ordering::Relaxed);
         let backend_name = request.backend_name.clone();
         if request.image_optimizer.is_some() {
             return Err(Report::new(PlatformError::HttpClient)
@@ -1193,7 +1206,7 @@ mod tests {
 
     #[test]
     fn auction_http_capabilities_are_explicit() {
-        let client = FastlyPlatformHttpClient;
+        let client = FastlyPlatformHttpClient::default();
         let capabilities = trusted_server_core::platform::AuctionTargetId::Fastly
             .descriptor()
             .capabilities();
@@ -1363,7 +1376,7 @@ mod tests {
 
     #[test]
     fn fastly_platform_http_client_send_returns_error_for_unregistered_backend() {
-        let client = FastlyPlatformHttpClient;
+        let client = FastlyPlatformHttpClient::default();
         let request = request_builder()
             .method("GET")
             .uri("https://example.com/")
@@ -1383,7 +1396,7 @@ mod tests {
 
     #[test]
     fn fastly_platform_http_client_send_async_returns_error_for_unregistered_backend() {
-        let client = FastlyPlatformHttpClient;
+        let client = FastlyPlatformHttpClient::default();
         let request = request_builder()
             .method("GET")
             .uri("https://example.com/")
@@ -1403,7 +1416,7 @@ mod tests {
 
     #[test]
     fn fastly_platform_http_client_select_returns_error_for_empty_list() {
-        let client = FastlyPlatformHttpClient;
+        let client = FastlyPlatformHttpClient::default();
         let err = futures::executor::block_on(client.select(vec![]))
             .expect_err("should return error for empty pending list");
 
@@ -1416,7 +1429,7 @@ mod tests {
 
     #[test]
     fn fastly_platform_http_client_select_returns_error_for_wrong_inner_type() {
-        let client = FastlyPlatformHttpClient;
+        let client = FastlyPlatformHttpClient::default();
         // Wrap a non-PendingRequest type to trigger the downcast failure.
         let wrong = PlatformPendingRequest::new(42u32).with_backend_name("origin-a");
         let err = futures::executor::block_on(client.select(vec![wrong]))
@@ -1435,7 +1448,7 @@ mod tests {
 
     #[test]
     fn fastly_platform_http_client_rejects_stream_marked_pending_from_select() {
-        let client = FastlyPlatformHttpClient;
+        let client = FastlyPlatformHttpClient::default();
         let pending = PlatformPendingRequest::new(42_u32)
             .with_backend_name("origin-a")
             .with_response_handling(true, edgezero_core::http::Method::GET);
@@ -1450,7 +1463,7 @@ mod tests {
 
     #[test]
     fn fastly_platform_http_client_send_returns_error_for_streaming_body() {
-        let client = FastlyPlatformHttpClient;
+        let client = FastlyPlatformHttpClient::default();
         let request = request_builder()
             .method("POST")
             .uri("https://example.com/")
@@ -1477,7 +1490,7 @@ mod tests {
 
     #[test]
     fn fastly_platform_http_client_send_async_rejects_image_optimizer_metadata() {
-        let client = FastlyPlatformHttpClient;
+        let client = FastlyPlatformHttpClient::default();
         let request = request_builder()
             .method("GET")
             .uri("https://example.com/image.jpg")
@@ -1500,7 +1513,7 @@ mod tests {
 
     #[test]
     fn fastly_platform_http_client_supports_pending_streaming_responses() {
-        let client = FastlyPlatformHttpClient;
+        let client = FastlyPlatformHttpClient::default();
         assert!(
             client.supports_pending_streaming_responses(),
             "should advertise direct pending-response streaming"
@@ -1525,7 +1538,7 @@ mod tests {
 
     #[test]
     fn fastly_platform_http_client_send_async_returns_error_for_streaming_body() {
-        let client = FastlyPlatformHttpClient;
+        let client = FastlyPlatformHttpClient::default();
         let request = request_builder()
             .method("POST")
             .uri("https://example.com/")

@@ -491,6 +491,8 @@ pub(crate) enum CallOutcome {
     BurstCapped,
     /// A limiter error meant nothing was sent.
     NotDispatched,
+    /// The request's backend budget had no room, so nothing was sent.
+    OverBackendBudget,
 }
 
 impl CallOutcome {
@@ -576,7 +578,9 @@ pub(crate) fn outcome_to_changes(
             TRANSPORT_BACKOFF_CAP_SECS,
         ),
         CallOutcome::BurstCapped => wait_until(now.saturating_add(BURST_WAIT_SECS)),
-        CallOutcome::BreakerOpen | CallOutcome::NotDispatched => OutcomeChanges::default(),
+        CallOutcome::BreakerOpen | CallOutcome::NotDispatched | CallOutcome::OverBackendBudget => {
+            OutcomeChanges::default()
+        }
     }
 }
 
@@ -1277,6 +1281,27 @@ fn record_failure(deps: &IdentityDeps<'_>, provider: &IdentityProviderId, outcom
     }
 }
 
+/// Whether one more call would pass `[ec.identity] max_backend_requests`.
+/// A hold call runs before the origin fetch may have started and before
+/// the auction, so it leaves room for the origin and one call per auction
+/// provider. An adapter that does not count its requests is not budgeted.
+fn over_backend_budget(deps: &IdentityDeps<'_>, hold: bool) -> bool {
+    let Some(started) = deps.services.http_client().requests_started() else {
+        return false;
+    };
+    let auction = &deps.settings.auction;
+    let reserved = if hold {
+        1 + if auction.enabled {
+            auction.providers.len()
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    started + reserved >= deps.settings.ec.identity.max_backend_requests
+}
+
 /// Whether the burst cap stops the call. `Err` when it could not be read.
 fn burst_capped(
     deps: &IdentityDeps<'_>,
@@ -1347,6 +1372,12 @@ async fn prepare_call<'a>(
     let Some((timeout, budget_limited)) = call_timeout(deps, &settings, remaining) else {
         return Prepared::Settled(CallOutcome::HoldCutOff);
     };
+    if over_backend_budget(deps, budget.is_some()) {
+        log::debug!(
+            "Identity provider '{id}' not dispatched: the request's backend budget is spent"
+        );
+        return Prepared::Settled(CallOutcome::OverBackendBudget);
+    }
     match burst_capped(deps, id, signals.ec_id.as_deref(), &settings) {
         Ok(true) => return Prepared::Settled(CallOutcome::BurstCapped),
         Ok(false) => {}
@@ -4273,7 +4304,10 @@ mod tests {
 
     impl DispatchFixture {
         fn new(providers: Vec<Arc<dyn IdentityProvider>>) -> Self {
-            let settings = create_test_settings();
+            let mut settings = create_test_settings();
+            // One fixture client counts the sends of every run, where a real
+            // request starts from zero, so the budget tests set their own.
+            settings.ec.identity.max_backend_requests = usize::MAX;
             let client = Arc::new(FakeHttpClient::new());
             let backend = Arc::new(FakeBackend::new());
             let services = fake_services(&client, &backend);
@@ -4684,6 +4718,64 @@ mod tests {
         assert!(
             timeouts[1] <= Duration::from_millis(30),
             "should wait no longer than the remaining budget"
+        );
+    }
+
+    #[test]
+    fn after_send_dispatch_stops_at_the_backend_request_budget() {
+        let mut fixture = DispatchFixture::new(vec![
+            scripted("p", "p.example.com", "p.example.com"),
+            scripted("q", "q.example.com", "q.example.com"),
+        ]);
+        fixture.settings.ec.identity.max_backend_requests = 3;
+        fixture.client.started_earlier(2);
+        fixture.client.respond("p.example.com", 200, b"{}");
+        fixture.client.respond("q.example.com", 200, b"{}");
+        let limiter = FakeRateLimiter::new();
+
+        let outcomes = fixture.run(&["p", "q"], 1_000, None, Some(&limiter));
+
+        assert_eq!(
+            fixture.client.sent_hosts().len(),
+            1,
+            "should send only what the budget leaves after the origin and auction"
+        );
+        assert!(
+            outcomes
+                .iter()
+                .any(|(_, outcome)| matches!(outcome, CallOutcome::OverBackendBudget)),
+            "should report the call it did not send"
+        );
+        assert!(
+            limiter
+                .keys()
+                .iter()
+                .all(|key| !key.starts_with("identity-fail:")),
+            "should not count a skipped call as a breaker failure"
+        );
+    }
+
+    #[test]
+    fn hold_dispatch_reserves_the_origin_and_the_auction() {
+        let mut fixture =
+            DispatchFixture::new(vec![scripted("p", "p.example.com", "p.example.com")]);
+        fixture.settings.ec.identity.max_backend_requests = 3;
+        fixture.settings.auction.enabled = true;
+        fixture.settings.auction.mediator = None;
+        fixture.settings.auction.providers =
+            crate::auction_config_types::AuctionConfig::legacy_provider_map(&["one", "two"]);
+        fixture.client.respond("p.example.com", 200, b"{}");
+
+        let held = fixture.run(&["p"], 1_000, Some(Duration::from_secs(1)), None);
+        let after_send = fixture.run(&["p"], 1_000, None, None);
+
+        assert!(
+            matches!(outcome_of(&held, "p"), CallOutcome::OverBackendBudget),
+            "should not hold a call that would leave no room for the origin and two auction calls"
+        );
+        assert!(
+            !matches!(outcome_of(&after_send, "p"), CallOutcome::OverBackendBudget),
+            "control: after send nothing is reserved"
         );
     }
 

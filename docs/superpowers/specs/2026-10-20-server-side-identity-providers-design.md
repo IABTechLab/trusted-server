@@ -1541,7 +1541,20 @@ request when all of these hold:
      a hold-mode provider waits `after_send_timeout_ms`, not the hold
      budget, and a miss is an ordinary timeout (section 8).
    - After-send providers run after send, with `after_send_timeout_ms`.
-8. The per-visitor burst cap is not exceeded. This check comes last, just
+8. The request's backend budget has room. Fastly allows 32 backend
+   requests per execution (10 on trial accounts), and after-send calls run
+   in the same execution as the origin and the auction. `[ec.identity]
+max_backend_requests` (default 32) bounds them together: the adapter's
+   HTTP client counts every request it starts
+   (`PlatformHttpClient::requests_started`), and a provider call is sent
+   only while that count, plus a reserve, stays below the budget. A hold
+   call reserves one request for the origin and one per auction provider,
+   because both may still be ahead of it; an after-send call reserves
+   nothing. A call over budget is not dispatched, changes no `ps` field and
+   is never a failure, so it neither backs off the provider nor feeds the
+   breaker. An adapter that does not count its requests is not budgeted.
+   Pull sync today has no such bound (`ec/pull_sync.rs:184-284`).
+9. The per-visitor burst cap is not exceeded. This check comes last, just
    before dispatch, because the Fastly limiter increments on every check under
    the limit (`adapter-fastly/src/rate_limiter.rs:54-66`). The cap is
    `max_calls_per_minute` on the key `identity:<provider>:<visitor>`, where
@@ -2724,7 +2737,8 @@ write (section 5.3), and nothing else.
 | `Rejected` with a 4xx other than 429, `Config`, `UndeclaredInput`, `Malformed` | unchanged                                                                                                                                              | `f += 1`, `n = now + min(1 h × 2^(f-1), 24 h)`                                         | warn  |
 | `Rejected` with 429 or 5xx, `Transport`, timeout                               | unchanged                                                                                                                                              | `f += 1`, `n = now + min(5 min × 2^(f-1), 1 h)`; breaker `record`                      | info  |
 | Breaker open                                                                   | not dispatched                                                                                                                                         | unchanged                                                                              | debug |
-| Burst cap exceeded (section 4.7 step 8)                                        | not dispatched                                                                                                                                         | `n = max(n, now + 60 s)`; never a failure                                              | debug |
+| Burst cap exceeded (section 4.7 step 9)                                        | not dispatched                                                                                                                                         | `n = max(n, now + 60 s)`; never a failure                                              | debug |
+| Backend budget spent (section 4.7 step 8)                                      | not dispatched                                                                                                                                         | unchanged; never a failure                                                             | debug |
 | Capture: any result or error                                                   | removals as above; positive IDs counted in `capture_unpersisted`, never stored                                                                         | only `o`, `oc`, `iv` and `ov`; never `n`, `f` or the breaker                           | debug |
 | Captured `opted_out`, `revoke_scope = "global"`, any client                    | the withdrawal tombstone removes the row (section 5.1)                                                                                                 | removed with the row                                                                   | info  |
 
@@ -2982,6 +2996,9 @@ hold_budget_ms = 100
 hold_retry_sec = 300
 # Per provider response, before and after decoding.
 max_response_bytes = 65536
+# Backend requests one execution may start: origin, auction and provider
+# calls together. Default 32, Fastly's limit; 10 on trial accounts.
+max_backend_requests = 32
 
 [ec.identity.providers.id5]
 # "hold" or "after_send". Default "after_send". Providers run only on
@@ -4124,6 +4141,9 @@ token.
 - Only transport failures, timeouts, 429 and 5xx feed the breaker. 4xx and
   `Malformed` from many visitors never open it.
 - The burst cap is checked after every other eligibility step.
+- A provider call that would take the request past `max_backend_requests`
+  is not sent and counts as no failure; a hold call leaves room for the
+  origin and every auction provider.
 - Passive capture runs from `handle_proxy` only for providers with a capture
   rule matching the request, decodes gzip and brotli bodies under the caps,
   never reads the request body, and never touches `n`, `f` or the breaker.
@@ -4567,6 +4587,7 @@ review, which allowed breaking changes:
 | Non-browser removals | Applied, as consent withdrawals are; only clears need a real browser. Changed after the round 14 review from dropping them                                                                                                                         |
 | Expiry scope         | G7 covers owned expiring sources. A stateless owner keeps its expired record as a refresh anchor until `exp` plus its declared refresh grace. Unowned IDs keep no lifetime (section 2.3). Changed after the round 14 review                        |
 | Opt-out clears       | A TCF re-grant clears only a denial `fp` recorded (new TCF bit 16), with no `LastUpdated` comparison. A clear stores a watermark, the `at` of the opt-out it read, as `ps.oc`, and clears apply before opt-outs. Changed after the round 14 review |
+| Backend budget       | `max_backend_requests` (default 32) bounds origin, auction and provider calls in one execution; a provider call past it is skipped, not a failure, and a hold call reserves the origin and the auction. Added after the round 14 review            |
 | Capture              | Revoke-only: removals, opt-out and clear. Positive IDs are counted, never stored. `capture_enabled` and request-body consent are removed                                                                                                           |
 | Capture-only opt-out | Also removes the records of its sources that no provider wrote, and blocks the browser's values for them. A capture-only provider cannot own a source and must list its `sources`                                                                  |
 | Provider denials     | A provider's `ps.iv` and `ps.ov` filter browser candidates for unowned sources too. An opt-out's removals go to `ps.ov`, which its clear empties                                                                                                   |

@@ -373,7 +373,7 @@ fn warn_if_certificate_check_disabled(settings: &Settings) {
 /// continues to rely on the trusted `fastly-ssl` header injected by
 /// `edgezero_main` after sanitization.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
-    let http_client: Arc<dyn PlatformHttpClient> = Arc::new(FastlyPlatformHttpClient);
+    let http_client: Arc<dyn PlatformHttpClient> = Arc::new(FastlyPlatformHttpClient::default());
     #[cfg(test)]
     let http_client = state.http_client_for_test.clone().unwrap_or(http_client);
     let geo: Arc<dyn PlatformGeo> = Arc::new(FastlyPlatformGeo);

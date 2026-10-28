@@ -372,6 +372,14 @@ pub trait PlatformHttpClient: Send + Sync {
         true
     }
 
+    /// How many upstream requests this client has started, with
+    /// [`send`](Self::send) or [`send_async`](Self::send_async), on the
+    /// platform execution it belongs to. `None` when the adapter does not
+    /// count them, which leaves callers that budget requests unbudgeted.
+    fn requests_started(&self) -> Option<usize> {
+        None
+    }
+
     /// Whether the adapter enforces a hard total deadline for each request.
     ///
     /// First-byte and between-byte timers do not qualify: connection setup or a

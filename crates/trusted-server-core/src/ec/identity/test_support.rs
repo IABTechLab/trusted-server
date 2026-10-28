@@ -2119,6 +2119,7 @@ pub mod fake_http {
         sent: Mutex<Vec<String>>,
         uris: Mutex<Vec<String>>,
         backend: Mutex<Option<Arc<FakeBackend>>>,
+        earlier: Mutex<usize>,
     }
 
     impl FakeHttpClient {
@@ -2131,7 +2132,14 @@ pub mod fake_http {
                 sent: Mutex::new(Vec::new()),
                 uris: Mutex::new(Vec::new()),
                 backend: Mutex::new(None),
+                earlier: Mutex::new(0),
             }
+        }
+
+        /// Counts `count` backend requests as started before any provider
+        /// call, as the origin or the auction would.
+        pub fn started_earlier(&self, count: usize) {
+            *self.earlier.lock().expect("should lock the earlier count") = count;
         }
 
         /// Makes a wait that outlasts the first-byte timeout `backend` last
@@ -2200,6 +2208,11 @@ pub mod fake_http {
 
     #[async_trait::async_trait(?Send)]
     impl PlatformHttpClient for FakeHttpClient {
+        fn requests_started(&self) -> Option<usize> {
+            let earlier = *self.earlier.lock().expect("should lock the earlier count");
+            Some(earlier + self.sent.lock().expect("should lock the sent hosts").len())
+        }
+
         async fn send(
             &self,
             _request: PlatformHttpRequest,

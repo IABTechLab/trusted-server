@@ -661,6 +661,13 @@ pub struct IdentitySettings {
     #[serde(default = "IdentitySettings::default_max_response_bytes")]
     pub max_response_bytes: usize,
 
+    /// Most backend requests one platform execution may start, counting the
+    /// origin, the auction and every provider call. A provider call that
+    /// would pass it is not sent, and is not a failure. Fastly allows 32
+    /// (10 on trial accounts).
+    #[serde(default = "IdentitySettings::default_max_backend_requests")]
+    pub max_backend_requests: usize,
+
     /// Whether `/auction` and `/_ts/page-bids` return the `ts-eids-s` mirror
     /// payload the shim writes. Off until a page script that reads the
     /// mirror is named (spec 15, question 5).
@@ -677,6 +684,12 @@ impl IdentitySettings {
     #[must_use]
     pub const fn default_max_concurrency() -> usize {
         4
+    }
+
+    /// Default backend request budget: Fastly's per-execution limit.
+    #[must_use]
+    pub const fn default_max_backend_requests() -> usize {
+        32
     }
 
     /// Default hold budget in milliseconds.
@@ -711,6 +724,7 @@ impl Default for IdentitySettings {
             hold_budget_ms: Self::default_hold_budget_ms(),
             hold_retry_sec: Self::default_hold_retry_sec(),
             max_response_bytes: Self::default_max_response_bytes(),
+            max_backend_requests: Self::default_max_backend_requests(),
             mirror_enabled: false,
             providers: BTreeMap::new(),
         }
