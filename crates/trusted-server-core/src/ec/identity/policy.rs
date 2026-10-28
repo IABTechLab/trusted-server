@@ -228,6 +228,7 @@ mod tests {
     use crate::consent::types::{GppConsent, TcfConsent};
     use crate::consent::us_privacy::decode_us_privacy;
     use crate::ec::identity::descriptor::{ConsentPolicy, UsOptOut};
+    use crate::ec::identity::test_support::resolver_policy;
 
     #[derive(Default)]
     struct Signals {
@@ -303,7 +304,7 @@ mod tests {
 
     #[test]
     fn strict_blocks_each_signal_it_decodes() {
-        let strict = ConsentPolicy::strict();
+        let strict = resolver_policy();
         let allowed = consent_with(Signals::default());
         assert!(
             policy_allows(&strict, &allowed, PolicySignals { dnt: false }),
@@ -361,7 +362,7 @@ mod tests {
         });
         assert!(
             policy_allows(
-                &ConsentPolicy::strict().allowing_gpc(),
+                &resolver_policy().allowing_gpc(),
                 &gpc,
                 PolicySignals { dnt: false }
             ),
@@ -373,7 +374,7 @@ mod tests {
         });
         assert!(
             policy_allows(
-                &ConsentPolicy::strict().allowing_us_opt_out(UsOptOut::Sale),
+                &resolver_policy().allowing_us_opt_out(UsOptOut::Sale),
                 &sale,
                 PolicySignals { dnt: false }
             ),
@@ -387,7 +388,7 @@ mod tests {
         });
         assert!(
             policy_allows(
-                &ConsentPolicy::strict().with_tcf_vendor(9999),
+                &resolver_policy().with_tcf_vendor(9999),
                 &gdpr,
                 PolicySignals { dnt: false }
             ),
@@ -395,7 +396,7 @@ mod tests {
         );
         assert!(
             !policy_allows(
-                &ConsentPolicy::strict().with_tcf_vendor(1234),
+                &resolver_policy().with_tcf_vendor(1234),
                 &gdpr,
                 PolicySignals { dnt: false }
             ),
@@ -428,7 +429,7 @@ mod tests {
         });
         assert!(
             policy_allows(
-                &ConsentPolicy::strict(),
+                &resolver_policy(),
                 &header_only,
                 PolicySignals { dnt: false }
             ),
@@ -442,7 +443,7 @@ mod tests {
         });
         assert!(
             !policy_allows(
-                &ConsentPolicy::strict(),
+                &resolver_policy(),
                 &under_gdpr,
                 PolicySignals { dnt: false }
             ),
@@ -456,11 +457,7 @@ mod tests {
             ..Signals::default()
         });
         assert!(
-            policy_allows(
-                &ConsentPolicy::strict(),
-                &gpp_tcf,
-                PolicySignals { dnt: false }
-            ),
+            policy_allows(&resolver_policy(), &gpp_tcf, PolicySignals { dnt: false }),
             "should accept TCF consent from a GPP TCF section"
         );
 
@@ -468,7 +465,7 @@ mod tests {
         undecodable.raw_gpp_string = Some("not-a-gpp-string".to_owned());
         assert!(
             !policy_allows(
-                &ConsentPolicy::strict(),
+                &resolver_policy(),
                 &undecodable,
                 PolicySignals { dnt: false }
             ),
@@ -487,14 +484,14 @@ mod tests {
         let mut consent = consent_with(Signals::default());
         consent.raw_gpp_string = Some("corrupt".to_owned());
         consent.gpp = Some(corrupt);
-        let relaxed = ConsentPolicy::strict()
+        let relaxed = resolver_policy()
             .allowing_gpc()
             .allowing_dnt()
             .allowing_us_opt_out(UsOptOut::Sale)
             .allowing_us_opt_out(UsOptOut::Sharing)
             .allowing_us_opt_out(UsOptOut::TargetedAdvertising);
         assert!(
-            !allows(&ConsentPolicy::strict(), &consent),
+            !allows(&resolver_policy(), &consent),
             "should block strict on an undecodable US section"
         );
         assert!(
@@ -507,7 +504,7 @@ mod tests {
         );
         let control = consent_with_gpp(|_| {});
         assert!(
-            allows(&ConsentPolicy::strict(), &control),
+            allows(&resolver_policy(), &control),
             "should allow a decodable GPP string under the same policy"
         );
     }
@@ -527,7 +524,7 @@ mod tests {
 
     #[test]
     fn strict_blocks_sharing_targeted_gpc_field_and_known_child() {
-        let strict = ConsentPolicy::strict();
+        let strict = resolver_policy();
         let control = consent_with_gpp(|gpp| {
             gpp.us_sharing_opt_out = Some(false);
             gpp.us_targeted_advertising_opt_out = Some(false);
@@ -546,14 +543,14 @@ mod tests {
         );
         assert!(
             allows(
-                &ConsentPolicy::strict().allowing_us_opt_out(UsOptOut::Sharing),
+                &resolver_policy().allowing_us_opt_out(UsOptOut::Sharing),
                 &sharing
             ),
             "should allow the sharing opt-out when the policy relaxes it"
         );
         assert!(
             !allows(
-                &ConsentPolicy::strict().allowing_us_opt_out(UsOptOut::TargetedAdvertising),
+                &resolver_policy().allowing_us_opt_out(UsOptOut::TargetedAdvertising),
                 &sharing
             ),
             "should keep blocking sharing when only another opt-out is relaxed"
@@ -566,7 +563,7 @@ mod tests {
         );
         assert!(
             allows(
-                &ConsentPolicy::strict().allowing_us_opt_out(UsOptOut::TargetedAdvertising),
+                &resolver_policy().allowing_us_opt_out(UsOptOut::TargetedAdvertising),
                 &targeted
             ),
             "should allow the targeted-advertising opt-out when the policy relaxes it"
@@ -575,12 +572,12 @@ mod tests {
         let gpc = consent_with_gpp(|gpp| gpp.us_gpc = Some(true));
         assert!(!allows(&strict, &gpc), "should block on GPP's GPC field");
         assert!(
-            allows(&ConsentPolicy::strict().allowing_gpc(), &gpc),
+            allows(&resolver_policy().allowing_gpc(), &gpc),
             "should allow GPP's GPC field when the policy relaxes GPC"
         );
 
         let child = consent_with_gpp(|gpp| gpp.us_known_child = Some(true));
-        let everything_relaxed = ConsentPolicy::strict()
+        let everything_relaxed = resolver_policy()
             .allowing_gpc()
             .allowing_dnt()
             .allowing_us_opt_out(UsOptOut::Sale)
@@ -608,12 +605,12 @@ mod tests {
             gpp.us_targeted_advertising_opt_out = Some(true);
         });
         assert!(
-            !allows(&ConsentPolicy::strict(), &consent),
+            !allows(&resolver_policy(), &consent),
             "should block on targeted advertising alone"
         );
         let sale_only = consent_with_gpp(|gpp| gpp.us_sale_opt_out = Some(false));
         assert!(
-            allows(&ConsentPolicy::strict(), &sale_only),
+            allows(&resolver_policy(), &sale_only),
             "should allow when nothing opts out"
         );
     }
@@ -624,12 +621,12 @@ mod tests {
             gpp.us_privacy_section = Some(decode_us_privacy("1YYN").expect("should decode"));
         });
         assert!(
-            !allows(&ConsentPolicy::strict(), &opted_out),
+            !allows(&resolver_policy(), &opted_out),
             "should block on a sale opt-out in GPP section 6"
         );
         assert!(
             allows(
-                &ConsentPolicy::strict().allowing_us_opt_out(UsOptOut::Sale),
+                &resolver_policy().allowing_us_opt_out(UsOptOut::Sale),
                 &opted_out
             ),
             "should allow it when the policy relaxes the sale opt-out"
@@ -638,7 +635,7 @@ mod tests {
             gpp.us_privacy_section = Some(decode_us_privacy("1YNN").expect("should decode"));
         });
         assert!(
-            allows(&ConsentPolicy::strict(), &not_opted_out),
+            allows(&resolver_policy(), &not_opted_out),
             "should allow a section 6 string that does not opt out"
         );
     }
@@ -648,24 +645,24 @@ mod tests {
         let mut raw_gpp = consent_with(Signals::default());
         raw_gpp.raw_gpp_string = Some("DBABTA~1YNN".to_owned());
         assert!(
-            !allows(&ConsentPolicy::strict(), &raw_gpp),
+            !allows(&resolver_policy(), &raw_gpp),
             "should block a raw GPP string with no decoded form"
         );
         raw_gpp.gpp = Some(decode_gpp_string("DBABTA~1YNN").expect("should decode"));
         assert!(
-            allows(&ConsentPolicy::strict(), &raw_gpp),
+            allows(&resolver_policy(), &raw_gpp),
             "should allow the same string once it decodes"
         );
 
         let mut raw_usp = consent_with(Signals::default());
         raw_usp.raw_us_privacy = Some("1YNN".to_owned());
         assert!(
-            !allows(&ConsentPolicy::strict(), &raw_usp),
+            !allows(&resolver_policy(), &raw_usp),
             "should block a raw US Privacy string with no decoded form"
         );
         raw_usp.us_privacy = Some(decode_us_privacy("1YNN").expect("should decode"));
         assert!(
-            allows(&ConsentPolicy::strict(), &raw_usp),
+            allows(&resolver_policy(), &raw_usp),
             "should allow the same string once it decodes"
         );
     }
@@ -679,11 +676,11 @@ mod tests {
             ..Signals::default()
         });
         assert!(
-            allows(&ConsentPolicy::strict(), &gdpr),
+            allows(&resolver_policy(), &gdpr),
             "should allow purposes 1 and 4 under strict"
         );
         assert!(
-            !allows(&ConsentPolicy::strict().with_tcf_purposes([7]), &gdpr),
+            !allows(&resolver_policy().with_tcf_purposes([7]), &gdpr),
             "should block when a custom required purpose is not granted"
         );
         let with_seven = consent_with(Signals {
@@ -692,7 +689,7 @@ mod tests {
             ..Signals::default()
         });
         assert!(
-            allows(&ConsentPolicy::strict().with_tcf_purposes([7]), &with_seven),
+            allows(&resolver_policy().with_tcf_purposes([7]), &with_seven),
             "should allow when the custom required purpose is granted"
         );
 
@@ -704,11 +701,11 @@ mod tests {
             ..Signals::default()
         });
         assert!(
-            allows(&ConsentPolicy::strict().with_tcf_vendor(9999), &gpp_tcf),
+            allows(&resolver_policy().with_tcf_vendor(9999), &gpp_tcf),
             "should allow a vendor granted in the GPP TCF section"
         );
         assert!(
-            !allows(&ConsentPolicy::strict().with_tcf_vendor(1234), &gpp_tcf),
+            !allows(&resolver_policy().with_tcf_vendor(1234), &gpp_tcf),
             "should block a vendor the GPP TCF section does not grant"
         );
     }
@@ -742,7 +739,7 @@ mod tests {
             purposes: vec![1],
             ..Signals::default()
         });
-        let strict = ConsentPolicy::strict();
+        let strict = resolver_policy();
 
         assert_eq!(
             fingerprint(&strict, &first),
@@ -768,7 +765,7 @@ mod tests {
 
     #[test]
     fn fingerprint_bits_name_each_opt_out_separately() {
-        let strict = ConsentPolicy::strict();
+        let strict = resolver_policy();
         let bits = |consent: &ConsentContext| {
             u64::from_str_radix(&fingerprint(&strict, consent), 16).expect("should parse as hex")
         };
@@ -793,7 +790,7 @@ mod tests {
             "should tell the two opt-outs apart"
         );
 
-        let relaxed = ConsentPolicy::strict()
+        let relaxed = resolver_policy()
             .allowing_us_opt_out(UsOptOut::Sharing)
             .allowing_us_opt_out(UsOptOut::TargetedAdvertising);
         assert_eq!(
@@ -810,7 +807,7 @@ mod tests {
 
     #[test]
     fn fingerprint_names_gpp_gpc_sale_and_the_mask() {
-        let strict = ConsentPolicy::strict();
+        let strict = resolver_policy();
         let gpp_gpc = consent_with_gpp(|gpp| gpp.us_gpc = Some(true));
         assert_eq!(
             fingerprint(&strict, &gpp_gpc),
@@ -838,7 +835,7 @@ mod tests {
 
     #[test]
     fn fingerprint_keeps_part_1_bit_positions() {
-        let policy = ConsentPolicy::strict()
+        let policy = resolver_policy()
             .with_tcf_purposes([2, 10])
             .with_tcf_vendor(5);
         let mut consent = consent_with(Signals {

@@ -1874,6 +1874,7 @@ password = "production-admin-password-32-bytes"
             ProviderDescriptor::builder("secreted".parse()?)
                 .with_source("secreted.example.com".parse()?)
                 .with_resolves(Resolves::new().with_endpoint("https://api.example.com/fetch"))
+                .with_consent_policy(crate::ec::identity::test_support::resolver_policy())
                 .build()
         }
     }

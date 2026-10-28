@@ -809,6 +809,7 @@ mod tests {
         ProviderDescriptor::builder("p".parse().expect("should parse the provider id"))
             .with_source("example.com".parse().expect("should parse the source"))
             .with_resolves(resolves)
+            .with_consent_policy(crate::ec::identity::test_support::resolver_policy())
             .build()
             .expect("should build")
     }

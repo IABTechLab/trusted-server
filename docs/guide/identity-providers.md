@@ -42,7 +42,11 @@ ProviderDescriptor::builder("exampleid".parse()?)
             .with_wants([Input::PageUrl])
             .with_private_state(),
     )
-    .with_consent_policy(ConsentPolicy::strict().with_tcf_vendor(9999))
+    .with_consent_policy(
+        ConsentPolicy::strict()
+            .with_tcf_purposes([4])
+            .with_tcf_vendor(9999),
+    )
     .build()?
 ```
 
@@ -52,8 +56,8 @@ ProviderDescriptor::builder("exampleid".parse()?)
 - `with_private_state` lets you keep a small JSON blob between calls (see [Private state](#private-state)).
 - `with_expiring_ids` or `with_expiring_source` marks IDs as expiring. A set for an expiring source must then carry an expiry.
 - `Resolves::with_refresh_grace` is for an owner without private state whose refresh accepts an expired ID. An expired record it wrote stays a refresh anchor until its expiry plus the grace, so a backoff or a quiet spell does not turn the next call into an `Initial`. It needs the `Refresh` kind and a grace above zero.
-- `ConsentPolicy::strict()` is the default. It blocks when any consent signal cannot be decoded, requires TCF Purposes 1 and 4 where TCF applies, and blocks on every US opt-out, `Sec-GPC: 1` and `DNT: 1`. Relaxations such as `allowing_dnt` need a documented legal basis in the vendor spec.
-- `build()` fails with `Config` for a descriptor with no source or no capability, a missing or non-`https` endpoint, or invalid provenance.
+- `ConsentPolicy::strict()` is the default. It blocks when any consent signal cannot be decoded, requires TCF Purpose 1 where TCF applies, and blocks on every US opt-out, `Sec-GPC: 1` and `DNT: 1`. A provider that resolves must declare the purposes its GVL entry lists with `with_tcf_purposes` (Purpose 1 is always required) and its GVL ID with `with_tcf_vendor`. A vendor with no GVL ID calls `without_tcf_vendor` instead, so purpose consent alone lets it run. That and relaxations such as `allowing_dnt` need a documented legal basis in the vendor spec.
+- `build()` fails with `Config` for a descriptor with no source or no capability, a missing or non-`https` endpoint, invalid provenance, or a resolving policy that declares no purposes or names no vendor without `without_tcf_vendor`.
 
 The descriptor must never read a secret field. Deploy validation runs before secrets resolve and would see key names. `check_descriptor_ignores_secrets` enforces this in tests.
 

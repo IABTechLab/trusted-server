@@ -253,6 +253,9 @@ impl ProviderDescriptorBuilder {
                     )));
                 }
             }
+            if let Some(gap) = self.consent_policy.resolver_gap() {
+                return Err(fail(gap));
+            }
         }
 
         let expiring = if self.expiring_all {
@@ -601,28 +604,52 @@ pub struct ConsentPolicy {
     allow_gpc: bool,
     allowed_us_opt_outs: BTreeSet<UsOptOut>,
     eid_persistence_only: bool,
+    purposes_declared: bool,
+    without_vendor: bool,
 }
 
 impl ConsentPolicy {
     /// The default. Blocked when any consent signal present cannot be
-    /// decoded. Where TCF applies, requires Purposes 1 and 4. Blocked by
-    /// every US opt-out TS decodes, by `Sec-GPC: 1` and by `DNT: 1`.
+    /// decoded. Where TCF applies, requires Purpose 1 and whatever the
+    /// provider declares with [`with_tcf_purposes`](Self::with_tcf_purposes)
+    /// and [`with_tcf_vendor`](Self::with_tcf_vendor). Blocked by every US
+    /// opt-out TS decodes, by `Sec-GPC: 1` and by `DNT: 1`.
+    ///
+    /// A resolver's policy must declare its purposes and its vendor, or say
+    /// it has none with [`without_tcf_vendor`](Self::without_tcf_vendor);
+    /// [`ProviderDescriptorBuilder::build`] rejects it otherwise.
     #[must_use]
     pub fn strict() -> Self {
         Self {
-            tcf_purposes: [1, 4].into_iter().collect(),
+            tcf_purposes: [1].into_iter().collect(),
             tcf_vendor: None,
             allow_dnt: false,
             allow_gpc: false,
             allowed_us_opt_outs: BTreeSet::new(),
             eid_persistence_only: false,
+            purposes_declared: false,
+            without_vendor: false,
         }
     }
 
-    /// Also requires these TCF purposes, where TCF applies.
+    /// Declares the TCF purposes the provider processes under consent, as
+    /// its GVL entry lists them. Each is required where TCF applies, beside
+    /// Purpose 1, which is always required. An empty list declares Purpose 1
+    /// alone.
     #[must_use]
     pub fn with_tcf_purposes(mut self, purposes: impl IntoIterator<Item = u8>) -> Self {
         self.tcf_purposes.extend(purposes);
+        self.purposes_declared = true;
+        self
+    }
+
+    /// Declares that the provider has no IAB Global Vendor List ID, so no
+    /// vendor consent is checked: purpose consent alone lets it run where
+    /// TCF applies. Needs a documented legal basis (TCF Policies, Chapter
+    /// III, Policy 14(3)).
+    #[must_use]
+    pub fn without_tcf_vendor(mut self) -> Self {
+        self.without_vendor = true;
         self
     }
 
@@ -662,6 +689,8 @@ impl ConsentPolicy {
     pub(in crate::ec::identity) fn eid_persistence_only() -> Self {
         Self {
             eid_persistence_only: true,
+            purposes_declared: true,
+            without_vendor: true,
             ..Self::strict()
         }
     }
@@ -700,6 +729,19 @@ impl ConsentPolicy {
     #[must_use]
     pub(crate) fn is_eid_persistence_only(&self) -> bool {
         self.eid_persistence_only
+    }
+
+    /// Why a resolver may not use this policy, if it may not.
+    fn resolver_gap(&self) -> Option<&'static str> {
+        if !self.purposes_declared {
+            Some("consent policy declares no TCF purposes; call with_tcf_purposes")
+        } else if self.tcf_vendor.is_none() && !self.without_vendor {
+            Some(
+                "consent policy names no TCF vendor; call with_tcf_vendor, or without_tcf_vendor with a documented legal basis",
+            )
+        } else {
+            None
+        }
     }
 }
 
@@ -771,7 +813,11 @@ mod tests {
                     .with_needs([Input::ClientIp, Input::UserAgent])
                     .with_wants([Input::PageUrl]),
             )
-            .with_consent_policy(ConsentPolicy::strict().with_tcf_vendor(9999))
+            .with_consent_policy(
+                ConsentPolicy::strict()
+                    .with_tcf_purposes([4])
+                    .with_tcf_vendor(9999),
+            )
             .build()
             .expect("should build");
 
@@ -815,7 +861,72 @@ mod tests {
                 .copied()
                 .collect::<Vec<_>>(),
             vec![1, 4],
-            "should require Purposes 1 and 4 under strict"
+            "should require Purpose 1 and the declared Purpose 4"
+        );
+    }
+
+    #[test]
+    fn strict_requires_only_purpose_one_until_purposes_are_declared() {
+        let policy = ConsentPolicy::strict();
+
+        assert_eq!(
+            policy.tcf_purposes().iter().copied().collect::<Vec<_>>(),
+            vec![1],
+            "should require Purpose 1 alone"
+        );
+        assert_eq!(
+            ConsentPolicy::strict()
+                .with_tcf_purposes([3, 5])
+                .tcf_purposes()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1, 3, 5],
+            "should add the declared purposes to Purpose 1"
+        );
+    }
+
+    #[test]
+    fn a_resolver_must_declare_its_purposes_and_vendor() {
+        let resolver = |policy: ConsentPolicy| {
+            ProviderDescriptor::builder(id("p"))
+                .with_source(source("example.com"))
+                .with_resolves(Resolves::new().with_endpoint("https://a.example.com"))
+                .with_consent_policy(policy)
+                .build()
+        };
+
+        let undeclared = resolver(ConsentPolicy::strict().with_tcf_vendor(5))
+            .expect_err("should reject a resolver that declares no purposes");
+        let no_vendor = resolver(ConsentPolicy::strict().with_tcf_purposes([4]))
+            .expect_err("should reject a resolver that names no vendor");
+        let relaxed = resolver(
+            ConsentPolicy::strict()
+                .with_tcf_purposes([])
+                .without_tcf_vendor(),
+        )
+        .expect("should build a resolver that opts out of vendor consent");
+        let capture = ProviderDescriptor::builder(id("p"))
+            .with_source(source("example.com"))
+            .with_captures(Captures::new().with_path(Method::POST, "/integrations/p/api"))
+            .build();
+
+        assert!(
+            format!("{undeclared:?}").contains("with_tcf_purposes"),
+            "should name the missing purposes"
+        );
+        assert!(
+            format!("{no_vendor:?}").contains("without_tcf_vendor"),
+            "should name the vendor relaxation"
+        );
+        assert_eq!(
+            relaxed.consent_policy().tcf_vendor(),
+            None,
+            "should check no vendor"
+        );
+        assert!(
+            capture.is_ok(),
+            "should not require a policy of a capture-only provider"
         );
     }
 

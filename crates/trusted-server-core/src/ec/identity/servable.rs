@@ -90,6 +90,7 @@ mod tests {
     use super::*;
     use crate::ec::identity::descriptor::{Captures, ConsentPolicy, ProviderDescriptor, Resolves};
     use crate::ec::identity::provider::IdentityProvider;
+    use crate::ec::identity::test_support::resolver_policy;
     use crate::ec::identity::test_support::{
         example_entry_set, full_record, test_consent_allowing_everything,
         test_consent_gdpr_without_vendor,
@@ -364,7 +365,7 @@ mod tests {
 
     #[test]
     fn writer_policy_applies_to_unowned_sources() {
-        let strict = ConsentPolicy::strict().with_tcf_vendor(9999);
+        let strict = resolver_policy().with_tcf_vendor(9999);
         let catalog = ProviderCatalog::new(
             vec![provider("p", "a.example.com", strict, false)],
             BTreeMap::new(),

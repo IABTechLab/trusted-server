@@ -3766,9 +3766,7 @@ mod tests {
 
         impl InvalidatingProvider {
             fn new(id: &str, source: &str) -> Self {
-                use trusted_server_core::ec::identity::{
-                    ConsentPolicy, ProviderDescriptor, Resolves,
-                };
+                use trusted_server_core::ec::identity::{ProviderDescriptor, Resolves};
                 let source: trusted_server_core::ec::identity::SourceDomain =
                     source.parse().expect("should parse the source");
                 let descriptor =
@@ -3777,7 +3775,9 @@ mod tests {
                         .with_resolves(
                             Resolves::new().with_endpoint("https://probe.example.com/resolve"),
                         )
-                        .with_consent_policy(ConsentPolicy::strict())
+                        .with_consent_policy(
+                            trusted_server_core::ec::identity::test_support::resolver_policy(),
+                        )
                         .build()
                         .expect("should build the descriptor");
                 Self { descriptor, source }

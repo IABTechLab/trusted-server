@@ -21,7 +21,7 @@ use http::{HeaderValue, Response, header};
 use crate::consent::ConsentContext;
 use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_REVOKED};
 use crate::ec::identity::descriptor::ConsentPolicy;
-use crate::ec::identity::policy::{PolicySignals, fingerprint_bits};
+use crate::ec::identity::policy::{FP_PURPOSES, PolicySignals, fingerprint_bits};
 use crate::settings::Settings;
 
 /// Maximum age for the EC cookie (1 year in seconds).
@@ -156,13 +156,14 @@ pub fn set_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>, ec_
     }
 }
 
-/// The value of the global-revoke marker for `consent`: the strict
-/// policy's consent fingerprint (TCF bits, US opt-outs and GPC), hex. It
-/// changes when the visitor's consent changes, and not when a CMP re-saves
-/// the same decisions (spec 8).
+/// The value of the global-revoke marker for `consent`: a consent
+/// fingerprint over every TCF purpose, the US opt-outs and GPC, hex. It
+/// changes when any of the visitor's purpose decisions changes, and not
+/// when a CMP re-saves the same decisions (spec 8).
 #[must_use]
 pub(crate) fn revoke_marker_value(consent: &ConsentContext) -> String {
-    fingerprint_bits(&ConsentPolicy::strict(), consent, PolicySignals::default())
+    let policy = ConsentPolicy::strict().with_tcf_purposes(1..=FP_PURPOSES);
+    fingerprint_bits(&policy, consent, PolicySignals::default())
 }
 
 fn append_revoke_marker(
@@ -227,8 +228,31 @@ pub fn expire_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ec::identity::test_support::test_consent_gdpr_without_vendor;
     use crate::test_support::tests::create_test_settings;
     use http::header;
+
+    #[test]
+    fn revoke_marker_changes_with_any_purpose_decision() {
+        let granted = test_consent_gdpr_without_vendor(5);
+        let mut withdrawn = granted.clone();
+        withdrawn
+            .tcf
+            .as_mut()
+            .expect("should carry a TC string")
+            .purpose_consents[1] = false;
+
+        assert_ne!(
+            revoke_marker_value(&granted),
+            revoke_marker_value(&withdrawn),
+            "should change when Purpose 2 alone changes"
+        );
+        assert_eq!(
+            revoke_marker_value(&granted),
+            revoke_marker_value(&granted.clone()),
+            "should not change when nothing changes"
+        );
+    }
 
     fn empty_response() -> Response<EdgeBody> {
         Response::builder()

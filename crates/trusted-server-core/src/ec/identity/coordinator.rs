@@ -2329,7 +2329,7 @@ mod tests {
     };
     use crate::ec::identity::test_support::{
         OutcomeFixture, allowing_consent, facts_for_writer, fixed_capture_provider, fixed_provider,
-        pid, provider_from, record_for_test, source, stateful_fixed_provider,
+        pid, provider_from, record_for_test, resolver_policy, source, stateful_fixed_provider,
         test_consent_gdpr_without_vendor,
     };
     use crate::ec::kv_types::{KvEid, KvUid};
@@ -2531,7 +2531,7 @@ mod tests {
             "p",
             &["a.example.com"],
             Resolves::new(),
-            ConsentPolicy::strict().with_tcf_vendor(5),
+            resolver_policy().with_tcf_vendor(5),
         );
         let blocked =
             EligibilityFixture::new(&provider).with_consent(test_consent_gdpr_without_vendor(5));
@@ -2759,7 +2759,7 @@ mod tests {
             "q",
             &["a.example.com"],
             Resolves::new(),
-            ConsentPolicy::strict().with_tcf_vendor(5),
+            resolver_policy().with_tcf_vendor(5),
         );
         let asking = fixed_provider("p", &["a.example.com"]);
         let catalog = ProviderCatalog::new(vec![hiding, asking.clone()], BTreeMap::new());
@@ -3090,7 +3090,7 @@ mod tests {
     #[test]
     fn fingerprint_bits_is_a_plain_hex_bitmask_and_changes_with_each_signal() {
         let policy = ConsentPolicy::strict()
-            .with_tcf_purposes([2, 10])
+            .with_tcf_purposes([2, 4, 10])
             .with_tcf_vendor(5);
         let signals = PolicySignals::default();
         let gdpr = test_consent_gdpr_without_vendor(6);
@@ -3173,8 +3173,8 @@ mod tests {
 
     #[test]
     fn fingerprint_bits_leaves_a_relaxed_signal_at_zero_and_never_moves_a_bit() {
-        let strict = ConsentPolicy::strict();
-        let relaxed = ConsentPolicy::strict()
+        let strict = resolver_policy();
+        let relaxed = resolver_policy()
             .allowing_gpc()
             .allowing_dnt()
             .allowing_us_opt_out(UsOptOut::Sale);
@@ -3194,7 +3194,7 @@ mod tests {
         );
         assert_eq!(
             fingerprint_bits(
-                &ConsentPolicy::strict().with_tcf_purposes([7]),
+                &resolver_policy().with_tcf_purposes([7]),
                 &consent,
                 PolicySignals::default()
             ),
@@ -3624,7 +3624,7 @@ mod tests {
     #[test]
     fn opted_out_records_the_fingerprint_of_the_current_consent() {
         let provider = fixed_provider("p", &["a.example.com"]);
-        let policy = ConsentPolicy::strict();
+        let policy = resolver_policy();
         let mut consent = allowing_consent();
         consent.gpc = true;
         let fingerprint = fingerprint_bits(&policy, &consent, PolicySignals::default());
@@ -5341,7 +5341,7 @@ mod tests {
 
     #[test]
     fn tcf_regrant_clears_only_a_denial_the_opt_out_recorded() {
-        let descriptor = regrant_descriptor(ConsentPolicy::strict().with_tcf_vendor(5));
+        let descriptor = regrant_descriptor(resolver_policy().with_tcf_vendor(5));
         let signals = PolicySignals::default();
         // `test_consent_gdpr_without_vendor(v)` grants every purpose and every
         // vendor but `v`, so 99 grants vendor 5 and 5 denies it.
@@ -5393,13 +5393,13 @@ mod tests {
                 "regrant",
                 &["a.example.com"],
                 Resolves::new(),
-                ConsentPolicy::strict(),
+                resolver_policy(),
             )],
             BTreeMap::new(),
         );
         let mut view = EligibilityView::empty();
         let sale = gpp_consent(Some(true), None);
-        let fp = fingerprint_bits(&ConsentPolicy::strict(), &sale, PolicySignals::default());
+        let fp = fingerprint_bits(&resolver_policy(), &sale, PolicySignals::default());
         view.set_opt_out_for_test("regrant", 700, None);
         view.providers
             .get_mut(&pid("regrant"))
@@ -5420,7 +5420,7 @@ mod tests {
 
     #[test]
     fn jurisdiction_change_never_clears_it() {
-        let descriptor = regrant_descriptor(ConsentPolicy::strict());
+        let descriptor = regrant_descriptor(resolver_policy());
         let signals = PolicySignals::default();
         let sale = stored_opt_out(1_000, "800");
 
@@ -5456,7 +5456,7 @@ mod tests {
 
     #[test]
     fn gpp_regrant_clears_when_none_of_the_recorded_opt_outs_remain() {
-        let descriptor = regrant_descriptor(ConsentPolicy::strict());
+        let descriptor = regrant_descriptor(resolver_policy());
         let signals = PolicySignals::default();
         let sale_opt_out = gpp_consent(Some(true), None);
         let stored = fingerprint_bits(descriptor.consent_policy(), &sale_opt_out, signals);

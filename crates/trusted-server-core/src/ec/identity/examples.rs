@@ -51,7 +51,11 @@ impl IdentityProviderConfig for ExampleIdConfig {
                     .with_wants([Input::PageUrl])
                     .with_private_state(),
             )
-            .with_consent_policy(ConsentPolicy::strict().with_tcf_vendor(self.gvl_id))
+            .with_consent_policy(
+                ConsentPolicy::strict()
+                    .with_tcf_purposes([4])
+                    .with_tcf_vendor(self.gvl_id),
+            )
             .build()
     }
 }
@@ -238,7 +242,7 @@ mod tests {
     use crate::ec::identity::ids::SourceDomain;
     use crate::ec::identity::test_support::{
         CaptureFixture, ConformanceCases, ConformanceFailure, HarnessSetup, ProviderHarness,
-        TestConsent, check_descriptor_ignores_secrets,
+        TestConsent, check_descriptor_ignores_secrets, resolver_policy,
     };
     use crate::openrtb::{Eid, Uid};
 
@@ -321,6 +325,7 @@ mod tests {
                 .expect("should parse the provider id"),
         )
         .with_source(source())
+        .with_consent_policy(resolver_policy())
     }
 
     fn resolves() -> Resolves {

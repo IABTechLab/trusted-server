@@ -677,7 +677,11 @@ let descriptor = ProviderDescriptor::builder("exampleid".parse()?)
             .with_needs([Input::ClientIp, Input::UserAgent])
             .with_wants([Input::PageUrl]),
     )
-    .with_consent_policy(ConsentPolicy::strict().with_tcf_vendor(9999))
+    .with_consent_policy(
+        ConsentPolicy::strict()
+            .with_tcf_purposes([4])
+            .with_tcf_vendor(9999),
+    )
     .build()?;
 ```
 
@@ -807,15 +811,20 @@ pub enum Access {
 
 impl ConsentPolicy {
     /// The default. Blocked when any consent signal present cannot be
-    /// decoded. Where TCF applies, requires Purposes 1 and 4. Blocked by every
-    /// US opt-out TS decodes (sale, sharing, targeted advertising, and the
-    /// GPC and known-child fields of GPP sections), by `Sec-GPC: 1` and by
-    /// `DNT: 1`.
+    /// decoded. Where TCF applies, requires Purpose 1 and the purposes and
+    /// vendor the provider declares. Blocked by every US opt-out TS decodes
+    /// (sale, sharing, targeted advertising, and the GPC and known-child
+    /// fields of GPP sections), by `Sec-GPC: 1` and by `DNT: 1`.
     pub fn strict() -> Self;
-    /// Also requires these TCF purposes, where TCF applies.
+    /// Declares the TCF purposes the provider processes under consent, as
+    /// its GVL entry lists them. Each is required where TCF applies, beside
+    /// Purpose 1, which is always required.
     pub fn with_tcf_purposes(self, purposes: impl IntoIterator<Item = u8>) -> Self;
     /// Requires vendor consent for this IAB Global Vendor List ID.
     pub fn with_tcf_vendor(self, vendor_id: u16) -> Self;
+    /// Declares that the provider has no GVL ID, so purpose consent alone
+    /// lets it run where TCF applies. Needs a documented legal basis.
+    pub fn without_tcf_vendor(self) -> Self;
     /// Relaxations. Each needs a documented legal basis in the vendor spec.
     pub fn allowing_dnt(self) -> Self;
     pub fn allowing_gpc(self) -> Self;
@@ -836,6 +845,18 @@ impl SourceDomain {
     pub fn matches(&self, name: &str) -> bool;
 }
 ```
+
+**Declared purposes and vendor.** Decided after the round 14 review. A
+fixed purpose set fits no vendor: one GVL entry lists purposes another does
+not. So `strict()` requires only Purpose 1, and `build()` returns `Config`
+for a descriptor with `resolves` whose policy never calls
+`with_tcf_purposes`, or names no vendor with `with_tcf_vendor` and does not
+call `without_tcf_vendor`. TCF Policies, Chapter III, Policy 14(3) needs a
+legal basis for each vendor's processing, so purpose consent alone is
+never the default. A capture-only provider needs neither, because it sends
+nothing. Generic pull keeps its parity policy (`eid_persistence_only`,
+section 10.4), which checks no TCF purpose or vendor, as pull sync does
+today.
 
 The full EC ID is not an `Input`. A public variant would let any provider
 declare it, and only generic pull may receive it. `Resolves` has a
@@ -1335,7 +1356,11 @@ impl IdentityProviderConfig for ExampleIdConfig {
                     .with_wants([Input::PageUrl])
                     .with_private_state(),
             )
-            .with_consent_policy(ConsentPolicy::strict().with_tcf_vendor(self.gvl_id))
+            .with_consent_policy(
+                ConsentPolicy::strict()
+                    .with_tcf_purposes([4])
+                    .with_tcf_vendor(self.gvl_id),
+            )
             .build()
     }
 }
@@ -3360,7 +3385,11 @@ impl IdentityProviderConfig for LiveRampConfig {
                     .with_needs([Input::ClientIp, Input::Region])
                     .with_needs_for(ResolveKind::Initial, [Input::HashedEmail]),
             )
-            .with_consent_policy(ConsentPolicy::strict().with_tcf_vendor(LIVERAMP_GVL_ID))
+            .with_consent_policy(
+                ConsentPolicy::strict()
+                    .with_tcf_purposes(LIVERAMP_TCF_PURPOSES)
+                    .with_tcf_vendor(LIVERAMP_GVL_ID),
+            )
             .build()
     }
 }
@@ -3800,9 +3829,12 @@ impl IdentityProviderConfig for Uid2Config {
             )
             // UID2 has no GVL ID. An operator whose UID2 operator is a TCF
             // vendor names its ID in config.
-            .with_consent_policy(match self.tcf_vendor_id {
-                Some(vendor) => ConsentPolicy::strict().with_tcf_vendor(vendor),
-                None => ConsentPolicy::strict(),
+            .with_consent_policy({
+                let policy = ConsentPolicy::strict().with_tcf_purposes(UID2_TCF_PURPOSES);
+                match self.tcf_vendor_id {
+                    Some(vendor) => policy.with_tcf_vendor(vendor),
+                    None => policy.without_tcf_vendor(),
+                }
             })
             .build()
     }
@@ -4731,26 +4763,27 @@ Decisions made while writing this spec, with the user:
 Revision 15 applies these decisions, made by the user after the round 14
 review, which allowed breaking changes:
 
-| Decision              | Choice                                                                                                                                                                                                                                                                             |
-| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Stager providers      | None. Resolving providers run only on writer navigations, so every outcome, backoff included, is stored. Stagers serve KV                                                                                                                                                          |
-| Removals              | Written to KV on the request that carries them. `ts-eids-r`, its keyring and secrets, the overflow write and the strips-only rollout step are removed                                                                                                                              |
-| Non-browser removals  | Applied, as consent withdrawals are; only clears need a real browser. Changed after the round 14 review from dropping them                                                                                                                                                         |
-| Expiry scope          | G7 covers owned expiring sources. A stateless owner keeps its expired record as a refresh anchor until `exp` plus its declared refresh grace. Unowned IDs keep no lifetime (section 2.3). Changed after the round 14 review                                                        |
-| Opt-out clears        | A TCF re-grant clears only a denial `fp` recorded (new TCF bit 16), with no `LastUpdated` comparison. A clear stores a watermark, the `at` of the opt-out it read, as `ps.oc`, and clears apply before opt-outs. Changed after the round 14 review                                 |
-| Backend budget        | `max_backend_requests` (default 32) bounds origin, auction and provider calls in one execution; a provider call past it is skipped, not a failure, and a hold call reserves the origin and the auction. Added after the round 14 review                                            |
-| Per-IP ceiling        | `max_calls_per_ip_per_minute` (default 10) caps one provider's calls per client address across visitors, keyed on an HMAC of the IP, next to the per-visitor cap. Breaker failures are not required to come from distinct visitors. Added after the round 14 review                |
-| Reader-first rollout  | Rollout step 0, from `main`, reads version 2 rows, never rewrites them except to tombstone, and serves no stored ID from a row with a provider opt-out, so step 1 can roll back and deploy alongside old instances. Added after the round 14 review                                |
-| Global revoke minting | A global revoke also sets `ts-ec-revoked` with the consent fingerprint, and no EC is minted until the request's fingerprint differs. Decided after the round 14 review                                                                                                             |
-| Pending key           | Removals whose writes all failed, and positive captures from a request that is not the writer, go to `pending:<ec_id>` (one-day TTL, CAS append, 16 items). Every writer reads it and merges items above the row's `pg`. Auctions never read it. Decided after the round 14 review |
-| SPA writer            | A same-origin `/_ts/page-bids` call from a real browser is the writer once `spa_writer_interval_sec` (300, 0 = off) has passed since the row's `wa`; it writes only on a row its auction read and runs after-send providers only. Decided after the round 14 review                |
-| New-visitor providers | A new visitor's navigation that runs an auction runs hold-mode providers that do not read the EC ID, and the create carries their answers; finalize creates a row its navigation did not. Decided after the round 14 review                                                        |
-| Capture               | Revoke-only: removals, opt-out and clear. Positive IDs are counted, never stored. `capture_enabled` and request-body consent are removed                                                                                                                                           |
-| Capture-only opt-out  | Also removes the records of its sources that no provider wrote, and blocks the browser's values for them. A capture-only provider cannot own a source and must list its `sources`                                                                                                  |
-| Provider denials      | A provider's `ps.iv` and `ps.ov` filter browser candidates for unowned sources too. An opt-out's removals go to `ps.ov`, which its clear empties                                                                                                                                   |
-| Mirror feedback       | The shim never copies `ts-eids-s` into `ts-eids` or the `/auction` body                                                                                                                                                                                                            |
-| Dry run               | Removed, with `is_dry_run`                                                                                                                                                                                                                                                         |
-| KV schema             | Version 2 with one record shape. Version 1 rows are read and upgraded on write. Rollout step 0 reads version 2 and never rewrites it, so step 1 can roll back to it                                                                                                                |
-| Stored hashes         | `ps.iv` hashes are unkeyed and the consent fingerprint is a plain bitmask, because the row already holds the raw values. No legacy revision hash                                                                                                                                   |
-| Pull sync             | The pull-complete marker and the legacy pull sync config keys are removed                                                                                                                                                                                                          |
-| Withdrawal retry      | A tombstone that fails before send gets one more attempt after send                                                                                                                                                                                                                |
+| Decision                  | Choice                                                                                                                                                                                                                                                                             |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Stager providers          | None. Resolving providers run only on writer navigations, so every outcome, backoff included, is stored. Stagers serve KV                                                                                                                                                          |
+| Removals                  | Written to KV on the request that carries them. `ts-eids-r`, its keyring and secrets, the overflow write and the strips-only rollout step are removed                                                                                                                              |
+| Non-browser removals      | Applied, as consent withdrawals are; only clears need a real browser. Changed after the round 14 review from dropping them                                                                                                                                                         |
+| Expiry scope              | G7 covers owned expiring sources. A stateless owner keeps its expired record as a refresh anchor until `exp` plus its declared refresh grace. Unowned IDs keep no lifetime (section 2.3). Changed after the round 14 review                                                        |
+| Opt-out clears            | A TCF re-grant clears only a denial `fp` recorded (new TCF bit 16), with no `LastUpdated` comparison. A clear stores a watermark, the `at` of the opt-out it read, as `ps.oc`, and clears apply before opt-outs. Changed after the round 14 review                                 |
+| Backend budget            | `max_backend_requests` (default 32) bounds origin, auction and provider calls in one execution; a provider call past it is skipped, not a failure, and a hold call reserves the origin and the auction. Added after the round 14 review                                            |
+| Per-IP ceiling            | `max_calls_per_ip_per_minute` (default 10) caps one provider's calls per client address across visitors, keyed on an HMAC of the IP, next to the per-visitor cap. Breaker failures are not required to come from distinct visitors. Added after the round 14 review                |
+| Reader-first rollout      | Rollout step 0, from `main`, reads version 2 rows, never rewrites them except to tombstone, and serves no stored ID from a row with a provider opt-out, so step 1 can roll back and deploy alongside old instances. Added after the round 14 review                                |
+| Global revoke minting     | A global revoke also sets `ts-ec-revoked` with the consent fingerprint, and no EC is minted until the request's fingerprint differs. Decided after the round 14 review                                                                                                             |
+| Pending key               | Removals whose writes all failed, and positive captures from a request that is not the writer, go to `pending:<ec_id>` (one-day TTL, CAS append, 16 items). Every writer reads it and merges items above the row's `pg`. Auctions never read it. Decided after the round 14 review |
+| SPA writer                | A same-origin `/_ts/page-bids` call from a real browser is the writer once `spa_writer_interval_sec` (300, 0 = off) has passed since the row's `wa`; it writes only on a row its auction read and runs after-send providers only. Decided after the round 14 review                |
+| New-visitor providers     | A new visitor's navigation that runs an auction runs hold-mode providers that do not read the EC ID, and the create carries their answers; finalize creates a row its navigation did not. Decided after the round 14 review                                                        |
+| Provider consent purposes | `strict()` requires Purpose 1; a resolver declares its purposes and its vendor, or `without_tcf_vendor()`, or `build()` rejects it. The revoke marker fingerprints all ten purposes. Decided after the round 14 review                                                             |
+| Capture                   | Revoke-only: removals, opt-out and clear. Positive IDs are counted, never stored. `capture_enabled` and request-body consent are removed                                                                                                                                           |
+| Capture-only opt-out      | Also removes the records of its sources that no provider wrote, and blocks the browser's values for them. A capture-only provider cannot own a source and must list its `sources`                                                                                                  |
+| Provider denials          | A provider's `ps.iv` and `ps.ov` filter browser candidates for unowned sources too. An opt-out's removals go to `ps.ov`, which its clear empties                                                                                                                                   |
+| Mirror feedback           | The shim never copies `ts-eids-s` into `ts-eids` or the `/auction` body                                                                                                                                                                                                            |
+| Dry run                   | Removed, with `is_dry_run`                                                                                                                                                                                                                                                         |
+| KV schema                 | Version 2 with one record shape. Version 1 rows are read and upgraded on write. Rollout step 0 reads version 2 and never rewrites it, so step 1 can roll back to it                                                                                                                |
+| Stored hashes             | `ps.iv` hashes are unkeyed and the consent fingerprint is a plain bitmask, because the row already holds the raw values. No legacy revision hash                                                                                                                                   |
+| Pull sync                 | The pull-complete marker and the legacy pull sync config keys are removed                                                                                                                                                                                                          |
+| Withdrawal retry          | A tombstone that fails before send gets one more attempt after send                                                                                                                                                                                                                |

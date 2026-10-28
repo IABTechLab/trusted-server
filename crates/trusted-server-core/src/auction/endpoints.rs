@@ -793,7 +793,6 @@ mod tests {
     use crate::auction::types::{AuctionRequest, AuctionResponse};
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
-    use crate::ec::identity::descriptor::ConsentPolicy;
     use crate::ec::identity::revision::uid_hash;
     use crate::ec::identity::test_support::{
         ec_partner, example_entry_set, full_record, pid, provider_from, source,
@@ -2626,7 +2625,7 @@ mod tests {
                     crate::ec::identity::descriptor::Resolves::new()
                         .with_endpoint("https://api.example.com/fetch"),
                 )
-                .with_consent_policy(ConsentPolicy::strict());
+                .with_consent_policy(crate::ec::identity::test_support::resolver_policy());
         if expiring {
             builder = builder.with_expiring_ids();
         }

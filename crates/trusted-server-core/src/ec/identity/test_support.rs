@@ -53,6 +53,14 @@ use crate::redacted::Redacted;
 use crate::settings::{EcPartner, IdentitySettings, ProviderSettings};
 
 /// A request with no consent signal and no regulated jurisdiction.
+/// Purposes 1 and 4 with no vendor: the policy test resolvers run under.
+#[must_use]
+pub fn resolver_policy() -> ConsentPolicy {
+    ConsentPolicy::strict()
+        .with_tcf_purposes([4])
+        .without_tcf_vendor()
+}
+
 #[must_use]
 pub fn test_consent_allowing_everything() -> ConsentContext {
     ConsentContext {
@@ -260,7 +268,7 @@ pub fn answering_capture_provider_at(
     prefix: &str,
 ) -> Arc<dyn IdentityProvider> {
     let policy = match gvl_id {
-        Some(vendor) => ConsentPolicy::strict().with_tcf_vendor(vendor),
+        Some(vendor) => resolver_policy().with_tcf_vendor(vendor),
         None => ConsentPolicy::eid_persistence_only(),
     };
     let mut builder =
@@ -370,7 +378,7 @@ impl MultiEntryTestProvider {
             ProviderDescriptor::builder("exampleid".parse().expect("should parse the provider ID"))
                 .with_source(source(MULTI_ENTRY_SOURCE))
                 .with_resolves(resolves)
-                .with_consent_policy(ConsentPolicy::strict())
+                .with_consent_policy(resolver_policy())
                 .with_provenance(
                     &source(MULTI_ENTRY_SOURCE),
                     EidProvenance::new()

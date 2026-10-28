@@ -386,7 +386,7 @@ mod tests {
     use crate::ec::identity::descriptor::{Captures, Resolves};
     use crate::ec::identity::examples::{ExampleIdProvider, example_config};
     use crate::ec::identity::generic_pull::generic_pull_descriptors;
-    use crate::ec::identity::test_support::{ec_partner, fixed_capture_provider};
+    use crate::ec::identity::test_support::{ec_partner, fixed_capture_provider, resolver_policy};
     use crate::settings::{ProviderSettings, RevokeScope};
     use crate::test_support::tests::create_test_settings;
 
@@ -409,7 +409,8 @@ mod tests {
 
     fn resolving_descriptor(id: &str, sources: &[&str]) -> ProviderDescriptor {
         let mut builder = ProviderDescriptor::builder(id.parse().expect("should parse the ID"))
-            .with_resolves(Resolves::new().with_endpoint("https://api.example.com/fetch"));
+            .with_resolves(Resolves::new().with_endpoint("https://api.example.com/fetch"))
+            .with_consent_policy(resolver_policy());
         for source in sources {
             builder = builder.with_source(source.parse().expect("should parse the source"));
         }
