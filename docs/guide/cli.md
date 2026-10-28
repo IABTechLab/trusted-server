@@ -302,7 +302,7 @@ environment. It is mutually exclusive with `--key`. On Fastly, `ts` pushes a
 `fastly` CLI with the token in `FASTLY_API_TOKEN`. That push makes the same
 policy checks, writes the named file's SHA-256 and not the file into the blob,
 and keeps each file `--permissions` supplies once, under `permissions_<sha256>`,
-before the blob
+before the blob, which a live push writes 60 seconds after it writes an entry
 ([One blob for each host](/guide/configuration#one-blob-for-each-host)).
 `config diff` compares only the logical store ID on Fastly, because EdgeZero
 refuses every other key, so the policy a host runs is checked on that host's

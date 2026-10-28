@@ -3201,7 +3201,10 @@ and pins the file's SHA-256, and carries no copy of the file. The push keeps
 each file `--permissions` supplies once, in an entry of its own under
 `permissions_<sha256>`, written before the host's blob, and keeps an entry that
 already holds the file, so a hundred hosts that name three files store three
-entries. A changed file is a new entry, so a host still running an earlier
+entries. A live push that writes a policy entry waits 60 seconds before it
+writes the host's blob, because the store is consistent key by key, and a
+location that reads a blob before the entry it names answers that host
+`500`. A changed file is a new entry, so a host still running an earlier
 blob still finds the file that blob pins. The blob at `trusted_server_config`
 carries its file, as on a service with one blob. `ts config diff` compares only
 that blob, so the policy a host runs is checked on that host's `/_ts/config`.

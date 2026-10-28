@@ -486,7 +486,10 @@ fn a_remote_dry_run_names_the_live_store_and_writes_nothing() {
 
     // The runner's environment is cleared, so no `fastly` CLI can be found
     // and a dry run that asked it anything would fail.
-    let output = push(&project, &["--key", HOST, "--dry-run"]);
+    let output = push(
+        &project,
+        &["--key", HOST, "--dry-run", "--permissions", POLICY_FILE],
+    );
 
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
