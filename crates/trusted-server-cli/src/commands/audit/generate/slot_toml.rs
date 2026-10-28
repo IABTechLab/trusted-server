@@ -12,7 +12,7 @@ use trusted_server_core::creative_opportunities::{
 
 #[cfg(test)]
 use crate::commands::audit::generate::gpt_slots;
-use crate::error::{CliResult, cli_error, report_error};
+use crate::error::{CliResult, cli_error, report_error, toml_error_location};
 
 /// A slot ready to render — the union of discovered and existing fields, without
 /// the core type's `pub(crate)` compiled-pattern cache.
@@ -627,7 +627,8 @@ pub(super) fn splice_creative_slots(
 ) -> CliResult<String> {
     let mut document = existing.parse::<DocumentMut>().map_err(|error| {
         report_error(format!(
-            "failed to parse target config before updating slots: {error}"
+            "failed to parse target config{} before updating slots",
+            toml_error_location(existing, error.span())
         ))
     })?;
     let had_section = document.get("creative_opportunities").is_some();
@@ -700,8 +701,12 @@ pub(super) fn splice_creative_slots(
 /// Verifies that the structural update changed only generator-managed fields.
 fn ensure_only_managed_fields_changed(before: &str, after: &str) -> CliResult<()> {
     fn unmanaged(document: &str) -> CliResult<toml::Value> {
-        let mut value = toml::from_str::<toml::Value>(document)
-            .map_err(|error| report_error(format!("failed to validate updated config: {error}")))?;
+        let mut value = toml::from_str::<toml::Value>(document).map_err(|error| {
+            report_error(format!(
+                "failed to validate updated config{}",
+                toml_error_location(document, error.span())
+            ))
+        })?;
         if let Some(root) = value.as_table_mut() {
             let remove_empty = if let Some(creative) = root
                 .get_mut("creative_opportunities")
@@ -2465,5 +2470,39 @@ slot_id = "sidebar"
         );
 
         toml::from_str::<toml::Value>(&doc).expect("exotic targeting key renders as valid TOML");
+    }
+
+    #[test]
+    fn ensure_only_managed_fields_changed_parse_error_does_not_echo_config_source() {
+        let source = "[publisher]\norigin_url = \"https://origin-private.example.com/internal\n";
+
+        let error = ensure_only_managed_fields_changed(source, source)
+            .expect_err("should reject invalid TOML");
+
+        assert!(
+            !error.contains("origin-private.example.com"),
+            "should not echo config source text: {error}"
+        );
+        assert!(
+            error.contains("at line 2, column "),
+            "should report the error location: {error}"
+        );
+    }
+
+    #[test]
+    fn splice_creative_slots_parse_error_does_not_echo_config_source() {
+        let existing = "[publisher]\norigin_url = \"https://origin-private.example.com/internal\n";
+
+        let error = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
+            .expect_err("should reject invalid TOML");
+
+        assert!(
+            !error.contains("origin-private.example.com"),
+            "should not echo config source text: {error}"
+        );
+        assert!(
+            error.contains("at line 2, column "),
+            "should report the error location: {error}"
+        );
     }
 }

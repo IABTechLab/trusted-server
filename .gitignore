@@ -23,6 +23,8 @@
 # env
 .env*
 trusted-server.toml
+# partial copies left if the ts CLI config writer is killed mid-write
+.ts-write-*
 js-assets.toml
 
 # backup
