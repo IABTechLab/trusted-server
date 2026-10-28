@@ -242,6 +242,11 @@ impl PathPattern {
         )
     }
 
+    /// Whether the pattern is `permissions.text` itself.
+    fn is_policy_text(&self) -> bool {
+        self.names_policy_text() && self.steps.len() == 2
+    }
+
     /// Whether the concrete path `path` is one the pattern names.
     #[must_use]
     pub fn matches(&self, path: &[PathStep]) -> bool {
@@ -601,10 +606,14 @@ pub(crate) fn validate_patterns(settings: &Settings) -> Result<(), Report<Truste
     }
     for (list, patterns) in [(List::Show, &inspect.show), (List::Hide, &inspect.hide)] {
         if let Some(pattern) = patterns.iter().find(|pattern| pattern.names_policy_text()) {
+            let under = if pattern.is_policy_text() {
+                ""
+            } else {
+                ", which is under `permissions.text`"
+            };
             return Err(configuration(format!(
-                "[inspect] {list} names `{pattern}`, which is under `permissions.text`, the \
-                 policy file the push writes. The configuration page never shows the file, so \
-                 the pattern changes nothing"
+                "[inspect] {list} names `{pattern}`{under}, the policy file the push writes. The \
+                 configuration page never shows the file, so the pattern changes nothing"
             )));
         }
     }
