@@ -321,6 +321,11 @@ jobs:
         run: |
           cargo clippy --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --all-targets -- -D warnings
 
+      - name: Run producer process supervision on macOS
+        if: runner.os == 'macOS'
+        run: |
+          cargo test --package trusted-server-release --target "$(rustc -vV | sed -n 's/host: //p')" --locked --bin trusted-server-release process::
+
       - name: Set up Chrome for browser fixture tests
         if: runner.os == 'macOS'
         id: setup-chrome

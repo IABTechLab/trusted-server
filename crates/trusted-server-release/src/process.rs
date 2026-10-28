@@ -12,13 +12,13 @@
 //! sent `SIGKILL` — after a normal exit as well as on deadline, cancellation
 //! or output cap — so the signal cannot reach a recycled group. Only then is
 //! the leader reaped (polling, bounded by the kill grace, never a blocking
-//! wait), and `killpg` is repeated until it reports `ESRCH`.
+//! wait), and read-only `killpg(pgid, 0)` probes confirm disappearance.
 //!
 //! A residual pgid-reuse window remains after reaping: if every member is
-//! already gone and the ID is recycled before the confirming `killpg`, that
-//! call could reach the new group. Every original member has already been
-//! sent `SIGKILL` while the ID was pinned, so this window affects only the
-//! confirmation, not the kill.
+//! already gone and the ID is recycled before confirmation, a probe can
+//! observe the unrelated group and cause a bounded false cleanup failure.
+//! Signal zero cannot kill that group. Destructive signalling occurs only
+//! before reaping, while the leader's identity remains pinned.
 //!
 //! Pipes are drained concurrently under byte caps and every wait is bounded,
 //! so a descendant that leaves the group (`setsid`, job control) while still
@@ -172,7 +172,7 @@ pub(crate) enum ProcessFailure {
     /// Observing or reaping the leader failed.
     #[display("wait failed (errno {errno:?})")]
     Wait { errno: Option<i32> },
-    /// Signalling the process group failed with something other than `ESRCH`.
+    /// Group signalling or read-only observation failed outside `ESRCH`.
     #[display("process-group signal failed (errno {errno:?})")]
     Signal { errno: Option<i32> },
     /// The leader or group still existed after `SIGKILL` and the kill grace.

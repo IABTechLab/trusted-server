@@ -83,6 +83,10 @@ fn wait_for_leader(pid: libc::pid_t, watch: &Watch<'_>) -> io::Result<Option<Pro
 }
 
 pub(super) fn signal_group(process_group: libc::pid_t) -> io::Result<()> {
+    group_signal(process_group, libc::SIGKILL)
+}
+
+fn group_signal(process_group: libc::pid_t, signal: libc::c_int) -> io::Result<()> {
     // 0, -1 and 1 would address this supervisor's group, every process or
     // init; refuse them without inventing an errno.
     if process_group <= 1 {
@@ -93,7 +97,7 @@ pub(super) fn signal_group(process_group: libc::pid_t) -> io::Result<()> {
     }
     // SAFETY: `killpg` only reads its two integer arguments; it touches no
     // memory owned by this process.
-    let result = unsafe { libc::killpg(process_group, libc::SIGKILL) };
+    let result = unsafe { libc::killpg(process_group, signal) };
     if result == 0 {
         Ok(())
     } else {
@@ -101,17 +105,16 @@ pub(super) fn signal_group(process_group: libc::pid_t) -> io::Result<()> {
     }
 }
 
-fn signal_failure(source: &io::Error) -> Report<ReleaseError> {
+fn observation_failure(source: &io::Error) -> Report<ReleaseError> {
     process_error(
         ProcessFailure::Signal {
             errno: source.raw_os_error(),
         },
-        format!("killpg failed: {source}"),
+        format!("cannot observe process group: {source}"),
     )
 }
 
-/// Returns whether `source` may be XNU's transient refusal to signal a group
-/// that holds only zombies.
+/// Returns whether `source` may be a transient XNU group-operation refusal.
 fn is_transient_refusal(source: &io::Error) -> bool {
     source.raw_os_error() == Some(libc::EPERM)
 }
@@ -175,36 +178,51 @@ pub(super) fn settle(
             None => report,
         });
     };
-    kill_group_until_gone(process_group)?;
+    confirm_group_gone(process_group)?;
     Ok(status)
 }
 
-/// Sends `SIGKILL` to the group until `killpg` reports `ESRCH`.
+/// Observes group disappearance without delivering another signal.
 ///
 /// This runs after the leader is reaped, so the group ID is no longer pinned:
-/// if every member is already gone and the ID is recycled before a call
-/// here, that call could reach the new group. Every original member was
-/// already sent `SIGKILL` by [`settle`] while the ID was pinned, so the window
-/// affects only this confirmation.
-fn kill_group_until_gone(process_group: libc::pid_t) -> Result<(), Report<ReleaseError>> {
+/// a recycled ID can cause a bounded false cleanup failure, but signal zero
+/// cannot terminate the unrelated group. The initial kill stays in [`settle`].
+fn confirm_group_gone(process_group: libc::pid_t) -> Result<(), Report<ReleaseError>> {
     let until = Instant::now() + KILL_GRACE;
+    confirm_group_with(
+        process_group,
+        group_signal,
+        || Instant::now() >= until,
+        || thread::sleep(POLL_INTERVAL),
+    )
+}
+
+fn confirm_group_with(
+    process_group: libc::pid_t,
+    mut probe: impl FnMut(libc::pid_t, libc::c_int) -> io::Result<()>,
+    mut expired: impl FnMut() -> bool,
+    mut pause: impl FnMut(),
+) -> Result<(), Report<ReleaseError>> {
     loop {
-        let expired = Instant::now() >= until;
-        match signal_group(process_group) {
+        let expired = expired();
+        match probe(process_group, 0) {
             Err(source) if source.raw_os_error() == Some(libc::ESRCH) => return Ok(()),
             Err(source) if expired || !is_transient_refusal(&source) => {
-                return Err(signal_failure(&source));
+                return Err(observation_failure(&source));
             }
             Ok(()) if expired => {
                 return Err(process_error(
                     ProcessFailure::GroupSurvived,
-                    format!("process group {process_group} survived SIGKILL"),
+                    format!("process group {process_group} remained observable after cleanup"),
                 ));
             }
-            Ok(()) | Err(_) => thread::sleep(POLL_INTERVAL),
+            Ok(()) | Err(_) => pause(),
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 /// Waits for the leader's exit or a stop condition.
 ///
