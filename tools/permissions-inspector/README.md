@@ -4,7 +4,7 @@ A single-page tool that answers the question a policy owner actually
 has about a `permissions.yaml`: for a visitor in a given place, with given
 consent signals, which Data Uses are set?
 
-No policy ships with Trusted Server and no build carries one. A domain's
+No policy ships with Trusted Server and no adapter build carries one. A domain's
 settings name the publisher's own `permissions.yaml`, the file is
 supplied when the service is deployed, and the visitor's own signals
 decide the rest at runtime. The repository carries sample

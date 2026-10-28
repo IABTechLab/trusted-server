@@ -312,4 +312,44 @@ mod tests {
             "a stock build should link no loading cache, and links {offering:?}"
         );
     }
+
+    /// `ts config validate` validates with the builders the tool links, so a
+    /// document whose `[cache.<name>]` names a loading cache module is
+    /// refused, and the refusal names the table and says the tool has none.
+    #[test]
+    fn deploy_validation_refuses_a_loading_cache_module_the_tool_does_not_link() {
+        // Deploy validation refuses the example's placeholder addresses as
+        // insecure defaults, so the test gives addresses of its own.
+        let document = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../trusted-server.example.toml"
+        ))
+        .replace("domain = \"example.com\"", "domain = \"publisher.example\"")
+        .replace(
+            "cookie_domain = \".example.com\"",
+            "cookie_domain = \".publisher.example\"",
+        )
+        .replace(
+            "url = \"https://origin.example.com\"",
+            "url = \"https://origin.publisher.example\"",
+        );
+        let mut settings =
+            Settings::from_toml(&document).expect("should parse the example settings");
+        settings.cache.robots_txt.module = Some("51degrees".to_owned());
+
+        let error = trusted_server_core::config::validate_settings_for_deploy_with(
+            &settings,
+            &linked_builders(),
+        )
+        .expect_err("a loading cache module the tool does not link should be refused");
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains(
+                "[cache.robots-txt] module names `51degrees`, which no linked crate offers a \
+                 loading cache from. The loading cache modules this build has are: none"
+            ),
+            "should name the table and say the tool has no loading cache: {message}"
+        );
+    }
 }
