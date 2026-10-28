@@ -270,10 +270,19 @@ valid.
 
 - `v0.0.0-rehearsal.9` at `149754d357901ec874eab6140e92bce3d8613085`: all seven builds/signing jobs, immutable prerelease publication and complete independent verification passed. The publisher found the release attestation available on its first check (no live availability wait), then re-downloaded and byte-compared all 29 assets. All bundle/online-store/offline predicates and signer pins, SPDX comparisons, checksums, macOS floor and CLI source checks passed. Axum smokes proved 0.0.0.0:8080 from outside each container and rejected primary/legacy port zero. Pinned Fastly pack/validate/inspect/cmp and Viceroy runtime checks passed, with visible no-Build-facts check/result. [Full transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6364827112).
 
-The latest rehearsed implementation is `149754d357901ec874eab6140e92bce3d8613085` from `.9`.
-This review-head update is docs-only since rehearsed `149754d35`; workflows, scripts, tests and runtime code retain the rehearsed implementation.
+The original Phase 1 batch was rehearsed at `149754d357901ec874eab6140e92bce3d8613085` in `.9`.
+Later source updates and their exact rehearsal attributions are recorded below.
 
 The immutable `.2`, `.3`, `.4`, `.5`, `.6`, `.8` and `.9` releases remain intact; no drafts remain. The `.7` tag has no release. No upstream tags, releases or repository settings were changed.
+
+### Main merge and exact-head rehearsal
+
+- `.12` passed at `ab6e5493636fd3d1db4b22a071189070f90a189a`. Its [verification transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6440880360) remains evidence for that source only.
+- Main at `fd2bf10e709092a796ebad2f6de371b2ea8dfd56` was merged, without rebasing, into Phase 1 at `68eef902a8bddd9024676cc3806fa5377ed67fee`. [Exact-head CI passed](https://github.com/IABTechLab/trusted-server/actions/runs/40524031740), including all seven release builds; PR signing/publication were skipped. Release workflows, producer scripts, build facts and tool pins were unchanged by this merge; application code changed.
+- `.14` at that merge failed because GitHub could not acquire a hosted ARM64 macOS runner. Six started builds passed; signing/publication were skipped, and no release or draft was created. Its tag remains untouched. See the [failure record](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6446482013).
+- Fresh lightweight `.15` passed at `68eef902a8bddd9024676cc3806fa5377ed67fee`: [all 16 workflow jobs passed](https://github.com/prk-Jr/trusted-server/actions/runs/40536697334/attempts/1). Independent verification passed all 29 immutable prerelease assets (not Latest), 28 checksum entries, all seven binaries with both predicates and both signer identities online and offline, 14 SPDX comparisons, native CI smokes, macOS 13.0 checks and CLI source identity. See [transcript part 1](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6460657878) and [part 2](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6460658274).
+
+The latest rehearsed Phase 1 implementation is `68eef902a8bddd9024676cc3806fa5377ed67fee` from `.15`. This evidence update is docs-only since that exact SHA; it does not extend `.12` to later source. No IAB tags, releases or settings changed. Both PRs remain draft with no reviewers.
 
 ### Phase 1 review boundary notes
 
@@ -307,6 +316,6 @@ and state that startup is refused. They no longer forward EdgeZero's fallback
 warnings. Each port alias is still validated with the pinned EdgeZero resolver;
 existing defaults, accepted values and conflict rejection are preserved.
 
-This correction and the current-main integration change the binary inputs.
-Rehearsal `.9` remains evidence for its recorded implementation only; a fresh
-rehearsal is required for the updated binaries.
+This correction and the current-main integration changed the binary inputs.
+Rehearsal `.9` remains evidence for its recorded implementation only; `.12` and
+the fresh main-merge rehearsal `.15` are attributed separately above.
