@@ -5,7 +5,7 @@
 **Related specs:** `2026-10-12-loading-cache-design.md`, `2026-10-12-robots-txt-from-modules-design.md`, `2026-08-27-integration-provider-seam-design.md`
 **Related PRs:** IABTechLab/trusted-server#1373, reviewed on jwrosewell/trusted-server#27 (closed)
 **Issues:** IABTechLab/trusted-server#1320
-**Last updated:** 2026-10-18
+**Last updated:** 2026-10-26
 
 > **Why this spec exists.** A module that holds its own answers asks core for the cache of the name it chose, finds no `[cache.<name>]` table for that name, and gets the cache that holds nothing, so every request loads the answer again.
 
@@ -62,7 +62,7 @@ A declared name is the cache's name wherever the cache is used. The name is the 
 2. No `module` selects the one loading cache module the build links, or nothing when the build links none or several.
 3. A module's cache is made once however many tables select it.
 
-The new step comes after the tables. A declared cache that has no table at all follows the rule for a table with no `module`, and shares the cache already made for that module when a table made one. A stock build therefore holds a module's answers without a line in the document. The table below shows the result for a declared cache named `answers`.
+The new step comes after the tables. A declared cache that has no table at all follows the rule for a table with no `module`, and shares the cache already made for that module when a table made one. A build that links one loading cache module therefore holds a module's answers without a line in the document. Once the 51Degrees module leaves the stock lists (`2026-10-12-loading-cache-design.md`), a stock build links none, so there a declared cache holds nothing, and the Axum test that section 4 describes changes with the stock lists. The table below shows the result for a declared cache named `answers`.
 
 | The document                       | Loading cache modules linked | The `answers` cache                             |
 | ---------------------------------- | ---------------------------- | ----------------------------------------------- |
@@ -246,6 +246,7 @@ These joins have no test.
 | 2026-10-15 | Corrections from review round 2. What a module that borrows another module's cache name shares, the section the guide's push-order warning covers, the builders the deploy check is given, the round 1 log sentence on the code changes, and the follow-ups for the configuration guide, the integration guide, the rustdoc and the visibility of two functions.                                                                                                                                                                              |
 | 2026-10-17 | Who can read a copy names the shared store on each adapter, being Fastly's cache, the key-value store the Cloudflare and Spin adapters declare on row 24, `TRUSTED_SERVER_KV` and `default`, and none on Axum.                                                                                                                                                                                                                                                                                                                                |
 | 2026-10-18 | Items 5 to 8 leave 2.10. The configuration guide says core applies no lifetime of a declared table and when to push one, the integration guide lists `.with_cache_features(...)`, and `declared_caches` and `check_cache_tables` are `pub(crate)`. The rustdoc of `loading_caches_from` and `LoadingCacheConfig::module`, and the integration guide on a table naming no module, already gave rule 2 in 2.2. Section 3 and 2.8 match the guides. 2.7 and section 3 say the deploy check also refuses a `module` that offers no loading cache. |
+| 2026-10-26 | 2.2 says that a build linking one loading cache module holds a declared cache's answers without a line in the document, where it said a stock build does, because no stock build links one once the 51Degrees module leaves the stock lists (`2026-10-12-loading-cache-design.md`).                                                                                                                                                                                                                                                           |
 
 ## Review log
 
