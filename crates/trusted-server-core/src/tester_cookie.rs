@@ -19,9 +19,10 @@ use crate::settings::Settings;
 /// Formats the tester cookie `Set-Cookie` header value.
 fn format_tester_cookie(public: &PublicPrefix, domain: &str, max_age_seconds: u32) -> String {
     format!(
-        "{}=true; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}",
+        "{}=true; Domain={}; Path={}; Secure; SameSite=Lax; Max-Age={}",
         public.cookie_name(COOKIE_TESTER),
         domain,
+        public.cookie_path(),
         max_age_seconds,
     )
 }
@@ -29,9 +30,10 @@ fn format_tester_cookie(public: &PublicPrefix, domain: &str, max_age_seconds: u3
 /// Formats the tester cookie clearing `Set-Cookie` header value.
 fn format_clear_tester_cookie(public: &PublicPrefix, domain: &str) -> String {
     format!(
-        "{}=; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age=0",
+        "{}=; Domain={}; Path={}; Secure; SameSite=Lax; Max-Age=0",
         public.cookie_name(COOKIE_TESTER),
         domain,
+        public.cookie_path(),
     )
 }
 
@@ -198,6 +200,29 @@ mod tests {
                 .to_str()
                 .expect("should render set-cookie as utf-8");
             assert!(set_cookie.starts_with("_ex-tester="), "{set_cookie}");
+        }
+    }
+
+    #[test]
+    fn tester_cookie_is_under_the_removed_prefix_on_an_addressed_request() {
+        let mut settings = create_test_settings();
+        settings.tester_cookie.enabled = true;
+        let public = PublicPrefix::default().under_path(Some("/publisher-a.example"));
+
+        for response in [
+            handle_set_tester(&settings, &public).expect("should set the tester cookie"),
+            handle_clear_tester(&settings, &public).expect("should clear the tester cookie"),
+        ] {
+            let set_cookie = response
+                .headers()
+                .get(header::SET_COOKIE)
+                .expect("should write the tester cookie")
+                .to_str()
+                .expect("should render set-cookie as utf-8");
+            assert!(
+                set_cookie.contains("; Path=/publisher-a.example; "),
+                "{set_cookie}"
+            );
         }
     }
 

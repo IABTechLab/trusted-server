@@ -195,11 +195,18 @@ pub use generation::{
 struct RequestEc {
     /// EC ID from the Edge Cookie, `<public prefix>-ec`, if present.
     cookie_ec: Option<String>,
+    /// The values of the other Edge Cookies, see [`parse_ec_from_request`].
+    other_cookie_ecs: Vec<String>,
     /// Pull-sync completeness marker, if present.
     pull_sync_marker: Option<String>,
 }
 
 /// Parses EC identity from request cookies in a single pass.
+///
+/// Where `public` writes under a removed prefix, the browser sends the Edge
+/// Cookie under the publisher's path and any of the same name under `/`, and
+/// the jar keeps one. The values of the others are kept apart, so a
+/// withdrawal reaches them too.
 ///
 /// # Errors
 ///
@@ -209,11 +216,22 @@ fn parse_ec_from_request(
     public: &PublicPrefix,
 ) -> Result<RequestEc, Report<TrustedServerError>> {
     let jar = handle_request_cookies(req)?;
+    let name = public.cookie_name(COOKIE_EC);
     let cookie_ec = jar
         .as_ref()
-        .and_then(|j| j.get(&public.cookie_name(COOKIE_EC)))
+        .and_then(|j| j.get(&name))
         .map(cookie::Cookie::value)
         .and_then(|value| request_ec_id_if_allowed(value, "Edge Cookie"));
+    let other_cookie_ecs = if public.cookie_path() == "/" {
+        Vec::new()
+    } else {
+        crate::cookies::cookie_values(req, &name)
+            .into_iter()
+            .filter(|value| {
+                Some(value) != cookie_ec.as_ref() && ec_id_has_only_allowed_chars(value)
+            })
+            .collect()
+    };
     let pull_sync_marker = jar
         .as_ref()
         .and_then(|j| j.get(&public.cookie_name(COOKIE_EC_PULL_COMPLETE)))
@@ -222,6 +240,7 @@ fn parse_ec_from_request(
 
     Ok(RequestEc {
         cookie_ec,
+        other_cookie_ecs,
         pull_sync_marker,
     })
 }
@@ -262,6 +281,10 @@ pub struct EcContext {
     /// request. Stored separately from `ec_value` because the header may
     /// take precedence, but revocation still needs the cookie value.
     cookie_ec_value: Option<String>,
+    /// The values of the other Edge Cookies a request under a removed prefix
+    /// carried, such as one under `/`, which the jar did not keep. A
+    /// withdrawal tombstones their rows too.
+    other_cookie_ec_values: Vec<String>,
     /// Whether an EC ID was found on the incoming request (header or cookie).
     ec_was_present: bool,
     /// Whether a new EC ID was generated during this request.
@@ -433,7 +456,8 @@ impl EcContext {
         geo_status: consent::GeoStatus<'_>,
     ) -> Result<Self, Report<TrustedServerError>> {
         let geo_info = geo_status.info();
-        let parsed = parse_ec_from_request(req, services.public_prefix())?;
+        let public_prefix = services.public_prefix().for_request(req);
+        let parsed = parse_ec_from_request(req, &public_prefix)?;
 
         // Take the selected module once. It is used here to decide whether
         // the incoming cookie value is a usable identifier, to read the
@@ -568,6 +592,7 @@ impl EcContext {
         Ok(Self {
             ec_value,
             cookie_ec_value: parsed.cookie_ec,
+            other_cookie_ec_values: parsed.other_cookie_ecs,
             ec_was_present,
             ec_generated: false,
             consent,
@@ -582,7 +607,7 @@ impl EcContext {
             response_headers: Vec::new(),
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
-            public_prefix: services.public_prefix().clone(),
+            public_prefix,
             client_eids: None,
             module_eids,
             pull_sync_marker: PullSyncMarkerState::from_cookie(parsed.pull_sync_marker),
@@ -933,6 +958,15 @@ impl EcContext {
             .and_then(|value| self.kv_key_for(value))
     }
 
+    /// The identity-graph keys for the other Edge Cookies a request under a
+    /// removed prefix carried, such as one under `/`, which a withdrawal
+    /// tombstones with [`cookie_ec_kv_key`](Self::cookie_ec_kv_key).
+    pub(crate) fn other_cookie_ec_kv_keys(&self) -> impl Iterator<Item = String> + '_ {
+        self.other_cookie_ec_values
+            .iter()
+            .filter_map(|value| self.kv_key_for(value))
+    }
+
     /// Returns whether the Edge Cookie was present on the incoming request.
     #[must_use]
     pub fn cookie_was_present(&self) -> bool {
@@ -959,7 +993,9 @@ impl EcContext {
     }
 
     /// The start of every cookie name this request's Edge Cookie state reads
-    /// and writes, such as `ts` for `ts-ec`.
+    /// and writes, such as `ts` for `ts-ec`, and the `Path` it writes them
+    /// under, which is the request's removed prefix or `/`, see
+    /// [`PublicPrefix::for_request`].
     #[must_use]
     pub fn public_prefix(&self) -> &PublicPrefix {
         &self.public_prefix
@@ -1242,6 +1278,7 @@ impl EcContext {
         Self {
             ec_was_present: ec_value.is_some(),
             cookie_ec_value: ec_value.clone(),
+            other_cookie_ec_values: Vec::new(),
             ec_value,
             ec_generated: false,
             consent,
@@ -1290,6 +1327,7 @@ impl EcContext {
         Self {
             ec_was_present: ec_value.is_some(),
             cookie_ec_value: ec_value.clone(),
+            other_cookie_ec_values: Vec::new(),
             ec_value,
             ec_generated: false,
             consent,
@@ -1327,6 +1365,7 @@ impl EcContext {
         Self {
             ec_value,
             cookie_ec_value,
+            other_cookie_ec_values: Vec::new(),
             ec_was_present,
             ec_generated,
             consent,
@@ -2522,6 +2561,211 @@ pub(crate) mod tests {
             cookies.iter().any(|cookie| cookie.starts_with("ts-ec=")),
             "core's own managed cookie should still be written, got: {cookies:?}"
         );
+    }
+
+    /// The request `create_test_request` builds, addressed by path with
+    /// `/publisher-a.example` removed.
+    fn addressed_test_request(headers: &[(&str, &str)]) -> Request<EdgeBody> {
+        let mut req = create_test_request(headers);
+        req.extensions_mut()
+            .insert(crate::addressing::RemovedPathPrefix::new(
+                "/publisher-a.example".to_owned(),
+            ));
+        req
+    }
+
+    /// The name and the `Path` of each `Set-Cookie` value in `cookies`.
+    fn names_and_paths(cookies: &[String]) -> Vec<(&str, &str)> {
+        cookies
+            .iter()
+            .map(|cookie| {
+                let name = cookie.split('=').next().unwrap_or_default();
+                let path = cookie
+                    .split("; ")
+                    .find_map(|attribute| attribute.strip_prefix("Path="))
+                    .unwrap_or_default();
+                (name, path)
+            })
+            .collect()
+    }
+
+    /// The context takes the removed prefix from the request it reads, so
+    /// on a request addressed by path the Edge Cookie the finalize step
+    /// writes is under that prefix.
+    #[tokio::test]
+    async fn finalize_writes_the_edge_cookie_under_the_removed_prefix() {
+        use crate::platform::test_support::noop_services_with_ec_module;
+
+        let mut settings = create_test_settings();
+        settings.ec.module = Some(EcModuleSelection::from("header_setting"));
+        let services = noop_services_with_ec_module(Arc::new(HeaderSettingModule {
+            name: "set-cookie",
+            value: MODULE_EVIDENCE_COOKIE,
+            id: Some("module-value"),
+        }));
+        let req = addressed_test_request(&[]);
+        let mut ec = EcContext::read_from_request(&settings, &req, &services)
+            .expect("should read EC context");
+        let graph = KvIdentityGraph::in_memory("test-ec-store");
+        ec.generate_if_needed(&settings, Some(&graph), &services)
+            .await
+            .expect("should generate an identifier");
+
+        let cookies = finalized_set_cookies(&settings, &mut ec, &graph).await;
+
+        assert!(
+            names_and_paths(&cookies).contains(&("ts-ec", "/publisher-a.example")),
+            "the Edge Cookie should be under the removed prefix, got: {cookies:?}"
+        );
+    }
+
+    /// A withdrawal on a request addressed by path expires the Edge Cookie
+    /// and its resolved marker under the removed prefix and under `/`, so a
+    /// copy the browser holds under `/` does not survive it. With no removed
+    /// prefix each is expired once, under `/`.
+    #[tokio::test]
+    async fn a_withdrawal_under_a_removed_prefix_also_expires_the_root_cookies() {
+        let mut settings = create_test_settings();
+        settings.ec.module = None;
+        settings.ec.module_blocks.clear();
+        let cookie = format!("ts-ec={}", valid_ec_id("a", "abcXYZ"));
+        let graph = KvIdentityGraph::in_memory("test-ec-store");
+
+        for (req, expected) in [
+            (
+                addressed_test_request(&[("cookie", &cookie)]),
+                vec![
+                    ("ts-ec", "/publisher-a.example"),
+                    ("ts-ecr", "/publisher-a.example"),
+                    ("ts-ec", "/"),
+                    ("ts-ecr", "/"),
+                ],
+            ),
+            (
+                create_test_request(&[("cookie", &cookie)]),
+                vec![("ts-ec", "/"), ("ts-ecr", "/")],
+            ),
+        ] {
+            let mut ec = EcContext::read_from_request(&settings, &req, &noop_services())
+                .expect("should read EC context")
+                .with_storage_withdrawn_for_test(true);
+
+            let cookies = finalized_set_cookies(&settings, &mut ec, &graph).await;
+
+            assert!(
+                cookies.iter().all(|cookie| cookie.contains("Max-Age=0")),
+                "a withdrawal should only expire cookies, got: {cookies:?}"
+            );
+            assert_eq!(names_and_paths(&cookies), expected);
+        }
+    }
+
+    /// A returning visitor whose one Edge Cookie is under `/`, where every
+    /// Edge Cookie was before core wrote under the removed prefix, withdraws
+    /// on a request addressed by path. The cookie and its resolved marker are
+    /// expired under the prefix and under `/`, and the row is tombstoned.
+    #[tokio::test]
+    async fn a_withdrawal_reaches_a_returning_visitors_root_edge_cookie() {
+        let settings = create_test_settings();
+        let ec_id = valid_ec_id("c", "RtCk01");
+        let req = addressed_test_request(&[("cookie", &format!("ts-ec={ec_id}"))]);
+        let mut ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context")
+            .with_storage_withdrawn_for_test(true);
+        assert!(ec.ec_was_present(), "the visitor should be a returning one");
+        assert!(!ec.ec_allowed(), "the gate should be closed");
+        let kv_key = ec
+            .kv_key_for(&ec_id)
+            .expect("the module should own the identifier");
+        let graph = KvIdentityGraph::in_memory("test-ec-store");
+        graph
+            .create(&kv_key, &KvEntry::minimal("ssp.example.com", "uid", 1))
+            .expect("should seed the visitor's row");
+
+        let cookies = finalized_set_cookies(&settings, &mut ec, &graph).await;
+
+        assert_eq!(
+            names_and_paths(&cookies),
+            [
+                ("ts-ec", "/publisher-a.example"),
+                ("ts-ecr", "/publisher-a.example"),
+                ("ts-ec", "/"),
+                ("ts-ecr", "/"),
+            ]
+        );
+        let (entry, _) = graph
+            .get(&kv_key)
+            .expect("should read the row")
+            .expect("should keep the row");
+        assert!(!entry.consent.ok, "the withdrawal should tombstone the row");
+    }
+
+    /// A pull-sync marker under `/` is sent on a request addressed by path,
+    /// and a withdrawal there expires it under the removed prefix and under
+    /// `/`, as it expires the Edge Cookie.
+    #[tokio::test]
+    async fn a_withdrawal_under_a_removed_prefix_also_expires_a_root_pull_sync_marker() {
+        let settings = create_test_settings();
+        let cookie = format!(
+            "ts-ec={}; ts-ec-pull-complete=v1.1.fingerprint.tag",
+            valid_ec_id("c", "RtCk02")
+        );
+        let req = addressed_test_request(&[("cookie", &cookie)]);
+        let mut ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context")
+            .with_storage_withdrawn_for_test(true);
+        let graph = KvIdentityGraph::in_memory("test-ec-store");
+
+        let cookies = finalized_set_cookies(&settings, &mut ec, &graph).await;
+
+        let marker_paths: Vec<&str> = names_and_paths(&cookies)
+            .into_iter()
+            .filter(|(name, _)| *name == "ts-ec-pull-complete")
+            .map(|(_, path)| path)
+            .collect();
+        assert_eq!(marker_paths, ["/publisher-a.example", "/"]);
+    }
+
+    /// A browser can hold an Edge Cookie under the publisher's path and one
+    /// of another value under `/`, such as one a request addressed by host
+    /// created, and sends both on a request under the path. The jar keeps
+    /// one, and a withdrawal there tombstones the row of each.
+    #[tokio::test]
+    async fn a_withdrawal_under_a_removed_prefix_tombstones_each_edge_cookies_row() {
+        let settings = create_test_settings();
+        let under_path = valid_ec_id("d", "PathCk");
+        let under_root = valid_ec_id("e", "RootCk");
+        let cookie = format!("ts-ec={under_path}; ts-ec={under_root}");
+        let req = addressed_test_request(&[("cookie", &cookie)]);
+        let mut ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context")
+            .with_storage_withdrawn_for_test(true);
+        let graph = KvIdentityGraph::in_memory("test-ec-store");
+        let kv_keys: Vec<String> = [&under_path, &under_root]
+            .into_iter()
+            .map(|ec_id| {
+                ec.kv_key_for(ec_id)
+                    .expect("the module should own the identifier")
+            })
+            .collect();
+        for kv_key in &kv_keys {
+            graph
+                .create(kv_key, &KvEntry::minimal("ssp.example.com", "uid", 1))
+                .expect("should seed a live row");
+        }
+
+        finalized_set_cookies(&settings, &mut ec, &graph).await;
+
+        for kv_key in &kv_keys {
+            let (entry, _) = graph
+                .get(kv_key)
+                .expect("should read the row")
+                .expect("should keep the row");
+            assert!(
+                !entry.consent.ok,
+                "the withdrawal should tombstone `{kv_key}`"
+            );
+        }
     }
 
     /// A cookie a module may set for itself, used to check which module

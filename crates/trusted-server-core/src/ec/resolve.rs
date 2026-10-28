@@ -243,11 +243,11 @@ pub async fn handle_ec_resolve(
     // carry, which a replacing write would drop.
     apply_module_response_headers(response.headers_mut(), generated.response_headers);
 
-    set_ec_cookie(settings, services.public_prefix(), &mut response, &ec_id);
+    set_ec_cookie(settings, ec_context.public_prefix(), &mut response, &ec_id);
     // The Edge Cookie is HttpOnly, so the page script cannot see it; the
     // non-HttpOnly marker tells the script the resolve succeeded so it does
     // not post again on every page view.
-    set_resolved_marker_cookie(settings, services.public_prefix(), &mut response);
+    set_resolved_marker_cookie(settings, ec_context.public_prefix(), &mut response);
 
     Ok(response)
 }
@@ -1042,6 +1042,21 @@ mod tests {
         }
     }
 
+    /// A location whose rules set storage without a signal, so the gate is
+    /// open.
+    fn open_gate_geo() -> crate::platform::GeoInfo {
+        crate::platform::GeoInfo {
+            city: String::new(),
+            country: "US".to_owned(),
+            continent: String::new(),
+            latitude: 0.0,
+            longitude: 0.0,
+            metro_code: 0,
+            region: Some("CA".to_owned()),
+            asn: None,
+        }
+    }
+
     /// A context read the way a composition root builds one, with the selected
     /// built-in module threaded through the services, at a location whose
     /// rules set storage without a signal so the gate is open.
@@ -1055,16 +1070,7 @@ mod tests {
             .uri("https://test-publisher.com/")
             .body(EdgeBody::empty())
             .expect("should build organic request");
-        let geo = crate::platform::GeoInfo {
-            city: String::new(),
-            country: "US".to_owned(),
-            continent: String::new(),
-            latitude: 0.0,
-            longitude: 0.0,
-            metro_code: 0,
-            region: Some("CA".to_owned()),
-            asn: None,
-        };
+        let geo = open_gate_geo();
         let ec = EcContext::read_from_request_with_geo(settings, &organic, &services, Some(&geo))
             .expect("should read EC context");
         assert!(
@@ -1113,6 +1119,57 @@ mod tests {
                     .to_str()
                     .is_ok_and(|cookie| cookie.starts_with("ts-ec="))),
             "should set the Edge Cookie"
+        );
+    }
+
+    /// The endpoint writes under the prefix of the context read from its own
+    /// request, as an adapter reads it, so on a request addressed by path the
+    /// Edge Cookie and its marker are under the removed prefix.
+    #[tokio::test]
+    async fn resolve_writes_under_the_removed_prefix_of_an_addressed_request() {
+        let settings = settings_with_client_fixed();
+        let module = crate::ec::module::build_reusable_module(&settings.ec, None, None)
+            .expect("should build the selected module")
+            .expect("a built-in module is reusable");
+        let services = noop_services_with_ec_module(module);
+        let mut req = post(FIXED_WORD);
+        req.extensions_mut()
+            .insert(crate::addressing::RemovedPathPrefix::new(
+                "/publisher-a.example".to_owned(),
+            ));
+        let ec = EcContext::read_from_request_with_geo(
+            &settings,
+            &req,
+            &services,
+            Some(&open_gate_geo()),
+        )
+        .expect("should read EC context");
+
+        let response = handle_ec_resolve(&settings, req, &ec, Some(&in_memory_graph()), &services)
+            .await
+            .expect("a valid selection should not be an error");
+
+        assert_eq!(response.status(), StatusCode::OK, "should set identity");
+        let names_and_paths: Vec<(String, String)> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| {
+                let cookie = value.to_str().expect("should be utf-8");
+                let name = cookie.split('=').next().unwrap_or_default();
+                let path = cookie
+                    .split("; ")
+                    .find_map(|attribute| attribute.strip_prefix("Path="))
+                    .unwrap_or_default();
+                (name.to_owned(), path.to_owned())
+            })
+            .collect();
+        assert_eq!(
+            names_and_paths,
+            [
+                ("ts-ec".to_owned(), "/publisher-a.example".to_owned()),
+                ("ts-ecr".to_owned(), "/publisher-a.example".to_owned()),
+            ]
         );
     }
 

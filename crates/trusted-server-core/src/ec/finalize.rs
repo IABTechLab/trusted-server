@@ -81,6 +81,12 @@ pub async fn ec_finalize_response(
         if storage_withdrawn && ec_context.pull_sync_marker().was_present() {
             let public = ec_context.public_prefix().clone();
             expire_marker(&public, ec_context.pull_sync_marker_mut(), response);
+            // A marker under `/` is sent on a request under a removed prefix
+            // as well, so it is expired there too, as the Edge Cookie is.
+            if public.cookie_path() != "/" {
+                let root = public.under_path(None);
+                expire_marker(&root, ec_context.pull_sync_marker_mut(), response);
+            }
         }
 
         finalize_unusable_consent(
@@ -579,21 +585,24 @@ fn finalize_unusable_consent(
 
 /// The identity-graph keys a withdrawal must tombstone.
 ///
-/// Both the `ts-ec` cookie the request carried and the active identifier are
-/// turned into keys by the module that owns them, so the tombstone lands on
-/// the row the live identifier is stored under rather than on the raw cookie
-/// value. An identifier no module this deployment reads owns produces no key
-/// and is dropped, and with no module selected the built-in HMAC grammar
-/// decides, as
+/// The `ts-ec` cookie the request carried, any other of that name a request
+/// under a removed prefix carried, such as one under `/`, and the active
+/// identifier are each turned into keys by the module that owns them, so the
+/// tombstone lands on the row the live identifier is stored under rather than
+/// on the raw cookie value. An identifier no module this deployment reads owns
+/// produces no key and is dropped, and with no module selected the built-in
+/// HMAC grammar decides, as
 /// [`AcceptedModules::canonical_kv_key`](super::module::AcceptedModules::canonical_kv_key)
-/// does. The two collapse to one key when they are the same identity written
-/// two ways.
+/// does. Two of them collapse to one key when they are the same identity
+/// written two ways.
 fn withdrawal_kv_keys(ec_context: &EcContext) -> HashSet<String> {
     let mut keys = HashSet::new();
 
     if let Some(cookie_kv_key) = ec_context.cookie_ec_kv_key() {
         keys.insert(cookie_kv_key);
     }
+
+    keys.extend(ec_context.other_cookie_ec_kv_keys());
 
     if let Some(active_kv_key) = ec_context.ec_kv_key() {
         keys.insert(active_kv_key);

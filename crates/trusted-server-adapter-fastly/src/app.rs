@@ -1044,10 +1044,10 @@ async fn run_named_route(
             }
         }
         NamedRouteHandler::SetTester => {
-            handle_set_tester(&state.settings, services.public_prefix())
+            handle_set_tester(&state.settings, &services.public_prefix().for_request(&req))
         }
         NamedRouteHandler::ClearTester => {
-            handle_clear_tester(&state.settings, services.public_prefix())
+            handle_clear_tester(&state.settings, &services.public_prefix().for_request(&req))
         }
         NamedRouteHandler::Permissions | NamedRouteHandler::Config | NamedRouteHandler::Data => {
             unreachable!("the inspection endpoints are answered before EC setup")
@@ -2603,6 +2603,34 @@ mod tests {
             set_cookie,
             "ts-tester=true; Domain=.test-publisher.com; Path=/; Secure; SameSite=Lax; Max-Age=2592000",
             "tester cookie should use publisher.cookie_domain and persist across browser restarts"
+        );
+    }
+
+    /// On a request addressed by path, the tester cookie is written under
+    /// the removed prefix, as every other cookie core writes is.
+    #[test]
+    fn dispatch_set_tester_writes_under_the_removed_prefix() {
+        let mut settings = test_settings();
+        settings.tester_cookie.enabled = true;
+        let state = app_state_for_settings(settings);
+        let router = TrustedServerApp::routes_for_state(&state);
+        let mut request = empty_request(Method::GET, "/_ts/set-tester");
+        request
+            .extensions_mut()
+            .insert(trusted_server_core::addressing::RemovedPathPrefix::new(
+                "/publisher-a.example".to_owned(),
+            ));
+        let response = route(&router, request);
+
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("should set tester cookie")
+            .to_str()
+            .expect("should render set-cookie as utf-8");
+        assert!(
+            set_cookie.contains("; Path=/publisher-a.example; "),
+            "tester cookie should be under the removed prefix: {set_cookie}"
         );
     }
 
