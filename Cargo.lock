@@ -6658,6 +6658,7 @@ dependencies = [
  "trusted-server-framework-nextjs",
  "trusted-server-headers-geo",
  "trusted-server-identity-lockr",
+ "trusted-server-middleware-51degrees",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
  "trusted-server-permission-signal-mtm",
@@ -6703,6 +6704,7 @@ dependencies = [
  "trusted-server-headers-geo",
  "trusted-server-identity-lockr",
  "trusted-server-js",
+ "trusted-server-middleware-51degrees",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
  "trusted-server-permission-signal-mtm",
@@ -6754,6 +6756,7 @@ dependencies = [
  "trusted-server-geo-fastly",
  "trusted-server-headers-geo",
  "trusted-server-identity-lockr",
+ "trusted-server-middleware-51degrees",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
  "trusted-server-permission-signal-mtm",
@@ -6803,6 +6806,7 @@ dependencies = [
  "trusted-server-headers-geo",
  "trusted-server-identity-lockr",
  "trusted-server-js",
+ "trusted-server-middleware-51degrees",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
  "trusted-server-permission-signal-mtm",
@@ -7028,6 +7032,7 @@ dependencies = [
  "trusted-server-framework-nextjs",
  "trusted-server-headers-geo",
  "trusted-server-identity-lockr",
+ "trusted-server-middleware-51degrees",
  "trusted-server-tag-google-tag",
  "trusted-server-tag-google-tag-manager",
  "trusted-server-testing-testlight",
@@ -7269,6 +7274,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-server-middleware-51degrees"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "edgezero-core",
+ "error-stack",
+ "http",
+ "serde",
+ "serde_json",
+ "tokio",
+ "trusted-server-core",
+ "trusted-server-loading-cache-51degrees",
+ "trusted-server-shared-51degrees",
+ "url",
+ "validator",
+]
+
+[[package]]
 name = "trusted-server-openrtb"
 version = "0.1.0"
 dependencies = [
@@ -7340,6 +7363,26 @@ dependencies = [
  "serde_json",
  "trusted-server-core",
  "trusted-server-permission-signal-gpc",
+]
+
+[[package]]
+name = "trusted-server-shared-51degrees"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "edgezero-core",
+ "error-stack",
+ "http",
+ "log",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokio",
+ "trusted-server-core",
+ "trusted-server-loading-cache-51degrees",
+ "url",
+ "validator",
 ]
 
 [[package]]

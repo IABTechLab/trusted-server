@@ -2121,6 +2121,16 @@ the service starts, with the names that could be written.
 | `[cache.robots-txt]` | `store_seconds`      | `604800`, a week        | 1 to 31536000 | The longest a module's answer is used. The module's own refresh ends it sooner. |
 | `[cache.robots-txt]` | `store_idle_seconds` | `2592000`, 30 days      | 1 to 31536000 | How long an answer in the shared store lasts unused.                            |
 
+The 51Degrees modules declare `51degrees-answers`, the cache that holds the
+service's answers, sized in `[cache.51degrees-answers]`.
+
+| Table                       | Field                | Default          | Range         | Description                                                             |
+| --------------------------- | -------------------- | ---------------- | ------------- | ----------------------------------------------------------------------- |
+| `[cache.51degrees-answers]` | `module`             | none             |               | The module whose loading cache holds the 51Degrees service's answers.   |
+| `[cache.51degrees-answers]` | `memory_seconds`     | `60`             | 0 to 31536000 | How long the copy in memory is used. Zero keeps none.                   |
+| `[cache.51degrees-answers]` | `store_seconds`      | `604800`, a week | 1 to 31536000 | The longest an answer is used. An answer ends after an hour regardless. |
+| `[cache.51degrees-answers]` | `store_idle_seconds` | `86400`, a day   | 1 to 31536000 | How long an answer in the shared store lasts unused.                    |
+
 A module may declare caches of its own, named by the module, and a deployment
 selects a loading cache for each in its own `[cache.<name>]` table with the
 same four settings. Core applies none of the lifetimes in such a table. They
@@ -2234,6 +2244,7 @@ validation knows is listed below.
 | `[tag.google-tag-manager]`    | [Google Tag Manager](/guide/integrations/google_tag_manager)       |
 | `[ad-tag.google]`             | [GPT](/guide/integrations/gpt)                                     |
 | `[ad-tag.google.diagnostics]` | [GPT diagnostics](/guide/integrations/gpt-diagnostics)             |
+| `[shared.51degrees]`          | [51Degrees](/guide/integrations/51degrees)                         |
 | `[cmp.inmobi]`                | [InMobi Choice](/guide/integrations/inmobi)                        |
 | `[proxy.js_asset_proxy]`      | [JS Asset Proxy](#js-asset-proxy-integration) (no dedicated guide) |
 | `[identity.lockr]`            | [lockr](/guide/integrations/lockr)                                 |
@@ -2423,6 +2434,7 @@ generated configuration places it in.
 | `ad-tag.google.diagnostics`   | `[[serve]]` | For a request that activated diagnostics, writes the bootstrap ahead of the script bundle and the tag that loads the diagnostics module straight after it                                                                                                                                                                                                         |
 | `ads-txt.iabtl`               | `[[fetch]]` | Writes the lines `[ads-txt.iabtl]` gives at the end of the publisher's `ads.txt`, on `text/plain` alone                                                                                                                                                                                                                                                           |
 | `headers.geo`                 | `[[serve]]` | Writes the location the request resolved as the `x-geo-*` response headers, or `x-geo-info-available: false` where none is known. `[headers] modules = ["geo"]` selects it                                                                                                                                                                                        |
+| `51degrees.client_hints`      | `[[serve]]` | Asks the 51Degrees service which client hints the reader's browser can send, writes `Accept-CH` and `Critical-CH` unless the browser already sends those hints, `Permissions-Policy` on the response and the `Delegate-CH` tag in the head for that list, and leaves the names in the request's state                                                             |
 | `robots_txt`                  | `[[fetch]]` | Makes the `robots.txt` that `[robots-txt]` describes, in place of whatever the origin answers, on `text/plain` and at `/robots.txt` alone                                                                                                                                                                                                                         |
 | `service_version`             | `[[serve]]` | Writes `X-TS-Version`, the git version the build compiled in, and `X-TS-Service-Version`, the platform's version number of the service, when each is known. Core supplies it, so no section selects it                                                                                                                                                            |
 
@@ -2515,6 +2527,35 @@ refused, because a serve middleware's head markup is written after what each
 fetch middleware writes ahead of the script bundle, and so is naming it for one
 page in both phases, which would write it twice. See [InMobi Choice](/guide/integrations/inmobi)
 for the tag's parts and what the module keeps to.
+
+### 51Degrees Integration
+
+**Section**: `[shared.51degrees]`, with `[middleware.51degrees.client_hints]`
+and `[cache.51degrees-answers]`
+
+The table's presence runs the 51Degrees modules, and its fields are what
+every one of them shares.
+
+| Field         | Type    | Default  | Contract                                                                                                                                  |
+| ------------- | ------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `endpoint`    | URL     | Required | The service's JSON endpoint, with any resource key the deployment requires in its path, whose origin the browser's hints are delegated to |
+| `license_key` | String  | Required | The name of the license key's entry in the secret store, which every server side call presents in place of the public resource key        |
+| `timeout_ms`  | Integer | `500`    | How long a call to the service waits, `1..=10000` milliseconds                                                                            |
+
+The client hints middleware's own table has one field.
+
+| Table                                 | Field      | Type    | Default | Contract                                                                                     |
+| ------------------------------------- | ---------- | ------- | ------- | -------------------------------------------------------------------------------------------- |
+| `[middleware.51degrees.client_hints]` | `critical` | Boolean | `true`  | Whether `Critical-CH` is written with `Accept-CH`, so a browser retries its first navigation |
+
+The service's answers load through the cache `51degrees-answers`, selected and
+sized in `[cache.51degrees-answers]` with the four settings every declared
+cache takes, see [Loading caches](#loading-caches), and are held only where
+the build links a loading cache module. An answer ends after an hour whatever
+`store_seconds` says. Each table refuses a field it does not
+read, and a table with no `license_key` is refused, because every 51Degrees
+module presents one. See [51Degrees](/guide/integrations/51degrees) for what
+the middleware writes and where to place it.
 
 ### Google Tag Integration
 

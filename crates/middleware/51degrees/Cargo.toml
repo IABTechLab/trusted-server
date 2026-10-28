@@ -1,0 +1,38 @@
+[package]
+name = "trusted-server-middleware-51degrees"
+description = "The 51Degrees client hints middleware: asks the service which hints a reader's browser can send, and writes Accept-CH, Critical-CH, Permissions-Policy and the Delegate-CH tag on each page."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+trusted-server-core = { workspace = true }
+trusted-server-shared-51degrees = { workspace = true }
+async-trait = { workspace = true }
+edgezero-core = { workspace = true }
+error-stack = { workspace = true }
+http = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+url = { workspace = true }
+validator = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+trusted-server-core = { workspace = true, features = ["test-utils"] }
+trusted-server-loading-cache-51degrees = { workspace = true }
+trusted-server-shared-51degrees = { workspace = true, features = ["test-utils"] }
+
+# The visible owner of this vendor crate, the way Prebid.js requires a named
+# maintainer of every adapter.
+[package.metadata.maintainers]
+owner = "51Degrees"
+status = "vendor owned"

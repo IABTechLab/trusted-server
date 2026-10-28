@@ -35,6 +35,7 @@ their operational procedures.
 | [`google_tag_manager`](/guide/integrations/google_tag_manager) | production         | `[tag] modules = ["google-tag-manager"]`                  | settings builder   | bundled         |
 | [`gpt`](/guide/integrations/gpt)                               | production         | `[ad-tag] modules = ["google"]`                           | settings builder   | bundled         |
 | [`gpt_diagnostics`](/guide/integrations/gpt-diagnostics)       | development        | `[ad-tag] modules = ["google.diagnostics"]`               | settings builder   | standalone      |
+| [`51degrees`](/guide/integrations/51degrees)                   | development        | `[shared.51degrees]`                                      | settings builder   | none            |
 | [`inmobi`](/guide/integrations/inmobi)                         | development        | `[cmp] module = "inmobi"`                                 | settings builder   | none            |
 | `js_asset_proxy` (no dedicated guide)                          | development        | `[proxy] modules = ["js_asset_proxy"]`                    | settings builder   | none            |
 | [`lockr`](/guide/integrations/lockr)                           | production         | `[identity] module = "lockr"`                             | settings builder   | bundled         |

@@ -1,0 +1,7 @@
+[shared.51degrees]
+endpoint = "https://cloud.example.com/api/v4/json"
+license_key = "a-license-key-for-the-recorded-page"
+
+[[serve]]
+media_type = "text/html"
+middleware = ["51degrees.client_hints"]

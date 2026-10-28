@@ -433,6 +433,7 @@ pull_sync_concurrency = 3
 #   "ad-tag.google.loader",
 #   "ad-tag.google.diagnostics",
 #   "headers.geo",
+#   "51degrees.client_hints",
 #   "service_version",
 # ]
 
@@ -525,6 +526,18 @@ pull_sync_concurrency = 3
 # memory_seconds = 60
 # store_seconds = 604800
 # store_idle_seconds = 2592000
+
+# The loading cache that holds the 51Degrees service's answers, which the
+# 51Degrees modules under [shared.51degrees] ask for once for each request's
+# evidence, and how long the copies last, with the same four settings. An
+# answer ends after an hour whatever the store lifetime says. A stock build
+# links no loading cache module and refuses `module`, as for
+# [cache.robots-txt].
+# [cache.51degrees-answers]
+# module = "51degrees"
+# memory_seconds = 60
+# store_seconds = 604800
+# store_idle_seconds = 86400
 
 # Operator-controlled cache header policies for static/rehosted assets. Disabled
 # rules never match, and matcher/policy validation is deferred until a rule is
@@ -895,6 +908,24 @@ auction_timeout_ms = 500
 # [cmp.inmobi]
 # script_url = "https://cmp.inmobi.com/choice/<account>/<site>/choice.js?tag_version=V3"
 # cmp_id = 10
+
+# 51Degrees. The table's presence runs the 51Degrees modules, and every one
+# of them presents `license_key`, the name of the key's entry in the secret
+# store, on its server side calls. `endpoint` is the service's JSON endpoint,
+# with any resource key the deployment requires in its path, and `timeout_ms`
+# is how long a call waits. The client hints middleware delegates the
+# browser's hints to the endpoint's origin, where a [[serve]] entry names
+# `51degrees.client_hints`.
+# [shared.51degrees]
+# endpoint = "https://cloud.51degrees.com/api/v4/json"
+# license_key = "fiftyone_degrees_license_key"
+# timeout_ms = 500
+
+# The client hints middleware's own options. `critical` writes Critical-CH
+# with Accept-CH, so a browser retries the first navigation of a session
+# carrying its hints, and is on unless set to false.
+# [middleware.51degrees.client_hints]
+# critical = true
 
 # Permutive DMP. `organization_id` and `workspace_id` are required.
 # [audience]

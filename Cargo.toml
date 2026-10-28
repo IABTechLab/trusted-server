@@ -22,6 +22,8 @@ members = [
     "crates/ads-txt/iabtl",
     "crates/headers/geo",
     "crates/loading-cache/51degrees",
+    "crates/shared/51degrees",
+    "crates/middleware/51degrees",
     "crates/asset-cache/51degrees",
     "crates/tag/google-tag",
     "crates/tag/google-tag-manager",
@@ -172,6 +174,8 @@ trusted-server-cmp-inmobi = { path = "crates/cmp/inmobi" }
 trusted-server-ads-txt-iabtl = { path = "crates/ads-txt/iabtl" }
 trusted-server-headers-geo = { path = "crates/headers/geo" }
 trusted-server-loading-cache-51degrees = { path = "crates/loading-cache/51degrees" }
+trusted-server-shared-51degrees = { path = "crates/shared/51degrees" }
+trusted-server-middleware-51degrees = { path = "crates/middleware/51degrees" }
 trusted-server-asset-cache-51degrees = { path = "crates/asset-cache/51degrees" }
 trusted-server-tag-google-tag = { path = "crates/tag/google-tag" }
 trusted-server-tag-google-tag-manager = { path = "crates/tag/google-tag-manager" }

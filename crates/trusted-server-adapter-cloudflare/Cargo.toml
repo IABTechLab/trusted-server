@@ -32,6 +32,7 @@ serde_json = { workspace = true }
 trusted-server-ad-server-iabtl = { workspace = true }
 trusted-server-ad-tag-google = { workspace = true }
 trusted-server-ads-txt-iabtl = { workspace = true }
+trusted-server-middleware-51degrees = { workspace = true }
 trusted-server-auction-aps = { workspace = true }
 trusted-server-auction-prebid = { workspace = true }
 trusted-server-auction-prebid-server = { workspace = true }

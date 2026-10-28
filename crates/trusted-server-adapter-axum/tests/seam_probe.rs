@@ -15,7 +15,7 @@ use axum::http::{HeaderMap, Request};
 use edgezero_adapter_axum::service::EdgeZeroAxumService;
 use error_stack::Report;
 use tower::{Service as _, ServiceExt as _};
-use trusted_server_adapter_axum::app::TrustedServerApp;
+use trusted_server_adapter_axum::app::{TrustedServerApp, module_builders_with};
 use trusted_server_core::auction::compile_auction_plan;
 use trusted_server_core::config::validate_settings_for_deploy_with;
 use trusted_server_core::error::TrustedServerError;
@@ -644,7 +644,9 @@ async fn a_cache_table_no_module_declares_is_refused_by_the_deploy_check_and_at_
     ));
     let both = [seam_probe::builder(), seam_probe::loading_cache_builder()];
 
-    let deploy = validate_settings_for_deploy_with(&settings, &both)
+    // The deploy check reads the builders startup links, the adapter's own
+    // and the deployment's after them.
+    let deploy = validate_settings_for_deploy_with(&settings, &module_builders_with(&both))
         .expect_err("the deploy check should refuse the misspelt table");
     let startup = TrustedServerApp::routes_with_registrations(settings, &both)
         .err()
@@ -658,7 +660,7 @@ async fn a_cache_table_no_module_declares_is_refused_by_the_deploy_check_and_at_
         "should name the table: {message}"
     );
     assert!(
-        message.contains("robots-txt, iabtl-answers"),
+        message.contains("robots-txt, 51degrees-answers, iabtl-answers"),
         "should list the caches this build declares: {message}"
     );
     assert_eq!(
