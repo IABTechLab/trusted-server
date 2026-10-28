@@ -50,9 +50,11 @@ The generated local Wrangler files define `publisher_proxy_secret` and
 `ec_passphrase` separately. Edge Cookie identity is off by default, so the
 smoke's settings select the built-in `hmac` module, whose passphrase is the
 `ec_passphrase` secret. The smoke launches
-`wrangler dev` once for each omitted secret. Each case requires a 500 response
-and verifies the exact missing binding against Wrangler's runtime binding
-inventory. The Worker installs no logger, so no case waits for a log line. The
+`wrangler dev` once for each omitted secret. Each case requires a 500 response,
+verifies the exact missing binding against Wrangler's runtime binding
+inventory, and waits for the Worker's log line naming the missing input, the
+app-config key before the push and the omitted secret after it, which
+`wrangler dev` prints with its own output (see [Logging](#logging)). The
 positive publisher request must return 200, include the stub-origin sentinel,
 rewrite its origin URL to the Worker listener, and omit the original URL.
 

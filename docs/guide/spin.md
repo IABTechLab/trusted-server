@@ -62,9 +62,11 @@ variables:
 - `v_trusted_x5fserver_x5fsecrets_v_ec_x5fpassphrase`
 
 It first launches `spin up` before config is pushed, then relaunches it while
-omitting each variable independently. Every publisher request must return 500.
-The component installs no logger, so the smoke checks these cases by their
-status alone.
+omitting each variable independently. Every publisher request must return 500,
+and the component's log, which the smoke keeps with `--log-dir`, must name the
+intended missing input, the app-config blob before the push and the omitted
+variable's secret after it. A generic degraded response cannot satisfy the
+check.
 
 The final non-health publisher request must return 200, retain the stub-origin
 sentinel, rewrite its origin URL to the Spin listener, and omit the original
