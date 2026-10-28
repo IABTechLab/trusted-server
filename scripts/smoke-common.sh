@@ -12,6 +12,28 @@ smoke_require_command() {
     command -v "$1" >/dev/null 2>&1 || smoke_die "required command not found: $1"
 }
 
+smoke_require_spin_version() {
+    # `.tool-versions` is the single source of truth for the pinned version, so
+    # the floor is read from there rather than restated here. spin-sdk 7 imports
+    # wasi:http/types@0.3.0, which Spin 4.0.x cannot link.
+    local versions="${BASH_SOURCE[0]%/*}/../.tool-versions"
+    local minimum
+    minimum=$(awk '$1 == "spin" { print $2; exit }' "$versions" 2>/dev/null)
+    [ -n "$minimum" ] || smoke_die "no spin version pinned in .tool-versions"
+    local raw
+    raw=$(spin --version 2>/dev/null) || smoke_die "could not run: spin --version"
+    local found
+    found=$(printf '%s\n' "$raw" | sed -n '1s/^spin \([0-9][0-9.]*\).*/\1/p')
+    [ -n "$found" ] || smoke_die "could not parse a version from: $raw"
+    # The component still builds and its tests still pass, so only `spin up`
+    # surfaces the mismatch; check the runtime before starting the app.
+    local lowest
+    lowest=$(printf '%s\n%s\n' "$minimum" "$found" | sort -V | head -1)
+    if [ "$lowest" != "$minimum" ]; then
+        smoke_die "spin $minimum or newer is required (found $found); spin-sdk 7 imports wasi:http/types@0.3.0, which earlier runtimes cannot link. Install from https://spinframework.dev/install"
+    fi
+}
+
 smoke_make_workspace() {
     local adapter="$1"
     local base="${TMPDIR:-/tmp}"
