@@ -91,9 +91,10 @@ impl fmt::Display for Jurisdiction {
     }
 }
 
-/// Detects the privacy jurisdiction for a request from its location.
+/// Detects the privacy jurisdiction for a request from its location, in
+/// the policy whose rules are `maps`.
 ///
-/// Walks the `permissions.yaml` place tree the same way the permission
+/// Walks the policy's place tree the same way the permission
 /// baseline is resolved: the request's region when it is listed, otherwise its
 /// country, otherwise the top of the tree. A node that names no jurisdiction of
 /// its own inherits the one above it, which is resolved when the file is
@@ -108,8 +109,7 @@ impl fmt::Display for Jurisdiction {
 /// must not apply that declaration, such as one holding a failed geo lookup,
 /// resolves [`Jurisdiction::Unknown`] itself rather than calling this.
 #[must_use]
-pub fn detect_jurisdiction(geo: Option<&GeoInfo>) -> Jurisdiction {
-    let maps = PermissionMaps::standard();
+pub fn detect_jurisdiction(maps: &PermissionMaps, geo: Option<&GeoInfo>) -> Jurisdiction {
     match geo {
         Some(geo) => maps.jurisdiction_for(Some(&geo.country), geo.region.as_deref()),
         None => maps.default_jurisdiction(),
@@ -124,6 +124,7 @@ pub fn detect_jurisdiction(geo: Option<&GeoInfo>) -> Jurisdiction {
 mod tests {
     use super::{Jurisdiction, detect_jurisdiction};
     use crate::geo::GeoInfo;
+    use crate::permissions::PermissionMaps;
 
     fn make_geo(country: &str, region: Option<&str>) -> GeoInfo {
         GeoInfo {
@@ -142,7 +143,7 @@ mod tests {
     fn gdpr_detected_for_eu_country() {
         let geo = make_geo("DE", None);
         assert_eq!(
-            detect_jurisdiction(Some(&geo)),
+            detect_jurisdiction(PermissionMaps::sample(), Some(&geo)),
             Jurisdiction::Gdpr,
             "Germany should trigger GDPR"
         );
@@ -152,7 +153,7 @@ mod tests {
     fn gdpr_detected_for_eea_country() {
         let geo = make_geo("NO", None);
         assert_eq!(
-            detect_jurisdiction(Some(&geo)),
+            detect_jurisdiction(PermissionMaps::sample(), Some(&geo)),
             Jurisdiction::Gdpr,
             "Norway (EEA) should trigger GDPR"
         );
@@ -162,7 +163,7 @@ mod tests {
     fn gdpr_detected_for_uk() {
         let geo = make_geo("GB", None);
         assert_eq!(
-            detect_jurisdiction(Some(&geo)),
+            detect_jurisdiction(PermissionMaps::sample(), Some(&geo)),
             Jurisdiction::Gdpr,
             "the UK should trigger GDPR"
         );
@@ -172,7 +173,7 @@ mod tests {
     fn us_state_detected_for_california() {
         let geo = make_geo("US", Some("CA"));
         assert_eq!(
-            detect_jurisdiction(Some(&geo)),
+            detect_jurisdiction(PermissionMaps::sample(), Some(&geo)),
             Jurisdiction::UsState("CA".to_owned()),
             "California should trigger US state privacy"
         );
@@ -184,13 +185,13 @@ mod tests {
         // keeps them apart by where they sit, so no ordering rule is needed.
         let delaware = make_geo("US", Some("DE"));
         assert_eq!(
-            detect_jurisdiction(Some(&delaware)),
+            detect_jurisdiction(PermissionMaps::sample(), Some(&delaware)),
             Jurisdiction::UsState("DE".to_owned()),
             "US/DE should be Delaware"
         );
         let germany = make_geo("DE", None);
         assert_eq!(
-            detect_jurisdiction(Some(&germany)),
+            detect_jurisdiction(PermissionMaps::sample(), Some(&germany)),
             Jurisdiction::Gdpr,
             "DE at the country level should be Germany"
         );
@@ -200,7 +201,7 @@ mod tests {
     fn us_non_privacy_state_inherits_the_country_node() {
         let geo = make_geo("US", Some("WY"));
         assert_eq!(
-            detect_jurisdiction(Some(&geo)),
+            detect_jurisdiction(PermissionMaps::sample(), Some(&geo)),
             Jurisdiction::NonRegulated,
             "Wyoming is not listed, so it inherits the US node"
         );
@@ -210,7 +211,7 @@ mod tests {
     fn us_no_region_is_non_regulated() {
         let geo = make_geo("US", None);
         assert_eq!(
-            detect_jurisdiction(Some(&geo)),
+            detect_jurisdiction(PermissionMaps::sample(), Some(&geo)),
             Jurisdiction::NonRegulated,
             "the US without a region should be non-regulated"
         );
@@ -219,12 +220,12 @@ mod tests {
     #[test]
     fn an_unlisted_country_inherits_the_top_of_the_tree() {
         // Nothing is written for Japan, so it inherits the top node, which the
-        // shipped policy sets to GDPR. That is the same node an unresolved
+        // sample policy sets to GDPR. That is the same node an unresolved
         // place gets, so an unlisted country is treated no more loosely than a
         // visitor with no place at all.
         let geo = make_geo("JP", None);
         assert_eq!(
-            detect_jurisdiction(Some(&geo)),
+            detect_jurisdiction(PermissionMaps::sample(), Some(&geo)),
             Jurisdiction::Gdpr,
             "an unlisted country should inherit the top of the tree"
         );
@@ -233,7 +234,7 @@ mod tests {
     #[test]
     fn no_geo_uses_the_top_of_the_tree() {
         assert_eq!(
-            detect_jurisdiction(None),
+            detect_jurisdiction(PermissionMaps::sample(), None),
             Jurisdiction::Gdpr,
             "with no place the policy's declared top node applies"
         );
@@ -243,13 +244,13 @@ mod tests {
     fn case_insensitive_place_matching() {
         let geo = make_geo("de", None);
         assert_eq!(
-            detect_jurisdiction(Some(&geo)),
+            detect_jurisdiction(PermissionMaps::sample(), Some(&geo)),
             Jurisdiction::Gdpr,
             "a lowercase country code should still match"
         );
         let state = make_geo("us", Some("ca"));
         assert_eq!(
-            detect_jurisdiction(Some(&state)),
+            detect_jurisdiction(PermissionMaps::sample(), Some(&state)),
             Jurisdiction::UsState("CA".to_owned()),
             "a lowercase region code should still match and upper-case the state"
         );

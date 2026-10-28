@@ -9,11 +9,13 @@ use super::{
     GeoModule, PlatformBackend, PlatformConfigStore, PlatformHttpClient, PlatformKvStore,
     PlatformSecretStore,
 };
+use crate::asset_cache::AssetCacheModule;
 use crate::ec::device::DeviceModule;
 use crate::ec::identifiers::IdentifierModule;
 use crate::ec::module::EdgeCookieModule;
 use crate::evidence::HostSignals;
 use crate::permission_signal::PermissionSignalModule;
+use crate::permissions::PermissionPolicy;
 
 /// Geographic information extracted from a request.
 ///
@@ -217,6 +219,10 @@ pub struct RuntimeServices {
     /// selects no module, the Axum adapter, and the core tests all do.
     pub(crate) resolved_ec_module: Option<Arc<dyn EdgeCookieModule>>,
     pub(crate) device_module: Option<Arc<dyn DeviceModule>>,
+    /// The asset cache module `[asset-cache]` selected, which may answer for
+    /// a file before core asks its origin. `None` has every file asked of
+    /// its origin.
+    pub(crate) asset_cache_module: Option<Arc<dyn AssetCacheModule>>,
     /// The permission signal modules this deployment runs, in the order
     /// they are asked, selected at the composition root from the scheme
     /// crates the adapter links. Empty when the adapter offers none, in which
@@ -233,6 +239,9 @@ pub struct RuntimeServices {
     /// selected prefix module, which start every name the browser holds and
     /// every key in a shared store. See [`crate::prefix`].
     pub(crate) prefixes: crate::prefix::Prefixes,
+    /// The permission policy the request's domain loaded, which decides its
+    /// permissions.
+    pub(crate) permission_policy: Arc<PermissionPolicy>,
 }
 
 impl RuntimeServices {
@@ -253,6 +262,7 @@ impl RuntimeServices {
     ///     .http_client(Arc::new(MyHttpClient))
     ///     .geo(Arc::new(MyGeo))
     ///     .client_info(client_info)
+    ///     .permission_policy(policy)
     ///     .build();
     /// ```
     #[must_use]
@@ -401,6 +411,13 @@ impl RuntimeServices {
         self.device_module.clone()
     }
 
+    /// The asset cache module `[asset-cache]` selected, when it selected
+    /// one. `None` has core ask the origin for every file.
+    #[must_use]
+    pub fn asset_cache_module(&self) -> Option<Arc<dyn AssetCacheModule>> {
+        self.asset_cache_module.clone()
+    }
+
     /// The prefixes of the publisher this request was resolved to, being the
     /// start of every name the browser holds and of every key in a shared
     /// store. See [`crate::prefix`].
@@ -419,6 +436,12 @@ impl RuntimeServices {
     #[must_use]
     pub fn public_prefix(&self) -> &crate::prefix::PublicPrefix {
         self.prefixes.public()
+    }
+
+    /// The permission policy the request's domain loaded.
+    #[must_use]
+    pub fn permission_policy(&self) -> &Arc<PermissionPolicy> {
+        &self.permission_policy
     }
 
     /// Wrap the KV store in a [`super::KvHandle`] for ergonomic access to
@@ -539,6 +562,18 @@ impl RuntimeServices {
         }
     }
 
+    /// Returns a clone of this instance with the asset cache module
+    /// replaced.
+    ///
+    /// Adapters use this to apply the module `[asset-cache]` selected.
+    #[must_use]
+    pub fn with_asset_cache_module(self, module: Arc<dyn AssetCacheModule>) -> Self {
+        Self {
+            asset_cache_module: Some(module),
+            ..self
+        }
+    }
+
     /// Returns a clone of this instance carrying the prefixes of the publisher
     /// the request was resolved to.
     ///
@@ -576,6 +611,19 @@ impl RuntimeServices {
     #[must_use]
     pub fn with_loading_cache(self, cache: Arc<dyn super::PlatformLoadingCache>) -> Self {
         self.with_loading_caches(Arc::new(super::LoadingCaches::every(cache)))
+    }
+
+    /// Returns a clone of this instance carrying the permission policy the
+    /// request's domain loaded.
+    ///
+    /// An adapter hands each request the policy its domain's settings carry,
+    /// whichever services the request is given.
+    #[must_use]
+    pub fn with_permission_policy(self, permission_policy: Arc<PermissionPolicy>) -> Self {
+        Self {
+            permission_policy,
+            ..self
+        }
     }
 
     /// Returns a clone of this instance with the template cache replaced.
@@ -631,6 +679,7 @@ pub struct RuntimeServicesBuilder {
     prefixes: Option<crate::prefix::Prefixes>,
     permission_signal_modules: Arc<[Arc<dyn PermissionSignalModule>]>,
     identifier_modules: Arc<[Arc<dyn IdentifierModule>]>,
+    permission_policy: Option<Arc<PermissionPolicy>>,
 }
 
 impl RuntimeServicesBuilder {
@@ -654,6 +703,7 @@ impl RuntimeServicesBuilder {
             prefixes: None,
             permission_signal_modules: Arc::default(),
             identifier_modules: Arc::default(),
+            permission_policy: None,
         }
     }
 
@@ -814,6 +864,14 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Set the permission policy the request's domain loaded, which every
+    /// request needs to decide its permissions.
+    #[must_use]
+    pub fn permission_policy(mut self, policy: Arc<PermissionPolicy>) -> Self {
+        self.permission_policy = Some(policy);
+        self
+    }
+
     /// Construct [`RuntimeServices`] from the accumulated configuration.
     ///
     /// # Panics
@@ -861,9 +919,15 @@ impl RuntimeServicesBuilder {
             host_signals: self.host_signals,
             resolved_ec_module: self.resolved_ec_module,
             device_module: self.device_module,
+            // An adapter hands each request the module the registry
+            // selected, so services built for no request have none.
+            asset_cache_module: None,
             prefixes: self.prefixes.unwrap_or_default(),
             permission_signal_modules: self.permission_signal_modules,
             identifier_modules: self.identifier_modules,
+            permission_policy: self
+                .permission_policy
+                .expect("should set permission_policy before building RuntimeServices"),
         }
     }
 }
