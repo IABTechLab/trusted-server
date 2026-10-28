@@ -14,13 +14,13 @@
 # as it stands. Read it, change it, or replace it, and have whoever is
 # accountable for the deployment decide what it should say.
 #
-# No policy ever ships with Trusted Server. The builder of a deployment
-# chooses the permissions.yaml compiled into their image, an operator overlay
-# is the recorded follow-on, and the visitor's signals decide the rest at
-# runtime. This copy is compiled into test and demo builds so the rules stay
-# visible and reviewable in version control. The samples live in
-# config/permissions, and choosing one is always an explicit choice by whoever
-# builds, configures, or inspects.
+# No policy ships with Trusted Server and no build carries one. A domain's
+# settings name the publisher's own policy file in [permissions] policy, the
+# file is supplied with `ts config push --permissions <file>` when the service
+# is deployed, and the visitor's signals decide the rest at runtime. This copy
+# is for testing and evaluation, so the tests and the permissions inspector
+# read it. The samples live in config/permissions, and choosing one is always
+# an explicit choice by whoever configures or inspects.
 #
 # There are three parts:
 #   groups   named permission baselines, defined once and referenced by rules
