@@ -6548,6 +6548,8 @@ At each caller, build a `ServeContext` with the KV `ps.o` keys of the row as `op
 
 In `ec/identify.rs`, keep the lookup of this partner's own source and gate it with `is_servable`, using the same context built from the request's consent, never the row's stored `consent` (spec 7.1). Do not route it through `resolve_partner_ids`, which also drops partners with `bidstream_enabled = false`; `/identify` returns those today. The response keeps its shape: `uid` is `record.first_uid()`, the first UID of the first entry, and `eid` is still built from it with `partner.openrtb_atype` and no `ext` (`ec/identify.rs:127-135`).
 
+A provider-written record (`w` set) passes only with browser context (spec 7.1, 9.5): `classify_origin` allowed the `Origin` and `Sec-Fetch-Site` is `same-origin` or `same-site` (`is_same_site_fetch`; a missing header fails closed). A browser-seeded record keeps today's behaviour. Tests: `identify_returns_a_provider_written_id_only_with_browser_context` (same-site and same-origin return it; no `Origin`, no `Sec-Fetch-Site`, `cross-site` and `none` withhold it) and `identify_returns_a_browser_seeded_id_without_browser_context`. The Fastly adapter's `identify_request` test helper sends both headers, as a browser does.
+
 - [ ] **Step 6: Run and see them pass**
 
 Run: `cargo test-fastly -- ec::` and `cargo test-fastly -- auction::`

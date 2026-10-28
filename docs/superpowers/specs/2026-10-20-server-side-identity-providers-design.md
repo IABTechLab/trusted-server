@@ -2455,11 +2455,14 @@ request with a valid EC that uses identity (the writer request, `/auction`,
    navigation. The read finds orphans (section 5.5), feeds eligibility
    (section 4.7), filters browser candidates (section 7.1) and serves the
    withdrawal path when consent is withdrawn.
-2. `/auction` and `/_ts/page-bids` keep their existing reads and gain no new
+2. `/_ts/api/v1/identify` reads the row with `kv.get` and never writes it
+   (section 5.1). It reads KV only, never a cookie copy, and applies the
+   servability check and the browser-context rule of section 7.1.
+3. `/auction` and `/_ts/page-bids` keep their existing reads and gain no new
    triggers. A stager navigation that runs an auction, such as a prefetch,
    preloads as today, without the pull-complete marker's skip (section
    10.4).
-3. **Any request that read KV** uses the row as the base:
+4. **Any request that read KV** uses the row as the base:
    - A tombstone, or `consent.ok = false`, empties the server set. An
      `/auction` or `/_ts/page-bids` response returns `clear` for the
      mirror.
@@ -2605,7 +2608,12 @@ header (`ec/mod.rs:325`), and builds its consent from the same request's
 cookies, `Sec-GPC` and geolocation (`ec/mod.rs:338-345`). That does not
 prove the visitor's browser sent the call: the EC ID is a bearer value
 (section 9.5), and a server that holds it can send `Cookie: ts-ec=<id>`
-with its own consent cookies. Within a request:
+with its own consent cookies. So `/identify` returns a provider-written ID
+(a record with `w`) only with browser context: an `Origin` the CORS check
+allows and a `Sec-Fetch-Site` of `same-origin` or `same-site`. A call
+without either, including one with no `Sec-Fetch-Site` at all, gets the
+response it would get if that record were absent. A browser-seeded record
+keeps today's behaviour. Within a request:
 
 - An absent consent string is treated as the auction treats it. Where TCF
   applies, a strict policy finds no vendor consent and blocks. Elsewhere
@@ -2889,6 +2897,11 @@ This spec designs against that:
   that replays the EC through the vendor's proxied API and gets a 2xx with
   IDs can clear that provider's opt-out. Accepted: the vendor issued again
   for that request, and the IDs reach KV only through the browser path.
+- `/identify` fails closed for provider-written IDs without browser
+  context (section 7.1). Both headers can be forged by a server, so this
+  stops a partner that replays an EC with a plain HTTP client, not one that
+  imitates a browser; it costs nothing, and the IDs at stake did not reach
+  `/identify` before this spec.
 - `x-ts-eids` on `/auction` is accepted as a troubleshooting header
   (section 16): a replayed EC with granting consent reads the server set
   through it, as it reads the browser's own IDs today.

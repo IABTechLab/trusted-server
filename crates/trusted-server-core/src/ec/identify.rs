@@ -28,10 +28,21 @@ use super::kv_types::KvPartnerId;
 use super::log_id;
 use super::registry::PartnerRegistry;
 
+/// Whether the browser marked the request as a same-origin or same-site
+/// fetch. A missing `Sec-Fetch-Site` header fails closed.
+fn is_same_site_fetch(req: &Request<EdgeBody>) -> bool {
+    req.headers()
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|site| matches!(site, "same-origin" | "same-site"))
+}
+
 /// Handles `GET /_ts/api/v1/identify`.
 ///
 /// Requires Bearer token authentication. Returns only the requesting
-/// partner's UID for the active EC ID.
+/// partner's UID for the active EC ID. A provider-written UID is returned only
+/// to a call with an allowed `Origin` and a same-origin or same-site
+/// `Sec-Fetch-Site`, because the EC ID is a bearer value servers hold too.
 ///
 /// # Errors
 ///
@@ -91,6 +102,10 @@ pub fn handle_identify(
         ));
     };
 
+    // The EC ID is a bearer value partners and the origin hold (spec 9.5).
+    // A provider-written ID goes only to a call the visitor's browser made
+    // from the publisher's site.
+    let browser_context = allowed_origin.is_some() && is_same_site_fetch(req);
     let mut degraded = false;
     let mut uid: Option<String> = None;
     let mut cluster_size: Option<u32> = None;
@@ -127,6 +142,7 @@ pub fn handle_identify(
                     if let Some(partner_uid) = entry
                         .ids
                         .get(&partner.source_domain)
+                        .filter(|record| record.w.is_none() || browser_context)
                         .filter(|record| {
                             partner
                                 .source_domain
@@ -383,7 +399,11 @@ mod tests {
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
-    use crate::ec::identity::test_support::{example_entry_set, full_record};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use crate::ec::identity::runtime::IdentityRuntime;
+    use crate::ec::identity::test_support::{example_entry_set, fixed_provider, full_record};
     use crate::ec::kv_types::{KvEid, KvEntry, KvUid};
     use crate::ec::registry::PartnerRegistry;
     use crate::redacted::Redacted;
@@ -756,6 +776,98 @@ mod tests {
         let body = identify_body(&kv, &ec_id);
 
         assert_eq!(body["uid"], "live-uid", "should return the unexpired ID");
+    }
+
+    /// Calls `/identify` for a row whose `ssp.example.com` record `writer`
+    /// wrote, with the provider `prov` configured, and `headers` on the
+    /// request. Returns the `uid` the response carries.
+    fn identify_uid_with_headers(writer: Option<&str>, headers: &[(&str, &str)]) -> Option<String> {
+        let settings = create_test_settings();
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut entry = KvEntry::minimal("other.example.com", "other-uid", 1);
+        entry.ids.insert(
+            "ssp.example.com".to_owned(),
+            KvPartnerId {
+                w: writer.map(str::to_owned),
+                ..KvPartnerId::new("written-uid")
+            },
+        );
+        let kv = KvIdentityGraph::in_memory("identify-store");
+        kv.create(&ec_id, &entry).expect("should seed KV entry");
+        let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let mut builder = Request::builder()
+            .method("GET")
+            .uri("https://edge.test-publisher.com/identify")
+            .header("authorization", format!("Bearer {VALID_API_TOKEN}"));
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let req = builder
+            .body(EdgeBody::empty())
+            .expect("should build test request");
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        ec_context.set_identity_runtime(Arc::new(
+            IdentityRuntime::from_settings_with_providers(
+                &settings,
+                vec![fixed_provider("prov", &["ssp.example.com"])],
+                BTreeMap::new(),
+            )
+            .expect("should build the runtime"),
+        ));
+
+        let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
+            .expect("should construct identify response");
+        assert_eq!(response.status(), StatusCode::OK, "should answer 200");
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().into_bytes().unwrap_or_default())
+                .expect("should decode identify response JSON");
+        body["uid"].as_str().map(str::to_owned)
+    }
+
+    #[test]
+    fn identify_returns_a_provider_written_id_only_with_browser_context() {
+        const ORIGIN: (&str, &str) = ("origin", "https://www.test-publisher.com");
+
+        assert_eq!(
+            identify_uid_with_headers(Some("prov"), &[ORIGIN, ("sec-fetch-site", "same-site")])
+                .as_deref(),
+            Some("written-uid"),
+            "should return it to a same-site browser call"
+        );
+        assert_eq!(
+            identify_uid_with_headers(Some("prov"), &[ORIGIN, ("sec-fetch-site", "same-origin")])
+                .as_deref(),
+            Some("written-uid"),
+            "should return it to a same-origin browser call"
+        );
+        for (headers, case) in [
+            (&[][..], "no Origin"),
+            (&[ORIGIN][..], "no Sec-Fetch-Site"),
+            (
+                &[ORIGIN, ("sec-fetch-site", "cross-site")][..],
+                "a cross-site fetch",
+            ),
+            (
+                &[ORIGIN, ("sec-fetch-site", "none")][..],
+                "a user-initiated fetch",
+            ),
+        ] {
+            assert_eq!(
+                identify_uid_with_headers(Some("prov"), headers),
+                None,
+                "should withhold it for {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn identify_returns_a_browser_seeded_id_without_browser_context() {
+        assert_eq!(
+            identify_uid_with_headers(None, &[]).as_deref(),
+            Some("written-uid"),
+            "should keep today's behaviour for an ID no provider wrote"
+        );
     }
 
     #[test]

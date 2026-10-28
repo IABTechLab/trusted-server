@@ -397,6 +397,8 @@ configured `[[ec.partners]]` token.
 
 **No writes:** the endpoint never writes KV, and it omits an ID that has expired. The response shape is unchanged: one UID per source, even for a record that holds several.
 
+**Provider-written IDs need a browser call.** The EC ID is a bearer value: partners and the origin hold it, and any server can send it in a `ts-ec` cookie. So an ID a server-side identity provider wrote is returned only when the request carries an allowed `Origin` and `Sec-Fetch-Site: same-origin` or `same-site`, as a browser's fetch from the publisher's site does. Otherwise the response omits `uid` and `eid`, as if no ID were synced. IDs from browser ingest, batch sync and pull sync are returned as before.
+
 **Request:**
 
 - Uses `ts-ec` cookie and consent signals

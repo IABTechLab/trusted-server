@@ -2784,6 +2784,8 @@ mod tests {
                     format!("Bearer token-for-{source}-0123456789abcdef"),
                 )
                 .header("cookie", cookie)
+                .header("origin", "https://www.test-publisher.com")
+                .header("sec-fetch-site", "same-site")
                 .body(EdgeBody::empty())
                 .expect("should build request");
             as_browser(&mut request);
