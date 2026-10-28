@@ -1,0 +1,13 @@
+# Minimal Viceroy config for testing crates nested one level deeper than the
+# adapters (for example `crates/device/fastly` and `crates/geo/fastly`).
+#
+# The shared wasm test runner in `.cargo/config.toml` starts Viceroy with
+# `-C ../../fastly.toml`, resolved from the crate directory. For a two-level
+# crate such as `crates/trusted-server-adapter-fastly` that reaches the
+# repository root manifest. For a three-level crate it resolves here, to
+# `crates/fastly.toml`. These crates' unit tests use no backends, KV stores,
+# or dictionaries, only a manifest Viceroy can start from.
+manifest_version = 3
+name = "trusted-server-nested-crate-tests"
+
+[local_server]

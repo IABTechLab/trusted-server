@@ -138,6 +138,18 @@ pull_sync_concurrency = 3
 # OPTIONAL — Core features (disabled/omitted by default)
 # =============================================================================
 
+# Device detection module selection. The built-in module classifies from
+# the User-Agent alone and makes no host-specific call. The opt-in "fastly"
+# module strengthens the browser/bot gate with the host's TLS/H2 signals.
+# [device]
+# module = "builtin"
+
+# Geo / IP intelligence module selection. The platform host geo is the
+# default. Set module = "none" to resolve no location and make no host geo
+# call.
+# [geo]
+# module = "platform"
+
 # Custom headers added to every response (e.g. X-Robots-Tag: noindex).
 # [response_headers]
 # X-Robots-Tag = "noindex"

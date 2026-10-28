@@ -74,12 +74,24 @@ pub const EC_RESPONSE_HEADERS: &[&str] = &[
     "x-ts-eids-truncated",
 ];
 
+/// The request headers that carry the host's TLS JA4 and HTTP/2 client
+/// signals from an adapter's entry point to the request handlers.
+///
+/// They describe the reader's connection and must never leave Trusted Server.
+/// [`INTERNAL_HEADERS`] is built from this list, so integration proxies drop
+/// them, and the publisher origin request, which carries the reader's other
+/// headers onward, removes them by this list as well.
+///
+/// Uses `&str` slices for the same reason [`INTERNAL_HEADERS`] does.
+pub const HOST_SIGNAL_HEADERS: &[&str] = &["x-ts-tls-ja4", "x-ts-h2-fingerprint"];
+
 /// The internal headers that are not part of the Edge Cookie output surface.
 ///
-/// Kept apart from [`EC_RESPONSE_HEADERS`] only so [`INTERNAL_HEADERS`] can be
-/// assembled from the two without repeating either. Add a header here unless it
-/// is one EC finalization has to strip, in which case it belongs in
-/// [`EC_RESPONSE_HEADERS`] and reaches [`INTERNAL_HEADERS`] from there.
+/// Kept apart from [`EC_RESPONSE_HEADERS`] and [`HOST_SIGNAL_HEADERS`] only so
+/// [`INTERNAL_HEADERS`] can be assembled from the three without repeating any.
+/// Add a header here unless EC finalization has to strip it or it carries a
+/// host signal, in which case it belongs in one of those two lists and reaches
+/// [`INTERNAL_HEADERS`] from there.
 const NON_EC_INTERNAL_HEADERS: &[&str] = &[
     "x-pub-user-id",
     "x-subject-id",
@@ -103,9 +115,10 @@ const NON_EC_INTERNAL_HEADERS: &[&str] = &[
 ];
 
 /// How many names [`INTERNAL_HEADERS`] holds.
-const INTERNAL_HEADER_COUNT: usize = EC_RESPONSE_HEADERS.len() + NON_EC_INTERNAL_HEADERS.len();
+const INTERNAL_HEADER_COUNT: usize =
+    EC_RESPONSE_HEADERS.len() + NON_EC_INTERNAL_HEADERS.len() + HOST_SIGNAL_HEADERS.len();
 
-/// Joins the two source lists into the array [`INTERNAL_HEADERS`] borrows.
+/// Joins the three source lists into the array [`INTERNAL_HEADERS`] borrows.
 ///
 /// Written as a `const fn` because slice concatenation is not available in a
 /// `const` initializer, and the join has to happen while the crate is compiled
@@ -122,6 +135,11 @@ const fn join_internal_headers() -> [&'static str; INTERNAL_HEADER_COUNT] {
         joined[i + j] = NON_EC_INTERNAL_HEADERS[j];
         j += 1;
     }
+    let mut k = 0;
+    while k < HOST_SIGNAL_HEADERS.len() {
+        joined[i + j + k] = HOST_SIGNAL_HEADERS[k];
+        k += 1;
+    }
     joined
 }
 
@@ -131,9 +149,10 @@ const fn join_internal_headers() -> [&'static str; INTERNAL_HEADER_COUNT] {
 /// debugging, and compression hints. Leaking them to external origins could expose
 /// data and internal implementation details.
 ///
-/// Built at compile time from [`EC_RESPONSE_HEADERS`] followed by
-/// [`NON_EC_INTERNAL_HEADERS`], so an Edge Cookie response header cannot be
-/// added to one list and missed in the other.
+/// Built at compile time from [`EC_RESPONSE_HEADERS`],
+/// [`NON_EC_INTERNAL_HEADERS`] and [`HOST_SIGNAL_HEADERS`], in that order, so
+/// an Edge Cookie response header or a host signal header cannot be added to
+/// its own list and missed here.
 ///
 /// Uses `&str` slices because `HeaderName` has interior mutability and cannot appear
 /// in `const` context.
@@ -168,14 +187,27 @@ mod tests {
 
         assert_eq!(
             INTERNAL_HEADERS.len(),
-            EC_RESPONSE_HEADERS.len() + NON_EC_INTERNAL_HEADERS.len(),
-            "every internal header should come from exactly one of the two source lists"
+            EC_RESPONSE_HEADERS.len() + NON_EC_INTERNAL_HEADERS.len() + HOST_SIGNAL_HEADERS.len(),
+            "every internal header should come from exactly one of the three source lists"
         );
 
         for (index, header) in INTERNAL_HEADERS.iter().enumerate() {
             assert!(
                 !INTERNAL_HEADERS[index + 1..].contains(header),
-                "`{header}` is listed twice, so the two source lists overlap"
+                "`{header}` is listed twice, so the source lists overlap"
+            );
+        }
+    }
+
+    #[test]
+    fn every_host_signal_header_is_an_internal_header() {
+        // Integration proxies forward every `x-` request header that
+        // `INTERNAL_HEADERS` does not name, so a host signal header missing
+        // from it would reach a third party.
+        for header in HOST_SIGNAL_HEADERS {
+            assert!(
+                INTERNAL_HEADERS.contains(header),
+                "`{header}` carries a host signal, so it must never be forwarded"
             );
         }
     }

@@ -101,6 +101,14 @@ impl OwnedRequestInfo {
         }
     }
 
+    /// Replaces the header snapshot, for a caller that builds the info first
+    /// and has the headers second.
+    #[must_use]
+    pub fn with_headers(mut self, headers: HeaderMap) -> Self {
+        self.headers = headers;
+        self
+    }
+
     /// Attaches the request target (URL path and query string) to this snapshot,
     /// so a module can read request parameters through
     /// [`query_param`](RequestInfo::query_param).
@@ -176,6 +184,14 @@ impl<'a> BorrowedRequestInfo<'a> {
         }
     }
 
+    /// Borrows a different header map, for a caller that builds the info first
+    /// and has the headers second.
+    #[must_use]
+    pub fn with_headers(mut self, headers: &'a HeaderMap) -> Self {
+        self.headers = Some(headers);
+        self
+    }
+
     /// Attaches the borrowed request target (URL path and query string), so a
     /// module can read request parameters through
     /// [`query_param`](RequestInfo::query_param).
@@ -218,6 +234,20 @@ impl RequestInfo for BorrowedRequestInfo<'_> {
     fn query(&self) -> &str {
         self.query
     }
+}
+
+/// Host-computed client signals that are not carried in request headers.
+///
+/// A host that can compute them supplies an implementation (Fastly exposes the
+/// TLS JA4 and HTTP/2 signals). A module that needs them takes
+/// `Arc<dyn HostSignals>` in its constructor, and on a host that supplies none the
+/// module cannot be built and the request stops.
+pub trait HostSignals: Send + Sync + core::fmt::Debug {
+    /// The full JA4 TLS signal, or `None` when unavailable.
+    fn ja4(&self) -> Option<&str>;
+
+    /// The raw HTTP/2 SETTINGS signal, or `None` when unavailable.
+    fn h2(&self) -> Option<&str>;
 }
 
 #[cfg(test)]
@@ -328,5 +358,49 @@ mod tests {
         assert_eq!(info.query(), "id=abc123");
         assert_eq!(info.query_param("id").as_deref(), Some("abc123"));
         assert_eq!(info.header("cookie"), Some("client-id=abc123; ts-ec=xyz"));
+    }
+
+    fn headers_with_user_agent(user_agent: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::USER_AGENT,
+            user_agent
+                .parse()
+                .expect("should parse a User-Agent header value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn request_info_reads_the_user_agent_from_attached_headers() {
+        let headers = headers_with_user_agent("ExampleAgent/1.0");
+
+        let owned = OwnedRequestInfo::new(String::new(), headers.clone());
+        let borrowed = BorrowedRequestInfo::new("", Some(&headers));
+
+        assert_eq!(
+            owned.user_agent(),
+            "ExampleAgent/1.0",
+            "the owned snapshot should report the attached User-Agent"
+        );
+        assert_eq!(
+            borrowed.user_agent(),
+            "ExampleAgent/1.0",
+            "the borrowed view should report the attached User-Agent"
+        );
+    }
+
+    #[test]
+    fn request_info_reports_no_user_agent_without_headers() {
+        assert_eq!(
+            OwnedRequestInfo::new(String::new(), HeaderMap::new()).user_agent(),
+            "",
+            "a snapshot built without headers should report no User-Agent"
+        );
+        assert_eq!(
+            BorrowedRequestInfo::new("", None).user_agent(),
+            "",
+            "a borrowed view built without headers should report no User-Agent"
+        );
     }
 }

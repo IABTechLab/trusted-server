@@ -139,7 +139,7 @@ fn json_bool_or_string_is_true(value: Option<&serde_json::Value>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ec::module::HMAC_MODULE_KEY;
+    use crate::ec::module::{HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY};
     use crate::integrations::didomi::DidomiIntegrationConfig;
     use crate::platform::{PlatformError, StoreId};
     use crate::redacted::Redacted;
@@ -147,7 +147,7 @@ mod tests {
         AssetOriginAuth, EcPartner, ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig,
     };
     use crate::test_support::tests::{
-        crate_test_settings_str, hmac_passphrase, select_hmac_module,
+        crate_test_settings_str, hmac_passphrase, select_hmac_module, select_host_signals_module,
     };
 
     fn test_settings() -> Settings {
@@ -209,6 +209,7 @@ mod tests {
                 "partner-api-token-key" => "resolved-partner-api-token-32-bytes-ok",
                 "partner-pull-token-key" => "resolved-partner-pull-token-32-bytes-ok",
                 "trusted-client-ip-key" => "resolved-trusted-client-ip-secret-32-bytes",
+                "host-signals-passphrase-key" => "resolved-host-signals-passphrase-32-bytes-ok",
                 "labeled-passphrase-key" => "resolved-labeled-passphrase-32-bytes",
                 _ => key,
             };
@@ -538,6 +539,78 @@ mod tests {
         );
     }
 
+    /// Answers `ec_key`, refuses to be asked for that key's value as though it
+    /// were a key name, and otherwise answers as [`UnifiedSecretStore`] does.
+    struct RefusesAValueAsAKey;
+
+    const CROSS_NAMED_PASSPHRASE: &str = "resolved-cross-named-passphrase-32-bytes";
+
+    impl PlatformSecretStore for RefusesAValueAsAKey {
+        fn get_bytes(
+            &self,
+            store_name: &StoreName,
+            key: &str,
+        ) -> Result<Vec<u8>, Report<PlatformError>> {
+            match key {
+                "ec_key" => Ok(CROSS_NAMED_PASSPHRASE.as_bytes().to_vec()),
+                CROSS_NAMED_PASSPHRASE => Err(Report::new(PlatformError::SecretStore)),
+                _ => UnifiedSecretStore.get_bytes(store_name, key),
+            }
+        }
+
+        fn create(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+
+        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+    }
+
+    /// A block named after one built-in implementation that configures the
+    /// other is on the fixed secret list already, so its passphrase is
+    /// resolved once and not read back as a key name.
+    #[test]
+    fn a_built_in_block_naming_the_other_built_in_resolves_its_passphrase_once() {
+        use crate::secret_resolution::ConfiguredSecretFields as _;
+
+        for (name, implementation) in [("hmac", "host_signals"), ("host_signals", "hmac")] {
+            let mut data =
+                serde_json::to_value(test_settings()).expect("should serialize settings to JSON");
+            data["ec"] = serde_json::json!({
+                "module": name,
+                (name): { "implementation": implementation, "passphrase": "ec_key" },
+            });
+
+            let listed = TrustedServerAppConfig::configured_secret_fields(&data);
+            let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
+            let envelope_json =
+                serde_json::to_string(&envelope).expect("should serialize envelope");
+            let reconstructed = settings_from_config_blob(
+                &envelope_json,
+                &RefusesAValueAsAKey,
+                &StoreName::from("ts_secrets"),
+            )
+            .unwrap_or_else(|error| panic!("[ec.{name}] should load: {error:?}"));
+
+            assert!(
+                listed.is_empty(),
+                "[ec.{name}] is on the fixed list, so it is not listed again"
+            );
+            let written =
+                serde_json::to_value(&reconstructed).expect("should serialize the loaded settings");
+            assert_eq!(
+                written["ec"][name]["passphrase"], CROSS_NAMED_PASSPHRASE,
+                "[ec.{name}] should carry the stored passphrase"
+            );
+        }
+    }
+
     #[test]
     fn omitted_s3_secret_references_resolve_default_store_keys() {
         let mut original = test_settings();
@@ -857,6 +930,47 @@ mod tests {
         assert!(
             err.to_string().contains("short_passphrase") || err.to_string().contains("validation"),
             "error should indicate runtime validation: {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("short_key"),
+            "error should not expose the secret value"
+        );
+    }
+
+    #[test]
+    fn resolves_the_host_signals_passphrase_from_the_mapped_store() {
+        let mut original = test_settings();
+        select_host_signals_module(&mut original.ec, "host-signals-passphrase-key");
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should resolve the host_signals passphrase from the mapped store");
+
+        assert_eq!(
+            reconstructed
+                .ec
+                .module_blocks
+                .get(HOST_SIGNALS_MODULE_KEY)
+                .and_then(crate::settings::EcModuleBlock::host_signals_settings)
+                .map(|config| config.passphrase.expose().as_str()),
+            Some("resolved-host-signals-passphrase-32-bytes-ok")
+        );
+    }
+
+    #[test]
+    fn runtime_validation_rejects_a_short_resolved_host_signals_passphrase() {
+        let mut settings = test_settings();
+        select_host_signals_module(&mut settings.ec, "short_key");
+
+        let err = load_settings(&envelope_json(&settings))
+            .expect_err("should reject a short resolved host_signals passphrase");
+
+        assert!(
+            err.to_string().contains("short_passphrase"),
+            "error should name the passphrase check: {err:?}"
         );
         assert!(
             !err.to_string().contains("short_key"),

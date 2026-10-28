@@ -10,6 +10,7 @@ use super::{
     PlatformSecretStore,
 };
 use crate::ec::module::EdgeCookieModule;
+use crate::evidence::HostSignals;
 
 /// Geographic information extracted from a request.
 ///
@@ -190,6 +191,10 @@ pub struct RuntimeServices {
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
     /// Per-request client metadata extracted at the entry point.
     pub(crate) client_info: ClientInfo,
+    /// Host-computed client signals (TLS JA4, HTTP/2), when the host
+    /// supplies them. `None` on a host that exposes none, so a module that
+    /// requires them cannot be built and the request stops.
+    pub(crate) host_signals: Option<Arc<dyn HostSignals>>,
     /// The Edge Cookie module this deployment already resolved from
     /// `[ec] module` while it built application state.
     ///
@@ -282,6 +287,18 @@ impl RuntimeServices {
     #[must_use]
     pub fn client_info(&self) -> &ClientInfo {
         &self.client_info
+    }
+
+    /// Returns the host-computed client signals, when the host supplies
+    /// them.
+    ///
+    /// A module that derives identity from the TLS JA4 or HTTP/2 signals
+    /// takes these as an injected service. The result is `None` on a host that
+    /// exposes none, so such a module cannot be built there and the request
+    /// stops rather than creating a degraded identifier.
+    #[must_use]
+    pub fn host_signals(&self) -> Option<Arc<dyn HostSignals>> {
+        self.host_signals.clone()
     }
 
     /// Returns the Edge Cookie module the composition root already resolved,
@@ -383,6 +400,7 @@ pub struct RuntimeServicesBuilder {
     geo: Option<Arc<dyn PlatformGeo>>,
     auction_telemetry_sink: Option<Arc<dyn AuctionTelemetrySink>>,
     client_info: Option<ClientInfo>,
+    host_signals: Option<Arc<dyn HostSignals>>,
     resolved_ec_module: Option<Arc<dyn EdgeCookieModule>>,
 }
 
@@ -399,6 +417,7 @@ impl RuntimeServicesBuilder {
             geo: None,
             auction_telemetry_sink: None,
             client_info: None,
+            host_signals: None,
             resolved_ec_module: None,
         }
     }
@@ -479,6 +498,17 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Set the host-computed client signals service.
+    ///
+    /// Optional: a host that exposes no TLS or HTTP/2 signals leaves this
+    /// unset, so a module that requires them cannot be built and the request
+    /// stops.
+    #[must_use]
+    pub fn host_signals(mut self, host_signals: Arc<dyn HostSignals>) -> Self {
+        self.host_signals = Some(host_signals);
+        self
+    }
+
     /// Set the Edge Cookie module the composition root already resolved.
     ///
     /// Optional. This is the module the selector actually chose, so setting
@@ -531,6 +561,7 @@ impl RuntimeServicesBuilder {
             client_info: self
                 .client_info
                 .expect("should set client_info before building RuntimeServices"),
+            host_signals: self.host_signals,
             resolved_ec_module: self.resolved_ec_module,
         }
     }

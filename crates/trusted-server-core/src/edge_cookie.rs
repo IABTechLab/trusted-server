@@ -59,8 +59,10 @@ pub fn generate_ec_id(
         return Ok(None);
     };
 
-    // The module reads request data (for example the client IP) borrowed at
-    // call time, so nothing is cloned.
+    // The module reads request data (the client IP and the request headers)
+    // borrowed at call time, so nothing is cloned. A module that also reads
+    // host signals takes them from the injected `HostSignals` service rather
+    // than from this request info.
     let request_info = BorrowedRequestInfo::new(&client_ip, request_headers);
     // This helper skips the consent gate, and the built-in module does not
     // read the consent context, so it is not threaded here.

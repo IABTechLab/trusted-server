@@ -2,9 +2,9 @@
 pub mod tests {
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource, TcfConsent};
-    use crate::ec::module::{EcModuleSelection, HMAC_MODULE_KEY};
+    use crate::ec::module::{EcModuleSelection, HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY};
     use crate::redacted::Redacted;
-    use crate::settings::{Ec, EcModuleBlock, HmacModuleConfig, Settings};
+    use crate::settings::{Ec, EcModuleBlock, HmacModuleConfig, HostSignalsModuleConfig, Settings};
 
     #[must_use]
     pub fn crate_test_settings_str() -> String {
@@ -97,6 +97,20 @@ pub mod tests {
         ec.module = Some(EcModuleSelection::from(name));
         ec.module_blocks.clear();
         ec.module_blocks.insert(name.to_owned(), block);
+    }
+
+    /// Selects the built-in host-signal module under its own name with
+    /// `passphrase`, replacing whatever Edge Cookie module the settings
+    /// carried.
+    pub fn select_host_signals_module(ec: &mut Ec, passphrase: &str) {
+        ec.module = Some(EcModuleSelection::from(HOST_SIGNALS_MODULE_KEY));
+        ec.module_blocks.clear();
+        ec.module_blocks.insert(
+            HOST_SIGNALS_MODULE_KEY.to_owned(),
+            EcModuleBlock::from(HostSignalsModuleConfig {
+                passphrase: Redacted::new(passphrase.to_owned()),
+            }),
+        );
     }
 
     /// The passphrase the block `name` holds.

@@ -644,6 +644,45 @@ mod tests {
     }
 
     #[test]
+    fn lockr_api_proxy_does_not_forward_host_signal_headers() {
+        // The API proxy forwards the reader's custom `x-` headers, so the
+        // host's TLS and HTTP/2 client signals must be filtered out by name.
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"ok".to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let integration = LockrIntegration::new(test_config());
+        let req = http::Request::builder()
+            .method(HttpMethod::GET)
+            .uri("https://publisher.example/integrations/lockr/api/publisher/app/v1/identityLockr/settings")
+            .header("x-ts-tls-ja4", "t13d1516h2_8daaf6152771_02713d6af862")
+            .header("x-ts-h2-fingerprint", "1:65536;4:6291456|15663105|0|m,a,s,p")
+            .header("x-lockr-trace", "kept")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        futures::executor::block_on(integration.handle(&settings, &services, req))
+            .expect("should proxy request");
+
+        let recorded = stub.recorded_request_headers();
+        let headers = recorded.first().expect("should forward one request");
+        for name in ["x-ts-tls-ja4", "x-ts-h2-fingerprint"] {
+            assert!(
+                headers.iter().all(|(header_name, _)| header_name != name),
+                "should not forward the host signal header `{name}` to the Lockr API"
+            );
+        }
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| name == "x-lockr-trace" && value == "kept"),
+            "should still forward the reader's other custom headers"
+        );
+    }
+
+    #[test]
     fn test_api_path_extraction_preserves_casing() {
         let test_cases = [
             (

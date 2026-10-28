@@ -24,7 +24,7 @@ use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
     deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
-use trusted_server_core::ec::module::{EdgeCookieModule, build_shared_module};
+use trusted_server_core::ec::module::{EdgeCookieModule, build_reusable_module};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::sanitize_forwarded_headers;
@@ -153,10 +153,12 @@ fn build_state_with_services(
     // is served, so a selection this adapter can never supply fails here rather
     // than on the first request. Keeping what the resolution produced is what
     // stops the request path resolving the same settings again. This adapter
-    // injects no vendor Edge Cookie module of its own, so the only injected
-    // module is one a caller put into the services it supplied.
-    let ec_module = build_shared_module(
+    // supplies no host signals, so that argument is `None`, and injects no
+    // vendor Edge Cookie module of its own, so the only injected module is
+    // one a caller put into the services it supplied.
+    let ec_module = build_reusable_module(
         &settings.ec,
+        None,
         services
             .as_ref()
             .and_then(RuntimeServices::resolved_ec_module),
@@ -179,10 +181,12 @@ impl AppState {
     /// Builds the per-request services, carrying the Edge Cookie module the
     /// composition root already resolved so the request path does not resolve
     /// `[ec] module` a second time.
+    /// Nothing is carried when the composition root found nothing safe to keep,
+    /// and the request path resolves for itself.
     fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
         self.services
             .clone()
-            .unwrap_or_else(|| build_runtime_services(ctx))
+            .unwrap_or_else(|| build_runtime_services(ctx, &self.settings))
             .with_resolved_ec_module(self.ec_module.clone())
     }
 }
@@ -1202,7 +1206,7 @@ mod tests {
         // No resolved module is threaded here, so the request path resolves
         // the selection itself, which is what an embedder driving core
         // directly does and where the loud failure has to stay.
-        let services = build_runtime_services(&ctx);
+        let services = build_runtime_services(&ctx, &settings);
         let req = ctx.into_request();
 
         let error = build_ec_context(&settings, &services, &req)

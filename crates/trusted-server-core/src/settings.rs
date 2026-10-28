@@ -21,7 +21,7 @@ use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
 use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
-use crate::ec::module::{EcModuleSelection, HMAC_MODULE_KEY};
+use crate::ec::module::{EcModuleSelection, HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY};
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
@@ -706,8 +706,8 @@ impl Ec {
     /// implementation is not a module name, when a block is configured with no
     /// selector or alongside `"none"`, when the selector names a key `[ec]`
     /// reads as its own setting, when a block the selector does not name is
-    /// configured, or when the selected module resolves to an
-    /// implementation that needs settings and has no block.
+    /// configured, or when the selected module resolves to an implementation
+    /// that needs settings and has no block.
     pub fn validate_module_selection(&self) -> Result<(), Report<TrustedServerError>> {
         for (name, block) in self.module_blocks.iter() {
             Self::validate_module_name(name)?;
@@ -756,10 +756,12 @@ impl Ec {
         }
 
         // A module has a block only when it has settings, and core knows
-        // which of its own implementations need them. A module an adapter
+        // which of its own implementations need them. Both modules built
+        // into core take a passphrase, so both need one. A module an adapter
         // injects has the contents of its block read by that adapter when it
         // builds the module, so core cannot say whether it needs one.
-        if self.module_blocks.implementation(name) == HMAC_MODULE_KEY
+        let implementation = self.module_blocks.implementation(name);
+        if (implementation == HMAC_MODULE_KEY || implementation == HOST_SIGNALS_MODULE_KEY)
             && !self.module_blocks.contains_key(name)
         {
             return Err(Report::new(TrustedServerError::Configuration {
@@ -864,7 +866,7 @@ impl Ec {
 
 impl Validate for Ec {
     /// Validates the partner entries and the settings of every block that
-    /// configures the built-in HMAC module.
+    /// configures a module built into core.
     ///
     /// Written out rather than derived because each block's errors are keyed
     /// by the name the operator wrote the block under, so a passphrase
@@ -874,8 +876,17 @@ impl Validate for Ec {
     fn validate(&self) -> Result<(), ValidationErrors> {
         let mut errors = ValidationErrors::new();
         errors.merge_self("partners", self.partners.validate());
-        for (name, config) in self.module_blocks.hmac_blocks() {
-            if let Err(block_errors) = config.validate() {
+        let blocks = self
+            .module_blocks
+            .hmac_blocks()
+            .map(|(name, config)| (name, config.validate()))
+            .chain(
+                self.module_blocks
+                    .host_signals_blocks()
+                    .map(|(name, config)| (name, config.validate())),
+            );
+        for (name, result) in blocks {
+            if let Err(block_errors) = result {
                 errors.errors_mut().insert(
                     Cow::Owned(name.to_owned()),
                     ValidationErrorsKind::Struct(Box::new(block_errors)),
@@ -974,6 +985,19 @@ impl EcModuleBlocks {
             .iter()
             .filter_map(|(name, block)| block.hmac_settings().map(|config| (name.as_str(), config)))
     }
+
+    /// Every configured block that sets the built-in host-signal module up,
+    /// with the name it is written under.
+    ///
+    /// The same contract as [`hmac_blocks`](Self::hmac_blocks), for the other
+    /// module core builds itself.
+    pub fn host_signals_blocks(&self) -> impl Iterator<Item = (&str, &HostSignalsModuleConfig)> {
+        self.0.iter().filter_map(|(name, block)| {
+            block
+                .host_signals_settings()
+                .map(|config| (name.as_str(), config))
+        })
+    }
 }
 
 impl Deref for EcModuleBlocks {
@@ -1065,12 +1089,15 @@ where
     // configuration is read rather than at the request that needed it, and
     // keeps the settings of a module an adapter injects as the raw values
     // that adapter deserializes for itself.
-    let settings = if implementation.as_deref().unwrap_or(name) == HMAC_MODULE_KEY {
-        let config = serde_json::from_value(JsonValue::Object(table))
-            .map_err(|err| E::custom(format!("[ec.{name}] is invalid ({err})")))?;
-        EcModuleSettings::Hmac(config)
-    } else {
-        EcModuleSettings::Injected(table)
+    let invalid = |err| E::custom(format!("[ec.{name}] is invalid ({err})"));
+    let settings = match implementation.as_deref().unwrap_or(name) {
+        HMAC_MODULE_KEY => EcModuleSettings::Hmac(
+            serde_json::from_value(JsonValue::Object(table)).map_err(invalid)?,
+        ),
+        HOST_SIGNALS_MODULE_KEY => EcModuleSettings::HostSignals(
+            serde_json::from_value(JsonValue::Object(table)).map_err(invalid)?,
+        ),
+        _ => EcModuleSettings::Injected(table),
     };
     Ok(EcModuleBlock {
         implementation,
@@ -1102,7 +1129,17 @@ impl EcModuleBlock {
     pub fn hmac_settings(&self) -> Option<&HmacModuleConfig> {
         match &self.settings {
             EcModuleSettings::Hmac(config) => Some(config),
-            EcModuleSettings::Injected(_) => None,
+            EcModuleSettings::HostSignals(_) | EcModuleSettings::Injected(_) => None,
+        }
+    }
+
+    /// The built-in host-signal module's settings, when this block
+    /// configures it.
+    #[must_use]
+    pub fn host_signals_settings(&self) -> Option<&HostSignalsModuleConfig> {
+        match &self.settings {
+            EcModuleSettings::HostSignals(config) => Some(config),
+            EcModuleSettings::Hmac(_) | EcModuleSettings::Injected(_) => None,
         }
     }
 }
@@ -1119,6 +1156,18 @@ impl From<HmacModuleConfig> for EcModuleBlock {
     }
 }
 
+impl From<HostSignalsModuleConfig> for EcModuleBlock {
+    /// Builds the `[ec.host_signals]` block, the built-in host-signal module
+    /// configured under its own name. A block under a label names its
+    /// implementation instead.
+    fn from(config: HostSignalsModuleConfig) -> Self {
+        Self {
+            implementation: None,
+            settings: EcModuleSettings::HostSignals(config),
+        }
+    }
+}
+
 /// The settings one module block holds, read according to the
 /// implementation the block configures.
 #[derive(Debug, Clone, Serialize)]
@@ -1126,6 +1175,9 @@ impl From<HmacModuleConfig> for EcModuleBlock {
 pub enum EcModuleSettings {
     /// The built-in HMAC module's settings.
     Hmac(HmacModuleConfig),
+
+    /// The built-in host-signal module's settings.
+    HostSignals(HostSignalsModuleConfig),
 
     /// The settings of a module an adapter injects, kept as the raw values
     /// the block held. The adapter that builds the module deserializes them
@@ -1146,6 +1198,113 @@ pub struct HmacModuleConfig {
     /// Publisher passphrase used as the HMAC key for EC generation.
     #[validate(custom(function = Ec::validate_passphrase))]
     pub passphrase: Redacted<String>,
+}
+
+/// Configuration for the built-in host-signal Edge Cookie module.
+///
+/// Mapped from the `[ec.host_signals]` TOML block, or from a block under a
+/// label whose `implementation` is `host_signals`. Unknown keys are rejected,
+/// so a mistyped setting fails at startup instead of being accepted silently
+/// and leaving the intended setting at its default.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct HostSignalsModuleConfig {
+    /// Passphrase used as the HMAC key over the host signals and client IP.
+    #[validate(custom(function = Ec::validate_passphrase))]
+    pub passphrase: Redacted<String>,
+}
+
+/// Device-detection configuration.
+///
+/// Mapped from the `[device]` TOML section. Selects which device-detection
+/// module classifies a request into device signals, mirroring the Edge
+/// Cookie module selection in [`Ec`].
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceConfig {
+    /// The key of the device-detection module to activate.
+    ///
+    /// Defaults to the built-in `builtin` module when absent, which classifies
+    /// from the User-Agent alone, so device classification itself makes no
+    /// host-specific call. The opt-in `fastly` module strengthens the
+    /// browser/bot gate with the host's TLS and HTTP/2 signals, which the Fastly
+    /// entry point reads on every request regardless of this selector. Override
+    /// it with the
+    /// `TRUSTED_SERVER__device__module` environment variable so the same
+    /// compiled WebAssembly can switch modules at deployment. An unknown key is
+    /// rejected at startup by
+    /// [`validate_module_selection`](Self::validate_module_selection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
+}
+
+impl DeviceConfig {
+    /// Returns the active device-detection module key, defaulting to the
+    /// built-in heuristic.
+    #[must_use]
+    pub fn module_key(&self) -> &str {
+        self.module.as_deref().unwrap_or("builtin")
+    }
+
+    /// Validates that the selected device-detection module is available in
+    /// this build.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when the selected module
+    /// key is not one this build provides.
+    pub fn validate_module_selection(&self) -> Result<(), Report<TrustedServerError>> {
+        match self.module_key() {
+            "builtin" | "fastly" => Ok(()),
+            key => Err(Report::new(TrustedServerError::Configuration {
+                message: format!("Device detection module `{key}` is not available in this build"),
+            })),
+        }
+    }
+}
+
+/// Geo / IP intelligence configuration.
+///
+/// Mapped from the `[geo]` TOML section. Selects which module resolves a
+/// client IP into [`GeoInfo`](crate::platform::GeoInfo), mirroring the Edge
+/// Cookie module selection in [`Ec`].
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct GeoConfig {
+    /// The key of the geo module to activate.
+    ///
+    /// The host platform's geo lookup is the default when absent, and
+    /// `module = "platform"` spells the same choice explicitly. Selecting
+    /// `module = "none"` resolves no geolocation and makes no host geo call,
+    /// so a deployment can opt out of any host geo service. Override it with the
+    /// `TRUSTED_SERVER__geo__module` environment variable so the same compiled
+    /// WebAssembly can switch modules at deployment. An unknown key is rejected
+    /// at startup by
+    /// [`validate_module_selection`](Self::validate_module_selection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
+}
+
+impl GeoConfig {
+    /// Validates that the selected geo module is available in this build.
+    ///
+    /// No selector is valid and is the default, selecting the host platform's
+    /// geo lookup. The explicit `"none"` runs without geolocation, the same
+    /// way the Edge Cookie module runs statelessly when `"none"` is
+    /// selected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when the selected module
+    /// key is not one this build provides.
+    pub fn validate_module_selection(&self) -> Result<(), Report<TrustedServerError>> {
+        match self.module.as_deref() {
+            None | Some("platform") | Some("none") => Ok(()),
+            Some(key) => Err(Report::new(TrustedServerError::Configuration {
+                message: format!("Geo module `{key}` is not available in this build"),
+            })),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
@@ -3187,6 +3346,18 @@ fn is_default_auction_debug_comment_options(value: &AuctionDebugCommentOptions) 
     *value == AuctionDebugCommentOptions::default()
 }
 
+// The module selectors are new sections, so a serialized blob that carries
+// them is rejected by a base-revision binary that has never heard of them.
+// Omitting the default table keeps an unchanged `ts config push` readable
+// across a rollout or a rollback.
+fn is_default_device_config(value: &DeviceConfig) -> bool {
+    *value == DeviceConfig::default()
+}
+
+fn is_default_geo_config(value: &GeoConfig) -> bool {
+    *value == GeoConfig::default()
+}
+
 /// Behavior of the `<!-- ts-debug: ... -->` auction dump. Only consulted when
 /// [`DebugConfig::auction_html_comment`] is true.
 ///
@@ -3519,6 +3690,12 @@ pub struct Settings {
     pub tinybird: TinybirdSettings,
     #[serde(default)]
     pub debug: DebugConfig,
+    #[serde(default, skip_serializing_if = "is_default_device_config")]
+    #[validate(nested)]
+    pub device: DeviceConfig,
+    #[serde(default, skip_serializing_if = "is_default_geo_config")]
+    #[validate(nested)]
+    pub geo: GeoConfig,
 }
 
 impl Settings {
@@ -3633,6 +3810,8 @@ impl Settings {
 
         settings.ec.migrate_legacy_ec_layout()?;
         settings.ec.validate_module_selection()?;
+        settings.device.validate_module_selection()?;
+        settings.geo.validate_module_selection()?;
         settings.validate_admin_coverage()?;
         settings.validate_admin_handler_passwords()?;
 
@@ -3719,6 +3898,11 @@ impl Settings {
 
         for (name, hmac) in self.ec.module_blocks.hmac_blocks() {
             if Ec::is_placeholder_passphrase(hmac.passphrase.expose()) {
+                insecure_fields.push(format!("ec.{name}.passphrase"));
+            }
+        }
+        for (name, host_signals) in self.ec.module_blocks.host_signals_blocks() {
+            if Ec::is_placeholder_passphrase(host_signals.passphrase.expose()) {
                 insecure_fields.push(format!("ec.{name}.passphrase"));
             }
         }
@@ -6146,6 +6330,34 @@ mod tests {
     }
 
     #[test]
+    fn device_module_defaults_to_builtin_and_rejects_unknown() {
+        let config = DeviceConfig::default();
+        assert_eq!(
+            config.module_key(),
+            "builtin",
+            "no selector should default to the built-in module"
+        );
+        config
+            .validate_module_selection()
+            .expect("should validate the built-in default");
+
+        let fastly = DeviceConfig {
+            module: Some("fastly".to_owned()),
+        };
+        fastly
+            .validate_module_selection()
+            .expect("should validate the fastly opt-in");
+
+        let unknown = DeviceConfig {
+            module: Some("acme".to_owned()),
+        };
+        assert!(
+            unknown.validate_module_selection().is_err(),
+            "an unknown device module should be rejected at startup"
+        );
+    }
+
+    #[test]
     fn an_unselected_module_block_is_rejected() {
         // A vendor selector with the vendor block present, plus a stray hmac
         // block, is almost always a stale or mistyped configuration.
@@ -6165,6 +6377,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_host_signals_block_is_read_as_the_built_in_modules_settings() {
+        // The block is the built-in module's own settings, rather than kept as
+        // the raw values of a module an adapter injects.
+        let settings = Settings::from_toml(&crate_test_settings_str_with_ec_section(&format!(
+            "[ec]
+module = \"{HOST_SIGNALS_MODULE_KEY}\"
+
+\
+             [ec.{HOST_SIGNALS_MODULE_KEY}]
+\
+             passphrase = \"test-secret-key-32-bytes-minimum\"
+"
+        )))
+        .expect("a host_signals selection with its block should load");
+        assert!(
+            settings
+                .ec
+                .module_blocks
+                .get(HOST_SIGNALS_MODULE_KEY)
+                .and_then(EcModuleBlock::host_signals_settings)
+                .is_some(),
+            "the block should be read as the host-signal module's settings"
+        );
+    }
     #[test]
     fn a_labeled_block_the_selector_does_not_name_is_rejected() {
         // A block under a label is still a module block, so it is held to
@@ -6226,6 +6463,39 @@ passphrase = "another-test-secret-key-32-bytes"
     }
 
     #[test]
+    fn geo_module_accepts_default_platform_and_none_and_rejects_unknown() {
+        let config = GeoConfig::default();
+        assert!(
+            config.module.is_none(),
+            "geo should default to no selector, which selects the host geo"
+        );
+        config
+            .validate_module_selection()
+            .expect("should validate the default host geo selection");
+
+        let platform = GeoConfig {
+            module: Some("platform".to_owned()),
+        };
+        platform
+            .validate_module_selection()
+            .expect("should validate the explicit platform selection");
+
+        let none = GeoConfig {
+            module: Some("none".to_owned()),
+        };
+        none.validate_module_selection()
+            .expect("should validate the explicit opt-out of geolocation");
+
+        let unknown = GeoConfig {
+            module: Some("acme".to_owned()),
+        };
+        assert!(
+            unknown.validate_module_selection().is_err(),
+            "an unknown geo module should be rejected at startup"
+        );
+    }
+
+    #[test]
     fn the_reserved_ec_keys_are_the_ones_the_section_reads() {
         // The list is written out for the unknown-field message and the
         // reserved-name check, so it has to stay level with the struct.
@@ -6245,6 +6515,32 @@ passphrase = "another-test-secret-key-32-bytes"
             written,
             EC_SECTION_KEYS.iter().copied().collect::<HashSet<_>>(),
             "EC_SECTION_KEYS should name every key the [ec] section reads as its own"
+        );
+    }
+
+    #[test]
+    fn unknown_keys_in_module_sections_are_rejected() {
+        // A mistyped key must fail at startup rather than silently selecting
+        // a default behind the operator's back.
+        for (section, bad_key) in [
+            ("[geo]", "providr = \"platform\""),
+            ("[device]", "providr = \"builtin\""),
+        ] {
+            let toml_str = format!(
+                "{}\n\n            {section}\n            {bad_key}\n",
+                crate_test_settings_str()
+            );
+            assert!(
+                Settings::from_toml(&toml_str).is_err(),
+                "an unknown key in {section} should be rejected"
+            );
+        }
+
+        let toml_str = crate_test_settings_str()
+            .replace("[ec.hmac]", "[ec.hmac]\n            unexpected = \"value\"");
+        assert!(
+            Settings::from_toml(&toml_str).is_err(),
+            "an unknown key in [ec.hmac] should be rejected"
         );
     }
 
@@ -7438,6 +7734,7 @@ source_domain = "partner.example.com"
 
             [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
             "#,
         )
         .expect("should parse settings without max_buffered_body_bytes");
@@ -7474,9 +7771,10 @@ source_domain = "partner.example.com"
             passphrase = "test-secret-key-32-bytes-minimum"
             "#,
         );
+        let error = result.expect_err("should reject a zero buffered-body cap");
         assert!(
-            result.is_err(),
-            "publisher.max_buffered_body_bytes = 0 must fail config validation"
+            error.to_string().contains("max_buffered_body_bytes"),
+            "the rejection should be for the zero cap, not another validation, got: {error}"
         );
     }
 
@@ -9456,6 +9754,29 @@ formats = [{{ width = 300, height = 250 }}]
         assert_creative_opportunity_slot_config_rejected(
             &slot_body,
             "must render to at most 100 UTF-8 bytes",
+        );
+    }
+
+    /// An unset selector must not serialize as `"module": null`.
+    ///
+    /// The section as a whole is skipped while every field is default, so this
+    /// serializes the struct directly. Once a later change makes another field
+    /// required, the section is always emitted and a null selector would then
+    /// reach a config blob, where a binary that predates the field rejects it.
+    #[test]
+    fn an_unset_module_selector_is_omitted_from_the_serialized_section() {
+        let geo = GeoConfig::default();
+        let json = serde_json::to_string(&geo).expect("should serialize the geo section");
+        assert!(
+            !json.contains("module"),
+            "an unset geo selector should be omitted rather than serialized as null, got {json}"
+        );
+
+        let device = DeviceConfig::default();
+        let json = serde_json::to_string(&device).expect("should serialize the device section");
+        assert!(
+            !json.contains("module"),
+            "an unset device selector should be omitted rather than serialized as null, got {json}"
         );
     }
 
