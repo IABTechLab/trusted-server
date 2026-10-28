@@ -16,6 +16,7 @@ workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 chromiumoxide = { workspace = true }
+chrono = { workspace = true }
 clap = { workspace = true }
 derive_more = { workspace = true }
 error-stack = { workspace = true }
@@ -50,6 +51,7 @@ scraper = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
+sha2 = { workspace = true }
 similar = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }

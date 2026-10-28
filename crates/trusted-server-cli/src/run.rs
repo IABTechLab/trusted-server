@@ -9,6 +9,7 @@ use edgezero_cli::args::{
 use crate::commands::audit::{AuditArgs, run_audit};
 use crate::commands::config::ad_templates::{AdTemplatesCommand, run_ad_templates};
 use crate::commands::config::init::{ConfigInitArgs, run_config_init};
+use crate::commands::config::keyed_push;
 use crate::commands::config::policy;
 use crate::commands::pbs::{self, PbsArgs};
 use crate::prebid_bundle::{NpmPrebidBundleGenerator, PrebidBundleArgs, run_bundle};
@@ -68,7 +69,8 @@ enum ConfigCommand {
     /// Reclaim orphaned chunk entries leaked from prior oversized pushes.
     Gc(ConfigGcArgs),
     /// Push `trusted-server.toml`, with the permission policy file it names,
-    /// as a blob envelope through `EdgeZero`.
+    /// as a blob envelope through `EdgeZero`, or under a Fastly `--key` of
+    /// its own with `--local`.
     Push(policy::PushArgs),
     /// Validate `edgezero.toml`, the typed Trusted Server config and, with
     /// `--permissions`, the permission policy file it names.
@@ -143,9 +145,15 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
         Command::Config(ConfigCommand::Gc(args)) => {
             edgezero_cli::run_config_gc(&args).map(|()| RunOutcome::Success)
         }
-        Command::Config(ConfigCommand::Push(args)) => {
-            policy::run_push(args).map(|()| RunOutcome::Success)
+        Command::Config(ConfigCommand::Push(args)) => match keyed_push::own_key(&args.edgezero) {
+            Some(key) => {
+                let stdout = std::io::stdout();
+                let mut out = stdout.lock();
+                keyed_push::run(&args, key, &mut out)
+            }
+            None => policy::run_push(args),
         }
+        .map(|()| RunOutcome::Success),
         Command::Config(ConfigCommand::Validate(args)) => {
             policy::run_validate(args).map(|()| RunOutcome::Success)
         }

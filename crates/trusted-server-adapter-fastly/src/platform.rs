@@ -8,15 +8,18 @@ use std::io::Read as _;
 use std::net::IpAddr;
 
 use crate::backend::BackendConfig;
+use trusted_server_core::permissions::PolicyReference;
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
     BackendNamingPolicy, ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformCacheIntent,
     PlatformConfigStore, PlatformError, PlatformHttpClient, PlatformHttpRequest,
     PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions,
     PlatformImageOptimizerParams, PlatformImageOptimizerRegion, PlatformPendingRequest,
-    PlatformResponse, PlatformSecretStore, PlatformSelectResult, StoreId, StoreName,
+    PlatformPolicySource, PlatformResponse, PlatformSecretStore, PlatformSelectResult, StoreId,
+    StoreName, policy_entry_text, policy_key,
 };
 use trusted_server_core::settings::TrustedClientIpConfig;
+use trusted_server_core::settings_data::resolve_fastly_chunk_pointer;
 
 // ---------------------------------------------------------------------------
 // FastlyPlatformConfigStore
@@ -36,6 +39,48 @@ use trusted_server_core::settings::TrustedClientIpConfig;
 /// opened per call to read the management token; the Fastly Compute SDK caches
 /// the open handle so that cost is negligible.
 pub struct FastlyPlatformConfigStore;
+
+/// The shared policy entries of a config store, from which a blob the keyed
+/// push wrote for a host, which carries no policy file, reads the file it
+/// pins.
+///
+/// An entry is read as a blob is, through the store and core's chunk reader,
+/// and the runtime loader checks the file against the blob's digest.
+pub(crate) struct FastlyPolicyEntries<'a> {
+    config_store: &'a dyn PlatformConfigStore,
+    store_name: &'a StoreName,
+}
+
+impl<'a> FastlyPolicyEntries<'a> {
+    /// The entries of the store `store_name` names, read through
+    /// `config_store`.
+    pub(crate) fn new(
+        config_store: &'a dyn PlatformConfigStore,
+        store_name: &'a StoreName,
+    ) -> Self {
+        Self {
+            config_store,
+            store_name,
+        }
+    }
+}
+
+impl PlatformPolicySource for FastlyPolicyEntries<'_> {
+    fn policy_text(&self, reference: &PolicyReference) -> Result<String, Report<PlatformError>> {
+        let key = policy_key(&reference.sha256);
+        let value = self
+            .config_store
+            .get(self.store_name, &key)
+            .change_context(PlatformError::PolicySource)
+            .attach(format!("the policy entry `{key}` cannot be read"))?;
+        let entry = resolve_fastly_chunk_pointer(self.config_store, self.store_name, &value)
+            .change_context(PlatformError::PolicySource)
+            .attach(format!(
+                "the chunks of the policy entry `{key}` cannot be read"
+            ))?;
+        policy_entry_text(&entry)
+    }
+}
 
 impl PlatformConfigStore for FastlyPlatformConfigStore {
     fn get(&self, store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
@@ -747,6 +792,90 @@ mod tests {
     use trusted_server_core::settings::TrustedClientIpConfig;
 
     const PEER_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 9));
+
+    /// Config store entries held in memory, as a deployed store holds them.
+    struct EntriesStore(std::collections::BTreeMap<String, String>);
+
+    impl PlatformConfigStore for EntriesStore {
+        fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+            self.0
+                .get(key)
+                .cloned()
+                .ok_or_else(|| Report::new(PlatformError::ConfigStore).attach("not found"))
+        }
+
+        fn put(
+            &self,
+            _store_id: &StoreId,
+            _key: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    /// The reference a host's blob carries for the repository's sample.
+    fn sample_reference() -> PolicyReference {
+        use trusted_server_core::permissions::{
+            SAMPLE_POLICY_NAME, SAMPLE_POLICY_TEXT, policy_sha256,
+        };
+
+        PolicyReference {
+            policy: SAMPLE_POLICY_NAME.to_owned(),
+            sha256: policy_sha256(SAMPLE_POLICY_TEXT),
+        }
+    }
+
+    #[test]
+    fn a_host_blob_reads_its_policy_file_from_the_shared_entry() {
+        use trusted_server_core::permissions::{SAMPLE_POLICY_NAME, SAMPLE_POLICY_TEXT};
+        use trusted_server_core::platform::PolicyEntry;
+
+        let reference = sample_reference();
+        let entry = edgezero_core::blob_envelope::BlobEnvelope::new(
+            serde_json::to_value(PolicyEntry {
+                name: SAMPLE_POLICY_NAME.to_owned(),
+                text: SAMPLE_POLICY_TEXT.to_owned(),
+            })
+            .expect("should serialize the entry"),
+            "2026-01-01T00:00:00Z".to_owned(),
+        );
+        let store = EntriesStore(std::collections::BTreeMap::from([(
+            policy_key(&reference.sha256),
+            serde_json::to_string(&entry).expect("should serialize the envelope"),
+        )]));
+        let store_name = StoreName::from("trusted_server_config");
+
+        let text = FastlyPolicyEntries::new(&store, &store_name)
+            .policy_text(&reference)
+            .expect("should read the policy file from its entry");
+
+        assert_eq!(text, SAMPLE_POLICY_TEXT);
+    }
+
+    #[test]
+    fn a_host_blob_whose_policy_entry_is_missing_is_refused_naming_the_entry() {
+        let reference = sample_reference();
+        let store = EntriesStore(std::collections::BTreeMap::new());
+        let store_name = StoreName::from("trusted_server_config");
+
+        let error = FastlyPolicyEntries::new(&store, &store_name)
+            .policy_text(&reference)
+            .expect_err("a missing entry should be refused");
+
+        assert!(
+            matches!(error.current_context(), PlatformError::PolicySource),
+            "{error:?}"
+        );
+        assert!(
+            format!("{error:?}").contains(&policy_key(&reference.sha256)),
+            "the reason should name the entry: {error:?}"
+        );
+    }
 
     fn trusted_client_ip_config() -> TrustedClientIpConfig {
         TrustedClientIpConfig {

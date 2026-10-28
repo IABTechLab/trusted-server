@@ -55,9 +55,7 @@ pub fn default_config_store_name() -> StoreName {
 /// Resolves the app-config blob key from the process environment.
 ///
 /// Native adapters such as Axum use this wrapper and honour a `__KEY`
-/// override. The Fastly runtime always reads the entry under the logical store
-/// ID, and its CLI rejects any other `--key` or `__KEY` value, so no override
-/// applies there.
+/// override.
 #[must_use]
 pub fn default_config_key() -> String {
     config_key(&EnvConfig::from_env())
@@ -146,7 +144,15 @@ fn read_config_entry(
         .change_context(TrustedServerError::Configuration { message })
 }
 
-fn resolve_fastly_chunk_pointer(
+/// The value a Fastly config store entry holds, put back together from its
+/// chunks when the entry is a pointer to them, as a long value is written,
+/// and the value itself otherwise.
+///
+/// # Errors
+///
+/// [`TrustedServerError::Configuration`] when a pointer is malformed, or a
+/// chunk cannot be read or has the wrong length or SHA-256.
+pub fn resolve_fastly_chunk_pointer(
     config_store: &dyn PlatformConfigStore,
     store_name: &StoreName,
     value: &str,

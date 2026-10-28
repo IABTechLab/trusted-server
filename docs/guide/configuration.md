@@ -3309,13 +3309,15 @@ canary keys are no longer read.
 
 `[stores.config].default` in `edgezero.toml` supplies the logical config store
 ID, currently `trusted_server_config`. The Fastly runtime opens the store by
-that logical ID and reads the entry under the same key on every target. Store
+that logical ID and reads the entry under the same key on every target, unless
+the store's `TS__CONFIG__KEY` entry names another
+([One blob for each host](#one-blob-for-each-host)). Store
 selection is a deploy-time input: a managed `ts deploy --adapter fastly` links
 the physical store named by
 `EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` to the service version
-under the logical ID. No selector is read from a Config Store at runtime, and
-on Fastly the CLI rejects any `--key` or `__KEY` selector other than the
-logical ID.
+under the logical ID. On Fastly the CLI rejects a `__KEY` selector other than
+the logical ID, and it pushes a `--key` other than the logical ID only with
+`--local`.
 
 Keep the `__NAME` selector set in the shell or deploy job for every push, so
 `ts config push` writes into the same physical store the deployment links.
@@ -3323,6 +3325,108 @@ Isolate staging by selecting a different physical store. See
 [Secret Stores](/guide/fastly#secret-stores) and the
 [CLI lifecycle commands](/guide/cli#lifecycle-commands) for the full deploy and
 staging flow.
+
+### One blob for each host
+
+One Fastly service can serve several publishers, each from an app-config blob
+of its own. The `TS__CONFIG__KEY` entry in the store linked as
+`trusted_server_config` is the service's selector. Write `{host}` in it and the
+runtime replaces it with the host of each request before it reads any
+settings, so every host reads the blob stored under its own name.
+
+Push a blob for each host the service answers for, then set the selector.
+Push each key in lower case. The runtime lowercases the request's host and
+`--key` stores the key as typed, so a blob pushed under
+`WWW.Publisher-A.example` is never read and every request for that host is
+answered `421`.
+
+```bash
+ts config push --adapter fastly --local --key www.publisher-a.example \
+  --app-config publisher-a.toml --permissions standard.yaml
+ts config push --adapter fastly --local --key www.publisher-b.example \
+  --app-config publisher-b.toml --permissions standard.yaml
+
+fastly config-store-entry update --upsert \
+  --store-id <id of the store linked as trusted_server_config> \
+  --key TS__CONFIG__KEY \
+  --value '{host}'
+```
+
+`ts config push` writes a key other than `trusted_server_config` only with
+`--local`, into the local store in `fastly.toml`. Copy the entries it writes
+into a live store with `fastly config-store-entry update`, the policy entries
+first and a long value's chunks before its pointer. The selector is read on
+every request, so the blobs come first.
+
+Each host's blob names its permission policy file in `[permissions] policy`
+and pins the file's SHA-256, and carries no copy of the file. The push keeps
+each file `--permissions` supplies once, in an entry of its own under
+`permissions_<sha256>`, written before the host's blob, and keeps an entry that
+already holds the file, so a hundred hosts that name three files store three
+entries. A changed file is a new entry, so a host still running an earlier
+blob still finds the file that blob pins. The blob at `trusted_server_config`
+carries its file, as on a service with one blob. `ts config diff` compares only
+that blob, so the policy a host runs is checked on that host's `/_ts/config`.
+
+| A request for                                               | Reads the blob at         | Is answered                      |
+| ----------------------------------------------------------- | ------------------------- | -------------------------------- |
+| `www.publisher-a.example`                                   | `www.publisher-a.example` | From publisher A's config        |
+| `WWW.Publisher-A.example:443` or `www.publisher-a.example.` | `www.publisher-a.example` | From publisher A's config        |
+| `www.publisher-b.example`                                   | `www.publisher-b.example` | From publisher B's config        |
+| A host with no blob                                         | None                      | `421 Misdirected Request`        |
+| A `Host` that is not a host name, not UTF-8, or absent      | None                      | `421 Misdirected Request`        |
+| A host whose key would be over 255 characters               | None                      | `421 Misdirected Request`        |
+| `/health`, for any host                                     | None                      | `200`, before any config is read |
+| Any host, under a malformed selector                        | None                      | `500`                            |
+| Any host, where the store cannot be read                    | None                      | `500`                            |
+| A host whose policy entry is missing or is another file     | The host's blob           | `500`, with the reason logged    |
+
+An instance that already holds the rules for the SHA-256 a host's blob pins
+does not read that host's policy entry, so a missing or replaced entry is
+answered with `500` only by an instance that has not loaded that SHA-256
+before.
+
+A selector is malformed when it is empty, carries whitespace, a control
+character or `{host}` more than once, carries a brace outside its `{host}`
+(such as `{Host}`), or is longer than 255 characters. Without the entry every
+request reads `trusted_server_config`, and a selector without `{host}` is the
+key of one blob for every host.
+
+A host with no blob is never answered from the logical store ID or from
+another host's blob, because a shared fallback is how a host nobody configured
+comes to be served another publisher's site. A host name is letters, digits
+and hyphens in labels joined by single dots, and no label starts or ends with
+a hyphen. An IPv4 address such as `127.0.0.1` passes, and an IPv6 literal such
+as `[::1]` is refused. Nothing else is looked up, so a request cannot name the
+logical store ID, the selector or a part of a stored blob, each of which
+carries an underscore.
+
+- A publisher with several names has a blob under each. `www.publisher.example`
+  and `publisher.example` are two keys, and what each serves is for the
+  publisher to decide.
+- The selector may carry text around the placeholder, such as `{host}_staging`.
+  Each key is then pushed in full, with `--key www.publisher-a.example_staging`.
+- Every blob resolves its secret references in the one secret store the service
+  maps, so each publisher's blob names keys of its own.
+- Request signing keys belong to the service, so every publisher on it signs
+  with the same keys.
+- A staged version reads the selector and the blobs of the store its version
+  links as `trusted_server_config`, so a staging store of its own may carry a
+  selector of its own, such as `{host}_staging`.
+- Only the Fastly adapter reads the placeholder. The Axum, Cloudflare and Spin
+  adapters read one app-config blob.
+
+A service that wrote its selector as the service-scoped `__KEY` entry of
+`edgezero_runtime_env` follows
+[Upgrading from EdgeZero v0.0.8](/guide/fastly#upgrading-from-edgezero-v0-0-8)
+and writes the same value into `TS__CONFIG__KEY` before it deploys a build
+that reads that entry. It also removes any blob at `trusted_server_config` from
+a store that holds a blob for each host, so a store that loses its selector
+serves no host from it.
+
+`./scripts/config-by-host-local-test.sh` serves two publishers from one local
+Viceroy instance. It checks that each host is answered from its own blob and
+that a host with none is refused.
 
 ### Local development
 

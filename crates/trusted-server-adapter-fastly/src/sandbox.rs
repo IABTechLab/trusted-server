@@ -6,8 +6,11 @@
 //! per-sandbox bookkeeping the entry point carries across requests.
 //!
 //! [`Sandbox`] owns the state the entry point carries across requests: the
-//! logger guard, the measurement counters, and the retained application.
+//! logger guard, the measurement counters, and the retained applications.
 
+use std::cell::{Cell, RefCell};
+use std::convert::Infallible;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,19 +60,101 @@ pub(crate) const INSTANCE_ID_UNAVAILABLE: &str = "unavailable";
 
 /// Per-sandbox state, owned by `edgezero_adapter_fastly::lifecycle::Sandbox`.
 ///
-/// The framework owns lazy successful-only retention, the callback count, the
-/// initialization-attempt count, and the one-time setup guard. This alias
-/// names the application-specific payload it retains.
-pub(crate) type Sandbox = edgezero_adapter_fastly::lifecycle::Sandbox<RetainedApp>;
+/// The framework owns the callback count and the one-time setup guard, and
+/// holds the payload this alias names. The payload owns retention.
+pub(crate) type Sandbox = edgezero_adapter_fastly::lifecycle::Sandbox<RetainedApps>;
 
-/// The application state a retained sandbox carries.
+/// How many applications a sandbox keeps.
+///
+/// Each holds a publisher's settings, registry and routes, and all of them
+/// share the sandbox's one memory bound, so the least recently served is
+/// dropped past this many.
+pub(crate) const MAX_RETAINED_APPS: usize = 8;
+
+/// The application state a retained sandbox carries for one app-config blob.
 ///
 /// Only ever reachable after a successful build: a failed build returns the
-/// error router as the `initialize` error instead, so it is served for the
+/// error router as the build's error instead, so it is served for the
 /// current request and dropped rather than retained.
 pub(crate) struct RetainedApp {
     pub(crate) app: App,
     pub(crate) state: Arc<AppState>,
+}
+
+/// The applications a sandbox has built, each under the key of the app-config
+/// blob it was built from.
+///
+/// The framework hands its payload out by shared reference, so the list sits
+/// behind a [`RefCell`].
+#[derive(Default)]
+pub(crate) struct RetainedApps {
+    /// Most recently served first.
+    apps: RefCell<Vec<(String, Rc<RetainedApp>)>>,
+    build_attempts: Cell<u64>,
+}
+
+impl RetainedApps {
+    /// The application built from the blob at `config_key`, building it when
+    /// the sandbox holds none.
+    ///
+    /// Retains only success. A failed build hands its error back unchanged,
+    /// which serves this request and is dropped, so a transient config-store
+    /// failure cannot pin the sandbox into error mode and the next request
+    /// for the key builds again.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error `build` returned.
+    pub(crate) fn get_or_build<E>(
+        &self,
+        config_key: &str,
+        build: impl FnOnce() -> Result<RetainedApp, E>,
+    ) -> Result<Rc<RetainedApp>, E> {
+        if let Some(app) = self.served(config_key) {
+            return Ok(app);
+        }
+
+        self.build_attempts
+            .set(self.build_attempts.get().saturating_add(1));
+        let app = Rc::new(build()?);
+
+        let mut apps = self.apps.borrow_mut();
+        apps.insert(0, (config_key.to_owned(), Rc::clone(&app)));
+        apps.truncate(MAX_RETAINED_APPS);
+        Ok(app)
+    }
+
+    /// The retained application for `config_key`, marked as the most recently
+    /// served.
+    fn served(&self, config_key: &str) -> Option<Rc<RetainedApp>> {
+        let mut apps = self.apps.borrow_mut();
+        let position = apps.iter().position(|(key, _)| key == config_key)?;
+        let entry = apps.remove(position);
+        let app = Rc::clone(&entry.1);
+        apps.insert(0, entry);
+        Some(app)
+    }
+
+    /// Builds attempted, failed ones included.
+    pub(crate) fn build_attempts(&self) -> u64 {
+        self.build_attempts.get()
+    }
+
+    /// How many applications are retained.
+    #[cfg(test)]
+    pub(crate) fn retained(&self) -> usize {
+        self.apps.borrow().len()
+    }
+}
+
+/// Makes the holder of `sandbox`'s applications, once.
+pub(crate) fn hold_applications(sandbox: &mut Sandbox) {
+    let Ok(()) = sandbox.initialize(|| Ok::<_, Infallible>(RetainedApps::default()));
+}
+
+/// Application builds `sandbox` has attempted, failed ones included.
+pub(crate) fn build_attempts(sandbox: &Sandbox) -> u64 {
+    sandbox.state().map_or(0, RetainedApps::build_attempts)
 }
 
 /// Startup diagnostics held until a logger exists.
@@ -101,16 +186,17 @@ impl StartupDiagnostics {
     }
 }
 
-/// Snapshots of the framework's counters, taken around one callback.
+/// Snapshots of the sandbox's counters, taken around one callback.
 ///
 /// `serve_custom` owns the [`Sandbox`] and drops it when serving ends, so the
-/// retirement line cannot read it afterwards. These are snapshots of
-/// `EdgeZero`'s counters taken while the sandbox is still borrowed; nothing here
-/// increments anything.
+/// retirement line cannot read it afterwards. These are snapshots of the
+/// callback count `EdgeZero` keeps and the build count [`RetainedApps`] keeps,
+/// taken while the sandbox is still borrowed. Nothing here increments
+/// anything.
 ///
 /// The two are read at different points on purpose. The framework increments
 /// its callback count *before* invoking the callback, so `requests` is correct
-/// on entry. Initialization happens *during* the callback, so `attempts` must
+/// on entry. An application is built *during* the callback, so `attempts` must
 /// be read on the way out. The count itself is never lost — it lives in the
 /// sandbox until serving ends — but a snapshot taken on entry is stale by the
 /// time the final callback finishes, so a build it performed goes unreported.
@@ -131,7 +217,7 @@ impl RetirementCounters {
     ) -> R {
         self.requests = sandbox.requests();
         let outcome = callback(sandbox);
-        self.attempts = sandbox.initialization_attempts();
+        self.attempts = build_attempts(sandbox);
         outcome
     }
 
@@ -140,7 +226,7 @@ impl RetirementCounters {
         self.requests
     }
 
-    /// Initialization attempts observed on exit from the last callback.
+    /// Build attempts observed on exit from the last callback.
     pub(crate) fn attempts(&self) -> u64 {
         self.attempts
     }
@@ -172,7 +258,7 @@ impl SandboxCounters {
             .filter(|settings| metrics_enabled(settings))
             .map(|_| Self {
                 ordinal,
-                builds: sandbox.initialization_attempts(),
+                builds: build_attempts(sandbox),
                 request_id: request_id.to_owned(),
             })
     }
@@ -723,6 +809,27 @@ mod tests {
         );
     }
 
+    /// A sandbox holding its applications, as the entry point makes it.
+    fn holding_sandbox() -> Sandbox {
+        let mut sandbox = Sandbox::default();
+        hold_applications(&mut sandbox);
+        sandbox
+    }
+
+    /// Hands back the application for `key`, which must already be retained.
+    fn retained_for(apps: &RetainedApps, key: &str) -> Rc<RetainedApp> {
+        apps.get_or_build(key, || -> Result<RetainedApp, &str> {
+            panic!("`{key}` is retained and must not be rebuilt")
+        })
+        .expect("a retained application should be reused")
+    }
+
+    /// Builds and retains an application for `key`.
+    fn build_for(apps: &RetainedApps, key: &str) -> Rc<RetainedApp> {
+        apps.get_or_build(key, || Ok::<_, &str>(test_retained()))
+            .expect("the build should succeed")
+    }
+
     #[test]
     fn a_sandbox_starts_with_no_retained_application() {
         let sandbox = Sandbox::default();
@@ -732,19 +839,54 @@ mod tests {
             "construction must be lazy so the health probe never pays for it"
         );
         assert_eq!(
-            sandbox.initialization_attempts(),
+            build_attempts(&sandbox),
             0,
             "a sandbox that has served nothing should report no build attempts"
         );
     }
 
     #[test]
+    fn holding_applications_builds_none() {
+        let mut sandbox = holding_sandbox();
+
+        assert_eq!(
+            sandbox
+                .state()
+                .expect("should hold its applications")
+                .retained(),
+            0,
+            "should hold no application before one is asked for"
+        );
+        assert_eq!(
+            build_attempts(&sandbox),
+            0,
+            "making the holder should not count as a build"
+        );
+
+        // Asking again must keep what is held, or every request would start
+        // from an empty holder and nothing would ever be reused.
+        build_for(
+            sandbox.state().expect("should hold its applications"),
+            "trusted_server_config",
+        );
+        hold_applications(&mut sandbox);
+        assert_eq!(
+            sandbox
+                .state()
+                .expect("should hold its applications")
+                .retained(),
+            1,
+            "holding again should keep the applications already built"
+        );
+    }
+
+    #[test]
     fn a_retained_application_is_reused_without_rebuilding() {
-        let mut sandbox = Sandbox::default();
+        let apps = RetainedApps::default();
         let builds = Cell::new(0_u32);
 
-        sandbox
-            .initialize(|| {
+        let first = apps
+            .get_or_build("trusted_server_config", || {
                 builds.set(builds.get() + 1);
                 Ok::<_, &str>(test_retained())
             })
@@ -752,12 +894,16 @@ mod tests {
         assert_eq!(builds.get(), 1, "the first request should build");
 
         for attempt in 2..=4_u32 {
-            sandbox
-                .initialize(|| -> Result<RetainedApp, &str> {
+            let again = apps
+                .get_or_build("trusted_server_config", || -> Result<RetainedApp, &str> {
                     builds.set(builds.get() + 1);
                     panic!("request {attempt} must not rebuild a retained application")
                 })
                 .expect("a retained application should be reused");
+            assert!(
+                Rc::ptr_eq(&first, &again),
+                "request {attempt} should be handed the application built first"
+            );
         }
 
         assert_eq!(
@@ -765,21 +911,17 @@ mod tests {
             1,
             "four requests should cost exactly one build; that is the whole point"
         );
-        assert_eq!(
-            sandbox.initialization_attempts(),
-            1,
-            "the framework counter should agree"
-        );
+        assert_eq!(apps.build_attempts(), 1, "the build counter should agree");
     }
 
     #[test]
     fn a_failed_build_is_retried_and_a_later_success_is_retained() {
-        let mut sandbox = Sandbox::default();
+        let apps = RetainedApps::default();
         let builds = Cell::new(0_u32);
 
         // Request 1: the build fails. The error payload stands in for the
         // error router `build_app_with_state` returns when state is `None`.
-        let failed = sandbox.initialize(|| {
+        let failed = apps.get_or_build("trusted_server_config", || {
             builds.set(builds.get() + 1);
             Err::<RetainedApp, &str>("error router")
         });
@@ -788,31 +930,23 @@ mod tests {
             Some("error router"),
             "a failed build must be handed back for this request only"
         );
-        assert!(
-            sandbox.state().is_none(),
-            "a failed build must not be retained"
-        );
+        assert_eq!(apps.retained(), 0, "a failed build must not be retained");
 
         // Request 2: the retry succeeds. Only reachable because the failure
         // was not retained.
-        sandbox
-            .initialize(|| {
-                builds.set(builds.get() + 1);
-                Ok::<_, &str>(test_retained())
-            })
-            .expect("the retry should succeed");
-        assert!(
-            sandbox.state().is_some(),
+        apps.get_or_build("trusted_server_config", || {
+            builds.set(builds.get() + 1);
+            Ok::<_, &str>(test_retained())
+        })
+        .expect("the retry should succeed");
+        assert_eq!(
+            apps.retained(),
+            1,
             "the recovered application should be retained"
         );
 
-        // Request 3: recovery is durable — no further build.
-        sandbox
-            .initialize(|| -> Result<RetainedApp, &str> {
-                builds.set(builds.get() + 1);
-                panic!("a recovered application must not be rebuilt")
-            })
-            .expect("request 3 should reuse the recovered app");
+        // Request 3: recovery is durable, so no further build.
+        retained_for(&apps, "trusted_server_config");
 
         assert_eq!(
             builds.get(),
@@ -820,9 +954,126 @@ mod tests {
             "one failed build plus one successful build, then reuse"
         );
         assert_eq!(
-            sandbox.initialization_attempts(),
+            apps.build_attempts(),
             2,
             "both attempts should be counted so a retry loop stays visible"
+        );
+    }
+
+    #[test]
+    fn an_application_answers_only_for_the_key_it_was_built_from() {
+        let apps = RetainedApps::default();
+
+        let first = build_for(&apps, "a.example");
+        let second = build_for(&apps, "b.example");
+
+        assert!(
+            !Rc::ptr_eq(&first, &second),
+            "a second publisher must be built an application of its own"
+        );
+        assert_eq!(apps.build_attempts(), 2, "two blobs should cost two builds");
+
+        for (key, built) in [
+            ("b.example", &second),
+            ("a.example", &first),
+            ("a.example", &first),
+            ("b.example", &second),
+        ] {
+            assert!(
+                Rc::ptr_eq(&retained_for(&apps, key), built),
+                "`{key}` must be answered by the application built from its own blob"
+            );
+        }
+        assert_eq!(
+            apps.build_attempts(),
+            2,
+            "serving both in any order should build nothing more"
+        );
+    }
+
+    #[test]
+    fn a_failed_build_for_one_key_leaves_another_s_application_retained() {
+        let apps = RetainedApps::default();
+        let first = build_for(&apps, "a.example");
+
+        let failed = apps.get_or_build("b.example", || Err::<RetainedApp, &str>("error router"));
+        assert_eq!(
+            failed.err(),
+            Some("error router"),
+            "the second publisher's failed build should be handed back"
+        );
+
+        assert!(
+            Rc::ptr_eq(&retained_for(&apps, "a.example"), &first),
+            "the first publisher's application should still be retained"
+        );
+        assert_eq!(
+            apps.retained(),
+            1,
+            "the failed build should not have been retained under either key"
+        );
+    }
+
+    #[test]
+    fn the_least_recently_served_application_is_dropped_past_the_bound() {
+        let apps = RetainedApps::default();
+        let key = |index: usize| format!("{index}.example");
+
+        for index in 0..MAX_RETAINED_APPS {
+            build_for(&apps, &key(index));
+        }
+        assert_eq!(
+            apps.retained(),
+            MAX_RETAINED_APPS,
+            "should keep every application up to the bound"
+        );
+
+        // Serving the oldest makes the second oldest the one to drop.
+        retained_for(&apps, &key(0));
+        build_for(&apps, "one-more.example");
+
+        assert_eq!(
+            apps.retained(),
+            MAX_RETAINED_APPS,
+            "should never keep more than the bound"
+        );
+        retained_for(&apps, &key(0));
+        retained_for(&apps, "one-more.example");
+        for index in 2..MAX_RETAINED_APPS {
+            retained_for(&apps, &key(index));
+        }
+
+        let rebuilt = Cell::new(false);
+        apps.get_or_build(&key(1), || {
+            rebuilt.set(true);
+            Ok::<_, &str>(test_retained())
+        })
+        .expect("the dropped application should build again");
+        assert!(
+            rebuilt.get(),
+            "the least recently served application should have been dropped"
+        );
+    }
+
+    #[test]
+    fn captured_counters_report_the_builds_the_sandbox_attempted() {
+        let sandbox = holding_sandbox();
+        let mut settings = Settings::default();
+        settings.debug.sandbox_metrics_enabled = true;
+
+        let apps = sandbox.state().expect("should hold its applications");
+        build_for(apps, "a.example");
+        build_for(apps, "b.example");
+        retained_for(apps, "a.example");
+
+        assert_eq!(
+            SandboxCounters::capture(&sandbox, 3, "req-3", Some(&settings)),
+            Some(SandboxCounters {
+                ordinal: 3,
+                builds: 2,
+                request_id: "req-3".to_owned(),
+            }),
+            "should report a build for each blob and none for a reuse"
         );
     }
 
@@ -840,15 +1091,17 @@ mod tests {
         assert_eq!(
             counters.attempts(),
             0,
-            "a callback that never initializes should report no attempts"
+            "a callback that never builds should report no attempts"
         );
 
         // Callback 2 succeeds. The build happens DURING this callback, so it
         // only shows up if the count is read on the way out.
         counters.observe(&mut sandbox, |sandbox| {
-            sandbox
-                .initialize(|| Ok::<_, &str>(test_retained()))
-                .expect("the build should succeed");
+            hold_applications(sandbox);
+            build_for(
+                sandbox.state().expect("should hold its applications"),
+                "trusted_server_config",
+            );
         });
         assert_eq!(
             counters.attempts(),
@@ -862,11 +1115,17 @@ mod tests {
         let mut sandbox = Sandbox::default();
         let mut counters = RetirementCounters::default();
 
-        // The application state is not retained, but the attempt itself stays
-        // in `initialization_attempts()` until the sandbox is dropped. What a
-        // stale snapshot loses is the report, not the count.
+        // The application is not retained, but the attempt itself stays in
+        // the holder's count until the sandbox is dropped. What a stale
+        // snapshot loses is the report, not the count.
         counters.observe(&mut sandbox, |sandbox| {
-            let failed = sandbox.initialize(|| Err::<RetainedApp, &str>("error router"));
+            hold_applications(sandbox);
+            let failed = sandbox
+                .state()
+                .expect("should hold its applications")
+                .get_or_build("trusted_server_config", || {
+                    Err::<RetainedApp, &str>("error router")
+                });
             assert_eq!(
                 failed.err(),
                 Some("error router"),
@@ -879,8 +1138,12 @@ mod tests {
             1,
             "a failed build on the final callback must still be reported"
         );
-        assert!(
-            sandbox.state().is_none(),
+        assert_eq!(
+            sandbox
+                .state()
+                .expect("should hold its applications")
+                .retained(),
+            0,
             "a failed build must not be retained"
         );
     }
@@ -941,7 +1204,7 @@ mod tests {
         );
     }
 
-    // Request ordinals and build attempts are counted by
+    // Request ordinals are counted by
     // `edgezero_adapter_fastly::lifecycle::Sandbox` itself, incremented in its
     // private per-callback hook. They are exercised through `serve_custom` /
     // `run_custom` at runtime and covered by the framework's own tests, so
