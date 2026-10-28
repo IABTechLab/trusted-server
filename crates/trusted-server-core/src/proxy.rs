@@ -119,7 +119,7 @@ pub const ASSET_NO_STORE_PRIVATE_CACHE_CONTROL: &str = NO_STORE_PRIVATE_CACHE_CO
 
 /// Cache policy metadata emitted by the asset proxy handler.
 ///
-/// The Fastly router finalizes standard response headers after the asset handler
+/// An adapter's router finalizes standard response headers after the asset handler
 /// returns. This typed policy lets the router reapply protected cache directives
 /// without depending on an exact header string set by the handler.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -132,8 +132,8 @@ pub enum AssetProxyCachePolicy {
     ///
     /// The adapter must call [`Self::apply_after_route_finalization`] after
     /// standard response and privacy finalization, passing its runtime
-    /// [`EdgeCacheHeader`]. Asset rehosting is Fastly-only today; a future
-    /// adapter must preserve this finalization step to emit its edge directive.
+    /// [`EdgeCacheHeader`]. An adapter that rehosts assets must preserve this
+    /// finalization step to emit its edge directive.
     Normalized(CachePolicy),
 }
 
@@ -218,7 +218,7 @@ impl AssetProxyResponse {
         self.cache_policy
     }
 
-    /// Consume this wrapper and return a buffered Fastly response.
+    /// Consume this wrapper and return a buffered response.
     ///
     /// # Errors
     ///
@@ -249,7 +249,7 @@ impl AssetProxyResponse {
 ///
 /// Returns [`TrustedServerError::Proxy`] when `platform_resp` carries a
 /// streaming body, which the buffered proxy path cannot materialize.
-pub(crate) fn platform_response_to_fastly(
+pub(crate) fn platform_response_to_buffered(
     platform_resp: PlatformResponse,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let (parts, body) = platform_resp.response.into_parts();
@@ -257,7 +257,7 @@ pub(crate) fn platform_response_to_fastly(
         EdgeBody::Once(bytes) => bytes.to_vec(),
         EdgeBody::Stream(_) => {
             return Err(Report::new(TrustedServerError::Proxy {
-                message: "streaming platform response body is not supported by Fastly response conversion"
+                message: "streaming platform response body is not supported by buffered response conversion"
                     .to_string(),
             }));
         }
@@ -265,7 +265,7 @@ pub(crate) fn platform_response_to_fastly(
     Ok(Response::from_parts(parts, EdgeBody::from(body_bytes)))
 }
 
-fn platform_response_to_fastly_asset(platform_resp: PlatformResponse) -> AssetProxyResponse {
+fn platform_response_to_asset(platform_resp: PlatformResponse) -> AssetProxyResponse {
     let (parts, body) = platform_resp.response.into_parts();
 
     match body {
@@ -282,8 +282,8 @@ fn platform_response_to_fastly_asset(platform_resp: PlatformResponse) -> AssetPr
 
 /// Stream a platform response body directly to a writable client stream.
 ///
-/// Asset routes and Fastly `EdgeZero` publisher fallback both use this bridge
-/// after headers have been committed through `stream_to_client()`.
+/// Asset routes and an adapter's `EdgeZero` publisher fallback both use this
+/// bridge after headers have been committed through `stream_to_client()`.
 ///
 /// # Errors
 ///
@@ -313,8 +313,8 @@ pub async fn stream_asset_body<W: Write>(
                     .change_context(TrustedServerError::Proxy {
                         message: "failed to write streaming platform response body".to_string(),
                     })?;
-                // Flush per chunk: Fastly's `StreamingBody` is a
-                // `BufWriter<StreamingBodyHandle>`, so a segment smaller than
+                // Flush per chunk: a platform's client stream may be a
+                // `BufWriter` over its stream handle, so a segment smaller than
                 // the write buffer would sit in the Wasm heap until a later
                 // write filled it. The publisher stream yields compressed
                 // segments that are commonly smaller than that buffer, and the
@@ -971,9 +971,9 @@ async fn send_asset_origin_request(
         })?;
 
     if stream_response {
-        Ok(platform_response_to_fastly_asset(platform_resp))
+        Ok(platform_response_to_asset(platform_resp))
     } else {
-        platform_response_to_fastly(platform_resp).map(AssetProxyResponse::origin_controlled)
+        platform_response_to_buffered(platform_resp).map(AssetProxyResponse::origin_controlled)
     }
 }
 
@@ -1206,9 +1206,9 @@ pub async fn handle_asset_proxy_request(
     })?;
 
     let mut response = if stream_response {
-        platform_response_to_fastly_asset(platform_resp)
+        platform_response_to_asset(platform_resp)
     } else {
-        platform_response_to_fastly(platform_resp).map(AssetProxyResponse::origin_controlled)?
+        platform_response_to_buffered(platform_resp).map(AssetProxyResponse::origin_controlled)?
     };
     strip_asset_proxy_response_headers(response.response_mut());
 
@@ -1793,10 +1793,10 @@ pub async fn handle_first_party_proxy_sign(
     // protocol-relative sign target inherits it.
     //
     // Prefer the URI's explicit scheme, which adapters that deliver absolute
-    // request targets (Fastly, Spin after normalization) always carry, and fall
-    // back to TLS/forwarded metadata otherwise. What must never be used is the
-    // parsed request target: origin-form URIs — what browsers send and the Axum
-    // adapter forwards verbatim — have no scheme of their own, so parsing would
+    // request targets always carry, and fall back to TLS/forwarded metadata
+    // otherwise. What must never be used is the parsed request target:
+    // origin-form URIs, which browsers send and an adapter may forward
+    // verbatim, have no scheme of their own, so parsing would
     // hand back the placeholder base's `https` and make an HTTP dev server sign
     // an HTTPS target it then proxies over TLS against a plaintext service.
     let request_scheme = req
@@ -2013,7 +2013,7 @@ pub async fn handle_first_party_proxy_rebuild(
     } else {
         // Support GET: /first-party/proxy-rebuild?tsclick=...&add=...&del=...
         // Parse the query component directly rather than the full URI: browsers
-        // (and the Axum/Spin adapters) deliver origin-form URIs (`/path?query`),
+        // (and the adapters that forward them) deliver origin-form URIs (`/path?query`),
         // which `url::Url::parse` rejects as relative.
         rebuild_request_from_pairs(url::form_urlencoded::parse(req_query.as_bytes()))?
     };
@@ -2194,9 +2194,9 @@ const REQUEST_TARGET_BASE: &str = "https://request.invalid";
 
 /// Parse a request target that may be either an absolute URL or origin-form.
 ///
-/// Adapters differ in what `Request::uri()` carries: Fastly and the normalized
-/// Spin path expose an absolute URL, while browsers send origin-form targets
-/// (`/path?query`) that the Axum adapter passes through verbatim. Joining a
+/// Adapters differ in what `Request::uri()` carries. Some expose an absolute
+/// URL, while browsers send origin-form targets (`/path?query`) that other
+/// adapters pass through verbatim. Joining a
 /// fixed placeholder origin lets one parser serve both, so first-party
 /// endpoints behave identically across adapters.
 ///
@@ -2882,7 +2882,7 @@ mod tests {
     fn proxy_sign_inherits_the_request_scheme_for_protocol_relative_urls() {
         // A protocol-relative target adopts the scheme the visitor is on. It
         // must come from the request, not from the parser's placeholder base:
-        // origin-form URIs (browsers, and the Axum adapter verbatim) carry no
+        // origin-form URIs (browsers, and an adapter forwarding them) carry no
         // scheme, so an HTTP dev server would otherwise sign an HTTPS target
         // and proxy TLS against a plaintext service.
         futures::executor::block_on(async {
@@ -3412,7 +3412,7 @@ mod tests {
 
     #[test]
     fn first_party_click_accepts_origin_form_uri() {
-        // Browsers send origin-form request targets and the Axum adapter passes
+        // Browsers send origin-form request targets and an adapter may pass
         // them through verbatim, so the shared signed-target parser must accept
         // both forms — otherwise the second hop of the rebuild redirect chain
         // fails instead of reaching the advertiser.
@@ -3480,7 +3480,7 @@ mod tests {
     #[test]
     fn proxy_rebuild_get_with_origin_form_uri_redirects() {
         // The opaque-origin creative click guard navigates to this endpoint,
-        // and browsers (via the Axum/Spin adapters) deliver origin-form URIs
+        // and browsers (through an adapter that forwards them) deliver origin-form URIs
         // (`/path?query`) rather than absolute URLs. The handler must parse the
         // query and answer with the 302 recovery redirect.
         futures::executor::block_on(async {
@@ -6908,7 +6908,7 @@ mod tests {
 
     #[test]
     fn stream_asset_body_flushes_each_chunk_before_polling_the_source_again() {
-        // Fastly's `StreamingBody` is a `BufWriter`, so a yielded segment only
+        // A platform's client stream may be a `BufWriter`, so a yielded segment only
         // reaches the client once the sink is flushed. The publisher stream
         // awaits the origin (and the auction) between segments, so a segment
         // smaller than the write buffer must be flushed before the next poll or

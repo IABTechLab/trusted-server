@@ -69,7 +69,11 @@ pub(crate) fn sanitize_fastly_forwarded_headers(
         req.remove_header(config.auth_header.as_str());
     }
 
-    for &name in SPOOFABLE_FORWARDED_HEADERS {
+    let own = [
+        crate::app::FASTLY_TLS_HEADER,
+        crate::app::FASTLY_CLIENT_IP_HEADER,
+    ];
+    for &name in SPOOFABLE_FORWARDED_HEADERS.iter().chain(&own) {
         if req.get_header(name).is_some() {
             log::debug!("Stripped spoofable header: {name}");
             req.remove_header(name);

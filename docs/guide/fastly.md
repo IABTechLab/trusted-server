@@ -118,8 +118,8 @@ carries other traffic, a dedicated `x-` name is safer: the front-door VCL then
 never modifies `Fastly-Client-IP`, so security rules, rate limiters, logging
 formats, and vendor snippets that read it keep working unchanged.
 
-Both names are validated at startup. `ip_header` must be `fastly-client-ip` or
-begin with `x-`, `auth_header` must begin with `x-`, the two must differ, and
+Both names are validated at startup. `ip_header` must begin with `x-` or end
+with `-client-ip`, as `fastly-client-ip` does, `auth_header` must begin with `x-`, the two must differ, and
 neither may reuse a Trusted Server internal header name such as
 `x-forwarded-for` or `x-ts-ec`. Use lowercase in the TOML.
 

@@ -44,7 +44,10 @@ use trusted_server_device_fastly::{FastlyDeviceModule, FastlyHostSignals};
 mod app;
 mod backend;
 mod compat;
+mod config_chunks;
 mod config_selection;
+#[cfg(test)]
+mod core_sdk_guard;
 mod ec_kv;
 mod esi_assembly;
 mod logging;
@@ -404,6 +407,7 @@ pub fn run_with_addressing(
 /// come from the runtime environment before the SDK serving loop is entered;
 /// an unconfigured or partially configured sandbox stays single-request.
 pub fn run() {
+    app::declare_platform();
     let (mode, diagnostics) = serve_mode();
 
     // Held outside the sandbox: `serve_custom` owns the `Sandbox` and exposes
@@ -739,14 +743,14 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
     // sanitization that removes the headers it reads.
     let resolved_client_ip = compat::resolve_and_sanitize_client_ip(&mut req, trusted_client_ip);
 
-    // Re-inject a trusted TLS scheme signal after sanitization has stripped any
-    // client-sent fastly-ssl header. Setting it from Fastly's native TLS
-    // metadata here is authoritative. detect_request_scheme in http_util checks
-    // this header so scheme-sensitive logic produces https URLs on HTTPS traffic.
+    // Re-inject the TLS header after sanitization has stripped any a client
+    // sent. Setting it from Fastly's native TLS metadata here is authoritative,
+    // and core reads it as the TLS header this adapter declares, so
+    // scheme-sensitive logic produces https URLs on HTTPS traffic.
     if req.get_tls_protocol().ok().flatten().is_some()
         || req.get_tls_cipher_openssl_name().ok().flatten().is_some()
     {
-        req.set_header("fastly-ssl", "1");
+        req.set_header(app::FASTLY_TLS_HEADER, "1");
     }
 
     // Strip any client-supplied x-ts-tls-* headers before injecting the trusted
@@ -1215,8 +1219,8 @@ pub(crate) fn extract_cookie_value(req: &HttpRequest, name: &str) -> Option<Stri
 /// resolved, passed in as `registered`, and it is shown the User-Agent and
 /// the cookies, which carry what a page gathers in the browser. Otherwise
 /// [`build_device_module`] gives the built-in module, which reads only the
-/// User-Agent, or the Fastly module, which also reads the TLS/H2 signals
-/// captured into a [`FastlyHostSignals`]. The Fastly module, and so the
+/// User-Agent, or for `platform` the Fastly module, which also reads the
+/// TLS/H2 signals captured into a [`FastlyHostSignals`]. The Fastly module, and so the
 /// signal capture, is built only when selected, so the default request path
 /// makes no Fastly-specific signal call. The module is handed a module
 /// context carrying the request, that evidence, the settings and the
@@ -1285,7 +1289,7 @@ fn entry_request(req: &FastlyRequest) -> ModuleRequest<'_> {
 /// `https` when the entry point marked the request as arriving over TLS,
 /// which it does from Fastly's own TLS metadata.
 fn entry_scheme(req: &FastlyRequest) -> &'static str {
-    if req.get_header_str("fastly-ssl").is_some() {
+    if req.get_header_str(app::FASTLY_TLS_HEADER).is_some() {
         "https"
     } else {
         "http"
@@ -1380,7 +1384,7 @@ mod tests {
         req.set_header("user-agent", "Mozilla/5.0 (X11; Linux x86_64) Chrome/140.0");
         req.set_header("cookie", "example_width=1280");
         // The entry point marks a request that arrived over TLS this way.
-        req.set_header("fastly-ssl", "1");
+        req.set_header(crate::app::FASTLY_TLS_HEADER, "1");
         req
     }
 

@@ -18,9 +18,7 @@ use trusted_server_core::platform::{
     StoreId, StoreName, policy_entry_text, policy_key,
 };
 use trusted_server_core::settings::Settings;
-use trusted_server_core::settings_data::{
-    get_settings_from_config_store_with, resolve_fastly_chunk_pointer,
-};
+use trusted_server_core::settings_data::get_settings_from_config_store_with;
 
 const HOST: &str = "a.publisher.example";
 
@@ -178,11 +176,30 @@ fn stored_entries(project: &TempDir) -> Vec<(String, String)> {
 
 struct MemoryConfigStore(BTreeMap<String, String>);
 
-impl PlatformConfigStore for MemoryConfigStore {
-    fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+impl MemoryConfigStore {
+    fn entry(&self, key: &str) -> Result<String, Report<PlatformError>> {
         self.0.get(key).cloned().ok_or_else(|| {
             Report::new(PlatformError::ConfigStore).attach(format!("missing key `{key}`"))
         })
+    }
+}
+
+impl PlatformConfigStore for MemoryConfigStore {
+    /// The entry at `key`, its chunks joined in order when it is a chunk
+    /// pointer, as the Fastly config store returns a long entry whole.
+    fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+        let value = self.entry(key)?;
+        let pointer: serde_json::Value =
+            serde_json::from_str(&value).unwrap_or(serde_json::Value::Null);
+        if pointer["edgezero_kind"] != "fastly_config_chunks" {
+            return Ok(value);
+        }
+        pointer["chunks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|chunk| self.entry(chunk["key"].as_str().unwrap_or_default()))
+            .collect()
     }
 
     fn put(
@@ -240,10 +257,7 @@ impl PlatformPolicySource for SharedPolicyEntries<'_> {
         POLICY_READS.with(|reads| reads.set(reads.get() + 1));
         let store_name = StoreName::from(DEFAULT_CONFIG_STORE_ID);
         let value = self.0.get(&store_name, &policy_key(&reference.sha256))?;
-        let entry = resolve_fastly_chunk_pointer(self.0, &store_name, &value).map_err(|error| {
-            Report::new(PlatformError::PolicySource).attach(format!("{error:?}"))
-        })?;
-        policy_entry_text(&entry)
+        policy_entry_text(&value)
     }
 }
 
@@ -370,7 +384,7 @@ fn a_long_document_is_written_as_chunks_then_a_pointer() {
         &["--local", "--key", HOST, "--permissions", POLICY_FILE],
     ));
 
-    let mut entries = stored_entries(&project);
+    let entries = stored_entries(&project);
     let chunk_prefix = format!("{HOST}.__edgezero_chunks.");
     let chunk_count = entries
         .iter()
@@ -381,40 +395,29 @@ fn a_long_document_is_written_as_chunks_then_a_pointer() {
         .iter()
         .position(|(key, _)| key == HOST)
         .expect("should write the pointer");
-    assert!(
-        entries[..pointer_at]
-            .iter()
-            .filter(|(key, _)| key.starts_with(&chunk_prefix))
-            .count()
-            == chunk_count,
+    let written: Vec<&str> = entries[..pointer_at]
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .filter(|key| key.starts_with(&chunk_prefix))
+        .collect();
+    assert_eq!(
+        written.len(),
+        chunk_count,
         "every chunk should be written before the pointer"
     );
-    let (settings, reads) = read_back_counting_reads(&entries, HOST);
-    let settings = settings.expect("should read the chunked blob back whole");
+    // The Fastly adapter reads a written document back whole, which
+    // `config_chunks.rs` tests against a fixture this writer produced.
+    let pointer: serde_json::Value =
+        serde_json::from_str(&entries[pointer_at].1).expect("should write the pointer as JSON");
+    let named: Vec<&str> = pointer["chunks"]
+        .as_array()
+        .expect("should name the chunks")
+        .iter()
+        .map(|chunk| chunk["key"].as_str().expect("should name each chunk's key"))
+        .collect();
     assert_eq!(
-        reads, 1,
-        "the read-back should read the policy file from its shared entry"
-    );
-    assert_eq!(
-        settings.publisher.domain, HOST,
-        "should reassemble the pushed app config"
-    );
-    assert_eq!(
-        settings.proxy.allowed_domains.len(),
-        400,
-        "should reassemble every part of the long blob"
-    );
-
-    let pointer = &mut entries[pointer_at].1;
-    let mut changed: serde_json::Value =
-        serde_json::from_str(pointer).expect("should write the pointer as JSON");
-    changed["chunks"][0]["sha256"] = serde_json::Value::from("0".repeat(64));
-    *pointer = changed.to_string();
-    let refused =
-        read_back(&entries, HOST).expect_err("a chunk whose hash differs should be refused");
-    assert!(
-        format!("{refused:?}").contains("sha mismatch"),
-        "should refuse the chunk for its hash: {refused:?}"
+        named, written,
+        "the pointer should name the chunks written, in order"
     );
 }
 

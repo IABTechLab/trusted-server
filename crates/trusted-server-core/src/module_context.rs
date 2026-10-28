@@ -409,8 +409,8 @@ impl<'r> ModuleContext<'r> {
     /// what the geo module in `services` declares, the device signals what the
     /// device module in `services` declares, and the identifier what the Edge
     /// Cookie module the state was built with declares. Signals from a device
-    /// module the adapter builds itself, as Fastly does with none registered,
-    /// are gated by nothing, so such a module must declare no permission.
+    /// module an adapter builds itself while none is registered are gated by
+    /// nothing, so such a module must declare no permission.
     #[must_use]
     pub fn with_request_state(self, state: &'r EcContext, services: &'r RuntimeServices) -> Self {
         let mut context = self

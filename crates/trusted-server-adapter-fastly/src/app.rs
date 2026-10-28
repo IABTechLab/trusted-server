@@ -309,6 +309,43 @@ pub const FASTLY_SURROGATE_CONTROL_HEADER: &str = "fastly-surrogate-control";
 /// The header core writes a shared cache policy in on this adapter.
 pub(crate) const EDGE_CACHE_HEADER: EdgeCacheHeader = EdgeCacheHeader::SurrogateControl;
 
+/// The header the entry point sets to `1` on a request that arrived over TLS,
+/// after stripping any a client sent. Core reads it for the scheme and never
+/// forwards it to an origin.
+pub(crate) const FASTLY_TLS_HEADER: &str = "fastly-ssl";
+
+/// The header Fastly carries the client's address in, which a client could
+/// also send, so it is stripped at entry.
+pub(crate) const FASTLY_CLIENT_IP_HEADER: &str = "fastly-client-ip";
+
+/// A Fastly debugging header that is never passed on to a third party.
+const FASTLY_DEBUG_POP_HEADER: &str = "x-debug-fastly-pop";
+
+/// The variable Compute sets to `1` for a version on its staging network.
+const FASTLY_IS_STAGING: &str = "FASTLY_IS_STAGING";
+
+/// Whether Compute runs this version on its staging network.
+pub(crate) fn fastly_is_staging() -> bool {
+    std::env::var(FASTLY_IS_STAGING).is_ok_and(|value| value == "1")
+}
+
+/// Tells core which headers Compute sets on requests and reads from
+/// responses, and whether this version runs on its staging network.
+///
+/// [`crate::run`] calls this before serving, ahead of the first settings
+/// validation, which refuses an internal header the platform declared. Every
+/// state build calls it too, so a state built on its own is declared the
+/// same. Declaring twice changes nothing.
+pub(crate) fn declare_platform() {
+    use trusted_server_core::platform as core_platform;
+
+    core_platform::declare_platform_cache_headers(&[FASTLY_SURROGATE_CONTROL_HEADER]);
+    core_platform::declare_platform_staging(fastly_is_staging());
+    core_platform::declare_platform_tls_headers(&[FASTLY_TLS_HEADER]);
+    core_platform::declare_platform_spoofable_headers(&[FASTLY_CLIENT_IP_HEADER]);
+    core_platform::declare_platform_internal_headers(&[FASTLY_DEBUG_POP_HEADER]);
+}
+
 /// Build the application state from explicit settings, composing the modules
 /// this adapter links with the externally supplied builders in
 /// `integrations`.
@@ -329,9 +366,7 @@ pub(crate) fn build_state_with_registrations(
     settings: Settings,
     integrations: &[IntegrationBuilder],
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    trusted_server_core::platform::declare_platform_cache_headers(&[
-        FASTLY_SURROGATE_CONTROL_HEADER,
-    ]);
+    declare_platform();
     warn_if_certificate_check_disabled(&settings);
 
     // The modules this adapter links come first and the deployment's own
@@ -410,7 +445,7 @@ fn fastly_platform_identity() -> PlatformIdentity {
         name: "fastly".to_owned(),
         service_id: read("FASTLY_SERVICE_ID"),
         service_version: read("FASTLY_SERVICE_VERSION"),
-        staging: std::env::var("FASTLY_IS_STAGING").is_ok_and(|value| value == "1"),
+        staging: fastly_is_staging(),
         pop: read("FASTLY_POP"),
     }
 }

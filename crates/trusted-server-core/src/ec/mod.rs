@@ -1365,8 +1365,8 @@ impl EcContext {
     /// from a consent record the way a deployment does through a signal
     /// module. It states the answer instead and tests what finalization does
     /// with it. That a record refusing storage produces this answer is proved
-    /// where the modules are linked, in the Axum adapter's
-    /// `permission_signals` test.
+    /// where the modules are linked, in the `permission_signals` test of an
+    /// adapter that links them.
     #[cfg(test)]
     #[must_use]
     pub fn with_storage_withdrawn_for_test(mut self, withdrawn: bool) -> Self {
@@ -1399,8 +1399,7 @@ fn permissions_for_test(ec_allowed: bool) -> PermissionState {
 ///
 /// Uses [`web_time::SystemTime`], which maps to `std::time::SystemTime` on
 /// native and `wasm32-wasip1` targets and to a JS-backed clock on
-/// `wasm32-unknown-unknown` (Cloudflare Workers), where `std::time` is not
-/// available.
+/// `wasm32-unknown-unknown`, where `std::time` is not available.
 pub(crate) fn current_timestamp() -> u64 {
     checked_current_timestamp().unwrap_or(0)
 }
@@ -1567,8 +1566,8 @@ pub(crate) mod tests {
 
     #[test]
     fn read_from_request_does_not_authorize_recovery_from_navigation_headers() {
-        // Non-Fastly adapters build EC context through the shared read path and
-        // never call `set_recovery_eligible`. Navigation headers alone must not
+        // An adapter that builds EC context through the shared read path never
+        // calls `set_recovery_eligible`. Navigation headers alone must not
         // authorize orphan recovery or seed KV state.
         let settings = create_test_settings();
         let ec_id = valid_ec_id("b", "CkEc01");
@@ -2862,9 +2861,9 @@ pub(crate) mod tests {
     /// A geo module whose lookup fails, the state the permission model's
     /// fail-closed rule exists for.
     ///
-    /// No geo module shipped in this workspace can fail: the Fastly SDK's
-    /// `geo_lookup` returns an `Option`, the Cloudflare module reads request
-    /// headers, and the Axum and Spin modules resolve nothing at all. The
+    /// No geo module shipped in this workspace can fail, because each one
+    /// reads an optional answer from its platform, reads request headers or
+    /// resolves nothing at all. The
     /// `Result` on [`PlatformGeo::lookup`] is there for a module that does
     /// its own fallible lookup, so this stands in for one and proves the floor
     /// is reached through the seam rather than only from a hand-built status.

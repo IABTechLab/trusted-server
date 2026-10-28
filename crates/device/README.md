@@ -6,5 +6,5 @@ HTTP/2 signals. Future vendor modules (for example
 `crates/device/<vendor>`) slot in alongside it.
 
 The built-in default module (User-Agent only) ships in `trusted-server-core`
-(`ec::device`). Adapters select and inject the vendor module via
-`build_device_module`.
+(`ec::device`). An adapter injects its platform's own module through
+`build_device_module`, which builds it when `[device] module = "platform"`.

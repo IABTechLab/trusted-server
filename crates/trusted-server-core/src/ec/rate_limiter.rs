@@ -2,8 +2,7 @@
 //!
 //! Provides the [`RateLimiter`] trait used by batch sync and pull sync for
 //! per-partner request rate enforcement. Platform-specific implementations
-//! live in the adapter crates (e.g. the Fastly Edge Rate Limiting
-//! implementation in `trusted-server-adapter-fastly`).
+//! live in the adapter crates.
 
 use error_stack::Report;
 

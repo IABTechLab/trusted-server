@@ -349,13 +349,13 @@ pub struct StubHttpClient {
     // Test-only wall-clock delays applied before each select result is returned.
     select_delays: Mutex<VecDeque<Duration>>,
     // Reported by supports_concurrent_fanout(); set false to emulate
-    // platforms whose send_async executes eagerly (e.g. Cloudflare Workers).
+    // platforms whose send_async executes eagerly.
     concurrent_fanout: std::sync::atomic::AtomicBool,
     // Reported by has_enforceable_total_request_deadline(); set true to emulate
     // a future adapter with a hard total request deadline.
     enforceable_total_request_deadline: std::sync::atomic::AtomicBool,
-    // Reported by supports_streaming_responses(); set true to emulate Fastly's
-    // streaming response support.
+    // Reported by supports_streaming_responses(); set true to emulate a
+    // platform that streams responses.
     streaming_responses_supported: std::sync::atomic::AtomicBool,
     pending_streaming_responses_supported: std::sync::atomic::AtomicBool,
     image_optimizer_options: Mutex<Vec<Option<PlatformImageOptimizerOptions>>>,
@@ -824,7 +824,7 @@ impl PlatformHttpClient for StubHttpClient {
 
     /// Always marks the first pending request in the input as ready (FIFO order).
     ///
-    /// This differs from Fastly's production `select()`, which returns whichever
+    /// This differs from a platform's production `select()`, which returns whichever
     /// request completes first and makes no ordering guarantees. Tests that rely on
     /// this stub should not depend on "first-pushed = first-ready" semantics, and
     /// should document their ordering assumptions explicitly if order matters.
@@ -864,9 +864,10 @@ impl PlatformHttpClient for StubHttpClient {
 
         let ready_backend_name = stub.backend_name.clone();
 
-        // Strip backend names from remaining to match Fastly production behavior:
-        // Fastly's select() rebuilds remaining with PlatformPendingRequest::new()
-        // (no backend_name) — orchestrators must not rely on names being set.
+        // Strip backend names from remaining to match production behavior, where
+        // a platform's select() may rebuild remaining with
+        // PlatformPendingRequest::new() (no backend_name), so orchestrators must
+        // not rely on names being set.
         let remaining: Vec<PlatformPendingRequest> = pending_requests
             .into_iter()
             .map(|r| match r.downcast::<StubPendingResponse>() {
@@ -1661,7 +1662,7 @@ mod tests {
         assert_eq!(
             result.remaining[0].backend_name(),
             None,
-            "should strip backend name from remaining (matches Fastly production behavior)"
+            "should strip backend name from remaining (matches production select behavior)"
         );
 
         let names = stub.recorded_backend_names();

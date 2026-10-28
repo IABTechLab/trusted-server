@@ -1,8 +1,7 @@
 //! Platform abstraction layer for `trusted-server-core`.
 //!
 //! This module defines platform-neutral service contracts and request-scoped
-//! runtime state. Concrete implementations live in adapter crates such as
-//! `trusted-server-adapter-fastly`.
+//! runtime state. Concrete implementations live in the adapter crates.
 //!
 //! ## Traits
 //!
@@ -23,7 +22,7 @@
 //! The following components were evaluated for platform-specific behavior
 //! (verified 2026-03-31; see `docs/superpowers/plans/2026-03-31-pr8-content-rewriting-verification.md`)
 //! and found to have a platform-agnostic rewriting pipeline. No
-//! platform trait is required; future adapters (Cloudflare Workers, Axum, Spin) need not provide
+//! platform trait is required, and no adapter needs to provide
 //! any content-rewriting implementation:
 //!
 //! - **Content rewriting** — `html_processor`, `streaming_processor`,
@@ -47,7 +46,9 @@ mod image_optimizer;
 mod kv;
 mod loading_cache;
 mod policy_source;
+mod request_headers;
 mod server_key;
+mod staging;
 mod template_assembly;
 mod template_cache;
 #[cfg(any(test, feature = "test-utils"))]
@@ -86,7 +87,13 @@ pub use policy_source::{
     POLICY_KEY_PREFIX, PlatformPolicySource, PolicyEntry, PolicyOrigin, policy_entry_text,
     policy_key,
 };
+pub use request_headers::{
+    declare_platform_internal_headers, declare_platform_spoofable_headers,
+    declare_platform_tls_headers, is_platform_internal_header, platform_spoofable_headers,
+    platform_tls_headers,
+};
 pub use server_key::ServerKeyPrefix;
+pub use staging::{declare_platform_staging, platform_is_staging};
 pub use template_assembly::{
     PlatformTemplateAssembler, TemplateAssemblyError, UnavailableTemplateAssembler,
     contains_publisher_esi_directive,

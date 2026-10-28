@@ -7,8 +7,8 @@ use super::{GeoInfo, PlatformBackendSpec, PlatformError, RuntimeServices, StoreI
 /// Synchronous, object-safe access to a key-value config store.
 ///
 /// Reads use the edge-visible store name. Writes use the platform management
-/// store identifier because Fastly separates the runtime store name from the
-/// management API store ID.
+/// store identifier because a platform may separate the runtime store name
+/// from the management API store ID.
 pub trait PlatformConfigStore: Send + Sync {
     /// Retrieve a string value from `store_name` by `key`.
     ///
@@ -171,8 +171,8 @@ pub trait PlatformGeo: Send + Sync {
     /// ISO 3166-1 alpha-2 code (for example `US`) and the region as the
     /// ISO 3166-2 subdivision code without the country prefix (for example
     /// `CA`). The permission model keys its country and region rules on these
-    /// codes, matched case-insensitively, so the Fastly and other geo
-    /// modules feed the same rules without translation.
+    /// codes, matched case-insensitively, so every platform's geo module
+    /// feeds the same rules without translation.
     ///
     /// # Errors
     ///

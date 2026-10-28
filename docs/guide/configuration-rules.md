@@ -50,7 +50,7 @@ setting = "value"
 | `source`            | one               | `module`, a string | `origin`, an HTTP origin, or a module that supplies a source                                            |
 | `ec`                | one               | `module`, a string | `hmac`, `host_signals`, `client_fixed` (demonstration builds), or an integration that supplies identity |
 | `geo`               | one               | `module`, a string | `platform`, `none`, or an integration that supplies location                                            |
-| `device`            | one               | `module`, a string | `builtin` (the default), `fastly`, or an integration that supplies device signals                       |
+| `device`            | one               | `module`, a string | `builtin` (the default), `platform`, or an integration that supplies device signals                     |
 | `permission-signal` | several, in order | `modules`, a list  | `gpc`, `gpp`, `us-privacy`, `tcf`                                                                       |
 | `demand`            | several           | `modules`, a list  | `auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps`                                      |
 | `ad-server`         | one               | `module`, a string | `iabtl`                                                                                                 |
@@ -300,6 +300,7 @@ endpoint = "https://house.example.com/openrtb2/auction"
 | --------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
 | `[integrations.<id>]` with `enabled = true`                                                   | the module in the section of its type, and `[<type>.<name>]` only for settings                     |
 | `[ec.providers.<name>]`                                                                       | `[ec.<name>]`                                                                                      |
+| `[device] module = "fastly"`                                                                  | `[device] module = "platform"`                                                                     |
 | `[permission_signal] sources`                                                                 | `[permission-signal] modules`                                                                      |
 | `host-signals`, `client-fixed`, `gpp-sale-opt-out`, `gpp_sale_opt_out`, `us_privacy`          | `host_signals`, `client_fixed`, `gpp`, `us-privacy`                                                |
 | `[auction.providers.<id>]` with `protocol`, `profile` and `profile_config`                    | `[demand] modules` and `[demand.<name>]`, with `implementation` and the settings flat in the table |

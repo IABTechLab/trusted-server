@@ -29,7 +29,7 @@ flowchart TB
 ```
 
 Each adapter owns transport routing in its `app.rs`. Core request handling stays
-in `auction::endpoints`, so no demand implementation depends on Fastly types.
+in `auction::endpoints`, so no demand implementation depends on a platform's types.
 
 `handle_auction` performs these steps:
 
@@ -183,11 +183,10 @@ integration registry from the same `Arc<AuctionPlan>`. Tests for one
 implementation should cover its typed settings, exact request output, response
 admission, routing, local failures, and target validation.
 
-Run target-matched aliases rather than bare workspace tests:
+Run core's tests on the host target, and the adapter aliases
+[TESTING.md](../../../../TESTING.md#automated-checks) lists, rather than bare
+workspace tests:
 
 ```bash
-cargo test-fastly
-cargo test-axum
-cargo test-cloudflare
-cargo test-spin
+cargo test -p trusted-server-core --target "$(rustc -vV | sed -n 's/host: //p')"
 ```

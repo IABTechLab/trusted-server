@@ -496,6 +496,7 @@ Every PR must pass:
 9. Native core build-digest test and lint (`cargo test -p trusted-server-core --test template_build_digest` and `cargo clippy -p trusted-server-core --test template_build_digest -- -D warnings`)
 10. Wasm clock lint: `scripts/lint-wasm-clock.sh` (crates built into the Cloudflare Worker must use `web_time`, not the `std::time::{Instant,SystemTime}` `now`/`elapsed` methods, which panic there)
 11. Documentation proposal scripts: `shellcheck scripts/docs-proposal/*.sh && node --test scripts/docs-proposal/hunks.test.mjs && scripts/docs-proposal/test.sh`
+12. Core platform names: `python3 scripts/lint-core-platform-names.py` (no file in `crates/trusted-server-core` names a hosting platform or one of its domains, in code, comments, tests, documents or file names)
 
 ---
 

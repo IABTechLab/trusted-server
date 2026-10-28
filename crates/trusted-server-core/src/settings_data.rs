@@ -1,7 +1,5 @@
 use edgezero_core::env_config::EnvConfig;
 use error_stack::{Report, ResultExt};
-use serde::Deserialize;
-use sha2::{Digest as _, Sha256};
 
 pub use crate::config_payload::DEFAULT_CONFIG_STORE_ID;
 use crate::config_payload::{DEFAULT_SECRET_STORE_ID, settings_from_config_blob_with};
@@ -9,25 +7,6 @@ use crate::error::TrustedServerError;
 use crate::integrations::IntegrationBuilder;
 use crate::platform::{PlatformConfigStore, PlatformSecretStore, PolicyOrigin, StoreName};
 use crate::settings::Settings;
-
-const FASTLY_CHUNK_POINTER_KIND: &str = "fastly_config_chunks";
-const FASTLY_CONFIG_ENTRY_LIMIT: usize = 8_000;
-
-#[derive(Debug, Deserialize)]
-struct FastlyChunkPointer {
-    chunks: Vec<FastlyChunkRef>,
-    edgezero_kind: String,
-    envelope_len: usize,
-    envelope_sha256: String,
-    version: u8,
-}
-
-#[derive(Debug, Deserialize)]
-struct FastlyChunkRef {
-    key: String,
-    len: usize,
-    sha256: String,
-}
 
 /// Resolves the `EdgeZero` app-config store name from runtime configuration.
 #[must_use]
@@ -43,10 +22,10 @@ pub fn config_key(env: &EnvConfig) -> String {
 
 /// Resolves the `EdgeZero` app-config store name from the process environment.
 ///
-/// Native adapters such as Axum use this wrapper. Fastly reads no selector at
-/// runtime: it opens the store under the logical ID that a managed deployment
-/// links to the selected physical store. Without an override, this wrapper
-/// also returns the manifest default logical store ID.
+/// Native adapters use this wrapper. An adapter whose platform
+/// links each store to the deployment under its logical ID opens the store
+/// under that ID and reads no store name at runtime. Without an override,
+/// this wrapper also returns the manifest default logical store ID.
 #[must_use]
 pub fn default_config_store_name() -> StoreName {
     config_store_name(&EnvConfig::from_env())
@@ -54,8 +33,10 @@ pub fn default_config_store_name() -> StoreName {
 
 /// Resolves the app-config blob key from the process environment.
 ///
-/// Native adapters such as Axum use this wrapper and honour a `__KEY`
-/// override.
+/// Native adapters use this wrapper and honour a `__KEY`
+/// override, which must match `ts config push --key`, because an ordinary
+/// push without that flag writes at the logical store ID. An adapter that
+/// chooses its key for each request resolves the key itself.
 #[must_use]
 pub fn default_config_key() -> String {
     config_key(&EnvConfig::from_env())
@@ -105,6 +86,10 @@ pub fn get_settings_from_config_store(
 /// against the built-in integrations followed by `extra_integrations`, with
 /// the permission policy they name read from `policy_origin`.
 ///
+/// The entry is read as the platform's config store returns it, whole. A
+/// platform that stores a long document in parts reassembles it in its own
+/// config store read.
+///
 /// # Errors
 ///
 /// Returns [`TrustedServerError::Configuration`] when the config blob is
@@ -120,8 +105,7 @@ pub fn get_settings_from_config_store_with(
     policy_origin: PolicyOrigin<'_>,
     extra_integrations: &[IntegrationBuilder],
 ) -> Result<Settings, Report<TrustedServerError>> {
-    let raw_value = read_config_entry(config_store, store_name, key)?;
-    let envelope_json = resolve_fastly_chunk_pointer(config_store, store_name, &raw_value)?;
+    let envelope_json = read_config_entry(config_store, store_name, key)?;
     settings_from_config_blob_with(
         &envelope_json,
         secret_store,
@@ -144,117 +128,6 @@ fn read_config_entry(
         .change_context(TrustedServerError::Configuration { message })
 }
 
-/// The value a Fastly config store entry holds, put back together from its
-/// chunks when the entry is a pointer to them, as a long value is written,
-/// and the value itself otherwise.
-///
-/// # Errors
-///
-/// [`TrustedServerError::Configuration`] when a pointer is malformed, or a
-/// chunk cannot be read or has the wrong length or SHA-256.
-pub fn resolve_fastly_chunk_pointer(
-    config_store: &dyn PlatformConfigStore,
-    store_name: &StoreName,
-    value: &str,
-) -> Result<String, Report<TrustedServerError>> {
-    let Ok(pointer) = serde_json::from_str::<FastlyChunkPointer>(value) else {
-        return Ok(value.to_string());
-    };
-    if pointer.edgezero_kind != FASTLY_CHUNK_POINTER_KIND {
-        return Ok(value.to_string());
-    }
-    if pointer.version != 1 {
-        return configuration_error(format!(
-            "unsupported Fastly config chunk pointer version {}; expected 1",
-            pointer.version
-        ));
-    }
-    if value.len() > FASTLY_CONFIG_ENTRY_LIMIT {
-        return configuration_error(format!(
-            "Fastly config chunk pointer is {} bytes, exceeding the {} byte entry limit",
-            value.len(),
-            FASTLY_CONFIG_ENTRY_LIMIT
-        ));
-    }
-
-    let mut declared_envelope_len = 0usize;
-    for chunk in &pointer.chunks {
-        if chunk.len > FASTLY_CONFIG_ENTRY_LIMIT {
-            return configuration_error(format!(
-                "Fastly config chunk `{}` declares {} bytes, exceeding the {} byte entry limit",
-                chunk.key, chunk.len, FASTLY_CONFIG_ENTRY_LIMIT
-            ));
-        }
-        declared_envelope_len = match declared_envelope_len.checked_add(chunk.len) {
-            Some(total) => total,
-            None => {
-                return configuration_error(
-                    "Fastly config chunk lengths overflowed usize".to_string(),
-                );
-            }
-        };
-    }
-    if declared_envelope_len != pointer.envelope_len {
-        return configuration_error(format!(
-            "Fastly config chunk lengths total mismatch: expected envelope length {}, got {}",
-            pointer.envelope_len, declared_envelope_len
-        ));
-    }
-
-    let mut envelope_json = String::with_capacity(pointer.envelope_len);
-    let mut actual_envelope_len = 0usize;
-    for chunk in pointer.chunks {
-        let chunk_value = read_config_entry(config_store, store_name, &chunk.key)?;
-        let chunk_len = chunk_value.len();
-        if chunk_len != chunk.len {
-            return configuration_error(format!(
-                "Fastly config chunk `{}` length mismatch: expected {}, got {}",
-                chunk.key, chunk.len, chunk_len
-            ));
-        }
-        actual_envelope_len = actual_envelope_len.saturating_add(chunk_len);
-        if actual_envelope_len > pointer.envelope_len {
-            return configuration_error(format!(
-                "Fastly config envelope exceeded declared length {} while reading chunk `{}`",
-                pointer.envelope_len, chunk.key
-            ));
-        }
-        let chunk_sha = sha256_hex(chunk_value.as_bytes());
-        if chunk_sha != chunk.sha256 {
-            return configuration_error(format!(
-                "Fastly config chunk `{}` sha mismatch: expected {}, got {}",
-                chunk.key, chunk.sha256, chunk_sha
-            ));
-        }
-        envelope_json.push_str(&chunk_value);
-    }
-
-    if envelope_json.len() != pointer.envelope_len {
-        return configuration_error(format!(
-            "Fastly config envelope length mismatch: expected {}, got {}",
-            pointer.envelope_len,
-            envelope_json.len()
-        ));
-    }
-    let envelope_sha = sha256_hex(envelope_json.as_bytes());
-    if envelope_sha != pointer.envelope_sha256 {
-        return configuration_error(format!(
-            "Fastly config envelope sha mismatch: expected {}, got {}",
-            pointer.envelope_sha256, envelope_sha
-        ));
-    }
-
-    Ok(envelope_json)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
-
-fn configuration_error<T>(message: String) -> Result<T, Report<TrustedServerError>> {
-    Err(Report::new(TrustedServerError::Configuration { message }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,7 +136,6 @@ mod tests {
     use crate::settings::Settings;
     use crate::test_support::tests::{crate_test_settings_str, sample_permissions};
     use edgezero_core::blob_envelope::BlobEnvelope;
-    use serde_json::json;
     use std::collections::BTreeMap;
 
     struct MemoryConfigStore {
@@ -434,93 +306,6 @@ mod tests {
         assert_eq!(
             loaded.publisher.domain, settings.publisher.domain,
             "should load publisher domain"
-        );
-    }
-
-    #[test]
-    fn loads_settings_from_fastly_chunk_pointer() {
-        let mut settings =
-            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
-        settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
-        let envelope_json = envelope_json(&settings);
-        // Chunks as long as an entry may be, cut where a character ends, so a
-        // blob carrying the sample policy takes several.
-        let mut chunks: Vec<(String, String)> = Vec::new();
-        let mut rest = envelope_json.as_str();
-        while !rest.is_empty() {
-            let mut end = rest.len().min(FASTLY_CONFIG_ENTRY_LIMIT);
-            while !rest.is_char_boundary(end) {
-                end -= 1;
-            }
-            let (chunk, remainder) = rest.split_at(end);
-            let key = format!("{CONFIG_BLOB_KEY}.__edgezero_chunks.test.{}", chunks.len());
-            chunks.push((key, chunk.to_owned()));
-            rest = remainder;
-        }
-        assert!(chunks.len() > 2, "the blob should need several chunks");
-        let pointer = json!({
-            "edgezero_kind": FASTLY_CHUNK_POINTER_KIND,
-            "version": 1,
-            "envelope_sha256": sha256_hex(envelope_json.as_bytes()),
-            "envelope_len": envelope_json.len(),
-            "chunks": chunks
-                .iter()
-                .map(|(key, chunk)| json!({
-                    "key": key,
-                    "sha256": sha256_hex(chunk.as_bytes()),
-                    "len": chunk.len()
-                }))
-                .collect::<Vec<_>>()
-        })
-        .to_string();
-        let mut entries = BTreeMap::from([(CONFIG_BLOB_KEY.to_string(), pointer)]);
-        entries.extend(chunks);
-        let store = MemoryConfigStore { entries };
-
-        let loaded = load_settings(
-            &store,
-            &StoreName::from(DEFAULT_CONFIG_STORE_ID),
-            CONFIG_BLOB_KEY,
-        )
-        .expect("should load settings");
-
-        assert_eq!(
-            loaded.publisher.domain, settings.publisher.domain,
-            "should reconstruct chunked envelope"
-        );
-    }
-
-    #[test]
-    fn rejects_chunk_pointer_when_declared_lengths_do_not_match_envelope_len() {
-        let chunk_key = format!("{CONFIG_BLOB_KEY}.__edgezero_chunks.test.0");
-        let pointer = json!({
-            "edgezero_kind": FASTLY_CHUNK_POINTER_KIND,
-            "version": 1,
-            "envelope_sha256": sha256_hex(b"ab"),
-            "envelope_len": 1,
-            "chunks": [
-                {
-                    "key": chunk_key,
-                    "sha256": sha256_hex(b"ab"),
-                    "len": 2
-                }
-            ]
-        })
-        .to_string();
-        let store = MemoryConfigStore {
-            entries: BTreeMap::from([(CONFIG_BLOB_KEY.to_string(), pointer)]),
-        };
-
-        let err = load_settings(
-            &store,
-            &StoreName::from(DEFAULT_CONFIG_STORE_ID),
-            CONFIG_BLOB_KEY,
-        )
-        .expect_err("should reject malformed chunk length metadata");
-
-        assert!(
-            err.to_string().contains("chunk lengths total mismatch"),
-            "error should explain chunk length mismatch: {err:?}"
         );
     }
 

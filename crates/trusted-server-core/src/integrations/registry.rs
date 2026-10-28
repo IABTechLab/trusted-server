@@ -1117,11 +1117,12 @@ const GEO_MODULE_PLATFORM: &str = "platform";
 /// The same choice as leaving the selector unset, spelled explicitly.
 const DEVICE_MODULE_BUILTIN: &str = "builtin";
 
-/// `[device] module` value opting in to the host module the adapter builds.
+/// `[device] module` value opting in to the host platform's own module, which
+/// the adapter builds.
 ///
 /// Resolved by `build_device_module` in [`device`](crate::ec::device) rather
 /// than by a module, so the registry supplies nothing for it.
-const DEVICE_MODULE_FASTLY: &str = "fastly";
+const DEVICE_MODULE_PLATFORM: &str = "platform";
 
 /// The type folder each of these kinds of module is selected in, which a name
 /// written in its section may leave off.
@@ -1347,9 +1348,9 @@ fn resolve_device_module(
     let selector = settings.device.module.as_deref();
     let resolved = match selector {
         // Unset and `builtin` both name the module core supplies itself, and
-        // `fastly` names the host module the adapter builds, so the registry
-        // supplies nothing for any of the three.
-        None | Some(DEVICE_MODULE_BUILTIN) | Some(DEVICE_MODULE_FASTLY) => None,
+        // `platform` names the host platform's own module the adapter builds,
+        // so the registry supplies nothing for any of the three.
+        None | Some(DEVICE_MODULE_BUILTIN) | Some(DEVICE_MODULE_PLATFORM) => None,
         Some(written) => Some(named_module(
             DEVICE_TYPE,
             "device",
@@ -2469,13 +2470,11 @@ impl IntegrationRegistry {
                 // The served `?v=` hash and its memo trust this value, so a
                 // stale literal is a startup error rather than a stale
                 // script. The cost is one SHA-256 of each carried module
-                // per registry build, and only the Axum dev server builds
-                // the registry once, because its `main` builds the router
-                // before serving. Fastly starts a fresh Wasm instance per
-                // request, and `edgezero_adapter_cloudflare::run_app` and
-                // `edgezero_adapter_spin::run_app` both call `build_app`
-                // inside the per-request entry point, so those three pay
-                // it on every request.
+                // per registry build. A native server builds the registry
+                // once, because its `main` builds the router before
+                // serving, while an adapter that starts a fresh instance
+                // per request, or builds the app inside its per-request
+                // entry point, pays it on every request.
                 let actual = hex::encode(Sha256::digest(module.source.as_bytes()));
                 if actual != module.sha256 {
                     return Err(Report::new(TrustedServerError::Configuration {
@@ -4861,7 +4860,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_proxy_passes_http_request_without_fastly_round_trip() {
+    fn handle_proxy_passes_http_request_without_a_platform_round_trip() {
         let settings = create_test_settings();
         let registry = IntegrationRegistry::from_routes(vec![(
             http::Method::GET,

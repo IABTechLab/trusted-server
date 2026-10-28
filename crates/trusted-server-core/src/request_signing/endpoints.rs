@@ -189,13 +189,13 @@ fn validate_kid_format(kid: &str) -> Result<(), Report<TrustedServerError>> {
 /// common denominator. Concretely the kid must start with a lowercase ASCII
 /// letter, on top of the structural [`validate_kid_format`] charset checks.
 ///
-/// That floor is currently set by the Fermyon Spin variable encoder
-/// (`spin_variable_name` in the Spin adapter's `platform.rs`), which requires a
-/// lowercase ASCII leading character: it would otherwise alias digit-leading keys
-/// (`1foo` and `n1foo` both map to `v_n1foo`) or reject uppercase/punctuation
-/// leading keys (`KidA`, `_kid`, `-kid`, `.kid`, `:kid`) at storage time.
-/// Checking the floor here refuses such a kid for every platform rather than
-/// leaving it to fail at storage time on Spin. [`kid_is_creatable`] exposes
+/// That floor is set by the strictest variable-name encoder among the
+/// adapters, which requires a lowercase ASCII leading character: it would
+/// otherwise alias digit-leading keys (`1foo` and `n1foo` both map to
+/// `v_n1foo`) or reject uppercase/punctuation leading keys (`KidA`, `_kid`,
+/// `-kid`, `.kid`, `:kid`) at storage time. Checking the floor here refuses
+/// such a kid for every platform rather than leaving it to fail at storage
+/// time on one. [`kid_is_creatable`] exposes
 /// this predicate so adapter crates can pin the contract with a test, because
 /// core must never accept a kid its encoder rejects. System-generated KIDs
 /// (`ts-YYYY-MM-DD`) start with `t` and are unaffected.
@@ -534,9 +534,10 @@ mod tests {
 
     #[test]
     fn validate_kid_rejects_non_lowercase_leading_ids() {
-        // The Spin variable encoder requires a lowercase ASCII leading character,
-        // so uppercase- and punctuation-leading KIDs that pass validate_kid_format
-        // must be rejected for a new key, which Spin could not store.
+        // The strictest adapter's variable encoder requires a lowercase ASCII
+        // leading character, so uppercase- and punctuation-leading KIDs that
+        // pass validate_kid_format must be rejected for a new key, which that
+        // adapter could not store.
         for kid in &["KidA", "_kid", "-kid", ".kid", ":kid"] {
             assert!(
                 validate_kid(kid).is_err(),

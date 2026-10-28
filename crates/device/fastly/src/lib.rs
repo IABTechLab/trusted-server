@@ -2,7 +2,7 @@
 //!
 //! [`FastlyDeviceModule`] strengthens the built-in User-Agent classification
 //! with the host's TLS (JA4) and HTTP/2 signals, for deployments on Fastly
-//! Compute. It is selected by `[device] module = "fastly"` and wired in by the
+//! Compute. It is selected by `[device] module = "platform"` and wired in by the
 //! Fastly adapter, which injects the captured host signals and hands the module
 //! the request's module context.
 //!
@@ -66,7 +66,7 @@ impl HostSignals for FastlyHostSignals {
     }
 }
 
-/// The Fastly device module, opt-in via `[device] module = "fastly"`.
+/// The Fastly device module, opt-in via `[device] module = "platform"`.
 ///
 /// Classifies a request with [`DeviceSignals::derive`], which strengthens the
 /// User-Agent classification with the host signals. It reads the User-Agent

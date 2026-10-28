@@ -29,8 +29,7 @@ use crate::creative_opportunities::AssemblyMode;
 /// The build digest in the template fingerprint already isolates every core change,
 /// including the metadata encoding, the seam marker, and Rust-inlined head programs,
 /// so those need no bump. Bump this only when code outside that digest changes
-/// template compatibility, such as entry storage in
-/// `trusted-server-adapter-fastly/src/template_cache.rs` or the Rust side of
+/// template compatibility, such as an adapter's entry storage or the Rust side of
 /// `trusted-server-js`, unless another fingerprint input already isolates the change.
 ///
 /// | Version | Transform |
@@ -772,9 +771,10 @@ impl fmt::Debug for dyn PlatformTemplateCache {
 
 /// A platform's shared-template cache.
 ///
-/// Only the Fastly adapter implements this; every other adapter uses
-/// [`UnavailableTemplateCache`], which reports [`TemplateCacheMiss::Unsupported`] so
-/// the caller transforms every time rather than failing.
+/// An adapter whose platform has a shared cache implements this, and every other
+/// adapter uses [`UnavailableTemplateCache`], which reports
+/// [`TemplateCacheMiss::Unsupported`] so the caller transforms every time rather
+/// than failing.
 ///
 /// `Send + Sync` on the trait, `?Send` on the futures: `RuntimeServices` is held in a
 /// `LazyLock` static, so the trait object must cross threads even though the futures
@@ -833,8 +833,9 @@ pub struct TemplateEntry {
 /// The null object, used by every adapter without a template cache.
 ///
 /// Reporting [`TemplateCacheMiss::Unsupported`] rather than erroring means the
-/// ESI assembly mode degrades to transforming per request on Cloudflare, Axum and Spin
-/// instead of failing — the mode stays portable, only the caching is not.
+/// ESI assembly mode degrades to transforming per request on an adapter without a
+/// template cache instead of failing, so the mode stays portable and only the
+/// caching is not.
 pub struct UnavailableTemplateCache;
 
 #[async_trait::async_trait(?Send)]
@@ -1558,7 +1559,7 @@ mod tests {
     #[tokio::test]
     async fn the_null_object_reports_unsupported_rather_than_failing() {
         // Degrading to per-request transformation keeps the shared modes portable on
-        // adapters with no cache; erroring would make them Fastly-only outright.
+        // adapters with no cache, where erroring would make them unusable.
         let cache = UnavailableTemplateCache;
         assert_eq!(
             cache.get(&key()).await.err(),

@@ -836,7 +836,24 @@ mod tests {
 
     use super::*;
 
-    static FASTLY_IS_STAGING_ENV_LOCK: Mutex<()> = Mutex::new(());
+    static PLATFORM_STAGING_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Runs `run` with the platform declared as staging or not, putting the
+    /// declaration back afterwards, even when `run` panics.
+    fn with_platform_staging<T>(staging: bool, run: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                trusted_server_core::platform::declare_platform_staging(self.0);
+            }
+        }
+        let _guard = PLATFORM_STAGING_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = Restore(trusted_server_core::platform::platform_is_staging());
+        trusted_server_core::platform::declare_platform_staging(staging);
+        run()
+    }
 
     fn protection_config() -> DataDomeConfig {
         DataDomeConfig {
@@ -864,25 +881,16 @@ mod tests {
         services: &RuntimeServices,
         request: &mut Request<EdgeBody>,
     ) -> RequestFilterDecision {
-        let _guard = FASTLY_IS_STAGING_ENV_LOCK
-            .lock()
-            .expect("should lock staging environment test guard");
-        temp_env::with_var(
-            trusted_server_core::constants::ENV_FASTLY_IS_STAGING,
-            Some("1"),
-            || {
-                futures::executor::block_on(integration.filter_protection_request(
-                    RequestFilterInput {
-                        settings,
-                        services,
-                        request,
-                        geo_info: None,
-                        permissions: None,
-                        is_integration_route: false,
-                    },
-                ))
-            },
-        )
+        with_platform_staging(true, || {
+            futures::executor::block_on(integration.filter_protection_request(RequestFilterInput {
+                settings,
+                services,
+                request,
+                geo_info: None,
+                permissions: None,
+                is_integration_route: false,
+            }))
+        })
     }
 
     fn filter_marks_request(
@@ -1137,25 +1145,16 @@ mod tests {
             edgezero_core::http::HeaderValue::from_static("temporary-test-credential-32-bytes!"),
         );
 
-        let _guard = FASTLY_IS_STAGING_ENV_LOCK
-            .lock()
-            .expect("should lock staging environment test guard");
-        let decision = temp_env::with_var(
-            trusted_server_core::constants::ENV_FASTLY_IS_STAGING,
-            None::<&str>,
-            || {
-                futures::executor::block_on(integration.filter_protection_request(
-                    RequestFilterInput {
-                        settings: &settings,
-                        services: &services,
-                        request: &mut request,
-                        geo_info: None,
-                        permissions: None,
-                        is_integration_route: false,
-                    },
-                ))
-            },
-        );
+        let decision = with_platform_staging(false, || {
+            futures::executor::block_on(integration.filter_protection_request(RequestFilterInput {
+                settings: &settings,
+                services: &services,
+                request: &mut request,
+                geo_info: None,
+                permissions: None,
+                is_integration_route: false,
+            }))
+        });
 
         assert!(
             matches!(decision, RequestFilterDecision::Continue(_)),

@@ -9,10 +9,10 @@
 //! service, is built only on a host that supplies that service. Construction
 //! reads configuration and long-lived services, so a selection this deployment
 //! cannot satisfy fails at startup rather than leaving it running without an
-//! identity. Fastly, Cloudflare and Spin resolve the module once per
-//! application state and thread the result. Axum and embedders resolve per
-//! request. The host-signal module is the exception, being built per request
-//! from that request's TLS and HTTP/2 signals (see
+//! identity. An adapter resolves the module once per application state and
+//! threads the result, or leaves the request path to resolve it per request,
+//! as an embedder does. The host-signal module is the exception, being built
+//! per request from that request's TLS and HTTP/2 signals (see
 //! [`is_request_scoped`](EdgeCookieModule::is_request_scoped)).
 //!
 //! Request evidence reaches a module at call time rather than at

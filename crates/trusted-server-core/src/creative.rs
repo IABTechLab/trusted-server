@@ -785,7 +785,7 @@ pub fn rewrite_css_body(settings: &Settings, css: &str) -> Result<String, CssRew
 /// Maximum byte length of creative HTML accepted by [`sanitize_creative_html`].
 ///
 /// Inputs larger than this are rejected (empty string returned) to prevent unbounded
-/// allocations on the hot path. Fastly Compute enforces upstream request-body limits,
+/// allocations on the hot path. A platform may enforce upstream request-body limits,
 /// but this guard protects internal callers too.
 const MAX_CREATIVE_SIZE: usize = 1024 * 1024; // 1 MiB
 
@@ -1655,7 +1655,7 @@ mod tests {
 
     #[test]
     fn inline_rewrite_uses_http_localhost_origin_with_port() {
-        // Axum/Viceroy dev runs over HTTP on a port. The inline URLs must carry
+        // Local development runs over HTTP on a port. The inline URLs must carry
         // the actual request origin (scheme + host + port), not a hardcoded
         // https://<publisher.domain> that development traffic never reaches.
         let settings = crate::test_support::tests::create_test_settings();
@@ -3474,31 +3474,31 @@ b{background:url(\"https://cdn.example/c.png\")}";
     #[test]
     fn to_abs_respects_wildcard_domains() {
         let mut settings = crate::test_support::tests::create_test_settings();
-        settings.rewrite.exclude_domains = vec!["*.cloudflare.com".to_owned()];
+        settings.rewrite.exclude_domains = vec!["*.cdn.example.com".to_owned()];
 
         // Should exclude base domain
-        assert_eq!(to_abs(&settings, "https://cloudflare.com/cdn.js"), None);
+        assert_eq!(to_abs(&settings, "https://cdn.example.com/cdn.js"), None);
 
         // Should exclude subdomain
         assert_eq!(
-            to_abs(&settings, "https://cdnjs.cloudflare.com/lib.js"),
+            to_abs(&settings, "https://assets.cdn.example.com/lib.js"),
             None
         );
         assert_eq!(
-            to_abs(&settings, "//cloudflare.com/cdn.js"),
+            to_abs(&settings, "//cdn.example.com/cdn.js"),
             None,
             "should exclude a protocol-relative wildcard base domain"
         );
         assert_eq!(
-            to_abs(&settings, "//cdnjs.cloudflare.com/lib.js"),
+            to_abs(&settings, "//assets.cdn.example.com/lib.js"),
             None,
             "should exclude a protocol-relative wildcard subdomain"
         );
 
         // Should not exclude different domain
         assert_eq!(
-            to_abs(&settings, "https://notcloudflare.com/lib.js"),
-            Some("https://notcloudflare.com/lib.js".to_owned())
+            to_abs(&settings, "https://notcdn.example.com/lib.js"),
+            Some("https://notcdn.example.com/lib.js".to_owned())
         );
     }
 

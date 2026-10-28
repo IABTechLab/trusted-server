@@ -8,14 +8,14 @@ use std::time::Duration;
 use subtle::ConstantTimeEq as _;
 
 use crate::cache_policy::{CachePolicy, EdgeCacheHeader};
-use crate::constants::INTERNAL_HEADERS;
+use crate::constants::is_internal_header;
 use crate::error::TrustedServerError;
 use crate::platform::ClientInfo;
 use crate::settings::{Settings, TrustedClientIpConfig};
 
 /// Copy `X-*` custom headers from one request to another, skipping TS-internal headers.
 ///
-/// This filters out all headers listed in [`INTERNAL_HEADERS`] **and** any header
+/// This filters out every header [`is_internal_header`] names **and** any header
 /// matching the `x-ts-` prefix (case-insensitive) to prevent leaking internal
 /// identity, geo-enrichment, debugging data, and dynamic `X-ts-<source_domain>`
 /// headers to downstream third-party services. Integrations that forward custom
@@ -27,33 +27,28 @@ pub fn copy_custom_headers(from: &Request<EdgeBody>, to: &mut Request<EdgeBody>)
         // so only the lowercase prefix check is needed.
         if name_str.starts_with("x-")
             && !name_str.starts_with("x-ts-")
-            && !INTERNAL_HEADERS.contains(&name_str)
+            && !is_internal_header(name_str)
         {
             to.headers_mut().append(header_name.clone(), value.clone());
         }
     }
 }
 
-/// Headers that clients can spoof to hijack URL rewriting or the client address.
+/// The standard headers that clients can spoof to hijack URL rewriting.
 ///
-/// On Fastly Compute these values are client-spoofable at request entry. The
-/// Fastly adapter may first consume an authenticated `fastly-client-ip`, but
-/// removes it before routing along with every other listed header. Stripping
-/// them forces [`RequestInfo::from_request`] to fall back to the trustworthy
-/// `Host` header and [`ClientInfo`] TLS detection.
-pub const SPOOFABLE_FORWARDED_HEADERS: &[&str] = &[
-    "forwarded",
-    "x-forwarded-host",
-    "x-forwarded-proto",
-    "fastly-ssl",
-    "fastly-client-ip",
-];
+/// Stripping them at entry forces [`RequestInfo::from_request`] to fall back
+/// to the trustworthy `Host` header and [`ClientInfo`] TLS detection. A
+/// platform's own spoofable headers are declared by its adapter, see
+/// [`crate::platform::declare_platform_spoofable_headers`].
+pub const SPOOFABLE_FORWARDED_HEADERS: &[&str] =
+    &["forwarded", "x-forwarded-host", "x-forwarded-proto"];
 
 /// Remove the configured client-IP trust headers before routing.
 ///
-/// Only the Fastly adapter consumes these values, but every adapter removes
-/// them so a shared configuration cannot expose an authentication secret to
-/// publisher or integration request handling.
+/// Only an adapter that resolves the trusted client address consumes these
+/// values, but every adapter removes them so a shared configuration cannot
+/// expose an authentication secret to publisher or integration request
+/// handling.
 pub fn sanitize_trusted_client_ip_headers(
     req: &mut Request<EdgeBody>,
     config: Option<&TrustedClientIpConfig>,
@@ -69,11 +64,17 @@ pub fn sanitize_trusted_client_ip_headers(
 /// Call this at the edge entry point (before routing) to prevent
 /// `X-Forwarded-Host: evil.com` from hijacking all URL rewriting.
 /// See <https://github.com/IABTechLab/trusted-server/issues/409>.
+///
+/// Strips the standard [`SPOOFABLE_FORWARDED_HEADERS`] and every TLS and
+/// spoofable header the running platform declared.
 pub fn sanitize_forwarded_headers(req: &mut Request<EdgeBody>) {
-    for header in SPOOFABLE_FORWARDED_HEADERS {
-        if req.headers().contains_key(*header) {
+    let declared = crate::platform::platform_tls_headers()
+        .into_iter()
+        .chain(crate::platform::platform_spoofable_headers());
+    for header in SPOOFABLE_FORWARDED_HEADERS.iter().copied().chain(declared) {
+        if req.headers().contains_key(header) {
             log::debug!("Stripped spoofable header: {header}");
-            req.headers_mut().remove(*header);
+            req.headers_mut().remove(header);
         }
     }
 }
@@ -121,20 +122,21 @@ pub fn is_navigation_request(req: &Request<EdgeBody>) -> bool {
 ///
 /// This struct captures the effective host and scheme from an incoming request.
 /// The parser checks forwarded headers (`Forwarded`, `X-Forwarded-Host`,
-/// `X-Forwarded-Proto`) as fallbacks, but on the Fastly edge
+/// `X-Forwarded-Proto`) as fallbacks, but at the edge
 /// [`sanitize_forwarded_headers`] strips those headers before this method is
-/// called, so the `Host` header and Fastly SDK TLS detection are the effective
-/// sources in production.
+/// called, so the `Host` header and the TLS status the adapter reports are the
+/// effective sources in production.
 #[derive(Debug, Clone)]
 pub struct RequestInfo {
     /// The effective host for URL rewriting (typically the `Host` header after edge sanitization).
     pub host: String,
-    /// The effective scheme (typically from Fastly SDK TLS detection after edge sanitization).
+    /// The effective scheme (typically from the TLS status the adapter reports, after edge
+    /// sanitization).
     pub scheme: String,
 }
 
 impl RequestInfo {
-    /// Extract request info from a Fastly request.
+    /// Extract request info from a request.
     ///
     /// Host fallback order (first present wins):
     /// 1. `Forwarded` header (`host=...`)
@@ -144,10 +146,10 @@ impl RequestInfo {
     ///    in place of a `Host` header
     ///
     /// Scheme fallback order:
-    /// 1. Fastly SDK TLS detection
+    /// 1. The TLS status the adapter reports in [`ClientInfo`]
     /// 2. `Forwarded` header (`proto=...`)
     /// 3. `X-Forwarded-Proto`
-    /// 4. `Fastly-SSL`
+    /// 4. A TLS header the platform declares
     /// 5. Default `http`
     ///
     /// In production the forwarded headers are stripped by
@@ -270,13 +272,15 @@ fn normalize_scheme(value: &str) -> Option<&'static str> {
     }
 }
 
-/// Detects the request scheme (HTTP or HTTPS) using Fastly SDK methods and headers.
+/// Detects the request scheme (HTTP or HTTPS) from the adapter's TLS status
+/// and headers.
 ///
 /// Tries multiple methods in order of reliability:
-/// 1. Fastly SDK TLS detection methods (most reliable)
+/// 1. The TLS status the adapter reports in [`ClientInfo`] (most reliable)
 /// 2. Forwarded header (RFC 7239)
 /// 3. X-Forwarded-Proto header
-/// 4. Fastly-SSL header (trusted on `EdgeZero` path; can be spoofed on legacy path)
+/// 4. A TLS header the platform declares, which its entry point sets after
+///    stripping any a client sent
 /// 5. Default to HTTP
 fn detect_request_scheme(
     req: &Request<EdgeBody>,
@@ -313,22 +317,16 @@ fn detect_request_scheme(
         return scheme;
     }
 
-    // 4. Check Fastly-SSL header. On the `EdgeZero` path this is injected from
-    //    authoritative Fastly TLS metadata after spoofable headers are stripped,
-    //    so it is reliable. On direct or legacy paths it can be spoofed by clients.
-    //
-    //    Layering wart: this is a vendor-specific header name living in
-    //    platform-neutral core. It is only a fallback — signal #1 above
-    //    (`ClientInfo::tls_protocol`) is the neutral path adapters populate. The
-    //    `fastly-ssl` fallback (plus its entry in `SPOOFABLE_FORWARDED_HEADERS`
-    //    and the origin-forwarding strip in `publisher::rewrite_origin_request`)
-    //    should be replaced by a platform-neutral scheme signal in a separate
-    //    change, after confirming the legacy path is covered by `ClientInfo`.
-    if let Some(ssl) = req.headers().get("fastly-ssl")
-        && let Ok(ssl_str) = ssl.to_str()
-        && (ssl_str == "1" || ssl_str.to_lowercase() == "true")
-    {
-        return "https";
+    // 4. Check the TLS headers the platform declared. Its entry point sets one
+    //    from the platform's own TLS metadata after stripping any a client
+    //    sent, so it is reliable there.
+    for name in crate::platform::platform_tls_headers() {
+        if let Some(ssl) = req.headers().get(name)
+            && let Ok(ssl_str) = ssl.to_str()
+            && (ssl_str == "1" || ssl_str.to_lowercase() == "true")
+        {
+            return "https";
+        }
     }
 
     // Default to HTTP
@@ -783,15 +781,25 @@ mod tests {
     }
 
     #[test]
-    fn test_request_info_scheme_from_fastly_ssl() {
+    fn test_request_info_scheme_from_a_declared_tls_header() {
+        crate::platform::declare_platform_tls_headers(&["example-platform-tls"]);
         let mut req = build_request(Method::GET, "https://test.example.com/page");
-        set_header(&mut req, "fastly-ssl", "1");
+        set_header(&mut req, "example-platform-tls", "1");
 
         let info = RequestInfo::from_request(&req, &default_client_info());
         assert_eq!(
             info.scheme, "https",
-            "Scheme should fall back to Fastly-SSL when other signals are missing"
+            "Scheme should fall back to the platform's TLS header when other signals are missing"
         );
+    }
+
+    #[test]
+    fn an_undeclared_tls_header_says_nothing_about_the_scheme() {
+        let mut req = build_request(Method::GET, "https://test.example.com/page");
+        set_header(&mut req, "example-undeclared-tls", "1");
+
+        let info = RequestInfo::from_request(&req, &default_client_info());
+        assert_eq!(info.scheme, "http");
     }
 
     #[test]
@@ -858,7 +866,10 @@ mod tests {
         set_header(&mut req, "forwarded", "host=evil.com;proto=https");
         set_header(&mut req, "x-forwarded-host", "evil.com");
         set_header(&mut req, "x-forwarded-proto", "https");
-        set_header(&mut req, "fastly-ssl", "1");
+        crate::platform::declare_platform_tls_headers(&["example-platform-tls"]);
+        crate::platform::declare_platform_spoofable_headers(&["example-platform-client-ip"]);
+        set_header(&mut req, "example-platform-tls", "1");
+        set_header(&mut req, "example-platform-client-ip", "203.0.113.9");
 
         sanitize_forwarded_headers(&mut req);
 
@@ -875,8 +886,12 @@ mod tests {
             "should strip X-Forwarded-Proto header"
         );
         assert!(
-            req.headers().get("fastly-ssl").is_none(),
-            "should strip Fastly-SSL header"
+            req.headers().get("example-platform-tls").is_none(),
+            "should strip the platform's TLS header"
+        );
+        assert!(
+            req.headers().get("example-platform-client-ip").is_none(),
+            "should strip the platform's spoofable header"
         );
         assert_eq!(
             req.headers()

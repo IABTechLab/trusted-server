@@ -9,11 +9,11 @@ use super::image_optimizer::PlatformImageOptimizerOptions;
 
 /// What the caller wants the platform's intermediary cache to do with this request.
 ///
-/// One enum rather than independent flags because on Fastly they are *not* independent:
-/// `set_surrogate_key` and `set_ttl` each "override any previous `Request::set_pass` call"
-/// (`fastly-0.12.1/src/http/request.rs:2462`, `:2381`). A pair of booleans could express
-/// "bypass the cache, and tag it for purge", which on Fastly silently means "do not
-/// bypass" — the opposite of how it reads. This type makes that combination unspellable.
+/// One enum rather than independent flags because on some platforms they are *not*
+/// independent: tagging a request for purge, or giving it a TTL, overrides an earlier
+/// cache bypass. A pair of booleans could express "bypass the cache, and tag it for
+/// purge", which there silently means "do not bypass", the opposite of how it reads.
+/// This type makes that combination unspellable.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum PlatformCacheIntent {
     /// Let the platform apply its default behavior, honoring origin freshness.
@@ -38,7 +38,7 @@ impl PlatformCacheIntent {
     /// The surrogate key to tag the stored object with, when there is one.
     ///
     /// `None` for both [`Self::Default`] and [`Self::Bypass`]: attaching a key to a
-    /// bypassed request would reverse the bypass on Fastly.
+    /// bypassed request would reverse the bypass on some platforms.
     #[must_use]
     pub fn surrogate_key(&self) -> Option<&str> {
         match self {
@@ -51,8 +51,8 @@ impl PlatformCacheIntent {
 /// Outbound HTTP request paired with a pre-resolved backend name.
 ///
 /// Uses `EdgeZero`'s neutral [`EdgeRequest`] type so adapters share one
-/// HTTP/body model while still preserving backend correlation for Fastly-style
-/// fan-out.
+/// HTTP/body model while still preserving backend correlation for fan-out
+/// across named backends.
 #[derive(Debug)]
 pub struct PlatformHttpRequest {
     /// Platform-neutral request to send upstream.
@@ -91,9 +91,10 @@ impl PlatformHttpRequest {
 
     /// Attach Image Optimizer metadata to the request.
     ///
-    /// The current Fastly adapter supports this on [`PlatformHttpClient::send`]
-    /// and rejects it on [`PlatformHttpClient::send_async`] because Fastly IO is
-    /// not available through the fan-out helper path.
+    /// An adapter whose platform optimizes images may support this on
+    /// [`PlatformHttpClient::send`] alone and reject it on
+    /// [`PlatformHttpClient::send_async`], where the optimizer is not available
+    /// through the fan-out helper path.
     #[must_use]
     pub fn with_image_optimizer(mut self, options: PlatformImageOptimizerOptions) -> Self {
         self.image_optimizer = Some(options);
@@ -169,7 +170,7 @@ impl PlatformResponse {
 /// bound exists because [`edgezero_core::body::Body`] wraps a
 /// `LocalBoxStream` that is intentionally `!Send` for wasm32 compatibility —
 /// wasm32 targets are single-threaded and cannot use `Send` futures.
-/// Adapter crates targeting a multi-threaded runtime (e.g. Axum with tokio)
+/// Adapter crates targeting a multi-threaded runtime (e.g. tokio on a server)
 /// would need to wrap state in `Arc` rather than relying on `Send` here.
 ///
 /// See [`PlatformHttpClient`] for the trait-level `?Send` design rationale,
@@ -277,8 +278,8 @@ pub struct PlatformSelectResult {
     /// Requests still in flight after the ready result is removed.
     ///
     /// Note: entries in this list may have `backend_name == None` on some
-    /// adapters (e.g., Fastly), because the adapter cannot preserve input
-    /// identifiers across the platform `select()` call. Orchestrators must
+    /// adapters, because the adapter cannot preserve input identifiers across
+    /// the platform `select()` call. Orchestrators must
     /// not rely on `backend_name()` being set on remaining entries.
     pub remaining: Vec<PlatformPendingRequest>,
     /// Backend name of the request that became ready with an error, when
@@ -288,8 +289,8 @@ pub struct PlatformSelectResult {
 }
 
 /// A [`PlatformHttpClient`] stand-in used when outbound HTTP is not available
-/// on the current platform (e.g. Cloudflare Workers, where the proxy client is
-/// managed by the edgezero dispatch layer instead).
+/// on the current platform (for example where the proxy client is managed by
+/// the edgezero dispatch layer instead).
 ///
 /// Every method returns [`PlatformError::HttpClient`], ensuring that code paths
 /// that reach this stub receive a typed error. Adapter crates should use this
@@ -363,8 +364,8 @@ pub trait PlatformHttpClient: Send + Sync {
     /// pending requests progress concurrently and [`select`](Self::select)
     /// races them.
     ///
-    /// Platforms where `send_async` executes each request eagerly before
-    /// returning (e.g. Cloudflare Workers) return `false`. On such platforms
+    /// A platform whose `send_async` executes each request eagerly before
+    /// returning answers `false`. On such platforms
     /// multi-request fan-out runs sequentially and accrues the sum of the
     /// individual latencies, so callers with a latency budget (the auction
     /// orchestrator) must check this before launching more than one request.
@@ -474,8 +475,8 @@ mod tests {
 
     #[test]
     fn cache_intent_cannot_request_bypass_and_a_surrogate_key_at_once() {
-        // The whole reason this is an enum. On Fastly a surrogate key reverses a prior
-        // set_pass, so "bypass, and tag for purge" would silently mean "do not bypass".
+        // The whole reason this is an enum. On some platforms a surrogate key reverses a
+        // prior bypass, so "bypass, and tag for purge" would silently mean "do not bypass".
         let bypass = PlatformCacheIntent::Bypass;
         let shared = PlatformCacheIntent::Shared {
             surrogate_key: "ts-origin".to_owned(),
@@ -526,7 +527,7 @@ mod tests {
 
     #[test]
     fn platform_response_default_has_no_backend_name() {
-        // On Axum/Cloudflare noop clients return PlatformResponse::new(response)
+        // An adapter's noop client returns PlatformResponse::new(response)
         // with no backend_name. Core logic must not panic when backend_name is None.
         let response = edgezero_core::http::response_builder()
             .status(200)
@@ -543,7 +544,8 @@ mod tests {
 
     #[test]
     fn platform_response_with_backend_name_is_some() {
-        // On Fastly, responses carry backend_name for error correlation.
+        // An adapter that sends to named backends tags responses with
+        // backend_name for error correlation.
         let response = edgezero_core::http::response_builder()
             .status(200)
             .body(edgezero_core::body::Body::empty())

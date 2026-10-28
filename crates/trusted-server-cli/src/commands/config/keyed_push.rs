@@ -32,7 +32,7 @@ use edgezero_core::blob_envelope::BlobEnvelope;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::manifest::{Manifest, ManifestLoader};
 use error_stack::Report;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use toml_edit::{DocumentMut, Item, Table};
 use trusted_server_core::config::TrustedServerAppConfig;
@@ -42,7 +42,6 @@ use trusted_server_core::platform::{
     PlatformConfigStore, PlatformError, PolicyEntry, StoreId, StoreName, policy_entry_text,
     policy_key,
 };
-use trusted_server_core::settings_data::resolve_fastly_chunk_pointer;
 
 use super::policy::{self, PolicyText, PushArgs};
 use crate::fastly_cli::{self, FastlyProcess, FastlyRunner};
@@ -82,6 +81,22 @@ struct ChunkPointer<'a> {
 struct ChunkRef {
     key: String,
     len: usize,
+    sha256: String,
+}
+
+/// A pointer read back from a store, with the fields [`stored_whole`]
+/// checks.
+#[derive(Deserialize)]
+struct StoredPointer {
+    chunks: Vec<StoredChunk>,
+    edgezero_kind: String,
+    envelope_sha256: String,
+}
+
+/// One chunk a stored pointer names.
+#[derive(Deserialize)]
+struct StoredChunk {
+    key: String,
     sha256: String,
 }
 
@@ -277,16 +292,41 @@ fn policy_entries(name: &str, text: &str) -> Result<PolicyEntries, String> {
 }
 
 /// Whether `stored` holds the policy file whose SHA-256 is `sha256` under
-/// `key`, read back as the runtime reads it, chunks included. An entry that
-/// cannot be read back, or holds another file, does not.
+/// `key`, read back whole, chunks included. An entry that cannot be read
+/// back, or holds another file, does not.
 fn holds_policy(stored: &dyn PlatformConfigStore, key: &str, sha256: &str) -> bool {
     let store_name = StoreName::from(DEFAULT_CONFIG_STORE_ID);
     stored
         .get(&store_name, key)
         .ok()
-        .and_then(|value| resolve_fastly_chunk_pointer(stored, &store_name, &value).ok())
+        .and_then(|value| stored_whole(stored, &store_name, value))
         .and_then(|value| policy_entry_text(&value).ok())
         .is_some_and(|text| policy_sha256(&text) == sha256)
+}
+
+/// `value` read back whole: the value itself, or, when it is a pointer
+/// [`entries`] wrote, its chunks joined in order. `None` when a chunk is
+/// missing or holds other bytes than the pointer names.
+fn stored_whole(
+    stored: &dyn PlatformConfigStore,
+    store_name: &StoreName,
+    value: String,
+) -> Option<String> {
+    let Ok(pointer) = serde_json::from_str::<StoredPointer>(&value) else {
+        return Some(value);
+    };
+    if pointer.edgezero_kind != POINTER_KIND {
+        return Some(value);
+    }
+    let mut whole = String::new();
+    for chunk in pointer.chunks {
+        let text = stored.get(store_name, &chunk.key).ok()?;
+        if sha256_hex(&text) != chunk.sha256 {
+            return None;
+        }
+        whole.push_str(&text);
+    }
+    (sha256_hex(&whole) == pointer.envelope_sha256).then_some(whole)
 }
 
 /// Entries already read from a store, for the chunk reader to read chunks

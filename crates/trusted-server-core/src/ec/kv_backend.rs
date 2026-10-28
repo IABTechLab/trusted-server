@@ -3,8 +3,7 @@
 //! [`super::kv::KvIdentityGraph`] owns all identity-graph business logic
 //! (CAS retry loops, consent tombstone semantics, entry validation) and
 //! delegates raw store access to an [`EcKvStore`] implementation provided
-//! by the adapter crate (e.g. the Fastly KV Store backend in
-//! `trusted-server-adapter-fastly`).
+//! by the adapter crate.
 //!
 //! This trait is intentionally narrow: lookup with a generation marker,
 //! conditional insert, strong prefix listing, and delete. Conditional writes are

@@ -3,8 +3,7 @@
 //! This module provides [`KvIdentityGraph`] which implements the
 //! read-modify-write operations for the EC identity graph on top of the
 //! platform-neutral [`EcKvStore`] primitives. The platform adapter supplies
-//! the concrete store backend (e.g. the Fastly KV Store implementation in
-//! `trusted-server-adapter-fastly`).
+//! the concrete store backend.
 //!
 //! All methods return `Result` — callers decide whether to swallow errors
 //! (organic request paths) or propagate them (sync endpoints). See the

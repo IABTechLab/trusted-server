@@ -20,7 +20,6 @@ use trusted_server_core::platform::{
     PlatformSecretStore, PlatformSelectResult, StoreId, StoreName, policy_entry_text, policy_key,
 };
 use trusted_server_core::settings::TrustedClientIpConfig;
-use trusted_server_core::settings_data::resolve_fastly_chunk_pointer;
 
 // ---------------------------------------------------------------------------
 // FastlyPlatformConfigStore
@@ -28,17 +27,19 @@ use trusted_server_core::settings_data::resolve_fastly_chunk_pointer;
 
 /// Fastly [`ConfigStore`]-backed implementation of [`PlatformConfigStore`].
 ///
-/// Reads take the store name on each call. The service never writes to a
-/// config store, so `put` and `delete` are refused. Signing keys are written
-/// by `ts keys`.
+/// Reads take the store name on each call, and a document stored in chunks
+/// because it is longer than an entry is read back whole, see
+/// [`crate::config_chunks`]. The service never writes to a config store, so
+/// `put` and `delete` are refused. Signing keys are written by `ts keys`.
 pub struct FastlyPlatformConfigStore;
 
 /// The shared policy entries of a config store, from which a blob the keyed
 /// push wrote for a host, which carries no policy file, reads the file it
 /// pins.
 ///
-/// An entry is read as a blob is, through the store and core's chunk reader,
-/// and the runtime loader checks the file against the blob's digest.
+/// An entry is read as a blob is, through the store, which returns a long
+/// entry whole, and the runtime loader checks the file against the blob's
+/// digest.
 pub(crate) struct FastlyPolicyEntries<'a> {
     config_store: &'a dyn PlatformConfigStore,
     store_name: &'a StoreName,
@@ -66,12 +67,7 @@ impl PlatformPolicySource for FastlyPolicyEntries<'_> {
             .get(self.store_name, &key)
             .change_context(PlatformError::PolicySource)
             .attach(format!("the policy entry `{key}` cannot be read"))?;
-        let entry = resolve_fastly_chunk_pointer(self.config_store, self.store_name, &value)
-            .change_context(PlatformError::PolicySource)
-            .attach(format!(
-                "the chunks of the policy entry `{key}` cannot be read"
-            ))?;
-        policy_entry_text(&entry)
+        policy_entry_text(&value)
     }
 }
 
@@ -82,17 +78,8 @@ impl PlatformConfigStore for FastlyPlatformConfigStore {
             Report::new(PlatformError::ConfigStore)
                 .attach(format!("failed to open config store '{name}': {e}"))
         })?;
-        store
-            .try_get(key)
-            .map_err(|e| {
-                Report::new(PlatformError::ConfigStore).attach(format!(
-                    "lookup for key '{key}' in config store '{name}' failed: {e}"
-                ))
-            })?
-            .ok_or_else(|| {
-                Report::new(PlatformError::ConfigStore)
-                    .attach(format!("key '{key}' not found in config store '{name}'"))
-            })
+        let value = read_entry(&store, name, key)?;
+        crate::config_chunks::whole_entry(value, |chunk| read_entry(&store, name, chunk))
     }
 
     fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
@@ -104,6 +91,21 @@ impl PlatformConfigStore for FastlyPlatformConfigStore {
         Err(Report::new(PlatformError::ConfigStore)
             .attach("the service does not write to config stores"))
     }
+}
+
+/// The value at `key` in the open config store `store`, named `name`.
+fn read_entry(store: &ConfigStore, name: &str, key: &str) -> Result<String, Report<PlatformError>> {
+    store
+        .try_get(key)
+        .map_err(|e| {
+            Report::new(PlatformError::ConfigStore).attach(format!(
+                "lookup for key '{key}' in config store '{name}' failed: {e}"
+            ))
+        })?
+        .ok_or_else(|| {
+            Report::new(PlatformError::ConfigStore)
+                .attach(format!("key '{key}' not found in config store '{name}'"))
+        })
 }
 
 // ---------------------------------------------------------------------------

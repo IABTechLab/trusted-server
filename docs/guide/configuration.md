@@ -748,13 +748,15 @@ trimmed or normalized. Missing, empty, duplicate, non-UTF-8, mismatched, or malf
 values do not reject the request; Trusted Server safely falls back to the
 immediate peer address. Both configured headers are removed before routing.
 
-Header names are validated case-insensitively. `ip_header` must be
-`fastly-client-ip` or start with `x-`, while `auth_header` must start with `x-`.
-The names must differ. Neither field may use a header name reserved for
-Trusted Server's own internal signals (for example `x-forwarded-for`,
-`x-geo-info-available`, `x-ts-ec`, `x-ts-tls-protocol`, or `x-ts-tls-cipher`);
-the full reserved set is the internal-header list that Trusted Server strips
-before forwarding to third parties. These restrictions exclude standard
+Header names are validated case-insensitively. `ip_header` must start with
+`x-` or end with `-client-ip`, as a platform's own client address header such as
+`fastly-client-ip` does, while `auth_header` must start with `x-`. The names
+must differ. Neither field may use a header name reserved for Trusted Server's
+own internal signals, for example `x-forwarded-for`, `x-geo-info-available`,
+`x-ts-ec`, `x-ts-tls-protocol`, or `x-ts-tls-cipher`. The full reserved set is
+the internal-header list that Trusted Server strips before forwarding to third
+parties, together with the internal headers the adapter declares for its
+platform. These restrictions exclude standard
 sensitive headers such as `Host`, `Content-Length`, `Cookie`, and
 `Authorization`, as well as every Trusted Server internal header. Choose
 dedicated `x-` names that no other application or routing logic uses, because
@@ -1010,17 +1012,17 @@ Selects how a request is classified into the coarse device signals the Edge Cook
 
 ### `[device]`
 
-| Field    | Type           | Required | Description                                                                                                                                                                                                                            |
-| -------- | -------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `module` | String or null | No       | Name of the device-detection module: `builtin` (the default, User-Agent only, no host-specific call), `fastly` to add the host's TLS (JA4) and HTTP/2 probabilistic identifiers, or the name of a module a crate outside core supplies |
+| Field    | Type           | Required | Description                                                                                                                                                                                                                                                               |
+| -------- | -------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `module` | String or null | No       | Name of the device-detection module: `builtin` (the default, User-Agent only, no host-specific call), `platform` to add the host's TLS (JA4) and HTTP/2 probabilistic identifiers where the platform supplies them, or the name of a module a crate outside core supplies |
 
-The default `builtin` module classifies from the User-Agent alone and makes no host-specific call, so the default path stays host-neutral. Neither `builtin` nor `fastly` has settings, and `[device]` holds no module settings table. A module from a crate at `crates/device/<name>` is written `<name>` or `device.<name>`, and the crate's own module has to be selected in the section of its type as well. Naming a module this deployment does not run fails at startup, with the device modules it does run.
+The default `builtin` module classifies from the User-Agent alone and makes no host-specific call, so the default path stays host-neutral. Neither `builtin` nor `platform` has settings, and `[device]` holds no module settings table. A module from a crate at `crates/device/<name>` is written `<name>` or `device.<name>`, and the crate's own module has to be selected in the section of its type as well. Naming a module this deployment does not run fails at startup, with the device modules it does run.
 
 **Example**:
 
 ```toml
 [device]
-module = "builtin" # or "fastly" to add TLS and HTTP/2 evidence
+module = "builtin" # or "platform" to add TLS and HTTP/2 evidence
 ```
 
 **Environment Override**:

@@ -29,7 +29,6 @@ pub const HEADER_X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwar
 pub const HEADER_X_SUBJECT_ID: HeaderName = HeaderName::from_static("x-subject-id");
 pub const HEADER_X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 pub const HEADER_X_COMPRESS_HINT: HeaderName = HeaderName::from_static("x-compress-hint");
-pub const HEADER_X_DEBUG_FASTLY_POP: HeaderName = HeaderName::from_static("x-debug-fastly-pop");
 
 // Staging / version identification headers. The two version headers are
 // written by core's `service_version` middleware where a `[[serve]]` entry
@@ -46,9 +45,6 @@ pub const TS_GIT_VERSION: Option<&str> = match option_env!("TRUSTED_SERVER__GIT_
     Some(version) if !version.is_empty() => Some(version),
     _ => None,
 };
-
-// Fastly environment variables
-pub const ENV_FASTLY_IS_STAGING: &str = "FASTLY_IS_STAGING";
 
 // Common standard header names used across modules
 pub const HEADER_USER_AGENT: HeaderName = HeaderName::from_static("user-agent");
@@ -107,10 +103,9 @@ const NON_EC_INTERNAL_HEADERS: &[&str] = &[
     "x-geo-region",
     "x-request-id",
     "x-compress-hint",
-    "x-debug-fastly-pop",
-    // Trusted TLS metadata injected by the Fastly EdgeZero entry point.
-    // Injected after stripping spoofable forwarded headers so they cannot be
-    // client-supplied. Must not be forwarded to downstream origins.
+    // Trusted TLS metadata an adapter's entry point injects after stripping
+    // spoofable forwarded headers, so they cannot be client-supplied. Must
+    // not be forwarded to downstream origins.
     "x-ts-tls-protocol",
     "x-ts-tls-cipher",
 ];
@@ -158,6 +153,14 @@ const fn join_internal_headers() -> [&'static str; INTERNAL_HEADER_COUNT] {
 /// Uses `&str` slices because `HeaderName` has interior mutability and cannot appear
 /// in `const` context.
 pub const INTERNAL_HEADERS: &[&str] = &join_internal_headers();
+
+/// Whether `name`, in lower case, must not be forwarded to a third party,
+/// being one of [`INTERNAL_HEADERS`] or an internal header the running
+/// platform declared.
+#[must_use]
+pub fn is_internal_header(name: &str) -> bool {
+    INTERNAL_HEADERS.contains(&name) || crate::platform::is_platform_internal_header(name)
+}
 
 #[cfg(test)]
 mod tests {

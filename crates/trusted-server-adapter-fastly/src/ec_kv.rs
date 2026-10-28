@@ -193,10 +193,15 @@ impl EcKvStore for FastlyEcKvStore {
 mod tests {
     use std::time::Duration;
 
+    use trusted_server_core::ec::kv_types::{KvMetadata, SCHEMA_VERSION};
+
     use super::*;
 
     /// KV store declared for the local simulator in `fastly.toml`.
     const TEST_STORE: &str = "ec_identity_store";
+
+    /// The most metadata the Fastly KV Store keeps with one entry.
+    const KV_METADATA_LIMIT_BYTES: usize = 2048;
 
     /// Entry metadata. Opaque to the backend, which only round-trips bytes.
     const METADATA: &str = "entry-metadata";
@@ -495,5 +500,25 @@ mod tests {
         for key in &keys {
             backend.delete(key).expect("should delete the entry");
         }
+    }
+
+    #[test]
+    fn identity_graph_metadata_fits_the_store_metadata_limit() {
+        // Worst case: all fields populated.
+        let meta = KvMetadata {
+            ok: false,
+            country: "XX".to_owned(),
+            v: SCHEMA_VERSION,
+            cluster_size: Some(u32::MAX),
+            is_mobile: Some(2),
+            known_browser: Some(true),
+        };
+        let json = serde_json::to_string(&meta).expect("should serialize KvMetadata");
+        assert!(
+            json.len() <= KV_METADATA_LIMIT_BYTES,
+            "metadata must fit in the Fastly KV Store's {KV_METADATA_LIMIT_BYTES}-byte \
+             limit, got {} bytes",
+            json.len()
+        );
     }
 }

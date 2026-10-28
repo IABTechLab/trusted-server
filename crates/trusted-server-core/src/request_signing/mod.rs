@@ -10,8 +10,8 @@
 //! - **Store name** ([`JWKS_CONFIG_STORE_NAME`], [`SIGNING_SECRET_STORE_NAME`]):
 //!   used for runtime reads via [`crate::platform::PlatformConfigStore::get`]
 //!   and [`crate::platform::PlatformSecretStore::get_bytes`] through
-//!   [`crate::platform::RuntimeServices`]. These names are configured in
-//!   `fastly.toml` for the Fastly adapter.
+//!   [`crate::platform::RuntimeServices`]. Each adapter's platform
+//!   configuration declares stores under these names.
 //!
 //! - **Store ID**: used for write operations via
 //!   [`crate::platform::PlatformConfigStore::put`] /
@@ -35,14 +35,14 @@ pub mod signing;
 
 /// Config store name for JWKS public keys used by runtime read operations.
 ///
-/// This must match the store name declared in `fastly.toml` under
-/// `[local_server.config_stores]`.
+/// This must match the config store name the adapter's platform
+/// configuration declares.
 pub const JWKS_CONFIG_STORE_NAME: &str = "jwks_store";
 
 /// Secret store name for Ed25519 signing keys used by runtime read operations.
 ///
-/// This must match the store name declared in `fastly.toml` under
-/// `[local_server.secret_stores]`.
+/// This must match the secret store name the adapter's platform
+/// configuration declares.
 pub const SIGNING_SECRET_STORE_NAME: &str = "signing_keys";
 
 /// Lazily constructed [`StoreName`] for JWKS config-store reads.
