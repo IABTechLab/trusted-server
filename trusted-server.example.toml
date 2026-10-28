@@ -202,6 +202,21 @@ pull_sync_concurrency = 3
 # always_allow = ["/ads.txt"]
 # sitemap = "https://publisher.example.com/sitemap.xml"
 
+# The sellers added to the publisher's ads.txt. The origin's file stays
+# authoritative and the lines are written at its end, where a [[fetch]] entry
+# for text/plain on the file's path names the middleware. Each line is a data
+# record or a variable of the ads.txt grammar, checked as the settings load.
+# [ads-txt]
+# modules = ["sellers"]
+
+# [ads-txt.sellers]
+# lines = ["ssp.example, 12345, DIRECT, f08c47fec0942fa0"]
+
+# [[fetch]]
+# media_type = "text/plain"
+# path = "/ads.txt"
+# middleware = ["ads-txt.sellers"]
+
 # Sign outbound OpenRTB/API requests. The runtime reads its keys from fixed
 # store names (`jwks_store` / `signing_keys`), and `ts keys` writes them. To keep
 # signing OFF, leave this whole block commented out.

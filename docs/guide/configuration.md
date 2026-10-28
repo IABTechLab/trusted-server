@@ -221,7 +221,7 @@ fail and the service will return its startup-error response.
 
 ## Key Sections
 
-11 of these sections select what runs, with `module` where one runs and
+12 of these sections select what runs, with `module` where one runs and
 `modules` where several run, and each gives every selected name its own
 `[<type>.<name>]` settings table, as
 [Configuration Rules](/guide/configuration-rules) describes.
@@ -229,6 +229,7 @@ fail and the service will return its startup-error response.
 | Section                                                                                                           | Selects               | Purpose                                                                                       |
 | ----------------------------------------------------------------------------------------------------------------- | --------------------- | --------------------------------------------------------------------------------------------- |
 | `[ad-server]`                                                                                                     | one module            | The ad server that picks the winner                                                           |
+| `[ads-txt]`                                                                                                       | several modules       | The sellers added to the publisher's `ads.txt`, see ads.txt Configuration                     |
 | `[analytics]`                                                                                                     | one module            | The module that receives auction telemetry                                                    |
 | `[auction]`                                                                                                       | several modules       | Auction orchestration, bidder routes, and the modules the auction runs, `prebid` among them   |
 | `[cache]`                                                                                                         | nothing               | Static and rehosted asset cache policy                                                        |
@@ -1185,6 +1186,48 @@ modules = ["refuse_all"]
 always_allow = ["/ads.txt"]
 ```
 
+## ads.txt Configuration
+
+The sellers a deployment adds to the publisher's `ads.txt`. The publisher's
+own file at the origin stays authoritative, and with no `[ads-txt]` section
+it passes through untouched.
+
+### `[ads-txt]`
+
+| Field     | Type          | Required | Description                                                                       |
+| --------- | ------------- | -------- | --------------------------------------------------------------------------------- |
+| `modules` | Array[String] | Yes      | What adds lines to the file. `sellers` writes the lines `[ads-txt.sellers]` gives |
+
+### `[ads-txt.sellers]`
+
+| Field   | Type          | Required | Description                                                                                                                                                         |
+| ------- | ------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `lines` | Array[String] | Yes      | The lines written at the end of the file, each a data record (domain, account id, `DIRECT` or `RESELLER`, and an optional certification authority id) or a variable |
+
+**How the file is made.** Where a `[[fetch]]` entry for `text/plain` names
+the module, it writes the lines after the origin's last one. The entry's
+`path` is a prefix, so `/ads.txt` also covers `/ads.txt.bak`.
+
+**Refused when the settings load**: a line that is not a data record or a
+variable, naming which part is wrong, a comment, an empty list, and a
+document that selects the module but names it in no `[[fetch]]` entry for
+`text/plain`, where the lines would never be written.
+
+**Example**:
+
+```toml
+[ads-txt]
+modules = ["sellers"]
+
+[ads-txt.sellers]
+lines = ["ssp.example, 12345, DIRECT, f08c47fec0942fa0", "CONTACT=ads@publisher.example"]
+
+[[fetch]]
+media_type = "text/plain"
+path = "/ads.txt"
+middleware = ["ads-txt.sellers"]
+```
+
 ## Request Signing
 
 Configuration for Ed25519 request signing.
@@ -1901,6 +1944,7 @@ the names in and the order `trusted-server.example.toml` shows them in.
 | `bot-protection.datadome.tag` | `[[serve]]` | Writes DataDome's client tag into the head, unless the request filter marked the request, `inject_client_side_tag` is off or no `client_side_key` is set                                                          |
 | `ad-tag.google`               | `[[fetch]]` | Writes the `tsjs.adInit` bootstrap into the head and, when `rewrite_script` is set, points a `src` or `href` that is the GPT script's address at `/integrations/gpt/script`                                       |
 | `ad-tag.google.diagnostics`   | `[[serve]]` | For a request that activated diagnostics, writes the bootstrap ahead of the script bundle and the tag that loads the diagnostics module straight after it                                                         |
+| `ads-txt.sellers`             | `[[fetch]]` | Writes the lines `[ads-txt.sellers]` gives at the end of the publisher's `ads.txt`, on `text/plain` alone                                                                                                         |
 | `service_version`             | `[[serve]]` | Writes `X-TS-Version`, the git version the build compiled in, and `X-TS-Service-Version`, the platform's version number of the service, when each is known. Core supplies it, so no section selects it            |
 
 An entry that could not do what it says refuses the configuration, both when

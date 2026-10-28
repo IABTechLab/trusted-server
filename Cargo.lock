@@ -6691,6 +6691,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-server-ads-txt-sellers"
+version = "0.1.0"
+dependencies = [
+ "error-stack",
+ "serde",
+ "trusted-server-core",
+ "validator",
+]
+
+[[package]]
 name = "trusted-server-auction-aps"
 version = "0.1.0"
 dependencies = [
@@ -7090,6 +7100,7 @@ dependencies = [
  "tokio",
  "trusted-server-ad-server-mock",
  "trusted-server-ad-tag-google",
+ "trusted-server-ads-txt-sellers",
  "trusted-server-auction-aps",
  "trusted-server-auction-prebid",
  "trusted-server-auction-prebid-server",

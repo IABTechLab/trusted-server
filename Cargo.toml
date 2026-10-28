@@ -19,6 +19,7 @@ members = [
     "crates/cmp/sourcepoint",
     "crates/cmp/didomi",
     "crates/cmp/inmobi",
+    "crates/ads-txt/sellers",
     "crates/tag/google-tag-manager",
     "crates/testing/testlight",
     "crates/framework/nextjs",
@@ -163,6 +164,7 @@ trusted-server-audience-permutive = { path = "crates/audience/permutive" }
 trusted-server-cmp-sourcepoint = { path = "crates/cmp/sourcepoint" }
 trusted-server-cmp-didomi = { path = "crates/cmp/didomi" }
 trusted-server-cmp-inmobi = { path = "crates/cmp/inmobi" }
+trusted-server-ads-txt-sellers = { path = "crates/ads-txt/sellers" }
 trusted-server-tag-google-tag-manager = { path = "crates/tag/google-tag-manager" }
 trusted-server-testing-testlight = { path = "crates/testing/testlight" }
 trusted-server-framework-nextjs = { path = "crates/framework/nextjs" }

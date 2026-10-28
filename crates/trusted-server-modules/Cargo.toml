@@ -24,6 +24,7 @@ trusted-server-audience-permutive = { workspace = true }
 trusted-server-bot-protection-datadome = { workspace = true }
 trusted-server-cmp-didomi = { workspace = true }
 trusted-server-cmp-inmobi = { workspace = true }
+trusted-server-ads-txt-sellers = { workspace = true }
 trusted-server-cmp-osano = { workspace = true }
 trusted-server-cmp-sourcepoint = { workspace = true }
 trusted-server-core = { workspace = true }
