@@ -95,7 +95,7 @@ Preserve single-shot listing/refusal, draft creation, uploads and publication by
 - [x] User accepts the ordinary-release adapter's narrower equality claim for this Phase 2 slice.
 - [x] User approves the concrete informational writer/measurement/transfer contract and additive Fastly provenance subject.
 - [x] User approves implementation after a concrete plan is written and independently reviewed within this design; qualification types/selectors and new triggers remain closed.
-- [ ] Rehearse the exact reviewed head and report time/cost and unchanged Phase 1 verification before merge. Merging Phase 2 activates the gate on the next real tag; no separate switch.
+- [x] Rehearse the exact reviewed head and report time/cost and unchanged Phase 1 verification before merge. Merging Phase 2 activates the gate on the next real tag; no separate switch.
 
 ## Approved forward-compatibility and mismatch conditions
 

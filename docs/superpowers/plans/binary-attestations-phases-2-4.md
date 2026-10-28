@@ -2,7 +2,7 @@
 
 **Phase 2 spec:** [ordinary Fastly release equality](../specs/2026-10-28-1235-binary-attestations-phase2-design.md), with its own source-checked review rounds. Tracking issue: #1235.
 
-**Status:** Assignment approved with dependency-closure corrections on 2026-10-26. The Phase 2 source port and approved ordinary Fastly integration are complete in draft #1449, rehearsed at `770a425df4b28caaaef68dfd930bceabd9928046`. The original completion record was docs-only; the later main merge changes application inputs without changing release machinery and is not re-rehearsed. Qualification and the remaining Phase 3/4 design gates stay closed.
+**Status:** Phase 2 passed final review, exact-source CI and rehearsal `.16` at `5fa3843364f247fdc261c438ab9257323637a42c`. This completion record is docs-only since that implementation. [Full transcript](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6467368408). Historical `.13` stays attributed only to `770a425df4b28caaaef68dfd930bceabd9928046`. Qualification and Phase 3/4 production gates remain closed; Phase 3 planning is draft #1463.
 
 **Tracking issue:** #1235. The earlier separate tracking-issue draft is retained as planning history, not an additional issue prerequisite.
 
@@ -12,7 +12,7 @@
 
 Frozen source: `122b78664b1235c717e9208fd200f9a9b0c335df` from #1262; source-map base: `f9281917a7260b723f5f22175911c6d2147ef650`. A fresh read of #1262 on 2026-10-26 confirmed that its published head is still the frozen source. Introducing and shaping SHAs remain recorded per group in [the slice map](binary-attestations-slice-map.json); they are provenance references, not safe whole-commit cherry-pick boundaries.
 
-Current Phase 1 base: `4940928e800fed00e4bddd8f3727fb52dcb2b296`, containing later application inputs. Rehearsal `.15` remains attributed only to `68eef902a8bddd9024676cc3806fa5377ed67fee`. Phase 2 carries the updated base through tree-identical merge `8a797dbcb0467b867dfbcc571597110b9254d672`. Phase 2 `.13` stays attributed to `770a425df4b28caaaef68dfd930bceabd9928046`; the subsequent main merge is a no-release-machinery merge, with changed application inputs and no fresh Phase 2 rehearsal.
+Current Phase 1 base: `4940928e800fed00e4bddd8f3727fb52dcb2b296`, containing later application inputs. Rehearsal `.15` remains attributed only to `68eef902a8bddd9024676cc3806fa5377ed67fee`. Phase 2 carries the updated base through tree-identical merge `8a797dbcb0467b867dfbcc571597110b9254d672`. Phase 2 `.13` stays attributed to `770a425df4b28caaaef68dfd930bceabd9928046`; the later application inputs and structured diagnostics are covered by `.16` at `5fa3843364f247fdc261c438ab9257323637a42c`.
 
 | Draft PR                                                           | Branch                               | Base                                 | Intended capability                                      |
 | ------------------------------------------------------------------ | ------------------------------------ | ------------------------------------ | -------------------------------------------------------- |
@@ -103,7 +103,7 @@ Gate 1's [ordinary-release design](binary-attestations-phase2-fastly-integration
 - [x] Port source by module, preserving Phase 1 hunks and recording each current-main adaptation; update per-path landing metadata in the slice map.
 - [x] Adapt closed producer tables to the seven Phase 1 assets and current pins without opening qualifications or changing the index schema.
 - [x] Run explicitly selected pure tests with a nonzero-selection guard; compile platform-specific branches in CI; keep process/ignored tests CI-only.
-- [ ] Obtain independent and security reviews; pass touched CI gates before pushing and rehearse only an exact green reviewed head.
+- [x] Obtain independent and security reviews; pass touched CI gates before pushing and rehearse only an exact green reviewed head. Current-input completion is `.16` at `5fa384336`; review coverage limits are recorded in the integration plan.
 - [x] Obtain separate Fastly integration design approval and independently review the [concrete implementation plan](binary-attestations-phase2-fastly-integration-implementation.md) before implementing its missing gate/writer. Do not claim the intended Phase 2 capability is shipped by porting closed code.
 
 The following progress notes and per-path staged labels are historical snapshots of successive chunks. Current completion is recorded by the checkpoints above and the approved integration plan; an old snapshot is not an outstanding port task.

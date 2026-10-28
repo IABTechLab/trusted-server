@@ -2,7 +2,7 @@
 
 **Issue:** #1235. **Date:** 2026-10-28.
 
-**Status:** Implemented in draft #1449; final independent/security review and current-input rehearsal remain readiness gates. This phase-specific spec consolidates the approved Gate 1 design; it does not approve later controlled-recipe, SPDX, index or consumer work.
+**Status:** Implemented, independently reviewed and rehearsed in draft #1449 at `5fa3843364f247fdc261c438ab9257323637a42c` through successful rehearsal `.16`. This completion record is docs-only since that exact implementation. [Full transcript](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6467368408). This phase-specific spec consolidates the approved Gate 1 design; it does not approve later controlled-recipe, SPDX, index or consumer work.
 
 ## Goal and scope
 
@@ -38,11 +38,11 @@ Input, transfer, comparison or signing failure prevents release. A real mismatch
 
 Pure tests cover strict documents, source/tool/JS/environment joins, archive validation, atomic output and failure cleanup. Hosted process tests cover subprocess behavior, cancellation and negative comparator/canary behavior; local process tests are not substituted for hosted evidence. CI builds all seven binaries and the additional Fastly reproduction; PR signing/publication remain skipped. The pinned Fastly packaging route runs read-only in CI without deployment or local configuration changes.
 
-The release rehearsal must verify all 30 files, immutable/prerelease/not-Latest state, actual A/B joins, both predicates and identities online/offline for all seven binaries, companion provenance, SPDX equality, sums, native smoke and pinned Fastly packaging. Historical `.13` proves only `770a425df`; it does not cover later application inputs. The [compatibility record](../plans/binary-attestations-phase1-compatibility.md) retains exact-source evidence and the rerun-all recovery proof.
+The release rehearsal must verify all 30 files, immutable/prerelease/not-Latest state, actual A/B joins, both predicates and identities online/offline for all seven binaries, companion provenance, SPDX equality, sums, native smoke and pinned Fastly packaging. Historical `.13` proves only `770a425df`. Rehearsal `.16` covers the later application inputs and structured diagnostics at `5fa3843364f247fdc261c438ab9257323637a42c`; all 18 release jobs and independent verification passed. The [compatibility record](../plans/binary-attestations-phase1-compatibility.md) retains exact-source evidence and the rerun-all recovery proof.
 
 The user approved completing Gate 1’s structured failure diagnostics before the fresh rehearsal. Typed rejection checks classify a separate canonical diagnostic, capped at 4,096 bytes, with actual measured facts or explicit `unavailable` fields. It remains a CI-only failure artifact alongside bounded stderr, never a signed or published companion. Writer failure cannot change the failed result. The negative hosted fixture must observe `mismatched` at stage `bytes`.
 
-Final readiness requires two fresh source-checked spec-review rounds, whole-implementation independent/security review, exact-head green CI and a current-input rehearsal. The existing parent issue #1235 tracks this phase; no separate tracking issue is needed. Keep #1449 draft until its outstanding gates are closed and the user authorizes the transition.
+Two fresh source-checked spec-review rounds, risk-based independent/security implementation reviews, exact-implementation green CI and the current-input rehearsal are recorded. Any subsequent evidence-record commit is docs-only; its hosted checks are assessed separately. The existing parent issue #1235 tracks this phase; no separate tracking issue is needed. Keep #1449 draft until its outstanding gates are closed and the user authorizes the transition.
 
 ## Review log
 
