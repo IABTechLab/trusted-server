@@ -3017,6 +3017,7 @@ mod tests {
                 client_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))),
                 ..ClientInfo::default()
             })
+            .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
             .build();
         let request = browser_request(Method::GET, "/article", "document");
 

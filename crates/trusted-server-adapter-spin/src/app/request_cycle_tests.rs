@@ -733,6 +733,7 @@ fn services_for_a_reader(origin: &Arc<StubHttpClient>) -> RuntimeServices {
             ..ClientInfo::default()
         })
         .permission_signal_modules(super::shipped_signal_modules().into())
+        .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
         .build()
 }
 
