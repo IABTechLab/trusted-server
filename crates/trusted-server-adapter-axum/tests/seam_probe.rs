@@ -566,12 +566,26 @@ async fn report_with(settings: Settings, integrations: &[IntegrationBuilder]) ->
     serde_json::from_str(&body).expect("the report route should return JSON")
 }
 
+/// The id of a loading cache module these tests link beside the probe's.
+const SECOND_LOADING_CACHE_ID: &str = "loading-cache.memory";
+
+/// Core's `MemoryLoadingCache`, which keeps what it loads.
+fn memory_loading_cache() -> Arc<dyn trusted_server_core::platform::PlatformLoadingCache> {
+    Arc::new(trusted_server_core::platform::test_support::MemoryLoadingCache::default())
+}
+
+/// A loading cache module other than the probe's, so a build can link two.
+fn second_loading_cache_builder() -> IntegrationBuilder {
+    IntegrationBuilder::implementations(SECOND_LOADING_CACHE_ID, env!("CARGO_PKG_NAME"))
+        .with_loading_cache(memory_loading_cache)
+}
+
 /// `[cache.seam-probe-answers]` selects the loading cache the probe's answers
 /// are held in, the way `[cache.robots-txt]` selects core's. Left out, the
-/// cache takes the one loading cache module the build links, and this build
-/// links two, the stock one and the probe's, so it keeps nothing until the
-/// table names one. With the probe's cache not linked, the stock one alone
-/// is, and the cache takes it without a table.
+/// cache takes the one loading cache module the build links, and keeps
+/// nothing when the build links none or several. A stock build links none,
+/// so the first two cases link a second module beside the probe's, and only
+/// the one whose table is read keeps values.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cache_the_probe_declares_is_selected_in_its_own_table() {
     let named = settings_with(&format!(
@@ -581,24 +595,35 @@ async fn a_cache_the_probe_declares_is_selected_in_its_own_table() {
             {PROBE_BLOCK}
         "#
     ));
-    let both = [seam_probe::builder(), seam_probe::loading_cache_builder()];
+    let two = [
+        seam_probe::builder(),
+        seam_probe::loading_cache_builder(),
+        second_loading_cache_builder(),
+    ];
 
-    let report = report_with(named, &both).await;
+    let report = report_with(named, &two).await;
     assert_eq!(
         report["answers_cache_keeps_values"], true,
         "the table should select the module it names: {report}"
     );
 
-    let report = report_with(settings_with(PROBE_BLOCK), &both).await;
+    let report = report_with(settings_with(PROBE_BLOCK), &two).await;
     assert_eq!(
         report["answers_cache_keeps_values"], false,
         "with two loading cache modules linked and no table the cache should keep nothing: {report}"
     );
 
-    let report = report_with(settings_with(PROBE_BLOCK), &[seam_probe::builder()]).await;
+    let both = [seam_probe::builder(), seam_probe::loading_cache_builder()];
+    let report = report_with(settings_with(PROBE_BLOCK), &both).await;
     assert_eq!(
         report["answers_cache_keeps_values"], true,
         "a declared cache with no table should take the one loading cache module linked: {report}"
+    );
+
+    let report = report_with(settings_with(PROBE_BLOCK), &[seam_probe::builder()]).await;
+    assert_eq!(
+        report["answers_cache_keeps_values"], false,
+        "with no loading cache module linked the cache should keep nothing: {report}"
     );
 }
 
