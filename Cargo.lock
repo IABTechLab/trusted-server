@@ -6571,7 +6571,6 @@ dependencies = [
  "async-trait",
  "base64",
  "bytes",
- "derive_more",
  "edgezero-adapter-cloudflare",
  "edgezero-core",
  "error-stack",

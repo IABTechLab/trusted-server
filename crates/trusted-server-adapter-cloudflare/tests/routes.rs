@@ -15,9 +15,10 @@ const LEGACY_ADMIN_DENY_METHODS: &[&str] =
 
 /// Build the full application router from explicit test settings.
 ///
-/// The settings baked into the binary contain placeholder secrets that
-/// `get_settings()` rejects by design, which would turn every route into a
-/// startup error page (and its route table into the fallback-only set).
+/// A Worker reads its settings from its config store when it builds its
+/// application, and `TrustedServerApp::routes()`, which cannot read the store,
+/// serves the startup error router on every route (and its route table is the
+/// fallback-only set).
 /// The handler regex is the production-shaped `^/_ts/admin`, matching
 /// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
 /// `/_ts/admin/keys/*` routes are auth-gated exactly as in production.
@@ -73,9 +74,9 @@ fn assert_route_registered(method: &str, path: &str) {
 }
 
 /// Build a router from explicit test settings so routes resolve to their real
-/// handlers instead of the `startup_error_router` fallback. The settings baked
-/// into the binary carry placeholder secrets that `get_settings()` rejects,
-/// which would otherwise turn every route into a startup error page.
+/// handlers instead of the `startup_error_router` fallback, which
+/// `TrustedServerApp::routes()` serves because it cannot read the config
+/// store.
 fn make_router() -> RouterService {
     let settings = trusted_server_core::settings::Settings::from_toml(
         r#"
@@ -108,8 +109,8 @@ fn make_router() -> RouterService {
 
 #[test]
 fn routes_build_without_panic() {
-    // build_state() may fail (no real settings in CI) — startup_error_router
-    // is the fallback. Either way, routes() must not panic.
+    // routes() cannot read the config store, so it serves the startup error
+    // router, and building it must not panic.
     let _router = TrustedServerApp::routes();
 }
 
