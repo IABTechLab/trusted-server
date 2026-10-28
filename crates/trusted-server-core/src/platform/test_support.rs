@@ -1286,6 +1286,89 @@ pub fn build_services_with_secret_and_http_client(
     build_services_with_config_secret_and_http_client(NoopConfigStore, secret_store, http_client)
 }
 
+/// A loading cache for tests that cannot link the module supplying the real
+/// one.
+///
+/// It keeps each value until the lifetime its load gave runs out, records the
+/// key and cache of every call, and runs a load for every key it does not
+/// hold. Loads are not joined, because these tests ask one at a time, and
+/// the module's own tests prove the joining.
+#[derive(Default)]
+pub struct MemoryLoadingCache {
+    entries: Mutex<HashMap<String, (bytes::Bytes, Option<web_time::Instant>)>>,
+    calls: Mutex<Vec<(&'static str, String)>>,
+}
+
+impl MemoryLoadingCache {
+    /// The cache name and key of every call, in order.
+    pub fn calls(&self) -> Vec<(&'static str, String)> {
+        self.calls.lock().expect("should lock the calls").clone()
+    }
+
+    /// Every key held, sorted.
+    pub fn keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .entries
+            .lock()
+            .expect("should lock the entries")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl super::PlatformLoadingCache for MemoryLoadingCache {
+    async fn get_or_load(
+        &self,
+        _services: &RuntimeServices,
+        spec: &super::CacheSpec,
+        key: &super::StoreKey,
+        load: super::Loader,
+    ) -> Result<bytes::Bytes, super::LoadError> {
+        let key = key.to_string();
+        self.calls
+            .lock()
+            .expect("should lock the calls")
+            .push((spec.name, key.clone()));
+        let held = self
+            .entries
+            .lock()
+            .expect("should lock the entries")
+            .get(&key)
+            .filter(|(_, end)| end.is_none_or(|end| web_time::Instant::now() < end))
+            .map(|(bytes, _)| bytes.clone());
+        if let Some(bytes) = held {
+            return Ok(bytes);
+        }
+        let loaded = load().await?;
+        let end = loaded
+            .lifetime
+            .map(|lifetime| web_time::Instant::now() + lifetime);
+        if loaded.lifetime.is_none_or(|lifetime| !lifetime.is_zero()) {
+            self.entries
+                .lock()
+                .expect("should lock the entries")
+                .insert(key, (loaded.bytes.clone(), end));
+        }
+        Ok(loaded.bytes)
+    }
+
+    async fn remove(
+        &self,
+        _services: &RuntimeServices,
+        _spec: &super::CacheSpec,
+        key: &super::StoreKey,
+    ) {
+        self.entries
+            .lock()
+            .expect("should lock the entries")
+            .remove(&key.to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::platform::{DEFAULT_FIRST_BYTE_TIMEOUT, PlatformImageOptimizerParams};

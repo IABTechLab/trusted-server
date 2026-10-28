@@ -10,7 +10,9 @@ request the Worker reads its settings from the config store, the Workers KV
 namespace bound as `trusted_server_config` that `ts config push --adapter
 cloudflare` writes, and serves the router built from them, or the startup
 error router when they cannot be read or do not load. It has no `/health`
-route or request-time KV registry and permits one enabled auction provider.
+route and permits one enabled auction provider. It declares the
+`TRUSTED_SERVER_KV` namespace as its key-value store, which every request is
+given, so a Worker without the binding fails every request.
 
 Build and test from the repository root:
 

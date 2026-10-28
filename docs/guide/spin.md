@@ -74,9 +74,16 @@ manifest, SQLite store, response captures, and logs.
 ## Runtime boundaries
 
 Use the same store mapping and encoded variables in the deployment provider;
-empty variable defaults fail closed. Spin's request-time store registry is
-currently unwired, so EC KV lookup and request-signing key variables are
-unavailable. Forwarded client-IP headers are sanitized, and Spin derives its
+empty variable defaults fail closed. The adapter declares Spin's `default`
+key-value store, the store startup reads the settings from, so EdgeZero opens it
+for every request, and a loading cache module that a deployment links keeps its
+copies there between requests, while a copy in memory lasts one request because
+Spin builds the state for each request. EdgeZero treats a declared store as
+required, so a component that cannot open `default` fails every request before
+any route runs, `/health` included. No request-time config store is declared,
+so request signing cannot read its key metadata, and EC KV lookup is not
+available. Forwarded client-IP
+headers are sanitized, and Spin derives its
 runtime authority, scheme, and client-address headers in the innermost
 normalization layer.
 

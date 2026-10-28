@@ -2982,9 +2982,115 @@ pub struct CacheSettings {
     /// Ordered static/rehosted asset rules. The first enabled matching rule wins.
     #[serde(default)]
     pub asset_rules: Vec<CacheAssetRule>,
+    /// How long the copies of each robots.txt contributor's answer last,
+    /// `[cache.robots-txt]`.
+    #[serde(
+        rename = "robots-txt",
+        default,
+        skip_serializing_if = "LoadingCacheConfig::is_default"
+    )]
+    pub robots_txt: LoadingCacheConfig,
+}
+
+/// The most seconds a loading cache lifetime setting accepts, a year.
+pub const MAX_LOADING_CACHE_SECONDS: u32 = 365 * 24 * 60 * 60;
+
+/// The name of the cache that holds each robots.txt module's answer, whose
+/// settings are `[cache.robots-txt]`.
+pub const ROBOTS_TXT_CACHE: &str = "robots-txt";
+
+/// How long one loading cache's copies last, each field defaulting to the
+/// cache's own default when absent.
+///
+/// See [`crate::platform::PlatformLoadingCache`]. The memory copy is the brief
+/// one a process keeps in front of the shared store, and the shared store's
+/// copy is the one every instance reads.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoadingCacheConfig {
+    /// The module whose loading cache holds this cache's copies, as its short
+    /// name or in full, for example `51degrees` or `loading-cache.51degrees`.
+    /// Absent, the one loading cache module the build links, and with none
+    /// linked, or several, no copy is kept and every call loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
+    /// How long the brief copy in process memory is used, in seconds. Zero
+    /// keeps no memory copy, and a missing value is still loaded once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_seconds: Option<u32>,
+    /// How long the copy in the shared store is used at most, in seconds. An
+    /// answer with a shorter lifetime of its own ends sooner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_seconds: Option<u32>,
+    /// How long the copy in the shared store lasts unused, in seconds, after
+    /// which it leaves the store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_idle_seconds: Option<u32>,
+}
+
+impl LoadingCacheConfig {
+    /// Whether nothing is set, so every lifetime is the cache's default.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The lifetimes these settings give, each from `defaults` where unset.
+    #[must_use]
+    pub fn lifetimes(
+        &self,
+        defaults: crate::platform::CacheLifetimes,
+    ) -> crate::platform::CacheLifetimes {
+        let seconds = |value: Option<u32>, default: Duration| {
+            value.map_or(default, |value| Duration::from_secs(u64::from(value)))
+        };
+        crate::platform::CacheLifetimes {
+            memory: seconds(self.memory_seconds, defaults.memory),
+            store: seconds(self.store_seconds, defaults.store),
+            store_idle: seconds(self.store_idle_seconds, defaults.store_idle),
+        }
+    }
+
+    /// Refuses a lifetime out of range, naming the setting by `table`.
+    ///
+    /// # Errors
+    ///
+    /// When the memory lifetime is over [`MAX_LOADING_CACHE_SECONDS`], or the
+    /// store lifetime or idle time is zero or over it.
+    pub fn check(&self, table: &str) -> Result<(), Report<TrustedServerError>> {
+        check_loading_cache_seconds(table, "memory_seconds", self.memory_seconds, 0)?;
+        check_loading_cache_seconds(table, "store_seconds", self.store_seconds, 1)?;
+        check_loading_cache_seconds(table, "store_idle_seconds", self.store_idle_seconds, 1)
+    }
+}
+
+fn check_loading_cache_seconds(
+    table: &str,
+    field: &str,
+    value: Option<u32>,
+    least: u32,
+) -> Result<(), Report<TrustedServerError>> {
+    match value {
+        Some(value) if value < least || value > MAX_LOADING_CACHE_SECONDS => {
+            Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[{table}] {field} is {value}, and must be from {least} to \
+                     {MAX_LOADING_CACHE_SECONDS}"
+                ),
+            }))
+        }
+        _ => Ok(()),
+    }
 }
 
 impl CacheSettings {
+    /// Each cache a loading cache may hold, by its name, with the settings
+    /// its `[cache.<name>]` table carries.
+    #[must_use]
+    pub fn loading_caches(&self) -> [(&'static str, &LoadingCacheConfig); 1] {
+        [(ROBOTS_TXT_CACHE, &self.robots_txt)]
+    }
+
     fn normalize(&mut self) {
         for rule in &mut self.asset_rules {
             rule.normalize();
@@ -2995,9 +3101,11 @@ impl CacheSettings {
     ///
     /// # Errors
     ///
-    /// Returns a configuration error if any rule ID is duplicate, or if an
-    /// enabled rule has an invalid policy/matcher or cannot compile its regex/glob.
+    /// Returns a configuration error if a loading cache lifetime is out of
+    /// range, if any rule ID is duplicate, or if an enabled rule has an
+    /// invalid policy/matcher or cannot compile its regex/glob.
     pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        self.robots_txt.check("cache.robots-txt")?;
         let mut seen_ids = HashSet::new();
         for rule in &self.asset_rules {
             if rule.id.is_empty() {
@@ -6678,6 +6786,99 @@ module = \"none\"",
         assert!(
             error.to_string().contains("validation failed"),
             "zero max_age_seconds should fail settings validation, got: {error}"
+        );
+    }
+
+    #[test]
+    fn loading_cache_lifetimes_are_read_with_defaults_for_what_is_unset() {
+        let toml_str = format!(
+            r#"{}
+
+            [cache.robots-txt]
+            store_seconds = 600
+            store_idle_seconds = 3600
+        "#,
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse the lifetimes");
+        let defaults = crate::platform::CacheLifetimes {
+            memory: Duration::from_secs(5),
+            store: Duration::from_secs(60),
+            store_idle: Duration::from_secs(70),
+        };
+
+        assert_eq!(
+            settings.cache.robots_txt.lifetimes(defaults),
+            crate::platform::CacheLifetimes {
+                memory: Duration::from_secs(5),
+                store: Duration::from_secs(600),
+                store_idle: Duration::from_secs(3600),
+            }
+        );
+    }
+
+    #[test]
+    fn a_loading_cache_lifetime_out_of_range_is_refused_naming_it() {
+        for (field, value, least) in [
+            ("store_seconds", "0", 1),
+            ("store_idle_seconds", "0", 1),
+            ("memory_seconds", "31536001", 0),
+        ] {
+            let toml_str = format!(
+                "{}
+
+[cache.robots-txt]
+{field} = {value}
+",
+                crate_test_settings_str()
+            );
+            let error = Settings::from_toml(&toml_str)
+                .expect_err("a lifetime out of range should not load");
+            let message = format!("{error:?}");
+            assert!(
+                message.contains(&format!(
+                    "[cache.robots-txt] {field} is {value}, and must be from {least} to 31536000"
+                )),
+                "{field}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn unset_loading_cache_lifetimes_are_not_written_back() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse the settings");
+        let written = serde_json::to_value(&settings.cache).expect("should serialize");
+
+        assert_eq!(written, serde_json::json!({ "asset_rules": [] }));
+    }
+
+    #[test]
+    fn a_loading_cache_module_is_read_and_written_back() {
+        let toml_str = format!(
+            r#"{}
+
+            [cache.robots-txt]
+            module = "51degrees"
+        "#,
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse the selection");
+
+        assert_eq!(
+            settings.cache.robots_txt.module.as_deref(),
+            Some("51degrees")
+        );
+        assert!(!settings.cache.robots_txt.is_default());
+        assert_eq!(
+            settings.cache.loading_caches(),
+            [(super::ROBOTS_TXT_CACHE, &settings.cache.robots_txt)],
+            "should list the robots.txt cache by its name"
+        );
+        let written = serde_json::to_value(&settings.cache).expect("should serialize");
+        assert_eq!(
+            written,
+            serde_json::json!({ "asset_rules": [], "robots-txt": { "module": "51degrees" } })
         );
     }
 

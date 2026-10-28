@@ -1,5 +1,6 @@
 //! Integration module registry and sample implementations.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use edgezero_core::body::Body as EdgeBody;
@@ -422,7 +423,12 @@ pub struct IntegrationBuilder {
     adserver: Option<&'static AdServerImplementation>,
     module: Option<&'static str>,
     section: Option<&'static str>,
+    loading_cache: Option<LoadingCacheFactory>,
 }
+
+/// Gives the loading cache a module supplies, see
+/// [`IntegrationBuilder::with_loading_cache`].
+pub type LoadingCacheFactory = fn() -> Arc<dyn crate::platform::PlatformLoadingCache>;
 
 /// The build function of a builder that supplies no page integration.
 fn no_registration(
@@ -462,6 +468,7 @@ impl IntegrationBuilder {
             adserver: None,
             module: None,
             section: None,
+            loading_cache: None,
         }
     }
 
@@ -489,6 +496,7 @@ impl IntegrationBuilder {
             adserver: None,
             module: None,
             section: None,
+            loading_cache: None,
         }
     }
 
@@ -616,6 +624,25 @@ impl IntegrationBuilder {
     #[must_use]
     pub const fn module_name(&self) -> Option<&'static str> {
         self.module
+    }
+
+    /// Offers the loading cache this crate supplies, see
+    /// [`crate::platform::PlatformLoadingCache`].
+    ///
+    /// The offer is not a selection. A cache is selected by naming the module
+    /// in its own `[cache.<name>]` table, and an adapter resolves every table's
+    /// selection with [`loading_caches_from`] when it builds its state. A table
+    /// naming no module takes the one loading cache module the build links.
+    #[must_use]
+    pub const fn with_loading_cache(mut self, factory: LoadingCacheFactory) -> Self {
+        self.loading_cache = Some(factory);
+        self
+    }
+
+    /// The loading cache this builder offers, when it offers one.
+    #[must_use]
+    pub const fn loading_cache(&self) -> Option<LoadingCacheFactory> {
+        self.loading_cache
     }
 
     /// Names the section that selects this module, for one selected outside
@@ -756,4 +783,278 @@ pub(crate) fn all_builders(
     extra: &[IntegrationBuilder],
 ) -> impl Iterator<Item = IntegrationBuilder> + '_ {
     builders().iter().copied().chain(extra.iter().copied())
+}
+
+/// The loading cache each `[cache.<name>]` table selects, from the caches the
+/// builders a deployment links offer. A table that names no module takes the
+/// one loading cache module the build links, and keeps no copy when the build
+/// links none or several. A module's cache is made once however many tables
+/// select it.
+///
+/// # Errors
+///
+/// When a table names a module no linked builder offers a cache from, naming
+/// the table and the modules that do.
+pub fn loading_caches_from(
+    settings: &Settings,
+    builders: &[IntegrationBuilder],
+) -> Result<Arc<crate::platform::LoadingCaches>, Report<TrustedServerError>> {
+    let offered = offered_caches(builders);
+    let mut made: Vec<(&'static str, Arc<dyn crate::platform::PlatformLoadingCache>)> = Vec::new();
+    let mut caches = crate::platform::LoadingCaches::default();
+    for (table, config) in settings.cache.loading_caches() {
+        // A table naming no module takes the one loading cache module the
+        // build links, so answers are held without a line in the document.
+        // With none linked, or several, it holds nothing.
+        let written = match config.module.as_deref() {
+            Some(written) => written,
+            None if offered.len() == 1 => offered[0].0,
+            None => continue,
+        };
+        let (name, factory) = named_cache(table, written, &offered)?;
+        let cache = match made.iter().find(|(made_name, _)| *made_name == name) {
+            Some((_, cache)) => Arc::clone(cache),
+            None => {
+                let cache = factory();
+                made.push((name, Arc::clone(&cache)));
+                cache
+            }
+        };
+        caches.insert(table, cache);
+    }
+    Ok(Arc::new(caches))
+}
+
+/// Refuses a `[cache.<name>]` table whose `module` no linked builder offers
+/// a loading cache from, as [`loading_caches_from`] does. The deploy check
+/// runs it, so a misspelt module fails `ts config validate` rather than the
+/// service.
+///
+/// # Errors
+///
+/// When a table names a module no linked builder offers a cache from, naming
+/// the table and the modules that do.
+pub fn check_loading_cache_modules(
+    settings: &Settings,
+    builders: &[IntegrationBuilder],
+) -> Result<(), Report<TrustedServerError>> {
+    let offered = offered_caches(builders);
+    for (table, config) in settings.cache.loading_caches() {
+        if let Some(written) = config.module.as_deref() {
+            named_cache(table, written, &offered)?;
+        }
+    }
+    Ok(())
+}
+
+/// The loading cache each builder offers, by its module name.
+fn offered_caches(builders: &[IntegrationBuilder]) -> Vec<(&'static str, LoadingCacheFactory)> {
+    builders
+        .iter()
+        .filter_map(|builder| {
+            builder
+                .loading_cache()
+                .map(|factory| (builder.id(), factory))
+        })
+        .collect()
+}
+
+/// The offered cache that `[cache.<table>] module` names as `written`, by the
+/// module's short name or in full.
+///
+/// # Errors
+///
+/// When nothing offered has that name, naming the table and the modules that
+/// offer a cache.
+fn named_cache(
+    table: &str,
+    written: &str,
+    offered: &[(&'static str, LoadingCacheFactory)],
+) -> Result<(&'static str, LoadingCacheFactory), Report<TrustedServerError>> {
+    offered
+        .iter()
+        .find(|(name, _)| {
+            *name == written || crate::module_name::short_form(LOADING_CACHE_TYPE, name) == written
+        })
+        .copied()
+        .ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[cache.{table}] module names `{written}`, which no linked crate offers \
+                     a loading cache from. The loading cache modules this build has are: {}",
+                    offered_cache_names(offered)
+                ),
+            })
+        })
+}
+
+/// The type folder loading cache modules live under, which their short
+/// names leave out.
+const LOADING_CACHE_TYPE: &str = "loading-cache";
+
+/// The short names of the modules offering a cache, for a refusal.
+fn offered_cache_names(offered: &[(&'static str, LoadingCacheFactory)]) -> String {
+    if offered.is_empty() {
+        return "none".to_owned();
+    }
+    offered
+        .iter()
+        .map(|(name, _)| crate::module_name::short_form(LOADING_CACHE_TYPE, name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(test)]
+mod loading_caches_from_tests {
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::platform::{CacheSpec, LoadError, Loader, PlatformLoadingCache, StoreKey};
+    use crate::settings::ROBOTS_TXT_CACHE;
+
+    fn no_build(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(None)
+    }
+
+    fn no_validate(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+        Ok(true)
+    }
+
+    /// A cache that says it keeps values, so a test can tell it from the
+    /// default, which keeps none.
+    struct Keeping;
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformLoadingCache for Keeping {
+        async fn get_or_load(
+            &self,
+            _services: &crate::platform::RuntimeServices,
+            _spec: &CacheSpec,
+            _key: &StoreKey,
+            load: Loader,
+        ) -> Result<Bytes, LoadError> {
+            load().await.map(|loaded| loaded.bytes)
+        }
+
+        async fn remove(
+            &self,
+            _services: &crate::platform::RuntimeServices,
+            _spec: &CacheSpec,
+            _key: &StoreKey,
+        ) {
+        }
+    }
+
+    fn keeping() -> Arc<dyn PlatformLoadingCache> {
+        Arc::new(Keeping)
+    }
+
+    fn nothing() -> Arc<dyn PlatformLoadingCache> {
+        Arc::new(crate::platform::NoLoadingCache)
+    }
+
+    fn builder(source: &'static str) -> IntegrationBuilder {
+        IntegrationBuilder::new("an_id", source, no_build, no_validate)
+    }
+
+    /// A module `id` offering a cache that keeps values.
+    fn offering(id: &'static str) -> IntegrationBuilder {
+        IntegrationBuilder::implementations(id, "a-crate").with_loading_cache(keeping)
+    }
+
+    /// A module `id` offering a cache that keeps nothing.
+    fn offering_nothing(id: &'static str) -> IntegrationBuilder {
+        IntegrationBuilder::implementations(id, "a-crate").with_loading_cache(nothing)
+    }
+
+    fn settings_selecting(module: Option<&str>) -> Settings {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.cache.robots_txt.module = module.map(str::to_owned);
+        settings
+    }
+
+    #[test]
+    fn a_feature_selecting_nothing_takes_the_one_module_offered() {
+        let caches = loading_caches_from(
+            &settings_selecting(None),
+            &[builder("first"), offering("loading-cache.one")],
+        )
+        .expect("no selection is not an error");
+
+        assert!(caches.for_feature(ROBOTS_TXT_CACHE).keeps_values());
+        assert!(!caches.is_empty());
+    }
+
+    #[test]
+    fn a_feature_selecting_nothing_keeps_nothing_when_two_are_offered() {
+        let caches = loading_caches_from(
+            &settings_selecting(None),
+            &[offering("loading-cache.one"), offering("loading-cache.two")],
+        )
+        .expect("no selection is not an error");
+
+        assert!(!caches.for_feature(ROBOTS_TXT_CACHE).keeps_values());
+        assert!(caches.is_empty());
+    }
+
+    #[test]
+    fn a_feature_selecting_nothing_keeps_nothing_when_none_is_offered() {
+        let caches = loading_caches_from(&settings_selecting(None), &[builder("first")])
+            .expect("no selection is not an error");
+
+        assert!(!caches.for_feature(ROBOTS_TXT_CACHE).keeps_values());
+        assert!(caches.is_empty());
+    }
+
+    #[test]
+    fn a_feature_selects_a_module_by_its_short_name_or_in_full() {
+        for written in ["one", "loading-cache.one"] {
+            let caches = loading_caches_from(
+                &settings_selecting(Some(written)),
+                &[
+                    offering_nothing("loading-cache.other"),
+                    offering("loading-cache.one"),
+                ],
+            )
+            .expect("a selected module should be found");
+
+            assert!(
+                caches.for_feature(ROBOTS_TXT_CACHE).keeps_values(),
+                "{written} should select the cache that keeps values, not the first offered"
+            );
+            assert!(!caches.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_feature_naming_a_module_nothing_offers_is_refused_naming_what_is_offered() {
+        let error = loading_caches_from(
+            &settings_selecting(Some("none")),
+            &[offering("loading-cache.one"), offering("loading-cache.two")],
+        )
+        .expect_err("a module nothing offers should be refused");
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains(
+                "[cache.robots-txt] module names `none`, which no linked crate offers a \
+                 loading cache from. The loading cache modules this build has are: one, two"
+            ),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn with_nothing_offered_the_refusal_says_so() {
+        let error = loading_caches_from(&settings_selecting(Some("one")), &[builder("first")])
+            .expect_err("a selection with nothing offered should be refused");
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("The loading cache modules this build has are: none"),
+            "{message}"
+        );
+    }
 }

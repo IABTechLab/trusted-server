@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicBool;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use edgezero_adapter_spin::config_store::SpinConfigStore;
 use edgezero_adapter_spin::context::SpinRequestContext;
-use edgezero_core::app::Hooks;
+use edgezero_core::app::{Hooks, StoreMetadata, StoresMetadata};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::context::RequestContext;
@@ -99,6 +99,10 @@ pub struct AppState {
     /// Services a caller supplied for every request, rather than services built
     /// from the request context. `None` in a deployment.
     services: Option<RuntimeServices>,
+    /// The loading caches the `[cache.<name>]` tables select from the linked
+    /// builders, taken when this state is built and handed to every request's
+    /// services.
+    loading_caches: Arc<trusted_server_core::platform::LoadingCaches>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -247,6 +251,8 @@ fn build_state_with_registrations_and_services(
             &settings,
             &shipped_signal_modules(),
         )?;
+    let loading_caches =
+        trusted_server_core::integrations::loading_caches_from(&settings, integrations)?;
     // This adapter builds no telemetry sink, so a module `[analytics]` selects
     // sends nothing unless the caller's services carry a sink.
     warn_once_when_analytics_is_unsent(
@@ -265,6 +271,7 @@ fn build_state_with_registrations_and_services(
         permission_signal_modules,
         permission_policy,
         services,
+        loading_caches,
     }))
 }
 
@@ -320,6 +327,7 @@ impl AppState {
                     &self.permission_signal_modules,
                     &self.permission_policy,
                 )
+                .with_loading_caches(Arc::clone(&self.loading_caches))
             })
             .with_resolved_ec_module(self.ec_module.clone())
             .with_permission_policy(Arc::clone(&self.permission_policy));
@@ -682,6 +690,15 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
 /// `EdgeZero` [`Hooks`] implementation for the Trusted Server application.
 pub struct TrustedServerApp;
 
+/// The key-value store this adapter declares, by the label `spin.toml`
+/// grants the component, which is also the store startup reads the settings
+/// from. `EdgeZero` opens the label named by the id unless
+/// `EDGEZERO__STORES__KV__DEFAULT__NAME` names another.
+///
+/// `EdgeZero` treats a declared store as required, so a component that
+/// cannot open the label fails every request before any route runs.
+const KV_STORE_ID: &str = "default";
+
 impl Hooks for TrustedServerApp {
     fn name() -> &'static str {
         "TrustedServer"
@@ -697,6 +714,22 @@ impl Hooks for TrustedServerApp {
         };
 
         build_router(&state)
+    }
+
+    /// Declares the key-value store alone, so `run_app` opens it for every
+    /// request and the request's services keep copies in it between
+    /// requests. Startup opens the same store itself for the settings, and
+    /// secrets come from Spin variables, so no config or secret store is
+    /// declared.
+    fn stores() -> StoresMetadata {
+        StoresMetadata {
+            config: None,
+            kv: Some(StoreMetadata {
+                default: KV_STORE_ID,
+                ids: &[KV_STORE_ID],
+            }),
+            secrets: None,
+        }
     }
 }
 

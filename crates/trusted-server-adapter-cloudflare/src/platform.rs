@@ -84,12 +84,13 @@ impl PlatformBackend for NoopBackend {
 /// registers for a request from the stores the application declares, to
 /// [`PlatformConfigStore`].
 ///
-/// Reads delegate through the handle. Writes are unsupported on all current
-/// adapter targets and return errors.
+/// [`TrustedServerApp`](crate::app::TrustedServerApp) declares no config
+/// store, because startup reads the settings from the config store's
+/// namespace itself, so a request is given [`NoopConfigStore`] instead.
 ///
-/// Note: the handle opens one Workers KV namespace. The `store_name`
-/// argument is intentionally ignored; callers cannot route to a different
-/// store by passing a different name.
+/// Reads delegate through the handle. Writes are unsupported on all current
+/// adapter targets and return errors. The handle opens one Workers KV
+/// namespace, so the `store_name` argument is ignored.
 struct ConfigStoreHandleAdapter(ConfigStoreHandle);
 
 impl PlatformConfigStore for ConfigStoreHandleAdapter {
@@ -114,7 +115,9 @@ impl PlatformConfigStore for ConfigStoreHandleAdapter {
 }
 
 /// Bridges edgezero's [`KvHandle`] (registered by `EdgeZero`'s dispatch from
-/// the `TRUSTED_SERVER_KV` KV namespace binding) to [`PlatformKvStore`].
+/// the `TRUSTED_SERVER_KV` KV namespace binding, the store
+/// [`TrustedServerApp`](crate::app::TrustedServerApp) declares) to
+/// [`PlatformKvStore`].
 ///
 /// Delegates all operations through `KvHandle`'s raw-bytes API, which includes
 /// key/value validation before forwarding to the underlying store.
@@ -583,10 +586,12 @@ impl PlatformSecretStore for CloudflareSecretStoreAdapter {
 
 /// Construct [`RuntimeServices`] for an incoming Cloudflare Workers request.
 ///
-/// Config and KV are sourced from the edgezero handles that `EdgeZero`'s
-/// dispatch registers before routing, from the stores the application
-/// declares, and a request with no handle gets a store that answers
-/// nothing. No platform-specific `#[cfg]` is required for these two stores.
+/// The key-value store is the handle `EdgeZero`'s dispatch opens before
+/// routing from the `TRUSTED_SERVER_KV` namespace binding, because
+/// [`TrustedServerApp`](crate::app::TrustedServerApp) declares that store. It
+/// declares no config store, so the config store is the no-op one, and
+/// startup reads the settings from the config store's namespace itself. No
+/// platform-specific `#[cfg]` is required for these two stores.
 ///
 /// Secrets still require direct `worker::Env` access because
 /// `SecretHandle::get_bytes` is async while `PlatformSecretStore::get_bytes`
@@ -610,14 +615,16 @@ pub fn build_runtime_services(
     #[cfg(not(target_arch = "wasm32"))]
     let http_client: Arc<dyn PlatformHttpClient> = Arc::new(UnavailableHttpClient);
 
-    // Config: use the ConfigStoreHandle the dispatch registered, so no
-    // #[cfg] is needed.
+    // Config: no config store is declared, so the dispatch registers no
+    // handle and the no-op store answers.
     let config_store: Arc<dyn PlatformConfigStore> = ctx
         .config_store_default()
         .map(|h| Arc::new(ConfigStoreHandleAdapter(h)) as Arc<dyn PlatformConfigStore>)
         .unwrap_or_else(|| Arc::new(NoopConfigStore));
 
-    // KV: use the KvHandle the dispatch registered, so no #[cfg] is needed.
+    // KV: the handle the dispatch opens for the declared store. A Worker
+    // without the binding fails in the dispatch before routing, so the
+    // unavailable store only answers where no dispatch ran, as in host tests.
     let kv_store: Arc<dyn PlatformKvStore> = ctx
         .kv_store_default()
         .map(|h| Arc::new(KvHandleAdapter(h)) as Arc<dyn PlatformKvStore>)

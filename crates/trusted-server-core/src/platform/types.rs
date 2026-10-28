@@ -174,6 +174,17 @@ pub struct RuntimeServices {
     /// per-request basis by cloning [`RuntimeServices`] with
     /// [`RuntimeServices::with_kv_store`].
     pub(crate) kv_store: Arc<dyn PlatformKvStore>,
+    /// The host's shared cache of small values, or `None` where the host has
+    /// none, in which case a caller holds what it pays for in the key-value
+    /// store instead.
+    pub(crate) value_cache: Option<Arc<dyn super::PlatformValueCache>>,
+    /// The loading cache each `[cache.<name>]` table selected, which loads a
+    /// missing value once per key and keeps its copies in
+    /// [`value_cache`](Self::value_cache) or the key-value store. A table
+    /// naming no module takes the one loading cache module the build links,
+    /// and with none linked, or several, its cache loads through
+    /// [`super::NoLoadingCache`], which holds nothing.
+    pub(crate) loading_caches: Arc<super::LoadingCaches>,
     /// Shared transformed-template cache. Defaults to
     /// [`UnavailableTemplateCache`], so adapters without one degrade to transforming
     /// per request rather than failing. See
@@ -260,6 +271,41 @@ impl RuntimeServices {
     #[must_use]
     pub fn kv_store(&self) -> &dyn PlatformKvStore {
         &*self.kv_store
+    }
+
+    /// The host's shared cache of small values, or `None` where it has none.
+    #[must_use]
+    pub fn value_cache(&self) -> Option<&dyn super::PlatformValueCache> {
+        self.value_cache.as_deref()
+    }
+
+    /// The loading cache the table `[cache.<name>]` selected, by the name a
+    /// [`super::CacheSpec`] carries.
+    #[must_use]
+    pub fn loading_cache_for(&self, name: &str) -> &dyn super::PlatformLoadingCache {
+        self.loading_caches.for_feature(name)
+    }
+
+    /// The value for `key` in the cache `spec` describes, from a fresh copy
+    /// or from `load`, kept in this request's stores. See
+    /// [`super::PlatformLoadingCache::get_or_load`].
+    ///
+    /// The cache is handed these services [without the
+    /// connection](Self::without_connection), because one load serves every
+    /// caller waiting on it.
+    ///
+    /// # Errors
+    ///
+    /// The error of the load this caller waited on.
+    pub async fn load_cached(
+        &self,
+        spec: &super::CacheSpec,
+        key: &super::StoreKey,
+        load: super::Loader,
+    ) -> Result<bytes::Bytes, super::LoadError> {
+        self.loading_cache_for(spec.name)
+            .get_or_load(&self.clone().without_connection(), spec, key, load)
+            .await
     }
 
     /// The shared transformed-template cache.
@@ -417,12 +463,14 @@ impl RuntimeServices {
     }
 
     /// Returns a clone of this instance with nothing of the connection it was
-    /// built for, being default client metadata and no host signals.
+    /// built for, being default client metadata and no host signals. The
+    /// stores, caches, backends, HTTP client and modules stay.
     ///
-    /// For a module whose answer is held and served to everyone who asks, so
-    /// that nothing of one connection can reach what the others are given.
+    /// For work whose answer is held and served to everyone who asks, such as
+    /// a load a cache shares, so that nothing of one connection can reach what
+    /// the others are given.
     #[must_use]
-    pub(crate) fn without_connection(self) -> Self {
+    pub fn without_connection(self) -> Self {
         Self {
             client_info: ClientInfo::default(),
             host_signals: None,
@@ -456,6 +504,23 @@ impl RuntimeServices {
             device_module: Some(device_module),
             ..self
         }
+    }
+
+    /// Returns a clone of this instance with the loading caches replaced.
+    #[must_use]
+    pub fn with_loading_caches(self, caches: Arc<super::LoadingCaches>) -> Self {
+        Self {
+            loading_caches: caches,
+            ..self
+        }
+    }
+
+    /// Returns a clone of this instance with every caller loading through
+    /// `cache`, for a test of one cache.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn with_loading_cache(self, cache: Arc<dyn super::PlatformLoadingCache>) -> Self {
+        self.with_loading_caches(Arc::new(super::LoadingCaches::every(cache)))
     }
 
     /// Returns a clone of this instance carrying the permission policy the
@@ -509,6 +574,8 @@ pub struct RuntimeServicesBuilder {
     config_store: Option<Arc<dyn PlatformConfigStore>>,
     secret_store: Option<Arc<dyn PlatformSecretStore>>,
     kv_store: Option<Arc<dyn PlatformKvStore>>,
+    value_cache: Option<Arc<dyn super::PlatformValueCache>>,
+    loading_caches: Option<Arc<super::LoadingCaches>>,
     template_cache: Option<Arc<dyn super::PlatformTemplateCache>>,
     template_assembler: Option<Arc<dyn super::PlatformTemplateAssembler>>,
     backend: Option<Arc<dyn PlatformBackend>>,
@@ -529,6 +596,8 @@ impl RuntimeServicesBuilder {
             config_store: None,
             secret_store: None,
             kv_store: None,
+            value_cache: None,
+            loading_caches: None,
             template_cache: None,
             template_assembler: None,
             backend: None,
@@ -555,6 +624,20 @@ impl RuntimeServicesBuilder {
     #[must_use]
     pub fn secret_store(mut self, secret_store: Arc<dyn PlatformSecretStore>) -> Self {
         self.secret_store = Some(secret_store);
+        self
+    }
+
+    /// Set the host's shared cache of small values.
+    #[must_use]
+    pub fn value_cache(mut self, cache: Arc<dyn super::PlatformValueCache>) -> Self {
+        self.value_cache = Some(cache);
+        self
+    }
+
+    /// Set the loading cache each `[cache.<name>]` table selected.
+    #[must_use]
+    pub fn loading_caches(mut self, caches: Arc<super::LoadingCaches>) -> Self {
+        self.loading_caches = Some(caches);
         self
     }
 
@@ -687,6 +770,10 @@ impl RuntimeServicesBuilder {
             kv_store: self
                 .kv_store
                 .expect("should set kv_store before building RuntimeServices"),
+            value_cache: self.value_cache,
+            // Defaulted rather than required: a deployment that links no
+            // module supplying one asks each source itself.
+            loading_caches: self.loading_caches.unwrap_or_default(),
             // Defaulted rather than required: an adapter with no template cache
             // should degrade to transforming per request, not fail to build.
             template_cache: self

@@ -214,6 +214,40 @@ fn test_cloudflare_dynamic_publisher_response_does_not_cross_cookie_boundaries()
     );
 }
 
+/// The Worker declares its key-value store and `EdgeZero` treats a declared
+/// store as required, so without the `TRUSTED_SERVER_KV` binding every
+/// request fails before any route runs, health check and robots.txt included.
+#[test]
+#[ignore = "requires the `wrangler` CLI in $PATH and a prebuilt Cloudflare Workers bundle (run build.sh first); the test starts wrangler dev automatically"]
+fn test_cloudflare_without_its_kv_binding_fails_every_request() {
+    init_logger();
+    let envelope = common::config::integration_app_config_envelope(origin_port())
+        .expect("should build the settings blob");
+    let process = environments::cloudflare::CloudflareWorkers
+        .spawn_without_kv_binding(&envelope)
+        .expect("should start Cloudflare Worker");
+    let client = reqwest::blocking::Client::new();
+
+    for path in ["/", "/.well-known/trusted-server.json", "/robots.txt"] {
+        let response = client
+            .get(format!("{}{path}", process.base_url))
+            .send()
+            .expect("should reach the Worker");
+        let status = response.status().as_u16();
+        let body = response.text().expect("should read the response");
+
+        assert_eq!(
+            status, 500,
+            "{path} should fail without the binding: {body}"
+        );
+        assert_eq!(
+            body.trim(),
+            "internal server error",
+            "{path} should fail where the Worker dispatches"
+        );
+    }
+}
+
 /// Exercises an enabled `/auction` request through auction telemetry in workerd.
 ///
 /// `std::time::Instant::now()` traps on Cloudflare's `wasm32-unknown-unknown`

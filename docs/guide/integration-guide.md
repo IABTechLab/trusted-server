@@ -413,6 +413,7 @@ points at the functions that do the work.
 | `.with_plan_registration(...)`                | Optional. Registers the module from the compiled auction plan, for a module whose page support follows what the plan selects. It runs whether or not a section selects the module, and its hooks go first |
 | `.with_plan_validator(...)`                   | Optional. Checks the module's settings against the compiled auction plan, when a deployment is validated and as the settings load                                                                         |
 | `.with_demand(...)` and `.with_adserver(...)` | Optional. Registers an auction implementation that `[demand]` or `[ad-server]` can name. A crate that supplies nothing else starts from `IntegrationBuilder::implementations(...)`                        |
+| `.with_loading_cache(...)`                    | Optional. Offers the loading cache the crate supplies, which a feature selects by the module's name in its `[cache.<name>]` table. An adapter takes the selections with `loading_caches_from`             |
 
 ```rust
 pub fn module_name() -> &'static str {
@@ -837,6 +838,86 @@ builder to that list, in the place its request hooks should run. The order of
 the list does not order page changes, which run in the order an entry names
 them. Offering a module does not run it, because the registry builds a module
 only when a section of the settings selects it.
+
+### Supplying a loading cache
+
+Some answers cost a call to make and are the same for many requests, such as
+each robots.txt module's answer. Core loads such an answer through
+`PlatformLoadingCache`, in `trusted_server_core::platform`, which loads a
+missing value once however many requests ask for it at the same moment, gives
+every request waiting on that load the value or the error, and holds nothing
+that failed. Core declares the interface and `NoLoadingCache`, which holds
+nothing and runs every load, and the implementation comes from a crate outside
+core.
+
+A crate supplies one by implementing `PlatformLoadingCache` and offering a
+factory on its builder with `.with_loading_cache(...)`. The offer is not a
+selection. Each feature that holds answers selects the cache that holds them
+by naming the module in its own `[cache.<name>]` table, so a crate that
+supplies nothing else starts from `IntegrationBuilder::implementations(...)`
+and is named by its id. An adapter takes the selections from the settings and
+the builders it is given with `loading_caches_from` when it builds its state,
+which refuses a name no builder offers a cache from, and hands them to every
+request's services as `LoadingCaches`. A feature whose table names no module
+takes the one loading cache module the build links, and loads through
+`NoLoadingCache` when the build links none or several. No stock list carries a
+loading cache module, so a stock build loads every value through
+`NoLoadingCache`. A deployment that wants copies kept hands a loading cache
+module's builder to its adapter, through `run_with` on Fastly or
+`routes_with_registrations` on Axum, Cloudflare and Spin, as it does for any
+crate of its own. `crates/loading-cache/51degrees` is one such module.
+
+```rust
+pub fn builder() -> IntegrationBuilder {
+    IntegrationBuilder::implementations(MODULE, env!("CARGO_PKG_NAME"))
+        .with_loading_cache(factory)
+}
+
+pub fn factory() -> Arc<dyn PlatformLoadingCache> {
+    Arc::new(ExampleCaches::new())
+}
+```
+
+An implementation keeps its copies in the stores `RuntimeServices` hands each
+call, being the host's value cache from `services.value_cache()` where the
+host supplies one and its key-value store otherwise, under the `StoreKey` the
+caller made, so a copy is shared by every instance that reads the same store.
+
+Code in core, or in a module, loads through the cache with
+`RuntimeServices::load_cached`. It names its cache with a `CacheSpec`, being
+the cache's name, the lifetimes of the memory and store copies and how many
+values the memory copy holds. Its key is a `StoreKey`, which starts with the publisher's `ServerKeyPrefix` from the
+loaded settings, so two publishers sharing a store never share a copy. The
+`Loader` it hands over owns everything it uses, and answers a `LoadedValue`,
+with a lifetime of its own where the source gives one. Its value serves every
+reader, so any services it needs come from
+`services.clone().without_connection()`, never
+the request's own, and `load_cached` hands the cache the same.
+
+```rust
+let key = StoreKey::new(&ServerKeyPrefix::for_settings(settings), CACHE, digest);
+let bytes = services
+    .load_cached(
+        &cache_spec(settings),
+        &key,
+        Box::new(move || {
+            Box::pin(async move {
+                let answer = ask(&owned)
+                    .await
+                    .map_err(|error| LoadError::new(error.to_string()))?;
+                Ok(LoadedValue::new(answer).with_lifetime(Duration::from_secs(3600)))
+            })
+        }),
+    )
+    .await?;
+```
+
+A caller whose load pays off only when its value is kept asks
+`services.loading_cache_for(name).keeps_values()` first, which the cache of a build
+that links none answers with false, and `remove` drops a copy that turned out
+to be unusable. The lifetimes come from the settings, as `[cache.robots-txt]`
+does through `LoadingCacheConfig::lifetimes`, so an operator tunes them
+without a code change.
 
 ### Two traps a vendor will hit
 

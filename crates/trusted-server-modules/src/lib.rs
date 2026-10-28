@@ -21,7 +21,8 @@ use trusted_server_core::integrations::IntegrationBuilder;
 use trusted_server_core::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
 
 /// The builders of the modules a stock build ships from crates of their own,
-/// in hook order.
+/// in hook order. None offers a loading cache, so a deployment that wants
+/// copies kept hands a loading cache module's builder to its adapter.
 #[must_use]
 pub fn builders() -> Vec<IntegrationBuilder> {
     vec![
@@ -441,6 +442,24 @@ mod tests {
                 "ad-server.mock",
             ],
             "should offer the stock modules in the order their hooks run"
+        );
+    }
+
+    /// A stock build links no loading cache module, so every feature loads
+    /// through `NoLoadingCache`, which keeps no copy, and a deployment that
+    /// wants copies kept hands a loading cache module's builder to its
+    /// adapter.
+    #[test]
+    fn the_stock_build_links_no_loading_cache() {
+        let offering: Vec<&str> = builders()
+            .iter()
+            .filter(|builder| builder.loading_cache().is_some())
+            .map(IntegrationBuilder::id)
+            .collect();
+
+        assert!(
+            offering.is_empty(),
+            "a stock build should link no loading cache, and links {offering:?}"
         );
     }
 

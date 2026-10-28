@@ -20,6 +20,7 @@ members = [
     "crates/cmp/didomi",
     "crates/cmp/inmobi",
     "crates/ads-txt/sellers",
+    "crates/loading-cache/51degrees",
     "crates/tag/google-tag-manager",
     "crates/testing/testlight",
     "crates/framework/nextjs",
@@ -97,6 +98,8 @@ error-stack = "0.6"
 esi = "0.7.2"
 fastly = "0.13"
 fern = "0.7.1"
+# The published loading cache package, which builds for every host.
+fiftyone-caching = { version = "4.5.8-49", default-features = false }
 flate2 = "1.1"
 futures = "0.3"
 # `ts dev lint domains` / `install-hooks` drive all git access through
@@ -165,6 +168,7 @@ trusted-server-cmp-sourcepoint = { path = "crates/cmp/sourcepoint" }
 trusted-server-cmp-didomi = { path = "crates/cmp/didomi" }
 trusted-server-cmp-inmobi = { path = "crates/cmp/inmobi" }
 trusted-server-ads-txt-sellers = { path = "crates/ads-txt/sellers" }
+trusted-server-loading-cache-51degrees = { path = "crates/loading-cache/51degrees" }
 trusted-server-tag-google-tag-manager = { path = "crates/tag/google-tag-manager" }
 trusted-server-testing-testlight = { path = "crates/testing/testlight" }
 trusted-server-framework-nextjs = { path = "crates/framework/nextjs" }

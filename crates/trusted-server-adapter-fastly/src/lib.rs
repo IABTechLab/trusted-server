@@ -33,9 +33,7 @@ use trusted_server_core::evidence::{BorrowedRequestInfo, HostSignals};
 use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::module_context::{ModuleContext, ModuleRequest};
 use trusted_server_core::platform::build_geo_module;
-use trusted_server_core::platform::{
-    ClientInfo, PlatformKvStore, RuntimeServices, UnavailableKvStore,
-};
+use trusted_server_core::platform::{ClientInfo, RuntimeServices, UnavailableKvStore};
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
@@ -54,6 +52,7 @@ mod rate_limiter;
 mod sandbox;
 mod template_cache;
 mod tinybird;
+mod value_cache;
 
 use crate::app::{
     AppState, EcFinalizeState, RuntimeStoreConfig, TrustedServerApp, build_finalize_services,
@@ -630,7 +629,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
         Some(settings) => {
             // The entry point is synchronous host code, so it drives the async
             // module seam at the same boundary it already drives the router.
-            let services = build_finalize_services(settings, entry_point_kv_store(&app_state));
+            let services = entry_point_finalize_services(settings, &app_state);
             let registered = app_state
                 .as_deref()
                 .and_then(|state| state.registry.device_module());
@@ -679,7 +678,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
                 settings,
                 &mut response,
                 client_ip,
-                entry_point_kv_store(&app_state),
+                entry_point_finalize_services(settings, &app_state),
             ));
         } else {
             match load_settings_from_config_store(&runtime_stores) {
@@ -688,7 +687,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
                         &settings,
                         &mut response,
                         client_ip,
-                        entry_point_kv_store(&app_state),
+                        entry_point_finalize_services(&settings, &app_state),
                     ));
                 }
                 Err(e) => {
@@ -783,31 +782,40 @@ fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
         .is_some()
 }
 
-/// The key-value store a module called from the entry point is given.
+/// The services a module called from the entry point is given, with the
+/// state's key-value store and loading cache when the state was built.
 ///
 /// The entry-point paths run whether or not application state was built, so a
-/// deployment whose state failed to build offers the unavailable store rather
-/// than no services at all. A module that needs the store then fails its own
-/// call instead of the entry point silently skipping the module.
-fn entry_point_kv_store(app_state: &Option<Arc<AppState>>) -> Arc<dyn PlatformKvStore> {
-    app_state.as_ref().map_or_else(
-        || Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>,
-        |state| Arc::clone(&state.default_kv_store),
-    )
+/// deployment whose state failed to build offers the unavailable store and a
+/// cache that holds nothing rather than no services at all. A module that
+/// needs the store then fails its own call instead of the entry point silently
+/// skipping the module.
+fn entry_point_finalize_services(
+    settings: &Settings,
+    app_state: &Option<Arc<AppState>>,
+) -> RuntimeServices {
+    match app_state {
+        Some(state) => build_finalize_services(
+            settings,
+            Arc::clone(&state.default_kv_store),
+            Arc::clone(&state.loading_caches),
+        ),
+        None => build_finalize_services(settings, Arc::new(UnavailableKvStore), Arc::default()),
+    }
 }
 
 async fn apply_entry_point_finalize_headers(
     settings: &Settings,
     response: &mut HttpResponse,
     client_ip: Option<std::net::IpAddr>,
-    kv_store: Arc<dyn PlatformKvStore>,
+    services: RuntimeServices,
 ) {
     // Route through the [geo] module selector, so a deployment that opts
     // out of geolocation makes no host geo call on the entry-point finalize
     // path either.
     let geo = build_geo_module(settings, Arc::new(FastlyPlatformGeo));
     let geo_info = if geo_allowed_for_response(response) {
-        let services = build_finalize_services(settings, kv_store).with_client_info(ClientInfo {
+        let services = services.with_client_info(ClientInfo {
             client_ip,
             ..ClientInfo::default()
         });
@@ -1228,7 +1236,8 @@ mod tests {
     #[test]
     fn the_device_module_the_registry_resolved_classifies_the_request() {
         let settings = test_settings();
-        let services = build_finalize_services(&settings, Arc::new(UnavailableKvStore));
+        let services =
+            build_finalize_services(&settings, Arc::new(UnavailableKvStore), Arc::default());
         let registered: Arc<dyn DeviceModule> = Arc::new(MarkedDeviceModule);
 
         let signals = futures::executor::block_on(derive_device_signals(
@@ -1249,7 +1258,8 @@ mod tests {
     #[test]
     fn with_no_registered_module_the_built_in_module_classifies_the_request() {
         let settings = test_settings();
-        let services = build_finalize_services(&settings, Arc::new(UnavailableKvStore));
+        let services =
+            build_finalize_services(&settings, Arc::new(UnavailableKvStore), Arc::default());
         let req = page_request();
 
         let signals =

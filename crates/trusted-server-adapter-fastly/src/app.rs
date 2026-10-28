@@ -123,8 +123,8 @@ use trusted_server_core::integrations::{
 };
 use trusted_server_core::permissions::PermissionState;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformIdentity, PlatformKvStore, PolicyOrigin, RuntimeServices,
-    StoreName, UNKNOWN, build_geo_module,
+    ClientInfo, GeoInfo, LoadingCaches, PlatformIdentity, PlatformKvStore, PolicyOrigin,
+    RuntimeServices, StoreName, UNKNOWN, build_geo_module,
 };
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
@@ -213,6 +213,10 @@ pub(crate) struct AppState {
     /// than the first request, and handed to every request's services.
     pub(crate) permission_signal_modules:
         Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>]>,
+    /// The loading caches the `[cache.<name>]` tables select from the linked
+    /// builders, taken when this state is built and handed to every request's
+    /// services.
+    pub(crate) loading_caches: Arc<LoadingCaches>,
     /// The permission policy the domain's settings loaded, which every
     /// request is given.
     pub(crate) permission_policy: Arc<trusted_server_core::permissions::PermissionPolicy>,
@@ -362,6 +366,8 @@ pub(crate) fn build_state_with_registrations(
 
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
+    let loading_caches =
+        trusted_server_core::integrations::loading_caches_from(&settings, integrations)?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -371,6 +377,7 @@ pub(crate) fn build_state_with_registrations(
         auction_telemetry_sink,
         ec_module,
         permission_signal_modules,
+        loading_caches,
         permission_policy,
     }))
 }
@@ -474,6 +481,8 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
         .kv_store(Arc::clone(&state.default_kv_store))
+        .value_cache(Arc::new(crate::value_cache::FastlyValueCache))
+        .loading_caches(Arc::clone(&state.loading_caches))
         // Constructed unconditionally, but only read when the assembly mode is a
         // shared-template one — which defaults to Inline, so this is inert until an
         // operator opts in.
@@ -542,11 +551,14 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
 pub(crate) fn build_finalize_services(
     settings: &Settings,
     kv_store: Arc<dyn PlatformKvStore>,
+    loading_caches: Arc<LoadingCaches>,
 ) -> RuntimeServices {
     RuntimeServices::builder()
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
         .kv_store(kv_store)
+        .value_cache(Arc::new(crate::value_cache::FastlyValueCache))
+        .loading_caches(loading_caches)
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .geo(build_geo_module(settings, Arc::new(FastlyPlatformGeo)))
@@ -1551,7 +1563,11 @@ impl TrustedServerApp {
         let mut router = RouterService::builder().middleware(FinalizeResponseMiddleware::new(
             Arc::clone(&state.settings),
             build_geo_module(&state.settings, Arc::new(FastlyPlatformGeo)),
-            build_finalize_services(&state.settings, Arc::clone(&state.default_kv_store)),
+            build_finalize_services(
+                &state.settings,
+                Arc::clone(&state.default_kv_store),
+                Arc::clone(&state.loading_caches),
+            ),
         ));
 
         let fallback_handler = fallback_route_handler(Arc::clone(state));
@@ -1909,6 +1925,7 @@ mod tests {
             default_kv_store,
             ec_module,
             permission_signal_modules: Arc::default(),
+            loading_caches: Arc::default(),
             permission_policy: trusted_server_core::permissions::PermissionPolicy::sample(),
         });
         TrustedServerApp::routes_for_state(&state)

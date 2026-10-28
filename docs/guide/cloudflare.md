@@ -68,9 +68,16 @@ cloudflare --permissions <file>`, which writes the settings and the policy file
 they name into the remote config store. Store the two credential values with
 `wrangler secret put publisher_proxy_secret` and `wrangler secret put
 ec_passphrase`; do not commit them to a Wrangler manifest. Deploy only after
-the config store holds the blob and the two secrets are set.
+the config store holds the blob, the two secrets are set and the
+`TRUSTED_SERVER_KV` namespace is bound.
 
-Request-time store registries are unwired, so EC KV lookup is not available.
+The adapter declares `TRUSTED_SERVER_KV` as its key-value store, so EdgeZero
+opens it for every request, and a loading cache module that a deployment links
+keeps its copies there between requests, while a copy in memory lasts one
+request because the Worker builds its state for each request. EdgeZero treats
+a declared store as required, so a Worker deployed without the binding answers
+every request with `500` before any route runs. No request-time config store
+is declared, and EC KV lookup is not available.
 Forwarded client-IP headers are sanitized, but `[trusted_client_ip]` is not
 resolved. See the [API reference](./api-reference) for route-level behavior.
 

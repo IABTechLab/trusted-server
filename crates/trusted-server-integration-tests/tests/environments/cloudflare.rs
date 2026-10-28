@@ -26,6 +26,27 @@ pub struct CloudflareWorkers;
 const CLOUDFLARE_DEFAULT_PORT: u16 = 8787;
 const CI_CONFIG: &str = "wrangler.ci.toml";
 
+/// The CI wrangler config without the key-value store's namespace, which
+/// [`CloudflareWorkers::spawn_without_kv_binding`] writes.
+const GENERATED_UNBOUND_CONFIG: &str = "wrangler.integration.generated.toml";
+
+/// The header of a table of the CI wrangler config that binds a key-value
+/// namespace.
+const KV_NAMESPACES_TABLE: &str = "[[kv_namespaces]]";
+
+/// The binding of the key-value namespace the adapter declares as its store.
+const KV_STORE_BINDING: &str = "TRUSTED_SERVER_KV";
+
+/// What [`CloudflareWorkers::spawn_wrangler`] waits for before it hands the
+/// Worker to a test.
+#[derive(Clone, Copy)]
+enum Readiness {
+    /// The health check answers with success.
+    Healthy,
+    /// The Worker answers at all, for a Worker whose every answer is an error.
+    AnyAnswer,
+}
+
 /// The arguments that store `envelope_path`'s contents in the Worker's local
 /// config store, the namespace bound as the store's default platform name in
 /// `config`.
@@ -75,6 +96,85 @@ fn seed_config_store(wrangler_dir: &Path, config: &str, envelope: &str) -> TestR
     Ok(())
 }
 
+/// Writes the CI wrangler config without the key-value store's namespace,
+/// keeping the config store's, and returns the file's name.
+fn write_ci_config_without_kv_binding(wrangler_dir: &Path) -> TestResult<String> {
+    let template_path = wrangler_dir.join(CI_CONFIG);
+    let template = std::fs::read_to_string(&template_path)
+        .change_context(TestError::RuntimeSpawn)
+        .attach(format!(
+            "failed to read Cloudflare CI wrangler config at {}",
+            template_path.display()
+        ))?;
+    let generated = without_kv_store_binding(&template)?;
+    let output_path = wrangler_dir.join(GENERATED_UNBOUND_CONFIG);
+    std::fs::write(&output_path, generated)
+        .change_context(TestError::RuntimeSpawn)
+        .attach(format!(
+            "failed to write generated Cloudflare CI wrangler config at {}",
+            output_path.display()
+        ))?;
+    Ok(GENERATED_UNBOUND_CONFIG.to_string())
+}
+
+/// `template` without the `[[kv_namespaces]]` table that binds
+/// [`KV_STORE_BINDING`], being the table's header and every line after it up
+/// to the next blank line or table. Every other table is kept.
+fn without_kv_store_binding(template: &str) -> TestResult<String> {
+    let binding = format!("binding = \"{KV_STORE_BINDING}\"");
+    let mut kept = Vec::new();
+    let mut table = Vec::new();
+    let mut dropped = 0;
+    for line in template.lines() {
+        let trimmed = line.trim();
+        if !table.is_empty() && (trimmed.is_empty() || trimmed.starts_with('[')) {
+            dropped += keep_unless_bound(&mut table, &mut kept, &binding);
+        }
+        if trimmed == KV_NAMESPACES_TABLE || !table.is_empty() {
+            table.push(line);
+        } else {
+            kept.push(line);
+        }
+    }
+    dropped += keep_unless_bound(&mut table, &mut kept, &binding);
+    if dropped != 1 {
+        return Err(Report::new(TestError::RuntimeSpawn).attach(format!(
+            "Cloudflare CI wrangler config must bind `{KV_STORE_BINDING}` in exactly one `{KV_NAMESPACES_TABLE}` table, found {dropped}"
+        )));
+    }
+    let mut generated = kept.join("\n");
+    generated.push('\n');
+    Ok(generated)
+}
+
+/// Moves the lines of `table` onto `kept`, unless the table holds the line
+/// `binding`, and returns the number of tables dropped.
+fn keep_unless_bound<'a>(
+    table: &mut Vec<&'a str>,
+    kept: &mut Vec<&'a str>,
+    binding: &str,
+) -> usize {
+    if table.iter().any(|line| line.trim() == binding) {
+        table.clear();
+        1
+    } else {
+        kept.append(table);
+        0
+    }
+}
+
+/// Polls `base_url` until the Worker answers with any status.
+fn wait_for_any_answer(base_url: &str) -> TestResult<()> {
+    for _ in 0..30 {
+        if reqwest::blocking::get(base_url).is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Err(Report::new(TestError::RuntimeNotReady)
+        .attach(format!("Runtime at {base_url} did not answer after 15s")))
+}
+
 impl RuntimeEnvironment for CloudflareWorkers {
     fn id(&self) -> &'static str {
         "cloudflare"
@@ -92,7 +192,7 @@ impl RuntimeEnvironment for CloudflareWorkers {
         } else {
             "wrangler.toml"
         };
-        self.spawn_wrangler(&wrangler_dir, config)
+        self.spawn_wrangler(&wrangler_dir, config, Readiness::Healthy)
     }
 
     fn health_check_path(&self) -> &str {
@@ -116,10 +216,33 @@ impl CloudflareWorkers {
     pub fn spawn_with_config_envelope(&self, envelope: &str) -> TestResult<RuntimeProcess> {
         let wrangler_dir = self.wrangler_dir();
         seed_config_store(&wrangler_dir, CI_CONFIG, envelope)?;
-        self.spawn_wrangler(&wrangler_dir, CI_CONFIG)
+        self.spawn_wrangler(&wrangler_dir, CI_CONFIG, Readiness::Healthy)
     }
 
-    fn spawn_wrangler(&self, wrangler_dir: &Path, config: &str) -> TestResult<RuntimeProcess> {
+    /// Start `wrangler dev` with a test-specific settings blob in its config
+    /// store and no namespace bound for the key-value store, returning once
+    /// the Worker answers at all, because every answer it gives is then an
+    /// error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TestError::RuntimeSpawn`] if the wrangler config cannot be
+    /// written, the config store cannot be seeded or `wrangler dev` cannot be
+    /// started, and [`TestError::RuntimeNotReady`] if the Worker never
+    /// answers.
+    pub fn spawn_without_kv_binding(&self, envelope: &str) -> TestResult<RuntimeProcess> {
+        let wrangler_dir = self.wrangler_dir();
+        let config = write_ci_config_without_kv_binding(&wrangler_dir)?;
+        seed_config_store(&wrangler_dir, &config, envelope)?;
+        self.spawn_wrangler(&wrangler_dir, &config, Readiness::AnyAnswer)
+    }
+
+    fn spawn_wrangler(
+        &self,
+        wrangler_dir: &Path,
+        config: &str,
+        readiness: Readiness,
+    ) -> TestResult<RuntimeProcess> {
         let port = super::find_available_port().unwrap_or(CLOUDFLARE_DEFAULT_PORT);
 
         #[cfg(unix)]
@@ -187,7 +310,12 @@ impl CloudflareWorkers {
         let handle = CloudflareHandle { child };
         let base_url = format!("http://127.0.0.1:{port}");
 
-        super::wait_for_ready(&base_url, self.health_check_path(), true)?;
+        match readiness {
+            Readiness::Healthy => {
+                super::wait_for_ready(&base_url, self.health_check_path(), true)?;
+            }
+            Readiness::AnyAnswer => wait_for_any_answer(&base_url)?,
+        }
 
         Ok(RuntimeProcess {
             inner: Box::new(handle),
@@ -278,6 +406,48 @@ mod tests {
         assert!(
             bound,
             "the CI config should bind the config store's namespace"
+        );
+    }
+
+    #[test]
+    fn without_kv_store_binding_drops_only_the_key_value_stores_table() {
+        let template = include_str!("../../../trusted-server-adapter-cloudflare/wrangler.ci.toml");
+
+        let generated =
+            without_kv_store_binding(template).expect("should drop the key-value store's table");
+
+        let manifest: toml::Value = toml::from_str(&generated).expect("should stay valid TOML");
+        let original: toml::Value = toml::from_str(template).expect("should parse the template");
+        let bound: Vec<&str> = manifest["kv_namespaces"]
+            .as_array()
+            .expect("should keep the config store's namespace")
+            .iter()
+            .filter_map(|namespace| namespace["binding"].as_str())
+            .collect();
+        assert_eq!(
+            bound,
+            [DEFAULT_CONFIG_STORE_ID],
+            "should bind the config store's namespace alone"
+        );
+        assert_eq!(
+            manifest.get("vars"),
+            original.get("vars"),
+            "should keep the variables"
+        );
+        assert_eq!(
+            manifest.get("main"),
+            original.get("main"),
+            "should keep the bundle"
+        );
+    }
+
+    #[test]
+    fn without_kv_store_binding_rejects_a_template_that_does_not_bind_the_store() {
+        let result = without_kv_store_binding("[vars]\n");
+
+        assert!(
+            result.is_err(),
+            "should reject a template that does not bind the store"
         );
     }
 }

@@ -98,7 +98,8 @@ impl PlatformBackend for NoopBackend {
 }
 
 // ---------------------------------------------------------------------------
-// edgezero handle adapters — injected by edgezero_adapter_spin::run_app
+// edgezero handle adapters, for the handles edgezero_adapter_spin::run_app
+// injects for the stores the app declares and the config handle startup opens
 // ---------------------------------------------------------------------------
 
 /// Bridges edgezero's [`ConfigStoreHandle`] to [`PlatformConfigStore`].
@@ -700,9 +701,12 @@ impl PlatformSecretStore for SpinSecretStoreAdapter {
 
 /// Construct [`RuntimeServices`] for an incoming Spin request.
 ///
-/// Config and KV are sourced from the `EdgeZero` handles that `run_app` injects
-/// before routing. Secrets are read synchronously from Spin component
-/// variables because Trusted Server's platform secret trait is sync.
+/// The key-value store is the handle `run_app` opens before routing for the
+/// `default` store [`TrustedServerApp`](crate::app::TrustedServerApp)
+/// declares. It declares no config store, so the config store is the no-op
+/// one, and startup reads the settings from the `default` store itself.
+/// Secrets are read synchronously from Spin component variables because
+/// Trusted Server's platform secret trait is sync.
 #[must_use]
 pub fn build_runtime_services(
     ctx: &edgezero_core::context::RequestContext,

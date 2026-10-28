@@ -56,33 +56,6 @@ fn routes_build_without_panic() {
     let _router = TrustedServerApp::routes();
 }
 
-#[test]
-fn edgezero_manifest_loads_and_resolves_spin_stores() {
-    let loader = edgezero_core::manifest::ManifestLoader::load_from_str(include_str!(
-        "../../../edgezero.toml"
-    ));
-    let manifest = loader.manifest();
-
-    assert!(
-        manifest.stores.config.is_some(),
-        "Spin EdgeZero manifest must enable config store injection"
-    );
-    assert_eq!(
-        manifest
-            .stores
-            .kv
-            .as_ref()
-            .expect("should declare a KV store")
-            .default_id(),
-        "trusted_server_kv",
-        "Spin KV declaration must expose its default logical store id"
-    );
-    assert!(
-        manifest.secret_store_enabled(edgezero_core::app::SPIN_ADAPTER),
-        "Spin EdgeZero manifest must enable secret handle injection"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Middleware regression tests, which verify FinalizeResponseMiddleware is
 // wired so it cannot be removed silently.

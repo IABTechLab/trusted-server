@@ -1,5 +1,8 @@
 //! Keep the checked-in Cloudflare configuration aligned with the runtime defaults.
 
+use edgezero_core::app::Hooks as _;
+use edgezero_core::env_config::EnvConfig;
+use trusted_server_adapter_cloudflare::app::TrustedServerApp;
 use trusted_server_core::config_payload::DEFAULT_CONFIG_STORE_ID;
 
 /// The binding of the key-value store's own namespace.
@@ -31,6 +34,46 @@ fn kv_namespaces(manifest: &str) -> Vec<(String, String)> {
             )
         })
         .collect()
+}
+
+/// `EdgeZero` treats a declared store as required, so a manifest that binds
+/// no namespace under the name it opens for the declared key-value store
+/// would fail every request.
+#[test]
+fn every_wrangler_manifest_binds_the_declared_key_value_store() {
+    let declared = TrustedServerApp::stores()
+        .kv
+        .expect("the adapter should declare its key-value store");
+
+    for (manifest_name, text) in [
+        ("wrangler.toml", include_str!("../wrangler.toml")),
+        ("wrangler.ci.toml", include_str!("../wrangler.ci.toml")),
+    ] {
+        let manifest: toml::Value =
+            toml::from_str(text).expect("should parse the Wrangler manifest");
+        // `EdgeZero` reads a store's binding name from the Worker's variables
+        // and falls back to the store's id.
+        let vars = manifest
+            .get("vars")
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flatten()
+            .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())));
+        let binding = EnvConfig::from_vars(vars).store_name("kv", declared.default);
+        let bound: Vec<&str> = manifest
+            .get("kv_namespaces")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|namespace| namespace.get("binding")?.as_str())
+            .collect();
+
+        assert!(
+            bound.contains(&binding.as_str()),
+            "{manifest_name} should bind `{binding}`, which the declared store opens, \
+             and binds {bound:?}"
+        );
+    }
 }
 
 #[test]

@@ -437,6 +437,21 @@ pull_sync_concurrency = 3
 # thumbnail = "width=150&crop=1:1,smart"
 # medium = "format=auto&width=828"
 
+# The loading cache that holds each robots.txt module's answer, named by the
+# module that offers it, and how long the copies last, in seconds: the brief
+# copy in process memory, the longest the copy in the shared store is used, and
+# how long that copy lasts unused. A module's own refresh ends its answer
+# sooner. Memory may be 0, the other two must be at least 1, and none may be
+# more than a year. Without `module` the one loading cache module the build
+# links is used, and with none or several linked no copy is kept. A stock
+# build links none and refuses any `module`, so `51degrees` is written only
+# where a deployment links crates/loading-cache/51degrees.
+# [cache.robots-txt]
+# module = "51degrees"
+# memory_seconds = 60
+# store_seconds = 604800
+# store_idle_seconds = 2592000
+
 # Operator-controlled cache header policies for static/rehosted assets. Disabled
 # rules never match, and matcher/policy validation is deferred until a rule is
 # enabled; IDs must be non-empty and unique. Keep rules disabled unless the

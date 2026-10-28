@@ -542,11 +542,52 @@ fn accept_answers_once(_settings: &Settings) -> Result<bool, Report<TrustedServe
     Ok(true)
 }
 
-/// This adapter holds no answer, so every request for the file asks each
-/// module, and a module that fails with nothing held makes the file a `503`
-/// that tells a crawler to come back in ten minutes and is not stored.
+/// The id of the module that never answers.
+const NEVER_ANSWERS_ID: &str = "robots-txt-never-answers";
+
+/// A robots.txt contributor that fails every time it is asked.
+#[derive(Debug)]
+struct NeverAnswers;
+
+#[async_trait::async_trait(?Send)]
+impl RobotsTxtContributor for NeverAnswers {
+    fn refresh(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+
+    fn fingerprint(&self) -> String {
+        "never-answers".to_owned()
+    }
+
+    async fn contribute(
+        &self,
+        _call: ModuleCall<'_>,
+    ) -> Result<Contribution, Report<TrustedServerError>> {
+        Err(Report::new(TrustedServerError::Proxy {
+            message: "the rules service is down".to_owned(),
+        }))
+    }
+}
+
+fn register_never_answers(
+    _settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    Ok(Some(
+        IntegrationRegistration::builder(NEVER_ANSWERS_ID)
+            .with_robots_txt_contributor("robots-txt.never-answers", Arc::new(NeverAnswers))
+            .build(),
+    ))
+}
+
+fn accept_never_answers(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    Ok(true)
+}
+
+/// A module whose answer is due for a refresh at once is asked again on the
+/// next request, and when it fails the last answer it gave is served past its
+/// age, because yesterday's rules are a better answer than none.
 #[test]
-fn with_nothing_held_a_module_that_fails_makes_the_file_unavailable() {
+fn a_module_that_fails_after_answering_has_its_last_answer_served() {
     let settings = settings_with(&format!(
         r#"
         [robots-txt]
@@ -573,11 +614,39 @@ fn with_nothing_held_a_module_that_fails_makes_the_file_unavailable() {
     let second = get(&router, "/robots.txt", None);
     assert_eq!(
         second.status().as_u16(),
-        503,
-        "nothing is held here, so the module is asked again and its failure fails the file"
+        200,
+        "the module fails, so the answer it gave last is served"
     );
-    assert_eq!(header_text(&second, "retry-after"), Some("600"));
-    assert_eq!(header_text(&second, "cache-control"), Some("no-store"));
+    assert_eq!(body_text(second), "User-Agent: OnceBot\nDisallow: /\n");
+}
+
+/// A module that fails with no answer kept makes the file a `503` that tells
+/// a crawler to come back in ten minutes and is not stored.
+#[test]
+fn with_nothing_kept_a_module_that_fails_makes_the_file_unavailable() {
+    let settings = settings_with(&format!(
+        r#"
+        [robots-txt]
+        modules = ["never-answers"]
+        {HMAC_BLOCK}
+
+        [testing]
+        modules = ["robots-txt-never-answers"]
+        "#
+    ));
+    let builder = IntegrationBuilder::new(
+        NEVER_ANSWERS_ID,
+        NEVER_ANSWERS_ID,
+        register_never_answers,
+        accept_never_answers,
+    )
+    .with_module_name("testing.robots-txt-never-answers");
+    let router = router_with(settings, &[builder]);
+
+    let response = get(&router, "/robots.txt", None);
+    assert_eq!(response.status().as_u16(), 503);
+    assert_eq!(header_text(&response, "retry-after"), Some("600"));
+    assert_eq!(header_text(&response, "cache-control"), Some("no-store"));
 }
 
 /// A request prepares exactly once whether a named route or the fallback
@@ -1150,7 +1219,11 @@ fn ec_and_device_selectors_naming_a_module_resolve_the_modules_it_declares() {
         "the Edge Cookie module should be the one the module declared"
     );
 
-    let services = build_finalize_services(&state.settings, Arc::clone(&state.default_kv_store));
+    let services = build_finalize_services(
+        &state.settings,
+        Arc::clone(&state.default_kv_store),
+        Arc::default(),
+    );
     let request_info = OwnedRequestInfo::new("192.0.2.1".to_owned(), HeaderMap::new());
     let method = Method::GET;
     let context = ModuleContext::new(ModuleRequest::new(
@@ -1194,8 +1267,11 @@ fn device_selector_naming_a_module_classifies_a_request_with_it() {
         )),
         &[seam_probe::builder()],
     );
-    let services =
-        build_finalize_services(&selected.settings, Arc::clone(&selected.default_kv_store));
+    let services = build_finalize_services(
+        &selected.settings,
+        Arc::clone(&selected.default_kv_store),
+        Arc::default(),
+    );
     let signals = block_on(crate::derive_device_signals(
         &selected.settings,
         selected.registry.device_module(),
@@ -1212,7 +1288,11 @@ fn device_selector_naming_a_module_classifies_a_request_with_it() {
         settings_with(&format!("{HMAC_BLOCK}{PROBE_BLOCK}")),
         &[seam_probe::builder()],
     );
-    let services = build_finalize_services(&unset.settings, Arc::clone(&unset.default_kv_store));
+    let services = build_finalize_services(
+        &unset.settings,
+        Arc::clone(&unset.default_kv_store),
+        Arc::default(),
+    );
     let signals = block_on(crate::derive_device_signals(
         &unset.settings,
         unset.registry.device_module(),
