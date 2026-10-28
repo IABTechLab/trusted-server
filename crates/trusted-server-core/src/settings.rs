@@ -3931,9 +3931,43 @@ pub struct Settings {
         reason = "the field exists so that reading the renamed table fails with directions"
     )]
     renamed_permission_signal: RenamedPermissionSignalTable,
+    /// The policy the runtime loader read and checked for `permissions`.
+    #[serde(skip)]
+    permission_policy: Option<std::sync::Arc<crate::permissions::PermissionPolicy>>,
 }
 
 impl Settings {
+    /// The permission policy this domain loaded.
+    ///
+    /// The runtime loader attaches it, and refuses a domain without one, so
+    /// only settings built some other way, as in a test, have none.
+    #[must_use]
+    pub fn permission_policy(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::permissions::PermissionPolicy>> {
+        self.permission_policy.as_ref()
+    }
+
+    /// Keeps the policy the runtime loader read for these settings.
+    pub(crate) fn attach_permission_policy(
+        &mut self,
+        policy: std::sync::Arc<crate::permissions::PermissionPolicy>,
+    ) {
+        self.permission_policy = Some(policy);
+    }
+
+    /// The same settings carrying `policy`, as the runtime loader would
+    /// attach it, for tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn with_permission_policy(
+        mut self,
+        policy: std::sync::Arc<crate::permissions::PermissionPolicy>,
+    ) -> Self {
+        self.permission_policy = Some(policy);
+        self
+    }
+
     /// Creates a new [`Settings`] instance from a TOML string.
     ///
     /// # Errors
@@ -4053,22 +4087,6 @@ impl Settings {
             .validate_jurisdiction_acknowledgment(&settings.ec)?;
         settings.validate_admin_coverage()?;
         settings.validate_admin_handler_passwords()?;
-
-        // Log the policy's declared default once per settings load, so an
-        // operator can see which permissions an unmatched request is granted
-        // without a signal, and which jurisdiction its consent gates apply.
-        let maps = crate::permissions::PermissionMaps::standard();
-        let granted: Vec<String> = maps
-            .baseline(None, None)
-            .permissions()
-            .iter()
-            .map(|permission| permission.to_string())
-            .collect();
-        log::debug!(
-            "Permission baseline: permissions.yaml top node, jurisdiction {}; granted without a signal: [{}]",
-            maps.default_jurisdiction(),
-            granted.join(", ")
-        );
 
         Ok(settings)
     }

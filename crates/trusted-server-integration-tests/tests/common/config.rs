@@ -1,6 +1,7 @@
 use edgezero_core::blob_envelope::BlobEnvelope;
 use error_stack::Report;
 use trusted_server_core::config::TrustedServerAppConfig;
+use trusted_server_core::permissions::{SAMPLE_POLICY_TEXT, policy_sha256};
 
 use crate::common::runtime::{TestError, TestResult};
 
@@ -32,6 +33,10 @@ fn app_config_envelope(
         })?;
     let mut settings = app_config.into_settings();
     settings.publisher.origin_url = origin_url;
+    // What `ts config push --permissions` writes for the sample the fixture
+    // names. Axum reads the file from its folder and leaves the text unused.
+    settings.permissions.sha256 = Some(policy_sha256(SAMPLE_POLICY_TEXT));
+    settings.permissions.text = Some(SAMPLE_POLICY_TEXT.to_owned());
     let app_config = TrustedServerAppConfig::new(settings).map_err(|report| {
         Report::new(TestError::ConfigGeneration)
             .attach(format!("invalid generated integration config: {report:?}"))

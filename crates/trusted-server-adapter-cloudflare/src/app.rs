@@ -138,6 +138,7 @@ async fn load_startup_settings(env: &worker::Env) -> Result<Settings, Report<Tru
         &envelope,
         &secret_store,
         &StoreName::from(DEFAULT_SECRET_STORE_ID),
+        trusted_server_core::platform::PolicyOrigin::Blob,
     )
 }
 
@@ -1039,5 +1040,33 @@ mod tests {
             500,
             "a configuration error should answer 500"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_startup_router_answers_500_to_a_policy_load_error() {
+        use trusted_server_core::test_support::policy_failure;
+
+        let error = policy_failure::load_error();
+        assert!(
+            format!("{error:?}").contains(&format!("`{}`", policy_failure::POLICY_NAME)),
+            "the startup error should name the policy: {error:?}"
+        );
+
+        let router = startup_error_router(&error);
+        for method in publisher_fallback_methods() {
+            for path in ["/", "/article"] {
+                let req = edgezero_core::http::request_builder()
+                    .method(method.clone())
+                    .uri(path)
+                    .body(edgezero_core::body::Body::empty())
+                    .expect("should build request");
+                let resp = router.oneshot(req).await.expect("should route the request");
+                assert_eq!(
+                    resp.status().as_u16(),
+                    500,
+                    "{method} {path} should answer 500"
+                );
+            }
+        }
     }
 }

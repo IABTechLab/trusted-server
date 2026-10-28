@@ -35,10 +35,17 @@ are:
 - `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PUBLISHER_PROXY_SECRET`
 - `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_PASSPHRASE`
 
-Before the positive request, the smoke omits the config and each secret in
-separate process starts. Each request must return 500 and its log must identify
-the missing environment variable or exact setting path. This prevents a port,
-launcher, or origin error from satisfying a negative case.
+Axum reads the permission policy file the settings name from the folder
+`TRUSTED_SERVER_PERMISSIONS_DIR` names, as `<folder>/<name>.yaml`, and checks
+it against the SHA-256 the push wrote into the blob, so the folder must hold
+the bytes that were pushed. The push writes no copy of the file for Axum. The
+smoke points the variable at the repository's `config/permissions` folder,
+which holds the sample its settings name.
+
+Before the positive request, the smoke omits the config, the policy folder and
+each secret in separate process starts. Each request must return 500 and its
+log must identify the missing environment variable or exact setting path. This
+prevents a port, launcher, or origin error from satisfying a negative case.
 
 The final publisher request must return 200, include the stub-origin sentinel,
 rewrite its origin URL to the Axum listener, and remove the original URL. The

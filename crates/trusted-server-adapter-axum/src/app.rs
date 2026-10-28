@@ -38,10 +38,12 @@ use trusted_server_core::settings_data::{
     default_config_key, default_config_store_name, get_settings_from_config_store,
 };
 
-use trusted_server_core::platform::RuntimeServices;
+use trusted_server_core::platform::{PolicyOrigin, RuntimeServices};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
-use crate::platform::{AxumPlatformConfigStore, AxumPlatformSecretStore, build_runtime_services};
+use crate::platform::{
+    AxumPlatformConfigStore, AxumPlatformSecretStore, AxumPolicyFolder, build_runtime_services,
+};
 
 // ---------------------------------------------------------------------------
 // AppState
@@ -98,6 +100,7 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
         &store_name,
         &config_key,
         &trusted_server_core::settings_data::default_secret_store_name(),
+        PolicyOrigin::Source(&AxumPolicyFolder::from_env()),
     )?;
     build_state_with_settings(settings)
 }
@@ -694,8 +697,8 @@ impl TrustedServerApp {
     /// Build the full application router from explicit settings.
     ///
     /// Testing seam: integration tests use this to drive the router with
-    /// known-good settings instead of the baked `get_settings()` result,
-    /// whose embedded placeholder secrets fail validation by design.
+    /// settings they build, where the process loads its settings from the
+    /// config store when it starts.
     ///
     /// # Errors
     ///
@@ -862,5 +865,148 @@ mod tests {
             error.to_string().contains("acme"),
             "the error should name the selected module, got: {error}"
         );
+    }
+
+    mod startup_policy {
+        use std::path::Path;
+
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use trusted_server_core::config_payload::DEFAULT_CONFIG_STORE_ID;
+        use trusted_server_core::permissions::{SAMPLE_POLICY_TEXT, policy_sha256};
+        use trusted_server_core::settings::PermissionsConfig;
+
+        use super::*;
+        use crate::platform::{PERMISSIONS_DIR_ENV_VAR, config_env_var};
+
+        const HANDLER_PASSWORD_VAR: &str =
+            "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_HANDLER_PASSWORD";
+        const PROXY_SECRET_VAR: &str =
+            "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PUBLISHER_PROXY_SECRET";
+
+        /// The blob the Axum push writes for settings naming `standard`,
+        /// pinned to `policy_text` and carrying no text of its own.
+        fn blob_naming_standard(policy_text: &str) -> String {
+            let mut settings = Settings::from_toml(
+                r#"
+                [[handlers]]
+                path = "^/_ts/admin"
+                username = "admin"
+                password = "handler_password"
+
+                [publisher]
+                domain = "publisher.example"
+                cookie_domain = ".publisher.example"
+                origin_url = "https://origin.publisher.example"
+                proxy_secret = "publisher_proxy_secret"
+                "#,
+            )
+            .expect("should parse the startup settings");
+            settings.permissions = PermissionsConfig {
+                policy: Some("standard".to_owned()),
+                sha256: Some(policy_sha256(policy_text)),
+                text: None,
+            };
+            let data = serde_json::to_value(&settings).expect("should serialize settings");
+            serde_json::to_string(&BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned()))
+                .expect("should serialize the envelope")
+        }
+
+        /// Builds the state as the process starts, with `blob` as its settings
+        /// and `folder` as its policy folder.
+        fn start(
+            blob: &str,
+            folder: Option<&Path>,
+        ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+            let config_var = config_env_var(DEFAULT_CONFIG_STORE_ID, DEFAULT_CONFIG_STORE_ID);
+            temp_env::with_vars(
+                [
+                    (config_var.as_str(), Some(blob)),
+                    (
+                        HANDLER_PASSWORD_VAR,
+                        Some("a-handler-password-for-the-startup-tests"),
+                    ),
+                    (
+                        PROXY_SECRET_VAR,
+                        Some("a-proxy-secret-for-the-startup-tests-32-bytes"),
+                    ),
+                    (PERMISSIONS_DIR_ENV_VAR, folder.and_then(Path::to_str)),
+                    (
+                        "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME",
+                        None,
+                    ),
+                    ("EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY", None),
+                    (
+                        "EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME",
+                        None,
+                    ),
+                ],
+                build_state,
+            )
+        }
+
+        #[test]
+        fn startup_reads_the_named_policy_file_from_the_policy_folder() {
+            let folder = tempfile::tempdir().expect("should create a policy folder");
+            std::fs::write(folder.path().join("standard.yaml"), SAMPLE_POLICY_TEXT)
+                .expect("should write the policy file");
+
+            let state = start(
+                &blob_naming_standard(SAMPLE_POLICY_TEXT),
+                Some(folder.path()),
+            )
+            .expect("should load the policy file the settings name");
+
+            let policy = state
+                .settings
+                .permission_policy()
+                .expect("should keep the policy with the settings");
+            assert_eq!(policy.name(), "standard");
+            assert_eq!(policy.sha256(), policy_sha256(SAMPLE_POLICY_TEXT));
+        }
+
+        #[test]
+        fn startup_without_the_pushed_policy_file_answers_500_on_every_route() {
+            let blob = blob_naming_standard(SAMPLE_POLICY_TEXT);
+            let empty = tempfile::tempdir().expect("should create an empty folder");
+            let edited = tempfile::tempdir().expect("should create a policy folder");
+            std::fs::write(
+                edited.path().join("standard.yaml"),
+                format!("{SAMPLE_POLICY_TEXT}# edited after the push\n"),
+            )
+            .expect("should write an edited policy file");
+
+            for (folder, reason) in [
+                (None, PERMISSIONS_DIR_ENV_VAR),
+                (Some(empty.path()), "standard.yaml"),
+                (Some(edited.path()), "is not the file that was pushed"),
+            ] {
+                let Err(error) = start(&blob, folder) else {
+                    panic!("the domain should not load from {folder:?}");
+                };
+                let message = format!("{error:?}");
+                assert!(
+                    message.contains("`standard`") && message.contains(reason),
+                    "the logged reason should name the policy and say `{reason}`: {message}"
+                );
+
+                let router = startup_error_router(&error);
+                for method in publisher_fallback_methods() {
+                    for path in ["/", "/article"] {
+                        let request = request_builder()
+                            .method(method.clone())
+                            .uri(path)
+                            .body(edgezero_core::body::Body::empty())
+                            .expect("should build the request");
+                        let response = futures::executor::block_on(router.oneshot(request))
+                            .expect("should route the request");
+                        assert_eq!(
+                            response.status(),
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "{method} {path} should answer 500"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

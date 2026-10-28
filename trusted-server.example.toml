@@ -226,7 +226,10 @@ pull_sync_concurrency = 3
 # file when the settings are pushed, with
 # `ts config push --permissions <file>`. The push writes the file's SHA-256
 # into the blob, and on Fastly, Cloudflare and Spin the file itself, so leave
-# `sha256` and `text` out. config/permissions/sample.yaml is a sample for
+# `sha256` and `text` out. Axum reads the file from the folder
+# TRUSTED_SERVER_PERMISSIONS_DIR names. A domain whose settings name no
+# policy, or whose file is missing or is not the file that was pushed, does
+# not start, and answers 500. config/permissions/sample.yaml is a sample for
 # testing and evaluation only.
 #
 # [permissions]

@@ -125,7 +125,8 @@ use trusted_server_core::integrations::{
 };
 use trusted_server_core::permissions::PermissionState;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, StoreName, build_geo_module,
+    ClientInfo, GeoInfo, PlatformKvStore, PolicyOrigin, RuntimeServices, StoreName,
+    build_geo_module,
 };
 use trusted_server_device_fastly::FastlyHostSignals;
 
@@ -231,6 +232,7 @@ pub(crate) fn load_settings_from_config_store(
         &stores.config_store_name,
         &stores.config_key,
         &stores.secret_store_name,
+        PolicyOrigin::Blob,
     )
 }
 
@@ -1866,6 +1868,28 @@ mod tests {
             Some("text/plain; charset=utf-8"),
             "startup errors should stay plain-text for OPTIONS requests"
         );
+    }
+
+    #[test]
+    fn the_startup_router_answers_500_to_a_policy_load_error() {
+        use trusted_server_core::test_support::policy_failure;
+
+        let error = policy_failure::load_error();
+        assert!(
+            format!("{error:?}").contains(&format!("`{}`", policy_failure::POLICY_NAME)),
+            "the startup error should name the policy: {error:?}"
+        );
+
+        let router = startup_error_router(&error);
+        for method in super::publisher_fallback_methods() {
+            for path in ["/", "/article"] {
+                assert_eq!(
+                    route(&router, empty_request(method.clone(), path)).status(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "{method} {path} should answer 500"
+                );
+            }
+        }
     }
 
     #[test]

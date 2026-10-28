@@ -127,7 +127,12 @@ fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
             .attach(error.to_string())
         })?;
     let secret_store = SpinSecretStoreAdapter;
-    settings_from_config_blob(&raw_envelope, &secret_store, &default_secret_store_name())
+    settings_from_config_blob(
+        &raw_envelope,
+        &secret_store,
+        &default_secret_store_name(),
+        trusted_server_core::platform::PolicyOrigin::Blob,
+    )
 }
 
 #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
@@ -650,8 +655,8 @@ impl TrustedServerApp {
     /// Build the full application router from explicit settings.
     ///
     /// Testing seam: cross-adapter parity tests use this to drive the router
-    /// with known-good settings instead of the baked `get_settings()` result,
-    /// whose embedded placeholder secrets fail validation by design.
+    /// with settings they build, where the component reads its settings from
+    /// its config store when it starts.
     ///
     /// # Errors
     ///
@@ -1571,6 +1576,35 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_startup_router_answers_500_to_a_policy_load_error() {
+        use trusted_server_core::test_support::policy_failure;
+
+        let error = policy_failure::load_error();
+        assert!(
+            format!("{error:?}").contains(&format!("`{}`", policy_failure::POLICY_NAME)),
+            "the startup error should name the policy: {error:?}"
+        );
+
+        let router = startup_error_router(&error);
+        for method in publisher_fallback_methods() {
+            for path in ["/", "/article"] {
+                let req = edgezero_core::http::request_builder()
+                    .method(method.clone())
+                    .uri(path)
+                    .body(edgezero_core::body::Body::empty())
+                    .expect("should build request");
+                let status = router
+                    .oneshot(req)
+                    .await
+                    .expect("should route the request")
+                    .status()
+                    .as_u16();
+                assert_eq!(status, 500, "{method} {path} should answer 500");
             }
         }
     }
