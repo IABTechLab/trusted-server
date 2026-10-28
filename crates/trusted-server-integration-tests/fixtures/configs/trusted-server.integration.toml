@@ -15,6 +15,10 @@ proxy_secret = "integration_proxy_secret"
 # scenarios exercise the US state opt-out machinery.
 module = "platform"
 
+[permissions]
+# The repository's sample, which every integration runtime is given.
+policy = "sample"
+
 [ec]
 module = "hmac"
 ec_store = "ec_identity_store"

@@ -70,7 +70,9 @@ EDGEZERO_MANIFEST="<release-root>/edgezero.toml" \
 
 # Run Axum dev server (native — no Viceroy). Settings load at runtime from the
 # platform config store on every adapter; publish an operator config with
-# `ts config push` (see trusted-server.example.toml for the template).
+# `ts config push --permissions <policy file>` (see
+# trusted-server.example.toml for the template). Axum reads the policy file
+# from the folder TRUSTED_SERVER_PERMISSIONS_DIR names.
 cargo run -p trusted-server-adapter-axum
 
 # Test Axum adapter only

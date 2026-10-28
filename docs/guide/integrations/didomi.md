@@ -34,10 +34,10 @@ geo_query_parameters = true
 # api_origin = "https://api.privacy-center.org"
 ```
 
-Publish application configuration with:
+Publish the application configuration and the permission policy file it names:
 
 ```bash
-ts config push --adapter fastly
+ts config push --adapter fastly --permissions standard.yaml
 ```
 
 | Field                  | Type    | Required | Default                               | Description                                             |

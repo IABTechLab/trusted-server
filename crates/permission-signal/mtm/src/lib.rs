@@ -28,11 +28,11 @@
 //! asked. Only the permissions are untouched.
 //!
 //! Where a baseline grants marketing without a signal, the baseline therefore
-//! applies. Under the shipped `gdpr-eu` and `gdpr-uk` groups every marketing
-//! Data Use requires a signal, so nothing is granted. Under `us-opt-out` they
-//! are granted outright, so marketing is permitted. A deployment wanting a
-//! decline to bind in an opt-out jurisdiction says so in its own permissions
-//! policy, which is where jurisdiction belongs.
+//! applies. Under the sample policy's `gdpr-eu` and `gdpr-uk` groups every
+//! marketing Data Use requires a signal, so nothing is granted. Under
+//! `us-opt-out` they are granted outright, so marketing is permitted. A
+//! deployment wanting a decline to bind in an opt-out jurisdiction says so in
+//! its own permissions policy, which is where jurisdiction belongs.
 //!
 //! This module lives outside `trusted-server-core` deliberately, like every
 //! scheme. Why is set out once, in `permission_signal/README.md` in core.
@@ -180,9 +180,9 @@ impl PermissionSignalModule for MtmModule {
         //
         // What this means where a baseline grants marketing without a signal,
         // stated because it is not obvious and somebody will need it. Under
-        // the shipped `gdpr-eu` and `gdpr-uk` groups every marketing Data Use
-        // is `requires_signal`, so nothing is granted and the answer is a
-        // refusal in effect. Under `us-opt-out` the same Data Uses are
+        // the sample policy's `gdpr-eu` and `gdpr-uk` groups every marketing
+        // Data Use is `requires_signal`, so nothing is granted and the answer
+        // is a refusal in effect. Under `us-opt-out` the same Data Uses are
         // `granted`, so the baseline applies and marketing is permitted. A
         // deployment that wants a decline to bind in an opt-out jurisdiction
         // sets that in its own permissions policy, which is where jurisdiction

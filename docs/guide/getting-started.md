@@ -59,12 +59,18 @@ Create and push the starter config, then start the local Fastly simulator:
 cp trusted-server.example.toml trusted-server.toml
 set -a && source .env.dev && set +a
 
-ts config push --adapter fastly --local --yes --no-diff
+# Name the repository's sample permission policy, for local testing only.
+printf '\n[permissions]\npolicy = "sample"\n' >> trusted-server.toml
+
+ts config push --adapter fastly --local --yes --no-diff \
+  --permissions config/permissions/sample.yaml
 fastly compute serve
 ```
 
 The local manifest provides public development-only values for the starter
 config's three secret references. Do not reuse them outside local development.
+The sample policy is for testing and evaluation only, and a deployment names
+its own file.
 The server will be available at `http://localhost:7676`.
 
 ### Option B — Axum dev server
@@ -80,12 +86,16 @@ the variables into your shell before starting the server.
 cp trusted-server.example.toml trusted-server.toml
 set -a && source .env.dev && set +a
 
+# Name the repository's sample permission policy, for local testing only.
+printf '\n[permissions]\npolicy = "sample"\n' >> trusted-server.toml
+
 # Use the repository's default app-config store name and key for this quickstart.
 unset EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME
 unset EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY
 
 # Create the local blob-backed config-store entry.
-ts config push --adapter axum --local --yes
+ts config push --adapter axum --local --yes \
+  --permissions config/permissions/sample.yaml
 export TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG="$(
   jq -r '.trusted_server_config' .edgezero/local-config-trusted_server_config.json
 )"
@@ -95,6 +105,9 @@ export TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG="$(
 export TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PUBLISHER_PROXY_SECRET="$(openssl rand -base64 32)"
 export TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_PASSPHRASE="$(openssl rand -base64 32)"
 export TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_HANDLER_PASSWORD="$(openssl rand -base64 32)"
+
+# Axum reads the policy file the settings name from this folder.
+export TRUSTED_SERVER_PERMISSIONS_DIR="$PWD/config/permissions"
 
 # Build and start the dev server in the same shell.
 cargo run -p trusted-server-adapter-axum
@@ -179,6 +192,7 @@ Edit `trusted-server.toml` to configure:
 - server bidder routes under `[auction.bidders.<id>]`;
 - KV store mappings;
 - EC configuration;
+- your permission policy file under `[permissions] policy`, by its stem;
 - consent settings (`[gdpr]`); and
 - stable key names for `trusted_server_secrets`.
 
@@ -190,11 +204,11 @@ fields and `profile_config`.
 Before the first push, provision the physical store mapped from logical
 `trusted_server_secrets` with the credential values referenced by the config.
 On Fastly, `ts_secrets` is the documented example physical name. Then validate
-and push:
+and push, supplying the policy file the settings name:
 
 ```bash
-ts config validate
-ts config push --adapter fastly
+ts config validate --permissions standard.yaml
+ts config push --adapter fastly --permissions standard.yaml
 ```
 
 This command performs target-independent plan validation. Each adapter performs

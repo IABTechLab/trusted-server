@@ -162,9 +162,8 @@ pull_sync_concurrency = 3
 #
 # The permission baseline for a request the geo module leaves unmatched
 # (and, with no geo module, for every request) is the top of the rules tree
-# in the permissions.yaml compiled into the build (the repository sample is
-# config/permissions/sample.yaml). Edit that file to
-# change it.
+# in the policy file [permissions] policy names. Edit that file, and push it
+# again, to change it.
 #
 # With no geo module, every request is treated as that top node, so a
 # visitor from another jurisdiction receives its permission rules. A
@@ -230,6 +229,20 @@ pull_sync_concurrency = 3
 # [consent.conflict_resolution]
 # mode = "restrictive"            # "restrictive" | "newest" | "permissive"
 # freshness_threshold_days = 30
+
+# The permission policy file this domain runs. Name the publisher's own
+# policy file here by its stem, so standard.yaml is "standard", and supply the
+# file when the settings are pushed, with
+# `ts config push --permissions <file>`. The push writes the file's SHA-256
+# into the blob, and on Fastly, Cloudflare and Spin the file itself, so leave
+# `sha256` and `text` out. Axum reads the file from the folder
+# TRUSTED_SERVER_PERMISSIONS_DIR names. A domain whose settings name no
+# policy, or whose file is missing or is not the file that was pushed, does
+# not start, and answers 500. config/permissions/sample.yaml is a sample for
+# testing and evaluation only.
+#
+# [permissions]
+# policy = "standard"
 
 # Which permission signal modules run, and in what order.
 #
