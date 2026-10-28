@@ -1967,7 +1967,9 @@ mod tests {
                 assume_single_jurisdiction = true
             "#,
         )
-        .expect("should parse the settings");
+        .expect("should parse the settings")
+        // A loaded domain carries its policy.
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
         build_state_with_settings(settings).expect("should build the state");
         assert!(
             trusted_server_core::platform::platform_cache_headers().is_empty(),
