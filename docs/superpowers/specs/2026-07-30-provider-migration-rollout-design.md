@@ -1,26 +1,28 @@
 # Design Spec: Module and Permission Model, Migration and Rollout
 
-**Status:** Proposed. The implementation is carried by the series' draft PRs
-#1343 to #1347 (rows 2 to 6 of the stack in #777), none of which is yet merged
-to main, and this document was revised against that series on 2026-08-25. The
-§8 sign-off rows remain the series'
-decision ledger, and rows the implementation now satisfies are marked with
-their PR so the task force can ratify rather than re-litigate. Updated on
-2026-09-01, where `[geo] default_country` is retired and the fallback baseline
-for a request with no resolvable country moves to the top node of the `rules:`
-tree in `permissions.yaml`, where `jurisdiction` is a per-node inherited
-attribute and the `consent.gdpr.applies_in` and
-`consent.us_states.privacy_states` lists retire into the same tree
-(permission-model spec §3.2, §3.4 and §12). Updated on 2026-10-06 to say
-module where it said provider, with `provider` kept for the two auction
-selectors (pluggable spec §2.1).
+**Status:** Proposed. The implementation is carried by the stack's pull
+requests #1343 to #1347 (rows 2 to 6 of the stack in #777), none of which is
+yet merged to main, and this document was revised against that series on
+2026-08-25. The §8 sign-off rows remain the series' decision ledger, and
+rows the implementation now satisfies are marked with their PR so the task
+force can ratify rather than re-litigate. Updated on 2026-09-01, where
+`[geo] default_country` is retired and the fallback baseline for a request
+with no resolvable country moves to the top node of the `rules:` tree in
+`permissions.yaml`, where `jurisdiction` is a per-node inherited attribute
+and the `consent.gdpr.applies_in` and `consent.us_states.privacy_states`
+lists retire into the same tree (permission-model spec §3.2, §3.4 and §12).
+Updated on 2026-10-06 to say module where it said provider, with `provider`
+kept for the two auction selectors (pluggable spec §2.1). Updated on
+2026-10-26, where the permission policy is the publisher's file, selected
+and supplied when a service is deployed and never compiled into a build
+(permission-model spec §3.1), which row 4 of the stack (#1345) builds.
 **Author:** Engineering
 **Issue references:** #777-#781 (epic)
 **Related specs:** `2026-07-30-pluggable-providers-design.md`,
 `2026-07-30-permission-model-design.md`,
 `2026-07-30-integration-response-header-hook-design.md` (not implemented in
 the series, see its status)
-**Last updated:** 2026-10-16
+**Last updated:** 2026-10-26
 
 > **Context.** The module/permission epic is a breaking change to a live
 > identity system. PR #838's review showed that the riskiest part of such a
@@ -68,23 +70,27 @@ integration module seam spec on top of the series and changes no code:
    Whether the host-signal surface stays is an **open review question**
    (sign-off row 22), not a settled decision.
 3. **PR #1045, the permission model.** Permission names follow the IAB
-   Privacy Taxonomy Data Uses (`permissions.yaml`, compiled into the
-   build). Signal precedence is fixed in code, most restrictive first,
-   meaning an opt-out (Sec-GPC, GPP sale opt-out, US Privacy) suppresses
-   the Data Uses the policy revokes even against a consenting TCF record,
-   a present but undecodable record blocks baseline grants (fail-closed),
-   and only then does a TCF record decide its mapped Data Uses.
+   Privacy Taxonomy Data Uses (`permissions.yaml`, which that pull request
+   compiled into the build, and which the permission-model spec now has
+   selected when a service is deployed, §3.1). Signal precedence is fixed
+   in code, most restrictive first, meaning an opt-out (Sec-GPC, GPP sale
+   opt-out, US Privacy) suppresses the Data Uses the policy revokes even
+   against a consenting TCF record, a present but undecodable record
+   blocks baseline grants (fail-closed), and only then does a TCF record
+   decide its mapped Data Uses. Row 4 of the stack (#1345) replaces that
+   fixed order with the order the deployment configures in
+   `[permission-signal] modules` (permission-model spec §4 and §13).
    Destructive withdrawal is narrow, where only a TCF record refusing
    storage in a jurisdiction whose baseline did not grant storage expires
    the cookie and writes the identity-graph tombstone, and opt-outs never
    destroy an issued identifier. Sharing beyond the edge (bidstream
    `user.id`, the identify response, partner pull sync) requires storage
-   plus personalised-ad selection, the same pair that gates bidstream
+   plus personalized-ad selection, the same pair that gates bidstream
    EIDs. A fallback baseline for a request with no resolvable country
    becomes required, shipped as `[geo] default_country` and carried by the
-   rules tree's top node since 2026-09-01, a failed geo lookup
-   resolves at the requires-signal floor instead of that baseline, and a
-   no-geo deployment running an Edge Cookie module must set
+   rules tree's top node since 2026-09-01, a failed geo lookup resolves at
+   the requires-signal floor instead of that baseline, and a no-geo
+   deployment running an Edge Cookie module must set
    `[geo] assume_single_jurisdiction = true`.
 4. **PR #1046, the hardened client-cycle resolve endpoint.**
    `POST /_ts/api/v1/ec/resolve` enforces publisher-origin `Origin` (403),
@@ -132,33 +138,35 @@ for the follow-up work that will implement them.
 | --- | -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1   | EU/GDPR request, no TCF consent → no EC                                                                        | Same (opt-in baseline)                                                                                                                                                                                                                  | Preserved. Implemented (#1045), where `gdpr-eu` requires a signal for storage, with an EU-27 plus EEA coverage test                                                                                                              |
 | 2   | US-state request, sale opt-out → no EC, existing EC expired and tombstoned even beside a consenting TCF string | Opt-out suppresses use but does not delete the identity. Lifting the opt-out restores the identity. The positive contextual-auction projection (permission §7's `ContextualAuctionView`) remains the design for what may still dispatch | **Changed deliberately.** The separation is implemented (#1045), with opt-outs stripping egress and never tombstoning. The contextual projection is not implemented (sign-off 4 open), and today EIDs and `user.id` are withheld |
-| 3   | US-state request, no signals at all → no EC (fail-closed)                                                      | The draft's recipe kept this via a `requires_signal` US rule with an extended grant-signal class                                                                                                                                        | **Changed by the shipped default (#1045), flagged.** `permissions.yaml` ships US as a `granted` baseline whose uses drop on any opt-out, so a no-signal US request receives an EC. A deployer edits the yaml to differ           |
+| 3   | US-state request, no signals at all → no EC (fail-closed)                                                      | The draft's recipe kept this via a `requires_signal` US rule with an extended grant-signal class                                                                                                                                        | **Changed by the repository's sample (#1045), flagged.** It gives US a `granted` baseline that opt-outs revoke, so a no-signal US request gets an EC. From row 4 no build carries the sample, so each publisher's file decides   |
 | 3a  | US-state request, explicit not-opted-out GPP/USP value → EC allowed                                            | No US signal grants anything. N/A, absent, reserved, and unknown values grant nothing                                                                                                                                                   | Implemented (#1045) in a stricter form than drafted, where signals only revoke, so the drafted "explicit not-opted-out may grant" class does not exist (sign-offs 3, 17)                                                         |
-| 3b  | US-state request, TCF record refusing Purpose 1, no US opt-out → no EC                                         | Refusal beats coexisting non-TCF grant signals                                                                                                                                                                                          | Implemented (#1045), where an authoritative TCF refusal revokes its mapped uses. Under the shipped `granted` US baseline the refusal suppresses without tombstoning                                                              |
+| 3b  | US-state request, TCF record refusing Purpose 1, no US opt-out → no EC                                         | Refusal beats coexisting non-TCF grant signals                                                                                                                                                                                          | Implemented (#1045), where an authoritative TCF refusal revokes its mapped uses. Under the sample's `granted` US baseline the refusal suppresses without tombstoning                                                             |
 | 3c  | Consent-record conflict modes, expiry, KV fallback, proxy mode                                                 | Per the permission spec §4.4 matrix, whose changed row is that malformed-present blocks acquisition                                                                                                                                     | Malformed-present fail-closed is implemented (#1045). The rest of the consent normalization pipeline is carried forward unchanged by the series                                                                                  |
 | 3d  | Valid plus expired consent records, where conflict resolution can select the expired record                    | Expired sources drop before conflict resolution                                                                                                                                                                                         | Open. Not addressed by the series                                                                                                                                                                                                |
-| 3e  | Only the GPP sale field (and USP) is consulted, with sharing/targeted opt-outs ignored                         | Sale, sharing, and targeted-advertising opt-outs deny the personalised-ads uses, and none affects storage or destroys identity                                                                                                          | Partially implemented (#1045), where sale, USP, and Sec-GPC are honored and never destructive. The sharing and targeted-advertising GPP fields are not yet decoded (sign-off 3 open)                                             |
-| 3f  | Non-privacy-state US traffic (for example Wyoming) is non-regulated → EC allowed                               | Country-level `US` is a protective floor, region rules may be stricter, and regionless traffic never degrades to non-regulated                                                                                                          | Implemented (#1045), where `permissions.yaml` maps country `US` to `us-opt-out`, with state rows able to override                                                                                                                |
+| 3e  | Only the GPP sale field (and USP) is consulted, with sharing/targeted opt-outs ignored                         | Sale, sharing, and targeted-advertising opt-outs deny the personalized-ads uses, and none affects storage or destroys identity                                                                                                          | Partially implemented (#1045), where sale, USP, and Sec-GPC are honored and never destructive. The sharing and targeted-advertising GPP fields are not yet decoded (sign-off 3 open)                                             |
+| 3f  | Non-privacy-state US traffic (for example Wyoming) is non-regulated → EC allowed                               | Country-level `US` is a protective floor, region rules may be stricter, and regionless traffic never degrades to non-regulated                                                                                                          | Implemented (#1045), where the repository's sample maps country `US` to `us-opt-out`, with state rows able to override. From row 4 no build carries the sample, so each publisher's file decides                                 |
 | 3g  | Graph rows persist JA4 class, H2 signal hash, and buyer-facing quality metadata                                | The draft discontinued these for new rows                                                                                                                                                                                               | **Contradicted by the series, flagged.** Rows still persist device signals, including signal hash prefixes, when the opt-in modules run (#1044/#1046). Tied to the open host-signal question (sign-off 22)                       |
-| 4   | UK request, no TCF record → no EC                                                                              | Same, unless the policy deliberately adopts a `granted` storage baseline for GB with citation and sign-off                                                                                                                              | **The shipped default adopts `granted` storage for GB (#1045), flagged.** The citation and sign-off the draft required do not exist yet. The task force owns this row                                                            |
+| 4   | UK request, no TCF record → no EC                                                                              | Same, unless the policy deliberately adopts a `granted` storage baseline for GB with citation and sign-off                                                                                                                              | **The repository's sample adopts `granted` storage for GB (#1045), flagged.** The citation and sign-off the draft required do not exist yet. The task force owns this row                                                        |
 | 5   | No country resolvable (geo failure) → no EC (fail-closed)                                                      | Protective failure profile, where permissions resolve at the requires-signal floor and `default_country` is reserved for unmatched requests in acknowledged static-jurisdiction mode                                                    | Implemented (#1045), where a failed lookup resolves at the requires-signal floor, logged at error level, and never falls back to `default_country` (sign-off 18)                                                                 |
 | 6   | Non-regulated country, TCF record refusing Purpose 1 → EC still created, identity never tombstoned             | Refusal blocks new grants everywhere, and existing identity is never tombstoned where the baseline is `granted`                                                                                                                         | Implemented (#1045), where an authoritative refusal revokes its mapped uses everywhere and withdrawal is scoped to non-granted baselines                                                                                         |
 | 7   | Country resolved but in no regulation list → EC created, EIDs pass through                                     | Governed by the deployment's default rule. The implementation expresses this as the required `[geo] default_country`, naming the `permissions.yaml` rule for unmatched requests                                                         | Implemented (#1045) with a changed mechanism, since no `rules.default` entry exists and the fallback is required and validated at startup. Restructured on 2026-09-01, where the fallback is the top node of the `rules:` tree   |
 | 8   | Opt-out signal outside US states → ignored today                                                               | Mapped use restrictions are honored globally, and opt-outs never tombstone identity                                                                                                                                                     | Implemented (#1045), where the signal mapping is jurisdiction-free and suppresses even TCF-consented uses, without destruction (sign-off 1)                                                                                      |
 | 9   | Fastly bot gate requires JA4 plus platform class before KV-backed EC writes                                    | The draft deferred host signal processing and startup-failed `[device] module = "fastly"`                                                                                                                                               | **Contradicted by the series, flagged.** The `fastly` device module ships opt-in with `builtin` (UA-only) as the default (#1044). Whether the host-signal surface stays is sign-off 22, open                                     |
 | 10  | Fastly always resolves geo per request                                                                         | Only with `[geo] module = "platform"`. The neutral default flips only together with the permission model's jurisdiction guard, never in an intermediate step                                                                            | Implemented as sequenced (#1044 kept the platform default, and #1045 flipped geo off by default together with `default_country` and the acknowledgment guard)                                                                    |
-| 11a | Raw EC egress on jurisdiction-gated paths today (`user.id`, EIDs, identify, pull sync)                         | Gated by the sharing pair (storage plus personalised-ads), at least as strict as today for every path                                                                                                                                   | Implemented (#1045), where `ec_sharing_allowed` gates `user.id`, the identify response, and pull sync, and `gate_eids_by_permissions` gates EIDs, all on the same pair                                                           |
+| 11a | Raw EC egress on jurisdiction-gated paths today (`user.id`, EIDs, identify, pull sync)                         | Gated by the sharing pair (storage plus personalized-ads), at least as strict as today for every path                                                                                                                                   | Implemented (#1045), where `ec_sharing_allowed` gates `user.id`, the identify response, and pull sync, and `gate_eids_by_permissions` gates EIDs, all on the same pair                                                           |
 | 11b | Proxy / click / Testlight forwarding extract the raw EC cookie/header without today's jurisdiction gate        | Gated by the egress inventory (both purposes)                                                                                                                                                                                           | Open. Not implemented by the series (sign-off 8)                                                                                                                                                                                 |
 | 11c | Batch sync only authenticates the S2S caller and checks row state                                              | Gated by stored-provenance recompute, with legacy rows failing closed until backfilled                                                                                                                                                  | Open. Not implemented. Batch sync still checks caller and row state, with missing or withdrawn rows collapsing to ineligible (sign-offs 7, 13, 25)                                                                               |
 | 12  | EC generation succeeds without a configured identity-graph store                                               | The draft required an openable graph store at startup for a creating module                                                                                                                                                             | **Changed from the draft (#1043/#1046).** No startup requirement ships. The implemented rule is per request, where no available graph means no identifier is created (no phantom cookies), organic and resolve paths alike       |
 | 13  | Cookies created by graphless deployments have no graph row                                                     | Rowless proof under the graphless-migration flag, capped `w` records, disclosed cookie-only expiry                                                                                                                                      | Open. None of the rowless machinery is implemented. A cookie without a row is simply never shared (sign-offs 21, 29, 30)                                                                                                         |
 
-Rows 3, 4, and 7 are policy decisions, not code decisions. In the
-implemented series they live in `permissions.yaml`, which is compiled into
-the build precisely so the policy stays visible and reviewable in version
-control, made explicitly by maintainers rather than implied by an
-implementation. The shipped defaults for rows 3 and 4 are flagged above for
-the task force.
+Rows 3, 4, and 7 are policy decisions, not code decisions. They live in the
+publisher's `permissions.yaml`, which a domain's settings name and which is
+supplied when the service is deployed (permission-model spec §3.1), so the
+policy stays visible and reviewable as a file of its own, made explicitly by
+the publisher rather than implied by an implementation. No policy ships with
+Trusted Server, so nothing decides these rows for a publisher, and the
+values the repository's sample gives rows 3 and 4 are flagged above for the
+task force.
 
 ## 3. Identity stability guarantee
 
@@ -230,6 +238,14 @@ Requirements, each marked with its implementation state:
    release that rejects `[ec] passphrase` outright with a message naming
    the new location is scheduled, not yet in the tree.
 
+   The permission policy has no such dual-read release. A build with
+   permission-model spec §3.1, which row 4 of the stack builds, starts no
+   domain whose blob names no policy, and a build without it, as main is,
+   refuses `[permissions]` as an unknown field (`deny_unknown_fields` on
+   `Settings`, main's `settings.rs` line 2964), so no one blob starts both
+   builds. The build and the blob that names its policy therefore go live
+   together, and on Fastly the pair is staged first (§6 item 1).
+
    The draft's full N+1/N+2 interim (the negative-record read/write
    matrix, the `permissions_v2` model promotion, the `m00` mirror, and the
    rollback-floor machinery) is **deferred** together with the durable
@@ -291,13 +307,18 @@ Requirements, each marked with its implementation state:
    example ships Edge Cookie identity off by default, with each selector
    and its block documented together and commented together, and the
    fallback baseline stated in `permissions.yaml` rather than left to the
-   reader. The draft wanted the happy path
-   uncommented. The series instead closes PR #838's silent-stateless trap
-   by validation (requirement 6), so a half-uncommented configuration
-   refuses to start rather than running stateless. Static-geo examples
-   pair the rules tree's top node with the commented
-   `assume_single_jurisdiction` acknowledgment, which startup enforces
-   whenever an EC module runs with no geo module (#1045).
+   reader. The draft wanted the happy path uncommented. The series instead
+   closes PR #838's silent-stateless trap by validation (requirement 6), so
+   a half-uncommented configuration refuses to start rather than running
+   stateless. Static-geo examples pair the rules tree's top node with the
+   commented `assume_single_jurisdiction` acknowledgment, which startup
+   enforces whenever an EC module runs with no geo module (#1045). From row
+   4 of the stack the example names no policy, and a comment tells the
+   operator to name their own file in `[permissions] policy`, because no
+   tool chooses a policy. `ts config init` writes the example as the
+   operator's settings, and a push of it as written is refused with a
+   message naming what is missing (`trusted-server.example.toml` lines 223
+   to 235 at row 4).
 10. Every misconfiguration in the providers spec §6 table fails at
     **startup**. Implemented for configuration errors (#1043-#1045:
     selector/block mismatches, unknown keys, unknown selector values,
@@ -311,12 +332,15 @@ Requirements, each marked with its implementation state:
 11. Validation is split into two named layers. Partially implemented.
     Structural validation runs at `ts config push` / `ts config validate`
     (the CLI deserializes and validates the typed settings, with a
-    regression test covering environment overlays) and again at startup,
-    and startup additionally validates deployment facts only startup can
-    see (module availability in the build, the top node of the rules tree
-    in the compiled `permissions.yaml`, the acknowledgment rule). The
-    machine-readable adapter capability profile for push-time deployment
-    pre-checks is deferred with requirement 2.
+    regression test covering environment overlays) and again at startup, and
+    startup additionally validates deployment facts only startup can see
+    (module availability in the build, the acknowledgment rule). From row 4
+    of the stack the policy file the settings name, the top node of its
+    rules tree included, is validated at both, at push against the files
+    `--permissions` supplies and at load against the file the service reads
+    (permission-model spec §3.1 and §3.3). The machine-readable adapter
+    capability profile for push-time deployment pre-checks is deferred with
+    requirement 2.
 
 ## 5. Minimal-divergence migration recipe (operator-facing)
 
@@ -325,46 +349,64 @@ name says so. The divergences that actually shipped in the series, each a
 matrix row: global honoring of mapped opt-outs (row 8), an authoritative
 TCF refusal blocking new grants everywhere (row 6), the protective
 geo-failure floor (row 5), country-wide protective US handling (row 3f),
-malformed-present blocking acquisition (row 3c), and the shipped `granted`
+malformed-present blocking acquisition (row 3c), and the sample's `granted`
 US and GB storage baselines (rows 3 and 4, flagged for ratification).
 Divergences the draft listed that have **not** shipped and remain deferred:
 the sharing/targeted GPP fields (row 3e), the grant-signal class (row 3a,
 now stricter instead), and the batch-sync provenance gate (row 11c).
 
-Policy now lives in a permissions YAML document (the repository sample is
-`config/permissions/sample.yaml`, for testing and evaluation only),
-compiled into the build. There is
-no `[permissions]` block in `trusted-server.toml`, so the draft's
+Policy lives in the publisher's permissions YAML document (the repository
+sample is `config/permissions/sample.yaml`, for testing and evaluation
+only), which `[permissions] policy` in the settings names and
+`ts config push --permissions` supplies when the service is deployed, and
+no build carries it. On Axum the file sits in the folder
+`TRUSTED_SERVER_PERMISSIONS_DIR` names. Row 4 of the stack builds that
+design (permission-model spec §3.1). In the document the operator writes,
+`[permissions]` holds only that name, never rules, so the draft's
 partial-policy trap (a TOML table containing only a permissive default)
-cannot be written at all. A deployer edits the yaml and rebuilds, which
-keeps every policy change reviewable in version control. The shipped
-default policy maps the EU-27 plus the EEA states to `gdpr-eu` (a signal
-required for every modeled use), GB to `gdpr-uk` (storage `granted`,
-flagged in row 4), and US and AU to `us-opt-out` (a `granted` baseline
-where all granted uses drop on any opt-out signal), leaves every unmodeled
-Data Use `denied`, and sends unmatched requests to the group named at the top
-of the required rules tree.
+still cannot be written. A blob is the settings as `ts config push` stores
+them, and the push adds to the blob's `[permissions]` the file's SHA-256
+and, where the policy travels inside the blob, the file's text. A deployer
+edits the yaml and pushes the settings again, which keeps every policy
+change reviewable in the file's own history, and each blob pins the exact
+file it runs by its SHA-256. The repository's sample maps the EU-27 plus
+the EEA states to `gdpr-eu`, which needs a signal for each of the eleven
+named Data Uses and grants 23 of the 64 Data Uses without one, GB to
+`gdpr-uk` (storage `granted`, flagged in §2 row 4), and US and AU to
+`us-opt-out`, which grants 45 of the 64, the eleven named ones among them,
+until an opt-out revokes the seven Data Uses its revoke list names. It
+sends unmatched requests to the group named at the top of the required
+rules tree.
 
 The migrated operator configuration is:
 
 - `[ec] module = "hmac"` with its `[ec.hmac]` table naming the secret
   that holds the 32-plus character passphrase, carried over verbatim for
-  identity stability (§3);
+  identity stability (§3).
 - `[device]` left at the `builtin` default, with `fastly` as the opt-in
-  documented alongside the open sign-off 22 question;
-- `[geo] module = "platform"` where the adapter supplies a host lookup
-  (Fastly and Cloudflare in production, the Axum dev server in
-  development, while Spin resolves nothing either way). A selected
-  module's lookup failure resolves at the requires-signal floor and
-  never at the fallback baseline. A static deployment instead states its
-  group at the top of the rules tree together with
-  `assume_single_jurisdiction = true`;
+  documented alongside the open sign-off 22 question.
+- `[geo] module = "platform"` where the adapter has a host lookup, which is
+  Fastly and Cloudflare. The Axum and Spin lookups resolve nothing, and
+  from row 33 of the stack both adapters refuse the selection at startup. A
+  selected module's lookup failure resolves at the requires-signal floor
+  and never at the fallback baseline. A static deployment instead states
+  its group at the top of the rules tree together with
+  `assume_single_jurisdiction = true`.
 - the `permissions.yaml` rules tree carrying a top node with a `group` and a
   `jurisdiction` (required), with each country or region below stating its own
   `jurisdiction` only where it differs from the node above. The operator no
-  longer carries `consent.gdpr.applies_in` or `consent.us_states.privacy_states`,
-  because the shipped tree holds the same 31 GDPR countries and the same 20
-  privacy-law states.
+  longer carries `consent.gdpr.applies_in` or
+  `consent.us_states.privacy_states`, because the publisher's own tree
+  states its countries and states. The repository's sample lists the 31
+  GDPR countries and the 20 privacy-law states main's lists held, and its
+  top node carries `jurisdiction: gdpr`, so every country it does not list
+  resolves to `gdpr` as well. Carrying a changed list into the publisher's
+  file is an item `ts config migrate` leaves to do
+  (`2026-10-17-config-migrate-design.md`).
+- `[permissions] policy` naming that file, which
+  `ts config push --permissions` supplies with the settings, and on Axum
+  the same file in the folder `TRUSTED_SERVER_PERMISSIONS_DIR` names
+  (permission-model spec §3.1).
 
 The draft's committed per-adapter fixture files
 (`docs/guide/fixtures/migration-preserving-<adapter>.toml`, CI-validated
@@ -375,11 +417,20 @@ signals is unconditional in the shipped model.
 
 ## 6. Rollout sequence and observability
 
-1. Implementation PRs land in the epic's order. **Done as specified.**
-   The series landed modules first with the geo default held at today's
+1. Implementation PRs land in the epic's order. **Done as specified.** The
+   series landed modules first with the geo default held at today's
    behavior (#1044), and the permission model PR flipped the default
    together with its jurisdiction guard (#1045). Each PR's description
-   states what that PR changes.
+   states what that PR changes. With permission §3.1 the build and the
+   blob that names its policy go live together (§4 requirement 1). On
+   Fastly the pair is staged first, with `ts deploy --staging` and
+   `ts config push --staging --permissions <file>`. From row 11 of the
+   stack a service that chooses its blob by host stages each host's blob
+   with `ts config push --key <host> --permissions <file>`, with
+   `EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` naming the
+   staging store, because EdgeZero refuses `--staging` beside `--key`
+   (`2026-10-15-fastly-per-host-selector-design.md` section 2.5), and the
+   host's policy entries go to that store.
 2. **Adapter qualification as a release gate.** **Deferred** with §4
    requirement 2. The series' posture is the declared stateless-identity
    path for adapters without the identity endpoints. The response hook
@@ -389,9 +440,11 @@ signals is unconditional in the shipped model.
    blob envelope and validates the configuration. The immutable
    `push_sequence` envelope, prepare/commit activation, admission lease,
    quiescence barrier, and scheduled-unavailability protocol are not
-   implemented. Policy in the shipped series changes by rebuilding
-   (`permissions.yaml`) or by pushing configuration, both taking effect
-   on restart/reload rather than through a fleet-wide activation CAS.
+   implemented. Policy changes by pushing the settings again with an
+   edited file, or another one, which the push pins under a new SHA-256
+   (permission-model spec §3.1), and the change takes effect as each
+   instance next loads its settings rather than through a fleet-wide
+   activation CAS.
 4. Before/after deploy, operators watch **EC issuance rate** and EID
    attachment rate as the canary metrics, because the failure mode of a
    bad migration is a silent drop to zero (or a silent grant to
@@ -418,29 +471,45 @@ signals is unconditional in the shipped model.
    sense, where selection is configuration, so reverting to the previous
    configuration on the previous binary restores the previous behavior,
    and the same compiled binary switches modules through the
-   `TRUSTED_SERVER__ec__provider` / `TRUSTED_SERVER__device__provider` /
-   `TRUSTED_SERVER__geo__provider` overrides applied when the operator
-   publishes configuration through `ts config push`. The durable
-   artifacts today are exactly the **identity-graph withdrawal
-   tombstones** written by explicit storage withdrawal (no recovery, that
-   is their purpose). The draft's longer durable list (model epoch tuple,
-   use-opt-out suppressions, negative outbox, safety breaker) describes
-   the deferred durable-suppression design (sign-offs 11, 16, 19, 20).
-   The two documented-not-automated procedures (cleanup after a policy
-   tightening, legacy-reader retirement) remain for the migration guide.
+   `TRUSTED_SERVER__ec__module` / `TRUSTED_SERVER__device__module` /
+   `TRUSTED_SERVER__geo__module` overrides applied when the operator
+   publishes configuration through `ts config push`. Pushing the previous
+   settings again with the previous policy file restores the previous
+   policy, because a blob pins its file by name and SHA-256 and the push
+   pins whatever exact bytes `--permissions` supplies. A rollback
+   therefore needs the previous file's exact bytes, whether or not a store
+   entry for them survives, and on Axum the folder must hold that file
+   (permission-model spec §3.1). The durable artifacts today are exactly
+   the **identity-graph withdrawal tombstones** written by explicit
+   storage withdrawal (no recovery, that is their purpose). The draft's
+   longer durable list (model epoch tuple, use-opt-out suppressions,
+   negative outbox, safety breaker) describes the deferred
+   durable-suppression design (sign-offs 11, 16, 19, 20). The two
+   documented-not-automated procedures (cleanup after a policy tightening,
+   legacy-reader retirement) remain for the migration guide.
 
 ### 6.1 Operator CLI delta for this epic
 
-The pre-existing CLI design remains unchanged and is what the series
-uses. `ts config push` validates and publishes the operator configuration
+The pre-existing CLI design is what the series uses. `ts config push`
+validates and publishes the operator configuration
 (with typed environment overlays covered by a CLI regression test), and
-`ts config validate` runs the same structural validation standalone.
+`ts config validate` runs the same structural validation standalone. Once
+the policy is selected when a service is deployed (permission-model spec
+§3.1), both commands and `ts config diff` also take `--permissions <file>`,
+once for each policy file, which supplies the files the settings name. The
+push always checks the policy, validate and diff check it when
+`--permissions` is given, and validate without it says the policy was not
+checked.
 
 The draft's normative delta to `ts config push` (never-reused
 `push_sequence`, immutable envelope identity, candidate CAS, §5.5
-promotion protocol) and the `ts config gc` command are **not
+promotion protocol) and the draft's `ts config gc` command are **not
 implemented**. They are deferred together with sign-off 19 and remain the
 design bar for the durable-suppression and staged-activation follow-up.
+EdgeZero has a `ts config gc` of its own, which reclaims only chunks,
+the entries a value too long for one entry is split into, that no other
+entry points to, and only on Fastly (permission-model spec §3.1), so it is
+not the draft's command.
 Nothing in the series authorizes a generic raw metadata command or a
 model-transition command.
 
@@ -463,11 +532,13 @@ model-transition command.
   `#[cfg(test)]`. The core test-only helper survives as legacy, and the
   runtime path does not use that helper.)
 - The permission model page states the precedence rules the code
-  implements. **Done** (#1045/#1047). The permission-model guide is in
-  the docs navigation, and the precedence is fixed in code (opt-out over
-  TCF, malformed-present fail-closed, then TCF), with pinning tests per
-  opt-out source against a consenting TCF record. Operator docs and
-  normative spec must not diverge on precedence.
+  implements. **Done** (#1045/#1047). The permission-model guide is in the
+  docs navigation, and the precedence is fixed in code (opt-out over TCF,
+  malformed-present fail-closed, then TCF), with pinning tests per opt-out
+  source against a consenting TCF record. In #1345 the order is the one
+  the deployment configures in `[permission-signal] modules`
+  (permission-model spec §4 and §13). Operator docs and normative spec
+  must not diverge on precedence.
 
 ## 8. Product decisions requiring explicit sign-off
 
@@ -489,13 +560,13 @@ the code with the row open.
 | #   | Recommended resolution                                                                                                                                                                                                                                                                                                                    | Where                                     | Decision record | Status                                                                                                                                                                                                                                                    |
 | --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1   | Honor mapped use opt-outs globally. Destructive identity effects are limited to explicit storage withdrawal, authenticated deletion, or a qualifying live TCF Purpose 1 refusal.                                                                                                                                                          | permission §4, §4.2                       | (none)          | open. Implemented by #1045 (jurisdiction-free suppression, withdrawal only on a live TCF storage refusal under a non-granted baseline). Ratify                                                                                                            |
-| 2   | GPP/USP sale opt-outs suppress the personalised-ads uses only. They neither revoke storage nor delete the identity.                                                                                                                                                                                                                       | permission §4.5                           | (none)          | open. Partially implemented by #1045 (no opt-out deletes or destructively revokes). The shipped default maps opt-outs to `revokes: all` rather than personalised-ads only, a `permissions.yaml` choice to ratify                                          |
-| 3   | Sharing/targeted-advertising opt-outs suppress the personalised-ads uses. An explicit applicable not-opted-out value may grant them. Neither affects storage.                                                                                                                                                                             | permission §4.5                           | (none)          | open. Not implemented (the sharing and targeted-advertising GPP fields are not decoded, and no US signal grants anything in the shipped model)                                                                                                            |
-| 4   | US auction dispatch may continue while personalised-ads is unset only through permission §7's positive `ContextualAuctionView` and its sole normative inline manifest.                                                                                                                                                                    | permission §7.1                           | (none)          | open. The strip half is implemented by #1045 (EIDs and `user.id` withheld when the pair is unset). The positive contextual projection is not implemented                                                                                                  |
-| 5   | Country-only and regionless US traffic use a protective country-wide `us-opt-out` floor. State rules may be stricter.                                                                                                                                                                                                                     | permission §3.4                           | (none)          | open. Implemented by #1045 (`permissions.yaml` maps country `US` to `us-opt-out` with state overrides available). Ratify                                                                                                                                  |
+| 2   | GPP/USP sale opt-outs suppress the personalized-ads uses only. They neither revoke storage nor delete the identity.                                                                                                                                                                                                                       | permission §4.5                           | (none)          | open. Partially implemented by #1045 (no opt-out deletes or destructively revokes). The repository's sample revokes seven Data Uses rather than personalized ads only, and from row 4 each publisher's file decides                                       |
+| 3   | Sharing/targeted-advertising opt-outs suppress the personalized-ads uses. An explicit applicable not-opted-out value may grant them. Neither affects storage.                                                                                                                                                                             | permission §4.5                           | (none)          | open. Not implemented (the sharing and targeted-advertising GPP fields are not decoded, and no US signal grants anything in the shipped model)                                                                                                            |
+| 4   | US auction dispatch may continue while personalized-ads is unset only through permission §7's positive `ContextualAuctionView` and its sole normative inline manifest.                                                                                                                                                                    | permission §7.1                           | (none)          | open. The strip half is implemented by #1045 (EIDs and `user.id` withheld when the pair is unset). The positive contextual projection is not implemented                                                                                                  |
+| 5   | Country-only and regionless US traffic use a protective country-wide `us-opt-out` floor. State rules may be stricter.                                                                                                                                                                                                                     | permission §3.4                           | (none)          | open. Implemented by #1045 (the repository's sample maps country `US` to `us-opt-out` with state overrides available). Ratify, and from row 4 each publisher's file decides                                                                               |
 | 6   | Raw regulatory strings reach only the positively registered OpenRTB field that requires each source. All other destinations default deny. Identity rows retain normalized provenance/digests, not raw consent snapshots.                                                                                                                  | permission §7; modules §6.3               | (none)          | open. Not addressed by the series                                                                                                                                                                                                                         |
 | 7   | Reject legacy batch-sync traffic until live-browser provenance backfill makes the row re-evaluable.                                                                                                                                                                                                                                       | rollout §6 item 6; permission §7          | (none)          | open. Not implemented (no provenance exists to recompute)                                                                                                                                                                                                 |
-| 8   | Gate proxy, click, and Testlight identity forwarding on the sharing pair (storage plus personalised-ads).                                                                                                                                                                                                                                 | §2 row 11b                                | (none)          | open. Not implemented by the series                                                                                                                                                                                                                       |
+| 8   | Gate proxy, click, and Testlight identity forwarding on the sharing pair (storage plus personalized-ads).                                                                                                                                                                                                                                 | §2 row 11b                                | (none)          | open. Not implemented by the series                                                                                                                                                                                                                       |
 | 9   | Defer integration-owned cookie operations from the v1 response hook, and require a complete read/use/withdraw lifecycle before admission.                                                                                                                                                                                                 | hook §3                                   | (none)          | open. Overtaken (#1047 removed the whole hook from the series, so no cookie surface shipped). The deferral returns with the hook's first consumer                                                                                                         |
 | 10  | Do not create a blanket session-cookie exemption. Every cookie must be covered by an approved permission or narrowly defined security-use authority.                                                                                                                                                                                      | hook §3                                   | (none)          | open. Hook not shipped, unaffected                                                                                                                                                                                                                        |
 | 11  | Require a durable per-family negative-intent outbox in a failure domain independent of its strong target and checked freshly by every identity consumer, with a globally visible breaker over positive identity operations when neither can commit.                                                                                       | permission §4.3                           | (none)          | open. Not implemented (part of the durable-suppression follow-up)                                                                                                                                                                                         |
@@ -529,16 +600,16 @@ the code with the row open.
 | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Epic #777-#781 pending sign-off, no implementation                                                  | Implemented as five stacked PRs #1043-#1047, with §8 staying the ledger and rows marked for ratification                                                                                                                                                                                                                                                                                       | The series shipped the seam, selection, permission model, resolve endpoint, and docs, so the task force ratifies rather than re-litigates                    |
 | `[device] module = "fastly"` startup-fails pending a separate host-signal design (§2 row 9, row 22) | The `fastly` device module and host-signal EC module ship opt-in, and device signals persist in graph rows. The identifier-collision defect the review found (host-signal identifiers shared the HMAC grammar and keyspace) is fixed by the mandatory module-code envelope, so host-signal identifiers are `hs00~` namespaced. The policy question of row 22 is unchanged by the collision fix | Implementation choice, deliberately flagged as the open review question rather than presented as settled                                                     |
-| US recipe: `requires_signal` with an extended grant-signal class (§2 rows 3/3a)                     | Shipped default: `granted` US baseline, `revokes: all` on any opt-out, and no US signal grants anything                                                                                                                                                                                                                                                                                        | The shipped signal model is revoke-only, which is simpler and stricter on grants, and the baseline choice is deployer-editable yaml, flagged in rows 3 and 5 |
-| `[permissions]` TOML policy published at runtime                                                    | `permissions.yaml` compiled into the build, no `[permissions]` block                                                                                                                                                                                                                                                                                                                           | Policy stays reviewable in version control and the partial-policy trap cannot be written                                                                     |
+| US recipe: `requires_signal` with an extended grant-signal class (§2 rows 3/3a)                     | The repository's sample gives US a `granted` baseline and revokes seven Data Uses on any opt-out, and no US signal grants anything                                                                                                                                                                                                                                                             | The series' signal model is revoke-only, which is simpler and stricter on grants, and the baseline is each publisher's own decision, flagged in rows 3 and 5 |
+| `[permissions]` TOML policy published at runtime                                                    | The policy stays the publisher's `permissions.yaml`, which `[permissions] policy` names and `ts config push --permissions` supplies when the service is deployed, stored once and pinned in each blob by its SHA-256. The operator's `[permissions]` holds that name and never rules (permission-model spec §3.1)                                                                              | The file stays reviewable on its own, the digest ties each blob to one exact version, and the partial-policy trap still cannot be written                    |
 | `rules.default` worldwide default entry (§2 row 7)                                                  | Required fallback baseline naming the group for unmatched requests, validated at startup. Shipped as `[geo] default_country` and carried by the rules tree's top node since 2026-09-01                                                                                                                                                                                                         | Same role, one mechanism, loud when missing                                                                                                                  |
 | Graph store mandatory at startup for creating modules (§2 row 12, §4.4b)                            | No startup requirement, and with no graph no identifier is created, per request                                                                                                                                                                                                                                                                                                                | The phantom-cookie rule holds without a breaking startup change, and graphless deployments run identity-less                                                 |
 | `legacy_providers` reader chain for module switches (§4.8)                                          | Not implemented, so a switch restarts identity                                                                                                                                                                                                                                                                                                                                                 | Deferred until a second server-side module makes switching real                                                                                              |
 | N+1/N+2 negative-record machinery, model epochs, `m00` mirror (§4.1, row 20)                        | Deferred with rows 11, 16, 19, 20. The shipped dual-read is one release of `[ec] passphrase` mapping with mixed forms rejected                                                                                                                                                                                                                                                                 | Nothing durable beyond pre-existing withdrawal tombstones ships, so binary rollback strands no new state                                                     |
-| Staged activation, `push_sequence`, quiescence, `ts config gc` (§6.3, §6.1)                         | Basic `ts config push` / `ts config validate` only                                                                                                                                                                                                                                                                                                                                             | The activation protocol belongs to the deferred durable-suppression rollout (row 19)                                                                         |
+| Staged activation, `push_sequence`, quiescence, `ts config gc` (§6.3, §6.1)                         | Basic `ts config push` / `ts config validate` only. EdgeZero's own `ts config gc` reclaims only unreferenced chunks on Fastly and is not the draft's command                                                                                                                                                                                                                                   | The activation protocol belongs to the deferred durable-suppression rollout (row 19)                                                                         |
 | Migration guide with committed per-adapter fixtures and a full gated metric set (§5, §6.4)          | `configuration.md` / `edge-cookies.md` document the migrated shape, while fixtures, the guide page, and metrics remain outstanding                                                                                                                                                                                                                                                             | Documentation shipped for configuration, and the operational guide is the remaining deliverable before a release                                             |
 | Client cycle descoped and hook shipped headers-only (row 15)                                        | The client cycle shipped hardened (#1046) and the hook shipped not at all (#1047)                                                                                                                                                                                                                                                                                                              | Hardening replaced descoping, and the hook had no consumer, which is the hook spec's own admission rule                                                      |
 | Example config ships the migrated happy path uncommented (§4.9)                                     | Identity off by default with selector and block commented together, and validation closes the silent-stateless trap                                                                                                                                                                                                                                                                            | Loud startup validation, not an uncommented default, is what prevents PR #838's silent-stateless state                                                       |
 | Environment override documented but `#[cfg(test)]`-only in PR #838 (§7)                             | Override applied as typed EdgeZero app-config overlays at `ts config push`; the existing CLI overlay test covers the mechanism, and a module-specific override test is still to write                                                                                                                                                                                                          | The same compiled binary switches modules at deployment through the published configuration                                                                  |
 | Pinned known-answer HMAC vectors committed (§3)                                                     | Stability tested per inputs, and the pinned vector is still to commit                                                                                                                                                                                                                                                                                                                          | The cross-version CI pin remains open work under §3                                                                                                          |
-| GB storage baseline change only with citation and sign-off (§2 row 4)                               | The shipped `permissions.yaml` adopts `granted` storage for GB without a recorded citation                                                                                                                                                                                                                                                                                                     | Flagged in row 4, since the task force owns the decision and its record                                                                                      |
+| GB storage baseline change only with citation and sign-off (§2 row 4)                               | The repository's sample adopts `granted` storage for GB without a recorded citation                                                                                                                                                                                                                                                                                                            | Flagged in row 4, since the task force owns the decision and its record                                                                                      |

@@ -4,24 +4,26 @@
 `split/5-response-hook-docs` (§1a). The pull request that carried the
 documentation set
 ([#1047](https://github.com/IABTechLab/trusted-server/pull/1047)) was closed
-without merging on 2026-10-15, and draft pull request
-[#1347](https://github.com/IABTechLab/trusted-server/pull/1347) carries the
-same set. This spec is held with every other design
-document of the stack in
+without merging on 2026-10-15, and
+[#1347](https://github.com/IABTechLab/trusted-server/pull/1347), one of the
+stack's pull requests, carries the same set. This spec is held with every
+other design document of the stack in
 [#1342](https://github.com/IABTechLab/trusted-server/pull/1342). The hook was
 removed from the earlier draft of the documentation set because it has no
 consumer, which is this spec's own §-rule for speculative surface. The spec is
 retained as the design bar for the hook when its first consumer arrives (an
 integration that must set response headers such as Accept-CH or detection
-results). Revised 2026-08-25, on 2026-10-06 for the module wording, and on
-2026-10-15 and 2026-10-16 after its round 1 and round 2 reviews (Review log).
+results). Revised 2026-08-25, on 2026-10-06 for the module wording, on
+2026-10-15 and 2026-10-16 after its round 1 and round 2 reviews (Review log),
+and on 2026-10-26 for the permission policy, which is selected when a service
+is deployed.
 **Author:** Engineering
 **Issue references:** #782
 **Related specs:** `2026-07-30-pluggable-providers-design.md`,
 `2026-07-30-permission-model-design.md`,
 `2026-07-30-provider-migration-rollout-design.md` and the baseline DataDome
 design `2026-06-11-datadome-server-side-protection-design.md`
-**Last updated:** 2026-10-16
+**Last updated:** 2026-10-26
 
 > **Context.** Issue #782 already specifies this feature well; its done-when
 > is the contract. PR #838 shipped the trait and registry wiring with **no
@@ -30,8 +32,9 @@ design `2026-06-11-datadome-server-side-protection-design.md`
 > restates the contract plus the two details the issue left open (ordering
 > and collision policy), and adds the rule that prevents a repeat, which is
 > that the hook lands with a consumer or not at all. The series (PRs
-> #1043-#1047, closed on 2026-10-15 and carried now by drafts #1343-#1347)
-> applied that rule to this spec itself, see the Status above and §7.
+> #1043-#1047, closed on 2026-10-15 and carried now by the stack's pull
+> requests #1343-#1347) applied that rule to this spec itself, see the
+> Status above and §7.
 
 ---
 
@@ -62,11 +65,11 @@ This section states the code at `split/5-response-hook-docs` (commit
 that design is built. A search of the code and the guides at that commit finds
 none of the names below, and the same search at
 `split/7-integration-seam-impl`, `split/31-caching-release` and
-`split/50-cookies-by-path` (the tip of the stack) finds none either. The names
-are `IntegrationResponseMutator`, `with_response_mutator`,
-`behavior_revision`, `HOOK_INVARIANT_REVISION`, the seven fields of the cache
-revision tuple in §3, `SecurityUse`, `DataDomeSecurityRequestFilter`,
-`RedactedRequestView`, `PartnerEgress` and `vary_digest_key_secret_name`.
+`split/50-cookies-by-path` (row 50) finds none either. The names are
+`IntegrationResponseMutator`, `with_response_mutator`, `behavior_revision`,
+`HOOK_INVARIANT_REVISION`, the seven fields of the cache revision tuple in §3,
+`SecurityUse`, `DataDomeSecurityRequestFilter`, `RedactedRequestView`,
+`PartnerEgress` and `vary_digest_key_secret_name`.
 
 **Not built, and what each part waits for.**
 
@@ -74,16 +77,25 @@ revision tuple in §3, `SecurityUse`, `DataDomeSecurityRequestFilter`,
   mutator and no revision number, and no adapter has an apply point.
 - **The cache revision tuple (§2, §3 and §3a).** Four of its seven fields
   (`active_policy_digest`, `active_policy_ordinal`, `model_epoch` and
-  `activation_generation`) come from the permission model's policy
-  activation. Section 5.5 of `2026-07-30-permission-model-design.md` is headed
-  "Policy revision activation (deferred)" and begins "Not implemented", the
-  record in its section 11 says "None of it exists", and row 19 of §8 of
-  `2026-07-30-provider-migration-rollout-design.md` says "Not implemented".
-  Each build embeds `permissions.yaml`, so the deployed build is the policy.
-  The other three fields (`integration_registry_revision`,
-  `effective_config_revision` and `hook_invariant_revision`) have no code
-  either. The `pre_epic_v1` test in §4 item 8, the serve fence in §4a and the
-  effective-config digest in §4a.3 depend on the same activation.
+  `activation_generation`) come from the permission model's policy activation.
+  Section 5.5 of `2026-07-30-permission-model-design.md` is headed "Policy
+  revision activation (deferred)" and begins "Not implemented", the record in
+  its section 11 says "None of it exists", and row 19 of §8 of
+  `2026-07-30-provider-migration-rollout-design.md` says "Not implemented". At
+  this commit each build embeds the repository's sample,
+  `config/permissions/sample.yaml` (`DEFAULT_PERMISSION_RULES`,
+  `permissions.rs` line 494), so the deployed build is the policy. Row 4 of
+  the stack (#1345) builds section 3.1 of the permission model design, and at
+  row 4 no build carries a policy and a domain's blob, the settings as
+  `ts config push` stores them, names its policy file by name and SHA-256.
+  Once row 4 is merged forward into this row, the pushed blob is the policy
+  identity and `active_policy_digest` takes that `sha256`, while
+  `active_policy_ordinal`, `model_epoch` and `activation_generation` still
+  have nothing to come from. The remaining three fields
+  (`integration_registry_revision`, `effective_config_revision` and
+  `hook_invariant_revision`) have no code either. The `pre_epic_v1` test in §4
+  item 8, the serve fence in §4a and the effective-config digest in §4a.3
+  depend on the same activation.
 - **The keyed digest of `Vary` request values (§2).** The setting
   `[cache] vary_digest_key_secret_name` does not exist. `CacheSettings` in
   `settings.rs` holds `asset_rules` only and refuses an unknown key, and no
@@ -100,7 +112,7 @@ revision tuple in §3, `SecurityUse`, `DataDomeSecurityRequestFilter`,
   its table is `[integrations.datadome]`. From `split/7-integration-seam-impl`
   on, DataDome is the crate `crates/bot-protection/datadome` and its table is
   `[bot-protection.datadome]`. None of the settings that §4a.3 adds exists in
-  the tree at either branch or at the tip of the stack.
+  the tree at either branch or at `split/50-cookies-by-path`.
 
 **What exists.**
 
@@ -1519,10 +1531,10 @@ first consumer, §7) merges:
   response-header hook. The hook was removed from that PR before the series
   was presented, so PR #1047 carried the documentation set only, and no hook
   trait, registration builder, or adapter call site exists in the series'
-  tree (§1a). PR #1047 was closed without merging on 2026-10-15, and draft
-  PR #1347 carries the same set at the same commit (see the Status). This is
-  exactly the outcome §4 item 3 and §5 require for a feature with no
-  consumer, applied to the feature's own spec.
+  tree (§1a). PR #1047 was closed without merging on 2026-10-15, and one of
+  the stack's pull requests, PR #1347, carries the same set at the same
+  commit (see the Status). This is exactly the outcome §4 item 3 and §5
+  require for a feature with no consumer, applied to the feature's own spec.
 - The hook returns together with its first consumer, meaning an integration
   that must set response headers, for example `Accept-CH` client-hint
   requests or detection results such as §4a's security channel. The
@@ -1563,6 +1575,14 @@ changes no code and decides none of them.
    activation exists. The tuple in §3 names four fields from that activation
    and none has code. The template cache checks `template_fingerprint`, which
    hashes the build digest, the browser bundles and the whole typed settings.
+   At `61b1399c6` the build digest does not hash
+   `config/permissions/sample.yaml`, because core's build script hashes only
+   its `src` folder and the files it lists, so a change to the compiled sample
+   leaves the fingerprint as it was. Row 4 of the stack (#1345) builds section
+   3.1 of the permission model design, and at row 4 the policy's `sha256` sits
+   in the typed settings, so a policy change changes the fingerprint, which
+   leaves the policy's `text` out because `sha256` already names the file
+   (`template_fingerprint`, `publisher.rs` lines 2116 to 2145 at row 4).
 3. Whether `Edge-Control` joins `EDGE_CACHE_HEADER_NAMES`. The code strips four
    names and has no `edge-control`. If it joins, `remove_edge_cache_headers`,
    `is_edge_cache_header_name` and the tests of both change with it.
@@ -1610,6 +1630,7 @@ changes no code and decides none of them.
 | 2026-10-06 | Module wording.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | 2026-10-15 | Fixes from review round 1. The status and the closed pull request, a new section 1a on what the code does today, the cookie rule, the shared finalization code and the DataDome section name stated as the code has them, the reserved CDN cache fields taken from `EDGE_CACHE_HEADER_NAMES`, the three ids the id rule refuses, the template cache and the cache revision tuple marked as unreconciled or not built, the changes to shipped DataDome behavior in section 4a.4, the order of sections 4 and 4a, the sign-off rows, `must-revalidate` precedence, the duplicate-ID test in the done-when, the existing tests, the open questions and the review log. |
 | 2026-10-16 | Fixes from review round 2. What the providers design now says (section 1a), the two core functions that every adapter's `apply_finalize_headers` calls (sections 1a and 2), the closed pull request that carried the documentation set (#1047, section 7), the revision dates and the review log.                                                                                                                                                                                                                                                                                                                                                                   |
+| 2026-10-26 | Section 1a keeps that each build embeds the repository's sample at its commit, and says that row 4 of the stack (#1345) builds section 3.1 of the permission model design, so that once row 4 is merged forward a domain's blob, which names its policy file by name and SHA-256, is the policy identity and gives `active_policy_digest` its value. Open question 2 says that row 4's policy `sha256` reaches the template fingerprint, which leaves the policy's text out and which the compiled sample never reached. The stack's pull requests are named without calling them drafts.                                                                           |
 
 ## Review log
 
