@@ -225,7 +225,10 @@ configuration cannot load without, such as a `[[handlers]]` entry that can guard
 a path of the publisher's own, or one this release ignores whose value you carry
 elsewhere, such as `[consent.gdpr] applies_in`. Each needs a decision or a value
 the configuration does not hold, so the command leaves the setting where it is
-and reports it on every run until it is done.
+and reports it on every run until it is done. A configuration that names no
+permission policy file leaves one more item, because no policy ships with
+Trusted Server and the command chooses none, so name the publisher's file in
+`[permissions] policy` and supply it with `ts config push --permissions <file>`.
 
 The command reads the file alone, with no manifest and no environment overlay.
 It keeps the comments and the order of the tables you wrote. A module that was
@@ -252,13 +255,15 @@ After migrating:
    `TRUSTED_SERVER__PUBLISHER__ORIGIN_URL`, which is now
    `TRUSTED_SERVER__SOURCE__ORIGIN__URL`, because `ts config push` ignores a
    variable for a key the configuration does not hold.
-3. Run `ts config validate`.
-4. Push the configuration with the new build, because a build from before this
-   release refuses the migrated configuration and this release refuses the old
-   one. On Fastly, `ts deploy --staging` and `ts config push --staging` let you
-   check the pair together first. On Cloudflare and Spin, keep the key-value
-   store this release requires, the Workers KV binding `TRUSTED_SERVER_KV` and
-   Spin's `default` store, or every request fails.
+3. Run `ts config validate --permissions <file>` with the publisher's policy
+   file.
+4. Push the configuration and the policy file with the new build, because a
+   build from before this release refuses the migrated configuration and this
+   release refuses the old one. On Fastly, `ts deploy --staging` and
+   `ts config push --staging` let you check the pair together first. On
+   Cloudflare and Spin, keep the key-value store this release requires, the
+   Workers KV binding `TRUSTED_SERVER_KV` and Spin's `default` store, or every
+   request fails.
 5. Expect the stored pages and the publisher's stored assets to be fetched
    again once after the upgrade, because their keys hold a code worked out from
    the settings.
