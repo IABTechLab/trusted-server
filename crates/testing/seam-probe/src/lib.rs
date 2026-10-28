@@ -684,6 +684,7 @@ mod tests {
             .http_client(Arc::new(UnavailableHttpClient))
             .geo(Arc::new(DisabledGeo))
             .client_info(ClientInfo::default())
+            .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
             .build()
     }
 

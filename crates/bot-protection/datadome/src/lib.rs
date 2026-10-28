@@ -1876,6 +1876,8 @@ mod tests {
     /// that ships this crate loads them.
     fn load_with_table(table: &serde_json::Value) -> DataDomeConfig {
         let mut settings = create_test_settings();
+        // The blob a push writes names the policy and carries its file.
+        settings.permissions = trusted_server_core::test_support::tests::sample_permissions();
         settings
             .insert_module_config("bot-protection", MODULE, table)
             .expect("should insert DataDome's table");

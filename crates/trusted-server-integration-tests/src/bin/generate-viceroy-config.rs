@@ -290,7 +290,7 @@ mod tests {
     use trusted_server_core::platform::{
         PlatformConfigStore, PlatformError, PlatformSecretStore, PolicyOrigin, StoreId, StoreName,
     };
-    use trusted_server_core::settings_data::get_settings_from_config_store;
+    use trusted_server_core::settings_data::get_settings_from_config_store_with;
 
     /// The repository's sample, which the fixture names.
     fn sample() -> PolicyFile {
@@ -504,13 +504,14 @@ mod tests {
             .expect("should inject generated stores");
         let store = GeneratedConfigStore(generated_entries(&generated));
 
-        let settings = get_settings_from_config_store(
+        let settings = get_settings_from_config_store_with(
             &store,
             &integration_secret_store(),
             &StoreName::from(DEFAULT_CONFIG_STORE_ID),
             CONFIG_BLOB_KEY,
             &StoreName::from("trusted_server_secrets"),
             PolicyOrigin::Blob,
+            &trusted_server_modules::builders(),
         )
         .expect("should load the settings through the chunk pointer");
 

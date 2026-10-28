@@ -1900,7 +1900,7 @@ pub(crate) mod tests {
         // supplied.
         let settings = create_test_settings();
         let req = create_test_request(&[]);
-        let services = RuntimeServices::builder()
+        let services = crate::platform::test_support::test_services_builder()
             .config_store(Arc::new(FixedConfigStore {
                 store: "vendor_store",
                 key: "country",

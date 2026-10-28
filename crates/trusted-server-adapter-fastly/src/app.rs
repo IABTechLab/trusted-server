@@ -497,19 +497,25 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
 /// middleware builds this once and clones it per request with
 /// [`RuntimeServices::with_client_info`], and the entry point rebuilds it per
 /// call.
+///
+/// The settings are ones the runtime loader loaded, so they carry the
+/// permission policy their domain names, which every services graph holds.
 pub(crate) fn build_finalize_services(
     settings: &Settings,
     kv_store: Arc<dyn PlatformKvStore>,
 ) -> RuntimeServices {
-    RuntimeServices::builder()
+    let mut builder = RuntimeServices::builder()
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
         .kv_store(kv_store)
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .geo(build_geo_module(settings, Arc::new(FastlyPlatformGeo)))
-        .client_info(ClientInfo::default())
-        .build()
+        .client_info(ClientInfo::default());
+    if let Some(policy) = settings.permission_policy() {
+        builder = builder.permission_policy(Arc::clone(policy));
+    }
+    builder.build()
 }
 
 fn publisher_fallback_methods() -> [Method; 7] {

@@ -1104,7 +1104,7 @@ pub fn services_with_ec_module_and_config_store(
     ec_module: Arc<dyn crate::ec::module::EdgeCookieModule>,
     config_store: Arc<dyn PlatformConfigStore>,
 ) -> RuntimeServices {
-    RuntimeServices::builder()
+    test_services_builder()
         .config_store(config_store)
         .secret_store(Arc::new(NoopSecretStore))
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
