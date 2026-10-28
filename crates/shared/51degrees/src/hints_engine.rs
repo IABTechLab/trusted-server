@@ -78,8 +78,8 @@ impl ClientHintsCall {
     /// an error the request carries.
     ///
     /// The evidence is the request's `User-Agent` and `Sec-CH-UA` hints alone,
-    /// so the answer held for one reader serves every reader whose browser
-    /// sends the same values.
+    /// so where a loading cache module holds the answer, the answer for one
+    /// reader serves every reader whose browser sends the same values.
     pub async fn accept_ch(
         &self,
         request_info: &dyn RequestInfo,

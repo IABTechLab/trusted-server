@@ -508,7 +508,9 @@ pull_sync_concurrency = 3
 # how long that copy lasts unused. A module's own refresh ends its answer
 # sooner. Memory may be 0, the other two must be at least 1, and none may be
 # more than a year. Without `module` the one loading cache module the build
-# links is used, and with none or several linked no copy is kept.
+# links is used, and with none or several linked no copy is kept. A stock
+# build links none and refuses any `module`, so `51degrees` is written only
+# where a deployment links crates/loading-cache/51degrees.
 # [cache.robots-txt]
 # module = "51degrees"
 # memory_seconds = 60
@@ -518,7 +520,9 @@ pull_sync_concurrency = 3
 # The loading cache that holds the 51Degrees service's answers, which the
 # 51Degrees modules under [shared.51degrees] ask for once for each request's
 # evidence, and how long the copies last, with the same four settings. An
-# answer ends after an hour whatever the store lifetime says.
+# answer ends after an hour whatever the store lifetime says. A stock build
+# links no loading cache module and refuses `module`, as for
+# [cache.robots-txt].
 # [cache.51degrees-answers]
 # module = "51degrees"
 # memory_seconds = 60
