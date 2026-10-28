@@ -25,9 +25,10 @@ use trusted_server_core::test_support::nextjs_auction;
 
 /// Shared test settings for all adapters.
 ///
-/// The settings baked into the binaries contain placeholder secrets that
-/// `get_settings()` rejects by design, so all routers are built through
-/// their `routes_with_settings` testing seams from this known-good config.
+/// Each adapter reads its settings from its config store when it starts, so
+/// all routers are built through their `routes_with_settings` testing seams
+/// from this known-good config, which carries the repository's sample policy
+/// as a loaded domain carries its own.
 /// The handler regex is the production-shaped `^/_ts/admin`, matching
 /// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
 /// `/_ts/admin/keys/*` routes are auth-gated exactly as in production.
@@ -50,9 +51,13 @@ fn test_settings() -> Settings {
 
             [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            assume_single_jurisdiction = true
         "#,
     )
     .expect("should parse parity test settings")
+    .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
 }
 
 /// Build the Axum adapter router from the shared test settings.

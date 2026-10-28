@@ -4,13 +4,19 @@ use crate::common::runtime::{
 };
 use error_stack::ResultExt as _;
 use std::io::{BufRead as _, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use trusted_server_adapter_axum::platform::config_env_var;
+use trusted_server_adapter_axum::platform::{PERMISSIONS_DIR_ENV_VAR, config_env_var};
 use trusted_server_core::settings_data::{default_config_key, default_config_store_name};
 
 /// Default port the Axum dev server binds to when no `PORT` env var is supplied.
 const AXUM_DEFAULT_PORT: u16 = 8787;
+
+/// The repository's folder of policy files, which holds the sample the
+/// integration config names.
+fn permissions_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/permissions")
+}
 
 /// Secret-store entries referenced by the integration app-config fixture.
 const INTEGRATION_SECRET_ENV: &[(&str, &str)] = &[
@@ -66,6 +72,8 @@ impl RuntimeEnvironment for AxumDevServer {
         let mut child = Command::new(&binary)
             .env("PORT", port.to_string())
             .env(config_variable, app_config)
+            // Axum reads the policy file the settings name from this folder.
+            .env(PERMISSIONS_DIR_ENV_VAR, permissions_dir())
             .envs(INTEGRATION_SECRET_ENV.iter().copied())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

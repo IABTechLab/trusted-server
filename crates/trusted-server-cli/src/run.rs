@@ -2,14 +2,14 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 use edgezero_cli::args::{
-    ActiveVersionArgs, AuthArgs, BuildArgs, ConfigDiffArgs, ConfigGcArgs, ConfigPushArgs,
-    ConfigValidateArgs, DeployArgs, HealthcheckArgs, ProvisionArgs, RollbackArgs, ServeArgs,
+    ActiveVersionArgs, AuthArgs, BuildArgs, ConfigGcArgs, DeployArgs, HealthcheckArgs,
+    ProvisionArgs, RollbackArgs, ServeArgs,
 };
-use trusted_server_core::config::TrustedServerAppConfig;
 
 use crate::commands::audit::{AuditArgs, run_audit};
 use crate::commands::config::ad_templates::{AdTemplatesCommand, run_ad_templates};
 use crate::commands::config::init::{ConfigInitArgs, run_config_init};
+use crate::commands::config::policy;
 use crate::commands::pbs::{self, PbsArgs};
 use crate::prebid_bundle::{NpmPrebidBundleGenerator, PrebidBundleArgs, run_bundle};
 
@@ -64,13 +64,15 @@ enum ConfigCommand {
     /// Initialize a Trusted Server config file from the example template.
     Init(ConfigInitArgs),
     /// Diff `trusted-server.toml` against the live `EdgeZero` config.
-    Diff(ConfigDiffArgs),
+    Diff(policy::DiffArgs),
     /// Reclaim orphaned chunk entries leaked from prior oversized pushes.
     Gc(ConfigGcArgs),
-    /// Push `trusted-server.toml` as a blob envelope through `EdgeZero`.
-    Push(ConfigPushArgs),
-    /// Validate `edgezero.toml` and the typed Trusted Server config.
-    Validate(ConfigValidateArgs),
+    /// Push `trusted-server.toml`, with the permission policy file it names,
+    /// as a blob envelope through `EdgeZero`.
+    Push(policy::PushArgs),
+    /// Validate `edgezero.toml`, the typed Trusted Server config and, with
+    /// `--permissions`, the permission policy file it names.
+    Validate(policy::ValidateArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -129,24 +131,20 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
         Command::Config(ConfigCommand::Init(args)) => {
             run_config_init(&args).map(|()| RunOutcome::Success)
         }
-        Command::Config(ConfigCommand::Diff(args)) => {
-            match edgezero_cli::run_config_diff_typed::<TrustedServerAppConfig>(&args) {
-                Ok(edgezero_cli::DiffExit { code: 0 }) => Ok(RunOutcome::Success),
-                Ok(edgezero_cli::DiffExit { code: 1 }) => Ok(RunOutcome::AssertionFailed),
-                Ok(edgezero_cli::DiffExit { code }) => process::exit(code),
-                Err(err) => Err(err),
-            }
-        }
+        Command::Config(ConfigCommand::Diff(args)) => match policy::run_diff(args) {
+            Ok(edgezero_cli::DiffExit { code: 0 }) => Ok(RunOutcome::Success),
+            Ok(edgezero_cli::DiffExit { code: 1 }) => Ok(RunOutcome::AssertionFailed),
+            Ok(edgezero_cli::DiffExit { code }) => process::exit(code),
+            Err(err) => Err(err),
+        },
         Command::Config(ConfigCommand::Gc(args)) => {
             edgezero_cli::run_config_gc(&args).map(|()| RunOutcome::Success)
         }
         Command::Config(ConfigCommand::Push(args)) => {
-            edgezero_cli::run_config_push_typed::<TrustedServerAppConfig>(&args)
-                .map(|()| RunOutcome::Success)
+            policy::run_push(args).map(|()| RunOutcome::Success)
         }
         Command::Config(ConfigCommand::Validate(args)) => {
-            edgezero_cli::run_config_validate_typed::<TrustedServerAppConfig>(&args)
-                .map(|()| RunOutcome::Success)
+            policy::run_validate(args).map(|()| RunOutcome::Success)
         }
         Command::Deploy(args) => edgezero_cli::run_deploy(&args).map(|()| RunOutcome::Success),
         Command::Healthcheck(args) => {
@@ -561,13 +559,58 @@ mod tests {
             panic!("expected config push command");
         };
         let default_push = ConfigPushArgs::default();
-        assert_eq!(push.adapter, "fastly");
-        assert_eq!(push.app_config, default_push.app_config);
-        assert_eq!(push.manifest, default_push.manifest);
-        assert_eq!(push.store, default_push.store);
-        assert!(!push.local);
-        assert!(!push.dry_run);
-        assert!(!push.no_env);
+        assert_eq!(push.edgezero.adapter, "fastly");
+        assert_eq!(push.edgezero.app_config, default_push.app_config);
+        assert_eq!(push.edgezero.manifest, default_push.manifest);
+        assert_eq!(push.edgezero.store, default_push.store);
+        assert!(!push.edgezero.local);
+        assert!(!push.edgezero.dry_run);
+        assert!(!push.edgezero.no_env);
+        assert!(
+            push.policy.files.is_empty(),
+            "should supply no policy file unless asked"
+        );
+    }
+
+    #[test]
+    fn config_push_validate_and_diff_take_each_policy_file() {
+        let files = [
+            "--permissions",
+            "standard.yaml",
+            "--permissions",
+            "strict.yaml",
+        ];
+        let expected = vec![PathBuf::from("standard.yaml"), PathBuf::from("strict.yaml")];
+
+        let push = parse(
+            &[
+                ["ts", "config", "push", "--adapter", "fastly"].as_slice(),
+                &files,
+            ]
+            .concat(),
+        );
+        let Command::Config(ConfigCommand::Push(push)) = push.command else {
+            panic!("expected config push command");
+        };
+        assert_eq!(push.policy.files, expected);
+
+        let validate = parse(&[["ts", "config", "validate"].as_slice(), &files].concat());
+        let Command::Config(ConfigCommand::Validate(validate)) = validate.command else {
+            panic!("expected config validate command");
+        };
+        assert_eq!(validate.policy.files, expected);
+
+        let diff = parse(
+            &[
+                ["ts", "config", "diff", "--adapter", "fastly"].as_slice(),
+                &files,
+            ]
+            .concat(),
+        );
+        let Command::Config(ConfigCommand::Diff(diff)) = diff.command else {
+            panic!("expected config diff command");
+        };
+        assert_eq!(diff.policy.files, expected);
     }
 
     #[test]
@@ -577,13 +620,13 @@ mod tests {
             panic!("expected config diff command");
         };
         let default_diff = ConfigDiffArgs::default();
-        assert_eq!(diff.adapter, "fastly");
-        assert_eq!(diff.app_config, default_diff.app_config);
-        assert_eq!(diff.manifest, default_diff.manifest);
-        assert_eq!(diff.store, default_diff.store);
-        assert!(!diff.local);
-        assert!(!diff.exit_code);
-        assert!(!diff.no_env);
+        assert_eq!(diff.edgezero.adapter, "fastly");
+        assert_eq!(diff.edgezero.app_config, default_diff.app_config);
+        assert_eq!(diff.edgezero.manifest, default_diff.manifest);
+        assert_eq!(diff.edgezero.store, default_diff.store);
+        assert!(!diff.edgezero.local);
+        assert!(!diff.edgezero.exit_code);
+        assert!(!diff.edgezero.no_env);
     }
 
     #[test]
@@ -592,7 +635,10 @@ mod tests {
         let Command::Config(ConfigCommand::Push(push)) = args.command else {
             panic!("expected config push command");
         };
-        assert!(push.staging, "should target the staging publication flow");
+        assert!(
+            push.edgezero.staging,
+            "should target the staging publication flow"
+        );
 
         Args::try_parse_from([
             "ts",
@@ -614,7 +660,7 @@ mod tests {
             panic!("expected config diff command");
         };
         assert!(
-            diff.staging,
+            diff.edgezero.staging,
             "should compare against the staging publication flow"
         );
 
@@ -724,12 +770,15 @@ mod tests {
         let Command::Config(ConfigCommand::Validate(validate)) = args.command else {
             panic!("expected config validate command");
         };
-        assert_eq!(validate.app_config, Some(PathBuf::from("publisher-a.toml")));
-        assert!(validate.no_env);
-        assert!(validate.strict);
+        assert_eq!(
+            validate.edgezero.app_config,
+            Some(PathBuf::from("publisher-a.toml"))
+        );
+        assert!(validate.edgezero.no_env);
+        assert!(validate.edgezero.strict);
 
         let default_validate = ConfigValidateArgs::default();
-        assert_eq!(validate.manifest, default_validate.manifest);
+        assert_eq!(validate.edgezero.manifest, default_validate.manifest);
     }
 
     #[test]

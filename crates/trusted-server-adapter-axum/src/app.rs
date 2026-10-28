@@ -38,10 +38,12 @@ use trusted_server_core::settings_data::{
     default_config_key, default_config_store_name, get_settings_from_config_store,
 };
 
-use trusted_server_core::platform::RuntimeServices;
+use trusted_server_core::platform::{PolicyOrigin, RuntimeServices};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
-use crate::platform::{AxumPlatformConfigStore, AxumPlatformSecretStore, build_runtime_services};
+use crate::platform::{
+    AxumPlatformConfigStore, AxumPlatformSecretStore, AxumPolicyFolder, build_runtime_services,
+};
 
 // ---------------------------------------------------------------------------
 // AppState
@@ -52,7 +54,38 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    /// The permission signal modules `[permission-signal] modules` selects
+    /// from the scheme crates this adapter links, in the order they run.
+    /// Selected once here so a name no crate answers to fails startup rather
+    /// than the first request, and handed to every request's services.
+    permission_signal_modules:
+        Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>]>,
+    /// The permission policy the domain's settings loaded, which every
+    /// request is given.
+    permission_policy: Arc<trusted_server_core::permissions::PermissionPolicy>,
+    /// Services a caller supplied for every request, rather than services built
+    /// from the request context. `None` in a deployment.
     services: Option<RuntimeServices>,
+}
+
+/// The permission signal modules this adapter links, in the order they run
+/// when configuration names none. Global Privacy Control is first because it
+/// is a browser setting with no interface of its own, and the three that
+/// carry a choice someone made through an interface follow, so an answer
+/// given at a prompt amends the header the visitor arrived with.
+///
+/// Core supplies no module of its own, so this is where a deployment's
+/// schemes are decided. A scheme is added by linking its crate here, and a
+/// scheme core has never heard of plugs in the same way.
+fn shipped_signal_modules()
+-> Vec<Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>> {
+    vec![
+        Arc::new(trusted_server_permission_signal_gpc::GpcModule::new()),
+        Arc::new(trusted_server_permission_signal_gpp::GppSaleOptOutModule::new()),
+        Arc::new(trusted_server_permission_signal_us_privacy::UsPrivacyModule::new()),
+        Arc::new(trusted_server_permission_signal_tcf::TcfModule::new()),
+        Arc::new(trusted_server_permission_signal_mtm::MtmModule::new()),
+    ]
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -70,6 +103,7 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
         &store_name,
         &config_key,
         &trusted_server_core::settings_data::default_secret_store_name(),
+        PolicyOrigin::Source(&AxumPolicyFolder::from_env()),
     )?;
     build_state_with_settings(settings)
 }
@@ -115,20 +149,38 @@ fn build_state_with_services(
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Axum)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
+    let permission_signal_modules =
+        trusted_server_core::permission_signal::build_permission_signal_modules(
+            &settings,
+            &shipped_signal_modules(),
+        )?;
+    let permission_policy = settings.required_permission_policy()?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        permission_signal_modules,
+        permission_policy,
         services,
     }))
 }
 
 impl AppState {
+    /// Builds the per-request services, carrying the permission policy the
+    /// domain's settings loaded whichever services the request is given.
     fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
         self.services
             .clone()
-            .unwrap_or_else(|| build_runtime_services(ctx, &self.settings))
+            .unwrap_or_else(|| {
+                build_runtime_services(
+                    ctx,
+                    &self.settings,
+                    &self.permission_signal_modules,
+                    &self.permission_policy,
+                )
+            })
+            .with_permission_policy(Arc::clone(&self.permission_policy))
     }
 }
 
@@ -201,9 +253,13 @@ where
 /// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
 /// `/_ts/page-bids`, and the publisher fallback).
 ///
-/// Geo comes from the platform (a no-op on the local Axum dev server, so
-/// jurisdiction stays Unknown there unless the request carries TCF consent), and
-/// a geo lookup failure is logged and treated as no location.
+/// The geo lookup runs inside
+/// [`EcContext::read_from_request_resolving_geo`], so every adapter reports the
+/// same distinction: no location falls back to the top of the
+/// `permissions.yaml` rules tree, while a failed lookup resolves every
+/// permission at the requires-signal floor and is logged at error level.
+/// The platform geo is a no-op on the local Axum dev server, so a request there
+/// resolves at that top node unless it carries a signal.
 ///
 /// Mirrors the Fastly entry point, which keeps the report and answers with an
 /// error response: when the Edge Cookie context cannot be read the request
@@ -221,14 +277,7 @@ fn build_ec_context(
     services: &RuntimeServices,
     req: &Request,
 ) -> Result<EcContext, Report<TrustedServerError>> {
-    let geo_info = services
-        .geo()
-        .lookup(services.client_info().client_ip)
-        .unwrap_or_else(|e| {
-            log::warn!("geo lookup failed: {e}");
-            None
-        });
-    EcContext::read_from_request_with_geo(&state.settings, req, services, geo_info.as_ref())
+    EcContext::read_from_request_resolving_geo(&state.settings, req, services)
 }
 
 // ---------------------------------------------------------------------------
@@ -663,8 +712,8 @@ impl TrustedServerApp {
     /// Build the full application router from explicit settings.
     ///
     /// Testing seam: integration tests use this to drive the router with
-    /// known-good settings instead of the baked `get_settings()` result,
-    /// whose embedded placeholder secrets fail validation by design.
+    /// settings they build, where the process loads its settings from the
+    /// config store when it starts.
     ///
     /// # Errors
     ///
@@ -774,6 +823,11 @@ mod tests {
 
         [ec.acme]
         endpoint = "https://ec.acme.example.com"
+
+        # An Edge Cookie module is configured, so single-jurisdiction
+        # operation is acknowledged because no geo module is selected.
+        [geo]
+        assume_single_jurisdiction = true
     "#;
 
     /// Builds application state directly, bypassing the composition root's
@@ -791,6 +845,10 @@ mod tests {
             settings: Arc::new(settings),
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
+            // These tests exercise the Edge Cookie module path, and a
+            // request with no signal module resolves at the place baseline.
+            permission_signal_modules: Arc::default(),
+            permission_policy: trusted_server_core::permissions::PermissionPolicy::sample(),
             // This test drives the per-request path, which builds its services
             // from the request context.
             services: None,
@@ -812,7 +870,12 @@ mod tests {
             .body(edgezero_core::body::Body::empty())
             .expect("should build test request");
         let ctx = RequestContext::new(req, PathParams::default());
-        let services = build_runtime_services(&ctx, &state.settings);
+        let services = build_runtime_services(
+            &ctx,
+            &state.settings,
+            &state.permission_signal_modules,
+            &state.permission_policy,
+        );
         let req = ctx.into_request();
 
         let error = build_ec_context(&state, &services, &req)
@@ -822,5 +885,181 @@ mod tests {
             error.to_string().contains("acme"),
             "the error should name the selected module, got: {error}"
         );
+    }
+
+    mod startup_policy {
+        use std::path::Path;
+
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use trusted_server_core::config_payload::DEFAULT_CONFIG_STORE_ID;
+        use trusted_server_core::permissions::{SAMPLE_POLICY_TEXT, policy_sha256};
+        use trusted_server_core::settings::PermissionsConfig;
+
+        use super::*;
+        use crate::platform::{PERMISSIONS_DIR_ENV_VAR, config_env_var};
+
+        const HANDLER_PASSWORD_VAR: &str =
+            "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_HANDLER_PASSWORD";
+        const PROXY_SECRET_VAR: &str =
+            "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PUBLISHER_PROXY_SECRET";
+
+        /// Settings whose secrets are the key names the tests' variables
+        /// resolve.
+        fn startup_settings() -> Settings {
+            Settings::from_toml(
+                r#"
+                [[handlers]]
+                path = "^/_ts/admin"
+                username = "admin"
+                password = "handler_password"
+
+                [publisher]
+                domain = "publisher.example"
+                cookie_domain = ".publisher.example"
+                origin_url = "https://origin.publisher.example"
+                proxy_secret = "publisher_proxy_secret"
+                "#,
+            )
+            .expect("should parse the startup settings")
+        }
+
+        /// The sample with a comment naming `test`, so its digest is one no
+        /// earlier load in the process holds and the folder is read.
+        fn file_only_this_test_pins(test: &str) -> String {
+            format!("{SAMPLE_POLICY_TEXT}# pinned only by {test}\n")
+        }
+
+        /// The blob the Axum push writes for settings naming `standard`,
+        /// pinned to `policy_text` and carrying no text of its own.
+        fn blob_naming_standard(policy_text: &str) -> String {
+            let mut settings = startup_settings();
+            settings.permissions = PermissionsConfig {
+                policy: Some("standard".to_owned()),
+                sha256: Some(policy_sha256(policy_text)),
+                text: None,
+            };
+            let data = serde_json::to_value(&settings).expect("should serialize settings");
+            serde_json::to_string(&BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned()))
+                .expect("should serialize the envelope")
+        }
+
+        /// Builds the state as the process starts, with `blob` as its settings
+        /// and `folder` as its policy folder.
+        fn start(
+            blob: &str,
+            folder: Option<&Path>,
+        ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+            let config_var = config_env_var(DEFAULT_CONFIG_STORE_ID, DEFAULT_CONFIG_STORE_ID);
+            temp_env::with_vars(
+                [
+                    (config_var.as_str(), Some(blob)),
+                    (
+                        HANDLER_PASSWORD_VAR,
+                        Some("a-handler-password-for-the-startup-tests"),
+                    ),
+                    (
+                        PROXY_SECRET_VAR,
+                        Some("a-proxy-secret-for-the-startup-tests-32-bytes"),
+                    ),
+                    (PERMISSIONS_DIR_ENV_VAR, folder.and_then(Path::to_str)),
+                    (
+                        "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME",
+                        None,
+                    ),
+                    ("EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY", None),
+                    (
+                        "EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME",
+                        None,
+                    ),
+                ],
+                build_state,
+            )
+        }
+
+        #[test]
+        fn each_request_is_given_the_policy_its_domain_loaded() {
+            let policy = trusted_server_core::test_support::policies::open();
+            let state = build_state_with_settings(
+                startup_settings().with_permission_policy(Arc::clone(&policy)),
+            )
+            .expect("should build the state");
+            let request = request_builder()
+                .method("GET")
+                .uri("https://publisher.example/article")
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build the request");
+
+            let services =
+                state.services_for_request(&RequestContext::new(request, PathParams::default()));
+
+            assert!(
+                Arc::ptr_eq(services.permission_policy(), &policy),
+                "the request should decide under its domain's policy, not the sample"
+            );
+        }
+
+        #[test]
+        fn startup_reads_the_named_policy_file_from_the_policy_folder() {
+            let pushed = file_only_this_test_pins("the folder read test");
+            let folder = tempfile::tempdir().expect("should create a policy folder");
+            std::fs::write(folder.path().join("standard.yaml"), &pushed)
+                .expect("should write the policy file");
+
+            let state = start(&blob_naming_standard(&pushed), Some(folder.path()))
+                .expect("should load the policy file the settings name");
+
+            let policy = state
+                .settings
+                .permission_policy()
+                .expect("should keep the policy with the settings");
+            assert_eq!(policy.name(), "standard");
+            assert_eq!(policy.sha256(), policy_sha256(&pushed));
+        }
+
+        #[test]
+        fn startup_without_the_pushed_policy_file_answers_500_on_every_route() {
+            let pushed = file_only_this_test_pins("the startup refusal test");
+            let blob = blob_naming_standard(&pushed);
+            let empty = tempfile::tempdir().expect("should create an empty folder");
+            let edited = tempfile::tempdir().expect("should create a policy folder");
+            std::fs::write(
+                edited.path().join("standard.yaml"),
+                format!("{pushed}# edited after the push\n"),
+            )
+            .expect("should write an edited policy file");
+
+            for (folder, reason) in [
+                (None, PERMISSIONS_DIR_ENV_VAR),
+                (Some(empty.path()), "standard.yaml"),
+                (Some(edited.path()), "is not the file that was pushed"),
+            ] {
+                let Err(error) = start(&blob, folder) else {
+                    panic!("the domain should not load from {folder:?}");
+                };
+                let message = format!("{error:?}");
+                assert!(
+                    message.contains("`standard`") && message.contains(reason),
+                    "the logged reason should name the policy and say `{reason}`: {message}"
+                );
+
+                let router = startup_error_router(&error);
+                for method in publisher_fallback_methods() {
+                    for path in ["/", "/article"] {
+                        let request = request_builder()
+                            .method(method.clone())
+                            .uri(path)
+                            .body(edgezero_core::body::Body::empty())
+                            .expect("should build the request");
+                        let response = futures::executor::block_on(router.oneshot(request))
+                            .expect("should route the request");
+                        assert_eq!(
+                            response.status(),
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "{method} {path} should answer 500"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

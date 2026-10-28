@@ -8,52 +8,52 @@ configuration, page audits, and EdgeZero-backed lifecycle commands.
 The table summarizes native `--help` output on Linux and macOS. Platform-only
 commands are shown explicitly.
 
-| Command                          | Availability  | Summary                                                                                          | Usage                                                                                                          |
-| -------------------------------- | ------------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
-| `ts`                             | Linux + macOS | Trusted Server CLI                                                                               | `ts <COMMAND>`                                                                                                 |
-| `ts active-version`              | Linux + macOS | Print the currently active deployment version for a target adapter                               | `ts active-version --adapter <ADAPTER> --service-id <SERVICE_ID>`                                              |
-| `ts audit`                       | Linux + macOS | Browser-backed page and ad-template audits                                                       | `ts audit [COMMAND]`                                                                                           |
-| `ts audit ad-templates`          | Linux + macOS | Verify configured ad-template slots against live page evidence                                   | `ts audit ad-templates <COMMAND>`                                                                              |
-| `ts audit ad-templates generate` | Linux + macOS | Scrape a live page's GPT slots and update the config's `[creative_opportunities]` slots in place | `ts audit ad-templates generate [OPTIONS] <URL>`                                                               |
-| `ts audit ad-templates verify`   | Linux + macOS | Verify ad-template slots for one or more live URLs                                               | `ts audit ad-templates verify [OPTIONS] <URLS>...`                                                             |
-| `ts audit generate`              | Linux + macOS | Bootstrap a draft Trusted Server config + JS asset audit from a live page                        | `ts audit generate [OPTIONS] <URL>`                                                                            |
-| `ts audit page`                  | Linux + macOS | Audit a single page and print a read-only summary                                                | `ts audit page [OPTIONS] <URL>`                                                                                |
-| `ts auth`                        | Linux + macOS | Sign in / out / status against an `EdgeZero` adapter                                             | `ts auth <COMMAND>`                                                                                            |
-| `ts auth login`                  | Linux + macOS | Sign in (`wrangler login` / `fastly profile create` / `spin cloud login`)                        | `ts auth login --adapter <ADAPTER>`                                                                            |
-| `ts auth logout`                 | Linux + macOS | Sign out (`wrangler logout` / `fastly profile delete` / `spin cloud logout`)                     | `ts auth logout --adapter <ADAPTER>`                                                                           |
-| `ts auth status`                 | Linux + macOS | Show the current session (`wrangler whoami` / `fastly profile list` / `spin cloud info`)         | `ts auth status --adapter <ADAPTER>`                                                                           |
-| `ts build`                       | Linux + macOS | Build the project for a target adapter                                                           | `ts build --adapter <ADAPTER> [ADAPTER_ARGS]...`                                                               |
-| `ts config`                      | Linux + macOS | Trusted Server app-config commands                                                               | `ts config <COMMAND>`                                                                                          |
-| `ts config ad-templates`         | Linux + macOS | Diagnose server-side ad-template configuration and path matching                                 | `ts config ad-templates <COMMAND>`                                                                             |
-| `ts config ad-templates check`   | Linux + macOS | Assert that a page path or URL matches the expected slot set                                     | `ts config ad-templates check [OPTIONS] <--expected-slot <ID>\|--expect-no-slots> <PATH_OR_URL>`               |
-| `ts config ad-templates explain` | Linux + macOS | Explain why a page path or URL would or would not run the ad stack                               | `ts config ad-templates explain [OPTIONS] <PATH_OR_URL>`                                                       |
-| `ts config ad-templates lint`    | Linux + macOS | Validate ad-template config and summarize deploy-time implications                               | `ts config ad-templates lint [OPTIONS]`                                                                        |
-| `ts config ad-templates match`   | Linux + macOS | Show creative opportunity slots matching a page path or URL                                      | `ts config ad-templates match [OPTIONS] <PATH_OR_URL>`                                                         |
-| `ts config diff`                 | Linux + macOS | Diff `trusted-server.toml` against the live `EdgeZero` config                                    | `ts config diff [OPTIONS] --adapter <ADAPTER>`                                                                 |
-| `ts config gc`                   | Linux + macOS | Reclaim orphaned chunk entries leaked from prior oversized pushes                                | `ts config gc [OPTIONS] --adapter <ADAPTER>`                                                                   |
-| `ts config init`                 | Linux + macOS | Initialize a Trusted Server config file from the example template                                | `ts config init [OPTIONS]`                                                                                     |
-| `ts config push`                 | Linux + macOS | Push `trusted-server.toml` as a blob envelope through `EdgeZero`                                 | `ts config push [OPTIONS] --adapter <ADAPTER>`                                                                 |
-| `ts config validate`             | Linux + macOS | Validate `edgezero.toml` and the typed Trusted Server config                                     | `ts config validate [OPTIONS]`                                                                                 |
-| `ts deploy`                      | Linux + macOS | Deploy the project through a target adapter                                                      | `ts deploy [OPTIONS] --adapter <ADAPTER> [-- <ADAPTER_ARGS>...]`                                               |
-| `ts dev`                         | Linux + macOS | Local developer tools (e.g. the macOS-only production-hostname proxy)                            | `ts dev`                                                                                                       |
-| `ts dev proxy`                   | macOS only    | Run the local production-hostname dev proxy (macOS only)                                         | `ts dev proxy [OPTIONS] [COMMAND]`                                                                             |
-| `ts dev proxy ca`                | macOS only    | Manage the per-machine dev CA                                                                    | `ts dev proxy ca <COMMAND>`                                                                                    |
-| `ts dev proxy ca install`        | macOS only    | Add the CA to the OS trust store (macOS login keychain)                                          | `ts dev proxy ca install`                                                                                      |
-| `ts dev proxy ca path`           | macOS only    | Print the per-machine CA certificate path                                                        | `ts dev proxy ca path`                                                                                         |
-| `ts dev proxy ca regenerate`     | macOS only    | Regenerate the per-machine CA (invalidates prior trust)                                          | `ts dev proxy ca regenerate`                                                                                   |
-| `ts dev proxy ca uninstall`      | macOS only    | Remove the CA from the OS trust store                                                            | `ts dev proxy ca uninstall`                                                                                    |
-| `ts healthcheck`                 | Linux + macOS | Probe a deployed version until it reports healthy                                                | `ts healthcheck [OPTIONS] --adapter <ADAPTER> --domain <DOMAIN> --service-id <SERVICE_ID> --version <VERSION>` |
-| `ts prebid`                      | Linux + macOS | Trusted Server Prebid commands                                                                   | `ts prebid <COMMAND>`                                                                                          |
-| `ts prebid client`               | Linux + macOS | Generate a local external Prebid client bundle and update config metadata                        | `ts prebid client [OPTIONS]`                                                                                   |
-| `ts prebid server`               | Linux + macOS | Configure and operate a self-hosted Prebid Server deployment                                     | `ts prebid server [OPTIONS] <COMMAND>`                                                                         |
-| `ts prebid server inspect`       | Linux + macOS | Inspect local Trusted Server configuration without modifying it or contacting AWS                | `ts prebid server inspect [OPTIONS]`                                                                           |
-| `ts prebid server check`         | Linux + macOS | Validate declared PBS inputs and regional YAML merges locally, without AWS access                | `ts prebid server check [OPTIONS] --deployment <DEPLOYMENT>`                                                   |
-| `ts prebid server status`        | Linux + macOS | Read EC2 infrastructure status, not PBS health or the installed release                          | `ts prebid server status [OPTIONS] --deployment <DEPLOYMENT>`                                                  |
-| `ts prebid server secrets`       | Linux + macOS | Manage values for existing, explicitly declared Secrets Manager secrets                          | `ts prebid server secrets [OPTIONS] <COMMAND>`                                                                 |
-| `ts prebid server secrets set`   | Linux + macOS | Write a complete JSON credential payload; does not deploy or rotate partner credentials          | `ts prebid server secrets set [OPTIONS] --deployment <DEPLOYMENT> --region <REGION> <BIDDER>`                  |
-| `ts provision`                   | Linux + macOS | Provision platform resources through a target adapter                                            | `ts provision [OPTIONS] --adapter <ADAPTER>`                                                                   |
-| `ts rollback`                    | Linux + macOS | Roll a service back to a previously active deployment version                                    | `ts rollback [OPTIONS] --adapter <ADAPTER> --service-id <SERVICE_ID> --version <VERSION>`                      |
-| `ts serve`                       | Linux + macOS | Serve the project locally through a target adapter                                               | `ts serve --adapter <ADAPTER>`                                                                                 |
+| Command                          | Availability  | Summary                                                                                                                  | Usage                                                                                                          |
+| -------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| `ts`                             | Linux + macOS | Trusted Server CLI                                                                                                       | `ts <COMMAND>`                                                                                                 |
+| `ts active-version`              | Linux + macOS | Print the currently active deployment version for a target adapter                                                       | `ts active-version --adapter <ADAPTER> --service-id <SERVICE_ID>`                                              |
+| `ts audit`                       | Linux + macOS | Browser-backed page and ad-template audits                                                                               | `ts audit [COMMAND]`                                                                                           |
+| `ts audit ad-templates`          | Linux + macOS | Verify configured ad-template slots against live page evidence                                                           | `ts audit ad-templates <COMMAND>`                                                                              |
+| `ts audit ad-templates generate` | Linux + macOS | Scrape a live page's GPT slots and update the config's `[creative_opportunities]` slots in place                         | `ts audit ad-templates generate [OPTIONS] <URL>`                                                               |
+| `ts audit ad-templates verify`   | Linux + macOS | Verify ad-template slots for one or more live URLs                                                                       | `ts audit ad-templates verify [OPTIONS] <URLS>...`                                                             |
+| `ts audit generate`              | Linux + macOS | Bootstrap a draft Trusted Server config + JS asset audit from a live page                                                | `ts audit generate [OPTIONS] <URL>`                                                                            |
+| `ts audit page`                  | Linux + macOS | Audit a single page and print a read-only summary                                                                        | `ts audit page [OPTIONS] <URL>`                                                                                |
+| `ts auth`                        | Linux + macOS | Sign in / out / status against an `EdgeZero` adapter                                                                     | `ts auth <COMMAND>`                                                                                            |
+| `ts auth login`                  | Linux + macOS | Sign in (`wrangler login` / `fastly profile create` / `spin cloud login`)                                                | `ts auth login --adapter <ADAPTER>`                                                                            |
+| `ts auth logout`                 | Linux + macOS | Sign out (`wrangler logout` / `fastly profile delete` / `spin cloud logout`)                                             | `ts auth logout --adapter <ADAPTER>`                                                                           |
+| `ts auth status`                 | Linux + macOS | Show the current session (`wrangler whoami` / `fastly profile list` / `spin cloud info`)                                 | `ts auth status --adapter <ADAPTER>`                                                                           |
+| `ts build`                       | Linux + macOS | Build the project for a target adapter                                                                                   | `ts build --adapter <ADAPTER> [ADAPTER_ARGS]...`                                                               |
+| `ts config`                      | Linux + macOS | Trusted Server app-config commands                                                                                       | `ts config <COMMAND>`                                                                                          |
+| `ts config ad-templates`         | Linux + macOS | Diagnose server-side ad-template configuration and path matching                                                         | `ts config ad-templates <COMMAND>`                                                                             |
+| `ts config ad-templates check`   | Linux + macOS | Assert that a page path or URL matches the expected slot set                                                             | `ts config ad-templates check [OPTIONS] <--expected-slot <ID>\|--expect-no-slots> <PATH_OR_URL>`               |
+| `ts config ad-templates explain` | Linux + macOS | Explain why a page path or URL would or would not run the ad stack                                                       | `ts config ad-templates explain [OPTIONS] <PATH_OR_URL>`                                                       |
+| `ts config ad-templates lint`    | Linux + macOS | Validate ad-template config and summarize deploy-time implications                                                       | `ts config ad-templates lint [OPTIONS]`                                                                        |
+| `ts config ad-templates match`   | Linux + macOS | Show creative opportunity slots matching a page path or URL                                                              | `ts config ad-templates match [OPTIONS] <PATH_OR_URL>`                                                         |
+| `ts config diff`                 | Linux + macOS | Diff `trusted-server.toml` against the live `EdgeZero` config                                                            | `ts config diff [OPTIONS] --adapter <ADAPTER>`                                                                 |
+| `ts config gc`                   | Linux + macOS | Reclaim orphaned chunk entries leaked from prior oversized pushes                                                        | `ts config gc [OPTIONS] --adapter <ADAPTER>`                                                                   |
+| `ts config init`                 | Linux + macOS | Initialize a Trusted Server config file from the example template                                                        | `ts config init [OPTIONS]`                                                                                     |
+| `ts config push`                 | Linux + macOS | Push `trusted-server.toml`, with the permission policy file it names, as a blob envelope through `EdgeZero`              | `ts config push [OPTIONS] --adapter <ADAPTER>`                                                                 |
+| `ts config validate`             | Linux + macOS | Validate `edgezero.toml`, the typed Trusted Server config and, with `--permissions`, the permission policy file it names | `ts config validate [OPTIONS]`                                                                                 |
+| `ts deploy`                      | Linux + macOS | Deploy the project through a target adapter                                                                              | `ts deploy [OPTIONS] --adapter <ADAPTER> [-- <ADAPTER_ARGS>...]`                                               |
+| `ts dev`                         | Linux + macOS | Local developer tools (e.g. the macOS-only production-hostname proxy)                                                    | `ts dev`                                                                                                       |
+| `ts dev proxy`                   | macOS only    | Run the local production-hostname dev proxy (macOS only)                                                                 | `ts dev proxy [OPTIONS] [COMMAND]`                                                                             |
+| `ts dev proxy ca`                | macOS only    | Manage the per-machine dev CA                                                                                            | `ts dev proxy ca <COMMAND>`                                                                                    |
+| `ts dev proxy ca install`        | macOS only    | Add the CA to the OS trust store (macOS login keychain)                                                                  | `ts dev proxy ca install`                                                                                      |
+| `ts dev proxy ca path`           | macOS only    | Print the per-machine CA certificate path                                                                                | `ts dev proxy ca path`                                                                                         |
+| `ts dev proxy ca regenerate`     | macOS only    | Regenerate the per-machine CA (invalidates prior trust)                                                                  | `ts dev proxy ca regenerate`                                                                                   |
+| `ts dev proxy ca uninstall`      | macOS only    | Remove the CA from the OS trust store                                                                                    | `ts dev proxy ca uninstall`                                                                                    |
+| `ts healthcheck`                 | Linux + macOS | Probe a deployed version until it reports healthy                                                                        | `ts healthcheck [OPTIONS] --adapter <ADAPTER> --domain <DOMAIN> --service-id <SERVICE_ID> --version <VERSION>` |
+| `ts prebid`                      | Linux + macOS | Trusted Server Prebid commands                                                                                           | `ts prebid <COMMAND>`                                                                                          |
+| `ts prebid client`               | Linux + macOS | Generate a local external Prebid client bundle and update config metadata                                                | `ts prebid client [OPTIONS]`                                                                                   |
+| `ts prebid server`               | Linux + macOS | Configure and operate a self-hosted Prebid Server deployment                                                             | `ts prebid server [OPTIONS] <COMMAND>`                                                                         |
+| `ts prebid server inspect`       | Linux + macOS | Inspect local Trusted Server configuration without modifying it or contacting AWS                                        | `ts prebid server inspect [OPTIONS]`                                                                           |
+| `ts prebid server check`         | Linux + macOS | Validate declared PBS inputs and regional YAML merges locally, without AWS access                                        | `ts prebid server check [OPTIONS] --deployment <DEPLOYMENT>`                                                   |
+| `ts prebid server status`        | Linux + macOS | Read EC2 infrastructure status, not PBS health or the installed release                                                  | `ts prebid server status [OPTIONS] --deployment <DEPLOYMENT>`                                                  |
+| `ts prebid server secrets`       | Linux + macOS | Manage values for existing, explicitly declared Secrets Manager secrets                                                  | `ts prebid server secrets [OPTIONS] <COMMAND>`                                                                 |
+| `ts prebid server secrets set`   | Linux + macOS | Write a complete JSON credential payload; does not deploy or rotate partner credentials                                  | `ts prebid server secrets set [OPTIONS] --deployment <DEPLOYMENT> --region <REGION> <BIDDER>`                  |
+| `ts provision`                   | Linux + macOS | Provision platform resources through a target adapter                                                                    | `ts provision [OPTIONS] --adapter <ADAPTER>`                                                                   |
+| `ts rollback`                    | Linux + macOS | Roll a service back to a previously active deployment version                                                            | `ts rollback [OPTIONS] --adapter <ADAPTER> --service-id <SERVICE_ID> --version <VERSION>`                      |
+| `ts serve`                       | Linux + macOS | Serve the project locally through a target adapter                                                                       | `ts serve --adapter <ADAPTER>`                                                                                 |
 
 ## Install from source
 
@@ -84,11 +84,11 @@ ts --help
 
 ```bash
 ts config init
-# Edit trusted-server.toml
-ts config validate
+# Edit trusted-server.toml, naming the policy file in [permissions] policy
+ts config validate --permissions standard.yaml
 ts auth login --adapter fastly
 ts provision --adapter fastly
-ts config push --adapter fastly
+ts config push --adapter fastly --permissions standard.yaml
 ts serve --adapter fastly
 ```
 
@@ -106,14 +106,34 @@ ts config init
 Validate a local config before pushing it to platform storage:
 
 ```bash
-ts config validate
+ts config validate --permissions standard.yaml
 ```
 
 Push Trusted Server config through EdgeZero:
 
 ```bash
-ts config push --adapter fastly
+ts config push --adapter fastly --permissions standard.yaml
 ```
+
+The settings name the permission policy file the domain runs in
+`[permissions] policy`, by its stem, so `standard.yaml` is `standard`, and
+`--permissions <file>` supplies the file, once for each file. `config push`
+always checks the policy. It refuses settings that name no policy or one no
+supplied file has, a file whose name does not end `.yaml`, a file that is not
+UTF-8 text or not a valid policy, two files with one name, and settings or
+an overlay that set `[permissions] sha256` or `text`. It then writes the
+SHA-256 of the named file's exact bytes, in lower-case hexadecimal, into
+`[permissions] sha256`, and on Fastly, Cloudflare and Spin the file itself
+into `[permissions] text`, before EdgeZero builds the envelope, and prints
+the policy's name and digest. Axum reads the file from its own folder
+instead. `config validate` makes the same checks when `--permissions` is
+given, and says that the policy was not checked when it is not.
+`config diff` compares the settings as the push would write them, digest
+included, so when the settings name a policy it refuses to run without
+`--permissions`. Both refuse settings or an overlay that set
+`[permissions] sha256` or `text`, with or without the flag. A checkout that
+converts line endings changes a file's digest, so supply the file byte for
+byte.
 
 `config validate`, `config diff`, and `config push` use EdgeZero's typed
 app-config loader. By default that loader applies `TRUSTED_SERVER__...`
@@ -251,9 +271,9 @@ staged version:
 
 ```bash
 EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<staging-config-store> \
-  ts config push --adapter fastly --staging
+  ts config push --adapter fastly --staging --permissions standard.yaml
 EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<staging-config-store> \
-  ts config diff --adapter fastly --staging
+  ts config diff --adapter fastly --staging --permissions standard.yaml
 ```
 
 The config key is fixed on Fastly: production, staging, and local Viceroy all
@@ -616,7 +636,7 @@ not fall back to a fabricated default ad unit.
 When a run reports that it wrote a `{section}` template:
 
 1. Deploy the template-aware binary **first**.
-2. Then `ts config push`.
+2. Then `ts config push --permissions <file>`.
 3. Do **not** roll that binary back while the config is live.
 
 A run that did not template writes neither key, and leaves the config exactly as

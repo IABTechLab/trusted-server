@@ -79,6 +79,38 @@ TOML file.
 
 ---
 
+### The configuration names no permission policy
+
+**Error Message:**
+
+```
+the configuration names no permission policy, so name the publisher's policy file in `[permissions] policy` and push it with `ts config push --permissions <file>`
+```
+
+**Cause:** No adapter build carries a permission policy, so a domain's settings name
+the publisher's own policy file, and settings written before this change name none.
+The domain does not start, and every route answers `500`, except `/health` on
+the adapters whose startup router keeps it. A push of such settings is refused
+with a message naming `[permissions] policy`.
+
+**Solution:** Name the policy file by its stem in the settings, and supply the
+file when you push them.
+
+```toml
+[permissions]
+policy = "standard"
+```
+
+```bash
+ts config push --adapter fastly --permissions standard.yaml
+```
+
+On Axum, also point `TRUSTED_SERVER_PERMISSIONS_DIR` at the folder that holds
+`standard.yaml`. See
+[Permission Policy Configuration](/guide/configuration#permission-policy-configuration).
+
+---
+
 ### Invalid URL format
 
 **Error Message:**
@@ -707,8 +739,8 @@ curl -X POST http://localhost:7676/auction \
 ### Validate Configuration
 
 ```bash
-# Validate the resolved deployment configuration
-ts config validate
+# Validate the resolved deployment configuration and the policy file it names
+ts config validate --permissions standard.yaml
 
 # Then check startup logs when exercising the runtime
 fastly compute serve 2>&1 | grep -i "settings"

@@ -9,10 +9,15 @@ cookie_domain = "localhost"
 origin_url = "http://127.0.0.1:8888"
 proxy_secret = "integration_proxy_secret"
 
-# The lifecycle scenarios need a resolved jurisdiction for the consent gate,
-# and Viceroy supplies the host geo lookup.
 [geo]
+# Viceroy maps the loopback client to US/CA (see viceroy-template.toml), so
+# the platform geo module resolves a real place and the EC lifecycle
+# scenarios exercise the US state opt-out machinery.
 module = "platform"
+
+[permissions]
+# The repository's sample, which every integration runtime is given.
+policy = "sample"
 
 [ec]
 module = "hmac"

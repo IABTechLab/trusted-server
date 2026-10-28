@@ -13,7 +13,6 @@ use http::{Method, StatusCode, header};
 use serde::Deserialize;
 use url::Url;
 
-use crate::consent::allows_eid_persistence;
 use crate::platform::{
     DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, PlatformHttpRequest, PlatformPendingRequest,
     PlatformResponse, RuntimeServices,
@@ -62,23 +61,22 @@ struct PullSyncResponse {
 
 /// Builds post-send pull-sync context from the route EC context.
 ///
-/// Returns `None` when there are no pull-enabled partners, when consent denies
-/// EC, when there is no active EC ID or no module this deployment reads owns
-/// it, or when the request snapshot holds no consented row that is still
-/// missing at least one pull-partner UID.
+/// Returns `None` when there are no pull-enabled partners, when sharing is not
+/// permitted, when there is no active EC ID or no module this deployment reads
+/// owns it, or when the request snapshot holds no consented row that is still
+/// missing at least one pull-partner UID. Pull sync sends the identifier to a
+/// partner, so it needs the same permission pair as bidstream EIDs (storage
+/// plus personalised-ad selection), not only the module's storage permission.
 #[must_use]
 pub fn build_pull_sync_context(
     ec_context: &EcContext,
     registry: &PartnerRegistry,
 ) -> Option<PullSyncContext> {
-    // Without EID-persistence consent (TCF Purpose 1 + 4), finalization
-    // withholds browser-supplied partner UIDs. That leaves partner slots empty,
-    // which pull sync would otherwise read as eligible and disclose the EC ID
-    // to partners for exactly the users who opted out.
-    if registry.pull_enabled_partners().is_empty()
-        || !ec_context.ec_allowed()
-        || !allows_eid_persistence(ec_context.consent())
-    {
+    // Without storage and personalised-ad permissions, finalization withholds
+    // browser-supplied partner UIDs. That leaves partner slots empty, which pull
+    // sync would otherwise read as eligible and disclose the EC ID to partners
+    // for exactly the readers who withheld them.
+    if registry.pull_enabled_partners().is_empty() || !ec_context.ec_sharing_allowed() {
         return None;
     }
 
@@ -686,26 +684,27 @@ mod tests {
 
     #[test]
     fn build_pull_sync_context_skips_when_eid_persistence_is_denied() {
-        // Purpose 1 granted keeps the EC, but Purpose 4 denied withholds EID
-        // writes and leaves partner slots empty. Pull sync must not read those
+        // Storage allowed keeps the EC, but no personalised-ad selection withholds
+        // EID writes and leaves partner slots empty. Pull sync must not read those
         // empty slots as eligible and disclose the EC ID to partners.
         let consent = purpose_one_only_consent();
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
+        let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent)
+            .with_permissions_for_test(crate::test_support::tests::storage_only_permissions());
         let graph = KvIdentityGraph::in_memory("pull_store");
         ec_context.set_kv_snapshot(seed_present_snapshot(&graph, &ec_id));
         let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
             .expect("should build registry");
         assert!(
             ec_context.ec_allowed(),
-            "should keep the EC allowed when Purpose 1 is granted"
+            "should keep the EC allowed when storage is allowed"
         );
 
         let context = build_pull_sync_context(&ec_context, &registry);
 
         assert!(
             context.is_none(),
-            "should skip pull sync when TCF Purpose 4 is denied"
+            "should skip pull sync when personalised-ad selection is not allowed"
         );
     }
 

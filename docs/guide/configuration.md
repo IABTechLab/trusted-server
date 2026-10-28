@@ -27,7 +27,14 @@ proxy_secret = "publisher_proxy_secret"
 
 [ec]
 passphrase = "ec_passphrase"
+
+[permissions]
+policy = "standard"
 ```
+
+`[permissions] policy` names your permission policy file, here
+`standard.yaml`, which you supply when you push. See
+[Permission Policy Configuration](#permission-policy-configuration).
 
 ### Environment Variable Overrides
 
@@ -44,8 +51,8 @@ export TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=publisher_proxy_secret
 export TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
 
 # Replace the rejected placeholder values in trusted-server.toml, then validate.
-ts config validate
-ts config push --adapter fastly
+ts config validate --permissions standard.yaml
+ts config push --adapter fastly --permissions standard.yaml
 ```
 
 ### Static secret references
@@ -118,7 +125,8 @@ Prepare an initial reference-based deployment in this order:
 2. Choose a stable key name for each active credential field in the app config.
 3. Write each credential value under its referenced key without exposing it in
    command arguments, shell history, logs, or CI output.
-4. Run `ts config validate`, then `ts config push --adapter fastly`.
+4. Run `ts config validate`, then
+   `ts config push --adapter fastly --permissions <file>`.
 5. Start or deploy instances after the store and pushed config are both ready.
 
 Migrate an existing deployment in this order:
@@ -128,7 +136,8 @@ Migrate an existing deployment in this order:
    CI output.
 2. Replace each active credential value with a stable key name and remove the
    legacy Tinybird, DataDome, and S3 `secret_store` selectors.
-3. Run `ts config validate`, then `ts config push --adapter fastly --no-diff`.
+3. Run `ts config validate`, then
+   `ts config push --adapter fastly --no-diff --permissions <file>`.
 4. Restart/redeploy instances as needed to load the new values. Rotation is
    startup-scoped; changing a store value does not alter already-built state.
 
@@ -140,7 +149,7 @@ matches the runtime lookup:
 
 ```bash
 export EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=default
-ts config push --adapter spin
+ts config push --adapter spin --permissions standard.yaml
 ```
 
 For local Spin development, add `--local` to the push command. Also declare a
@@ -203,6 +212,7 @@ fail and the service will return its startup-error response.
 | `[[handlers]]`             | Ordered HTTP Basic-auth rules                                           |
 | `[image_optimizer]`        | Reusable Fastly Image Optimizer profiles                                |
 | `[integrations.*]`         | Typed partner and browser integration settings                          |
+| `[permissions]`            | The publisher's permission policy file, by name                         |
 | `[proxy]`                  | Proxy allowlist, TLS policy, and asset routes                           |
 | `[publisher]`              | Publisher domain, origin, and proxy signing key                         |
 | `[request_signing]`        | Outbound Ed25519 request signing and management-store IDs               |
@@ -226,6 +236,9 @@ proxy_secret = "publisher_proxy_secret"
 
 [ec]
 passphrase = "ec_passphrase"
+
+[permissions]
+policy = "standard"
 
 [request_signing]
 enabled = true
@@ -736,6 +749,43 @@ freshness_threshold_days = 30
 `applies_in` and `privacy_states` are policy inputs. Review them against the
 publisher's operating jurisdictions instead of assuming the built-in lists are
 legal advice.
+
+## Permission Policy Configuration
+
+`[permissions]` names the publisher's permission policy file, which decides
+which permissions each request has. The
+[permission model](/guide/permission-model) describes what the file says. No
+build carries a policy, so every deployment names its own file and supplies it
+with `ts config push --permissions <file>`.
+
+### `[permissions]`
+
+| Field    | Type   | Default | Contract                                                            |
+| -------- | ------ | ------- | ------------------------------------------------------------------- |
+| `policy` | String | None    | Required. The policy file's stem, so `standard.yaml` is `standard`  |
+| `sha256` | String | None    | Written by `ts config push`, never by the settings or an overlay    |
+| `text`   | String | None    | The file itself, written by the push on Fastly, Cloudflare and Spin |
+
+```toml
+[permissions]
+policy = "standard"
+```
+
+```bash
+ts config validate --permissions standard.yaml
+ts config push --adapter fastly --permissions standard.yaml
+```
+
+The push writes the SHA-256 of the file's exact bytes into `sha256`, and on
+every adapter but Axum the file into `text`. Axum reads `<policy>.yaml` from the
+folder `TRUSTED_SERVER_PERMISSIONS_DIR` names when it starts. The
+[CLI guide](/guide/cli#configuration-commands) lists what the push refuses.
+
+A domain whose settings name no policy, or whose file is missing, is not the
+file that was pushed or does not parse, does not start. Every route answers
+`500`, except `/health` on the adapters whose startup router keeps it (see
+[adapter support](/guide/integrations-overview#adapter-support)). Fastly and
+Axum log the reason, which names the policy when the settings name one.
 
 ## Response Headers
 
@@ -2919,7 +2969,7 @@ key. Clear any production key override for the local push:
 
 ```bash
 env -u EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY \
-  ts config push --adapter fastly --local
+  ts config push --adapter fastly --local --permissions standard.yaml
 ```
 
 `--local` writes under `[local_server.config_stores.trusted_server_config]` in

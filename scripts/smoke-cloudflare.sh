@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Exercise the Cloudflare local KV-to-binding bridge and publisher proxy path.
+# Exercise the Cloudflare local config store and publisher proxy path.
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -26,6 +26,8 @@ ORIGIN_PORT=${CLOUDFLARE_SMOKE_ORIGIN_PORT:-19089}
 BASE_PORT=${CLOUDFLARE_SMOKE_PORT:-19080}
 ORIGIN_PID=""
 APP_PID=""
+# The config store's binding, its default platform name.
+CONFIG_BINDING=trusted_server_config
 
 cleanup() {
     smoke_stop_process "$APP_PID"
@@ -48,7 +50,11 @@ smoke_initialize_config "$REPO_ROOT" "$WORKSPACE" "$ORIGIN_PORT"
 
 CLOUDFLARE_WORK="$WORKSPACE/cloudflare"
 mkdir -p "$CLOUDFLARE_WORK"
-cp "$CLOUDFLARE_ROOT/wrangler.toml" "$CLOUDFLARE_WORK/wrangler.toml"
+# The push runs Wrangler in the manifest's folder with its default
+# `wrangler.toml`, and every Worker below runs from a copy of
+# `wrangler.ci.toml`, so both are the CI manifest and name one local
+# config store namespace.
+cp "$CLOUDFLARE_ROOT/wrangler.ci.toml" "$CLOUDFLARE_WORK/wrangler.toml"
 cp "$CLOUDFLARE_ROOT/wrangler.ci.toml" "$CLOUDFLARE_WORK/wrangler.ci.toml"
 ln -s "$CLOUDFLARE_ROOT/build" "$CLOUDFLARE_WORK/build"
 sed \
@@ -57,58 +63,17 @@ sed \
     -e "s|manifest = \"$REPO_ROOT/crates/trusted-server-adapter-cloudflare/wrangler.toml\"|manifest = \"$CLOUDFLARE_WORK/wrangler.toml\"|" \
     "$REPO_ROOT/edgezero.toml" >"$WORKSPACE/edgezero.toml"
 
-(
-    cd "$WORKSPACE"
-    EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=TRUSTED_SERVER_KV \
-        "$SMOKE_TS_BIN" config push \
-        --adapter cloudflare \
-        --local \
-        --manifest "$WORKSPACE/edgezero.toml" \
-        --app-config "$SMOKE_APP_CONFIG" \
-        --yes \
-        --no-diff
-)
-ENVELOPE=$(
-    cd "$CLOUDFLARE_WORK"
-    wrangler kv key get trusted_server_config \
-        --binding TRUSTED_SERVER_KV \
-        --local \
-        --config wrangler.toml
-)
-[ -n "$ENVELOPE" ] || smoke_die "Wrangler KV read-back returned an empty envelope"
-CONFIG_JSON=$(jq --compact-output --null-input \
-    --arg app_config "$ENVELOPE" \
-    '{app_config: $app_config}')
-
 write_runtime_config() {
     local destination="$1"
-    local config_json="$2"
-    local missing_key="${3:-}"
-    local config_line=""
-    if [ -n "$config_json" ]; then
-        config_line="TRUSTED_SERVER_CONFIG = '''$config_json'''"
-    fi
-    CLOUDFLARE_SMOKE_CONFIG_LINE="$config_line" awk \
+    local missing_key="${2:-}"
+    # The secrets go at the end, under the manifest's last table, [vars].
+    awk \
         -v missing_key="$missing_key" \
         -v handler="$SMOKE_HANDLER_VALUE" \
         -v proxy="$SMOKE_PROXY_VALUE" \
         -v ec="$SMOKE_EC_VALUE" '
-        BEGIN {
-            config_line = ENVIRON["CLOUDFLARE_SMOKE_CONFIG_LINE"]
-        }
-        $0 == "TRUSTED_SERVER_CONFIG = \"{}\"" {
-            placeholders++
-            if (config_line != "") {
-                print config_line
-            }
-            next
-        }
         { print }
         END {
-            if (placeholders != 1) {
-                print "Cloudflare smoke template must contain one config placeholder" > "/dev/stderr"
-                exit 1
-            }
             if (missing_key != "handler_password") {
                 print "handler_password = \"" handler "\""
             }
@@ -125,11 +90,9 @@ write_runtime_config() {
 run_case() {
     local case_name="$1"
     local port="$2"
-    local config_json="$3"
-    local missing_key="$4"
-    local expected_status="$5"
-    local missing_binding="${6:-}"
-    local expected_diagnostic="${7:-}"
+    local missing_key="$3"
+    local expected_status="$4"
+    local missing_binding="${5:-}"
     local config_path="$CLOUDFLARE_WORK/wrangler.$case_name.toml"
     local log_path="$WORKSPACE/$case_name.log"
     local body_path="$WORKSPACE/$case_name.body"
@@ -137,7 +100,7 @@ run_case() {
 
     smoke_assert_process_alive "$ORIGIN_PID" "stub origin" "$WORKSPACE/origin.log"
 
-    write_runtime_config "$config_path" "$config_json" "$missing_key"
+    write_runtime_config "$config_path" "$missing_key"
     (
         cd "$CLOUDFLARE_WORK"
         exec wrangler dev \
@@ -146,6 +109,8 @@ run_case() {
             --ip 127.0.0.1
     ) >"$log_path" 2>&1 &
     APP_PID=$!
+    # The Worker installs no logger, so a negative case is checked by its
+    # status alone, which smoke_wait_http waits for.
     smoke_wait_http "http://127.0.0.1:$port/" "$expected_status" \
         "$body_path" "$headers_path"
     smoke_assert_process_alive "$APP_PID" "Wrangler" "$log_path"
@@ -153,40 +118,46 @@ run_case() {
     smoke_stop_process "$APP_PID"
     APP_PID=""
 
-    if [ -n "$expected_diagnostic" ]; then
+    if [ "$expected_status" != 200 ]; then
         grep --fixed-strings --quiet 'Your Worker has access to the following bindings:' "$log_path" ||
             smoke_die "Wrangler did not report the runtime binding inventory"
-        if grep --fixed-strings --quiet "$missing_binding" "$log_path"; then
+        grep --fixed-strings --quiet "env.$CONFIG_BINDING" "$log_path" ||
+            smoke_die "negative case did not bind the config store"
+        if [ -n "$missing_binding" ] && grep --fixed-strings --quiet "$missing_binding" "$log_path"; then
             smoke_die "negative case unexpectedly exposed $missing_binding"
         fi
-        if [ "$missing_binding" = "env.TRUSTED_SERVER_CONFIG" ]; then
-            grep --fixed-strings --quiet 'env.handler_password' "$log_path" ||
-                smoke_die "missing-config case did not retain the secret control binding"
-        else
-            grep --fixed-strings --quiet 'env.TRUSTED_SERVER_CONFIG' "$log_path" ||
-                smoke_die "missing-secret case did not retain the config control binding"
-        fi
-        smoke_assert_failure \
-            "$expected_status" \
-            "$expected_diagnostic" \
-            "$log_path"
     else
         smoke_assert_success "$body_path" "$ORIGIN_PORT" "$port"
     fi
 }
 
-run_case missing-config "$BASE_PORT" "" "" 500 \
-    'env.TRUSTED_SERVER_CONFIG' \
-    'Cloudflare TRUSTED_SERVER_CONFIG is required'
-run_case missing-handler "$((BASE_PORT + 1))" "$CONFIG_JSON" handler_password 500 \
-    'env.handler_password' \
-    "failed to resolve secret reference at \`handlers[0].password\` from secret store \`trusted_server_secrets\`"
-run_case missing-proxy "$((BASE_PORT + 2))" "$CONFIG_JSON" publisher_proxy_secret 500 \
-    'env.publisher_proxy_secret' \
-    "failed to resolve secret reference at \`publisher.proxy_secret\` from secret store \`trusted_server_secrets\`"
-run_case missing-ec "$((BASE_PORT + 3))" "$CONFIG_JSON" ec_passphrase 500 \
-    'env.ec_passphrase' \
-    "failed to resolve secret reference at \`ec.hmac.passphrase\` from secret store \`trusted_server_secrets\`"
-run_case positive "$((BASE_PORT + 4))" "$CONFIG_JSON" "" 200 "" ""
+# Before the push the config store holds no blob, so the Worker cannot load.
+run_case missing-config "$BASE_PORT" "" 500 ""
+
+(
+    cd "$WORKSPACE"
+    "$SMOKE_TS_BIN" config push \
+        --adapter cloudflare \
+        --local \
+        --manifest "$WORKSPACE/edgezero.toml" \
+        --app-config "$SMOKE_APP_CONFIG" \
+        --permissions "$SMOKE_POLICY_FILE" \
+        --yes \
+        --no-diff
+)
+ENVELOPE=$(
+    cd "$CLOUDFLARE_WORK"
+    wrangler kv key get trusted_server_config \
+        --binding "$CONFIG_BINDING" \
+        --local \
+        --config wrangler.toml
+)
+[ -n "$ENVELOPE" ] || smoke_die "Wrangler KV read-back returned an empty envelope"
+
+run_case missing-handler "$((BASE_PORT + 1))" handler_password 500 'env.handler_password'
+run_case missing-proxy "$((BASE_PORT + 2))" publisher_proxy_secret 500 \
+    'env.publisher_proxy_secret'
+run_case missing-ec "$((BASE_PORT + 3))" ec_passphrase 500 'env.ec_passphrase'
+run_case positive "$((BASE_PORT + 4))" "" 200 ""
 
 echo "Cloudflare first-success smoke passed"

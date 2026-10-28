@@ -77,18 +77,19 @@ impl PlatformBackend for NoopBackend {
 
 // ---------------------------------------------------------------------------
 // edgezero handle adapters — no #[cfg] needed; platform-specific store
-// construction is handled by edgezero's run_app before we receive the ctx.
+// construction is handled by EdgeZero's dispatch before we receive the ctx.
 // ---------------------------------------------------------------------------
 
-/// Bridges edgezero's [`ConfigStoreHandle`] (injected by `run_app` from the
-/// `TRUSTED_SERVER_CONFIG` env-var binding) to [`PlatformConfigStore`].
+/// Bridges edgezero's [`ConfigStoreHandle`], which `EdgeZero`'s dispatch
+/// registers for a request from the stores the application declares, to
+/// [`PlatformConfigStore`].
 ///
 /// Reads delegate through the handle. Writes are unsupported on all current
 /// adapter targets and return errors.
 ///
-/// Note: Cloudflare config is a single flat JSON env-var binding — all keys
-/// live in one namespace. The `store_name` argument is intentionally ignored;
-/// callers cannot route to a different store by passing a different name.
+/// Note: the handle opens one Workers KV namespace. The `store_name`
+/// argument is intentionally ignored; callers cannot route to a different
+/// store by passing a different name.
 struct ConfigStoreHandleAdapter(ConfigStoreHandle);
 
 impl PlatformConfigStore for ConfigStoreHandleAdapter {
@@ -112,8 +113,8 @@ impl PlatformConfigStore for ConfigStoreHandleAdapter {
     }
 }
 
-/// Bridges edgezero's [`KvHandle`] (injected by `run_app` from the
-/// `TRUSTED_SERVER_KV` KV namespace binding) to [`PlatformKvStore`].
+/// Bridges edgezero's [`KvHandle`] (registered by `EdgeZero`'s dispatch from
+/// the `TRUSTED_SERVER_KV` KV namespace binding) to [`PlatformKvStore`].
 ///
 /// Delegates all operations through `KvHandle`'s raw-bytes API, which includes
 /// key/value validation before forwarding to the underlying store.
@@ -122,7 +123,7 @@ impl PlatformConfigStore for ConfigStoreHandleAdapter {
 /// inside the `KvHandle` that `RuntimeServices::kv_handle()` constructs from
 /// this adapter. The overhead is negligible (string length checks only) and
 /// avoided by the fact that we reuse the already-opened `env.kv()` handle from
-/// `run_app` rather than opening a new one.
+/// the dispatch rather than opening a new one.
 struct KvHandleAdapter(KvHandle);
 
 #[async_trait::async_trait(?Send)]
@@ -582,10 +583,10 @@ impl PlatformSecretStore for CloudflareSecretStoreAdapter {
 
 /// Construct [`RuntimeServices`] for an incoming Cloudflare Workers request.
 ///
-/// Config and KV are sourced from the edgezero handles that `run_app` injects
-/// before routing — via the `TRUSTED_SERVER_CONFIG` env-var binding and the
-/// `TRUSTED_SERVER_KV` KV namespace declared in `cloudflare.toml`. No
-/// platform-specific `#[cfg]` is required for these two stores.
+/// Config and KV are sourced from the edgezero handles that `EdgeZero`'s
+/// dispatch registers before routing, from the stores the application
+/// declares, and a request with no handle gets a store that answers
+/// nothing. No platform-specific `#[cfg]` is required for these two stores.
 ///
 /// Secrets still require direct `worker::Env` access because
 /// `SecretHandle::get_bytes` is async while `PlatformSecretStore::get_bytes`
@@ -597,6 +598,10 @@ impl PlatformSecretStore for CloudflareSecretStoreAdapter {
 pub fn build_runtime_services(
     ctx: &edgezero_core::context::RequestContext,
     settings: &trusted_server_core::settings::Settings,
+    permission_signal_modules: &Arc<
+        [Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>],
+    >,
+    permission_policy: &Arc<trusted_server_core::permissions::PermissionPolicy>,
 ) -> RuntimeServices {
     let client_ip = extract_client_ip(ctx);
 
@@ -605,13 +610,14 @@ pub fn build_runtime_services(
     #[cfg(not(target_arch = "wasm32"))]
     let http_client: Arc<dyn PlatformHttpClient> = Arc::new(UnavailableHttpClient);
 
-    // Config: use the ConfigStoreHandle injected by run_app — no #[cfg] needed.
+    // Config: use the ConfigStoreHandle the dispatch registered, so no
+    // #[cfg] is needed.
     let config_store: Arc<dyn PlatformConfigStore> = ctx
         .config_store_default()
         .map(|h| Arc::new(ConfigStoreHandleAdapter(h)) as Arc<dyn PlatformConfigStore>)
         .unwrap_or_else(|| Arc::new(NoopConfigStore));
 
-    // KV: use the KvHandle injected by run_app — no #[cfg] needed.
+    // KV: use the KvHandle the dispatch registered, so no #[cfg] is needed.
     let kv_store: Arc<dyn PlatformKvStore> = ctx
         .kv_store_default()
         .map(|h| Arc::new(KvHandleAdapter(h)) as Arc<dyn PlatformKvStore>)
@@ -643,6 +649,13 @@ pub fn build_runtime_services(
         .backend(Arc::new(NoopBackend))
         .http_client(http_client)
         .geo(geo)
+        // The signal modules were selected once at startup from the scheme
+        // crates this adapter links, so every request asks exactly the ones
+        // configuration named, in that order.
+        .permission_signal_modules(Arc::clone(permission_signal_modules))
+        // The policy the domain's settings loaded decides the request's
+        // permissions.
+        .permission_policy(Arc::clone(permission_policy))
         .client_info(ClientInfo {
             client_ip,
             tls_protocol: None,
@@ -665,9 +678,10 @@ pub fn build_runtime_services(
 /// "unknown" sentinel) is treated as absent.
 ///
 /// The region is the ISO 3166-2 subdivision code from `cf-region-code`, for
-/// example `CA`, and not the subdivision name from `cf-region`, because the US
-/// state privacy rules in `[consent.us_states] privacy_states` are written as
-/// two-letter codes and a name would never match one.
+/// example `CA`, and not the subdivision name from `cf-region`, because the
+/// region nodes of the `permissions.yaml` rules tree, including the US states
+/// that carry `jurisdiction: us-state`, are written as two-letter codes and a
+/// name would never match one.
 struct CloudflareGeo {
     country: String,
     city: String,
@@ -830,12 +844,11 @@ mod tests {
     #[test]
     fn a_us_state_visitor_reaches_the_us_state_jurisdiction_and_its_opt_out() {
         // The region header has to reach the privacy outcome.
-        // `detect_jurisdiction` reaches its US branch only when the country is
-        // `US` and a region is present. With no region a US visitor falls
-        // through to `NonRegulated`, where `allows_ec_creation` returns true
-        // without reading `ctx.gpc`, so a Sec-GPC opt-out would be ignored.
-        let config = trusted_server_core::consent_config::ConsentConfig::default();
-
+        // `detect_jurisdiction` reaches a US state node of the policy tree
+        // only when the country is `US` and a region is present. With no
+        // region a US visitor falls through to the country node's
+        // `NonRegulated`, where `allows_ec_creation` returns true without
+        // reading `ctx.gpc`, so a Sec-GPC opt-out would be ignored.
         let ctx = make_ctx_with_headers(&[("cf-ipcountry", "US"), ("cf-region-code", "CA")]);
         let geo = build_geo(&ctx)
             .lookup(None)
@@ -847,8 +860,10 @@ mod tests {
             "the ISO 3166-2 subdivision code should reach the geo info"
         );
 
-        let jurisdiction =
-            trusted_server_core::consent::jurisdiction::detect_jurisdiction(Some(&geo), &config);
+        let jurisdiction = trusted_server_core::consent::jurisdiction::detect_jurisdiction(
+            trusted_server_core::permissions::PermissionMaps::sample(),
+            Some(&geo),
+        );
         assert_eq!(
             jurisdiction,
             trusted_server_core::consent::jurisdiction::Jurisdiction::UsState("CA".to_owned()),
@@ -878,7 +893,10 @@ mod tests {
             "no region header should mean no region, not an invented one"
         );
         assert_eq!(
-            trusted_server_core::consent::jurisdiction::detect_jurisdiction(Some(&geo), &config),
+            trusted_server_core::consent::jurisdiction::detect_jurisdiction(
+                trusted_server_core::permissions::PermissionMaps::sample(),
+                Some(&geo),
+            ),
             trusted_server_core::consent::jurisdiction::Jurisdiction::NonRegulated,
             "with no region a US visitor cannot be placed in a privacy state"
         );

@@ -32,8 +32,8 @@ export async function findAvailablePort(): Promise<number> {
  * Start a Docker container for the given framework.
  *
  * Uses `docker run -d` (detached) with `--rm` for auto-cleanup on stop.
- * The container is mapped to the fixed origin port so the WASM binary
- * (which has this port baked in) can proxy to it.
+ * The container is mapped to the fixed origin port, which the origin URL in
+ * the generated Viceroy config uses, so the WASM binary can proxy to it.
  *
  * @returns The container ID.
  */

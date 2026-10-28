@@ -6,8 +6,16 @@ use std::process::{Command, Output};
 
 use tempfile::TempDir;
 use trusted_server_core::config_payload::{CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_ID};
+use trusted_server_core::permissions::policy_sha256;
 
-fn project() -> TempDir {
+/// The policy file the project's settings name.
+const SAMPLE_POLICY: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../config/permissions/sample.yaml"
+);
+
+/// A project holding the example settings with `permissions` appended.
+fn project_with(permissions: &str) -> TempDir {
     let directory = tempfile::tempdir().expect("should create a temporary project");
     let mut manifest: toml::Value = toml::from_str(include_str!("../../../edgezero.toml"))
         .expect("should parse the repository manifest");
@@ -23,26 +31,45 @@ fn project() -> TempDir {
     .expect("should write the test manifest");
     fs::write(
         directory.path().join("trusted-server.toml"),
-        include_str!("../../../trusted-server.example.toml"),
+        format!(
+            "{}\n{permissions}",
+            include_str!("../../../trusted-server.example.toml")
+        ),
     )
     .expect("should copy the example app config");
     directory
 }
 
-fn push(project: &TempDir, args: &[&str], overrides: &[(&str, &str)]) -> Output {
-    let output = Command::new(env!("CARGO_BIN_EXE_ts"))
-        .args([
-            "config",
-            "push",
-            "--adapter",
-            "axum",
-            "--local",
-            "--no-diff",
-        ])
+/// A project whose settings name the repository's sample policy.
+fn project() -> TempDir {
+    project_with("[permissions]\npolicy = \"sample\"\n")
+}
+
+/// Runs a local Axum push of `project` with the sample policy file.
+fn run_push(project: &TempDir, args: &[&str], overrides: &[(&str, &str)]) -> Output {
+    let push = [
+        "config",
+        "push",
+        "--adapter",
+        "axum",
+        "--local",
+        "--no-diff",
+        "--permissions",
+        SAMPLE_POLICY,
+    ];
+    run_ts(project, &[&push[..], args].concat(), overrides)
+}
+
+/// Runs `ts` in `project` with the publisher settings the example leaves as
+/// placeholders.
+fn run_ts(project: &TempDir, args: &[&str], overrides: &[(&str, &str)]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_ts"))
         .args(args)
         .current_dir(project.path())
         // Do not inherit operator configuration or credentials from the test runner.
         .env_clear()
+        // The push hands its settings over in a file in the temp folder.
+        .envs(["TMPDIR", "TMP", "TEMP"].map(|name| (name, std::env::temp_dir().into_os_string())))
         .env("RUST_LOG", "info")
         .env("TRUSTED_SERVER__PUBLISHER__DOMAIN", "publisher.example.com")
         .env(
@@ -55,7 +82,11 @@ fn push(project: &TempDir, args: &[&str], overrides: &[(&str, &str)]) -> Output 
         )
         .envs(overrides.iter().copied())
         .output()
-        .expect("should run a local config push");
+        .expect("should run ts")
+}
+
+fn push(project: &TempDir, args: &[&str], overrides: &[(&str, &str)]) -> Output {
+    let output = run_push(project, args, overrides);
     assert!(
         output.status.success(),
         "local push should succeed: {}",
@@ -89,6 +120,45 @@ fn config_push_default_store_and_key_match_the_compiled_runtime() {
     assert_eq!(
         envelope["data"]["publisher"]["domain"],
         "publisher.example.com"
+    );
+    let sample = fs::read_to_string(SAMPLE_POLICY).expect("should read the sample policy");
+    assert_eq!(
+        envelope["data"]["permissions"],
+        serde_json::json!({ "policy": "sample", "sha256": policy_sha256(&sample) }),
+        "should pin the named file by its digest, with no text for Axum"
+    );
+}
+
+#[test]
+fn config_push_refuses_the_example_settings_as_written() {
+    // The example names no policy, because no tool chooses one.
+    let project = project_with("");
+
+    let output = run_push(&project, &["--yes"], &[]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "the push should be refused");
+    assert!(
+        stderr.contains("`[permissions] policy`"),
+        "should name what is missing: {stderr}"
+    );
+    assert!(
+        !project.path().join(".edgezero").exists(),
+        "a refused push should write nothing"
+    );
+}
+
+#[test]
+fn config_validate_without_the_policy_file_says_the_policy_was_not_checked() {
+    let project = project();
+
+    let output = run_ts(&project, &["config", "validate"], &[]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "validation should pass: {stderr}");
+    assert!(
+        stderr.contains("the policy was not checked"),
+        "should say that the policy was not checked: {stderr}"
     );
 }
 

@@ -15,9 +15,10 @@ const LEGACY_ADMIN_DENY_METHODS: &[&str] =
 
 /// Build the full application router from explicit test settings.
 ///
-/// The settings baked into the binary contain placeholder secrets that
-/// `get_settings()` rejects by design, which would turn every route into a
-/// startup error page (and its route table into the fallback-only set).
+/// The process reads its settings from its config store when it starts,
+/// which a test does not set up, so `TrustedServerApp::routes()` would turn
+/// every route into a startup error page (and its route table into the
+/// fallback-only set).
 fn test_settings() -> trusted_server_core::settings::Settings {
     trusted_server_core::settings::Settings::from_toml(
         r#"
@@ -37,9 +38,15 @@ fn test_settings() -> trusted_server_core::settings::Settings {
 
             [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            assume_single_jurisdiction = true
         "#,
     )
     .expect("should parse route test settings")
+    // A loaded domain carries its policy, and these tests decide under the
+    // repository's sample.
+    .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
 }
 
 fn test_router() -> edgezero_core::router::RouterService {
@@ -895,6 +902,11 @@ const UNINJECTED_MODULE_TOML: &str = r#"
 
     [ec.acme]
     endpoint = "https://ec.acme.example.com"
+
+    # An Edge Cookie module is configured, so single-jurisdiction operation
+    # is acknowledged because no geo module is selected.
+    [geo]
+    assume_single_jurisdiction = true
 "#;
 
 /// A module selection this adapter can never supply must fail while the

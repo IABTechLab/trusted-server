@@ -9,7 +9,7 @@ use serde_json::Value as JsonValue;
 
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
-use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
+use crate::consent::{consent_allows_server_side_auction, gate_eids_by_permissions};
 use crate::constants::COOKIE_TS_EIDS;
 use crate::cookies::extract_cookie_value;
 use crate::ec::EcContext;
@@ -171,10 +171,11 @@ pub async fn handle_auction(
 
     // Story 5 middleware contract: auction is a read-only EC route.
     // It must not generate EC IDs; it only consumes pre-routed context.
-    // Only forward the EC ID to auction partners when consent allows it.
-    // Owned so the identity-graph snapshot can be stored back on `ec_context`
-    // below without holding a borrow of it across the mutation.
-    let ec_id = if ec_context.ec_allowed() {
+    // Forward the EC ID to auction partners only when sharing is permitted,
+    // being storage plus personalized-ad selection, the same pair that gates
+    // EIDs. Owned so the identity-graph snapshot can be stored back on
+    // `ec_context` below without holding a borrow of it across the mutation.
+    let ec_id = if ec_context.ec_sharing_allowed() {
         ec_context.ec_value().map(str::to_owned)
     } else {
         None
@@ -282,8 +283,9 @@ pub async fn handle_auction(
     // `ts-eids` cookie so later requests can still forward the browser's
     // full OpenRTB-style EID structure.
     //
-    // Gate this on the same identity-consent condition as the EC ID
-    // (`ec_id.is_some()`, which is already filtered by `ec_context.ec_allowed()`).
+    // Gate this on the same identity condition as the EC ID
+    // (`ec_id.is_some()`, which is already filtered by the sharing pair via
+    // `ec_context.ec_sharing_allowed()`).
     // Otherwise a US/GPC or US-Privacy opt-out context — where EC identity use is
     // denied but a non-personalized auction may still run — could forward
     // persistent client EIDs from the body/cookie, since `gate_eids_by_consent`
@@ -351,10 +353,9 @@ pub async fn handle_auction(
     // consent gating before attaching them to the auction request.
     let merged_eids = merge_auction_eids(client_eids, eids);
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
-    auction_request.user.eids =
-        gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
+    auction_request.user.eids = gate_eids_by_permissions(merged_eids, ec_context.permissions());
     if had_eids && auction_request.user.eids.is_none() {
-        log::warn!("Auction EIDs stripped by TCF consent gating");
+        log::warn!("Auction EIDs stripped: bidstream permissions not set");
     }
 
     // Create auction context
@@ -677,7 +678,7 @@ mod tests {
 
     fn services_with_telemetry(sink: Arc<RecordingTelemetrySink>) -> RuntimeServices {
         let telemetry_sink: Arc<dyn AuctionTelemetrySink> = sink;
-        RuntimeServices::builder()
+        crate::platform::test_support::test_services_builder()
             .config_store(Arc::new(NoopConfigStore))
             .secret_store(Arc::new(NoopSecretStore))
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -689,13 +690,25 @@ mod tests {
             .build()
     }
 
-    fn make_ec_context(jurisdiction: Jurisdiction, ec_value: Option<&str>) -> EcContext {
-        EcContext::new_for_test(
+    fn make_ec_context(ec_allowed: bool, ec_value: Option<&str>) -> EcContext {
+        EcContext::new_for_test_gated(
+            ec_value.map(str::to_owned),
+            ConsentContext::default(),
+            ec_allowed,
+        )
+    }
+
+    /// A context in a non-regulated jurisdiction with the permission gate open,
+    /// for tests whose subject is dispatch or identity reuse rather than the
+    /// jurisdiction gate.
+    fn make_non_regulated_ec_context(ec_value: Option<&str>) -> EcContext {
+        EcContext::new_for_test_gated(
             ec_value.map(str::to_owned),
             ConsentContext {
-                jurisdiction,
+                jurisdiction: Jurisdiction::NonRegulated,
                 ..ConsentContext::default()
             },
+            true,
         )
     }
 
@@ -747,7 +760,7 @@ mod tests {
         graph.create(&ec_id, &live).expect("should seed live row");
         lookups.store(0, std::sync::atomic::Ordering::Relaxed);
 
-        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let mut ec_context = make_non_regulated_ec_context(Some(&ec_id));
         let req = Request::builder()
             .method("POST")
             .uri("https://test-publisher.com/auction")
@@ -847,9 +860,8 @@ mod tests {
                 ),
             )
             .expect("should seed the row under the canonical key");
-        let mut ec_context =
-            make_ec_context(Jurisdiction::NonRegulated, Some(CANONICAL_COOKIE_VALUE))
-                .with_module_for_test(Arc::new(CanonicalizingModule));
+        let mut ec_context = make_non_regulated_ec_context(Some(CANONICAL_COOKIE_VALUE))
+            .with_module_for_test(Arc::new(CanonicalizingModule));
         let req = Request::builder()
             .method("POST")
             .uri("https://test-publisher.com/auction")
@@ -922,7 +934,15 @@ mod tests {
         live.consent.ok = true;
         graph.create(&ec_id, &live).expect("should seed live row");
 
-        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let mut ec_context = EcContext::new_for_test_gated(
+            Some(ec_id.clone()),
+            ConsentContext {
+                jurisdiction: Jurisdiction::NonRegulated,
+                ..ConsentContext::default()
+            },
+            true,
+        )
+        .with_module_for_test(crate::ec::tests::hmac_module());
         ec_context.set_eid_sync_source(crate::ec::EidSyncSource::Auction);
         let req = Request::builder()
             .method("POST")
@@ -1096,7 +1116,7 @@ mod tests {
 
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, b"probe response".to_vec());
-        let services = RuntimeServices::builder()
+        let services = crate::platform::test_support::test_services_builder()
             .config_store(Arc::new(NoopConfigStore))
             .secret_store(Arc::new(NoopSecretStore))
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -1105,7 +1125,11 @@ mod tests {
             .geo(Arc::new(NoopGeo))
             .client_info(ClientInfo::default())
             .build();
-        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            ..ConsentContext::default()
+        };
+        let mut ec_context = EcContext::new_for_test_gated(None, consent, true);
         let body = json!({
             "adUnits": [{
                 "code": "div-gpt-ad-1",
@@ -1154,7 +1178,7 @@ mod tests {
         orchestrator.register_provider(Arc::new(PanicOnBidProvider));
         let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
         let services = services_with_telemetry(Arc::clone(&telemetry_sink));
-        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let mut ec_context = make_non_regulated_ec_context(None);
         let body = json!({
             "adUnits": [{
                 "code": "div-gpt-ad-1",
@@ -1217,7 +1241,7 @@ mod tests {
         let orchestrator = AuctionOrchestrator::from_plan(plan, None);
         let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
         let services = services_with_telemetry(Arc::clone(&telemetry_sink));
-        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let mut ec_context = make_non_regulated_ec_context(None);
         let body = json!({
             "adUnits": [{
                 "code": "div-gpt-ad-1",
@@ -1279,7 +1303,9 @@ mod tests {
         let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
         let services = services_with_telemetry(Arc::clone(&telemetry_sink));
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let mut ec_context = make_ec_context(Jurisdiction::Unknown, Some(&ec_id));
+        // The default consent context keeps the jurisdiction unknown, so the
+        // server-side auction gate fails closed; the EC gate is off to match.
+        let mut ec_context = make_ec_context(false, Some(&ec_id));
 
         let body = json!({
             "adUnits": [
@@ -1476,7 +1502,7 @@ mod tests {
     fn resolve_auction_eids_returns_empty_without_snapshot() {
         let registry = PartnerRegistry::empty();
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let ec_context = make_ec_context(true, Some(&ec_id));
 
         let result = resolve_auction_eids(&EcKvSnapshot::NotRead, Some(&registry), &ec_context);
         assert!(
@@ -1488,7 +1514,7 @@ mod tests {
     #[test]
     fn resolve_auction_eids_returns_none_without_registry() {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let ec_context = make_ec_context(true, Some(&ec_id));
 
         let result = resolve_auction_eids(&EcKvSnapshot::NotRead, None, &ec_context);
         assert!(
@@ -1501,7 +1527,7 @@ mod tests {
     fn resolve_auction_eids_returns_none_when_consent_denied() {
         let registry = PartnerRegistry::empty();
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let ec_context = make_ec_context(Jurisdiction::Unknown, Some(&ec_id));
+        let ec_context = make_ec_context(false, Some(&ec_id));
 
         let result = resolve_auction_eids(&EcKvSnapshot::NotRead, Some(&registry), &ec_context);
         assert!(
@@ -1513,7 +1539,11 @@ mod tests {
     #[test]
     fn resolve_auction_eids_returns_none_when_no_ec() {
         let registry = PartnerRegistry::empty();
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            ..ConsentContext::default()
+        };
+        let ec_context = EcContext::new_for_test_gated(None, consent, true);
 
         let result = resolve_auction_eids(&EcKvSnapshot::NotRead, Some(&registry), &ec_context);
         assert!(
@@ -1526,7 +1556,7 @@ mod tests {
     fn resolve_auction_eids_returns_empty_on_kv_miss() {
         let registry = PartnerRegistry::empty();
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let ec_context = make_ec_context(true, Some(&ec_id));
 
         let snapshot = EcKvSnapshot::Failed {
             ec_id: ec_id.clone(),

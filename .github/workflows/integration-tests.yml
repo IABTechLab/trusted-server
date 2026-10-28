@@ -29,9 +29,11 @@ jobs:
       - name: Set up shared integration build environment
         uses: ./.github/actions/setup-integration-test-env
         with:
-          origin-port: ${{ env.ORIGIN_PORT }}
           install-viceroy: "false"
           build-cloudflare: "true"
+
+      - name: Check that no permission policy is compiled into the Cloudflare WASM
+        run: ./scripts/check-no-compiled-policy.sh crates/trusted-server-adapter-cloudflare/build/index_bg.wasm
 
       - name: Generate integration Viceroy configs
         run: ./scripts/generate-integration-viceroy-configs.sh
@@ -67,7 +69,6 @@ jobs:
         id: shared-setup
         uses: ./.github/actions/setup-integration-test-env
         with:
-          origin-port: ${{ env.ORIGIN_PORT }}
           install-viceroy: "true"
           build-wasm: "false"
           build-axum: "false"
@@ -126,7 +127,6 @@ jobs:
         id: shared-setup
         uses: ./.github/actions/setup-integration-test-env
         with:
-          origin-port: ${{ env.ORIGIN_PORT }}
           install-viceroy: "true"
           build-wasm: "false"
           build-test-images: "false"
@@ -170,7 +170,6 @@ jobs:
         id: shared-setup
         uses: ./.github/actions/setup-integration-test-env
         with:
-          origin-port: ${{ env.ORIGIN_PORT }}
           install-viceroy: "true"
           build-wasm: "false"
           build-test-images: "false"

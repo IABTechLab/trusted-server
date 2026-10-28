@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::net::IpAddr;
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -8,11 +9,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, header};
 use error_stack::{Report, ResultExt as _};
+use trusted_server_core::permissions::PolicyReference;
 use trusted_server_core::platform::{
     BackendNamingPolicy, ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec,
     PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
-    PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult,
-    RuntimeServices, StoreId, StoreName,
+    PlatformPendingRequest, PlatformPolicySource, PlatformResponse, PlatformSecretStore,
+    PlatformSelectResult, RuntimeServices, StoreId, StoreName,
 };
 
 // ---------------------------------------------------------------------------
@@ -144,6 +146,84 @@ impl PlatformSecretStore for AxumPlatformSecretStore {
         Err(Report::new(PlatformError::SecretStore)
             .attach("secret store deletes are not supported on the Axum dev server"))
     }
+}
+
+// ---------------------------------------------------------------------------
+// PlatformPolicySource
+// ---------------------------------------------------------------------------
+
+/// The environment variable naming the folder of permission policy files.
+pub const PERMISSIONS_DIR_ENV_VAR: &str = "TRUSTED_SERVER_PERMISSIONS_DIR";
+
+/// The extension of a permission policy file.
+const POLICY_FILE_EXTENSION: &str = "yaml";
+
+/// Reads a domain's permission policy file from a folder, as
+/// `<folder>/<name>.yaml`.
+///
+/// The domain's blob pins the file by its SHA-256, which the runtime loader
+/// checks, so the folder must hold the bytes that were pushed.
+pub struct AxumPolicyFolder {
+    folder: Option<PathBuf>,
+}
+
+impl AxumPolicyFolder {
+    /// The folder [`PERMISSIONS_DIR_ENV_VAR`] names, where an empty value is
+    /// no folder.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::new(
+            std::env::var_os(PERMISSIONS_DIR_ENV_VAR)
+                .filter(|folder| !folder.is_empty())
+                .map(PathBuf::from),
+        )
+    }
+
+    /// Reads from `folder`, and refuses every read when it is `None`.
+    #[must_use]
+    pub fn new(folder: Option<PathBuf>) -> Self {
+        Self { folder }
+    }
+}
+
+impl PlatformPolicySource for AxumPolicyFolder {
+    fn policy_text(&self, reference: &PolicyReference) -> Result<String, Report<PlatformError>> {
+        let name = reference.policy.as_str();
+        let Some(folder) = &self.folder else {
+            return Err(Report::new(PlatformError::PolicySource).attach(format!(
+                "{PERMISSIONS_DIR_ENV_VAR} is not set, so no folder holds the permission policy `{name}`"
+            )));
+        };
+        if !is_plain_file_stem(name) {
+            return Err(Report::new(PlatformError::PolicySource).attach(format!(
+                "the permission policy name `{name}` is not a plain file name"
+            )));
+        }
+        let path = folder.join(format!("{name}.{POLICY_FILE_EXTENSION}"));
+        let bytes = std::fs::read(&path).map_err(|error| {
+            Report::new(PlatformError::PolicySource).attach(format!(
+                "failed to read the permission policy file {}: {error}",
+                path.display()
+            ))
+        })?;
+        String::from_utf8(bytes).map_err(|_| {
+            Report::new(PlatformError::PolicySource).attach(format!(
+                "the permission policy file {} is not UTF-8 text",
+                path.display()
+            ))
+        })
+    }
+}
+
+/// Whether `name` is a single file name inside the folder, holding no path
+/// separator and nothing that leaves the folder.
+fn is_plain_file_stem(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    !name.contains(['/', '\\'])
+        && matches!(
+            (components.next(), components.next()),
+            (Some(Component::Normal(_)), None)
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -530,6 +610,10 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
 pub fn build_runtime_services(
     ctx: &edgezero_core::context::RequestContext,
     settings: &trusted_server_core::settings::Settings,
+    permission_signal_modules: &Arc<
+        [Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>],
+    >,
+    permission_policy: &Arc<trusted_server_core::permissions::PermissionPolicy>,
 ) -> RuntimeServices {
     static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     KV_WARNED.get_or_init(|| {
@@ -578,6 +662,13 @@ pub fn build_runtime_services(
             settings,
             Arc::clone(GEO.get_or_init(|| Arc::new(AxumPlatformGeo) as Arc<dyn PlatformGeo>)),
         ))
+        // The signal modules were selected once at startup from the scheme
+        // crates this adapter links, so every request asks exactly the ones
+        // configuration named, in that order.
+        .permission_signal_modules(Arc::clone(permission_signal_modules))
+        // The policy the domain's settings loaded decides the request's
+        // permissions.
+        .permission_policy(Arc::clone(permission_policy))
         .client_info(ClientInfo {
             client_ip,
             tls_protocol: None,
@@ -597,6 +688,91 @@ mod tests {
     use edgezero_core::body::Body as EdgeBody;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    fn reference(policy: &str) -> PolicyReference {
+        PolicyReference {
+            policy: policy.to_owned(),
+            sha256: "the loader checks this".to_owned(),
+        }
+    }
+
+    #[test]
+    fn the_policy_folder_reads_the_named_file_byte_for_byte() {
+        let folder = tempfile::tempdir().expect("should create a policy folder");
+        let text = "groups:\r\n  open:\r\n    default: granted\r\n";
+        std::fs::write(folder.path().join("standard.yaml"), text).expect("should write a policy");
+
+        let read = AxumPolicyFolder::new(Some(folder.path().to_path_buf()))
+            .policy_text(&reference("standard"))
+            .expect("should read the named file");
+
+        assert_eq!(read, text, "should return the file's exact text");
+    }
+
+    #[test]
+    fn the_policy_folder_refuses_when_no_folder_is_named() {
+        let error = AxumPolicyFolder::new(None)
+            .policy_text(&reference("standard"))
+            .expect_err("should refuse with no folder");
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains(PERMISSIONS_DIR_ENV_VAR) && message.contains("`standard`"),
+            "should name the variable and the policy: {message}"
+        );
+    }
+
+    #[test]
+    fn the_policy_folder_refuses_a_file_it_does_not_hold() {
+        let folder = tempfile::tempdir().expect("should create a policy folder");
+
+        let error = AxumPolicyFolder::new(Some(folder.path().to_path_buf()))
+            .policy_text(&reference("standard"))
+            .expect_err("should refuse a missing file");
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("standard.yaml"),
+            "should name the file it looked for: {message}"
+        );
+    }
+
+    #[test]
+    fn the_policy_folder_refuses_a_name_that_leaves_the_folder() {
+        let root = tempfile::tempdir().expect("should create a root folder");
+        let folder = root.path().join("policies");
+        std::fs::create_dir(&folder).expect("should create the policy folder");
+        // A file the refused names would reach if they were followed.
+        std::fs::write(root.path().join("outside.yaml"), "groups: {}\n")
+            .expect("should write a file outside the folder");
+        let source = AxumPolicyFolder::new(Some(folder));
+
+        for name in ["../outside", "..\\outside", "sub/standard", "..", ".", ""] {
+            let error = source
+                .policy_text(&reference(name))
+                .expect_err("should refuse a name that is not a plain file name");
+            assert!(
+                format!("{error:?}").contains("not a plain file name"),
+                "should refuse `{name}` as a name: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_policy_folder_refuses_a_file_that_is_not_utf8_text() {
+        let folder = tempfile::tempdir().expect("should create a policy folder");
+        std::fs::write(folder.path().join("standard.yaml"), [0xff, 0xfe, 0x00])
+            .expect("should write a file that is not text");
+
+        let error = AxumPolicyFolder::new(Some(folder.path().to_path_buf()))
+            .policy_text(&reference("standard"))
+            .expect_err("should refuse bytes that are not UTF-8");
+
+        assert!(
+            format!("{error:?}").contains("not UTF-8 text"),
+            "should say why: {error:?}"
+        );
+    }
 
     #[test]
     fn auction_http_capabilities_are_explicit() {

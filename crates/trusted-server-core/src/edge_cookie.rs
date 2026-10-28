@@ -64,8 +64,9 @@ pub fn generate_ec_id(
     // host signals takes them from the injected `HostSignals` service rather
     // than from this request info.
     let request_info = BorrowedRequestInfo::new(&client_ip, request_headers);
-    // This helper skips the consent gate, and the built-in module does not
-    // read the consent context, so it is not threaded here.
+    // This helper skips the permission gate, and the built-in module reads
+    // neither the resolved permissions nor the consent context, so they are
+    // not threaded here.
     let generated = module.generate(&request_info, &IdentityInput::default())?;
     let generated = crate::ec::module::GeneratedEdgeCookie {
         id: generated

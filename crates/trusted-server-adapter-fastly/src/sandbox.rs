@@ -494,11 +494,16 @@ mod tests {
             origin_url = "https://origin.test-publisher.example"
             proxy_secret = "unit-test-proxy-secret"
 
+            [geo]
+            assume_single_jurisdiction = true
+
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
             "#,
         )
         .expect("should parse sandbox test settings")
+        // A loaded domain carries its policy.
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
     }
 
     /// A real `AppState`, so retention is exercised against the type the

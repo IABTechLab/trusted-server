@@ -6,7 +6,7 @@ use sha2::{Digest as _, Sha256};
 pub use crate::config_payload::DEFAULT_CONFIG_STORE_ID;
 use crate::config_payload::{DEFAULT_SECRET_STORE_ID, settings_from_config_blob};
 use crate::error::TrustedServerError;
-use crate::platform::{PlatformConfigStore, PlatformSecretStore, StoreName};
+use crate::platform::{PlatformConfigStore, PlatformSecretStore, PolicyOrigin, StoreName};
 use crate::settings::Settings;
 
 const FASTLY_CHUNK_POINTER_KIND: &str = "fastly_config_chunks";
@@ -68,23 +68,31 @@ pub fn default_secret_store_name() -> StoreName {
     StoreName::from(EnvConfig::from_env().store_name("secrets", DEFAULT_SECRET_STORE_ID))
 }
 
-/// Loads [`Settings`] from a platform config store and key.
+/// Loads [`Settings`] from a platform config store and key, with the
+/// permission policy they name read from `policy_origin`.
 ///
 /// # Errors
 ///
 /// Returns [`TrustedServerError::Configuration`] when the config blob is
 /// missing, cannot be read, fails envelope verification, secret resolution,
-/// or Trusted Server settings validation.
+/// or Trusted Server settings validation, or when its permission policy does
+/// not load.
 pub fn get_settings_from_config_store(
     config_store: &dyn PlatformConfigStore,
     secret_store: &dyn PlatformSecretStore,
     store_name: &StoreName,
     key: &str,
     default_secret_store_name: &StoreName,
+    policy_origin: PolicyOrigin<'_>,
 ) -> Result<Settings, Report<TrustedServerError>> {
     let raw_value = read_config_entry(config_store, store_name, key)?;
     let envelope_json = resolve_fastly_chunk_pointer(config_store, store_name, &raw_value)?;
-    settings_from_config_blob(&envelope_json, secret_store, default_secret_store_name)
+    settings_from_config_blob(
+        &envelope_json,
+        secret_store,
+        default_secret_store_name,
+        policy_origin,
+    )
 }
 
 fn read_config_entry(
@@ -209,7 +217,7 @@ mod tests {
     use crate::config_payload::{CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_ID};
     use crate::platform::{PlatformError, StoreId};
     use crate::settings::Settings;
-    use crate::test_support::tests::crate_test_settings_str;
+    use crate::test_support::tests::{crate_test_settings_str, sample_permissions};
     use edgezero_core::blob_envelope::BlobEnvelope;
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -268,8 +276,12 @@ mod tests {
         }
     }
 
+    /// The blob envelope `ts config push` writes for `settings`, naming the
+    /// repository's sample policy.
     fn envelope_json(settings: &Settings) -> String {
-        let data = serde_json::to_value(settings).expect("should serialize settings to JSON");
+        let mut settings = settings.clone();
+        settings.permissions = sample_permissions();
+        let data = serde_json::to_value(&settings).expect("should serialize settings to JSON");
         let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_string());
         serde_json::to_string(&envelope).expect("should serialize envelope")
     }
@@ -285,6 +297,7 @@ mod tests {
             store_name,
             key,
             &StoreName::from("trusted_server_secrets"),
+            PolicyOrigin::Blob,
         )
     }
 
@@ -386,37 +399,39 @@ mod tests {
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
         let envelope_json = envelope_json(&settings);
-        let midpoint = envelope_json.len() / 2;
-        let first_chunk = envelope_json[..midpoint].to_string();
-        let second_chunk = envelope_json[midpoint..].to_string();
-        let first_key = format!("{CONFIG_BLOB_KEY}.__edgezero_chunks.test.0");
-        let second_key = format!("{CONFIG_BLOB_KEY}.__edgezero_chunks.test.1");
+        // Chunks as long as an entry may be, cut where a character ends, so a
+        // blob carrying the sample policy takes several.
+        let mut chunks: Vec<(String, String)> = Vec::new();
+        let mut rest = envelope_json.as_str();
+        while !rest.is_empty() {
+            let mut end = rest.len().min(FASTLY_CONFIG_ENTRY_LIMIT);
+            while !rest.is_char_boundary(end) {
+                end -= 1;
+            }
+            let (chunk, remainder) = rest.split_at(end);
+            let key = format!("{CONFIG_BLOB_KEY}.__edgezero_chunks.test.{}", chunks.len());
+            chunks.push((key, chunk.to_owned()));
+            rest = remainder;
+        }
+        assert!(chunks.len() > 2, "the blob should need several chunks");
         let pointer = json!({
             "edgezero_kind": FASTLY_CHUNK_POINTER_KIND,
             "version": 1,
             "envelope_sha256": sha256_hex(envelope_json.as_bytes()),
             "envelope_len": envelope_json.len(),
-            "chunks": [
-                {
-                    "key": first_key,
-                    "sha256": sha256_hex(first_chunk.as_bytes()),
-                    "len": first_chunk.len()
-                },
-                {
-                    "key": second_key,
-                    "sha256": sha256_hex(second_chunk.as_bytes()),
-                    "len": second_chunk.len()
-                }
-            ]
+            "chunks": chunks
+                .iter()
+                .map(|(key, chunk)| json!({
+                    "key": key,
+                    "sha256": sha256_hex(chunk.as_bytes()),
+                    "len": chunk.len()
+                }))
+                .collect::<Vec<_>>()
         })
         .to_string();
-        let store = MemoryConfigStore {
-            entries: BTreeMap::from([
-                (CONFIG_BLOB_KEY.to_string(), pointer),
-                (first_key, first_chunk),
-                (second_key, second_chunk),
-            ]),
-        };
+        let mut entries = BTreeMap::from([(CONFIG_BLOB_KEY.to_string(), pointer)]);
+        entries.extend(chunks);
+        let store = MemoryConfigStore { entries };
 
         let loaded = load_settings(
             &store,

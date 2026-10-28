@@ -110,7 +110,6 @@ use trusted_server_core::ec::admin::{
     deny_admin_diagnostic_fallback, handle_admin_ec_lookup, handle_admin_eids_lookup,
 };
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
-use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
@@ -124,8 +123,10 @@ use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
     RequestFilterRegistryOutcome,
 };
+use trusted_server_core::permissions::PermissionState;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, StoreName, build_geo_module,
+    ClientInfo, GeoInfo, PlatformKvStore, PolicyOrigin, RuntimeServices, StoreName,
+    build_geo_module,
 };
 use trusted_server_device_fastly::FastlyHostSignals;
 
@@ -202,6 +203,15 @@ pub(crate) struct AppState {
     /// rather than resolved again on the request path.
     /// `None` for a deployment that selects no module.
     pub(crate) ec_module: Option<Arc<dyn EdgeCookieModule>>,
+    /// The permission signal modules `[permission-signal] modules` selects
+    /// from the scheme crates this adapter links, in the order they run.
+    /// Selected once here so a name no crate answers to fails startup rather
+    /// than the first request, and handed to every request's services.
+    pub(crate) permission_signal_modules:
+        Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>]>,
+    /// The permission policy the domain's settings loaded, which every
+    /// request is given.
+    pub(crate) permission_policy: Arc<trusted_server_core::permissions::PermissionPolicy>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -225,6 +235,7 @@ pub(crate) fn load_settings_from_config_store(
         &stores.config_store_name,
         &stores.config_key,
         &stores.secret_store_name,
+        PolicyOrigin::Blob,
     )
 }
 
@@ -263,6 +274,12 @@ pub(crate) fn build_state_from_settings(
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Fastly)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
+    let permission_signal_modules =
+        trusted_server_core::permission_signal::build_permission_signal_modules(
+            &settings,
+            &shipped_signal_modules(),
+        )?;
+    let permission_policy = settings.required_permission_policy()?;
 
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
@@ -274,7 +291,29 @@ pub(crate) fn build_state_from_settings(
         default_kv_store,
         auction_telemetry_sink,
         ec_module,
+        permission_signal_modules,
+        permission_policy,
     }))
+}
+
+/// The permission signal modules this adapter links, in the order they run
+/// when configuration names none. Global Privacy Control is first because it
+/// is a browser setting with no interface of its own, and the three that
+/// carry a choice someone made through an interface follow, so an answer
+/// given at a prompt amends the header the visitor arrived with.
+///
+/// Core supplies no module of its own, so this is where a deployment's
+/// schemes are decided. A scheme is added by linking its crate here, and a
+/// scheme core has never heard of plugs in the same way.
+fn shipped_signal_modules()
+-> Vec<Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>> {
+    vec![
+        Arc::new(trusted_server_permission_signal_gpc::GpcModule::new()),
+        Arc::new(trusted_server_permission_signal_gpp::GppSaleOptOutModule::new()),
+        Arc::new(trusted_server_permission_signal_us_privacy::UsPrivacyModule::new()),
+        Arc::new(trusted_server_permission_signal_tcf::TcfModule::new()),
+        Arc::new(trusted_server_permission_signal_mtm::MtmModule::new()),
+    ]
 }
 
 fn warn_if_certificate_check_disabled(settings: &Settings) {
@@ -345,6 +384,13 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         ))
         .auction_telemetry_sink(Arc::clone(&state.auction_telemetry_sink))
         .client_info(client_info)
+        // The signal modules were selected once at startup from the scheme
+        // crates this adapter links, so every request asks exactly the ones
+        // configuration named, in that order.
+        .permission_signal_modules(Arc::clone(&state.permission_signal_modules))
+        // The policy the domain's settings loaded decides the request's
+        // permissions.
+        .permission_policy(Arc::clone(&state.permission_policy))
         .host_signals(Arc::new(FastlyHostSignals::new(tls_ja4, h2_fingerprint)));
 
     // Hand every request the module resolved at the composition root, so the
@@ -490,16 +536,8 @@ fn build_ec_request_state(
     let eids_cookie = crate::extract_cookie_value(req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(req, COOKIE_SHAREDID);
 
-    let geo_info = services
-        .geo()
-        .lookup(services.client_info().client_ip)
-        .unwrap_or_else(|e| {
-            log::warn!("geo lookup failed during EC setup: {e}");
-            None
-        });
-
     let (ec_context, setup_error) =
-        match EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref()) {
+        match EcContext::read_from_request_resolving_geo(settings, req, services) {
             Ok(mut context) => {
                 context.set_device_signals(device_signals);
                 // Orphan-recovery eligibility is intentionally left false here.
@@ -513,18 +551,21 @@ fn build_ec_request_state(
             }
             Err(report) => (EcContext::default(), Some(report)),
         };
+    let geo_info = ec_context.geo_info().cloned();
 
     // Bot gate: suppress KV-backed EC writes for unrecognized clients, except
-    // consent withdrawals. Revocations keep the write path so tombstones stay
-    // authoritative even for privacy-extension-heavy clients.
+    // when the request carries an explicit withdrawal signal. The write path
+    // stays open for withdrawal so tombstones remain authoritative even for
+    // privacy-extension-heavy clients that do not look like known browsers. A
+    // merely not-permitted (pre-consent or fail-closed) request writes nothing,
+    // so it does not need the graph.
     let kv_graph = crate::maybe_identity_graph(settings);
-    let finalize_kv_graph = if setup_error.is_none()
-        && (is_real_browser || ec_consent_withdrawn(ec_context.consent()))
-    {
-        kv_graph.clone()
-    } else {
-        None
-    };
+    let finalize_kv_graph =
+        if setup_error.is_none() && (is_real_browser || ec_context.storage_withdrawn()) {
+            kv_graph.clone()
+        } else {
+            None
+        };
     let kv_graph = if is_real_browser { kv_graph } else { None };
 
     EcRequestState {
@@ -563,11 +604,15 @@ enum PreRoute {
 /// mutations are applied to `req` so the routed handler observes them; response
 /// effects are returned for the entry point to apply after EC finalization. A
 /// filter that responds (e.g. a `DataDome` challenge) short-circuits routing.
+///
+/// `permissions` carries the state resolved when the EC context was built, so
+/// every filter reads the same permissions as the rest of the request.
 async fn run_pre_route_filters(
     state: &AppState,
     services: &RuntimeServices,
     req: &mut Request,
     geo_info: Option<&GeoInfo>,
+    permissions: Option<&PermissionState>,
 ) -> PreRoute {
     match state
         .registry
@@ -576,6 +621,7 @@ async fn run_pre_route_filters(
             services,
             req,
             geo_info,
+            permissions,
         })
         .await
     {
@@ -686,13 +732,20 @@ async fn execute_named(
         ));
     }
 
-    let effects =
-        match run_pre_route_filters(&state, &services, &mut req, ec.geo_info.as_ref()).await {
-            PreRoute::ShortCircuit { response, effects } => {
-                return Ok(attach_dispatch_extensions(response, ec, effects));
-            }
-            PreRoute::Continue { effects } => effects,
-        };
+    let effects = match run_pre_route_filters(
+        &state,
+        &services,
+        &mut req,
+        ec.geo_info.as_ref(),
+        Some(ec.ec_context.permissions()),
+    )
+    .await
+    {
+        PreRoute::ShortCircuit { response, effects } => {
+            return Ok(attach_dispatch_extensions(response, ec, effects));
+        }
+        PreRoute::Continue { effects } => effects,
+    };
 
     let response = run_named_route(&state, &services, req, handler, &mut ec)
         .await
@@ -875,7 +928,14 @@ async fn dispatch_fallback(
 
     // Pre-route integration request filters (DataDome protection, etc.) run
     // before the route-type decision, matching legacy `route_request` ordering.
-    let effects = match run_pre_route_filters(state, services, &mut req, ec.geo_info.as_ref()).await
+    let effects = match run_pre_route_filters(
+        state,
+        services,
+        &mut req,
+        ec.geo_info.as_ref(),
+        Some(ec.ec_context.permissions()),
+    )
+    .await
     {
         PreRoute::ShortCircuit { response, effects } => {
             return attach_dispatch_extensions(response, ec, effects);
@@ -1376,7 +1436,7 @@ impl TrustedServerApp {
         let mut router = RouterService::builder()
             .middleware(FinalizeResponseMiddleware::new(
                 Arc::clone(&state.settings),
-                Arc::new(FastlyPlatformGeo),
+                build_geo_module(&state.settings, Arc::new(FastlyPlatformGeo)),
             ))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
 
@@ -1585,6 +1645,9 @@ mod tests {
             [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
+            [geo]
+            assume_single_jurisdiction = true
+
             [request_signing]
             enabled = false
             config_store_id = "test-config-store-id"
@@ -1604,11 +1667,33 @@ mod tests {
             "#,
         )
         .expect("should parse test settings")
+        // A loaded domain carries its policy, and these tests decide under the
+        // repository's sample.
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
     }
 
     fn test_router() -> RouterService {
         let state = build_state_from_settings(test_settings()).expect("should build test state");
         TrustedServerApp::routes_for_state(&state)
+    }
+
+    #[test]
+    fn each_request_is_given_the_policy_its_domain_loaded() {
+        let policy = trusted_server_core::test_support::policies::open();
+        let state =
+            build_state_from_settings(test_settings().with_permission_policy(Arc::clone(&policy)))
+                .expect("should build test state");
+        let context = RequestContext::new(
+            empty_request(Method::GET, "/article"),
+            PathParams::default(),
+        );
+
+        let services = build_per_request_services(&state, &context);
+
+        assert!(
+            Arc::ptr_eq(services.permission_policy(), &policy),
+            "the request should decide under its domain's policy, not the sample"
+        );
     }
 
     #[test]
@@ -1672,6 +1757,10 @@ mod tests {
             registry: Arc::new(registry),
             default_kv_store,
             ec_module,
+            // These tests exercise routing, and a request with no signal
+            // module resolves at the place baseline.
+            permission_signal_modules: Arc::default(),
+            permission_policy: trusted_server_core::permissions::PermissionPolicy::sample(),
         });
         TrustedServerApp::routes_for_state(&state)
     }
@@ -1810,6 +1899,28 @@ mod tests {
             Some("text/plain; charset=utf-8"),
             "startup errors should stay plain-text for OPTIONS requests"
         );
+    }
+
+    #[test]
+    fn the_startup_router_answers_500_to_a_policy_load_error() {
+        use trusted_server_core::test_support::policy_failure;
+
+        let error = policy_failure::load_error();
+        assert!(
+            format!("{error:?}").contains(&format!("`{}`", policy_failure::POLICY_NAME)),
+            "the startup error should name the policy: {error:?}"
+        );
+
+        let router = startup_error_router(&error);
+        for method in super::publisher_fallback_methods() {
+            for path in ["/", "/article"] {
+                assert_eq!(
+                    route(&router, empty_request(method.clone(), path)).status(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "{method} {path} should answer 500"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2094,9 +2205,13 @@ mod tests {
 
             [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            assume_single_jurisdiction = true
             "#,
         )
-        .expect("should parse production-shaped settings");
+        .expect("should parse production-shaped settings")
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
         let state = build_state_from_settings(settings).expect("should build state");
         let router = TrustedServerApp::routes_for_state(&state);
 
@@ -2772,6 +2887,9 @@ mod tests {
             [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
+            [geo]
+            assume_single_jurisdiction = true
+
             [request_signing]
             enabled = false
             config_store_id = "test-config-store-id"
@@ -2784,7 +2902,8 @@ mod tests {
             origin_url = "https://assets.example.com"
             "#,
         )
-        .expect("should parse asset-route settings");
+        .expect("should parse asset-route settings")
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
         let state = build_state_from_settings(settings).expect("should build state");
         let router = TrustedServerApp::routes_for_state(&state);
 
@@ -2875,6 +2994,7 @@ mod tests {
             .http_client(Arc::new(StreamingHttpClient))
             .geo(Arc::new(crate::platform::FastlyPlatformGeo))
             .client_info(ClientInfo::default())
+            .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
             .build()
     }
 
@@ -3041,6 +3161,12 @@ mod tests {
                     [ec]
                     passphrase = "test-secret-key-32-bytes-minimum"
 
+                    # The deprecated passphrase migrates to the hmac module, so
+                    # single-jurisdiction operation is acknowledged because no
+                    # geo module is selected.
+                    [geo]
+                    assume_single_jurisdiction = true
+
                     [auction]
                     enabled = true
                     providers = {}
@@ -3069,6 +3195,7 @@ mod tests {
             .http_client(Arc::clone(&origin) as Arc<dyn PlatformHttpClient>)
             .geo(Arc::new(crate::platform::FastlyPlatformGeo))
             .client_info(ClientInfo::default())
+            .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
             .build();
         let plan = Arc::new(compile_auction_plan(&settings).expect("should compile auction plan"));
         let registry = Arc::new(
@@ -3202,6 +3329,9 @@ mod tests {
             [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
+            [geo]
+            assume_single_jurisdiction = true
+
             [request_signing]
             enabled = false
             config_store_id = "test-config-store-id"
@@ -3214,7 +3344,8 @@ mod tests {
             origin_url = "https://assets.example.com"
             "#,
         )
-        .expect("should parse asset-route settings");
+        .expect("should parse asset-route settings")
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
         let state = build_state_from_settings(settings).expect("should build state");
 
         let services = streaming_runtime_services();

@@ -11,6 +11,8 @@ use super::{
 };
 use crate::ec::module::EdgeCookieModule;
 use crate::evidence::HostSignals;
+use crate::permission_signal::PermissionSignalModule;
+use crate::permissions::PermissionPolicy;
 
 /// Geographic information extracted from a request.
 ///
@@ -202,6 +204,16 @@ pub struct RuntimeServices {
     /// path resolves the selection itself, which is what a deployment that
     /// selects no module, the Axum adapter, and the core tests all do.
     pub(crate) resolved_ec_module: Option<Arc<dyn EdgeCookieModule>>,
+    /// The permission signal modules this deployment runs, in the order
+    /// they are asked, selected at the composition root from the scheme
+    /// crates the adapter links. Empty when the adapter offers none, in which
+    /// case every permission stays at its country and region baseline. Shared,
+    /// so building the services for a request bumps a reference count rather
+    /// than copying the list, and cloning the services does the same.
+    pub(crate) permission_signal_modules: Arc<[Arc<dyn PermissionSignalModule>]>,
+    /// The permission policy the request's domain loaded, which decides its
+    /// permissions.
+    pub(crate) permission_policy: Arc<PermissionPolicy>,
 }
 
 impl RuntimeServices {
@@ -222,6 +234,7 @@ impl RuntimeServices {
     ///     .http_client(Arc::new(MyHttpClient))
     ///     .geo(Arc::new(MyGeo))
     ///     .client_info(client_info)
+    ///     .permission_policy(policy)
     ///     .build();
     /// ```
     #[must_use]
@@ -316,6 +329,18 @@ impl RuntimeServices {
         self.resolved_ec_module.clone()
     }
 
+    /// The permission signal modules this deployment runs, in order.
+    #[must_use]
+    pub fn permission_signal_modules(&self) -> &[Arc<dyn PermissionSignalModule>] {
+        &self.permission_signal_modules
+    }
+
+    /// The permission policy the request's domain loaded.
+    #[must_use]
+    pub fn permission_policy(&self) -> &Arc<PermissionPolicy> {
+        &self.permission_policy
+    }
+
     /// Wrap the KV store in a [`super::KvHandle`] for ergonomic access to
     /// JSON helpers, pagination, and validation.
     #[must_use]
@@ -351,6 +376,19 @@ impl RuntimeServices {
     ) -> Self {
         Self {
             resolved_ec_module,
+            ..self
+        }
+    }
+
+    /// Returns a clone of this instance carrying the permission policy the
+    /// request's domain loaded.
+    ///
+    /// An adapter hands each request the policy its domain's settings carry,
+    /// whichever services the request is given.
+    #[must_use]
+    pub fn with_permission_policy(self, permission_policy: Arc<PermissionPolicy>) -> Self {
+        Self {
+            permission_policy,
             ..self
         }
     }
@@ -402,6 +440,8 @@ pub struct RuntimeServicesBuilder {
     client_info: Option<ClientInfo>,
     host_signals: Option<Arc<dyn HostSignals>>,
     resolved_ec_module: Option<Arc<dyn EdgeCookieModule>>,
+    permission_signal_modules: Arc<[Arc<dyn PermissionSignalModule>]>,
+    permission_policy: Option<Arc<PermissionPolicy>>,
 }
 
 impl RuntimeServicesBuilder {
@@ -419,6 +459,8 @@ impl RuntimeServicesBuilder {
             client_info: None,
             host_signals: None,
             resolved_ec_module: None,
+            permission_signal_modules: Arc::default(),
+            permission_policy: None,
         }
     }
 
@@ -521,6 +563,33 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Set the permission signal modules this deployment runs, in the order
+    /// they are asked.
+    ///
+    /// Optional, and empty when unset. An adapter hands in the shared list
+    /// [`build_permission_signal_modules`] selected from the scheme crates it
+    /// links, so the request path asks exactly the modules configuration
+    /// named, in that order, and core supplies none of its own.
+    ///
+    /// [`build_permission_signal_modules`]:
+    ///     crate::permission_signal::build_permission_signal_modules
+    #[must_use]
+    pub fn permission_signal_modules(
+        mut self,
+        modules: Arc<[Arc<dyn PermissionSignalModule>]>,
+    ) -> Self {
+        self.permission_signal_modules = modules;
+        self
+    }
+
+    /// Set the permission policy the request's domain loaded, which every
+    /// request needs to decide its permissions.
+    #[must_use]
+    pub fn permission_policy(mut self, policy: Arc<PermissionPolicy>) -> Self {
+        self.permission_policy = Some(policy);
+        self
+    }
+
     /// Construct [`RuntimeServices`] from the accumulated configuration.
     ///
     /// # Panics
@@ -563,6 +632,10 @@ impl RuntimeServicesBuilder {
                 .expect("should set client_info before building RuntimeServices"),
             host_signals: self.host_signals,
             resolved_ec_module: self.resolved_ec_module,
+            permission_signal_modules: self.permission_signal_modules,
+            permission_policy: self
+                .permission_policy
+                .expect("should set permission_policy before building RuntimeServices"),
         }
     }
 }

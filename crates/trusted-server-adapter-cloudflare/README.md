@@ -5,11 +5,12 @@ Cloudflare Workers adapter for Trusted Server. Production code targets
 adapter tests and deliberately exclude the Workers entry point.
 
 The crate translates Worker requests and responses, registers the shared
-router, and implements Cloudflare-specific HTTP and secret access. The current
-runtime does not open the KV config value written by `ts config push`; startup
-instead consumes the nested `TRUSTED_SERVER_CONFIG` variable bridge. It also
-has no `/health` route or request-time KV registry and permits one enabled
-auction provider.
+router, and implements Cloudflare-specific HTTP and secret access. For each
+request the Worker reads its settings from the config store, the Workers KV
+namespace bound as `trusted_server_config` that `ts config push --adapter
+cloudflare` writes, and serves the router built from them, or the startup
+error router when they cannot be read or do not load. It has no `/health`
+route or request-time KV registry and permits one enabled auction provider.
 
 Build and test from the repository root:
 
@@ -20,6 +21,5 @@ cargo test-cloudflare
 
 Run `./scripts/smoke-cloudflare.sh` for the isolated Wrangler handoff check.
 The [Cloudflare deployment guide](../../docs/guide/cloudflare.md) documents the
-required double encoding, secret bindings, failure cases, and cleanup. Keep
-portable request behavior in
-[`trusted-server-core`](../trusted-server-core/README.md).
+config store, secret bindings, failure cases, and cleanup. Keep portable
+request behavior in [`trusted-server-core`](../trusted-server-core/README.md).

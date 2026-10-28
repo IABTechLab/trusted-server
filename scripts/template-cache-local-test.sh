@@ -275,6 +275,17 @@ s = replace_once(
     'cookie_domain = ".local-harness.example"',
     "publisher cookie domain",
 )
+# The permission baseline and consent handling come from the rules tree of
+# the sample policy the push supplies. The Viceroy geolocation block appended
+# to the harness fastly.toml below maps the loopback client to US/CA, and the
+# platform geo module is selected here, so the auction runs under the US
+# state opt-out rules with no consent signal.
+s = replace_once(
+    s,
+    chr(10) + '# module = "platform"' + chr(10),
+    chr(10) + 'module = "platform"' + chr(10),
+    "platform geo module",
+)
 # A real auction points at the slow HTTPS stub so the timings mean something.
 s = replace_once(
     s,
@@ -327,6 +338,9 @@ origin_is_cookie_independent = true'''
 lines = s.split("\n")
 lines.insert(lines.index("[creative_opportunities]") + 1, scalars)
 lines.append('''
+[permissions]
+policy = "sample"
+
 [[creative_opportunities.slot]]
 id = "ts-slot-header"
 div_id = "ts-slot-header"
@@ -336,7 +350,9 @@ formats = [{ width = 728, height = 90 }]
 open(out, "w").write("\n".join(lines))
 PYEOF
 
-"$TS" config validate --app-config "$WORK/app.toml" >/dev/null
+POLICY_FILE="$REPO_ROOT/config/permissions/sample.yaml"
+"$TS" config validate --app-config "$WORK/app.toml" \
+  --permissions "$POLICY_FILE" >/dev/null
 
 info "Seeding an isolated config store (tracked fastly.toml remains untouched)"
 # `config push --local` edits the adapter manifest. Give it a complete temporary
@@ -346,6 +362,33 @@ info "Seeding an isolated config store (tracked fastly.toml remains untouched)"
 # pointed at this checkout without copying the workspace.
 cp "$REPO_ROOT/edgezero.toml" "$WORK/edgezero.toml"
 cp "$REPO_ROOT/fastly.toml" "$WORK/fastly.toml"
+# Give Viceroy a geolocation answer for the loopback client, so the platform
+# geo module selected in the app config resolves US/CA.
+cat >> "$WORK/fastly.toml" <<'GEOEOF'
+
+[local_server.geolocation]
+format = "inline-toml"
+
+[local_server.geolocation.addresses."127.0.0.1"]
+as_name = "Local Harness"
+as_number = 64496
+area_code = 0
+city = "Test City"
+conn_speed = "broadband"
+conn_type = "wired"
+continent = "NA"
+country_code = "US"
+country_code3 = "USA"
+country_name = "United States"
+latitude = 0.0
+longitude = 0.0
+metro_code = 0
+postal_code = "00000"
+proxy_description = "?"
+proxy_type = "?"
+region = "CA"
+utc_offset = -800
+GEOEOF
 
 # The application registers provider backends dynamically. Pre-register the exact
 # deterministic name so Viceroy reuses a local backend that trusts the temporary CA.
@@ -413,7 +456,7 @@ PYEOF
 ln -s "$REPO_ROOT/crates" "$WORK/crates"
 (cd "$WORK" && "$TS" config push --adapter fastly --local \
   --manifest "$WORK/edgezero.toml" --app-config "$WORK/app.toml" \
-  --no-diff --yes >/dev/null)
+  --permissions "$POLICY_FILE" --no-diff --yes >/dev/null)
 
 info "Starting Trusted Server on :$TS_PORT"
 # Deliberately not wrapped in a subshell: `$!` would then be the subshell's pid, so

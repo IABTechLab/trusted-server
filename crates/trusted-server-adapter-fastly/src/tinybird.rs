@@ -425,6 +425,7 @@ mod tests {
             .http_client(http_client)
             .geo(Arc::new(NoopGeo))
             .client_info(ClientInfo::default())
+            .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
             .build()
     }
 

@@ -439,9 +439,10 @@ Run the repository smoke from a clean shell:
 ```
 
 The script creates an isolated application config, applies its publisher-origin
-overrides, selects the built-in `hmac` Edge Cookie module, and runs strict
-validation. It then executes `ts config push
---adapter fastly --local`, adds all three required entries to
+overrides, selects the built-in `hmac` Edge Cookie module, names the
+repository's sample permission policy, and runs strict validation. It then
+executes `ts config push --adapter fastly --local` with the sample through
+`--permissions`, adds all three required entries to
 `[local_server.secret_stores.trusted_server_secrets]`, and starts
 `fastly compute serve`
 through Viceroy. The required keys are `handler_password`,

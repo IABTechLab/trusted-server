@@ -194,9 +194,8 @@ mod tests {
     }
 
     fn settings_with_response_headers(headers: Vec<(&str, &str)>) -> Settings {
-        // Build from explicit test settings: the settings baked into the
-        // binary contain placeholder secrets that `get_settings()` rejects
-        // by design.
+        // A Worker reads its settings from its config store, so the test
+        // builds its own.
         let mut s = Settings::from_toml(
             r#"
                 [[handlers]]
@@ -215,6 +214,9 @@ mod tests {
 
                 [ec.hmac]
                 passphrase = "test-secret-key-32-bytes-minimum"
+
+                [geo]
+                assume_single_jurisdiction = true
             "#,
         )
         .expect("should load test settings");

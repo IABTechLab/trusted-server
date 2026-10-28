@@ -10,8 +10,12 @@ Use `ts config init` to create a file, edit the generated
 `trusted-server.toml`, and run `ts config validate` before any platform
 write. `ts config diff --adapter ADAPTER` compares the validated local
 configuration with the selected platform value. `ts config push --adapter
-ADAPTER` writes it. Build, serve, deploy, health-check, rollback, and active
-version operations use the adapter commands declared in `edgezero.toml`.
+ADAPTER` writes it. The settings name the permission policy file in
+`[permissions] policy`, and all three commands take that file with
+`--permissions <file>`, which the push requires, as the diff does when the
+settings name a policy. Build, serve, deploy,
+health-check, rollback, and active version operations use the adapter
+commands declared in `edgezero.toml`.
 
 Configuration is startup state, not a live control plane. A successful push
 does not change a running instance until the target's restart or deployment
@@ -65,10 +69,11 @@ store before deletion, especially when using `--store` or `--no-env`.
 
 1. Put required secret values in the physical store mapped from
    `trusted_server_secrets`.
-2. Run `ts config validate`.
-3. Review `ts config diff --adapter ADAPTER`; use `--no-diff` when
-   deliberately inline configuration must not appear in logs.
-4. Run `ts config push --adapter ADAPTER`.
+2. Run `ts config validate --permissions <file>`.
+3. Review `ts config diff --adapter ADAPTER --permissions <file>`; use
+   `--no-diff` when deliberately inline configuration must not appear in
+   logs.
+4. Run `ts config push --adapter ADAPTER --permissions <file>`.
 5. Start or deploy the adapter and verify a non-health publisher route. A
    healthy endpoint alone may not prove that application configuration loaded.
    Confirm that its `x-ts-version` response header reports the release you

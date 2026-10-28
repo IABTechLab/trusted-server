@@ -113,6 +113,21 @@ jobs:
       - name: Verify Fastly WASM release build
         run: cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
 
+      - name: Check that no permission policy is compiled into the Fastly WASM
+        run: ./scripts/check-no-compiled-policy.sh target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm
+
+      # The sample carries both markers the guard looks for, so a guard that
+      # stops finding them passes the sample and fails the job here. Exit 1 is
+      # the refusal; exit 2 means the guard could not run.
+      - name: Check that the policy guard refuses a file that carries a policy
+        run: |
+          status=0
+          ./scripts/check-no-compiled-policy.sh config/permissions/sample.yaml || status=$?
+          if [ "$status" -ne 1 ]; then
+            echo "the guard should refuse config/permissions/sample.yaml with exit 1, and exited $status" >&2
+            exit 1
+          fi
+
   test-cloudflare:
     name: cargo check (cloudflare native + wasm32-unknown-unknown)
     runs-on: ubuntu-latest
@@ -153,16 +168,10 @@ jobs:
         run: cargo check-spin
 
       - name: Build Spin adapter release WASM
-        # Mirror the Fastly release-build overrides so the artifact embeds usable
-        # settings instead of the trusted-server.toml placeholders, which startup
-        # rejects (falling back to the generic 503 router). This proves the
-        # documented Spin artifact can boot, not just compile.
-        env:
-          TRUSTED_SERVER__PUBLISHER__ORIGIN_URL: http://127.0.0.1:8080
-          TRUSTED_SERVER__PUBLISHER__PROXY_SECRET: integration-test-proxy-secret
-          TRUSTED_SERVER__EC__PASSPHRASE: integration-test-ec-secret-padded-32
-          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
         run: cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
+
+      - name: Check that no permission policy is compiled into the Spin WASM
+        run: ./scripts/check-no-compiled-policy.sh target/wasm32-wasip1/release/trusted_server_adapter_spin.wasm
 
       - name: Run Spin adapter tests (native host)
         run: cargo test-spin

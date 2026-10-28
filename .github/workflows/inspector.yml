@@ -1,0 +1,23 @@
+name: "Permissions Inspector"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-inspector-wasm:
+    name: build inspector wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          target: wasm32-unknown-unknown
+          cache-key: cargo-inspector
+      - name: Build the inspector engine
+        run: ./scripts/build-inspector-wasm.sh

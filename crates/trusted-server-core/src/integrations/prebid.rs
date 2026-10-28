@@ -2726,8 +2726,9 @@ impl PrebidAuctionProvider {
                     .map(|ac| ConsentedProvidersSettings {
                         consented_providers: Some(ac.clone()),
                     }),
-                // EIDs resolved from the KV identity graph and consent-gated
-                // in `handle_auction` via `gate_eids_by_consent`.
+                // EIDs resolved from the KV identity graph and gated on the
+                // resolved permission state in `handle_auction` via
+                // `gate_eids_by_permissions`.
                 eids: request.user.eids.clone(),
             }
             .to_ext(),
@@ -3741,7 +3742,7 @@ mod tests {
     }
 
     fn services_with_backend(backend: impl PlatformBackend + 'static) -> RuntimeServices {
-        RuntimeServices::builder()
+        crate::platform::test_support::test_services_builder()
             .config_store(Arc::new(NoopConfigStore))
             .secret_store(Arc::new(NoopSecretStore))
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -3997,6 +3998,9 @@ module = "hmac"
 
 [ec.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
+
+[geo]
+assume_single_jurisdiction = true
 "#;
 
     fn parse_browser_prebid_toml_result(

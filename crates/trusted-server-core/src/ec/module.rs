@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::consent::ConsentContext;
 use crate::error::TrustedServerError;
 use crate::evidence::{HostSignals, RequestInfo};
+use crate::permissions::{Permission, PermissionSet, PermissionState};
 use crate::redacted::Redacted;
 use crate::settings::{Ec, EcModuleBlock};
 
@@ -152,15 +153,19 @@ pub const HMAC_MODULE_CODE: ModuleCode = crate::module_code!(HMAC_MODULE_KEY);
 /// [`EdgeCookieModule::generate`], not through this struct and not through
 /// anything injected into the module's constructor. This struct carries only
 /// the per-request gating context a module may read for behavior beyond
-/// gating. On the organic request path the gate has confirmed Edge Cookie
-/// storage is allowed before `generate` is called. A test calling
+/// gating. On the organic request path the gate has confirmed the module's
+/// required permissions are set before `generate` is called. A test calling
 /// `edge_cookie::generate_ec_id` reaches `generate` without that gate.
 #[derive(Default)]
 pub struct IdentityInput<'a> {
+    /// The permissions resolved for this request, when the calling path carries
+    /// them. A module reads this only for behavior beyond gating. The main
+    /// organic path supplies them; the publisher path passes `None`.
+    pub permissions: Option<&'a PermissionState>,
+
     /// The request's consent context, when available, for module-specific
-    /// logic. The core gates generation before calling the module, so a
-    /// module reads this only to forward or record consent. [`HmacModule`]
-    /// ignores it.
+    /// logic. The core gates on permissions, not consent, so a module reads
+    /// this only to forward or record consent. [`HmacModule`] ignores it.
     pub consent: Option<&'a ConsentContext>,
 }
 
@@ -554,9 +559,12 @@ impl<'a> AcceptedModules<'a> {
 
 /// A strategy for deriving an Edge Cookie identifier.
 ///
-/// Implementations are selected by configuration. A module derives the
-/// identifier at the edge in [`generate`](Self::generate), and the page
-/// response sets the `ts-ec` cookie.
+/// Implementations are selected by configuration and come in two types, which
+/// reach the same outcome (a `ts-ec` cookie) by different routes:
+///
+/// - **Server-side** (for example [`HmacModule`]): derives the identifier at
+///   the edge in [`generate`](Self::generate), and the page response sets the
+///   cookie. Nothing client-side is involved.
 ///
 /// A module that cannot derive an identifier at the edge returns a
 /// [`GeneratedEdgeCookie`] whose [`id`](GeneratedEdgeCookie::id) is `None`, so
@@ -599,6 +607,7 @@ pub trait EdgeCookieModule: Send + Sync + core::fmt::Debug {
 
     /// Derives an Edge Cookie identifier from the request evidence in
     /// `request_info` and the gating context in `input`.
+    ///
     ///
     /// # Errors
     ///
@@ -649,6 +658,17 @@ pub trait EdgeCookieModule: Send + Sync + core::fmt::Debug {
     /// suffix, matching the built-in identifier shape.
     fn normalize_id_for_kv(&self, value: &str) -> String {
         generation::normalize_ec_id_for_kv(value)
+    }
+
+    /// The permissions this module's data use requires.
+    ///
+    /// Trusted Server executes the module only when every permission returned
+    /// here is set. The default is empty, so a vendor-neutral module requires
+    /// no permission. A module that stores identity on the device, or shares it
+    /// onward, declares the matching permission so the request's country and
+    /// signal rules can gate it.
+    fn required_permissions(&self) -> PermissionSet {
+        PermissionSet::none()
     }
 }
 
@@ -705,6 +725,13 @@ impl EdgeCookieModule for HmacModule {
             id: Some(id),
             response_headers: Vec::new(),
         })
+    }
+
+    fn required_permissions(&self) -> PermissionSet {
+        // The HMAC module writes the Edge Cookie to the device, so it requires
+        // permission to store on the device (TCF Purpose 1). Whether that needs a
+        // signal is decided by the country rules, not by the module.
+        PermissionSet::none().with(Permission::StoreOnDevice)
     }
 }
 
@@ -769,6 +796,12 @@ impl EdgeCookieModule for HostSignalModule {
             id: Some(id),
             response_headers: Vec::new(),
         })
+    }
+
+    fn required_permissions(&self) -> PermissionSet {
+        // Writes the Edge Cookie to the device, so it requires necessary.operations.storage
+        // (TCF Purpose 1), the same gate as the HMAC module.
+        PermissionSet::none().with(Permission::StoreOnDevice)
     }
 }
 
@@ -1111,6 +1144,10 @@ impl EdgeCookieModule for SharedModule {
 
     fn normalize_id_for_kv(&self, value: &str) -> String {
         self.0.normalize_id_for_kv(value)
+    }
+
+    fn required_permissions(&self) -> PermissionSet {
+        self.0.required_permissions()
     }
 }
 
@@ -1532,6 +1569,7 @@ mod tests {
             "an identifier with another module's code is never owned"
         );
     }
+    use crate::permissions::PermissionMaps;
     use crate::redacted::Redacted;
 
     fn test_passphrase() -> Redacted<String> {
@@ -1779,7 +1817,21 @@ mod tests {
     }
 
     #[test]
-    fn host_signal_module_creates_from_signals() {
+    fn hmac_module_requires_store_on_device() {
+        let module = HmacModule::new(test_passphrase());
+        let required = module.required_permissions();
+        assert!(
+            required.contains(Permission::StoreOnDevice),
+            "the HMAC module writes a cookie, so it requires necessary.operations.storage"
+        );
+        assert!(
+            !required.contains(Permission::SelectPersonalisedAds),
+            "the HMAC module requires no advertising permissions"
+        );
+    }
+
+    #[test]
+    fn host_signal_module_mints_from_fingerprints_and_requires_store_on_device() {
         let signals = Arc::new(TestHostSignals {
             ja4: Some("t13d1516h2_8daaf6152771_e5627efa2ab1".to_owned()),
             h2: Some("1:65536;4:6291456".to_owned()),
@@ -1792,6 +1844,71 @@ mod tests {
         assert!(
             generated.id.is_some(),
             "the host-signal module should create an identifier from the signals"
+        );
+        assert!(
+            module
+                .required_permissions()
+                .contains(Permission::StoreOnDevice),
+            "the host-signal module writes a cookie, so it requires necessary.operations.storage"
+        );
+    }
+
+    /// A minimal module that overrides nothing optional, used to prove the
+    /// trait defaults.
+    #[derive(Debug)]
+    struct MinimalModule;
+
+    impl EdgeCookieModule for MinimalModule {
+        fn id(&self) -> &'static str {
+            "minimal"
+        }
+
+        fn code(&self) -> ModuleCode {
+            crate::module_code!("t0mi")
+        }
+
+        fn generate(
+            &self,
+            _request_info: &dyn RequestInfo,
+            _input: &IdentityInput<'_>,
+        ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+            Ok(GeneratedEdgeCookie::default())
+        }
+
+        fn accepts_id(&self, _value: &str) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_neutral_module_requires_no_permissions_by_default() {
+        // MinimalModule does not override required_permissions, so it
+        // inherits the trait default of none and requires no permission.
+        assert!(
+            MinimalModule.required_permissions().is_empty(),
+            "a vendor-neutral module requires nothing by default"
+        );
+    }
+
+    #[test]
+    fn the_edge_cookie_gate_blocks_until_the_permission_is_set() {
+        let required = HmacModule::new(test_passphrase()).required_permissions();
+        // Empty maps with no default: every permission is the requires-signal
+        // floor.
+        let maps = PermissionMaps::empty();
+
+        // No signal: the module's required permission is not set, so Trusted
+        // Server would not commit the Edge Cookie.
+        assert!(
+            !maps.resolve(None, |_| false).all_set(required),
+            "the floor should not run the Edge Cookie module without the permission set"
+        );
+
+        // A grant signal for necessary.operations.storage: the module's permission is now set.
+        assert!(
+            maps.resolve(None, |p| p == Permission::StoreOnDevice)
+                .all_set(required),
+            "the Edge Cookie module runs once necessary.operations.storage is set"
         );
     }
 

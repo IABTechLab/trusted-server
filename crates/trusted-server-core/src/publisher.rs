@@ -56,7 +56,7 @@ use crate::auction::types::{
 use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
 };
-use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
+use crate::consent::{consent_allows_server_side_auction, gate_eids_by_permissions};
 use crate::constants::{
     COOKIE_SHAREDID, COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT, HOST_SIGNAL_HEADERS,
 };
@@ -73,6 +73,7 @@ use crate::error::TrustedServerError;
 use crate::html_processor::BodyCloseInjection;
 use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
 use crate::integrations::IntegrationRegistry;
+use crate::permissions::PermissionState;
 use crate::platform::{
     GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices,
     TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY, VarySpec, contains_publisher_esi_directive,
@@ -635,6 +636,9 @@ struct ProcessResponseParams<'a> {
     settings: &'a Settings,
     content_type: &'a str,
     integration_registry: &'a IntegrationRegistry,
+    /// Head script carrying this request's permission state, or [`None`] under a
+    /// shared-template mode. See [`template_permissions_script`].
+    permissions_script: Option<&'a str>,
     ad_slots_script: Option<&'a str>,
     ad_bids_state: &'a Arc<Mutex<Option<String>>>,
     suppress_datadome_client_side_tag: bool,
@@ -678,6 +682,7 @@ impl PublisherBodyProcessor {
                 request_scheme: &params.request_scheme,
                 settings,
                 integration_registry,
+                permissions_script: permissions_script_for(params, settings),
                 ad_slots_script: params.ad_slots_script.as_deref().map(str::to_string),
                 ad_bids_state: Arc::clone(params.ad_bids_state.script_cell()),
                 suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
@@ -762,6 +767,7 @@ fn process_response_streaming<W: Write>(
             request_scheme: params.request_scheme,
             settings: params.settings,
             integration_registry: params.integration_registry,
+            permissions_script: params.permissions_script.map(str::to_string),
             ad_slots_script: params.ad_slots_script.map(str::to_string),
             ad_bids_state: params.ad_bids_state.clone(),
             suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
@@ -1319,6 +1325,9 @@ struct HtmlStreamProcessorParams<'a> {
     request_scheme: &'a str,
     settings: &'a Settings,
     integration_registry: &'a IntegrationRegistry,
+    /// Head script carrying this request's permission state, or [`None`] under a
+    /// shared-template mode. See [`template_permissions_script`].
+    permissions_script: Option<String>,
     ad_slots_script: Option<String>,
     ad_bids_state: Arc<Mutex<Option<String>>>,
     suppress_datadome_client_side_tag: bool,
@@ -1475,6 +1484,20 @@ pub(crate) fn body_close_injection(
     }
 }
 
+/// The head script this response's permission state belongs in, if any.
+///
+/// Derived here rather than carried on [`OwnedProcessResponseParams`] so the state
+/// has one representation on the request (the JSON) and the head-or-seam decision is
+/// taken from the same effective mode both seams use. Under a shared-template mode
+/// the answer is [`None`] and the seam carries the state instead.
+fn permissions_script_for(
+    params: &OwnedProcessResponseParams,
+    settings: &Settings,
+) -> Option<String> {
+    let mode = effective_assembly_mode(settings, params.template_cache_key.is_some());
+    template_permissions_script(mode, &params.permissions_json)
+}
+
 fn deferred_inline_seam_token(
     settings: &Settings,
     shared_template_authorized: bool,
@@ -1527,6 +1550,7 @@ fn create_html_stream_processor(
         .flatten();
 
     let config = config
+        .with_permissions_script(params.permissions_script)
         .with_ad_state(params.ad_slots_script, params.ad_bids_state)
         .with_gpt_diagnostics(gpt_diagnostics)
         .with_body_close(body_close)
@@ -1702,6 +1726,14 @@ pub struct OwnedProcessResponseParams {
     ///
     /// Request-scoped, so it travels with the request rather than into the template.
     pub(crate) seam_ad_slots: Option<String>,
+    /// This request's resolved permission state as page JSON, from
+    /// [`PermissionState::page_json`].
+    ///
+    /// Carried as the JSON rather than as a rendered script because it is delivered in
+    /// two different places: the head under an inline response, and the `</body>` seam
+    /// under a shared-template one. An empty string means no caller filled it in and
+    /// renders as the empty state.
+    pub(crate) permissions_json: String,
     /// Origin policy headers to store with the template and replay on a hit.
     pub(crate) policy_headers: Vec<(String, String)>,
     pub(crate) content_encoding: String,
@@ -2096,7 +2128,17 @@ fn template_fingerprint_with_build_digest(settings: &Settings, build_digest: &st
     // Array order is preserved: set-valued settings must serialize deterministically
     // themselves (for example, `allowed_context_keys` uses a `BTreeSet`).
     let canonical = serde_json::to_value(settings)
-        .map(|value| edgezero_core::canonical_form::canonical_data_sha256(&value))
+        .map(|mut value| {
+            // The SHA-256 already names the policy file, so settings that pin
+            // one file fingerprint the same whether or not they carry its text.
+            if let Some(permissions) = value
+                .get_mut("permissions")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                permissions.remove("text");
+            }
+            edgezero_core::canonical_form::canonical_data_sha256(&value)
+        })
         .expect("should serialize typed settings infallibly");
     hasher.update(canonical);
     hex::encode(hasher.finalize())
@@ -2120,21 +2162,28 @@ fn response_carries_a_seam_marker(was_authorized: bool, settings: &Settings) -> 
 /// calls `scheduleInitialAdInit`, which schedules `adInit` for precisely the traffic
 /// that opted out. Absent is not the same as empty here.
 ///
+/// It is never nothing at all, because the permission state has to reach the
+/// page whether or not the ad stack ran, and a shared template's head cannot carry it.
+/// The no-ad-stack answer is [`build_permissions_seam_script`], which sets the state and
+/// schedules no ad init.
+///
 /// Shared by the miss path and by **both** hit finalizers. They previously each spelled
 /// the decision out, and the two hit paths spelled it `unwrap_or("[]")` — so the gate
 /// held on a cache miss and was ignored on every cache hit.
 fn seam_script_for(params: &OwnedProcessResponseParams) -> String {
-    params
-        .seam_ad_slots
-        .as_deref()
-        .map(|slots| params.ad_bids_state.build_seam_script(slots))
-        .unwrap_or_default()
+    match params.seam_ad_slots.as_deref() {
+        Some(slots) => params
+            .ad_bids_state
+            .build_seam_script(slots, &params.permissions_json),
+        None => build_permissions_seam_script(&params.permissions_json),
+    }
 }
 
 /// Builds the injection state a cached template needs on the way out.
 ///
-/// The template carries no auction state — that is what makes it shareable — so the
-/// per-reader parts are attached here, from this request.
+/// The template carries no auction state and no permission state, which is what makes
+/// it shareable, so the per-reader parts are attached here, from this request. Both
+/// leave through the seam, never through the cached head.
 fn build_template_assembly_params(
     entry: &crate::platform::TemplateEntry,
     settings: &Settings,
@@ -2142,6 +2191,7 @@ fn build_template_assembly_params(
     request_scheme: &str,
     price_granularity: PriceGranularity,
     ad_bids_state: AdBidsState,
+    permissions_json: String,
 ) -> OwnedProcessResponseParams {
     OwnedProcessResponseParams {
         csp_nonce_observed: None,
@@ -2156,6 +2206,7 @@ fn build_template_assembly_params(
         request_scheme: request_scheme.to_string(),
         content_type: entry.metadata.content_type.clone(),
         // The template already carries the head seam; re-injecting would duplicate it.
+        permissions_json,
         ad_slots_script: None,
         ad_bids_state,
         auction_observation: None,
@@ -2907,6 +2958,7 @@ pub fn stream_publisher_body<W: Write>(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
 ) -> Result<(), Report<TrustedServerError>> {
+    let permissions_script = permissions_script_for(params, settings);
     let borrowed = ProcessResponseParams {
         content_encoding: &params.content_encoding,
         origin_host: &params.origin_host,
@@ -2916,6 +2968,7 @@ pub fn stream_publisher_body<W: Write>(
         settings,
         content_type: &params.content_type,
         integration_registry,
+        permissions_script: permissions_script.as_deref(),
         ad_slots_script: params.ad_slots_script.as_deref(),
         ad_bids_state: params.ad_bids_state.script_cell(),
         suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
@@ -3021,6 +3074,7 @@ pub async fn stream_publisher_body_async<W: Write>(
         request_scheme: &params.request_scheme,
         settings,
         integration_registry,
+        permissions_script: permissions_script_for(params, settings),
         ad_slots_script: params.ad_slots_script.as_deref().map(str::to_string),
         ad_bids_state: Arc::clone(params.ad_bids_state.script_cell()),
         suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
@@ -3304,8 +3358,8 @@ impl AdBidsState {
     }
 
     /// Build the shared-template seam, retaining the same debug prefix as inline.
-    fn build_seam_script(&self, slots_json: &str) -> String {
-        let seam = build_seam_script(slots_json, &self.bids());
+    fn build_seam_script(&self, slots_json: &str, permissions_json: &str) -> String {
+        let seam = build_seam_script(slots_json, &self.bids(), permissions_json);
         let prefix = self
             .debug_prefix
             .lock()
@@ -4483,17 +4537,21 @@ pub async fn handle_publisher_request(
     // this handler; subresource requests are likewise filtered there.
     let ec_allowed = ec_context.ec_allowed();
     log::debug!(
-        "Proxy EC state: has_ec_id={}, ec_allowed={ec_allowed}",
+        "Proxy EC state: has_ec_id={}, ec_allowed={ec_allowed}, sharing={}",
         ec_context.ec_value().is_some(),
+        ec_context.ec_sharing_allowed(),
     );
 
     let consent_context = ec_context.consent().clone();
-    // The active EC ID drives the internal snapshot preload and finalization —
-    // including consent-withdrawal tombstoning — so it must NOT be filtered by
-    // consent. The auction/EID identity is the consent-filtered view: under an
-    // explicit withdrawal `ec_allowed` is false, so auction dispatch forwards no
-    // EC while the origin-overlapped snapshot read still happens for the active
-    // ID, keeping the withdrawal CAS off the post-origin latency path.
+    // The active EC ID drives the internal snapshot preload and finalization,
+    // including withdrawal tombstoning, so it is not filtered by permission.
+    // The identifier forwarded into the auction request (user.id) is sharing
+    // beyond the edge, so it rides the same permission pair as bidstream EIDs
+    // (storage plus personalized-ad selection), not only the module's gate.
+    // Under an explicit withdrawal that pair is unset, so auction dispatch
+    // forwards no EC while the origin-overlapped snapshot read still happens
+    // for the active ID, keeping the withdrawal CAS off the post-origin
+    // latency path.
     let active_ec_id_owned = ec_context.ec_value().map(str::to_owned);
     let active_ec_id = active_ec_id_owned.as_deref();
     // The identity-graph key for the active EC ID, the owning module's
@@ -4501,13 +4559,20 @@ pub async fn handle_publisher_request(
     // under this key, the key the row was written under, rather than under the
     // identifier as issued.
     let active_kv_key = ec_context.ec_kv_key();
-    let ec_id_owned = active_ec_id_owned.clone().filter(|_| ec_allowed);
+    let ec_id_owned = active_ec_id_owned
+        .clone()
+        .filter(|_| ec_context.ec_sharing_allowed());
     let ec_id = ec_id_owned.as_deref();
     let cookie_jar = handle_request_cookies(&req)?;
     if let Some(registry) = auction.registry {
         ec_context.validate_pull_sync_marker(settings, registry);
     }
     let geo = ec_context.geo_info().cloned();
+    // Resolved at the start of the request, so take it here, before the mutable
+    // borrows further down. Every HTML response carries it to the page, whether the
+    // ad stack runs or not, so the value is read once and cloned rather than
+    // recomputed per delivery point.
+    let permissions_json = ec_context.permissions().page_json();
 
     let parsed_origin = url::Url::parse(&settings.publisher.origin_url).change_context(
         TrustedServerError::Proxy {
@@ -4840,7 +4905,7 @@ pub async fn handle_publisher_request(
                 .registry
                 .is_some_and(|registry| !registry.is_empty()),
         eid_cookie_may_need_persistence,
-        privacy_needs_row: crate::ec::consent::ec_consent_withdrawn(&consent_context),
+        privacy_needs_row: ec_context.storage_withdrawn(),
     });
     let mut pending_origin = None;
     // A shared-template hit skips the origin entirely, and an in-flight request
@@ -5125,6 +5190,7 @@ pub async fn handle_publisher_request(
                         request_scheme,
                         price_granularity,
                         ad_bids_state.clone(),
+                        permissions_json.clone(),
                     );
                     params.seam_ad_slots = seam_ad_slots.clone();
                     params.dispatched_auction = dispatched_auction.take();
@@ -5514,6 +5580,7 @@ pub async fn handle_publisher_request(
                     request_host: request_host.to_string(),
                     request_scheme: request_scheme.to_string(),
                     content_type,
+                    permissions_json,
                     ad_slots_script: ad_slots_script.clone(),
                     ad_bids_state: ad_bids_state.clone(),
                     suppress_datadome_client_side_tag,
@@ -5579,10 +5646,10 @@ fn apply_auction_eids_and_device(
     let merged_eids = merge_auction_eids(client_eids, kv_eids);
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
     auction_request.user.eids =
-        gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
+        gate_eids_by_permissions(merged_eids, targeting.ec_context.permissions());
     if had_eids && auction_request.user.eids.is_none() {
         log::warn!(
-            "{} auction EIDs stripped by TCF consent gating",
+            "{} auction EIDs stripped by permission gating",
             targeting.path_label
         );
     }
@@ -6032,6 +6099,7 @@ else t.bids=b;\
 pub(crate) fn build_seam_script(
     slots_json: &str,
     bid_map: &serde_json::Map<String, serde_json::Value>,
+    permissions_json: &str,
 ) -> String {
     // The local test script probes the minified `var a=JSON.parse`,
     // `var b=JSON.parse`, and `s(b,a)` literals below. Update the harness with any
@@ -6041,14 +6109,37 @@ pub(crate) fn build_seam_script(
     format!(
         "<script>(function(){{\
 var t=window.tsjs=window.tsjs||{{}};\
+t.permissions=JSON.parse(\"{}\");\
 var a=JSON.parse(\"{}\");\
 var b=JSON.parse(\"{}\");\
 var s=t.scheduleInitialAdInit;\
 if(typeof s===\"function\")s(b,a);\
 else{{t.adSlots=a;t.bids=b;}}\
 }})();</script>",
+        html_escape_for_script(&permissions_json_or_empty(permissions_json)),
         html_escape_for_script(slots_json),
         html_escape_for_script(&bids)
+    )
+}
+
+/// Build the `</body>` seam script for a request whose ad stack did not run.
+///
+/// The head of a shared template carries nothing request-scoped, so the seam is
+/// the only place this reader's permission state can be delivered. Before this
+/// existed the seam was empty whenever the ad stack was skipped, which left a
+/// bot-classified or permission-denied visitor with no state on the page at all.
+///
+/// Carries the state and nothing else. It deliberately does not set `adSlots` or
+/// `bids` and does not call `scheduleInitialAdInit`, because scheduling `adInit`
+/// for traffic that opted out is what the gate in [`seam_script_for`] exists to
+/// prevent.
+pub(crate) fn build_permissions_seam_script(permissions_json: &str) -> String {
+    format!(
+        "<script>(function(){{\
+var t=window.tsjs=window.tsjs||{{}};\
+t.permissions=JSON.parse(\"{}\");\
+}})();</script>",
+        html_escape_for_script(&permissions_json_or_empty(permissions_json))
     )
 }
 
@@ -6737,6 +6828,61 @@ pub(crate) fn template_ad_slots_script(
     }
 }
 
+/// The permission-state `<script>` the head carries, when this mode's head can
+/// carry one.
+///
+/// [`None`] under [`AssemblyMode::Esi`], unconditionally, for the same reason
+/// [`template_ad_slots_script`] returns [`None`] there. The processed document
+/// is cached and served to many readers, so a head carrying this reader's
+/// resolved permissions would freeze one earlier visitor's state into every
+/// later reader's page. Under that mode the state travels in the per-request
+/// `</body>` seam instead (see [`build_seam_script`] and
+/// [`build_permissions_seam_script`]).
+///
+/// Under [`AssemblyMode::Inline`] the response is per-navigation, so the head is
+/// safe and every HTML document gets the script, whether or not the ad stack
+/// ran. A visitor who is bot-classified or whose permissions are unset still
+/// needs to be told what is set, because that answer is what page code reads
+/// instead of guessing from a CMP.
+pub(crate) fn template_permissions_script(
+    mode: AssemblyMode,
+    permissions_json: &str,
+) -> Option<String> {
+    match mode {
+        AssemblyMode::Esi => None,
+        AssemblyMode::Inline => Some(build_permissions_script(permissions_json)),
+    }
+}
+
+/// Build the `tsjs.permissions` `<script>` tag from the request's resolved
+/// permission state.
+///
+/// The payload is [`PermissionState::page_json`], escaped the same way the
+/// slots and bids payloads are, so a Data Use name can never close the script
+/// element.
+pub(crate) fn build_permissions_script(permissions_json: &str) -> String {
+    let escaped = html_escape_for_script(&permissions_json_or_empty(permissions_json));
+    format!(
+        "<script>(window.tsjs=window.tsjs||{{}}).permissions=JSON.parse(\"{}\");</script>",
+        escaped
+    )
+}
+
+/// The permission state as page JSON, substituting the empty state for an unset
+/// value.
+///
+/// [`PermissionState::page_json`] never returns an empty string, so this only
+/// covers a params value nothing filled in. `JSON.parse("")` throws, and a
+/// thrown head script takes the rest of the snippet with it, so an unset value
+/// renders as the empty state rather than as broken JavaScript.
+fn permissions_json_or_empty(permissions_json: &str) -> Cow<'_, str> {
+    if permissions_json.is_empty() {
+        Cow::Owned(PermissionState::default().page_json())
+    } else {
+        Cow::Borrowed(permissions_json)
+    }
+}
+
 /// Build the `tsjs.adSlots` `<script>` tag from matched slots.
 ///
 /// Property names match what the client-side TSJS bundle expects:
@@ -7022,11 +7168,14 @@ pub async fn handle_page_bids(
     };
 
     let request_info = crate::http_util::RequestInfo::from_request(&req, services.client_info());
-    // Owned so the identity-graph snapshot can be stored back on `ec_context`
-    // below without holding a borrow of it across the mutation.
+    // The same sharing pair as the navigation path, because page-bids builds an
+    // auction request, so its user.id egress needs storage plus personalized-ad
+    // selection, matching the EID gate. Owned so the identity-graph snapshot
+    // can be stored back on `ec_context` below without holding a borrow of it
+    // across the mutation.
     let ec_id = ec_context
         .ec_value()
-        .filter(|_| ec_context.ec_allowed())
+        .filter(|_| ec_context.ec_sharing_allowed())
         .map(str::to_owned);
     let consent_context = ec_context.consent().clone();
     let geo = ec_context.geo_info().cloned();
@@ -7531,6 +7680,7 @@ mod tests {
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
     use crate::ec::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteOutcome};
     use crate::integrations::IntegrationRegistry;
+    use crate::permissions::{Permission, PermissionSet};
     use crate::platform::test_support::{
         NoopSecretStore, StubHttpClient, build_services_with_http_client,
         build_services_with_secret_http_client_and_client_ip, noop_services,
@@ -7540,6 +7690,20 @@ mod tests {
     use edgezero_core::body::Body as EdgeBody;
     use http::{Method, Request as HttpRequest, StatusCode, header};
     use std::sync::Arc;
+
+    /// A resolved permission state as page JSON, for tests that need a payload
+    /// with something in it rather than the empty state.
+    ///
+    /// Built through [`PermissionState::page_json`] so no test spells the page
+    /// shape out and a change to that shape is caught here.
+    fn permissions_json_fixture() -> String {
+        PermissionState::new(
+            PermissionSet::none()
+                .with(Permission::StoreOnDevice)
+                .with(Permission::SelectBasicAds),
+        )
+        .page_json()
+    }
 
     /// [`EcKvStore`] that records how many HTTP calls the shared stub client had
     /// made at the moment of each identity-graph lookup. This exposes the
@@ -8298,7 +8462,7 @@ mod tests {
             &AuctionDebugCommentOptions::default(),
         );
 
-        let seam = state.build_seam_script("[]");
+        let seam = state.build_seam_script("[]", &PermissionState::default().page_json());
 
         assert!(
             seam.contains("<!-- ts-debug:"),
@@ -9028,6 +9192,7 @@ mod tests {
             request_host: settings.publisher.domain.clone(),
             request_scheme: "https".to_owned(),
             content_type: "application/json".to_owned(),
+            permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
             auction_observation: None,
@@ -9321,6 +9486,7 @@ mod tests {
                 request_host: "example.com".to_string(),
                 request_scheme: "https".to_string(),
                 integrations: IntegrationRegistry::empty_for_tests(),
+                permissions_script: template_permissions_script(mode, &permissions_json_fixture()),
                 ad_slots_script,
                 ad_bids_state,
                 max_buffered_body_bytes: 16 * 1024 * 1024,
@@ -9407,6 +9573,7 @@ mod tests {
             for forbidden in [
                 ".adSlots",
                 ".bids=",
+                "permissions",
                 "__tsjs_gpt_diagnostics_active",
                 "history.replaceState",
             ] {
@@ -9415,6 +9582,63 @@ mod tests {
                     "{mode:?}: template contains request-scoped `{forbidden}`:\n{rendered}"
                 );
             }
+        }
+
+        #[test]
+        fn inline_documents_carry_the_permission_state_before_the_slots_and_bundle() {
+            // Arrange / Act
+            let rendered = render(
+                AssemblyMode::Inline,
+                RequestShape {
+                    ad_stack_ran: true,
+                    diagnostics_active: false,
+                    bids_available: true,
+                },
+            );
+
+            // Assert
+            let permissions = rendered
+                .find(".permissions=JSON.parse(")
+                .expect("should inject the permission state into an inline head");
+            let slots = rendered
+                .find(".adSlots=JSON.parse(")
+                .expect("should inject the slots into an inline head");
+            let bundle = rendered
+                .find("id=\"trustedserver-js\"")
+                .expect("should inject the tsjs bundle into an inline head");
+            assert!(
+                permissions < slots && permissions < bundle,
+                "the permission state should precede the slots and the bundle, \
+                 because both may read it as soon as they run:\n{rendered}"
+            );
+            assert!(
+                rendered.contains("necessary.operations.storage"),
+                "the state should carry the set Data Use names:\n{rendered}"
+            );
+        }
+
+        #[test]
+        fn inline_documents_with_no_ad_stack_still_carry_the_permission_state() {
+            // Arrange / Act: the ad stack is skipped for bots, prefetches and
+            // readers whose permissions are unset. Each still gets an answer.
+            let rendered = render(
+                AssemblyMode::Inline,
+                RequestShape {
+                    ad_stack_ran: false,
+                    diagnostics_active: false,
+                    bids_available: false,
+                },
+            );
+
+            // Assert
+            assert!(
+                rendered.contains(".permissions=JSON.parse("),
+                "a document with no ad stack should still carry the state:\n{rendered}"
+            );
+            assert!(
+                !rendered.contains(".adSlots="),
+                "no ad stack means no slots:\n{rendered}"
+            );
         }
 
         #[test]
@@ -9592,6 +9816,30 @@ mod tests {
             origin.publisher.origin_host_header_override = Some("tenant.example.com".to_string());
             assert_ne!(template_fingerprint(&base), template_fingerprint(&origin));
         }
+
+        #[test]
+        fn the_policy_file_counts_by_its_digest_and_not_its_text() {
+            let with_policy = |sha256: &str, text: &str| {
+                let mut settings = create_test_settings();
+                settings.permissions = crate::settings::PermissionsConfig {
+                    policy: Some("standard".to_owned()),
+                    sha256: Some(sha256.to_owned()),
+                    text: Some(text.to_owned()),
+                };
+                settings
+            };
+
+            assert_eq!(
+                template_fingerprint(&with_policy("digest-a", "groups: {}\n")),
+                template_fingerprint(&with_policy("digest-a", "a different text\n")),
+                "the text should not reach the fingerprint"
+            );
+            assert_ne!(
+                template_fingerprint(&with_policy("digest-a", "groups: {}\n")),
+                template_fingerprint(&with_policy("digest-b", "groups: {}\n")),
+                "a different policy file should select a different template"
+            );
+        }
     }
 
     mod seam_script_tests {
@@ -9604,7 +9852,68 @@ mod tests {
                     "atf".to_string(),
                     serde_json::json!({"hb_pb": "1.50"}),
                 )]),
+                &permissions_json_fixture(),
             )
+        }
+
+        #[test]
+        fn the_seam_carries_the_permission_state_with_the_probed_literals() {
+            // Arrange / Act
+            let script = seam();
+
+            // Assert
+            assert!(
+                script.contains("t.permissions=JSON.parse("),
+                "the seam should set the permission state: {script}"
+            );
+            assert!(
+                script.contains("necessary.operations.storage"),
+                "the state should carry the set Data Use names: {script}"
+            );
+            assert!(
+                script.find("t.permissions=") < script.find("var a=JSON.parse"),
+                "the state should be set before the slots, so anything the \
+                 scheduler runs can already read it: {script}"
+            );
+            for probed in ["var a=JSON.parse", "var b=JSON.parse", "s(b,a)"] {
+                assert!(
+                    script.contains(probed),
+                    "`scripts/template-cache-local-test.sh` probes `{probed}`; \
+                     update the harness with any rewrite of it: {script}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_request_with_no_ad_stack_still_receives_its_permission_state() {
+            // Arrange: `seam_ad_slots` is `None` exactly when the ad stack did not
+            // run, and the seam has to carry the permission state all the same.
+            let settings = create_test_settings();
+            let mut params = make_stream_params(&settings, "");
+            params.permissions_json = permissions_json_fixture();
+
+            // Act
+            let seam = seam_script_for(&params);
+
+            // Assert
+            assert!(
+                seam.contains("t.permissions=JSON.parse("),
+                "an opted-out or bot-classified reader should still be told what \
+                 is set: {seam}"
+            );
+            assert!(
+                seam.contains("necessary.operations.storage"),
+                "the state should carry the set Data Use names: {seam}"
+            );
+            assert!(
+                !seam.contains("scheduleInitialAdInit"),
+                "scheduling ad init for traffic that opted out is what the \
+                 no-ad-stack gate exists to prevent: {seam}"
+            );
+            assert!(
+                !seam.contains("adSlots"),
+                "a permissions-only seam should define no slots: {seam}"
+            );
         }
 
         #[test]
@@ -10193,7 +10502,7 @@ mod tests {
             http_client: Arc<StubHttpClient>,
             cache: Arc<MemoryTemplateCache>,
         ) -> RuntimeServices {
-            RuntimeServices::builder()
+            crate::platform::test_support::test_services_builder()
                 .config_store(Arc::new(NoopConfigStore))
                 .secret_store(Arc::new(NoopSecretStore))
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -10225,7 +10534,7 @@ mod tests {
         ) -> RuntimeServices {
             let telemetry_sink: Arc<dyn crate::auction::telemetry::AuctionTelemetrySink> =
                 telemetry_sink;
-            RuntimeServices::builder()
+            crate::platform::test_support::test_services_builder()
                 .config_store(Arc::new(NoopConfigStore))
                 .secret_store(Arc::new(NoopSecretStore))
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -12883,7 +13192,7 @@ mod tests {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let settings = Arc::new(settings_with_mode("esi"));
-            let services = RuntimeServices::builder()
+            let services = crate::platform::test_support::test_services_builder()
                 .config_store(Arc::new(NoopConfigStore))
                 .secret_store(Arc::new(NoopSecretStore))
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -14102,18 +14411,23 @@ mod tests {
                 .into_iter()
                 .enumerate()
                 {
-                    let consent = if withdrawn {
-                        ConsentContext {
-                            jurisdiction: crate::consent::jurisdiction::Jurisdiction::UsState(
-                                "CA".to_owned(),
-                            ),
-                            gpc: true,
-                            ..Default::default()
-                        }
+                    // A US-style opt-out suppresses use without expiring the
+                    // cookie, so the destructive path this test is about needs
+                    // a request that withdrew device storage outright.
+                    let mut ec_context = if withdrawn {
+                        EcContext::new_for_test_withdrawn(
+                            Some(identity.clone()),
+                            ConsentContext {
+                                jurisdiction: crate::consent::jurisdiction::Jurisdiction::UsState(
+                                    "CA".to_owned(),
+                                ),
+                                gpc: true,
+                                ..Default::default()
+                            },
+                        )
                     } else {
-                        scheduling_consent()
+                        EcContext::new_for_test(Some(identity.clone()), scheduling_consent())
                     };
-                    let mut ec_context = EcContext::new_for_test(Some(identity.clone()), consent);
                     assert_eq!(
                         ec_context.ec_allowed(),
                         !withdrawn,
@@ -16806,7 +17120,7 @@ mod tests {
             telemetry_sink: Arc<RecordingTelemetrySink>,
         ) -> RuntimeServices {
             let telemetry_sink: Arc<dyn AuctionTelemetrySink> = telemetry_sink;
-            RuntimeServices::builder()
+            crate::platform::test_support::test_services_builder()
                 .config_store(Arc::new(NoopConfigStore))
                 .secret_store(Arc::new(NoopSecretStore))
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -18347,6 +18661,7 @@ mod tests {
                 services: &services,
                 req: &mut req,
                 geo_info: None,
+                permissions: None,
             })
             .await
             .expect("should run DataDome filter");
@@ -19876,6 +20191,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/css".to_string(),
+            permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
             auction_observation: None,
@@ -19935,6 +20251,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
+            permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
             auction_observation: None,
@@ -19983,6 +20300,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
+            permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
             auction_observation: None,
@@ -20109,6 +20427,7 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
+                permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
                 auction_observation: None,
@@ -20173,6 +20492,7 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
+                permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
                 auction_observation: None,
@@ -20240,6 +20560,7 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
+                permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
                 auction_observation: None,
@@ -20307,6 +20628,7 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
+                permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
                 auction_observation: None,
@@ -20374,6 +20696,7 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
+                permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
                 auction_observation: None,
@@ -20423,6 +20746,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/css".to_string(),
+            permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
             auction_observation: None,
@@ -20640,6 +20964,7 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                permissions_json: String::new(),
                 ad_slots_script: Some(
                     r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
                         .to_string(),
@@ -20715,6 +21040,7 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                permissions_json: String::new(),
                 ad_slots_script: Some(
                     r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
                         .to_string(),
@@ -20792,6 +21118,7 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
+                permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
                 auction_observation: None,
@@ -20863,6 +21190,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/css".to_string(),
+            permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
             auction_observation: None,
@@ -21016,6 +21344,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
+            permissions_json: String::new(),
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
                     .to_string(),
@@ -21697,6 +22026,7 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
                 auction_observation: Some(AuctionObservationContext::from_parts(
@@ -21892,6 +22222,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
+            permissions_json: String::new(),
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
                     .to_string(),
@@ -21973,6 +22304,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "Text/HTML; Charset=utf-8".to_string(),
+            permissions_json: String::new(),
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
                     .to_string(),
@@ -22037,6 +22369,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html".to_string(),
+            permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
             auction_observation: None,
@@ -22155,6 +22488,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
+            permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
             auction_observation: None,
@@ -22222,6 +22556,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html".to_string(),
+            permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
             auction_observation: None,
@@ -25074,7 +25409,7 @@ mod tests {
             telemetry_sink: Arc<RecordingTelemetrySink>,
         ) -> RuntimeServices {
             let telemetry_sink: Arc<dyn AuctionTelemetrySink> = telemetry_sink;
-            RuntimeServices::builder()
+            crate::platform::test_support::test_services_builder()
                 .config_store(Arc::new(NoopConfigStore))
                 .secret_store(Arc::new(NoopSecretStore))
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))

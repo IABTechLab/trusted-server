@@ -226,10 +226,10 @@ fn test_cloudflare_enabled_auction_reaches_telemetry() {
     init_logger();
     // The readiness probe falls back to the proxied root page.
     let _origin = common::ec::MinimalOrigin::start(origin_port());
-    let config_json = common::config::cloudflare_auction_config_json(origin_port())
+    let envelope = common::config::auction_app_config_envelope(origin_port())
         .expect("should build auction-enabled Cloudflare config");
     let process = environments::cloudflare::CloudflareWorkers
-        .spawn_with_config_json(&config_json)
+        .spawn_with_config_envelope(&envelope)
         .expect("should start Cloudflare Worker");
     let request_body = serde_json::json!({
         "adUnits": [{
