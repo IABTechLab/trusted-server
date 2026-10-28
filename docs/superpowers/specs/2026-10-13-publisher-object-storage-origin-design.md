@@ -1,6 +1,6 @@
 # Design Spec: A publisher's site served from a folder of object storage
 
-**Status:** Proposed, 2026-10-13. Raised as draft pull request IABTechLab/trusted-server#1377 (from jwrosewell/trusted-server#31, which is closed), for Tech Lab review.
+**Status:** Proposed, 2026-10-13. Raised as pull request IABTechLab/trusted-server#1377 (from jwrosewell/trusted-server#31, which is closed), for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-12-page-middleware-design.md`, `2026-10-12-middleware-creates-a-missing-file-design.md`, `2026-04-28-multi-backend-asset-proxy-design.md` and `2026-10-14-origin-signing-design.md`, with every design document of the stack held in IABTechLab/trusted-server#1342
 **Related PRs:** IABTechLab/trusted-server#1377, jwrosewell/trusted-server#31 (closed)

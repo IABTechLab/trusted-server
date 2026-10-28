@@ -1,6 +1,6 @@
 # Design Spec: Small vendor, standard and platform names leave core
 
-**Status:** Proposed, 2026-10-14. Raised as draft pull request IABTechLab/trusted-server#1389 (from jwrosewell/trusted-server#41), for Tech Lab review.
+**Status:** Proposed, 2026-10-14. Raised as pull request IABTechLab/trusted-server#1389 (from jwrosewell/trusted-server#41), for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-14-source-modules-design.md`, `2026-10-14-no-modules-crate-design.md` and `2026-10-13-request-addressing-design.md`
 **Related PRs:** IABTechLab/trusted-server#1389, jwrosewell/trusted-server#41

@@ -1,6 +1,6 @@
 # Design Spec: A middleware may run on a media type other than HTML
 
-**Status:** Proposed, 2026-10-12. Raised as draft pull request IABTechLab/trusted-server#1360, row 19 of the stack in IABTechLab/trusted-server#777, for Tech Lab review. The two earlier pull requests for this change, IABTechLab/trusted-server#1306 and jwrosewell/trusted-server#14, are closed.
+**Status:** Proposed, 2026-10-12. Raised as pull request IABTechLab/trusted-server#1360, row 19 of the stack in IABTechLab/trusted-server#777, for Tech Lab review. The two earlier pull requests for this change, IABTechLab/trusted-server#1306 and jwrosewell/trusted-server#14, are closed.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-08-27-integration-provider-seam-design.md`, `2026-10-12-page-middleware-design.md`, `2026-10-12-ads-txt-sellers-design.md`, `2026-10-12-middleware-creates-a-missing-file-design.md`, `2026-10-12-robots-txt-middleware-design.md` and `2026-10-14-rsc-flight-middleware-design.md`, all in IABTechLab/trusted-server#1342, which holds every design document of the stack
 **Related PRs:** IABTechLab/trusted-server#1360, IABTechLab/trusted-server#1306 (closed), jwrosewell/trusted-server#14 (closed)

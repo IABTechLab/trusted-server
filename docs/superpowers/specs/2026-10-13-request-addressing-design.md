@@ -1,6 +1,6 @@
 # Design Spec: A deployment may address a request by its path before its configuration is chosen
 
-**Status:** Proposed, 2026-10-13. Raised as draft pull request IABTechLab/trusted-server#1376 (from jwrosewell/trusted-server#30, which is closed), for Tech Lab review.
+**Status:** Proposed, 2026-10-13. Raised as pull request IABTechLab/trusted-server#1376 (from jwrosewell/trusted-server#30, which is closed), for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-12-config-by-host-design.md`, `2026-10-12-middleware-prepare-design.md`, `2026-10-12-prefix-module-design.md`, `2026-08-27-integration-provider-seam-design.md` and `2026-10-15-cookies-by-path-design.md`, all in IABTechLab/trusted-server#1342, which holds every design document of the stack
 **Related PRs:** IABTechLab/trusted-server#1376, jwrosewell/trusted-server#30 (closed)

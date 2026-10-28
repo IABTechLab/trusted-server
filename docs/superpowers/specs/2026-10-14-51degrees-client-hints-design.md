@@ -1,6 +1,6 @@
 # Design Spec: A deployment using 51Degrees gets client hints from one middleware
 
-**Status:** Proposed, 2026-10-14. Raised as draft pull request IABTechLab/trusted-server#1386 (from jwrosewell/trusted-server#39), for Tech Lab review.
+**Status:** Proposed, 2026-10-14. Raised as pull request IABTechLab/trusted-server#1386 (from jwrosewell/trusted-server#39), for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-12-shared-vendor-tables-design.md` (the `[shared.51degrees]` table), `2026-10-12-loading-cache-design.md` (the `51degrees-answers` cache), `2026-10-12-page-middleware-design.md` (the `[[serve]]` entries), `2026-10-14-source-modules-design.md` (the source a page is fetched from) and `2026-10-17-request-filters-on-every-adapter-design.md` (the request filters every adapter runs), all in IABTechLab/trusted-server#1342, which holds every design document of the stack
 **Related PRs:** jwrosewell/trusted-server#39, IABTechLab/trusted-server#1386

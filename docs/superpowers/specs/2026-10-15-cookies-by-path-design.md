@@ -1,6 +1,6 @@
 # Design Spec: Core keeps a publisher's cookies under that publisher's path when one host serves several
 
-**Status:** Proposed, 2026-10-15. Raised as draft pull request IABTechLab/trusted-server#1400 (from jwrosewell/trusted-server#45), for Tech Lab review.
+**Status:** Proposed, 2026-10-15. Raised as pull request IABTechLab/trusted-server#1400 (from jwrosewell/trusted-server#45), for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-13-request-addressing-design.md`, `2026-10-12-prefix-module-design.md`
 **Related PRs:** IABTechLab/trusted-server#1400, jwrosewell/trusted-server#45

@@ -1,6 +1,6 @@
 # Design Spec: A geo module is called with the request
 
-**Status:** Proposed, 2026-10-15. Written after the code, for draft pull request IABTechLab/trusted-server#1374
+**Status:** Proposed, 2026-10-15. Written after the code, for pull request IABTechLab/trusted-server#1374
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-12-module-context-design.md`, `2026-10-12-device-signals-design.md`, `2026-08-27-integration-provider-seam-design.md`, `2026-09-07-didomi-geo-design.md`. Every design document of the stack is in IABTechLab/trusted-server#1342.
 **Related PRs:** IABTechLab/trusted-server#1374, reviewed on jwrosewell/trusted-server#28 (closed)

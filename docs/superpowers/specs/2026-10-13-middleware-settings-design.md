@@ -1,6 +1,6 @@
 # Design Spec: A middleware reads its settings from a table of its own
 
-**Status:** Proposed, 2026-10-15. Raised as draft pull request IABTechLab/trusted-server#1379 (from jwrosewell/trusted-server#33), for Tech Lab review.
+**Status:** Proposed, 2026-10-15. Raised as pull request IABTechLab/trusted-server#1379 (from jwrosewell/trusted-server#33), for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-08-27-integration-provider-seam-design.md`, `2026-10-12-page-middleware-design.md`, `2026-10-12-shared-vendor-tables-design.md`, `2026-10-14-51degrees-client-hints-design.md`
 **Related PRs:** jwrosewell/trusted-server#33, IABTechLab/trusted-server#1379, IABTechLab/trusted-server#1342

@@ -1,6 +1,6 @@
 # Design Spec: One module context
 
-**Status:** Proposed, 2026-10-12. Implemented as the draft pull request [IABTechLab/trusted-server#1349](https://github.com/IABTechLab/trusted-server/pull/1349), answering [IABTechLab/trusted-server#1267](https://github.com/IABTechLab/trusted-server/issues/1267). [IABTechLab/trusted-server#1342](https://github.com/IABTechLab/trusted-server/pull/1342) carries every design document of the stack in one place.
+**Status:** Proposed, 2026-10-12. Implemented as the pull request [IABTechLab/trusted-server#1349](https://github.com/IABTechLab/trusted-server/pull/1349), answering [IABTechLab/trusted-server#1267](https://github.com/IABTechLab/trusted-server/issues/1267). [IABTechLab/trusted-server#1342](https://github.com/IABTechLab/trusted-server/pull/1342) carries every design document of the stack in one place.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-08-27-integration-provider-seam-design.md`
 **Related PRs:** IABTechLab/trusted-server#1349, which builds on the integration seam in [IABTechLab/trusted-server#1348](https://github.com/IABTechLab/trusted-server/pull/1348) and was reviewed on [jwrosewell/trusted-server#3](https://github.com/jwrosewell/trusted-server/pull/3) (closed)

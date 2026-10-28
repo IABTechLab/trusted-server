@@ -1,6 +1,6 @@
 # Design Spec: The consent decoders live in the crates named for their standards
 
-**Status:** Proposed, 2026-10-14. Raised as draft pull request IABTechLab/trusted-server#1383 (from jwrosewell/trusted-server#37), for Tech Lab review.
+**Status:** Proposed, 2026-10-14. Raised as pull request IABTechLab/trusted-server#1383 (from jwrosewell/trusted-server#37), for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-14-source-modules-design.md`, in IABTechLab/trusted-server#1342, which holds every design document of the stack
 **Related PRs:** IABTechLab/trusted-server#1383, jwrosewell/trusted-server#37

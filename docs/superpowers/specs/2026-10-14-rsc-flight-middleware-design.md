@@ -1,6 +1,6 @@
 # Design Spec: The Flight rewriter is a middleware of the Next.js module
 
-**Status:** Proposed, 2026-10-14. Raised as draft pull request IABTechLab/trusted-server#1381 (from jwrosewell/trusted-server#35), for Tech Lab review.
+**Status:** Proposed, 2026-10-14. Raised as pull request IABTechLab/trusted-server#1381 (from jwrosewell/trusted-server#35), for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-09-07-850-parser-aware-body-hold-nextjs-streaming-design.md`, `2026-10-14-source-modules-design.md`
 **Related PRs:** IABTechLab/trusted-server#1381, jwrosewell/trusted-server#35

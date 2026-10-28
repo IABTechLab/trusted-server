@@ -1,6 +1,6 @@
 # Design Spec: An origin signer is a module a source's auth table names
 
-**Status:** Proposed, 2026-10-14. Raised as draft pull request jwrosewell/trusted-server#43, and as draft pull request IABTechLab/trusted-server#1391, for Tech Lab review.
+**Status:** Proposed, 2026-10-14. Raised as draft pull request jwrosewell/trusted-server#43, and as pull request IABTechLab/trusted-server#1391, for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-14-source-modules-design.md`, `2026-10-13-publisher-object-storage-origin-design.md`, `2026-05-19-asset-s3-auth-fastly-io-design.md` and `2026-10-14-no-modules-crate-design.md`, all in IABTechLab/trusted-server#1342, which holds every design document of the stack
 **Related PRs:** jwrosewell/trusted-server#43, IABTechLab/trusted-server#1391

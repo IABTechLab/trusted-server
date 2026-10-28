@@ -1,6 +1,6 @@
 # Design Spec: Each adapter lists the modules it links, each module describes its middleware, and the project's own modules are renamed iabtl
 
-**Status:** Proposed, 2026-10-14. Raised as draft pull request IABTechLab/trusted-server#1384 (from jwrosewell/trusted-server#38), for Tech Lab review.
+**Status:** Proposed, 2026-10-14. Raised as pull request IABTechLab/trusted-server#1384 (from jwrosewell/trusted-server#38), for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-14-source-modules-design.md`, in IABTechLab/trusted-server#1342, which replaced IABTechLab/trusted-server#1084 as the one place for every design document of the stack of pull requests listed in IABTechLab/trusted-server#777
 **Related PRs:** IABTechLab/trusted-server#1384, jwrosewell/trusted-server#38

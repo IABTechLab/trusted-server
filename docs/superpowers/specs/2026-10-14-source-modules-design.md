@@ -1,6 +1,6 @@
 # Design Spec: A source module says where the publisher path and the asset routes fetch from
 
-**Status:** Proposed, 2026-10-14. Raised as draft pull request IABTechLab/trusted-server#1380 (from jwrosewell/trusted-server#34), for Tech Lab review.
+**Status:** Proposed, 2026-10-14. Raised as pull request IABTechLab/trusted-server#1380 (from jwrosewell/trusted-server#34), for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-13-publisher-object-storage-origin-design.md`, `2026-10-13-origin-redirect-design.md`, `2026-10-13-request-addressing-design.md`, `2026-04-28-multi-backend-asset-proxy-design.md`
 **Related PRs:** jwrosewell/trusted-server#34, IABTechLab/trusted-server#1380

@@ -1,6 +1,6 @@
 # Design Spec: A folder origin's addresses in response headers, and a headers step for serve middleware
 
-**Status:** Proposed, 2026-10-13. Raised as draft pull request IABTechLab/trusted-server#1378 (from jwrosewell/trusted-server#32, which is closed), for Tech Lab review.
+**Status:** Proposed, 2026-10-13. Raised as pull request IABTechLab/trusted-server#1378 (from jwrosewell/trusted-server#32, which is closed), for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-13-publisher-object-storage-origin-design.md` and `2026-10-13-request-addressing-design.md`, both in IABTechLab/trusted-server#1342, which holds every design document of the stack
 **Related PRs:** IABTechLab/trusted-server#1378, IABTechLab/trusted-server#1238 (merged, the header rewrite this change extends), jwrosewell/trusted-server#32 (closed)

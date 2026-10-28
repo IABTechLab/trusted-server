@@ -1,9 +1,9 @@
 # Design Spec: A module hands core the identifiers it learned for a request
 
-**Status:** Proposed, 2026-10-14. Raised as draft pull requests jwrosewell/trusted-server#36 and IABTechLab/trusted-server#1382, for Tech Lab review.
+**Status:** Proposed, 2026-10-14. Raised as draft pull request jwrosewell/trusted-server#36 and as pull request IABTechLab/trusted-server#1382, for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-07-10-kv-eid-request-snapshot-ec-recovery-design.md`, `2026-09-08-1138-per-cookie-template-cache-policy-design.md`
-**Related PRs:** jwrosewell/trusted-server#36 (fork draft) and IABTechLab/trusted-server#1382 (Tech Lab draft). IABTechLab/trusted-server#1342 holds every design document of the stack.
+**Related PRs:** jwrosewell/trusted-server#36 (fork draft) and IABTechLab/trusted-server#1382 (Tech Lab pull request). IABTechLab/trusted-server#1342 holds every design document of the stack.
 **Issues:** IABTechLab/trusted-server#1337
 **Last updated:** 2026-10-15
 

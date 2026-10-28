@@ -1,7 +1,7 @@
 # Design Spec: Client-Cycle Edge Cookie Modules and the Resolve Endpoint
 
 **Status:** Proposed. The implementation is the series branch
-`split/4-client-resolve`, carried by draft pull request
+`split/4-client-resolve`, carried by pull request
 IABTechLab/trusted-server#1346, and is not merged to main.
 The anti-replay reservation of §3.9 and the vendor envelope verification it
 serves are deliberately not in v1. They land with the first real vendor
@@ -12,8 +12,8 @@ normative rather than deferred.
 **Issue references:** #778 (series), successor spec of the 2026-07-31 draft
 **Related specs:** `2026-07-30-pluggable-providers-design.md`,
 `2026-07-30-permission-model-design.md`
-**Related PRs:** IABTechLab/trusted-server#1346 (Tech Lab draft) carries the
-implementation. IABTechLab/trusted-server#1345 (Tech Lab draft) carries the
+**Related PRs:** IABTechLab/trusted-server#1346 (Tech Lab pull request) carries the
+implementation. IABTechLab/trusted-server#1345 (Tech Lab pull request) carries the
 permission model that the implementation builds on.
 IABTechLab/trusted-server#1342 holds every design document of the stack.
 **Last updated:** 2026-10-16

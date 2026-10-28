@@ -1,6 +1,6 @@
 # Design Spec: Pluggable Edge Cookie, Device, and Geo Modules
 
-**Status:** Proposed. Raised as draft pull requests
+**Status:** Proposed. Raised as pull requests
 IABTechLab/trusted-server#1343 (row 2 of the stack, the Edge Cookie module
 seam) and IABTechLab/trusted-server#1344 (row 3, device and geo selection),
 neither of which is merged to main. Both were reviewed earlier, as pull

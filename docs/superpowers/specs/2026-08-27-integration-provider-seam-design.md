@@ -1,6 +1,6 @@
 # Design Spec: The Integration Seam
 
-**Status:** Proposed, 2026-08-27, revised 2026-08-28, 2026-10-06, 2026-10-07, 2026-10-08, 2026-10-12, 2026-10-15 and 2026-10-16. Draft
+**Status:** Proposed, 2026-08-27, revised 2026-08-28, 2026-10-06, 2026-10-07, 2026-10-08, 2026-10-12, 2026-10-15 and 2026-10-16.
 PR #1342, row 1 of the stack in #777, carries this spec with every design
 document of the stack and the URL host linter's allowlist for the modules the
 stack ships, and targets `main` directly, so the whole normative set is
