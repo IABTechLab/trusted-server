@@ -1,6 +1,6 @@
 # Gate 3 implementation plan: versioned seven-artifact index
 
-**Status:** Proposed plan awaiting user approval. The Gate 3 design is approved with a new neutral v2 cohort ID, `trusted-server-binaries`. This plan authorizes no implementation, new schema/policy file, production selector or rehearsal tag. Consumer implementation remains Phase 4; live signing/publication and fork trust remain Gates 4/6.
+**Status:** Step 1 approved on 2026-10-28 for frozen-v1 regression checks, the assigned source port and restored assertions only. The Gate 3 design is approved with a new neutral v2 cohort ID, `trusted-server-binaries`. No v2 schema/policy/cohort/descriptor/admission/assembly, workflow, release script, signing, production selector or rehearsal tag is authorized. Consumer implementation remains Phase 4; live signing/publication and fork trust remain Gates 4/6.
 
 **Tracking:** Part of #1235; draft #1463. Read with the [approved design](binary-attestations-phase3-seven-artifact-index.md), [Gate 2 coverage/rollout decision](binary-attestations-phase3-complete-spdx-implementation.md) and [phase assignment](binary-attestations-phases-2-4.md).
 
@@ -19,7 +19,7 @@ Existing v1 policy and schema currently match frozen source `122b78664b1235c717e
 
 ## Explicit meaning of `provenance-sbom-repeatable`
 
-**Proposed v2 definition:** authenticated provenance and the approved composition/SPDX evidence, plus mandatory matched complete-final-byte A/B equality under an explicitly approved comparison profile. For the Fastly default row, the accepted ordinary profile is exactly `ordinary-release-fastly-byte-equality-v1`.
+**Approved v2 definition:** authenticated provenance and the approved composition/SPDX evidence, plus mandatory matched complete-final-byte A/B equality under an explicitly approved comparison profile. For the Fastly default row, the accepted ordinary profile is exactly `ordinary-release-fastly-byte-equality-v1`.
 
 That ordinary profile proves the project's observed ordinary-build repeatability with its recorded source/input/tool/environment/run/transfer joins. It does **not** establish controlled-recipe, acquisition, confinement, alternate-user or independent-builder qualification. Policy and public verification documentation must state this definition before v2 is accepted.
 
@@ -49,7 +49,7 @@ The proposed producer cohort source is `scripts/release/release-cohort-v2.json`,
 
 ## Implementation sequence after plan approval
 
-**Sequencing:** revised-plan approval permits **Step 1 only**. Steps 2–5, including v2 policy/cohort/schema files, metadata descriptors, ordinary-receipt admission and assembly, wait for the **final Gate 2 rollout/assurance decision**. Choosing the current full-cohort cost assessment is not that final decision. Step 6 integration follows those held steps; planning documents may still be revised now. A target-specific choice could change the v2 rows’ assurance profiles, so do not freeze them prematurely.
+**Sequencing:** Step 1 is approved and its source port, restored assertions and local execution are recorded in the [Step 1 ledger](binary-attestations-phase3-step1-port.md). Steps 2–5, including v2 policy/cohort/schema files, metadata descriptors, ordinary-receipt admission and assembly, wait for the **final Gate 2 rollout/assurance decision**. Choosing the current full-cohort cost assessment is not that final decision. Step 6 integration follows those held steps; planning documents may still be revised now. A target-specific choice could change the v2 rows’ assurance profiles, so do not freeze them prematurely.
 
 1. **After revised-plan approval:** freeze v1 bytes/fixtures with regression checks. Complete the approved source port and restore Phase 3 assertions in separate coherent commits. Prove Phase 2 plus Phase 3 dependency closure with host all-target check/clippy before integrating v2.
 2. **Held for Gate 2 decision:** add the separately approved v2 policy/cohort sources and a metadata-only seven-row descriptor matching every tuple in the approved design: filename, package/bin, role, kind, target, runtime/minimum/architecture, variant, capability and assurance. Never extend `FIXED_ARTIFACTS` to select Axum controlled recipes.
@@ -87,10 +87,10 @@ For each coherent metadata/schema/join change, first add a discriminating failin
 
 Use the host target explicitly for producer checks, for example `cargo +1.98.1 check -p trusted-server-release --target aarch64-apple-darwin --all-targets --locked` and the matching `clippy --all-targets --all-features -- -D warnings`. List each audited pure test by its full name, then use `cargo +1.98.1 test -p trusted-server-release --target aarch64-apple-darwin --locked <full-test-name> -- --exact` with a nonzero/one-passing-test guard. Hosted Linux CI must exercise Linux-only code and process fixtures; do not run the whole producer suite locally. Finish each approved chunk with Rust/docs formatting, domain lint and independent review before pushing.
 
-Before Step 1, approve this revised plan and its sequencing. The repeatability definition, frozen v1 hashes, narrow rebuild-check exception and 53/52 contract are already approved. Before Steps 2–5, obtain the final Gate 2 rollout/assurance decision; this plan alone does not open them. Before complete production/index release, close Gate 2 coverage for the selected cohort and separately approve Gate 4 publication and Gate 6 rehearsal trust. Consumer implementation remains Phase 4. No schema, policy, source, workflow or tag is created by this plan.
+Step 1 is approved with the explicit Gate 4 workflow-contract deferral recorded in the assignment. The repeatability definition, frozen v1 hashes, narrow rebuild-check exception and 53/52 contract are already approved. Before Steps 2–5, obtain the final Gate 2 rollout/assurance decision; this plan alone does not open them. Before complete production/index release, close Gate 2 coverage for the selected cohort and separately approve Gate 4 publication and Gate 6 rehearsal trust. Consumer implementation remains Phase 4. No schema, policy, source, workflow or tag is created by this plan.
 
 ## Plan review
 
-Independent read-only plan review on 2026-10-28 found no blocking findings against Phase 2 source `5fa384336` and frozen source `122b78664`. It confirmed the strict all-seven coverage stop, frozen v1 bytes, narrow ordinary-profile handling and cycle-free inventory. A policy-source wording inconsistency in the design was corrected to refer to a separately approved v2 policy. No tests, implementation or runtime qualification were performed by this review. User rollout/plan approvals remain pending.
+Independent read-only plan review on 2026-10-28 found no blocking findings against Phase 2 source `5fa384336` and frozen source `122b78664`. It confirmed the strict all-seven coverage stop, frozen v1 bytes, narrow ordinary-profile handling and cycle-free inventory. A policy-source wording inconsistency in the design was corrected to refer to a separately approved v2 policy. No tests, implementation or runtime qualification were performed by this review. Step 1 subsequently received user approval with the workflow-contract unit deferred to Gate 4. The final Gate 2 rollout/assurance decision and later implementation remain pending.
 
 A subsequent independent review checked the user-requested CLI policy location, separate producer cohort source, Step-1-only approval boundary and hold on Steps 2–5. It found no blocking findings; no source or configuration implementation was performed.

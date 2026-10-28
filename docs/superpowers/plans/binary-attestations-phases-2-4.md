@@ -2,7 +2,7 @@
 
 **Phase 2 spec:** [ordinary Fastly release equality](../specs/2026-10-28-1235-binary-attestations-phase2-design.md), with its own source-checked review rounds. Tracking issue: #1235.
 
-**Status:** Phase 2 implementation `5fa3843364f247fdc261c438ab9257323637a42c` passed exact-source CI and rehearsal `.16`; [full transcript](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6467368408). Phase 2 `fb4843355` is its docs-only evidence head. Phase 3 is design-only draft #1463: Gate 2/3 designs are approved, but the [full-cohort closure/cost assessment](binary-attestations-phase3-full-cohort-feasibility.md) and [index plan](binary-attestations-phase3-seven-artifact-index-implementation.md) still require their decisions. Implementation, qualification and later gates remain closed.
+**Status:** Phase 2 implementation `5fa3843364f247fdc261c438ab9257323637a42c` passed exact-source CI and rehearsal `.16`; [full transcript](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6467368408). Phase 2 `fb4843355` is its docs-only evidence head. Phase 3 draft #1463 contains the approved Step 1 frozen-source port and restored assertions; see the [per-path and execution record](binary-attestations-phase3-step1-port.md). Gate 2/3 designs are approved, but the final Gate 2 rollout/assurance decision remains pending after the [full-cohort closure/cost assessment](binary-attestations-phase3-full-cohort-feasibility.md). The v2 [index plan](binary-attestations-phase3-seven-artifact-index-implementation.md) Steps 2–5, production generation, qualification and later gates remain closed.
 
 **Tracking issue:** #1235. The earlier separate tracking-issue draft is retained as planning history, not an additional issue prerequisite.
 
@@ -31,7 +31,7 @@ Finish and rehearse each implementation phase before the next. Design-only propo
 - In `recipe/tests/complete.rs`, Phase 2 keeps build/composition/JS rejection tests; Phase 3 adds the SPDX-generation rejection test and the collection-export assertion. `full.rs`, `cli.rs` and `macos_cli.rs` retain build, equality or native measurement, inspection, remapping and runtime/startup checks in Phase 2; Phase 3 restores SPDX/index/export assertions. No test is dropped from the final stack.
 - Four `native_spdx_*` tests in `composition/native/tests.rs` land in Phase 3. Capture tests and `fixture_for_projection` remain in Phase 2. `recipe/startup/accepted/tests.rs` contains no evidence-module imports and stays wholly in Phase 2.
 - `crates/trusted-server-cli/tests/fixtures/release/release-index.json` moves to Phase 3 because distribution tests embed it. CLI consumer code remains Phase 4.
-- Three `workflow_contract_command_*` process tests in `tests/commands.rs` are restored in Phase 3 with the workflow-contract command; all other frozen command tests remain in Phase 2.
+- Three `workflow_contract_command_*` process tests in `tests/commands.rs` belong with the Phase 3 workflow-contract command but are deferred together to Gate 4, as recorded below; all other frozen command tests remain in Phase 2.
 - Main command/module registrations, error variants, re-exports, manifests, lockfile, workflows and shared tests are staged by dependency. Stage unused evidence/publication variants until their owning phase rather than introducing broad warning suppressions.
 
 ### Avoid duplicate build-facts ports
@@ -606,3 +606,25 @@ At `7beaa5483166d073c88f12dda295ffd26bdbec97`, the [real hosted A/B comparison](
 The additive signing handoff keeps binary/SPDX inputs unchanged, adds the real matched companion only for Fastly, checks its source/run/attempt and binary/SPDX digests, and signs it as a third provenance subject from the existing reusable signer. The companion travels with the signed Fastly artifact and its digest receipt. Publication validates that handoff before any mutation and adds only this companion, for 30 files and 29 checksum entries. Binary-only SPDX attestations and native input sets remain unchanged. Rehearsal `.10` at `3ccfe29715a073bd37010ea86037b9c8f89801c7` proved attestation compatibility and publication; its separate rerun-all proved current-attempt transfer and expected refusal of an existing immutable release. [Verification](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6438603951) and [recovery](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6439423827) are recorded independently of local tests. The subsequently merged head `770a425df4b28caaaef68dfd930bceabd9928046` has green CI after one lost-runner retry and passed fresh [rehearsal `.13` with full independent verification](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6441704601). Completion commit `2ed1b941a212aeb27e08f8d1e27cb8353f40f535` was docs-only after that exact rehearsed implementation. The later main merge is recorded separately in the compatibility document; `.13` does not attest its changed application inputs.
 
 The CI-only negative fixture invokes the real comparison executable on synthetic bound archives containing accurately hashed different fixture bytes. It requires the actual mismatch diagnostic, nonzero exit and absence of matched/later-stage sentinels within fixed time/output bounds. Separate read-only canaries and their audit exercise skipped-stage wiring without a release-path bypass, new trigger or altered-source tag. Process tests remain hosted-only.
+
+## Approved Phase 3 Step 1 scope and Gate 4 deferrals
+
+Step 1 is approved on 2026-10-28 for the 63 independent frozen-source paths and required shared support/restored assertions. No workflow, release script, signing, v2 contract or qualification changes are included. The following paths remain Phase 3 ownership but are retargeted from this source-port step to **Gate 4**, where they must guard the actual approved release workflows. No frozen workflow fixture or passing replacement is introduced.
+
+| Deferred path                                                  | Reason / future execution                                                         |
+| -------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `.github/actions/setup-integration-test-env/action.yml`        | Gate 4 actual-workflow integration; excluded from the approved source-only Step 1 |
+| `.github/workflows/release-validation.mjs`                     | Gate 4 actual-workflow integration; excluded from the approved source-only Step 1 |
+| `.github/workflows/release-validation.test.mjs`                | Gate 4 actual-workflow integration; excluded from the approved source-only Step 1 |
+| `.github/workflows/release-validation.yml`                     | Gate 4 actual-workflow integration; excluded from the approved source-only Step 1 |
+| `.github/workflows/test.yml`                                   | Gate 4 actual-workflow integration; excluded from the approved source-only Step 1 |
+| `crates/trusted-server-release/src/workflow_contract.rs`       | Gate 4 actual-workflow integration; excluded from the approved source-only Step 1 |
+| `crates/trusted-server-release/src/workflow_contract/tests.rs` | Gate 4 actual-workflow integration; excluded from the approved source-only Step 1 |
+| `scripts/release/qualification/approvals.json`                 | Gate 4 actual-workflow integration; excluded from the approved source-only Step 1 |
+| `scripts/release/qualification/hosted-workflow.proposal.yml`   | Gate 4 actual-workflow integration; excluded from the approved source-only Step 1 |
+| `scripts/release/tests/candidate-changes.sh`                   | Gate 4 actual-workflow integration; excluded from the approved source-only Step 1 |
+| `scripts/release/tests/candidate-changes.test.mjs`             | Gate 4 actual-workflow integration; excluded from the approved source-only Step 1 |
+
+Also defer the `check-workflow-contract` command in `src/main.rs` and these hunks of `tests/commands.rs`: `workflow_contract_command_checks_reviewed_files_without_release_authority`, `workflow_contract_command_requires_an_explicit_readable_workflow`, `workflow_contract_command_rejects_changed_workflow_or_runtime_helper`. The shared files themselves keep their Phase 2 work and only receive the separately required Step 1 support hunks.
+
+Frozen-source search confirms the ported SPDX, collection, distribution and candidate test modules do not import or compile against `workflow_contract`. If a later integration reveals such a dependency, stop and report it instead of stubbing it. All `Qualified*` types and production generation remain closed.

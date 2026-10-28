@@ -692,7 +692,7 @@
     "3": {
       "branch": "feature/binary-attestations-phase3",
       "base": "feature/binary-attestations-phase2",
-      "pull_request": null
+      "pull_request": 1463
     },
     "4": {
       "branch": "feature/binary-attestations-phase4",
@@ -1138,36 +1138,68 @@
   },
   "landing_status": {
     "Cargo.lock": {
-      "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
-      "state": "Staged Phase 2 dependency/support subset"
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf",
+      "state": "Phase 3 Step 1 shared support or restored assertions",
+      "pull_request": 1463,
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "35f42034e47cb6dbdd689076c10ce46dc369c324ed80887f651484a63782ad03",
+      "destination_sha256": "a17f7689a2395e73318d8f24c451d956cd814fdfb6e4b567b599bec06be7532e",
+      "source_equal": false,
+      "reason": "Add only graph entries needed by reqwest hickory-dns and restored release-crate dependencies; preserve every existing package identity/version."
     },
     "Cargo.toml": {
       "commit": "1534d462d052debae8b5d886268701077bf879a5",
       "state": "Staged Phase 2 dependency/support subset"
     },
     "crates/trusted-server-release/Cargo.toml": {
-      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
-      "state": "Staged Phase 2 dependency/support subset"
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf",
+      "state": "Phase 3 Step 1 shared support or restored assertions",
+      "pull_request": 1463,
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "a91db83f6e90626ccce1f8d5998ec409f51f0e188a289a2168b468ab8ce3072b",
+      "destination_sha256": "26c41f80b285c1bcfc90182dff1722a806cdee8ff5607c27205ce16167e11684",
+      "source_equal": false,
+      "reason": "Restore only reqwest hickory-dns, tokio, rcgen and rustls via current workspace pins; preserve Rust version 1.98; defer serde_yaml_ng."
     },
     "crates/trusted-server-release/src/documents.rs": {
       "commit": "1534d462d052debae8b5d886268701077bf879a5",
       "state": "Ported Phase 2 source or approved split"
     },
     "crates/trusted-server-release/src/documents/tests.rs": {
-      "commit": "1534d462d052debae8b5d886268701077bf879a5",
-      "state": "Ported Phase 2 source or approved split"
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1",
+      "state": "Phase 3 Step 1 shared support or restored assertions",
+      "pull_request": 1463,
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "e6070f1f8ff815c9f11b65dc6adab62bf9f6e458a5c7823a00706197bdeca851",
+      "destination_sha256": "02b003fbd1c78d6dce6c6bb1c28f45b7034df50bb0439628bdb25fe8080bdc14",
+      "source_equal": false,
+      "reason": "Add pure SHA-256 regression guards for frozen v1 policy/schema before source import, then exact v1 CLI and candidate index fixtures after import. No contract edits."
     },
     "crates/trusted-server-release/src/error.rs": {
-      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
-      "state": "Staged Phase 2 dependency/support subset"
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf",
+      "state": "Phase 3 Step 1 shared support or restored assertions",
+      "pull_request": 1463,
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "92490415449d2baa1425b59b1d715ea0a15c9e8b65327329b647fe62e3a32912",
+      "destination_sha256": "4d7ecf02012ba028f316e380c8cd72ff6ec6d7b03d9118809d5a0f889f37e73c",
+      "source_equal": false,
+      "reason": "Restore exact frozen Collection, Spdx and Distribution error variants and displays; defer Publication."
     },
     "crates/trusted-server-release/src/git_objects.rs": {
       "commit": "1534d462d052debae8b5d886268701077bf879a5",
       "state": "Ported Phase 2 source or approved split"
     },
     "crates/trusted-server-release/src/main.rs": {
-      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
-      "state": "Staged Phase 2 dependency/support subset"
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf",
+      "state": "Phase 3 Step 1 shared support or restored assertions",
+      "deferred_command": "check-workflow-contract",
+      "deferred_to_gate": 4,
+      "pull_request": 1463,
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "6589a60114c2de9beb9f0033684ec6581845d713babc58e8d4c6d2dd3b16bd72",
+      "destination_sha256": "d5c59ff9c2564e8e570bc80f94ff438accb90306abd2ea3469acef883df6159a",
+      "source_equal": false,
+      "reason": "Register collection, distribution and spdx with dead-code allowance while no production callers exist; preserve ordinary commands and all existing modules; defer workflow_contract and publication."
     },
     "crates/trusted-server-release/src/policy.rs": {
       "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
@@ -1255,7 +1287,9 @@
     },
     "crates/trusted-server-release/tests/commands.rs": {
       "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
-      "state": "Ported Phase 2 source or approved split"
+      "state": "Ported Phase 2 source or approved split",
+      "deferred_test_pattern": "workflow_contract_command_*",
+      "deferred_to_gate": 4
     },
     "crates/trusted-server-release/tests/fixtures/sha-mbles-1.bin": {
       "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
@@ -1794,8 +1828,14 @@
       "state": "Ported Phase 2 source or approved split"
     },
     "crates/trusted-server-release/src/recipe.rs": {
-      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
-      "state": "Ported Phase 2 source or approved split"
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf",
+      "state": "Phase 3 Step 1 shared support or restored assertions",
+      "pull_request": 1463,
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "f79891e9bc590d9e748c7f78c01c06198917c479d8b4118ea12bd0183519c245",
+      "destination_sha256": "1490effab9f0715e632b8509858077182c9508a8955ce7d532c6ebf1d255343f",
+      "source_equal": false,
+      "reason": "Restore only frozen evidence-consumed reexports; retain approved ordinary remapping reexports."
     },
     "crates/trusted-server-release/src/recipe/ambient.rs": {
       "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
@@ -1938,8 +1978,14 @@
       "state": "Ported Phase 2 source or approved split"
     },
     "crates/trusted-server-release/src/recipe/startup.rs": {
-      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
-      "state": "Ported Phase 2 source or approved split"
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf",
+      "state": "Phase 3 Step 1 shared support or restored assertions",
+      "pull_request": 1463,
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "e974798c80f8e53d465fda97d9340bed01f2172218c441ee901eee7fed931ac6",
+      "destination_sha256": "589c54af1c42546fa38f8416f419d4b9fcdb440c32d1627105447843762f9c68",
+      "source_equal": false,
+      "reason": "Remove test-only gate on accepted NativeStartupAccepted reexport for restored collection/distribution imports; preserve current startup implementation."
     },
     "crates/trusted-server-release/src/recipe/startup/accepted.rs": {
       "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
@@ -1958,8 +2004,14 @@
       "state": "Ported Phase 2 source or approved split"
     },
     "crates/trusted-server-release/src/recipe/tests.rs": {
-      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
-      "state": "Ported Phase 2 source or approved split"
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf",
+      "state": "Phase 3 Step 1 shared support or restored assertions",
+      "pull_request": 1463,
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "ecdb5e4fb040c71c189881e4bc7a60550d8463e6bd51d6caea6752f3ffd9a443",
+      "destination_sha256": "0a010946a7098bfa955133b63c337ff867fe5a1002d3ddcff76e5d101b0b85f3",
+      "source_equal": false,
+      "reason": "Register frozen tests; retain current ordinary-only Axum exclusion from controlled table."
     },
     "crates/trusted-server-release/src/recipe/tests/ambient.rs": {
       "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
@@ -1970,12 +2022,24 @@
       "state": "Ported Phase 2 source or approved split"
     },
     "crates/trusted-server-release/src/recipe/tests/candidate.rs": {
-      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
-      "state": "Ported Phase 2 source or approved split"
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf",
+      "state": "Phase 3 Step 1 shared support or restored assertions",
+      "pull_request": 1463,
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "6fda5e6361b841834fc14b22f6fc8c9fdee1fade5a76296570a806ecc85e6754",
+      "destination_sha256": "4f3beeb6bf3920631c94f2488ab76c4332bdb98e0ac443a351f825cb939cd4ef",
+      "source_equal": false,
+      "reason": "Restore frozen export helpers while retaining approved moved js_inventory_sha256 helper."
     },
     "crates/trusted-server-release/src/recipe/tests/cli.rs": {
-      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
-      "state": "Ported Phase 2 source or approved split"
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf",
+      "state": "Phase 3 Step 1 shared support or restored assertions",
+      "pull_request": 1463,
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "ba7bf52e7f25bb83ae6bf5a7fe087866d80b11acc6e06c28cc575502d2a12a6b",
+      "destination_sha256": "9048279a8d50e9a220868edcddc6ecce89edbd2a218d838ea247e9bb85d75a84",
+      "source_equal": false,
+      "reason": "Restore frozen assertions and imports; preserve Phase 2 shared JS inventory helper location. Retain existing named ignores and annotate reviewed esbuild hook 0.27.3 versus current JS lock 0.28.2; no hook policy adaptation."
     },
     "crates/trusted-server-release/src/recipe/tests/cli_candidate.rs": {
       "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
@@ -1986,8 +2050,14 @@
       "state": "Ported Phase 2 source or approved split"
     },
     "crates/trusted-server-release/src/recipe/tests/complete.rs": {
-      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
-      "state": "Ported Phase 2 source or approved split"
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf",
+      "state": "Phase 3 Step 1 shared support or restored assertions",
+      "pull_request": 1463,
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "fc6c6412456fe628a388f1ae21815165e67d9097c199a1ba006fe14793b3eb4b",
+      "destination_sha256": "fc6c6412456fe628a388f1ae21815165e67d9097c199a1ba006fe14793b3eb4b",
+      "source_equal": true,
+      "reason": "Restore frozen assertions and imports; preserve Phase 2 shared JS inventory helper location."
     },
     "crates/trusted-server-release/src/recipe/tests/complete_darwin.rs": {
       "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
@@ -2006,8 +2076,14 @@
       "state": "Ported Phase 2 source or approved split"
     },
     "crates/trusted-server-release/src/recipe/tests/full.rs": {
-      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
-      "state": "Ported Phase 2 source or approved split"
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf",
+      "state": "Phase 3 Step 1 shared support or restored assertions",
+      "pull_request": 1463,
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "a3e1e31b0f85d05a14f680d4d2b8c962fe2339a86e6be3c4003e5babf56d12fe",
+      "destination_sha256": "3e8d7b868a006fa436a18f690231b6f5fd869d1f1bbb09805a32884e0e59dbf4",
+      "source_equal": false,
+      "reason": "Restore frozen assertions and imports; preserve Phase 2 shared JS inventory helper location. Retain existing named ignores and annotate reviewed esbuild hook 0.27.3 versus current JS lock 0.28.2; no hook policy adaptation."
     },
     "crates/trusted-server-release/src/recipe/tests/full_macos.rs": {
       "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
@@ -2018,8 +2094,14 @@
       "state": "Ported Phase 2 source or approved split"
     },
     "crates/trusted-server-release/src/recipe/tests/macos_cli.rs": {
-      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
-      "state": "Ported Phase 2 source or approved split"
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf",
+      "state": "Phase 3 Step 1 shared support or restored assertions",
+      "pull_request": 1463,
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "e78f4692b18613f98f6971673bd4f0c66a4036151dac86a32936e6d7334f499c",
+      "destination_sha256": "df212449611d0b5c540fa935df9dec05acc96ee6b99aea0f5b62197f20854fdb",
+      "source_equal": false,
+      "reason": "Restore frozen assertions and imports; preserve Phase 2 shared JS inventory helper location. Retain existing named ignores and annotate reviewed esbuild hook 0.27.3 versus current JS lock 0.28.2; no hook policy adaptation."
     },
     "crates/trusted-server-release/src/recipe/tests/native.rs": {
       "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
@@ -2118,8 +2200,14 @@
       "state": "Ported Phase 2 source or approved split"
     },
     "crates/trusted-server-release/src/composition/native/tests.rs": {
-      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
-      "state": "Ported Phase 2 source or approved split"
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf",
+      "state": "Phase 3 Step 1 shared support or restored assertions",
+      "pull_request": 1463,
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "ae2f6fc5b815918605ab1a3e1daf12a7690ee3c015e3d0fa9b8076508ee489f5",
+      "destination_sha256": "ae2f6fc5b815918605ab1a3e1daf12a7690ee3c015e3d0fa9b8076508ee489f5",
+      "source_equal": true,
+      "reason": "Restore frozen SPDX/collection assertions removed for Phase 2."
     },
     "crates/trusted-server-release/src/composition/origin.rs": {
       "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
@@ -2220,6 +2308,732 @@
     "scripts/release/tests/fixtures/README.md": {
       "commit": "c0f53a5b1ee0928bf03d5e9123c35efdc8c943f6",
       "state": "Ported Phase 2 source or approved split"
+    },
+    ".github/actions/setup-integration-test-env/action.yml": {
+      "state": "Deferred from Phase 3 Step 1 to Gate 4",
+      "deferred_to_gate": 4,
+      "reason": "Deferred to Gate 4: guards release workflows replaced only by the later approved integration; validate actual release workflow files, with no frozen fixture substitute."
+    },
+    ".github/workflows/release-validation.mjs": {
+      "state": "Deferred from Phase 3 Step 1 to Gate 4",
+      "deferred_to_gate": 4,
+      "reason": "Deferred to Gate 4: guards release workflows replaced only by the later approved integration; validate actual release workflow files, with no frozen fixture substitute."
+    },
+    ".github/workflows/release-validation.test.mjs": {
+      "state": "Deferred from Phase 3 Step 1 to Gate 4",
+      "deferred_to_gate": 4,
+      "reason": "Deferred to Gate 4: guards release workflows replaced only by the later approved integration; validate actual release workflow files, with no frozen fixture substitute."
+    },
+    ".github/workflows/release-validation.yml": {
+      "state": "Deferred from Phase 3 Step 1 to Gate 4",
+      "deferred_to_gate": 4,
+      "reason": "Deferred to Gate 4: guards release workflows replaced only by the later approved integration; validate actual release workflow files, with no frozen fixture substitute."
+    },
+    ".github/workflows/test.yml": {
+      "state": "Deferred from Phase 3 Step 1 to Gate 4",
+      "deferred_to_gate": 4,
+      "reason": "Deferred to Gate 4: guards release workflows replaced only by the later approved integration; validate actual release workflow files, with no frozen fixture substitute."
+    },
+    "crates/trusted-server-release/src/workflow_contract.rs": {
+      "state": "Deferred from Phase 3 Step 1 to Gate 4",
+      "deferred_to_gate": 4,
+      "reason": "Deferred to Gate 4: guards release workflows replaced only by the later approved integration; validate actual release workflow files, with no frozen fixture substitute."
+    },
+    "crates/trusted-server-release/src/workflow_contract/tests.rs": {
+      "state": "Deferred from Phase 3 Step 1 to Gate 4",
+      "deferred_to_gate": 4,
+      "reason": "Deferred to Gate 4: guards release workflows replaced only by the later approved integration; validate actual release workflow files, with no frozen fixture substitute."
+    },
+    "scripts/release/qualification/approvals.json": {
+      "state": "Deferred from Phase 3 Step 1 to Gate 4",
+      "deferred_to_gate": 4,
+      "reason": "Deferred to Gate 4: guards release workflows replaced only by the later approved integration; validate actual release workflow files, with no frozen fixture substitute."
+    },
+    "scripts/release/qualification/hosted-workflow.proposal.yml": {
+      "state": "Deferred from Phase 3 Step 1 to Gate 4",
+      "deferred_to_gate": 4,
+      "reason": "Deferred to Gate 4: guards release workflows replaced only by the later approved integration; validate actual release workflow files, with no frozen fixture substitute."
+    },
+    "scripts/release/tests/candidate-changes.sh": {
+      "state": "Deferred from Phase 3 Step 1 to Gate 4",
+      "deferred_to_gate": 4,
+      "reason": "Deferred to Gate 4: guards release workflows replaced only by the later approved integration; validate actual release workflow files, with no frozen fixture substitute."
+    },
+    "scripts/release/tests/candidate-changes.test.mjs": {
+      "state": "Deferred from Phase 3 Step 1 to Gate 4",
+      "deferred_to_gate": 4,
+      "reason": "Deferred to Gate 4: guards release workflows replaced only by the later approved integration; validate actual release workflow files, with no frozen fixture substitute."
+    },
+    "crates/trusted-server-release/src/recipe/tests/candidate_entry.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "a22b2dd22cc8c031754675379fd2af70a0a205d77e9f683852001d811e0641f4",
+      "destination_sha256": "43d30080922aa61b297ab8cf882b2ca9c66413ad2bd5fd79bc6bcf76fa025893",
+      "source_equal": false,
+      "reason": "Retain Phase 2 shared js_inventory_sha256 in candidate.rs; remove duplicate and import shared helper.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/recipe/tests/candidate_index.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "cf22748697b017cd48e7f10f0c351ce144a2c3aed72a6060e6b6baf20c155019",
+      "destination_sha256": "cf22748697b017cd48e7f10f0c351ce144a2c3aed72a6060e6b6baf20c155019",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/recipe/tests/spdx_candidate.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "1b39552d8da757b6d5a477ae1b33740412fcb963b5bba613a5465993bccb9139",
+      "destination_sha256": "1b39552d8da757b6d5a477ae1b33740412fcb963b5bba613a5465993bccb9139",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/spdx.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "a0d4be45fff2491813f8d4d2e26ecd9157843777702ebec03aa01da853a94859",
+      "destination_sha256": "a0d4be45fff2491813f8d4d2e26ecd9157843777702ebec03aa01da853a94859",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/spdx/candidate.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "354a04e725065d93f0f8518bfbc112a1cdb65700e09fb4a5d49aa16d05c9dda9",
+      "destination_sha256": "354a04e725065d93f0f8518bfbc112a1cdb65700e09fb4a5d49aa16d05c9dda9",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/spdx/candidate/tests.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "5f89d63749555a6921d4353c8671a1d2aea1e982cc3ed6eba61fe6fa0ad37680",
+      "destination_sha256": "5f89d63749555a6921d4353c8671a1d2aea1e982cc3ed6eba61fe6fa0ad37680",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/spdx/cargo.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "8f171102e033efc52d21dcbfa625f3d7d6855c1f29be0df55f8773858aafeaa8",
+      "destination_sha256": "8f171102e033efc52d21dcbfa625f3d7d6855c1f29be0df55f8773858aafeaa8",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/spdx/cargo/tests.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "f9c7a12fe8c77e0963dae2614658d2189155201578afc594bf7eb9b94df7008e",
+      "destination_sha256": "f9c7a12fe8c77e0963dae2614658d2189155201578afc594bf7eb9b94df7008e",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/spdx/javascript.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "a6e2346c43ebda2676a9941e7fe6591bec25be246c58ceecd4ba968ecb87907e",
+      "destination_sha256": "a6e2346c43ebda2676a9941e7fe6591bec25be246c58ceecd4ba968ecb87907e",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/spdx/javascript/tests.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "ef84ac81eb3092a2edcd56a180b138df0e89fb458ca7182ec3023211ae03812a",
+      "destination_sha256": "ef84ac81eb3092a2edcd56a180b138df0e89fb458ca7182ec3023211ae03812a",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/spdx/native.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "9e6bc4f8014818185e9a2a662455c428672f74c79f950317d7f2a47ebfc0ec24",
+      "destination_sha256": "9e6bc4f8014818185e9a2a662455c428672f74c79f950317d7f2a47ebfc0ec24",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/spdx/native/tests.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "1e5f928fa79303906201518eb8b7b8ceb7792aa024577b385748061d0d837426",
+      "destination_sha256": "1e5f928fa79303906201518eb8b7b8ceb7792aa024577b385748061d0d837426",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/spdx/platform.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "2a07658e558983cfeee3392c157eaab59db155b2191e457e731afe819f5e0e7b",
+      "destination_sha256": "2a07658e558983cfeee3392c157eaab59db155b2191e457e731afe819f5e0e7b",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/spdx/platform/tests.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "cc63c4467533658a7a2e257d05d9c382469bbea974f99549b6869797267437ef",
+      "destination_sha256": "cc63c4467533658a7a2e257d05d9c382469bbea974f99549b6869797267437ef",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/spdx/tests.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "4c545a42d00853862c988a41fd6f42255898afb4015260fef8293ebd616d27ab",
+      "destination_sha256": "4c545a42d00853862c988a41fd6f42255898afb4015260fef8293ebd616d27ab",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/collection.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "87bc240c1a5241e7ffc541081ef4ef67b244f6cad0ac4debfc73064655ad3431",
+      "destination_sha256": "87bc240c1a5241e7ffc541081ef4ef67b244f6cad0ac4debfc73064655ad3431",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/collection/archive.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "37767ff99de206171db88b961fd3441f2b1d376fe3623d1494b84651d6479482",
+      "destination_sha256": "37767ff99de206171db88b961fd3441f2b1d376fe3623d1494b84651d6479482",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/collection/producer.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "2c9827af017301052e072600ecc6c096ce39067de05fef9bbdded38abc2a4f8a",
+      "destination_sha256": "2c9827af017301052e072600ecc6c096ce39067de05fef9bbdded38abc2a4f8a",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/collection/producer/strict_record.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "533e1ccbedb002213c5f8478ee3070b8aac59e6299e2466bf50f7a053a394bee",
+      "destination_sha256": "533e1ccbedb002213c5f8478ee3070b8aac59e6299e2466bf50f7a053a394bee",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/collection/producer/strict_record/tests.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "31154adb6665371574cb41cb885965fe3c38e3234e17d6d65b6653b3b98d0988",
+      "destination_sha256": "31154adb6665371574cb41cb885965fe3c38e3234e17d6d65b6653b3b98d0988",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/collection/records.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "7244efb318e8f612441994666fa6b94976ffebaa3dda2c05da38766acf1929a4",
+      "destination_sha256": "7244efb318e8f612441994666fa6b94976ffebaa3dda2c05da38766acf1929a4",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/collection/records/receipt.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "c455b60e08372d0459f28a6d0d851a80af8eac86edbaaff291bb086c8dccd2da",
+      "destination_sha256": "c455b60e08372d0459f28a6d0d851a80af8eac86edbaaff291bb086c8dccd2da",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/collection/tests.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "3d654ba42d1c3b8f149a279fd9ce28181d9d4cc83eed2b9aa50592dcf5cc54c7",
+      "destination_sha256": "3d654ba42d1c3b8f149a279fd9ce28181d9d4cc83eed2b9aa50592dcf5cc54c7",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/collection/transfer.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "b7c33bdf6dfbdd845582e92e5366f3e4dbedb969d86efa8525c8d2a9bb7f5001",
+      "destination_sha256": "b7c33bdf6dfbdd845582e92e5366f3e4dbedb969d86efa8525c8d2a9bb7f5001",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/collection/transfer/ordinary.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "f0de7b092d652b16c2f1e2f93ccc02ae35cc705720183cfbf3363f2169ed4bf0",
+      "destination_sha256": "f0de7b092d652b16c2f1e2f93ccc02ae35cc705720183cfbf3363f2169ed4bf0",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/collection/transfer/tests.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "4a6734fb4cd0cad27a82fea2fd9189d501dfc174410ba7eacc3ffe308e9a25c5",
+      "destination_sha256": "4a6734fb4cd0cad27a82fea2fd9189d501dfc174410ba7eacc3ffe308e9a25c5",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/collection/workflow_jobs.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "d8bbd89c7bb21ad16d0be431eac9a806d57f9f35ffdcda829ee511b82a9b4f5f",
+      "destination_sha256": "d8bbd89c7bb21ad16d0be431eac9a806d57f9f35ffdcda829ee511b82a9b4f5f",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/collection/workflow_jobs/tests.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "56abce6fa72e75e65f45b90d1151602c22f52c5bb1ab2b2151201208c7448b47",
+      "destination_sha256": "56abce6fa72e75e65f45b90d1151602c22f52c5bb1ab2b2151201208c7448b47",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/collection/workflow_jobs/tests/support.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "112ed0cfcb662f10838a6382f0e1ccf85de3c17c7f669876fa1f756edc50b8e5",
+      "destination_sha256": "112ed0cfcb662f10838a6382f0e1ccf85de3c17c7f669876fa1f756edc50b8e5",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/collection/workflow_jobs/tests/transfer.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "30bc20f9c630bbd03c5e7330340eeb01db5c36925a1e6a8d8839bf8532f35049",
+      "destination_sha256": "30bc20f9c630bbd03c5e7330340eeb01db5c36925a1e6a8d8839bf8532f35049",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/distribution.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "40173f501546a147f1c5d74b987dd694335b170b838ba9d1cf97c357067a77f7",
+      "destination_sha256": "40173f501546a147f1c5d74b987dd694335b170b838ba9d1cf97c357067a77f7",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/distribution/entry.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "45b987fb6f96a4eca909fff8a2c84a695f4bee24f044cac586e1497fb2ebef79",
+      "destination_sha256": "45b987fb6f96a4eca909fff8a2c84a695f4bee24f044cac586e1497fb2ebef79",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/distribution/joins.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "c7fba6075a3796b2aa5658e49d12bafd70c50f269bb56c219704e5fbf67111b6",
+      "destination_sha256": "c7fba6075a3796b2aa5658e49d12bafd70c50f269bb56c219704e5fbf67111b6",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/distribution/ordinary.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "6e3b3b92cc5097ba0ed2ee84035326101029da99b2ba846d782e167a4f139d6c",
+      "destination_sha256": "6e3b3b92cc5097ba0ed2ee84035326101029da99b2ba846d782e167a4f139d6c",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/distribution/summary.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "7a75133a6aeea70927a7b44e060c2214b43dcadca3ce113ab5f67eab92e67a2f",
+      "destination_sha256": "7a75133a6aeea70927a7b44e060c2214b43dcadca3ce113ab5f67eab92e67a2f",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/distribution/tests.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "363d65136821ba0888dd4a4a75dc10d744263eceb82d39de8452c655d65c0e98",
+      "destination_sha256": "363d65136821ba0888dd4a4a75dc10d744263eceb82d39de8452c655d65c0e98",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/distribution/tests/golden.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "942bfdf99bd054fb953aa5e597fa915941ee42bc7b33e85f96648df1d0101ad2",
+      "destination_sha256": "942bfdf99bd054fb953aa5e597fa915941ee42bc7b33e85f96648df1d0101ad2",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/distribution/tests/summary.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "9f94c44bf9a0c4f29de636270cd49832a46da9515a98bcf79c9f2c6641fabf77",
+      "destination_sha256": "9f94c44bf9a0c4f29de636270cd49832a46da9515a98bcf79c9f2c6641fabf77",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/distribution/tests/transfer.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "60e8ac6931da10e5659c89db4e38674226a963cb876da4064072cdbb533f8ec8",
+      "destination_sha256": "60e8ac6931da10e5659c89db4e38674226a963cb876da4064072cdbb533f8ec8",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/src/distribution/transfer.rs": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "cd1a0074230da10f987bbe86f1be7d6bd3df9ac85f2fd084af59a145ff430539",
+      "destination_sha256": "cd1a0074230da10f987bbe86f1be7d6bd3df9ac85f2fd084af59a145ff430539",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "4682306b1c7c68171da32b05e668e34df8cc69bf"
+    },
+    "crates/trusted-server-release/tests/fixtures/collection/README.md": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "d817494ec395b76c46fd894d4283e56add57b3dd944d13d7f7013ed6708c96be",
+      "destination_sha256": "d817494ec395b76c46fd894d4283e56add57b3dd944d13d7f7013ed6708c96be",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
+    },
+    "crates/trusted-server-release/tests/fixtures/collection/build-record.json": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "7b6076eec22b47d1a455395caec9ac3411a7ff7c3174026a6f85c24a99a21d21",
+      "destination_sha256": "7b6076eec22b47d1a455395caec9ac3411a7ff7c3174026a6f85c24a99a21d21",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
+    },
+    "crates/trusted-server-release/tests/fixtures/collection/composition.json": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "7966b1d8fe20efa0d0201ea27097286d68ee2c17534fa3230c8444ed7db1733d",
+      "destination_sha256": "7966b1d8fe20efa0d0201ea27097286d68ee2c17534fa3230c8444ed7db1733d",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
+    },
+    "crates/trusted-server-release/tests/fixtures/index/candidate/candidate-release-index.json": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "2e35dd6998ec958eae1f23454c50a5b6306be29d2f5eabdb60fd7360f0ca4203",
+      "destination_sha256": "2e35dd6998ec958eae1f23454c50a5b6306be29d2f5eabdb60fd7360f0ca4203",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
+    },
+    "crates/trusted-server-release/tests/fixtures/index/candidate/trusted-server-fastly.wasm.build-evidence.json": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "d507ab4f6377db0ffc5f35c0471322aeaf5b0fd454dcd6e223d5801d68017230",
+      "destination_sha256": "d507ab4f6377db0ffc5f35c0471322aeaf5b0fd454dcd6e223d5801d68017230",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
+    },
+    "crates/trusted-server-release/tests/fixtures/index/candidate/trusted-server-fastly.wasm.build-recipe.json": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "5dd2af6404b6554d20cdb67be8228f88f0726447612f29476972f6f8f3ff98d1",
+      "destination_sha256": "5dd2af6404b6554d20cdb67be8228f88f0726447612f29476972f6f8f3ff98d1",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
+    },
+    "crates/trusted-server-release/tests/fixtures/index/candidate/trusted-server-fastly.wasm.rebuild-check.json": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "381505ae1be7d5c46e7019a6e514c2e1ef7844bc85faba3ddb0da67513190437",
+      "destination_sha256": "381505ae1be7d5c46e7019a6e514c2e1ef7844bc85faba3ddb0da67513190437",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
+    },
+    "crates/trusted-server-release/tests/fixtures/index/candidate/trusted-server-fastly.wasm.spdx.json": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "ac94b402aa1d0fb889bc9cb063e81ff41573c16d52fd93a02290bec75b3f7dcb",
+      "destination_sha256": "ac94b402aa1d0fb889bc9cb063e81ff41573c16d52fd93a02290bec75b3f7dcb",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
+    },
+    "crates/trusted-server-release/tests/fixtures/index/candidate/ts-aarch64-apple-darwin.build-evidence.json": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "4398ff1d660f8f25741f0d26128312c856f8a80ed45fad92ce1961e3f89f6b66",
+      "destination_sha256": "4398ff1d660f8f25741f0d26128312c856f8a80ed45fad92ce1961e3f89f6b66",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
+    },
+    "crates/trusted-server-release/tests/fixtures/index/candidate/ts-aarch64-apple-darwin.build-recipe.json": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "c2ae63588adfd51957a42b943c668a8b0c9119f12b5cf13098c927662a82f95b",
+      "destination_sha256": "c2ae63588adfd51957a42b943c668a8b0c9119f12b5cf13098c927662a82f95b",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
+    },
+    "crates/trusted-server-release/tests/fixtures/index/candidate/ts-aarch64-apple-darwin.rebuild-check.json": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "e20a78e71af499d34b2d1aeb16b1429cfe7281a8eec715e571ebc7a840fa000f",
+      "destination_sha256": "e20a78e71af499d34b2d1aeb16b1429cfe7281a8eec715e571ebc7a840fa000f",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
+    },
+    "crates/trusted-server-release/tests/fixtures/index/candidate/ts-aarch64-apple-darwin.spdx.json": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "fe487f344797a42c97bdfe44248af98fc8d3e05aff8453c7e2f57f5bd5b88992",
+      "destination_sha256": "fe487f344797a42c97bdfe44248af98fc8d3e05aff8453c7e2f57f5bd5b88992",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
+    },
+    "crates/trusted-server-release/tests/fixtures/index/candidate/ts-x86_64-apple-darwin.build-evidence.json": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "248b207f66e9b325327779d493b353d9ccf88942d5739eaa89a42962d17c5fb1",
+      "destination_sha256": "248b207f66e9b325327779d493b353d9ccf88942d5739eaa89a42962d17c5fb1",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
+    },
+    "crates/trusted-server-release/tests/fixtures/index/candidate/ts-x86_64-apple-darwin.build-recipe.json": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "0b01813499eceb2aafc9e35311f6b14dce56c6b499fd0f5b97333c5267d2b114",
+      "destination_sha256": "0b01813499eceb2aafc9e35311f6b14dce56c6b499fd0f5b97333c5267d2b114",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
+    },
+    "crates/trusted-server-release/tests/fixtures/index/candidate/ts-x86_64-apple-darwin.rebuild-check.json": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "26737bde3396202434cd28fb6d9f3e7b085e4a82e7762e3f0177cb09d6966e21",
+      "destination_sha256": "26737bde3396202434cd28fb6d9f3e7b085e4a82e7762e3f0177cb09d6966e21",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
+    },
+    "crates/trusted-server-release/tests/fixtures/index/candidate/ts-x86_64-apple-darwin.spdx.json": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "dbaef04e50548077cced269f7d4baade02717ce3d9b054bbbd335d9bdea1020a",
+      "destination_sha256": "dbaef04e50548077cced269f7d4baade02717ce3d9b054bbbd335d9bdea1020a",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
+    },
+    "crates/trusted-server-release/tests/fixtures/index/candidate/ts-x86_64-unknown-linux-gnu.build-evidence.json": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "5a8f3a8ae4277cc3bcd03a7b58c600469b22205a957718b6570d5ddc1644ee63",
+      "destination_sha256": "5a8f3a8ae4277cc3bcd03a7b58c600469b22205a957718b6570d5ddc1644ee63",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
+    },
+    "crates/trusted-server-release/tests/fixtures/index/candidate/ts-x86_64-unknown-linux-gnu.build-recipe.json": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "de836324f0ca933580b1eb336f177fc21e1cc43140004ff5ecba735371cd3ee1",
+      "destination_sha256": "de836324f0ca933580b1eb336f177fc21e1cc43140004ff5ecba735371cd3ee1",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
+    },
+    "crates/trusted-server-release/tests/fixtures/index/candidate/ts-x86_64-unknown-linux-gnu.rebuild-check.json": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "c1f61f93204390231ef694c26eb0c6b3035475490ef4e4ae2850fa8d13714ce6",
+      "destination_sha256": "c1f61f93204390231ef694c26eb0c6b3035475490ef4e4ae2850fa8d13714ce6",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
+    },
+    "crates/trusted-server-release/tests/fixtures/index/candidate/ts-x86_64-unknown-linux-gnu.spdx.json": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "dd5cb2569a0ca2a1abbe110be9b966a282dff42dae9059cebcfa8b15268b274f",
+      "destination_sha256": "dd5cb2569a0ca2a1abbe110be9b966a282dff42dae9059cebcfa8b15268b274f",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
+    },
+    "crates/trusted-server-release/tests/fixtures/index/candidate/tsjs-inventory.json": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "64540e73dc3fb484a0fb0e5ee96b54e5ed12fcb34c7038107d7fbf75b59e9796",
+      "destination_sha256": "64540e73dc3fb484a0fb0e5ee96b54e5ed12fcb34c7038107d7fbf75b59e9796",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
+    },
+    "crates/trusted-server-cli/tests/fixtures/release/release-index.json": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "4ff7a4b64e2724172e19d8ef0b02f500f133719411a15b0ce74d8fce4c8b7034",
+      "destination_sha256": "4ff7a4b64e2724172e19d8ef0b02f500f133719411a15b0ce74d8fce4c8b7034",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
+    },
+    "crates/trusted-server-release/tests/fixtures/README.md": {
+      "pull_request": 1463,
+      "state": "Ported Phase 3 Step 1 source",
+      "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+      "source_sha256": "d1ff7de4b6deaef76a96852909733d92757e0c6653d30ed156c96e481978235c",
+      "destination_sha256": "d1ff7de4b6deaef76a96852909733d92757e0c6653d30ed156c96e481978235c",
+      "source_equal": true,
+      "reason": "Exact frozen full-file source import; no adaptation.",
+      "commit": "faf6e8efb3d71a1254e7f256ae60f4a82221c2e1"
     }
+  },
+  "phase3_step1": {
+    "source": "122b78664b1235c717e9208fd200f9a9b0c335df",
+    "approved_import_paths": 63,
+    "deferred_paths": [
+      ".github/actions/setup-integration-test-env/action.yml",
+      ".github/workflows/release-validation.mjs",
+      ".github/workflows/release-validation.test.mjs",
+      ".github/workflows/release-validation.yml",
+      ".github/workflows/test.yml",
+      "crates/trusted-server-release/src/workflow_contract.rs",
+      "crates/trusted-server-release/src/workflow_contract/tests.rs",
+      "scripts/release/qualification/approvals.json",
+      "scripts/release/qualification/hosted-workflow.proposal.yml",
+      "scripts/release/tests/candidate-changes.sh",
+      "scripts/release/tests/candidate-changes.test.mjs"
+    ],
+    "deferred_command": "check-workflow-contract",
+    "deferred_process_tests": [
+      "workflow_contract_command_checks_reviewed_files_without_release_authority",
+      "workflow_contract_command_requires_an_explicit_readable_workflow",
+      "workflow_contract_command_rejects_changed_workflow_or_runtime_helper"
+    ],
+    "reason": "Deferred to Gate 4: guards release workflows replaced only by the later approved integration; validate actual release workflow files, with no frozen fixture substitute.",
+    "port_ledger": "docs/superpowers/plans/binary-attestations-phase3-step1-port.md",
+    "support_paths": [
+      "crates/trusted-server-release/Cargo.toml",
+      "crates/trusted-server-release/src/main.rs",
+      "crates/trusted-server-release/src/error.rs",
+      "crates/trusted-server-release/src/recipe.rs",
+      "crates/trusted-server-release/src/recipe/startup.rs",
+      "crates/trusted-server-release/src/recipe/tests.rs",
+      "crates/trusted-server-release/src/recipe/tests/candidate.rs",
+      "crates/trusted-server-release/src/recipe/tests/complete.rs",
+      "crates/trusted-server-release/src/recipe/tests/full.rs",
+      "crates/trusted-server-release/src/recipe/tests/cli.rs",
+      "crates/trusted-server-release/src/recipe/tests/macos_cli.rs",
+      "crates/trusted-server-release/src/composition/native/tests.rs",
+      "Cargo.lock",
+      "crates/trusted-server-release/src/documents/tests.rs"
+    ]
   }
 }
