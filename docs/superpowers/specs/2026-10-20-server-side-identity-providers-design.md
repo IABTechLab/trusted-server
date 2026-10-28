@@ -311,8 +311,10 @@ these costs for it:
   removals still apply (sections 5.1, 5.3). A fallback writer built from
   `Accept: text/html` and `Upgrade-Insecure-Requests` was rejected because
   `fetch()` can send both.
-- **Rollback past rollout step 1 is unsupported.** Step 1 writes KV schema
-  version 2, which older builds reject (sections 6.1, 14).
+- **Rollback below rollout step 0 is unsupported.** Step 1 writes KV
+  schema version 2, which builds older than step 0 reject. Step 0 ships
+  first as the floor: it reads version 2 rows and never rewrites them
+  except to tombstone, so step 1 can roll back to it (sections 6.1, 14).
 - **Unowned IDs keep no lifetime.** Expiry is declared by the writing
   provider (`is_expiring`), and browser ingest, batch sync and a provider
   that gives no expiry carry no `exp`. So an unowned `liveramp.com`
@@ -4429,7 +4431,31 @@ crates/trusted-server-integration-tests/Cargo.toml --test parity`).
 
 ## 14. Rollout
 
-Two steps, each shippable on its own:
+Three steps, each shippable on its own and each able to roll back to the
+one before:
+
+0. **Reader first.** A release from `main`, before any of this spec, whose
+   only change is to the KV reader. It writes exactly what today's build
+   writes, schema version 1, and it ships so that step 1 has a floor to
+   roll back to, and so old and new instances can run side by side while
+   step 1 deploys. It:
+   - accepts a version 2 row (section 6.1) where today's
+     `KvEntry::validate` rejects it (`ec/kv_types.rs:376-381`). It reads the
+     row into today's in-memory shape: per source, the first UID of the
+     first entry, with `w`, `exp` and `at`, and nothing else.
+   - serves a version 2 record only when it is unexpired and its row holds
+     no provider opt-out (`ps.o` without a later `ps.oc`). It cannot tell
+     which sources an opt-out covers, so a row with one serves no stored
+     ID. Servability is otherwise today's.
+   - never rewrites a version 2 row with a positive change. Browser ingest,
+     `/auction` ingest and pull sync skip it and increment
+     `v2_row_write_skipped`, so a step 0 instance never downgrades a row
+     to version 1 and never drops `ps`, full entry sets or removal hashes.
+   - tombstones a version 2 row on a consent withdrawal as it does a
+     version 1 row. A tombstone holds no IDs, so its version does not
+     matter, and a withdrawal during a rollback is recorded.
+
+   Step 0 has no runtime switch and changes no response.
 
 1. **One write, no new vendors.** This step includes:
    - the outbound cookie strips (origin and Prebid Server) and the
@@ -4508,9 +4534,22 @@ providers, so:
   and `ps.st` do not: invalidated values can be re-seeded once, and
   stateful providers start over when rolled forward.
 
-**Rolling back past step 1 is unsupported.** Step 1 writes schema version 2,
-and today's reader rejects any version but 1 (`ec/kv_types.rs:376-381`), so
-an older build fails to read every row step 1 has written. Going back needs
+**Rolling back from step 1 to step 0.** Step 0 reads every row step 1
+wrote and serves its IDs under the rules above, so a rollback, or a rolling
+deploy with both builds live, loses no stored ID and no withdrawal. What it
+costs:
+
+- Rows step 1 wrote stop changing until step 1 returns: their ingest and
+  pull sync writes are skipped (`v2_row_write_skipped`), and provider
+  backoff in `ps` stops advancing because no provider runs.
+- A row with a provider opt-out serves no stored ID during the rollback,
+  which is stricter than step 1.
+- Rows step 0 writes are version 1, and step 1 reads and upgrades them on
+  its next write, as for any version 1 row.
+
+Rolling back below step 0 is unsupported: an older build rejects every
+version 2 row (`ec/kv_types.rs:376-381`), so old instances serve no stored
+ID and fail closed on withdrawals for those rows. Going back that far needs
 a KV migration to version 1, which this spec does not provide.
 
 ## 15. Open questions
@@ -4601,12 +4640,13 @@ review, which allowed breaking changes:
 | Opt-out clears       | A TCF re-grant clears only a denial `fp` recorded (new TCF bit 16), with no `LastUpdated` comparison. A clear stores a watermark, the `at` of the opt-out it read, as `ps.oc`, and clears apply before opt-outs. Changed after the round 14 review                  |
 | Backend budget       | `max_backend_requests` (default 32) bounds origin, auction and provider calls in one execution; a provider call past it is skipped, not a failure, and a hold call reserves the origin and the auction. Added after the round 14 review                             |
 | Per-IP ceiling       | `max_calls_per_ip_per_minute` (default 10) caps one provider's calls per client address across visitors, keyed on an HMAC of the IP, next to the per-visitor cap. Breaker failures are not required to come from distinct visitors. Added after the round 14 review |
+| Reader-first rollout | Rollout step 0, from `main`, reads version 2 rows, never rewrites them except to tombstone, and serves no stored ID from a row with a provider opt-out, so step 1 can roll back and deploy alongside old instances. Added after the round 14 review                 |
 | Capture              | Revoke-only: removals, opt-out and clear. Positive IDs are counted, never stored. `capture_enabled` and request-body consent are removed                                                                                                                            |
 | Capture-only opt-out | Also removes the records of its sources that no provider wrote, and blocks the browser's values for them. A capture-only provider cannot own a source and must list its `sources`                                                                                   |
 | Provider denials     | A provider's `ps.iv` and `ps.ov` filter browser candidates for unowned sources too. An opt-out's removals go to `ps.ov`, which its clear empties                                                                                                                    |
 | Mirror feedback      | The shim never copies `ts-eids-s` into `ts-eids` or the `/auction` body                                                                                                                                                                                             |
 | Dry run              | Removed, with `is_dry_run`                                                                                                                                                                                                                                          |
-| KV schema            | Version 2 with one record shape. Version 1 rows are read and upgraded on write. Rollback past rollout step 1 is unsupported                                                                                                                                         |
+| KV schema            | Version 2 with one record shape. Version 1 rows are read and upgraded on write. Rollout step 0 reads version 2 and never rewrites it, so step 1 can roll back to it                                                                                                 |
 | Stored hashes        | `ps.iv` hashes are unkeyed and the consent fingerprint is a plain bitmask, because the row already holds the raw values. No legacy revision hash                                                                                                                    |
 | Pull sync            | The pull-complete marker and the legacy pull sync config keys are removed                                                                                                                                                                                           |
 | Withdrawal retry     | A tombstone that fails before send gets one more attempt after send                                                                                                                                                                                                 |

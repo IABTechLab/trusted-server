@@ -12,10 +12,11 @@
 
 ## How this plan is split
 
-The spec's rollout (spec 14) has two steps, and each step can ship on its own. This plan has one **Part** per step, and each Part is one pull request. Each PR's branch is stacked on the previous one:
+The spec's rollout (spec 14) has three steps, and each step can ship on its own. This plan has one **Part** per step, and each Part is one pull request. Part 0 is based on `main`, because it must ship in a release before Part 1; Parts 1 and 2 are stacked:
 
 | Part | Spec step                | Branch                            | Base                                       | Tasks         |
 | ---- | ------------------------ | --------------------------------- | ------------------------------------------ | ------------- |
+| 0    | 0. Reader first          | `feat/1246-kv-v2-reader`          | `main`                                     | R1 to R3      |
 | 1    | 1. One write, no vendors | `feat/1246-identity-single-write` | `spec/1246-server-side-identity-providers` | 1 to 31       |
 | 2    | 2. Providers             | `feat/1246-identity-providers`    | `feat/1246-identity-single-write`          | 32 to 41, 39b |
 
@@ -23,7 +24,34 @@ A task with a letter suffix, such as Task 39b, was added by a later spec revisio
 
 Do not start Part 2 until Part 1's one-write invariant tests (Task 30) pass.
 
-**Rolling back past Part 1 is unsupported** (spec 14). Part 1 writes KV schema version 2, and today's reader rejects every version but 1, so a build without Part 1 cannot read a row Part 1 has written. Part 1's PR description and changelog say so.
+**Ship Part 0 in a release before deploying Part 1** (spec 14, added after the round 14 review). Part 1 writes KV schema version 2, and today's reader rejects every version but 1. Part 0 is the rollback floor: it reads version 2 rows and never rewrites them except to tombstone, so Part 1 can roll back to it and deploy alongside it. Rolling back below Part 0 is unsupported; Part 1's PR description and changelog say so.
+
+# Part 0: Reader first (spec 14, step 0)
+
+Based on `main`. Each task is test-first and ends green; the whole Part changes no response and writes only schema version 1.
+
+### Task R1: Read a version 2 row into today's shape
+
+**Files:** `crates/trusted-server-core/src/ec/kv_types.rs`, `crates/trusted-server-core/src/ec/kv.rs` (`get`, `load_snapshot`).
+
+- Add a deserialize-only `KvEntryV2Read` holding exactly the version 2 fields Part 0 reads (spec 6.1): the shared row fields, and per source the first UID of the first entry with `w`, `exp` and `at`, and `ps` reduced to whether any provider holds `o` without a later `oc`. Unknown fields are ignored.
+- `KvEntry::validate` keeps rejecting every version but 1 for writes. A new read path parses `v: 2` into `KvEntry` plus a `v2: Option<V2Facts>` marker (`has_open_opt_out`), so callers can tell a row came from version 2.
+- Tests: a version 2 fixture (copied from Part 1's `kv_types` tests, with `example.com` sources) loads as `EcKvSnapshot::Present`; a version 3 row still fails; a version 1 row is unchanged.
+
+### Task R2: Serve version 2 records conservatively
+
+**Files:** `crates/trusted-server-core/src/ec/eids.rs` (`resolve_partner_ids`), `crates/trusted-server-core/src/ec/identify.rs`.
+
+- A record from a version 2 row is served only when `exp` has not passed. A row with `has_open_opt_out` serves no stored ID, from either path.
+- Tests: an expired version 2 record is not served; a version 2 row with an open opt-out serves nothing; one with a cleared opt-out serves as usual.
+
+### Task R3: Never rewrite a version 2 row, except to tombstone
+
+**Files:** `crates/trusted-server-core/src/ec/kv.rs` (`sync_eid_cookie_updates_from_snapshot`, `upsert_partner_ids_from_snapshot`, `upsert_partner_id`, `upsert_partner_id_if_exists`, `create_or_revive`), `crates/trusted-server-core/src/ec/pull_sync.rs`.
+
+- Each positive write path returns early when the live row is version 2, logs at debug, and increments `v2_row_write_skipped`. `write_withdrawal_tombstone` and `tombstone_existing_from_snapshot` tombstone a version 2 row as they do a version 1 row.
+- Tests with the write-counting store: browser ingest, `/auction` ingest and pull sync write nothing to a version 2 row; a withdrawal tombstones it; a version 1 row is written as today.
+- Changelog: "Reads KV schema version 2 rows written by a later release, serving them read-only, so that release can roll back to this one."
 
 ## Global Constraints
 
