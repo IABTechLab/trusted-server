@@ -500,22 +500,29 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
 ///
 /// The settings are ones the runtime loader loaded, so they carry the
 /// permission policy their domain names, which every services graph holds.
+///
+/// # Panics
+///
+/// When the settings carry no permission policy, which only settings built
+/// outside the runtime loader can lack.
 pub(crate) fn build_finalize_services(
     settings: &Settings,
     kv_store: Arc<dyn PlatformKvStore>,
 ) -> RuntimeServices {
-    let mut builder = RuntimeServices::builder()
+    RuntimeServices::builder()
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
         .kv_store(kv_store)
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .geo(build_geo_module(settings, Arc::new(FastlyPlatformGeo)))
-        .client_info(ClientInfo::default());
-    if let Some(policy) = settings.permission_policy() {
-        builder = builder.permission_policy(Arc::clone(policy));
-    }
-    builder.build()
+        .client_info(ClientInfo::default())
+        .permission_policy(
+            settings
+                .required_permission_policy()
+                .expect("state is built only from loaded settings"),
+        )
+        .build()
 }
 
 fn publisher_fallback_methods() -> [Method; 7] {
