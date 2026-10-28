@@ -117,6 +117,51 @@ mod tests {
         );
     }
 
+    /// The committed development environment files.
+    const DEVELOPMENT_FILES: [(&str, &str); 2] = [
+        (".env.dev", include_str!("../../../../.env.dev")),
+        (".env.example", include_str!("../../../../.env.example")),
+    ];
+
+    /// Every store that an uncommented `*_STORE=<name>` line of a development
+    /// file names is declared in `fastly.toml` and in the Viceroy template, so
+    /// no name points at a store the local runtime does not have.
+    #[test]
+    fn every_store_a_development_file_names_is_declared() {
+        for (config_name, config) in [
+            ("fastly.toml", FASTLY_CONFIG),
+            ("Viceroy integration template", VICEROY_TEMPLATE),
+        ] {
+            let parsed: toml::Value =
+                toml::from_str(config).expect("should parse Fastly configuration");
+            let local_server = &parsed["local_server"];
+            let declares = |store: &str| {
+                ["kv_stores", "config_stores", "secret_stores"]
+                    .into_iter()
+                    .any(|kind| {
+                        local_server
+                            .get(kind)
+                            .and_then(|stores| stores.get(store))
+                            .is_some()
+                    })
+            };
+
+            for (file_name, contents) in DEVELOPMENT_FILES {
+                for (variable, store) in contents
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with('#'))
+                    .filter_map(|line| line.split_once('='))
+                    .filter(|(variable, _)| variable.trim().ends_with("_STORE"))
+                {
+                    assert!(
+                        declares(store.trim()),
+                        "{file_name} sets {variable} to `{store}`, which {config_name} does not declare"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn local_fastly_secret_store_is_exposed_under_its_logical_id() {
         for (name, config) in [
@@ -152,11 +197,7 @@ mod tests {
             .as_array()
             .expect("fastly.toml should define trusted_server_secrets");
 
-        for key in [
-            "publisher_proxy_secret",
-            "ec_passphrase",
-            "handler_password",
-        ] {
+        for key in ["publisher_proxy_secret", "ec_passphrase"] {
             assert!(
                 entries
                     .iter()

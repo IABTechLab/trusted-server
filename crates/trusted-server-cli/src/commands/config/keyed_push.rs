@@ -6,23 +6,30 @@
 //! validates the blob as `ts config validate` does, wraps it in `EdgeZero`'s
 //! envelope and splits a long one into `EdgeZero`'s chunk format, so the
 //! runtime reads it as it reads any pushed blob. `EdgeZero` keeps that format
-//! private to its crate, so the constants below copy it. The writer writes
-//! only the local server's store, in the `fastly.toml` the manifest names.
+//! private to its crate, so the constants below copy it. With `--local` the
+//! writer writes the local server's store, in the `fastly.toml` the manifest
+//! names. Otherwise it writes the live store that
+//! `EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` selects, through
+//! the `fastly` CLI, as `ts keys` writes signing keys.
 //!
 //! A host's blob names its permission policy file and pins the file's
 //! SHA-256, and carries no copy of the file. Each file `--permissions`
 //! supplies is kept once, in a shared entry under its digest, written before
-//! the blob, and an entry that already holds the file is not written again.
+//! the blob, and an entry that already holds the file is not written again. A
+//! live push that writes a policy entry waits
+//! [`POLICY_PROPAGATION_MARGIN_SECONDS`] before it writes the blob.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use edgezero_cli::args::{ConfigPushArgs, ConfigValidateArgs};
 use edgezero_core::app_config::{self, AppConfigLoadOptions};
 use edgezero_core::blob_envelope::BlobEnvelope;
+use edgezero_core::env_config::EnvConfig;
 use edgezero_core::manifest::{Manifest, ManifestLoader};
 use error_stack::Report;
 use serde::Serialize;
@@ -38,6 +45,7 @@ use trusted_server_core::platform::{
 use trusted_server_core::settings_data::resolve_fastly_chunk_pointer;
 
 use super::policy::{self, PolicyText, PushArgs};
+use crate::fastly_cli::{self, FastlyProcess, FastlyRunner};
 
 /// The adapter whose keys this writer writes.
 const ADAPTER: &str = "fastly";
@@ -51,6 +59,11 @@ const KEY_LIMIT: usize = 255;
 const CHUNK_KEY_INFIX: &str = ".__edgezero_chunks.";
 /// Marks an entry as a pointer to the chunks of one blob.
 const POINTER_KIND: &str = "fastly_config_chunks";
+/// How long a live push waits, once it has written a policy entry, before it
+/// writes the blob that names it. Fastly documents no time for a change to
+/// reach every location, and the store is consistent key by key, so this is
+/// a margin and not a guarantee.
+const POLICY_PROPAGATION_MARGIN_SECONDS: u64 = 60;
 
 /// The pointer to the chunks of one blob, with `EdgeZero`'s fields in
 /// `EdgeZero`'s order.
@@ -91,28 +104,23 @@ pub(crate) fn own_key(args: &ConfigPushArgs) -> Option<&str> {
         .filter(|key| *key != DEFAULT_CONFIG_STORE_ID)
 }
 
-/// Pushes the blob `args` names under `key`, into the local server's store,
-/// with each policy file `--permissions` supplies in its shared entry.
+/// Pushes the blob `args` names under `key`, into the local server's store
+/// with `--local` and into the live store otherwise, with each policy file
+/// `--permissions` supplies in its shared entry.
 ///
 /// The settings are checked as the plain push checks them, and the policy
 /// file they name must be among the files supplied. Every key is checked
 /// before anything is written. Each policy entry is written before the blob,
 /// and a long value's chunks before the pointer to them. `--dry-run` lists
-/// the keys and writes nothing.
+/// the keys, writes nothing and asks the `fastly` CLI nothing.
 ///
 /// # Errors
 ///
-/// Returns a message when the push is not `--local`, the settings or the
-/// policy files are refused, the blob fails validation, a key is refused, or
-/// the local manifest cannot be read or written.
+/// Returns a message when the settings or the policy files are refused, the
+/// blob fails validation, a key is refused, the local manifest cannot be read
+/// or written, or the live store cannot be found or written.
 pub(crate) fn run(args: &PushArgs, key: &str, out: &mut dyn Write) -> Result<(), String> {
     let push = &args.edgezero;
-    if !push.local {
-        return Err(format!(
-            "`--key {key}` can be pushed only with `--local` on Fastly. Write a live \
-             store's entries with `fastly config-store-entry update`."
-        ));
-    }
     let loader = ManifestLoader::from_path(&push.manifest)
         .map_err(|error| format!("failed to load {}: {error}", push.manifest.display()))?;
     let manifest = loader.manifest();
@@ -134,22 +142,47 @@ pub(crate) fn run(args: &PushArgs, key: &str, out: &mut dyn Write) -> Result<(),
         .iter()
         .map(|file| policy_entries(&file.name, &file.text))
         .collect::<Result<Vec<_>, _>>()?;
-    let fastly_toml = local_manifest(&push.manifest, manifest)?;
-    let stored = local_entries(&fastly_toml)?;
 
-    let (kept, missing): (Vec<_>, Vec<_>) = policies
-        .iter()
-        .partition(|policy| holds_policy(&stored, &policy.key, &policy.sha256));
-    let written: Vec<(String, String)> = missing
-        .iter()
-        .flat_map(|policy| policy.entries.iter().cloned())
-        .chain(blob)
-        .collect();
+    let (kept, written, destination) = if push.local {
+        let fastly_toml = local_manifest(&push.manifest, manifest)?;
+        let stored = local_entries(&fastly_toml)?;
+        let (kept, missing): (Vec<_>, Vec<_>) = policies
+            .iter()
+            .partition(|policy| holds_policy(&StoredEntries(&stored), &policy.key, &policy.sha256));
+        let written: Vec<(String, String)> = missing
+            .iter()
+            .flat_map(|policy| policy.entries.iter().cloned())
+            .chain(blob)
+            .collect();
+        if !push.dry_run {
+            write_local(&fastly_toml, &written)?;
+        }
+        let destination = format!(
+            "[local_server.config_stores.{DEFAULT_CONFIG_STORE_ID}.contents] in {}",
+            fastly_toml.display()
+        );
+        (kept, written, destination)
+    } else {
+        let store = remote_store_name(&EnvConfig::from_env())?;
+        let destination = format!("the Fastly config store `{store}`");
+        if push.dry_run {
+            // A dry run asks the `fastly` CLI nothing, so it lists what a push
+            // to a store holding none of the policy entries would write.
+            let written: Vec<(String, String)> = policies
+                .iter()
+                .flat_map(|policy| policy.entries.iter().cloned())
+                .chain(blob)
+                .collect();
+            (Vec::new(), written, destination)
+        } else {
+            let runner = FastlyProcess::from_environment()?;
+            let (kept, written) =
+                push_remote(&runner, &store, &policies, blob, &std::thread::sleep, out)?;
+            (kept, written, destination)
+        }
+    };
 
     let verb = if push.dry_run { "would write" } else { "wrote" };
-    if !push.dry_run {
-        write_local(&fastly_toml, &written)?;
-    }
     let output_failed = |error: std::io::Error| format!("failed to write command output: {error}");
     for policy in kept {
         writeln!(
@@ -162,10 +195,8 @@ pub(crate) fn run(args: &PushArgs, key: &str, out: &mut dyn Write) -> Result<(),
     for (entry_key, value) in &written {
         writeln!(
             out,
-            "{verb} `{entry_key}` ({} bytes) to \
-             [local_server.config_stores.{DEFAULT_CONFIG_STORE_ID}.contents] in {}",
-            value.len(),
-            fastly_toml.display()
+            "{verb} `{entry_key}` ({} bytes) to {destination}",
+            value.len()
         )
         .map_err(output_failed)?;
     }
@@ -248,12 +279,12 @@ fn policy_entries(name: &str, text: &str) -> Result<PolicyEntries, String> {
 /// Whether `stored` holds the policy file whose SHA-256 is `sha256` under
 /// `key`, read back as the runtime reads it, chunks included. An entry that
 /// cannot be read back, or holds another file, does not.
-fn holds_policy(stored: &BTreeMap<String, String>, key: &str, sha256: &str) -> bool {
-    let store = StoredEntries(stored);
+fn holds_policy(stored: &dyn PlatformConfigStore, key: &str, sha256: &str) -> bool {
     let store_name = StoreName::from(DEFAULT_CONFIG_STORE_ID);
     stored
-        .get(key)
-        .and_then(|value| resolve_fastly_chunk_pointer(&store, &store_name, value).ok())
+        .get(&store_name, key)
+        .ok()
+        .and_then(|value| resolve_fastly_chunk_pointer(stored, &store_name, &value).ok())
         .and_then(|value| policy_entry_text(&value).ok())
         .is_some_and(|text| policy_sha256(&text) == sha256)
 }
@@ -386,6 +417,185 @@ fn sha256_hex(text: &str) -> String {
     hex
 }
 
+/// The live store a push without `--local` writes, being the one
+/// `EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` selects, or the
+/// store named by the logical store ID when that is unset, as a deploy links
+/// it.
+///
+/// # Errors
+///
+/// Returns `EdgeZero`'s message when the selector is set but blank or holds
+/// a control character.
+fn remote_store_name(env: &EnvConfig) -> Result<String, String> {
+    env.store_name_checked("config", DEFAULT_CONFIG_STORE_ID)
+}
+
+/// The policies a live store already held, and the entries a live push
+/// wrote to it, in order.
+type LivePush<'p> = (Vec<&'p PolicyEntries>, Vec<(String, String)>);
+
+/// Pushes to the live config store named `store`, through the `fastly` CLI,
+/// each policy entry the store does not hold yet, then `blob`.
+///
+/// `fastly` reads and writes an entry by store id, so the id is found by the
+/// store's name first. A policy entry is read back as the runtime reads it,
+/// and one that holds the file is kept. Once a policy entry is written, the
+/// push says so in `out` and calls `wait` with
+/// [`POLICY_PROPAGATION_MARGIN_SECONDS`] before it writes the blob, so a
+/// location is unlikely to read the blob before the entry it names. Returns
+/// the policies the store held and the entries written, in order.
+///
+/// # Errors
+///
+/// Returns a message when the stores cannot be listed, no store or more than
+/// one carries the name, or a write fails.
+fn push_remote<'p>(
+    runner: &dyn FastlyRunner,
+    store: &str,
+    policies: &'p [PolicyEntries],
+    blob: Vec<(String, String)>,
+    wait: &dyn Fn(Duration),
+    out: &mut dyn Write,
+) -> Result<LivePush<'p>, String> {
+    let listing = runner.run(
+        &fastly_cli::args(&["config-store", "list", "--json", "--non-interactive"]),
+        None,
+    )?;
+    let store_id = store_id_by_name(&listing, store)?;
+    let live = LiveEntries {
+        runner,
+        store_id: &store_id,
+    };
+    let (kept, missing): (Vec<_>, Vec<_>) = policies
+        .iter()
+        .partition(|policy| holds_policy(&live, &policy.key, &policy.sha256));
+    let mut written: Vec<(String, String)> = missing
+        .iter()
+        .flat_map(|policy| policy.entries.iter().cloned())
+        .collect();
+    write_entries(runner, store, &store_id, &written)?;
+    if !written.is_empty() {
+        writeln!(
+            out,
+            "waiting {POLICY_PROPAGATION_MARGIN_SECONDS} seconds for the policy entries to \
+             reach every location before the blob is written"
+        )
+        .map_err(|error| format!("failed to write command output: {error}"))?;
+        wait(Duration::from_secs(POLICY_PROPAGATION_MARGIN_SECONDS));
+    }
+    write_entries(runner, store, &store_id, &blob)?;
+    written.extend(blob);
+    Ok((kept, written))
+}
+
+/// Writes `entries` in order to the live config store `store`, whose id is
+/// `store_id`, through the `fastly` CLI.
+///
+/// Each value reaches `fastly` on its standard input. A failed write stops
+/// the push, and its message leaves out what `fastly` printed, because that
+/// can quote the value.
+fn write_entries(
+    runner: &dyn FastlyRunner,
+    store: &str,
+    store_id: &str,
+    entries: &[(String, String)],
+) -> Result<(), String> {
+    for (written, (key, value)) in entries.iter().enumerate() {
+        let arguments = [
+            "config-store-entry".to_owned(),
+            "update".to_owned(),
+            format!("--store-id={store_id}"),
+            format!("--key={key}"),
+            "--stdin".to_owned(),
+            "--upsert".to_owned(),
+            "--non-interactive".to_owned(),
+        ];
+        runner.run(&arguments, Some(value)).map_err(|_error| {
+            format!(
+                "`fastly config-store-entry update` failed for `{key}` after {written} of {} \
+                 entries were written to the config store `{store}`. What `fastly` printed is \
+                 left out, because it can quote the value.",
+                entries.len()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// The entries of a live store, read through the `fastly` CLI, for the chunk
+/// reader to put a policy entry back together.
+struct LiveEntries<'a> {
+    runner: &'a dyn FastlyRunner,
+    store_id: &'a str,
+}
+
+impl PlatformConfigStore for LiveEntries<'_> {
+    fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+        let arguments = [
+            "config-store-entry".to_owned(),
+            "describe".to_owned(),
+            format!("--store-id={}", self.store_id),
+            format!("--key={key}"),
+            "--json".to_owned(),
+            "--non-interactive".to_owned(),
+        ];
+        let unreadable = || Report::new(PlatformError::ConfigStore);
+        let output = self
+            .runner
+            .run(&arguments, None)
+            .map_err(|message| unreadable().attach(message))?;
+        let entry: serde_json::Value = serde_json::from_str(&output).map_err(|error| {
+            unreadable().attach(format!(
+                "`fastly config-store-entry describe` did not answer JSON: {error}"
+            ))
+        })?;
+        entry
+            .get("item_value")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| unreadable().attach(format!("the entry `{key}` has no value")))
+    }
+
+    fn put(
+        &self,
+        _store_id: &StoreId,
+        _key: &str,
+        _value: &str,
+    ) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+
+    fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+}
+
+/// The id of the one store named `name` in what `fastly config-store list
+/// --json` printed, a bare list or an `items` envelope, as `EdgeZero` reads
+/// it.
+fn store_id_by_name(listing: &str, name: &str) -> Result<String, String> {
+    let parsed: serde_json::Value = serde_json::from_str(listing).map_err(|error| {
+        format!("`fastly config-store list --json` did not answer JSON: {error}")
+    })?;
+    let stores = parsed
+        .as_array()
+        .or_else(|| parsed.get("items").and_then(serde_json::Value::as_array))
+        .ok_or_else(|| "`fastly config-store list --json` did not answer a list".to_owned())?;
+    let ids: Vec<&str> = stores
+        .iter()
+        .filter(|store| store.get("name").and_then(serde_json::Value::as_str) == Some(name))
+        .filter_map(|store| store.get("id").and_then(serde_json::Value::as_str))
+        .collect();
+    match ids.as_slice() {
+        [id] => Ok((*id).to_owned()),
+        [] => Err(format!("no Fastly config store is named `{name}`")),
+        _ => Err(format!(
+            "{} Fastly config stores are named `{name}`, so the push cannot tell which to write",
+            ids.len()
+        )),
+    }
+}
+
 /// The `fastly.toml` the manifest names for the Fastly adapter, beside the
 /// manifest.
 fn local_manifest(manifest_path: &Path, manifest: &Manifest) -> Result<PathBuf, String> {
@@ -481,7 +691,240 @@ fn local_contents(document: &mut DocumentMut) -> Option<&mut Table> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    /// Plays the `fastly` CLI for one store listing and the entry writes,
+    /// recording each invocation with what it was handed on its standard
+    /// input.
+    struct RecordingFastly {
+        listing: &'static str,
+        calls: Mutex<Vec<(Vec<String>, Option<String>)>>,
+    }
+
+    impl FastlyRunner for RecordingFastly {
+        fn run(&self, args: &[String], stdin: Option<&str>) -> Result<String, String> {
+            self.calls
+                .lock()
+                .expect("should lock")
+                .push((args.to_vec(), stdin.map(str::to_owned)));
+            match (args[0].as_str(), args[1].as_str()) {
+                ("config-store", "list") => Ok(self.listing.to_owned()),
+                ("config-store-entry", "update") => Ok(String::new()),
+                _ => Err(format!("unexpected fastly {args:?}")),
+            }
+        }
+    }
+
+    #[test]
+    fn a_remote_push_writes_chunks_then_the_pointer() {
+        let envelope_json = format!("x{}", "y".repeat(2 * ENTRY_LIMIT));
+        let written = entries("a.example", &envelope_json, "data-sha").expect("should split");
+        let store = remote_store_name(&EnvConfig::from_vars([(
+            "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME",
+            "publisher_config",
+        )]))
+        .expect("should read the store selector");
+        let fastly = RecordingFastly {
+            listing: r#"[{"id":"logical-id","name":"trusted_server_config"},{"id":"publisher-id","name":"publisher_config"}]"#,
+            calls: Mutex::default(),
+        };
+
+        let waited = Mutex::new(Vec::new());
+        let mut out = Vec::new();
+
+        let (kept, pushed) = push_remote(
+            &fastly,
+            &store,
+            &[],
+            written.clone(),
+            &|wait| waited.lock().expect("should lock").push(wait),
+            &mut out,
+        )
+        .expect("should write every entry");
+
+        assert!(kept.is_empty(), "no policy was supplied");
+        assert_eq!(pushed, written, "should write the blob's entries in order");
+        assert!(
+            waited.into_inner().expect("should unlock").is_empty(),
+            "should not wait when no policy entry is written"
+        );
+        let calls = fastly.calls.into_inner().expect("should unlock");
+        assert_eq!(calls[0].0[0], "config-store", "should find the store first");
+        assert_eq!(calls[0].0[1], "list", "should find the store by its name");
+        assert!(written.len() > 2, "the blob should be written as chunks");
+        assert_eq!(
+            written.last().map(|(key, _)| key.as_str()),
+            Some("a.example"),
+            "the pointer should be the last entry"
+        );
+        assert_eq!(
+            calls.len(),
+            written.len() + 1,
+            "should write each entry once"
+        );
+        for ((arguments, stdin), (key, value)) in calls[1..].iter().zip(&written) {
+            assert_eq!(arguments[0], "config-store-entry", "should write an entry");
+            assert_eq!(arguments[1], "update", "should write an entry");
+            assert!(
+                arguments.contains(&"--store-id=publisher-id".to_owned()),
+                "should write `{key}` to the selected store: {arguments:?}"
+            );
+            assert!(
+                arguments.contains(&format!("--key={key}")),
+                "should write `{key}` in its place: {arguments:?}"
+            );
+            assert_eq!(
+                stdin.as_deref(),
+                Some(value.as_str()),
+                "should hand `{key}`'s value on standard input"
+            );
+        }
+    }
+
+    #[test]
+    fn a_remote_push_without_a_selector_writes_the_store_named_by_the_logical_id() {
+        assert_eq!(
+            remote_store_name(&EnvConfig::default()).expect("should need no selector"),
+            DEFAULT_CONFIG_STORE_ID
+        );
+    }
+
+    /// Plays one live store for the `fastly` CLI: it lists the store, answers
+    /// `describe` from the entries it holds, takes every write, and records
+    /// each call in `events`.
+    struct LiveStore<'a> {
+        entries: BTreeMap<String, String>,
+        events: &'a Mutex<Vec<String>>,
+    }
+
+    impl FastlyRunner for LiveStore<'_> {
+        fn run(&self, args: &[String], _stdin: Option<&str>) -> Result<String, String> {
+            let key = args
+                .iter()
+                .find_map(|arg| arg.strip_prefix("--key="))
+                .unwrap_or_default();
+            self.events
+                .lock()
+                .expect("should lock")
+                .push(format!("{} {key}", args[1]));
+            match (args[0].as_str(), args[1].as_str()) {
+                ("config-store", "list") => {
+                    Ok(r#"[{"id":"store-id","name":"trusted_server_config"}]"#.to_owned())
+                }
+                ("config-store-entry", "describe") => self
+                    .entries
+                    .get(key)
+                    .map(|value| serde_json::json!({ "item_value": value }).to_string())
+                    .ok_or_else(|| "the Fastly API returned 404".to_owned()),
+                ("config-store-entry", "update") => Ok(String::new()),
+                _ => Err(format!("unexpected fastly {args:?}")),
+            }
+        }
+    }
+
+    #[test]
+    fn a_live_push_writes_a_missing_policy_entry_and_waits_before_the_blob() {
+        let policy = policy_entries("open", OPEN_POLICY).expect("should build the policy");
+        let blob = entries("a.example", "{}", "data-sha").expect("should build the blob");
+        let events = Mutex::new(Vec::new());
+        let store = LiveStore {
+            entries: BTreeMap::new(),
+            events: &events,
+        };
+        let mut out = Vec::new();
+
+        let (kept, written) = push_remote(
+            &store,
+            "trusted_server_config",
+            std::slice::from_ref(&policy),
+            blob,
+            &|wait| {
+                events
+                    .lock()
+                    .expect("should lock")
+                    .push(format!("wait {}", wait.as_secs()));
+            },
+            &mut out,
+        )
+        .expect("should push");
+
+        assert!(kept.is_empty(), "the store held no policy entry");
+        assert_eq!(
+            events.into_inner().expect("should unlock"),
+            vec![
+                "list ".to_owned(),
+                format!("describe {}", policy.key),
+                format!("update {}", policy.key),
+                format!("wait {POLICY_PROPAGATION_MARGIN_SECONDS}"),
+                "update a.example".to_owned(),
+            ],
+            "the entry should be written, then the wait, then the blob"
+        );
+        assert_eq!(written.len(), 2, "the entry and the blob");
+        assert!(
+            String::from_utf8_lossy(&out).contains("waiting"),
+            "the push should say it is waiting"
+        );
+    }
+
+    #[test]
+    fn a_live_push_keeps_a_policy_entry_the_store_holds_and_does_not_wait() {
+        let policy = policy_entries("open", OPEN_POLICY).expect("should build the policy");
+        let blob = entries("a.example", "{}", "data-sha").expect("should build the blob");
+        let events = Mutex::new(Vec::new());
+        let store = LiveStore {
+            entries: policy.entries.iter().cloned().collect(),
+            events: &events,
+        };
+        let mut out = Vec::new();
+
+        let (kept, written) = push_remote(
+            &store,
+            "trusted_server_config",
+            std::slice::from_ref(&policy),
+            blob,
+            &|wait| {
+                events
+                    .lock()
+                    .expect("should lock")
+                    .push(format!("wait {}", wait.as_secs()));
+            },
+            &mut out,
+        )
+        .expect("should push");
+
+        assert_eq!(kept.len(), 1, "the store held the policy entry");
+        assert_eq!(
+            events.into_inner().expect("should unlock"),
+            vec![
+                "list ".to_owned(),
+                format!("describe {}", policy.key),
+                "update a.example".to_owned(),
+            ],
+            "only the blob should be written, with no wait"
+        );
+        assert_eq!(written.len(), 1, "the blob alone");
+    }
+
+    #[test]
+    fn a_remote_push_refuses_a_store_name_that_is_absent_or_ambiguous() {
+        let listing = r#"{"items":[{"id":"a","name":"twice"},{"id":"b","name":"twice"},{"id":"c","name":"once"}]}"#;
+
+        assert_eq!(
+            store_id_by_name(listing, "once").expect("should find one store"),
+            "c"
+        );
+        assert!(
+            store_id_by_name(listing, "twice").is_err(),
+            "should refuse a name two stores carry"
+        );
+        assert!(
+            store_id_by_name(listing, "none").is_err(),
+            "should refuse a name no store carries"
+        );
+    }
 
     /// A valid policy whose top node grants everything.
     const OPEN_POLICY: &str = "groups:\n  open:\n    default: granted\nrules:\n  group: open\n  jurisdiction: non-regulated\n";
@@ -511,7 +954,7 @@ mod tests {
         );
         let stored: BTreeMap<String, String> = policy.entries.iter().cloned().collect();
         assert!(
-            holds_policy(&stored, &policy.key, &policy.sha256),
+            holds_policy(&StoredEntries(&stored), &policy.key, &policy.sha256),
             "the entries should read back as the file"
         );
     }
@@ -534,7 +977,7 @@ mod tests {
             (other, "an entry holding another file"),
         ] {
             assert!(
-                !holds_policy(&stored, &open.key, &open.sha256),
+                !holds_policy(&StoredEntries(&stored), &open.key, &open.sha256),
                 "{case} should be written again"
             );
         }

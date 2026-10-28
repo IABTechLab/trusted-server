@@ -872,11 +872,6 @@ mod tests {
     fn settings_with_probe(body: &str) -> Settings {
         Settings::from_toml(&format!(
             r#"
-                [[handlers]]
-                path = "^/_ts/admin"
-                username = "admin"
-                password = "admin-pass"
-
                 [publisher]
                 domain = "test-publisher.example.com"
                 cookie_domain = ".test-publisher.example.com"
@@ -1120,11 +1115,6 @@ mod tests {
     fn validate_reports_not_selected_without_a_module_entry() {
         let settings = Settings::from_toml(
             r#"
-                [[handlers]]
-                path = "^/_ts/admin"
-                username = "admin"
-                password = "admin-pass"
-
                 [publisher]
                 domain = "test-publisher.example.com"
                 cookie_domain = ".test-publisher.example.com"

@@ -1,13 +1,8 @@
 //! Middleware implementations for the `EdgeZero` entry point.
 //!
-//! Provides two middleware types used by the `EdgeZero` entry point:
-//!
-//! - [`FinalizeResponseMiddleware`] — geo lookup and standard TS header injection
-//! - [`AuthMiddleware`] — basic-auth enforcement via [`enforce_basic_auth`]
-//!
-//! Registration order in [`crate::app`]: `FinalizeResponseMiddleware` outermost,
-//! then `AuthMiddleware`. This ensures auth-rejected responses also receive the
-//! standard TS headers before being returned to the client.
+//! Provides the middleware the `EdgeZero` entry point registers,
+//! [`FinalizeResponseMiddleware`], which looks the reader's location up and
+//! injects the standard TS headers.
 
 use std::sync::Arc;
 
@@ -18,7 +13,6 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Response, StatusCode};
 use edgezero_core::middleware::{Middleware, Next};
 use edgezero_core::response::IntoResponse;
-use trusted_server_core::auth::enforce_basic_auth;
 use trusted_server_core::constants::{
     ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
     HEADER_X_TS_ENV, HEADER_X_TS_FASTLY_VERSION,
@@ -36,9 +30,8 @@ pub(crate) const HEADER_X_TS_FINALIZED: &str = "x-ts-finalized";
 
 /// Outermost middleware: performs geo lookup and injects all standard TS response headers.
 ///
-/// Registered first in the middleware chain so that it wraps all inner middleware
-/// (including [`AuthMiddleware`]) and the handler. This guarantees every registered-route
-/// response — including auth-rejected ones — carries a consistent set of headers.
+/// Registered first in the middleware chain so that it wraps the handler. This
+/// guarantees every registered-route response carries a consistent set of headers.
 ///
 /// Router-level 405/404 responses for unregistered HTTP methods (e.g. TRACE) bypass the
 /// middleware chain. Those are covered by a second call to [`apply_finalize_headers`] at
@@ -117,51 +110,6 @@ impl Middleware for FinalizeResponseMiddleware {
             .insert(HEADER_X_TS_FINALIZED, HeaderValue::from_static("1"));
 
         Ok(response)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// AuthMiddleware
-// ---------------------------------------------------------------------------
-
-/// Inner middleware: enforces basic-auth before the handler runs.
-///
-/// - `Ok(Some(response))` from [`enforce_basic_auth`] → auth failed; return the
-///   challenge response (bubbles through [`FinalizeResponseMiddleware`] for header injection).
-/// - `Ok(None)` → no auth required or credentials accepted; continue the chain.
-/// - `Err(report)` → internal error; log and convert to an HTTP response via
-///   [`crate::app::http_error`] using the error's documented status code.
-///
-/// # Errors
-///
-/// When [`enforce_basic_auth`] returns an error report, converts it to an HTTP
-/// response via [`crate::app::http_error`] (preserving the error's status code)
-/// so that [`FinalizeResponseMiddleware`] can still inject standard TS headers
-/// before the response reaches the client.
-pub struct AuthMiddleware {
-    settings: Arc<Settings>,
-}
-
-impl AuthMiddleware {
-    /// Creates a new [`AuthMiddleware`] with the given settings.
-    pub fn new(settings: Arc<Settings>) -> Self {
-        Self { settings }
-    }
-}
-
-#[async_trait(?Send)]
-impl Middleware for AuthMiddleware {
-    async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        match enforce_basic_auth(&self.settings, ctx.request_mut()) {
-            Ok(Some(response)) => return Ok(response),
-            Ok(None) => {}
-            Err(report) => {
-                log::error!("auth check failed: {:?}", report);
-                return Ok(crate::app::http_error(&report));
-            }
-        }
-
-        next.run(ctx).await
     }
 }
 
@@ -352,11 +300,6 @@ mod tests {
     fn test_settings() -> Settings {
         Settings::from_toml(
             r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
@@ -374,8 +317,6 @@ mod tests {
 
             [request_signing]
             enabled = false
-            config_store_id = "test-config-store-id"
-            secret_store_id = "test-secret-store-id"
             "#,
         )
         .expect("should parse test settings")
@@ -880,10 +821,6 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------------
-    // AuthMiddleware::handle tests
-    // ---------------------------------------------------------------------------
-
     #[test]
     fn finalize_handle_preserves_duplicate_set_cookie_headers() {
         // Regression guard: FinalizeResponseMiddleware must not drop duplicate
@@ -912,25 +849,6 @@ mod tests {
         assert_eq!(
             cookie_count, 2,
             "FinalizeResponseMiddleware must not drop duplicate Set-Cookie headers"
-        );
-    }
-
-    #[test]
-    fn auth_handle_passes_through_when_auth_not_configured() {
-        let settings = test_settings();
-        let middleware = AuthMiddleware::new(Arc::new(settings));
-        let handler =
-            Arc::new(
-                |_ctx: RequestContext| async move { Ok::<Response, EdgeError>(empty_response()) },
-            );
-
-        let response = block_on(middleware.handle(empty_ctx(), Next::new(&[], &*handler)))
-            .expect("should pass through when auth is not configured");
-
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "should reach the handler when auth is not required"
         );
     }
 

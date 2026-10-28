@@ -216,9 +216,11 @@ Configure request signing in `trusted-server.toml`:
 
 ```toml
 [request_signing]
-config_store_id = "jwks_store"
-secret_store_id = "signing_keys"
+enabled = true
 ```
+
+The service reads its keys from the two stores below by the names they are
+linked under.
 
 ### Fastly Config Store Setup
 

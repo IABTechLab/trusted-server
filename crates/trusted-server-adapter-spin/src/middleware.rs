@@ -5,7 +5,6 @@ use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Response};
 use edgezero_core::middleware::{Middleware, Next};
-use trusted_server_core::auth::enforce_basic_auth;
 use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
 use trusted_server_core::http_util::sanitize_trusted_client_ip_headers;
 use trusted_server_core::settings::Settings;
@@ -55,9 +54,8 @@ impl Middleware for SanitizeRequestMiddleware {
 /// Spin does not expose geo headers to the application, so
 /// `X-Geo-Info-Available: false` is emitted for every response.
 ///
-/// Registered directly inside [`SanitizeRequestMiddleware`] and ahead of
-/// [`AuthMiddleware`] so that every outgoing response — including auth-rejected
-/// ones — carries a consistent set of headers.
+/// Registered directly inside [`SanitizeRequestMiddleware`], so that every
+/// outgoing response carries a consistent set of headers.
 pub struct FinalizeResponseMiddleware {
     settings: Arc<Settings>,
 }
@@ -82,44 +80,6 @@ impl Middleware for FinalizeResponseMiddleware {
 }
 
 // ---------------------------------------------------------------------------
-// AuthMiddleware
-// ---------------------------------------------------------------------------
-
-/// Inner middleware: enforces basic-auth before the handler runs.
-///
-/// - `Ok(Some(response))` from [`enforce_basic_auth`] → auth failed; return the
-///   challenge response (bubbles through [`FinalizeResponseMiddleware`] for header injection).
-/// - `Ok(None)` → no auth required or credentials accepted; continue the chain.
-/// - `Err(report)` → internal error; log and convert to a 500 HTTP response.
-pub struct AuthMiddleware {
-    settings: Arc<Settings>,
-}
-
-impl AuthMiddleware {
-    /// Creates a new [`AuthMiddleware`] with the given settings.
-    #[must_use]
-    pub fn new(settings: Arc<Settings>) -> Self {
-        Self { settings }
-    }
-}
-
-#[async_trait(?Send)]
-impl Middleware for AuthMiddleware {
-    async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        match enforce_basic_auth(&self.settings, ctx.request_mut()) {
-            Ok(Some(response)) => return Ok(response),
-            Ok(None) => {}
-            Err(report) => {
-                log::error!("auth check failed: {:?}", report);
-                return Ok(crate::app::http_error(&report));
-            }
-        }
-
-        next.run(ctx).await
-    }
-}
-
-// ---------------------------------------------------------------------------
 // NormalizeMiddleware
 // ---------------------------------------------------------------------------
 
@@ -132,9 +92,6 @@ impl Middleware for AuthMiddleware {
 /// structurally rather than by per-handler convention. A future route, or a
 /// signing handler that begins deriving an issuer/audience from `RequestInfo`,
 /// cannot silently trust spoofable input by forgetting to opt in.
-///
-/// Registered after [`AuthMiddleware`] (innermost) so the basic-auth gate still
-/// evaluates the original request, preserving prior behaviour.
 #[derive(Default)]
 pub struct NormalizeMiddleware;
 
@@ -225,11 +182,6 @@ mod tests {
         // test builds its own.
         let mut s = Settings::from_toml(
             r#"
-                [[handlers]]
-                path = "^/_ts/admin"
-                username = "admin"
-                password = "admin-pass"
-
                 [publisher]
                 domain = "test-publisher.example.com"
                 cookie_domain = ".test-publisher.example.com"

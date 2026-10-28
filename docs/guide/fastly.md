@@ -449,11 +449,10 @@ The script creates an isolated application config, applies its publisher-origin
 overrides, selects the built-in `hmac` Edge Cookie module, names the
 repository's sample permission policy, and runs strict validation. It then
 executes `ts config push --adapter fastly --local` with the sample through
-`--permissions`, adds all three required entries to
+`--permissions`, adds both required entries to
 `[local_server.secret_stores.trusted_server_secrets]`, and starts
-`fastly compute serve`
-through Viceroy. The required keys are `handler_password`,
-`publisher_proxy_secret`, and `ec_passphrase`.
+`fastly compute serve` through Viceroy. The required keys are
+`publisher_proxy_secret` and `ec_passphrase`.
 
 The check deliberately proves both halves of startup. With no config entry, it
 requires `/health` to return 200 while the publisher route returns 500 with the

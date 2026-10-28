@@ -69,14 +69,10 @@ write_runtime_config() {
     # The secrets go at the end, under the manifest's last table, [vars].
     awk \
         -v missing_key="$missing_key" \
-        -v handler="$SMOKE_HANDLER_VALUE" \
         -v proxy="$SMOKE_PROXY_VALUE" \
         -v ec="$SMOKE_EC_VALUE" '
         { print }
         END {
-            if (missing_key != "handler_password") {
-                print "handler_password = \"" handler "\""
-            }
             if (missing_key != "publisher_proxy_secret") {
                 print "publisher_proxy_secret = \"" proxy "\""
             }
@@ -154,10 +150,9 @@ ENVELOPE=$(
 )
 [ -n "$ENVELOPE" ] || smoke_die "Wrangler KV read-back returned an empty envelope"
 
-run_case missing-handler "$((BASE_PORT + 1))" handler_password 500 'env.handler_password'
-run_case missing-proxy "$((BASE_PORT + 2))" publisher_proxy_secret 500 \
+run_case missing-proxy "$((BASE_PORT + 1))" publisher_proxy_secret 500 \
     'env.publisher_proxy_secret'
-run_case missing-ec "$((BASE_PORT + 3))" ec_passphrase 500 'env.ec_passphrase'
-run_case positive "$((BASE_PORT + 4))" "" 200 ""
+run_case missing-ec "$((BASE_PORT + 2))" ec_passphrase 500 'env.ec_passphrase'
+run_case positive "$((BASE_PORT + 3))" "" 200 ""
 
 echo "Cloudflare first-success smoke passed"

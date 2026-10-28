@@ -3039,11 +3039,6 @@ mod tests {
 [auction]
 modules = ["prebid"]
 
-[[handlers]]
-path = "^/_ts/admin"
-username = "admin"
-password = "admin-pass"
-
 [publisher]
 domain = "test-publisher.com"
 cookie_domain = ".test-publisher.com"

@@ -14,12 +14,9 @@ use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan_with,
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
+use trusted_server_core::closed_paths::closed_path_response;
 use trusted_server_core::ec::EcContext;
-use trusted_server_core::ec::admin::{
-    admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
-};
 use trusted_server_core::ec::module::ensure_module_available;
-use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::inspect::config::{CONFIG_JSON_PATH, CONFIG_PAGE_PATH, handle_config};
 use trusted_server_core::inspect::data::{DATA_PAGE_PATH, handle_data};
@@ -48,7 +45,7 @@ use trusted_server_core::settings_data::{
 
 use trusted_server_core::platform::{PolicyOrigin, RuntimeServices};
 
-use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
+use crate::middleware::{FinalizeResponseMiddleware, SanitizeRequestMiddleware};
 use crate::platform::{
     AxumPlatformConfigStore, AxumPlatformSecretStore, AxumPolicyFolder, build_runtime_services,
 };
@@ -286,23 +283,6 @@ pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     response
 }
 
-/// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
-/// aliases on the Axum dev server.
-///
-/// These non-`/_ts` aliases are not matched by the `^/_ts/admin` basic-auth
-/// handler, so they fail closed locally rather than fall through to the
-/// publisher fallback — which would forward the caller's `Authorization` header
-/// and key-management payload to the origin, leaking admin credentials.
-fn legacy_admin_alias_denied() -> Response {
-    let mut response = Response::new(edgezero_core::body::Body::from("Not found\n"));
-    *response.status_mut() = StatusCode::NOT_FOUND;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
 // ---------------------------------------------------------------------------
 // Shared handler executor
 // ---------------------------------------------------------------------------
@@ -371,8 +351,9 @@ async fn build_ec_context(
 /// Dispatches the fallback routes: tsjs assets, integration proxy routes, and
 /// the publisher origin.
 ///
-/// The request arrives already prepared. Every route that reaches here is
-/// registered to [`fallback_handler`], which runs the request through
+/// The request arrives already prepared, and is not to a closed path. Every
+/// route that reaches here is registered to [`fallback_handler`], which
+/// answers a closed path itself and runs any other request through
 /// [`execute_handler`], and [`execute_handler`] calls
 /// `registry.prepare_request` before it calls this function, so there is
 /// nothing left to prepare here.
@@ -381,10 +362,6 @@ async fn dispatch_fallback(
     services: &RuntimeServices,
     req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
-    if let Some(response) = deny_admin_diagnostic_fallback(&req) {
-        return Ok(response);
-    }
-
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
@@ -452,7 +429,12 @@ async fn dispatch_fallback(
 fn fallback_handler(
     state: Arc<AppState>,
 ) -> impl Fn(RequestContext) -> HandlerFuture + Clone + Send + Sync + 'static {
-    move |ctx: RequestContext| {
+    move |ctx: RequestContext| -> HandlerFuture {
+        // A closed path is answered before the modules' preparers run, as the
+        // other adapters answer it, so no preparer sees or answers it.
+        if let Some(response) = closed_path_response(ctx.request()) {
+            return Box::pin(async move { Ok::<_, EdgeError>(response) });
+        }
         let state = Arc::clone(&state);
         Box::pin(execute_handler(
             state,
@@ -473,13 +455,6 @@ enum NamedRouteHandler {
     Permissions,
     Config,
     Data,
-    AdminNotSupported,
-    CachePurgeNotSupported,
-    AdminEcNotSupported,
-    AdminEidsLookup,
-    /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
-    /// reach the publisher fallback (which would leak admin credentials).
-    LegacyAdminDenied,
     Auction,
     PageBids,
     FirstPartyProxy,
@@ -494,17 +469,7 @@ struct NamedRoute {
     handler: NamedRouteHandler,
 }
 
-const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
-    Method::GET,
-    Method::POST,
-    Method::HEAD,
-    Method::OPTIONS,
-    Method::PUT,
-    Method::PATCH,
-    Method::DELETE,
-];
-
-fn named_routes() -> [NamedRoute; 22] {
+fn named_routes() -> [NamedRoute; 14] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -544,63 +509,6 @@ fn named_routes() -> [NamedRoute; 22] {
             path: DATA_PAGE_PATH,
             primary_methods: &[Method::GET],
             handler: NamedRouteHandler::Data,
-        },
-        // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
-        // and the production basic-auth handler regex (`^/_ts/admin`), so they
-        // are auth-gated under a production-shaped config.
-        NamedRoute {
-            path: "/_ts/admin/keys/rotate",
-            primary_methods: &[Method::POST],
-            handler: NamedRouteHandler::AdminNotSupported,
-        },
-        NamedRoute {
-            path: "/_ts/admin/keys/deactivate",
-            primary_methods: &[Method::POST],
-            handler: NamedRouteHandler::AdminNotSupported,
-        },
-        // Every method, for the same reason as the Fastly adapter: a method this route
-        // does not claim falls through to the publisher with the caller's `Authorization`
-        // header still attached.
-        NamedRoute {
-            path: "/_ts/admin/cache/purge",
-            primary_methods: LEGACY_ADMIN_DENY_METHODS,
-            handler: NamedRouteHandler::CachePurgeNotSupported,
-        },
-        // Admin EC lookup routes. Registered explicitly (like the key routes
-        // above) so they never fall through to the publisher fallback, and
-        // they match `Settings::ADMIN_ENDPOINTS` for auth coverage.
-        NamedRoute {
-            path: "/_ts/admin/ec",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::AdminEcNotSupported,
-        },
-        NamedRoute {
-            path: "/_ts/admin/ec/{id}",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::AdminEcNotSupported,
-        },
-        // Admin EIDs echo: pure request inspection (no KV), so the dev
-        // server serves the real handler.
-        NamedRoute {
-            path: "/_ts/admin/eids",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::AdminEidsLookup,
-        },
-        // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with
-        // a 404, matching the Fastly and Cloudflare adapters: the production
-        // basic-auth handler regex `^/_ts/admin` does not match them, and letting
-        // any publisher-fallback method fall through would forward the caller's
-        // `Authorization` header and key-management payload to the origin,
-        // leaking admin credentials.
-        NamedRoute {
-            path: "/admin/keys/rotate",
-            primary_methods: LEGACY_ADMIN_DENY_METHODS,
-            handler: NamedRouteHandler::LegacyAdminDenied,
-        },
-        NamedRoute {
-            path: "/admin/keys/deactivate",
-            primary_methods: LEGACY_ADMIN_DENY_METHODS,
-            handler: NamedRouteHandler::LegacyAdminDenied,
         },
         NamedRoute {
             path: "/auction",
@@ -671,49 +579,6 @@ fn named_route_handler(
                     }
                     NamedRouteHandler::Config => Ok(handle_config(&state.settings, &req)),
                     NamedRouteHandler::Data => handle_data(None, None, &req),
-                    NamedRouteHandler::CachePurgeNotSupported => {
-                        // The Axum dev server has no template cache to purge. 501 rather
-                        // than a fallthrough 404, so a CMS webhook can tell "not supported
-                        // here" from "endpoint does not exist".
-                        let body = edgezero_core::body::Body::from(
-                            "Template cache purge is not supported on the Axum dev server.\n\
-                             Use the Fastly adapter (via Viceroy or deployed) to purge.\n",
-                        );
-                        let mut resp = Response::new(body);
-                        *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
-                        resp.headers_mut().insert(
-                            header::CONTENT_TYPE,
-                            HeaderValue::from_static("text/plain; charset=utf-8"),
-                        );
-                        Ok(resp)
-                    }
-                    NamedRouteHandler::AdminNotSupported => {
-                        // Config/secret-store writes are backed by read-only env vars on the
-                        // Axum dev server. Returning 501 is clearer than failing on the first
-                        // store write.
-                        let body = edgezero_core::body::Body::from(
-                            "Admin key management is not supported on the Axum dev server.\n\
-                             Use the Fastly adapter (via Viceroy or deployed) to rotate or deactivate keys.\n",
-                        );
-                        let mut resp = Response::new(body);
-                        *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
-                        resp.headers_mut().insert(
-                            header::CONTENT_TYPE,
-                            HeaderValue::from_static("text/plain; charset=utf-8"),
-                        );
-                        Ok(resp)
-                    }
-                    NamedRouteHandler::AdminEcNotSupported => {
-                        // The EC identity graph is Fastly KV backed; the Axum
-                        // dev server has no store to read.
-                        Ok(admin_ec_lookup_not_supported())
-                    }
-                    NamedRouteHandler::AdminEidsLookup => {
-                        let partner_registry =
-                            PartnerRegistry::from_config(&state.settings.ec.partners)?;
-                        handle_admin_eids_lookup(&partner_registry, &req)
-                    }
-                    NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
                     NamedRouteHandler::Auction => {
                         // Build the geo-aware EC context so the auction consent
                         // gate sees the caller's jurisdiction — `EcContext::default()`
@@ -915,8 +780,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         // any middleware registered ahead of it would observe the
         // shared-secret authentication header.
         .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
-        .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
-        .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
+        .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)));
 
     router = router.route("/health", Method::GET, |_ctx: RequestContext| async {
         Ok::<Response, EdgeError>(
@@ -966,11 +830,6 @@ mod tests {
     /// inject, with the `[ec.acme]` block that module's settings live in.
     /// `acme` is a fictional vendor key.
     const UNINJECTED_MODULE_TOML: &str = r#"
-        [[handlers]]
-        path = "^/_ts/admin"
-        username = "admin"
-        password = "admin-pass"
-
         [publisher]
         domain = "test-publisher.example.com"
         cookie_domain = ".test-publisher.example.com"
@@ -1058,8 +917,6 @@ mod tests {
         use super::*;
         use crate::platform::{PERMISSIONS_DIR_ENV_VAR, config_env_var};
 
-        const HANDLER_PASSWORD_VAR: &str =
-            "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_HANDLER_PASSWORD";
         const PROXY_SECRET_VAR: &str =
             "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PUBLISHER_PROXY_SECRET";
 
@@ -1068,11 +925,6 @@ mod tests {
         fn startup_settings() -> Settings {
             Settings::from_toml(
                 r#"
-                [[handlers]]
-                path = "^/_ts/admin"
-                username = "admin"
-                password = "handler_password"
-
                 [publisher]
                 domain = "publisher.example"
                 cookie_domain = ".publisher.example"
@@ -1113,10 +965,6 @@ mod tests {
             temp_env::with_vars(
                 [
                     (config_var.as_str(), Some(blob)),
-                    (
-                        HANDLER_PASSWORD_VAR,
-                        Some("a-handler-password-for-the-startup-tests"),
-                    ),
                     (
                         PROXY_SECRET_VAR,
                         Some("a-proxy-secret-for-the-startup-tests-32-bytes"),

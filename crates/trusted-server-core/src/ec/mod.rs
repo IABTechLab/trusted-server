@@ -14,8 +14,6 @@
 //! # Module structure
 //!
 //! - auth (private) — shared Bearer-token authentication helpers
-//! - [`admin`]: operator endpoints that show the stored identity state
-//!   (`GET /_ts/admin/ec`)
 //! - [`generation`] — HMAC-based ID generation, IP normalization, format helpers
 //! - [`consent`]: EC-specific permission gating, with consent as one input
 //! - [`cookies`] — `Set-Cookie` header creation and expiration helpers
@@ -36,7 +34,6 @@
 
 mod auth;
 
-pub mod admin;
 pub mod batch_sync;
 pub mod consent;
 pub mod cookies;
@@ -856,7 +853,7 @@ impl EcContext {
     /// and EID resolution looks the entry up in that snapshot under this key.
     /// Each of these reaches the key through this function or through
     /// [`ec_kv_key`](Self::ec_kv_key), which wraps this function. Batch sync
-    /// and the admin lookup have no EC context, so they call
+    /// has no EC context, so it calls
     /// [`AcceptedModules::canonical_kv_key`](module::AcceptedModules::canonical_kv_key),
     /// the function this one wraps, directly.
     ///
@@ -1537,7 +1534,7 @@ pub(crate) mod tests {
     /// as a signed envelope. It accepts any of its own non-empty identifiers
     /// and keys the identity graph by the value unchanged.
     ///
-    /// Shared with the admin lookup, batch sync and pull sync tests.
+    /// Shared with the batch sync and pull sync tests.
     #[derive(Debug)]
     pub(crate) struct OpaqueModule;
 
@@ -2541,9 +2538,9 @@ pub(crate) mod tests {
     /// A module whose identifier normalizes to a distinct canonical form, to
     /// prove the identity graph is keyed by the canonical form.
     ///
-    /// Shared with the identify, finalization, pull sync, admin lookup, auction
-    /// and publisher tests, which need a module whose canonical key is not the
-    /// value the browser carries.
+    /// Shared with the identify, finalization, pull sync, auction and publisher
+    /// tests, which need a module whose canonical key is not the value the
+    /// browser carries.
     #[derive(Debug)]
     pub(crate) struct CanonicalizingModule;
 

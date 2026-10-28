@@ -2883,10 +2883,6 @@ mod tests {
             &draft
                 .toml
                 .replace(
-                    "password = \"handler_password\"",
-                    "password = \"test-admin-password-32-bytes-minimum\"",
-                )
-                .replace(
                     "passphrase = \"ec_passphrase\"",
                     "passphrase = \"test-ec-passphrase-32-bytes-minimum\"",
                 )
@@ -4030,10 +4026,6 @@ mod tests {
     fn loadable_config() -> String {
         EXAMPLE_CONFIG
             .replace(
-                "password = \"handler_password\"",
-                "password = \"test-admin-password-32-bytes-minimum\"",
-            )
-            .replace(
                 "passphrase = \"ec_passphrase\"",
                 "passphrase = \"test-ec-passphrase-32-bytes-minimum\"",
             )
@@ -4476,10 +4468,6 @@ mod tests {
             .expect("should write manifest");
         let config = EXAMPLE_CONFIG
             .replace(
-                "password = \"handler_password\"",
-                "password = \"test-admin-password-32-bytes-minimum\"",
-            )
-            .replace(
                 "passphrase = \"ec_passphrase\"",
                 "passphrase = \"test-ec-passphrase-32-bytes-minimum\"",
             )
@@ -4552,7 +4540,7 @@ mod tests {
                 assert!(output.starts_with("--- configured creative opportunities\n"));
                 assert!(output.contains("+++ generated creative opportunities\n"));
                 assert!(
-                    !output.contains("test-admin-password-32-bytes-minimum"),
+                    !output.contains("test-proxy-secret-32-bytes-minimum"),
                     "dry run must not expose unrelated secrets"
                 );
                 assert!(

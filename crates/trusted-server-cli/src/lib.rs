@@ -5,6 +5,8 @@ mod app_config;
 #[cfg(not(target_arch = "wasm32"))]
 mod error;
 #[cfg(not(target_arch = "wasm32"))]
+mod fastly_cli;
+#[cfg(not(target_arch = "wasm32"))]
 mod prebid_bundle;
 #[cfg(not(target_arch = "wasm32"))]
 mod run;

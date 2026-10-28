@@ -31,7 +31,6 @@ directly. The script reads the envelope and exports it as
 Secrets use `TRUSTED_SERVER_SECRET_{STORE}_{KEY}`. The exact required variables
 are:
 
-- `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_HANDLER_PASSWORD`
 - `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PUBLISHER_PROXY_SECRET`
 - `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_PASSPHRASE`
 
@@ -69,10 +68,8 @@ local debugging sessions.
 
 ## Runtime boundaries
 
-Axum implements the read-only `/_ts/admin/eids` diagnostic. EC record lookup
-and key rotation are registered but return not-supported responses because the
-adapter has no request-time KV implementation. It sanitizes forwarded client-IP
-headers but does not resolve `[trusted_client_ip]`; see the
+Axum sanitizes forwarded client-IP headers but does not resolve
+`[trusted_client_ip]`; see the
 [adapter matrix](./api-reference#adapter-and-startup-support).
 
 For an edge deployment, use the [Fastly](./fastly),

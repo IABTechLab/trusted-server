@@ -1570,109 +1570,36 @@ impl Rewrite {
     }
 }
 
-#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
-#[serde(deny_unknown_fields)]
-pub struct Handler {
-    #[serde(serialize_with = "crate::redacted::sensitive")]
-    #[validate(length(min = 1), custom(function = validate_path))]
-    pub path: String,
-    #[validate(custom(function = validate_redacted_not_empty))]
-    pub username: Redacted<String>,
-    #[validate(custom(function = validate_redacted_not_empty))]
-    pub password: Redacted<String>,
-    #[serde(skip, default)]
-    #[validate(skip)]
-    regex: OnceLock<Result<Regex, String>>,
-}
-
-impl Handler {
-    /// Known handler password placeholders that must not be used in deployments.
-    pub const PASSWORD_PLACEHOLDERS: &[&str] = &[
-        "replace-with-admin-password-32-bytes",
-        "replace-with-admin-password",
-        "change-me-admin-password",
-    ];
-
-    /// Returns `true` if `password` matches a known placeholder value
-    /// (case-insensitive).
-    #[must_use]
-    pub fn is_placeholder_password(password: &str) -> bool {
-        let password = password.trim();
-        Self::PASSWORD_PLACEHOLDERS
-            .iter()
-            .any(|placeholder| placeholder.eq_ignore_ascii_case(password))
-    }
-
-    fn compiled_regex(&self) -> Result<&Regex, Report<TrustedServerError>> {
-        match self
-            .regex
-            .get_or_init(|| Regex::new(&self.path).map_err(|err| err.to_string()))
-        {
-            Ok(regex) => Ok(regex),
-            Err(message) => Err(Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "Handler path regex `{}` failed to compile: {message}",
-                    self.path
-                ),
-            })),
-        }
-    }
-
-    /// Eagerly compile the handler regex to fail fast during startup.
-    ///
-    /// # Errors
-    ///
-    /// Returns a configuration error if the handler path regex does not compile.
-    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
-        self.compiled_regex().map(|_| ())
-    }
-
-    /// Determine whether this handler applies to the request path.
-    ///
-    /// # Errors
-    ///
-    /// Returns a configuration error if the handler path regex does not compile.
-    pub fn matches_path(&self, path: &str) -> Result<bool, Report<TrustedServerError>> {
-        self.compiled_regex().map(|regex| regex.is_match(path))
-    }
-}
-
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestSigning {
     #[serde(default = "default_request_signing_enabled")]
     pub enabled: bool,
-    #[serde(serialize_with = "crate::redacted::sensitive")]
-    pub config_store_id: String,
-    #[serde(serialize_with = "crate::redacted::sensitive")]
-    pub secret_store_id: String,
+    /// The removed `config_store_id`. The field never holds a value, because
+    /// reading one always fails.
+    #[serde(default, skip_serializing)]
+    #[allow(
+        dead_code,
+        reason = "the field exists so that reading the removed key fails with directions"
+    )]
+    config_store_id: RemovedSigningStoreId,
+    /// The removed `secret_store_id`, refused as `config_store_id` is.
+    #[serde(default, skip_serializing)]
+    #[allow(
+        dead_code,
+        reason = "the field exists so that reading the removed key fails with directions"
+    )]
+    secret_store_id: RemovedSigningStoreId,
 }
 
 impl RequestSigning {
-    /// Reserved example store-id values from the config template, plus the
-    /// empty string, that must not be deployed while request signing is enabled.
-    pub const STORE_ID_PLACEHOLDERS: &[&str] = &[
-        "<management-config-store-id>",
-        "<management-secret-store-id>",
-    ];
-
-    /// Returns `true` if `store_id` is empty or a known template placeholder
-    /// (case-insensitive).
+    /// Request signing switched on or off.
     #[must_use]
-    pub fn is_placeholder_store_id(store_id: &str) -> bool {
-        let store_id = store_id.trim();
-        store_id.is_empty()
-            || Self::STORE_ID_PLACEHOLDERS
-                .iter()
-                .any(|p| p.eq_ignore_ascii_case(store_id))
-    }
-
-    /// Returns `true` if `store_id` cannot be deployed as-is: a placeholder, or
-    /// a value with surrounding whitespace that the key-management routes would
-    /// forward to the management API verbatim.
-    #[must_use]
-    pub fn is_unusable_store_id(store_id: &str) -> bool {
-        Self::is_placeholder_store_id(store_id) || store_id != store_id.trim()
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            ..Self::default()
+        }
     }
 }
 
@@ -2696,14 +2623,6 @@ fn default_certificate_check() -> bool {
     true
 }
 
-fn is_admin_placeholder_password(password: &str) -> bool {
-    Handler::is_placeholder_password(password)
-        || matches!(
-            password.trim().to_ascii_lowercase().as_str(),
-            "changeme" | "password" | "admin"
-        )
-}
-
 impl Default for Proxy {
     fn default() -> Self {
         Self {
@@ -3664,6 +3583,25 @@ refused_table! {
 }
 
 refused_table! {
+    /// The `[[handlers]]` list, which gated paths behind HTTP Basic
+    /// authentication.
+    RemovedHandlers => "Configuration list `[[handlers]]` is not read, and no request is \
+        asked for a password. Remove every `[[handlers]]` entry. Nothing is served beneath \
+        /_ts/admin, so rotate signing keys with `ts keys`, purge the cache with \
+        `ts cache purge`, and put a password on a path of the publisher's own at its origin \
+        or in the hosting platform"
+}
+
+refused_table! {
+    /// A store id under `[request_signing]`, which the service does not read.
+    RemovedSigningStoreId => "`[request_signing]` does not take `config_store_id` or \
+        `secret_store_id`. The service reads its signing keys from the stores linked as \
+        `jwks_store` and `signing_keys` and writes neither. Remove both keys, and give the \
+        ids to `ts keys rotate` and `ts keys deactivate` as `--config-store-id` and \
+        `--secret-store-id`"
+}
+
+refused_table! {
     /// The `[permission_signal]` table, renamed `[permission-signal]`.
     RenamedPermissionSignalTable => "Configuration table `[permission_signal]` is now \
         `[permission-signal]`, named exactly as its folder crates/permission-signal. Move its \
@@ -3997,9 +3935,14 @@ pub struct Settings {
     /// `[cmp]` or `[tag]`, each named for the type of module it selects.
     #[serde(flatten)]
     pub sections: TypeSections,
-    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
-    #[validate(nested)]
-    pub handlers: Vec<Handler>,
+    /// The `[[handlers]]` list, kept so a configuration carrying one is
+    /// told that no path is gated by a password.
+    #[serde(default, skip_serializing)]
+    #[allow(
+        dead_code,
+        reason = "the field exists so that reading the removed list fails with directions"
+    )]
+    handlers: RemovedHandlers,
     #[serde(default, deserialize_with = "map_from_obj_or_str")]
     pub response_headers: HashMap<String, String>,
     pub request_signing: Option<RequestSigning>,
@@ -4273,8 +4216,6 @@ impl Settings {
         settings
             .geo
             .validate_jurisdiction_acknowledgment(&settings.ec)?;
-        settings.validate_admin_coverage()?;
-        settings.validate_admin_handler_passwords()?;
 
         Ok(settings)
     }
@@ -4296,10 +4237,6 @@ impl Settings {
             .auction_html_comment_options
             .validate_metadata_keys()?;
         self.validate_asset_image_optimizer_profile_sets()?;
-
-        for handler in &self.handlers {
-            handler.prepare_runtime()?;
-        }
 
         if let Some(co) = &mut self.creative_opportunities {
             co.compile_slots();
@@ -4396,11 +4333,6 @@ impl Settings {
                 ));
             }
         }
-        for handler in &self.handlers {
-            if Handler::is_placeholder_password(handler.password.expose()) {
-                insecure_fields.push(format!("handlers[{}].password", handler.path));
-            }
-        }
         if Publisher::is_placeholder_domain(&self.publisher.domain) {
             insecure_fields.push("publisher.domain".to_owned());
         }
@@ -4409,22 +4341,6 @@ impl Settings {
         }
         if Publisher::is_placeholder_origin_url(&self.publisher.origin_url) {
             insecure_fields.push("publisher.origin_url".to_owned());
-        }
-        // Checked whenever the block is present, not just when it is enabled:
-        // the key rotate/deactivate admin routes are registered unconditionally
-        // and read these store IDs without consulting `enabled`, so placeholder
-        // IDs behind a disabled block would still reach key management at
-        // runtime. Surrounding whitespace is rejected too: the placeholder check
-        // trims for comparison but the raw value is what `signing_store_ids`
-        // forwards to `KeyRotationManager`, so a padded id would validate yet
-        // reach the management API unusable.
-        if let Some(request_signing) = &self.request_signing {
-            if RequestSigning::is_unusable_store_id(&request_signing.config_store_id) {
-                insecure_fields.push("request_signing.config_store_id".to_owned());
-            }
-            if RequestSigning::is_unusable_store_id(&request_signing.secret_store_id) {
-                insecure_fields.push("request_signing.secret_store_id".to_owned());
-            }
         }
 
         if insecure_fields.is_empty() {
@@ -4478,159 +4394,6 @@ impl Settings {
     #[must_use]
     pub fn asset_route_for_path(&self, path: &str) -> Option<&ProxyAssetRoute> {
         self.proxy.asset_route_for_path(path)
-    }
-
-    /// Resolve the first handler whose regex matches the request path.
-    ///
-    /// # Errors
-    ///
-    /// Returns a configuration error if any handler regex does not compile.
-    pub fn handler_for_path(
-        &self,
-        path: &str,
-    ) -> Result<Option<&Handler>, Report<TrustedServerError>> {
-        for handler in &self.handlers {
-            if handler.matches_path(path)? {
-                return Ok(Some(handler));
-            }
-        }
-
-        Ok(None)
-    }
-
-    /// Returns whether `path` is within the reserved Trusted Server admin
-    /// namespace.
-    #[must_use]
-    pub(crate) fn is_admin_path(path: &str) -> bool {
-        path == "/_ts/admin" || path.starts_with("/_ts/admin/")
-    }
-
-    /// Known admin endpoint paths that must be covered by a handler.
-    ///
-    /// [`from_toml`](Self::from_toml) rejects configurations
-    /// where any of these paths lack a matching handler, ensuring admin
-    /// endpoints are always protected by authentication.
-    /// Update [`ADMIN_ENDPOINTS`](Self::ADMIN_ENDPOINTS) when adding new
-    /// admin routes to `crates/trusted-server-adapter-fastly/src/app.rs`.
-    ///
-    /// The `/_ts/admin/ec/{id}` entry is the canonical router pattern. Its
-    /// coverage is checked via [`admin_auth_probes`](Self::admin_auth_probes),
-    /// while validation errors continue to report this operator-facing route
-    /// template.
-    pub(crate) const ADMIN_ENDPOINTS: &[&str] = &[
-        "/_ts/admin/keys/rotate",
-        "/_ts/admin/keys/deactivate",
-        "/_ts/admin/ec",
-        "/_ts/admin/ec/{id}",
-        "/_ts/admin/eids",
-        "/_ts/admin/cache/purge",
-    ];
-
-    /// Probes that establish handler coverage for the dynamic
-    /// `/_ts/admin/ec/{id}` route.
-    ///
-    /// Coverage cannot be sampled: the router accepts any single segment after
-    /// `/_ts/admin/ec/` and basic auth runs on the raw path before routing, so
-    /// a handler that matches only some ID shapes leaves the rest of the route
-    /// surface — including malformed IDs, which still reach the admin handler —
-    /// unauthenticated at configuration time and fail-closed at runtime.
-    ///
-    /// Both probes must match the same configuration for the route to count as
-    /// covered. The bare prefix rejects handlers anchored to specific ID
-    /// shapes; the concrete ID rejects handlers anchored to the prefix itself
-    /// (`^/_ts/admin/ec/$`). Together they admit only prefix-level matchers
-    /// such as `^/_ts/admin` or `^/_ts/admin/ec/`.
-    const ADMIN_EC_ID_AUTH_PROBES: [&str; 2] = [
-        "/_ts/admin/ec/",
-        concat!(
-            "/_ts/admin/ec/",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            ".Ab12Z9",
-        ),
-    ];
-
-    fn admin_auth_probes(path: &'static str) -> [&'static str; 2] {
-        match path {
-            "/_ts/admin/ec/{id}" => Self::ADMIN_EC_ID_AUTH_PROBES,
-            path => [path, path],
-        }
-    }
-
-    /// Returns admin endpoint paths that no configured handler covers.
-    ///
-    /// Called during settings finalization to enforce that every admin endpoint
-    /// has a handler. An empty return
-    /// value means all admin endpoints are properly covered.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TrustedServerError::Configuration`] if any handler has an invalid path regex.
-    pub(crate) fn uncovered_admin_endpoints(
-        &self,
-    ) -> Result<Vec<&'static str>, Report<TrustedServerError>> {
-        let mut uncovered = Vec::new();
-        for &path in Self::ADMIN_ENDPOINTS {
-            let mut covered = true;
-            for probe in Self::admin_auth_probes(path) {
-                let mut probe_covered = false;
-                for handler in &self.handlers {
-                    if handler.matches_path(probe)? {
-                        probe_covered = true;
-                        break;
-                    }
-                }
-                covered &= probe_covered;
-            }
-            if !covered {
-                uncovered.push(path);
-            }
-        }
-        Ok(uncovered)
-    }
-
-    /// Validates that every admin endpoint is covered by at least one handler.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TrustedServerError::Configuration`] listing any uncovered
-    /// admin endpoints.
-    pub(crate) fn validate_admin_coverage(&self) -> Result<(), Report<TrustedServerError>> {
-        let uncovered = self.uncovered_admin_endpoints()?;
-        if uncovered.is_empty() {
-            return Ok(());
-        }
-        Err(Report::new(TrustedServerError::Configuration {
-            message: format!(
-                "No handler covers admin endpoint(s): {}. \
-                 Add a [[handlers]] entry with a path regex matching /_ts/admin/ \
-                 to protect admin access.",
-                uncovered.join(", ")
-            ),
-        }))
-    }
-
-    /// Rejects placeholder and well-known weak handler passwords.
-    ///
-    /// Applies to every handler rather than to handlers inferred to cover an
-    /// admin endpoint: handler selection is first-match-wins over operator
-    /// regexes, so a narrow handler can shadow the admin namespace for paths no
-    /// probe enumerates. Handlers are Trusted Server's own basic-auth gates, so
-    /// a placeholder password is never valid on any of them.
-    pub(crate) fn validate_admin_handler_passwords(
-        &self,
-    ) -> Result<(), Report<TrustedServerError>> {
-        for handler in &self.handlers {
-            if is_admin_placeholder_password(handler.password.expose()) {
-                return Err(Report::new(TrustedServerError::Configuration {
-                    message: format!(
-                        "Handler `{}` uses a placeholder password; configure a strong secret",
-                        handler.path
-                    ),
-                }));
-            }
-        }
-
-        Ok(())
     }
 
     /// Every section that selects modules, with its name: `[proxy]`,
@@ -5014,14 +4777,6 @@ fn validate_proxy_origin_url(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-fn validate_path(value: &str) -> Result<(), ValidationError> {
-    Regex::new(value).map(|_| ()).map_err(|err| {
-        let mut validation_error = ValidationError::new("invalid_regex");
-        validation_error.add_param("value".into(), &value);
-        validation_error.add_param("message".into(), &err.to_string());
-        validation_error
-    })
-}
 fn from_value_or_str<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
@@ -5435,7 +5190,7 @@ module = \"none\"",
     // hand-written `Debug` impl prints only integration IDs, never values.
     //
     // Do not use `..Struct::default()` anywhere in this function. A default
-    // spread would let a new secret field be added to `Handler`,
+    // spread would let a new secret field be added to `EcPartner`,
     // `TinybirdSettings`, or any other struct built here without forcing
     // anyone to consider it. The compile break is the prompt; the canary
     // list below is still maintained by hand. List every field explicitly.
@@ -5443,8 +5198,6 @@ module = \"none\"",
     fn settings_debug_output_redacts_every_secret_field() {
         const CANARY_PROXY_SECRET: &str = "CANARY-PROXY-SECRET-0123456789";
         const CANARY_EC_PASSPHRASE: &str = "CANARY-EC-PASSPHRASE-0123456789";
-        const CANARY_HANDLER_USERNAME: &str = "CANARY-HANDLER-USERNAME-0123456789";
-        const CANARY_HANDLER_PASSWORD: &str = "CANARY-HANDLER-PASSWORD-0123456789";
         const CANARY_EC_PARTNER_API_TOKEN: &str = "CANARY-EC-PARTNER-API-TOKEN-0123456789";
         const CANARY_EC_PARTNER_TS_PULL_TOKEN: &str = "CANARY-EC-PARTNER-TS-PULL-TOKEN-0123456789";
         const CANARY_TRUSTED_CLIENT_IP_SHARED_SECRET: &str =
@@ -5460,13 +5213,6 @@ module = \"none\"",
 
         settings.publisher.proxy_secret = Redacted::new(CANARY_PROXY_SECRET.to_string());
         select_hmac_module(&mut settings.ec, HMAC_MODULE_KEY, CANARY_EC_PASSPHRASE);
-
-        settings.handlers = vec![Handler {
-            path: "^/secure".to_string(),
-            username: Redacted::new(CANARY_HANDLER_USERNAME.to_string()),
-            password: Redacted::new(CANARY_HANDLER_PASSWORD.to_string()),
-            regex: OnceLock::new(),
-        }];
 
         settings.ec.partners = vec![EcPartner {
             name: "canary-partner".to_string(),
@@ -5533,15 +5279,13 @@ module = \"none\"",
             "should redact secret fields in Settings debug output"
         );
         assert!(
-            debug.contains("^/secure"),
-            "should leave non-secret handler path visible in debug output"
+            debug.contains("canary-partner.example"),
+            "should leave a non-secret value visible in debug output"
         );
 
         let canaries = [
             ("publisher.proxy_secret", CANARY_PROXY_SECRET),
             ("ec.hmac.passphrase", CANARY_EC_PASSPHRASE),
-            ("handlers[].username", CANARY_HANDLER_USERNAME),
-            ("handlers[].password", CANARY_HANDLER_PASSWORD),
             ("ec.partners[].api_token", CANARY_EC_PARTNER_API_TOKEN),
             (
                 "ec.partners[].ts_pull_token",
@@ -5977,6 +5721,140 @@ module = \"none\"",
                 "should name the placeholder trusted client IP shared secret field"
             );
         }
+    }
+
+    /// The shared fixture with one `[[handlers]]` entry ahead of everything
+    /// else, as a configuration written for a build that asked for passwords
+    /// carries it.
+    fn settings_str_with_a_handler() -> String {
+        format!(
+            "[[handlers]]\npath = \"^/_ts/admin\"\nusername = \"admin\"\n\
+             password = \"admin-pass\"\n{}",
+            crate_test_settings_str()
+        )
+    }
+
+    #[test]
+    fn toml_settings_refuse_a_handlers_list_with_directions() {
+        let error = Settings::from_toml(&settings_str_with_a_handler())
+            .expect_err("should refuse a configuration that still gates a path");
+
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("`[[handlers]]` is not read"),
+            "should say the list is not read: {rendered}"
+        );
+        assert!(
+            rendered.contains("ts keys") && rendered.contains("ts cache purge"),
+            "should say where administration went: {rendered}"
+        );
+    }
+
+    #[test]
+    fn json_settings_refuse_a_handlers_list_with_directions() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should load the test settings fixture");
+        let mut value = serde_json::to_value(settings)
+            .expect("should serialize the test settings fixture to JSON");
+        value["handlers"] = json!([
+            { "path": "^/secure", "username": "user", "password": "handler_password" },
+        ]);
+
+        let error = Settings::from_json_value(value)
+            .expect_err("should refuse a stored document that still gates a path");
+
+        assert!(
+            format!("{error:?}").contains("`[[handlers]]` is not read"),
+            "should say the list is not read: {error:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_handlers_list_is_refused_too() {
+        let toml = format!("handlers = []\n{}", crate_test_settings_str());
+
+        let error = Settings::from_toml(&toml).expect_err("should refuse the key itself");
+
+        assert!(
+            format!("{error:?}").contains("`[[handlers]]` is not read"),
+            "should say the list is not read: {error:?}"
+        );
+    }
+
+    #[test]
+    fn settings_are_written_without_a_handlers_list() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should load the test settings fixture");
+
+        let value = serde_json::to_value(&settings).expect("should serialize the settings");
+
+        assert!(
+            value.get("handlers").is_none(),
+            "should write nothing a later read would refuse"
+        );
+    }
+
+    #[test]
+    fn toml_settings_refuse_a_signing_store_id_with_directions() {
+        for key in ["config_store_id", "secret_store_id"] {
+            let fixture = crate_test_settings_str();
+            assert!(
+                fixture.contains("[request_signing]\n"),
+                "the fixture should have the section the key is added to"
+            );
+            let toml = fixture.replace(
+                "[request_signing]\n",
+                &format!("[request_signing]\n{key} = \"01GEXAMPLE\"\n"),
+            );
+
+            let error = Settings::from_toml(&toml).expect_err("should refuse the removed key");
+
+            let rendered = format!("{error:?}");
+            assert!(
+                rendered.contains("does not take `config_store_id` or `secret_store_id`"),
+                "should say the key is not read, for {key}: {rendered}"
+            );
+            assert!(
+                rendered.contains("ts keys rotate"),
+                "should say where the ids go, for {key}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_settings_refuse_a_signing_store_id_with_directions() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should load the test settings fixture");
+        let mut value = serde_json::to_value(settings)
+            .expect("should serialize the test settings fixture to JSON");
+        value["request_signing"]["secret_store_id"] = json!("01GEXAMPLE");
+
+        let error = Settings::from_json_value(value).expect_err("should refuse the removed key");
+
+        assert!(
+            format!("{error:?}").contains("--secret-store-id"),
+            "should say where the id goes: {error:?}"
+        );
+    }
+
+    #[test]
+    fn request_signing_is_written_as_enabled_alone() {
+        let mut settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should load the test settings fixture");
+        settings.request_signing = Some(RequestSigning::new(true));
+
+        let value = serde_json::to_value(&settings).expect("should serialize the settings");
+
+        assert_eq!(
+            value["request_signing"],
+            json!({ "enabled": true }),
+            "should write nothing a later read would refuse"
+        );
+        let read = Settings::from_json_value(value).expect("should read what was written");
+        assert!(
+            read.request_signing.is_some_and(|signing| signing.enabled),
+            "should keep request signing on across the round trip"
+        );
     }
 
     #[test]
@@ -7718,18 +7596,6 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
-    fn prepare_runtime_rejects_invalid_handler_regex() {
-        let toml_str = crate_test_settings_str().replace(r#"path = "^/secure""#, r#"path = "(""#);
-
-        let err = Settings::from_toml(&toml_str).expect_err("should reject invalid handler regex");
-        assert!(
-            err.to_string()
-                .contains("Handler path regex `(` failed to compile"),
-            "should describe the invalid handler regex"
-        );
-    }
-
-    #[test]
     fn test_settings_missing_required_fields() {
         let re = Regex::new(r"origin_url = .*").expect("regex should compile");
 
@@ -7936,36 +7802,6 @@ source_domain = "partner.example.com"
         );
     }
 
-    #[test]
-    fn is_placeholder_handler_password_rejects_known_template_value() {
-        assert!(
-            Handler::is_placeholder_password("replace-with-admin-password-32-bytes"),
-            "init-template handler password should be rejected"
-        );
-    }
-
-    #[test]
-    fn reject_placeholder_secrets_includes_handler_passwords() {
-        let mut settings =
-            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
-        settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
-        select_hmac_module(
-            &mut settings.ec,
-            HMAC_MODULE_KEY,
-            "test-secret-key-32-bytes-minimum",
-        );
-        settings.handlers[0].password =
-            Redacted::new("replace-with-admin-password-32-bytes".to_owned());
-
-        let err = settings
-            .reject_placeholder_secrets()
-            .expect_err("should reject placeholder handler password");
-        assert!(
-            format!("{err:?}").contains("handlers"),
-            "error should mention handler password field"
-        );
-    }
-
     fn test_partner_with_pull_token(ts_pull_token: &str) -> EcPartner {
         test_partner_with_tokens(None, ts_pull_token)
     }
@@ -8044,26 +7880,6 @@ source_domain = "partner.example.com"
     }
 
     #[test]
-    fn is_unusable_store_id_rejects_placeholders_empty_and_padded_values() {
-        for placeholder in RequestSigning::STORE_ID_PLACEHOLDERS {
-            assert!(
-                RequestSigning::is_unusable_store_id(placeholder),
-                "should reject placeholder store id '{placeholder}'"
-            );
-        }
-        for bad in ["", "   ", " 01GCFG ", "01GCFG "] {
-            assert!(
-                RequestSigning::is_unusable_store_id(bad),
-                "should reject unusable store id '{bad}'"
-            );
-        }
-        assert!(
-            !RequestSigning::is_unusable_store_id("01GCFG"),
-            "should accept a clean store id"
-        );
-    }
-
-    #[test]
     fn test_settings_empty_toml() {
         let toml_str = "";
         let settings = Settings::from_toml(toml_str);
@@ -8089,83 +7905,6 @@ source_domain = "partner.example.com"
 
         let settings = Settings::from_toml(&toml_str);
         assert!(settings.is_err(), "Should fail when sections are missing");
-    }
-
-    #[test]
-    fn test_handlers_override_with_env() {
-        let toml_str = crate_test_settings_str();
-
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        // Override handler 0 via env vars
-        let path_key_0 = format!(
-            "{}{}HANDLERS{}0{}PATH",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let username_key_0 = format!(
-            "{}{}HANDLERS{}0{}USERNAME",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let password_key_0 = format!(
-            "{}{}HANDLERS{}0{}PASSWORD",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        // Admin handler at index 1 (required for admin endpoint coverage)
-        let path_key_1 = format!(
-            "{}{}HANDLERS{}1{}PATH",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let username_key_1 = format!(
-            "{}{}HANDLERS{}1{}USERNAME",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let password_key_1 = format!(
-            "{}{}HANDLERS{}1{}PASSWORD",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        temp_env::with_vars(
-            [
-                (origin_key, Some("https://origin.test-publisher.com")),
-                (path_key_0, Some("^/env-handler")),
-                (username_key_0, Some("env-user")),
-                (password_key_0, Some("env-pass")),
-                (path_key_1, Some("^/_ts/admin")),
-                (username_key_1, Some("admin")),
-                (password_key_1, Some("admin-pass")),
-            ],
-            || {
-                let settings =
-                    Settings::from_toml_and_env(&toml_str).expect("Settings should load from env");
-                assert_eq!(settings.handlers.len(), 2);
-                let handler = &settings.handlers[0];
-                assert_eq!(handler.path, "^/env-handler");
-                assert_eq!(handler.username.expose(), "env-user");
-                assert_eq!(handler.password.expose(), "env-pass");
-            },
-        );
     }
 
     #[test]
@@ -8312,8 +8051,10 @@ source_domain = "partner.example.com"
         );
     }
 
+    /// An environment variable can give a handler to a configuration that
+    /// carries none, and that is refused as the list itself is.
     #[test]
-    fn test_invalid_handler_override_fails_during_runtime_preparation() {
+    fn a_handler_given_by_an_environment_variable_is_refused_too() {
         let toml_str = crate_test_settings_str();
 
         let origin_key = format!(
@@ -8334,9 +8075,14 @@ source_domain = "partner.example.com"
             origin_key,
             Some("https://origin.test-publisher.com"),
             || {
-                temp_env::with_var(path_key, Some("("), || {
-                    let _ = Settings::from_toml_and_env(&toml_str)
-                        .expect_err("should reject invalid handler regex override");
+                temp_env::with_var(path_key, Some("^/secure"), || {
+                    let error = Settings::from_toml_and_env(&toml_str)
+                        .expect_err("should refuse a handler an environment variable gives");
+
+                    assert!(
+                        format!("{error:?}").contains("`[[handlers]]` is not read"),
+                        "should say the list is not read: {error:?}"
+                    );
                 });
             },
         );
@@ -8610,11 +8356,6 @@ source_domain = "partner.example.com"
 
         let from_toml = Settings::from_toml(
             r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
             [publisher]
             domain = "example.com"
             cookie_domain = ".example.com"
@@ -8646,11 +8387,6 @@ source_domain = "partner.example.com"
         // silently breaking traffic.
         let result = Settings::from_toml(
             r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
             [publisher]
             domain = "example.com"
             cookie_domain = ".example.com"
@@ -10146,8 +9882,6 @@ source_domain = "partner.example.com"
         );
     }
 
-    // --- admin endpoint coverage ---
-
     #[test]
     fn test_publisher_rejects_cookie_domain_with_metacharacters() {
         for bad_domain in [
@@ -10174,356 +9908,9 @@ source_domain = "partner.example.com"
         );
     }
 
-    /// Helper that returns a settings TOML string WITHOUT any admin handler,
-    /// for tests that need to verify uncovered-admin-endpoint behaviour.
-    fn settings_str_without_admin_handler() -> String {
-        r#"
-            [[handlers]]
-            path = "^/secure"
-            username = "user"
-            password = "pass"
-
-            [publisher]
-            domain = "test-publisher.com"
-            cookie_domain = ".test-publisher.com"
-            origin_url = "https://origin.test-publisher.com"
-            proxy_secret = "unit-test-proxy-secret"
-
-            [ec]
-            module = "hmac"
-
-            [ec.hmac]
-            passphrase = "test-secret-key-32-bytes-minimum"
-
-            [geo]
-            assume_single_jurisdiction = true
-
-            [request_signing]
-            config_store_id = "test-config-store-id"
-            secret_store_id = "test-secret-store-id"
-        "#
-        .to_string()
-    }
-
-    #[test]
-    fn uncovered_admin_endpoints_returns_all_when_no_handler_covers_admin() {
-        // Deserialize directly to bypass from_toml's admin validation,
-        // since this test exercises uncovered_admin_endpoints itself.
-        let settings: Settings =
-            toml::from_str(&settings_str_without_admin_handler()).expect("should deserialize TOML");
-        let uncovered = settings
-            .uncovered_admin_endpoints()
-            .expect("should check admin coverage");
-        assert_eq!(
-            uncovered,
-            vec![
-                "/_ts/admin/keys/rotate",
-                "/_ts/admin/keys/deactivate",
-                "/_ts/admin/ec",
-                "/_ts/admin/ec/{id}",
-                "/_ts/admin/eids",
-                "/_ts/admin/cache/purge",
-            ],
-            "should report every admin endpoint as uncovered"
-        );
-    }
-
-    #[test]
-    fn uncovered_admin_endpoints_returns_empty_when_handler_covers_admin() {
-        let settings = create_test_settings();
-        let uncovered = settings
-            .uncovered_admin_endpoints()
-            .expect("should check admin coverage");
-        assert!(
-            uncovered.is_empty(),
-            "should report no uncovered admin endpoints when handler covers /_ts/admin"
-        );
-    }
-
-    #[test]
-    fn uncovered_admin_endpoints_detects_partial_coverage() {
-        let toml_str = settings_str_without_admin_handler()
-            + r#"
-            [[handlers]]
-            path = "^/_ts/admin/keys/rotate$"
-            username = "admin"
-            password = "secret"
-            "#;
-        // Deserialize directly to bypass from_toml's admin validation,
-        // since this test exercises uncovered_admin_endpoints itself.
-        let settings: Settings = toml::from_str(&toml_str).expect("should deserialize TOML");
-        let uncovered = settings
-            .uncovered_admin_endpoints()
-            .expect("should check admin coverage");
-        assert_eq!(
-            uncovered,
-            vec![
-                "/_ts/admin/keys/deactivate",
-                "/_ts/admin/ec",
-                "/_ts/admin/ec/{id}",
-                "/_ts/admin/eids",
-                "/_ts/admin/cache/purge",
-            ],
-            "should detect the admin endpoints not covered by the narrow handler"
-        );
-    }
-
-    #[test]
-    fn from_toml_rejects_literal_parameter_template_auth_coverage() {
-        let toml_str = crate_test_settings_str().replace(
-            r#"path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass""#,
-            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids|cache/purge)$"
-            username = "admin"
-            password = "strong-test-password"
-
-            [[handlers]]
-            path = "^/_ts/admin/ec/[{]id[}]$"
-            username = "admin"
-            password = "strong-test-password""#,
-        );
-
-        let error = Settings::from_toml(&toml_str)
-            .expect_err("should reject literal parameter-template auth coverage");
-        let message = format!("{error:?}");
-        assert!(
-            message.contains("/_ts/admin/ec/{id}"),
-            "should identify the concrete EC route as uncovered, got: {message}"
-        );
-    }
-
-    #[test]
-    fn from_toml_rejects_lowercase_only_dynamic_admin_ec_auth_coverage() {
-        let toml_str = crate_test_settings_str().replace(
-            r#"path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass""#,
-            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids|cache/purge)$"
-            username = "admin"
-            password = "strong-test-password"
-
-            [[handlers]]
-            path = "^/_ts/admin/ec/[a-f0-9]{64}[.][a-z0-9]{6}$"
-            username = "admin"
-            password = "strong-test-password""#,
-        );
-
-        let error = Settings::from_toml(&toml_str)
-            .expect_err("should reject lowercase-only dynamic EC auth coverage");
-        let message = format!("{error:?}");
-        assert!(
-            message.contains("/_ts/admin/ec/{id}"),
-            "should identify the mixed-case EC route as uncovered, got: {message}"
-        );
-    }
-
-    #[test]
-    fn from_toml_rejects_placeholder_password_on_shadowing_admin_handler() {
-        // Handler selection is first-match-wins, so a narrow handler placed
-        // ahead of the admin matcher governs the EC IDs it matches. No probe
-        // enumerates those IDs, so the placeholder check cannot be limited to
-        // handlers inferred to cover an admin endpoint.
-        let toml_str = crate_test_settings_str().replace(
-            r#"path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass""#,
-            r#"path = "^/_ts/admin/ec/[a-f0-9]{64}[.]zzzzzz$"
-            username = "admin"
-            password = "change-me-admin-password"
-
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "strong-test-password""#,
-        );
-
-        let error = Settings::from_toml(&toml_str)
-            .expect_err("should reject placeholder password on shadowing admin handler");
-        let message = format!("{error:?}");
-        assert!(
-            message.contains("placeholder password"),
-            "should identify the placeholder handler password, got: {message}"
-        );
-    }
-
-    #[test]
-    fn from_toml_rejects_weak_password_on_non_admin_handler() {
-        let toml_str = crate_test_settings_str().replace(
-            r#"path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass""#,
-            r#"path = "^/_ts/admin"
-            username = "admin"
-            password = "strong-test-password"
-
-            [[handlers]]
-            path = "^/private"
-            username = "admin"
-            password = "changeme""#,
-        );
-
-        let error = Settings::from_toml(&toml_str)
-            .expect_err("should reject a weak password on any handler");
-        let message = format!("{error:?}");
-        assert!(
-            message.contains("placeholder password"),
-            "should identify the weak handler password, got: {message}"
-        );
-    }
-
-    #[test]
-    fn from_toml_rejects_sampled_id_only_dynamic_admin_ec_auth_coverage() {
-        // A handler anchored to the full EC ID grammar still leaves the rest of
-        // the route surface (malformed IDs, which the router accepts and the
-        // admin handler rejects with 400) unauthenticated, so coverage must not
-        // be inferred from ID-shaped samples.
-        let toml_str = crate_test_settings_str().replace(
-            r#"path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass""#,
-            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids|cache/purge)$"
-            username = "admin"
-            password = "strong-test-password"
-
-            [[handlers]]
-            path = "^/_ts/admin/ec/[a-f0-9]{64}[.][A-Za-z0-9]{6}$"
-            username = "admin"
-            password = "strong-test-password""#,
-        );
-
-        let error = Settings::from_toml(&toml_str)
-            .expect_err("should reject ID-sampled dynamic EC auth coverage");
-        let message = format!("{error:?}");
-        assert!(
-            message.contains("/_ts/admin/ec/{id}"),
-            "should identify the dynamic EC route as uncovered, got: {message}"
-        );
-    }
-
-    #[test]
-    fn from_toml_rejects_prefix_anchored_admin_ec_auth_coverage() {
-        // `^/_ts/admin/ec/$` matches the prefix probe but no actual lookup.
-        let toml_str = crate_test_settings_str().replace(
-            r#"path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass""#,
-            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids|cache/purge)$"
-            username = "admin"
-            password = "strong-test-password"
-
-            [[handlers]]
-            path = "^/_ts/admin/ec/$"
-            username = "admin"
-            password = "strong-test-password""#,
-        );
-
-        let error = Settings::from_toml(&toml_str)
-            .expect_err("should reject prefix-anchored dynamic EC auth coverage");
-        let message = format!("{error:?}");
-        assert!(
-            message.contains("/_ts/admin/ec/{id}"),
-            "should identify the dynamic EC route as uncovered, got: {message}"
-        );
-    }
-
-    #[test]
-    fn from_toml_accepts_prefix_matcher_admin_ec_auth_coverage() {
-        let toml_str = crate_test_settings_str().replace(
-            r#"path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass""#,
-            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids|cache/purge)$"
-            username = "admin"
-            password = "strong-test-password"
-
-            [[handlers]]
-            path = "^/_ts/admin/ec/"
-            username = "admin"
-            password = "strong-test-password""#,
-        );
-
-        Settings::from_toml(&toml_str)
-            .expect("should accept a prefix-level matcher for the dynamic EC route");
-    }
-
-    #[test]
-    fn from_toml_and_env_rejects_config_without_admin_handler() {
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        temp_env::with_var(
-            origin_key,
-            Some("https://origin.test-publisher.com"),
-            || {
-                let result = Settings::from_toml_and_env(&settings_str_without_admin_handler());
-                assert!(
-                    result.is_err(),
-                    "should reject configuration when admin endpoints are not covered"
-                );
-                let err = format!("{:?}", result.unwrap_err());
-                assert!(
-                    err.contains("No handler covers admin endpoint"),
-                    "error should mention uncovered admin endpoints, got: {err}"
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn from_toml_rejects_admin_handler_placeholder_password() {
-        let toml_str = crate_test_settings_str()
-            .replace(r#"password = "admin-pass""#, r#"password = "changeme""#);
-
-        let result = Settings::from_toml(&toml_str);
-        assert!(
-            result.is_err(),
-            "should reject placeholder password on admin handler"
-        );
-        let err = format!("{:?}", result.expect_err("should reject placeholder"));
-        assert!(
-            err.contains("placeholder password"),
-            "error should mention placeholder admin password, got: {err}"
-        );
-    }
-
-    #[test]
-    fn from_toml_accepts_non_placeholder_admin_password() {
-        let settings = Settings::from_toml(&crate_test_settings_str())
-            .expect("should accept non-placeholder admin password");
-        assert_eq!(settings.handlers.len(), 2, "should parse handlers");
-    }
-
-    #[test]
-    fn from_toml_rejects_config_without_admin_handler() {
-        let result = Settings::from_toml(&settings_str_without_admin_handler());
-        assert!(
-            result.is_err(),
-            "should reject configuration when admin endpoints are not covered"
-        );
-        let err = format!("{:?}", result.expect_err("should be an error"));
-        assert!(
-            err.contains("No handler covers admin endpoint"),
-            "error should mention uncovered admin endpoints, got: {err}"
-        );
-    }
-
-    /// Verifies that [`Settings::ADMIN_ENDPOINTS`] stays in sync with the
-    /// admin route table in `crates/trusted-server-adapter-fastly/src/app.rs`.
-    ///
-    /// If this test fails, a route was added or removed in the Fastly
-    /// router without updating `ADMIN_ENDPOINTS` (or vice versa).
     #[test]
     fn settings_parses_creative_opportunities_section() {
         let toml = r#"
-[[handlers]]
-path = "^/_ts/admin"
-username = "admin"
-password = "unit-test-admin-secret"
-
 [publisher]
 domain = "example.com"
 cookie_domain = ".example.com"
@@ -10609,11 +9996,6 @@ formats = [{ width = 300, height = 250 }]
     #[test]
     fn settings_rejects_invalid_creative_opportunity_slot_id() {
         let toml = r#"
-[[handlers]]
-path = "^/_ts/admin"
-username = "admin"
-password = "unit-test-admin-secret"
-
 [publisher]
 domain = "example.com"
 cookie_domain = ".example.com"
@@ -10651,11 +10033,6 @@ formats = [{ width = 300, height = 250 }]
         // id injected via env is rejected by from_toml_and_env (the build-time
         // path uses the same validation against the merged config).
         let toml = r#"
-[[handlers]]
-path = "^/_ts/admin"
-username = "admin"
-password = "unit-test-admin-secret"
-
 [publisher]
 domain = "example.com"
 cookie_domain = ".example.com"
@@ -10699,11 +10076,6 @@ gam_network_id = "21765378893"
     fn creative_opportunity_settings_toml(slot_body: &str) -> String {
         format!(
             r#"
-[[handlers]]
-path = "^/_ts/admin"
-username = "admin"
-password = "unit-test-admin-secret"
-
 [publisher]
 domain = "example.com"
 cookie_domain = ".example.com"
@@ -10838,48 +10210,6 @@ formats = [{{ width = 300, height = 250 }}]
             !json.contains("module"),
             "an unset device selector should be omitted rather than serialized as null, got {json}"
         );
-    }
-
-    #[test]
-    fn admin_endpoints_match_fastly_router() {
-        let router_source = include_str!("../../trusted-server-adapter-fastly/src/app.rs");
-
-        for endpoint in Settings::ADMIN_ENDPOINTS {
-            assert!(
-                router_source.contains(endpoint),
-                "ADMIN_ENDPOINTS lists \"{endpoint}\" but it was not found in \
-                 crates/trusted-server-adapter-fastly/src/app.rs — remove it from ADMIN_ENDPOINTS or \
-                 add the route back to the router"
-            );
-        }
-
-        // Also verify we haven't missed any admin routes in the router.
-        // Best-effort: only detects string-literal routes in the NamedRoute
-        // table. If you define admin routes differently (e.g. via constants),
-        // add them to ADMIN_ENDPOINTS manually.
-        let admin_routes_in_router: Vec<&str> = router_source
-            .lines()
-            .filter_map(|line| {
-                let trimmed = line.trim();
-                // Route entries look like: path: "/_ts/admin/...",
-                if trimmed.starts_with("path: ") && trimmed.contains("\"/_ts/admin/") {
-                    let start = trimmed.find("\"/_ts/admin/")?;
-                    let rest = &trimmed[start + 1..];
-                    let end = rest.find('"')?;
-                    Some(&rest[..end])
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        for route in &admin_routes_in_router {
-            assert!(
-                Settings::ADMIN_ENDPOINTS.contains(route),
-                "Router has admin route \"{route}\" that is missing from \
-                 Settings::ADMIN_ENDPOINTS — add it to ensure auth coverage"
-            );
-        }
     }
 }
 

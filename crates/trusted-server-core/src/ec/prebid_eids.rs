@@ -51,17 +51,6 @@ enum DecodedCookieEids {
     Structured(Vec<StructuredCookieEid>),
 }
 
-pub(crate) struct DiagnosticEidSource {
-    pub(crate) source: String,
-    pub(crate) uids: Vec<String>,
-}
-
-pub(crate) struct PrebidEidAnalysis {
-    pub(crate) eids: Vec<Eid>,
-    pub(crate) diagnostic_sources: Vec<DiagnosticEidSource>,
-    pub(crate) updates: Vec<PartnerIdUpdate>,
-}
-
 /// Parses a `ts-eids` cookie value into OpenRTB-style `Eid` entries.
 ///
 /// Accepts both the current structured cookie format and the earlier legacy
@@ -97,27 +86,6 @@ fn decode_prebid_eids_cookie(cookie_value: &str) -> Result<DecodedCookieEids, St
 }
 
 impl DecodedCookieEids {
-    fn diagnostic_sources(&self) -> Vec<DiagnosticEidSource> {
-        match self {
-            Self::Legacy(entries) => entries
-                .iter()
-                .filter(|entry| !entry.source.is_empty())
-                .map(|entry| DiagnosticEidSource {
-                    source: entry.source.clone(),
-                    uids: vec![entry.id.clone()],
-                })
-                .collect(),
-            Self::Structured(entries) => entries
-                .iter()
-                .filter(|entry| !entry.source.is_empty())
-                .map(|entry| DiagnosticEidSource {
-                    source: entry.source.clone(),
-                    uids: entry.uids.iter().map(|uid| uid.id.clone()).collect(),
-                })
-                .collect(),
-        }
-    }
-
     fn into_openrtb(self) -> Vec<Eid> {
         match self {
             Self::Legacy(entries) => legacy_cookie_eids_to_openrtb(entries),
@@ -164,28 +132,12 @@ pub(crate) fn collect_prebid_eid_updates(
     cookie_value: &str,
     registry: &PartnerRegistry,
 ) -> Vec<PartnerIdUpdate> {
-    let Ok(analysis) = analyze_prebid_eids_cookie(cookie_value, registry) else {
+    let Ok(eids) = parse_prebid_eids_cookie(cookie_value) else {
         log::trace!("Prebid EIDs: failed to decode ts-eids cookie; dropping");
         return Vec::new();
     };
 
-    analysis.updates
-}
-
-pub(crate) fn analyze_prebid_eids_cookie(
-    cookie_value: &str,
-    registry: &PartnerRegistry,
-) -> Result<PrebidEidAnalysis, String> {
-    let decoded = decode_prebid_eids_cookie(cookie_value)?;
-    let diagnostic_sources = decoded.diagnostic_sources();
-    let eids = decoded.into_openrtb();
-    let updates = collect_prebid_eid_updates_from_eids(&eids, registry);
-
-    Ok(PrebidEidAnalysis {
-        eids,
-        diagnostic_sources,
-        updates,
-    })
+    collect_prebid_eid_updates_from_eids(&eids, registry)
 }
 
 fn collect_prebid_eid_updates_from_eids(
@@ -217,7 +169,7 @@ fn collect_prebid_eid_updates_from_eids(
     updates
 }
 
-pub(crate) fn dedupe_partner_updates(updates: Vec<PartnerIdUpdate>) -> Vec<PartnerIdUpdate> {
+fn dedupe_partner_updates(updates: Vec<PartnerIdUpdate>) -> Vec<PartnerIdUpdate> {
     let mut latest = std::collections::BTreeMap::new();
     for update in updates {
         latest.insert(update.partner_id, update.uid);
@@ -233,14 +185,14 @@ fn first_valid_uid(uids: &[Uid]) -> Option<&Uid> {
     uids.iter().find(|uid| is_valid_eid_uid(&uid.id))
 }
 
-pub(crate) fn is_valid_eid_uid(uid: &str) -> bool {
+fn is_valid_eid_uid(uid: &str) -> bool {
     !uid.trim().is_empty() && !eid_id_exceeds_size_limit(uid)
 }
 
 /// `SharedID` EID source domain used for partner registry lookup.
 const SHAREDID_SOURCE_DOMAIN: &str = "sharedid.org";
 
-pub(crate) fn collect_sharedid_update(
+fn collect_sharedid_update(
     cookie_value: &str,
     registry: &PartnerRegistry,
 ) -> Option<PartnerIdUpdate> {

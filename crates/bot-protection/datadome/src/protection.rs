@@ -600,8 +600,6 @@ fn is_internal_path(path: &str) -> bool {
         || path.starts_with("/first-party/")
         || path == "/.well-known/trusted-server.json"
         || path == "/verify-signature"
-        || path.starts_with("/admin/")
-        || path.starts_with("/_ts/admin/")
         || path == "/_ts/api/v1/identify"
         || path == "/_ts/api/v1/batch-sync"
 }
@@ -948,6 +946,27 @@ mod tests {
             .extensions()
             .get::<trusted_server_core::response_privacy::PersonalizedResponse>()
             .is_some()
+    }
+
+    #[test]
+    fn only_the_servers_own_paths_are_internal() {
+        for path in [
+            "/static/tsjs=tsjs-core.min.js",
+            "/integrations/example/script.js",
+            "/first-party/proxy",
+            "/.well-known/trusted-server.json",
+            "/verify-signature",
+            "/_ts/api/v1/identify",
+            "/_ts/api/v1/batch-sync",
+        ] {
+            assert!(is_internal_path(path), "{path} should skip protection");
+        }
+        for path in ["/", "/article", "/admin/", "/admin/login", "/wp-admin/"] {
+            assert!(
+                !is_internal_path(path),
+                "{path} is the publisher's own, so protection should be asked about it"
+            );
+        }
     }
 
     #[test]

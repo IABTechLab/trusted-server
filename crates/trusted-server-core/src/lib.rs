@@ -5,7 +5,6 @@
 //!
 //! # Modules
 //!
-//! - [`auth`]: Basic authentication enforcement helpers
 //! - [`constants`]: Application-wide constants and configuration values
 //! - [`cookies`]: Cookie parsing and generation utilities
 //! - [`error`]: Error types and error handling utilities
@@ -32,9 +31,8 @@
 pub(crate) mod asset_image_optimizer;
 pub mod auction;
 pub mod auction_config_types;
-pub mod auth;
 pub mod cache_policy;
-pub mod cache_purge;
+pub mod closed_paths;
 pub mod config;
 pub mod config_payload;
 pub mod consent;

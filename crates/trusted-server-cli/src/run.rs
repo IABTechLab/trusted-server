@@ -41,6 +41,9 @@ enum Command {
     Deploy(DeployArgs),
     /// Probe a deployed version until it reports healthy.
     Healthcheck(HealthcheckArgs),
+    /// Rotate and retire request signing keys, with a Fastly API token.
+    #[command(subcommand)]
+    Keys(crate::commands::keys::KeysCommand),
     /// Trusted Server Prebid commands.
     Prebid(PrebidArgs),
     /// Provision platform resources through a target adapter.
@@ -70,7 +73,7 @@ enum ConfigCommand {
     Gc(ConfigGcArgs),
     /// Push `trusted-server.toml`, with the permission policy file it names,
     /// as a blob envelope through `EdgeZero`, or under a Fastly `--key` of
-    /// its own with `--local`.
+    /// its own.
     Push(policy::PushArgs),
     /// Validate `edgezero.toml`, the typed Trusted Server config and, with
     /// `--permissions`, the permission policy file it names.
@@ -161,6 +164,9 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
         Command::Healthcheck(args) => {
             edgezero_cli::run_healthcheck(&args).map(|()| RunOutcome::Success)
         }
+        Command::Keys(command) => {
+            crate::commands::keys::run(&command).map(|()| RunOutcome::Success)
+        }
         Command::Prebid(prebid) => match prebid.command {
             PrebidCommand::Client(args) => {
                 let mut generator = NpmPrebidBundleGenerator;
@@ -182,7 +188,7 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
         Command::Cache(command) => {
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
-            crate::commands::cache::run(command, &mut out).map(|()| RunOutcome::Success)
+            crate::commands::cache::run(&command, &mut out).map(|()| RunOutcome::Success)
         }
         Command::Origin(command) => {
             let stdout = std::io::stdout();
@@ -202,6 +208,63 @@ mod tests {
 
     fn parse(args: &[&str]) -> Args {
         Args::try_parse_from(args).expect("should parse args")
+    }
+
+    #[test]
+    fn parses_cache_purge_with_its_service_and_one_scope() {
+        let args = parse(&[
+            "ts",
+            "cache",
+            "purge",
+            "--service-id",
+            "ExampleServiceId0123456",
+            "--page",
+            "https://example.com/article",
+        ]);
+        let Command::Cache(crate::commands::cache::CacheCommand::Purge(purge)) = args.command
+        else {
+            panic!("expected cache purge command");
+        };
+        assert_eq!(purge.service_id, "ExampleServiceId0123456");
+        assert_eq!(purge.page.as_deref(), Some("https://example.com/article"));
+        assert!(!purge.all, "should not also purge everything");
+
+        Args::try_parse_from([
+            "ts",
+            "cache",
+            "purge",
+            "--service-id",
+            "ExampleServiceId0123456",
+            "--all",
+            "--page",
+            "https://example.com/article",
+        ])
+        .expect_err("should refuse both scopes at once");
+    }
+
+    #[test]
+    fn parses_keys_rotate_with_its_stores_and_kid() {
+        let args = parse(&[
+            "ts",
+            "keys",
+            "rotate",
+            "--config-store-id",
+            "config-123",
+            "--secret-store-id",
+            "secret-456",
+            "--kid",
+            "ts-next",
+        ]);
+        let Command::Keys(crate::commands::keys::KeysCommand::Rotate(rotate)) = args.command else {
+            panic!("expected keys rotate command");
+        };
+        let rendered = format!("{rotate:?}");
+        assert!(
+            rendered.contains("config-123")
+                && rendered.contains("secret-456")
+                && rendered.contains("ts-next"),
+            "should carry both stores and the key id, got {rendered}"
+        );
     }
 
     #[test]

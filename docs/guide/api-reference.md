@@ -7,7 +7,7 @@ Quick reference for all Trusted Server HTTP endpoints.
 - [First-Party Endpoints](#first-party-endpoints) - Core ad serving and proxying
 - [Edge Cookie Endpoints](#edge-cookie-endpoints) - Identity sync and enrichment
 - [Request Signing](#request-signing-endpoints) - Cryptographic signing and key management
-- [Admin Diagnostics](#admin-diagnostic-endpoints) - Protected EC troubleshooting
+- [The Administration Prefix](#the-administration-prefix) - Paths answered here and never forwarded
 - [Inspection Endpoints](#inspection-endpoints) - What a deployment shows to anyone who asks
 - [TSJS Library](#tsjs-library-endpoint) - JavaScript library serving
 - [Utility Endpoints](#utility-endpoints) - Optional operational helpers
@@ -38,11 +38,6 @@ authority, scheme, and client-address headers in the innermost middleware.
 | normal  | `/.well-known/trusted-server.json`     | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/__ts/page-bids`                      | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/__ts/page-bids`                      | `OPTIONS`                                                  | literal        | `always`                              | guarded               | guarded               | guarded               | guarded               |
-| normal  | `/_ts/admin/ec/{id}`                   | `GET`                                                      | template       | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
-| normal  | `/_ts/admin/ec`                        | `GET`                                                      | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
-| normal  | `/_ts/admin/eids`                      | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
-| normal  | `/_ts/admin/keys/deactivate`           | `POST`                                                     | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
-| normal  | `/_ts/admin/keys/rotate`               | `POST`                                                     | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
 | normal  | `/_ts/api/v1/batch-sync`               | `POST`                                                     | literal        | `always`                              | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/api/v1/identify`                 | `GET`, `OPTIONS`                                           | literal        | `always`                              | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/clear-tester`                    | `GET`                                                      | literal        | `settings.tester_cookie.enabled`      | real                  | —                     | —                     | —                     |
@@ -55,8 +50,6 @@ authority, scheme, and client-address headers in the innermost middleware.
 | normal  | `/_ts/permissions.json`                | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/permissions`                     | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/set-tester`                      | `GET`                                                      | literal        | `settings.tester_cookie.enabled`      | real                  | —                     | —                     | —                     |
-| normal  | `/admin/keys/deactivate`               | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `always`                              | guarded               | guarded               | guarded               | guarded               |
-| normal  | `/admin/keys/rotate`                   | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `always`                              | guarded               | guarded               | guarded               | guarded               |
 | normal  | `/auction`                             | `POST`                                                     | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/first-party/click`                   | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/first-party/proxy-rebuild`           | `GET`, `POST`                                              | literal        | `always`                              | real                  | real                  | real                  | real                  |
@@ -83,9 +76,8 @@ Each endpoint contract below states authentication, request and response shape,
 status behavior, cache and CORS behavior, configuration gates, rate limiting,
 and an example or an explicit not-applicable value.
 
-`Auth: none` means that the endpoint has no built-in authentication. An
-operator can still wrap any path with a `[[handlers]]` Basic-auth rule. Unless
-an endpoint says otherwise, it has no endpoint-specific CORS policy and no
+`Auth: none` means that the endpoint has no built-in authentication. Unless an
+endpoint says otherwise, it has no endpoint-specific CORS policy and no
 in-process rate limiter. Responses still pass through the adapter's standard
 response finalizer. Upstream proxies can preserve selected upstream headers;
 that is not a blanket CORS grant.
@@ -122,15 +114,8 @@ Endpoint-specific CORS: `Access-Control-Allow-Origin: *`.
 
 ```json
 {
-  "masked": [
-    "handlers[0].password",
-    "handlers[0].path",
-    "handlers[0].username",
-    "publisher.origin_url",
-    "publisher.proxy_secret"
-  ],
+  "masked": ["publisher.origin_url", "publisher.proxy_secret"],
   "settings": {
-    "handlers": [{ "password": "XXXX", "path": "XXXX", "username": "XXXX" }],
     "publisher": {
       "cookie_domain": ".example.com",
       "domain": "example.com",
@@ -760,7 +745,7 @@ curl -I "https://edge.example.com/first-party/click?tsurl=https://advertiser.com
 
 URL signing endpoint. Returns a signed first-party proxy URL for a valid HTTP or HTTPS target. When `proxy.allowed_domains` is non-empty, the endpoint checks the parsed target host before signing. An empty list permits every valid host.
 
-**Contract:** Auth: none unless an operator adds a handler. GET accepts a `url`
+**Contract:** Auth: none. GET accepts a `url`
 query value; POST accepts `{ "url": "..." }` and is limited to 64 KiB. `200`
 returns `{href, base}` and gives `href` a 30-second `tsexp`. A disallowed host
 returns `403`, an oversized POST returns `413`, and malformed/unsupported URLs
@@ -978,205 +963,21 @@ curl -X POST https://edge.example.com/verify-signature \
 
 ---
 
-### POST /\_ts/admin/keys/rotate
+### Key rotation
 
-Generates and activates a new signing key.
-
-**Authentication:** Requires basic auth (configured via `handlers` in `trusted-server.toml`)
-
-**Contract:** Fastly implements this route; Axum, Cloudflare, and Spin return
-`501`. Startup requires complete Basic-auth coverage of `/_ts/admin`. The body
-is empty or JSON `{ "kid": "..." }`, limited to 4 KiB. A supplied KID must be
-1–128 characters, use ASCII alphanumerics plus `-_.:`, and start with a
-lowercase ASCII letter. Success returns `200`; invalid KIDs return structured
-`400`; store/rotation failures return structured `500`. Successful and failure
-bodies use the same schema and set `success` accordingly. The handler defines
-no dedicated cache, CORS, or rate-limit policy.
-
-**Request Body (Optional):**
-
-```json
-{
-  "kid": "custom-key-id"
-}
-```
-
-If omitted, auto-generates date-based ID (e.g., `ts-2025-01-15-A`).
-
-**Response:**
-
-```json
-{
-  "success": true,
-  "message": "Key rotated successfully",
-  "new_kid": "ts-2025-01-15-A",
-  "previous_kid": "ts-2025-01-14-A",
-  "active_kids": ["ts-2025-01-15-A", "ts-2025-01-14-A"],
-  "jwk": { "kty": "OKP", "crv": "Ed25519", "kid": "ts-2025-01-15-A" }
-}
-```
-
-**Example:**
-
-```bash
-curl -X POST https://edge.example.com/_ts/admin/keys/rotate \
-  -u admin:password \
-  -H "Content-Type: application/json"
-```
-
-**Behavior:**
-
-- Keeps both new and previous key active
-- Updates `current-kid` to new key
-- Preserves old key for graceful transition
-
-See [Key Rotation Guide](./key-rotation.md) for workflow details.
+Key rotation has no HTTP route. An operator rotates and retires keys with
+`ts keys rotate` and `ts keys deactivate`, which run the rotation library in
+core against the signing stores. See [Key Rotation](./key-rotation.md).
 
 ---
 
-### POST /\_ts/admin/keys/deactivate
+## The Administration Prefix
 
-Deactivates or deletes a signing key.
+The whole `/_ts/admin` prefix is closed. No route is served beneath it, and a request to any path beneath it, as sent or percent-encoded (`/_ts/admin%2Fec`), is answered here with `404` and `Cache-Control: no-store` before the publisher fallback, so an `Authorization` header and a request body sent to it never reach the publisher's origin. The `/admin/keys` aliases outside `/_ts` are closed the same way.
 
-**Authentication:** Requires basic auth
+No request is asked for a password.
 
-**Contract:** Fastly implements this route; Axum, Cloudflare, and Spin return
-`501`. The JSON body is limited to 4 KiB. Deactivation accepts legacy KIDs that
-satisfy the 1–128 character and safe-character rules but do not satisfy the
-new-key lowercase-leading rule. Success returns `200`; invalid KIDs return a
-structured `400`; storage failures return a structured `500`. The handler
-defines no dedicated cache, CORS, or rate-limit policy.
-
-**Request Body:**
-
-```json
-{
-  "kid": "ts-2025-01-14-A",
-  "delete": false
-}
-```
-
-| Field    | Type    | Required | Description                                       |
-| -------- | ------- | -------- | ------------------------------------------------- |
-| `kid`    | string  | Yes      | Key ID to deactivate                              |
-| `delete` | boolean | No       | If true, permanently removes key (default: false) |
-
-**Response:**
-
-```json
-{
-  "success": true,
-  "message": "Key deactivated successfully",
-  "deactivated_kid": "ts-2025-01-14-A",
-  "deleted": false,
-  "remaining_active_kids": ["ts-2025-01-15-A"]
-}
-```
-
-**Example:**
-
-```bash
-curl -X POST https://edge.example.com/_ts/admin/keys/deactivate \
-  -u admin:password \
-  -H "Content-Type: application/json" \
-  -d '{"kid":"ts-2025-01-14-A","delete":true}'
-```
-
----
-
-## Admin Diagnostic Endpoints
-
-These endpoints expose sensitive identity and cookie data and require HTTP Basic Authentication. Configure a handler that covers the entire `/_ts/admin` namespace; startup rejects configurations that do not protect every admin route, including handlers that match only some `/_ts/admin/ec/{id}` values — the dynamic route needs a prefix-level matcher such as `^/_ts/admin` or `^/_ts/admin/ec/`. The whole `/_ts/admin` prefix is reserved: any admin path that reaches publisher fallback — unknown, malformed, or percent-encoded (`/_ts/admin%2Fec`) — is answered locally with `404` and is never proxied, so an admin `Authorization` header and request body never reach the publisher origin. The retired non-`/_ts` `/admin/keys` aliases are reserved the same way. Normal diagnostic-handler responses after successful authentication are JSON with `Cache-Control: no-store`. Missing or invalid credentials receive the shared plaintext `401 Unauthorized` Basic-auth challenge. Unexpected configuration or KV failures use the adapter's shared plaintext `5xx` error response. Those authentication and internal-error responses are outside the diagnostic JSON and cache-header contract.
-
-The diagnostic handlers have no CORS grant or in-process rate limiter. Apply an
-edge policy if operator access also needs request-rate enforcement.
-
-The examples below use fictional IDs and values only.
-
-### GET /\_ts/admin/ec
-
-### GET /\_ts/admin/ec/`{id}`
-
-Reads an EC identity-graph record for troubleshooting. The explicit route accepts an EC ID created by the module this deployment selects, such as the built-in HMAC module's `hmac~{64 hex}.{6 alphanumeric}` form. The built-in HMAC module also still reads the bare legacy `{64 hex}.{6 alphanumeric}` form, and a deployment with no module selected accepts both of those forms. The bare route uses the request's `ts-ec` cookie.
-
-This lookup is implemented only by the Fastly adapter because the identity graph is stored in Fastly KV. Other adapters return `501 Not Implemented`.
-
-**Response fields:**
-
-- `ec_id` is the EC ID as requested, and `kv_key` is the identity-graph key the record was read from. The key is `ec_id` in the normalized form the identity graph stores, which is the same string as `ec_id` for an identifier the built-in HMAC module issued. `store` and `generation` identify the raw KV lookup.
-- `entry` preserves the stored JSON shape, including unknown and legacy fields. Derived `created_iso` and `consent.updated_iso` fields are added only when absent.
-- `metadata` preserves the stored metadata JSON shape.
-- `tombstone` reports whether consent has been withdrawn. It is absent when the entry body cannot be parsed as JSON or deserialized as the typed EC schema.
-- `auction.eids` previews the partner EIDs the stored record can contribute; `auction.skipped` explains filtered IDs.
-- `entry_error`, `metadata_error`, and `raw_body` keep malformed or schema-incompatible records inspectable.
-
-The auction preview validates the stored record and partner configuration, but cannot reproduce live per-request consent checks. It must not be treated as proof that a specific auction request will receive those EIDs.
-
-**Status codes:**
-
-| Status | Meaning                                                     |
-| ------ | ----------------------------------------------------------- |
-| `200`  | Record found, including inspectable corrupt records         |
-| `400`  | Invalid explicit EC ID                                      |
-| `401`  | Missing or invalid Basic credentials                        |
-| `404`  | Record not found, or the bare route has no `ts-ec` cookie   |
-| `405`  | Method other than `GET` (`Allow: GET`)                      |
-| `501`  | EC identity graph unavailable on this adapter or deployment |
-| `5xx`  | Unexpected configuration or KV failure (plaintext)          |
-
-```bash
-curl -u 'admin:<resolved-admin-password>' \
-  "https://edge.example.com/_ts/admin/ec/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.abc123"
-
-curl -u 'admin:<resolved-admin-password>' \
-  --cookie "ts-ec=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.abc123" \
-  "https://edge.example.com/_ts/admin/ec"
-```
-
-### GET /\_ts/admin/eids
-
-Parses the request's `ts-eids` and `sharedId` cookies and previews which configured partner IDs cookie ingestion would match or drop. It performs request inspection only: it does not read or write KV and is available on every adapter. The preview lists candidate matches from the cookies alone; it does not apply the permission gate on identity-graph writes, does not see `/auction` request-body EIDs, and does not account for partner UIDs already stored in KV.
-
-After successful authentication this endpoint always returns `200 OK`; missing or malformed cookies are represented by `cookie_present`, `sharedid_present`, and `parse_error`. The `ingest.matched` and `ingest.unmatched` arrays show the ingestion preview. Each unmatched entry contains its `source` and either a `no_partner` reason when no configured partner recognizes it or `no_valid_uid` when the partner exists but every supplied UID is empty or exceeds the storage limit.
-
-The request body is not applicable. The `200` JSON response is `no-store`.
-`401`, `405`, and unexpected `5xx` responses follow the shared admin behavior
-above. The route is available on every adapter and depends on configured EC
-partners, but not on the EC KV store.
-
-```json
-{
-  "ingest": {
-    "matched": [
-      {
-        "source_domain": "configured.example",
-        "uid": "fictional-uid"
-      }
-    ],
-    "unmatched": [
-      {
-        "source": "unknown.example",
-        "reason": "no_partner"
-      }
-    ]
-  }
-}
-```
-
-```bash
-curl -u 'admin:<resolved-admin-password>' \
-  --cookie "sharedId=fictional-shared-id" \
-  "https://edge.example.com/_ts/admin/eids"
-```
-
-Malformed diagnostic paths return a local `404`, and unsupported methods return a local `405`; they are never forwarded to the publisher origin.
-
-### Legacy /admin/keys/rotate and /admin/keys/deactivate aliases
-
-All seven fallback methods return local `404 text/plain`. These retired aliases
-accept no schema, invoke no key operation, forward nothing to the publisher,
-and define no cache, CORS, or rate-limit policy. Example: `curl -i
-https://edge.example.com/admin/keys/rotate` must not reach the origin.
+What is held against a reader's own Edge Cookie is shown to that reader at [`GET /_ts/data`](#get-ts-data).
 
 ---
 
@@ -1196,8 +997,8 @@ stores, publisher proxying, or integrations are usable.
 
 ### GET /\_ts/debug/ja4
 
-**Contract:** Fastly-only; gated by `[debug].ja4_endpoint_enabled`. Auth: none
-unless wrapped by a handler. The request has no body. Enabled requests return
+**Contract:** Fastly-only; gated by `[debug].ja4_endpoint_enabled`. Auth: none.
+The request has no body. Enabled requests return
 `200 text/plain` with JA4, HTTP/2 fingerprint, cipher, TLS version, user-agent,
 and client-hint values. Disabled requests return `404`. The response is
 `no-store, private` and varies on the user-agent/client-hint fields. It defines
@@ -1353,8 +1154,8 @@ true. An integration no section selects registers no route,
 so its path continues through
 normal routing and can reach the publisher fallback. Duplicate registrations
 are startup errors. None of these routes has built-in caller authentication or
-an in-process rate limiter; `[[handlers]]` and platform controls remain
-available when a deployment needs either.
+an in-process rate limiter; platform controls remain available when a
+deployment needs either.
 
 | Route family      | Request and success contract                                                                                                                                           | Errors, cache, and CORS                                                                                                                                                                       | Example                                                                                                                                   |
 | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1469,41 +1270,15 @@ No EC ID response header is emitted. EC identity is maintained with the `ts-ec` 
 
 ## Authentication and policy boundaries
 
-### Basic Authentication
+### Authentication
 
-Endpoints under protected paths require HTTP Basic Authentication:
-
-**Configuration:**
-
-```toml
-[[handlers]]
-path = "^/_ts/admin"
-username = "admin"
-password = "admin_password"
-```
-
-`password` is a key in the Trusted Server secret store. Provision the actual
-Basic Authentication password under `admin_password`.
-
-**Usage:**
-
-```bash
-curl -u 'admin:<resolved-admin-password>' https://edge.example.com/_ts/admin/keys/rotate
-```
-
-**Protected Endpoints:**
-
-- `/_ts/admin/keys/rotate`
-- `/_ts/admin/keys/deactivate`
-- `/_ts/admin/ec`
-- `/_ts/admin/ec/{id}`
-- `/_ts/admin/eids`
-- Any paths matching configured `handlers` patterns
-
-The EC partner APIs use their own Bearer-token contract. Signed first-party
-proxy routes use `tstoken` instead of HTTP authentication. All other built-in
-routes are unauthenticated unless the operator deliberately wraps them with a
-handler.
+Trusted Server asks no request for a password. The EC partner APIs use their
+own Bearer-token contract, and signed first-party proxy routes use `tstoken`
+instead of HTTP authentication. All other built-in routes are unauthenticated.
+A deployment that needs a password on a path of the publisher's own sets it at
+the origin or in the hosting platform. An `Authorization` header a reader
+sends is passed to the origin with the request, and the response to it is
+never stored in a shared cache.
 
 ### Rate limiting
 

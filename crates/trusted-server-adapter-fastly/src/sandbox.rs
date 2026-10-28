@@ -569,11 +569,6 @@ mod tests {
     fn test_settings() -> Settings {
         Settings::from_toml(
             r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
             [publisher]
             domain = "test-publisher.example"
             cookie_domain = ".test-publisher.example"

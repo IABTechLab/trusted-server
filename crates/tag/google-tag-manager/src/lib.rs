@@ -3050,11 +3050,6 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
     #[test]
     fn test_config_parsing() {
         let toml_str = r#"
-[[handlers]]
-path = "^/_ts/admin"
-username = "admin"
-password = "admin-pass"
-
 [publisher]
 domain = "test-publisher.com"
 cookie_domain = ".test-publisher.com"
@@ -3090,11 +3085,6 @@ assume_single_jurisdiction = true
     #[test]
     fn a_block_for_an_unnamed_integration_is_refused() {
         let toml_str = r#"
-[[handlers]]
-path = "^/_ts/admin"
-username = "admin"
-password = "admin-pass"
-
 [publisher]
 domain = "test-publisher.com"
 cookie_domain = ".test-publisher.com"

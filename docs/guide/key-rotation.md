@@ -4,12 +4,16 @@ Learn how to rotate signing keys to maintain security and manage the lifecycle o
 
 ## Overview
 
-Key rotation is the process of generating new signing keys and transitioning from old keys to new ones. Trusted Server provides automated key rotation with:
+Key rotation is the process of generating new signing keys and transitioning from old keys to new ones. The key rotation library in core, `KeyRotationManager` in `crates/trusted-server-core/src/request_signing/rotation.rs`, provides:
 
 - **Zero-downtime rotation** - Old and new keys work simultaneously
 - **Automatic key generation** - Date-based key identifiers
 - **Grace period support** - Multiple active keys during transition
 - **Safe deactivation** - Prevents removing the last active key
+
+::: tip Run by an operator
+Keys are rotated and retired with [`ts keys`](./cli.md#request-signing-keys), run by an operator holding a Fastly API token. Nothing in a running deployment rotates or retires keys, and there is no HTTP route for it.
+:::
 
 ## Why Rotate Keys?
 
@@ -32,11 +36,11 @@ The Edge Cookie `ec.hmac.passphrase` is long-lived HMAC-SHA256 keying material u
 
 ## Prerequisites
 
-Before you can rotate keys, you need to set up the required Fastly stores and API credentials.
+Request signing needs two Fastly stores set up and linked to the service.
 
 ### Required Stores
 
-Key rotation requires three Fastly stores:
+Request signing reads two Fastly stores, and key rotation writes them:
 
 1. **Config Store** (`jwks_store`) - Stores public JWKs and metadata
    - `current-kid` - The active key identifier
@@ -47,8 +51,7 @@ Key rotation requires three Fastly stores:
    - Each key stored with its `kid` as the key name
    - Values are base64-encoded Ed25519 private keys
 
-3. **Secret Store** (`api-keys`) - Stores Fastly API credentials
-   - `api_key` - Fastly API token for managing stores
+The running service only reads these stores, so it needs no Fastly API token of its own.
 
 ### Creating Stores
 
@@ -58,66 +61,27 @@ Key rotation requires three Fastly stores:
 # Create the config store
 fastly config-store create --name=jwks_store
 
-# Get the store ID (you'll need this for configuration)
+# Get the store ID (you'll need this for `ts keys`)
 fastly config-store list
 ```
 
 Note the Config Store ID from the output.
 
-#### 2. Create Secret Stores
+#### 2. Create Secret Store
 
 ```bash
 # Create secret store for signing keys
 fastly secret-store create --name=signing_keys
 
-# Create secret store for API credentials
-fastly secret-store create --name=api-keys
-
-# Get the store IDs
+# Get the store ID
 fastly secret-store list
 ```
 
-Note both Secret Store IDs from the output.
+Note the Secret Store ID from the output.
 
 ::: tip Dashboard Alternative
 You can also create stores via the Fastly dashboard, but CLI commands are recommended for automation and reproducibility.
 :::
-
-### Creating Fastly API Key
-
-Key rotation uses the Fastly API to manage store contents. You need to create an API token:
-
-#### Step 1: Generate API Token
-
-1. Log in to the [Fastly Dashboard](https://manage.fastly.com)
-2. Navigate to **Account → API Tokens → Personal Tokens**
-3. Click **Create Token**
-4. Configure the token:
-   - **Name**: `trusted-server-key-rotation`
-   - **Scope**: `global:read`, `global:write` (or scope to your specific service)
-   - **Expiration**: Set according to your security policy
-
-#### Step 2: Store API Token
-
-Store the API token in the `api-keys` secret store:
-
-```bash
-# Read without echoing, then send the API key over stdin rather than argv.
-read -rsp 'Fastly API token: ' FASTLY_ROTATION_API_TOKEN && printf '\n'
-printf '%s' "$FASTLY_ROTATION_API_TOKEN" | fastly secret-store-entry create \
-  --store-id=<your-api-keys-store-id> \
-  --name=api_key \
-  --stdin
-unset FASTLY_ROTATION_API_TOKEN
-```
-
-::: warning Keep Your API Token Secure
-
-- Never commit API tokens to version control
-- Store them only in Fastly Secret Store
-- Rotate API tokens according to your security policy
-- Use minimal required permissions
-  :::
 
 ### Linking Stores to Service
 
@@ -137,12 +101,6 @@ fastly service-version compute secret-store create \
   --version=<version> \
   --secret-store-id=<signing-keys-store-id> \
   --name=signing_keys
-
-# Link API keys secret store
-fastly service-version compute secret-store create \
-  --version=<version> \
-  --secret-store-id=<api-keys-store-id> \
-  --name=api-keys
 ```
 
 ::: tip Dashboard Linking
@@ -166,25 +124,22 @@ For local testing, configure stores in `fastly.toml`:
   [[local_server.secret_stores.signing_keys]]
     key = "ts-2025-01-01"
     data = "<signing-key>"
-
-  [[local_server.secret_stores.api-keys]]
-    key = "api_key"
-    env = "FASTLY_KEY"  # Load from environment variable
 ```
 
 ### Configuration in trusted-server.toml
 
-Update `trusted-server.toml` with your store IDs:
+Switch request signing on in `trusted-server.toml`:
 
 ```toml
 [request_signing]
 enabled = true
-config_store_id = "<config-store-id>"  # Your jwks_store ID
-secret_store_id = "<secret-store-id"  # Your signing_keys ID
 ```
 
+The service finds the two stores by the names they are linked under, so the
+configuration holds no store id.
+
 ::: tip Getting Store IDs
-Use `fastly config-store list` and `fastly secret-store list` to retrieve your store IDs.
+`ts keys` takes the two store IDs on its command line. Use `fastly config-store list` and `fastly secret-store list` to retrieve them.
 :::
 
 ### Verification
@@ -216,9 +171,9 @@ You should see a JWKS response with your public keys.
 │     ↓                                │
 │  3. Store public JWK (Config Store)  │
 │     ↓                                │
-│  4. Update current-kid pointer       │
+│  4. Update active-kids list          │
 │     ↓                                │
-│  5. Update active-kids list          │
+│  5. Update current-kid pointer       │
 │     ↓                                │
 │  6. Both keys now active             │
 │                                      │
@@ -244,79 +199,40 @@ You should see a JWKS response with your public keys.
 
 ## Rotating Keys
 
-### Using the Rotation Endpoint
-
-**Endpoint**: `POST /_ts/admin/keys/rotate`
-
-#### Automatic Key ID (Recommended)
-
-Let Trusted Server generate a date-based key ID:
+Rotate with `ts keys rotate`, with a Fastly API token in `FASTLY_API_TOKEN`:
 
 ```bash
-curl -X POST https://your-domain/_ts/admin/keys/rotate \
-  -H "Content-Type: application/json" \
-  -d '{}'
+ts keys rotate --config-store-id <jwks-store-id> --secret-store-id <signing-keys-store-id>
 ```
 
-**Response**:
+It writes the private key to the secret store, the public JWK to the config
+store, then `active-kids`, then `current-kid` last, and prints the new and
+previous key ids, the active keys and the public JWK as JSON. `--kid` names the
+key, which otherwise is `ts-<date>`, with a random suffix when a key of that
+date exists. A command that cannot read the config store writes nothing.
 
-```json
-{
-  "success": true,
-  "message": "Key rotated successfully",
-  "new_kid": "ts-2024-02-15",
-  "previous_kid": "ts-2024-01-15",
-  "active_kids": ["ts-2024-01-15", "ts-2024-02-15"],
-  "jwk": {
-    "kty": "OKP",
-    "crv": "Ed25519",
-    "x": "new-public-key-base64url",
-    "kid": "ts-2024-02-15",
-    "alg": "EdDSA"
-  }
-}
-```
-
-#### Custom Key ID
-
-Specify a custom key identifier:
-
-```bash
-curl -X POST https://your-domain/_ts/admin/keys/rotate \
-  -H "Content-Type: application/json" \
-  -d '{"kid": "production-2024-q1"}'
-```
-
-**Response**:
-
-```json
-{
-  "success": true,
-  "message": "Key rotated successfully",
-  "new_kid": "production-2024-q1",
-  "previous_kid": "ts-2024-01-15",
-  "active_kids": ["ts-2024-01-15", "production-2024-q1"],
-  "jwk": { ... }
-}
-```
+The command runs the rotation library in core, which another tool can call
+directly.
 
 ### Using the Rust API
 
 ```rust
 use trusted_server_core::request_signing::KeyRotationManager;
 
-// Initialize rotation manager
-let manager = KeyRotationManager::new("jwks_store", "signing_keys")?;
+// The IDs of the two stores. The stores are written through the platform's
+// `RuntimeServices`.
+let manager = KeyRotationManager::new("<config-store-id>", "<secret-store-id>");
 
 // Rotate with automatic kid
-let result = manager.rotate_key(None)?;
+let result = manager.rotate_key(&services, None)?;
 
 println!("New key: {}", result.new_kid);
 println!("Previous key: {:?}", result.previous_kid);
 println!("Active keys: {:?}", result.active_kids);
 
-// Or rotate with custom kid
-let custom_result = manager.rotate_key(Some("my-custom-key".to_string()))?;
+// Or rotate with custom kid. `rotate_key` does not check the kid, so check it
+// with `kid_is_creatable` first.
+let custom_result = manager.rotate_key(&services, Some("my-custom-key".to_string()))?;
 ```
 
 ## Managing Active Keys
@@ -326,8 +242,8 @@ let custom_result = manager.rotate_key(Some("my-custom-key".to_string()))?;
 **Rust API**:
 
 ```rust
-let manager = KeyRotationManager::new("jwks_store", "signing_keys")?;
-let active_keys = manager.list_active_keys()?;
+let manager = KeyRotationManager::new("<config-store-id>", "<secret-store-id>");
+let active_keys = manager.list_active_keys(&services)?;
 
 for kid in active_keys {
     println!("Active key: {}", kid);
@@ -360,78 +276,42 @@ Deactivate old keys after:
 3. No more requests using the old key
 4. Old signatures no longer need verification
 
-### Deactivation Endpoint
-
-**Endpoint**: `POST /_ts/admin/keys/deactivate`
-
-#### Deactivate (Keep in Storage)
-
-Remove from active rotation but keep in storage:
+Deactivate with `ts keys deactivate`, and add `--delete` to remove the key
+from both stores as well:
 
 ```bash
-curl -X POST https://your-domain/_ts/admin/keys/deactivate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "kid": "ts-2024-01-15",
-    "delete": false
-  }'
+ts keys deactivate --config-store-id <jwks-store-id> \
+  --secret-store-id <signing-keys-store-id> --kid ts-2024-01-15 --delete
 ```
 
-**Response**:
-
-```json
-{
-  "success": true,
-  "message": "Key deactivated successfully",
-  "deactivated_kid": "ts-2024-01-15",
-  "deleted": false,
-  "remaining_active_kids": ["ts-2024-02-15"]
-}
-```
-
-#### Delete Permanently
-
-Remove from storage completely:
-
-```bash
-curl -X POST https://your-domain/_ts/admin/keys/deactivate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "kid": "ts-2024-01-15",
-    "delete": true
-  }'
-```
-
-**Response**:
-
-```json
-{
-  "success": true,
-  "message": "Key deleted successfully",
-  "deactivated_kid": "ts-2024-01-15",
-  "deleted": true,
-  "remaining_active_kids": ["ts-2024-02-15"]
-}
-```
+A delete that fails part way can be run again, because a key that is already
+gone from a store counts as deleted there. The library calls the command makes
+are below.
 
 ### Using the Rust API
 
 ```rust
-let manager = KeyRotationManager::new("jwks_store", "signing_keys")?;
+let manager = KeyRotationManager::new("<config-store-id>", "<secret-store-id>");
 
 // Deactivate (keep in storage)
-manager.deactivate_key("ts-2024-01-15")?;
+manager.deactivate_key(&services, "ts-2024-01-15")?;
 
 // Delete completely
-manager.delete_key("ts-2024-01-15")?;
+manager.delete_key(&services, "ts-2024-01-15")?;
 ```
 
 ### Safety Checks
 
-The system prevents:
+The library refuses to:
 
-- **Deleting the last active key** - At least one key must remain active
-- **Invalid key IDs** - Returns error for non-existent keys
+- **Deactivate the last active key** - At least one key must remain active
+- **Deactivate or delete the current key** - Rotate first, then retire the old key
+
+`ts keys deactivate` also refuses an ID that is not 1 to 128 letters, digits,
+`-`, `_`, `.` and `:`, and the names `current-kid` and `active-kids`, before it
+reads or writes anything. An ID that no store holds is not an error, because a
+key that is gone counts as retired, so read `remaining_active_kids` in the
+report to see what is left.
 
 ## Key Naming Conventions
 
@@ -470,28 +350,9 @@ Use descriptive names for specific purposes:
 
 ### Strategy 1: Scheduled Rotation
 
-Regular rotation on a fixed schedule:
-
-```bash
-# Cron job: Rotate every 90 days
-0 0 1 */3 * /usr/local/bin/rotate-keys.sh
-```
-
-**rotate-keys.sh**:
-
-```bash
-#!/bin/bash
-# Rotate signing keys
-curl -X POST https://your-domain/_ts/admin/keys/rotate
-
-# Wait 30 days grace period
-sleep $((30 * 24 * 60 * 60))
-
-# Deactivate old key
-OLD_KEY=$(date -d '90 days ago' +ts-%Y-%m-%d)
-curl -X POST https://your-domain/_ts/admin/keys/deactivate \
-  -d "{\"kid\": \"$OLD_KEY\", \"delete\": true}"
-```
+Regular rotation on a fixed schedule, for example every 90 days with a 30 day
+grace period before the old key is deleted. A scheduler runs `ts keys rotate`,
+and `ts keys deactivate --delete` once the grace period has passed.
 
 ### Strategy 2: On-Demand Rotation
 
@@ -597,18 +458,6 @@ Test rotation in staging first:
 
 ## Troubleshooting
 
-### Rotation Failed
-
-**Error**: `Failed to create KeyRotationManager`
-
-**Solutions**:
-
-- Verify all required stores are created (see [Prerequisites](#prerequisites))
-- Check Fastly API token is stored in `api-keys` secret store as `api_key`
-- Verify `config_store_id` and `secret_store_id` in `trusted-server.toml` match your actual store IDs
-- Ensure stores are linked to your Compute service
-- Confirm API token has `global:read` and `global:write` permissions
-
 ### Cannot Deactivate Key
 
 **Error**: `Cannot deactivate the last active key`
@@ -651,37 +500,19 @@ Test rotation in staging first:
 If a key is compromised:
 
 1. **Immediate**: Rotate to new key
-
-```bash
-curl -X POST /_ts/admin/keys/rotate
-```
-
 2. **Urgent**: Deactivate compromised key
-
-```bash
-curl -X POST /_ts/admin/keys/deactivate \
-  -d '{"kid": "compromised-key", "delete": false}'
-```
-
 3. **Investigation**: Review logs for misuse
-
 4. **Communication**: Notify partners of compromise
-
 5. **Cleanup**: Delete compromised key after investigation
 
-```bash
-curl -X POST /_ts/admin/keys/deactivate \
-  -d '{"kid": "compromised-key", "delete": true}'
-```
+Rotate with `ts keys rotate`, then retire the compromised key with
+`ts keys deactivate --delete`, as [Rotating Keys](#rotating-keys) describes.
 
 ### Access Control
 
-Restrict rotation endpoints:
-
-- Require authentication/authorization
-- Use admin-only API keys
-- Implement rate limiting
-- Audit all rotation attempts
+There is no rotation endpoint on the publisher's domain. Rotation writes the
+signing stores, so only an operator holding platform credentials with write
+access to those stores can rotate or retire a key.
 
 ## Next Steps
 

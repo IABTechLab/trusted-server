@@ -153,10 +153,6 @@ run_case missing-config "$BASE_PORT" 500 \
 cat >>"$FASTLY_MANIFEST" <<EOF
 
 [[local_server.secret_stores.trusted_server_secrets]]
-key = "handler_password"
-data = "$SMOKE_HANDLER_VALUE"
-
-[[local_server.secret_stores.trusted_server_secrets]]
 key = "publisher_proxy_secret"
 data = "$SMOKE_PROXY_VALUE"
 
@@ -167,17 +163,14 @@ EOF
 CONFIGURED_FASTLY="$WORKSPACE/fastly.toml.configured"
 cp "$FASTLY_MANIFEST" "$CONFIGURED_FASTLY"
 
-write_without_secret "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST" handler_password
-run_case missing-handler "$((BASE_PORT + 1))" 500 \
-    "failed to resolve secret reference at \`handlers[0].password\`"
 write_without_secret "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST" publisher_proxy_secret
-run_case missing-proxy "$((BASE_PORT + 2))" 500 \
+run_case missing-proxy "$((BASE_PORT + 1))" 500 \
     "failed to resolve secret reference at \`publisher.proxy_secret\`"
 write_without_secret "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST" ec_passphrase
-run_case missing-ec "$((BASE_PORT + 3))" 500 \
+run_case missing-ec "$((BASE_PORT + 2))" 500 \
     "failed to resolve secret reference at \`ec.hmac.passphrase\`"
 
 cp "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST"
-run_case positive "$((BASE_PORT + 4))" 200
+run_case positive "$((BASE_PORT + 3))" 200
 
 echo "Fastly first-success smoke passed"

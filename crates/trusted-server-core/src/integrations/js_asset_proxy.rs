@@ -1057,16 +1057,6 @@ mod tests {
     #[test]
     fn rejects_unknown_proxy_mode() {
         let toml = r#"
-            [[handlers]]
-            path = "^/secure"
-            username = "user"
-            password = "pass"
-
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
@@ -1080,8 +1070,7 @@ mod tests {
             assume_single_jurisdiction = true
 
             [request_signing]
-            config_store_id = "test-config-store-id"
-            secret_store_id = "test-secret-store-id"
+            enabled = false
 
             [proxy]
             modules = ["js_asset_proxy"]

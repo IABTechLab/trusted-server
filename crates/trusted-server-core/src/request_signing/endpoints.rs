@@ -1,18 +1,17 @@
 //! HTTP endpoint handlers for request signing operations.
 //!
-//! This module provides endpoint handlers for JWKS retrieval, signature verification,
-//! key rotation, and key deactivation operations.
+//! This module provides endpoint handlers for JWKS retrieval and signature
+//! verification, and the key ID rules key creation follows.
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::{Request, Response, StatusCode, header};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{IntoHttpResponse, TrustedServerError};
+use crate::error::TrustedServerError;
 use crate::http_util::enforce_max_body_size;
 use crate::platform::RuntimeServices;
 use crate::request_signing::discovery::TrustedServerDiscovery;
-use crate::request_signing::rotation::KeyRotationManager;
 use crate::request_signing::signing;
 use crate::settings::Settings;
 
@@ -99,7 +98,6 @@ pub struct VerifySignatureResponse {
 }
 
 const VERIFY_MAX_BODY_BYTES: usize = 4096;
-const ADMIN_MAX_BODY_BYTES: usize = 4096;
 
 /// Will verify a signature given a payload and kid
 /// Useful for testing integration with signatures
@@ -160,62 +158,11 @@ pub fn handle_verify_signature(
     Ok(json_response(StatusCode::OK, response_json))
 }
 
-/// JSON request body for the key-rotation endpoint.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct RotateKeyRequest {
-    /// Optional explicit key identifier for the new signing key.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kid: Option<String>,
-}
-
-/// JSON response body for the key-rotation endpoint.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct RotateKeyResponse {
-    /// Whether the rotation operation succeeded.
-    pub success: bool,
-    /// Human-readable summary of the rotation result.
-    pub message: String,
-    /// Newly generated or supplied key identifier.
-    pub new_kid: String,
-    /// Previously active key identifier, if one existed.
-    pub previous_kid: Option<String>,
-    /// Active key identifiers after the rotation completes.
-    pub active_kids: Vec<String>,
-    /// Public JWK associated with the newly active key.
-    pub jwk: serde_json::Value,
-    /// Error detail when rotation fails.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-struct SigningStoreIds<'a> {
-    config_store_id: &'a str,
-    secret_store_id: &'a str,
-}
-
 const MAX_KID_LENGTH: usize = 128;
 
-fn signing_store_ids(
-    settings: &Settings,
-) -> Result<SigningStoreIds<'_>, Report<TrustedServerError>> {
-    settings
-        .request_signing
-        .as_ref()
-        .map(|setting| SigningStoreIds {
-            config_store_id: setting.config_store_id.as_str(),
-            secret_store_id: setting.secret_store_id.as_str(),
-        })
-        .ok_or_else(|| {
-            TrustedServerError::Configuration {
-                message: "missing signing storage configuration".to_string(),
-            }
-            .into()
-        })
-}
-
-/// Validates the structural constraints every kid must satisfy regardless of
-/// operation: non-empty, length-bounded, and limited to a safe charset so a kid
-/// cannot smuggle a CSV separator or other control characters into storage.
+/// Validates the structural constraints every kid must satisfy: non-empty,
+/// length-bounded, and limited to a safe charset so a kid cannot smuggle a CSV
+/// separator or other control characters into storage.
 fn validate_kid_format(kid: &str) -> Result<(), Report<TrustedServerError>> {
     if kid.is_empty() || kid.len() > MAX_KID_LENGTH {
         return Err(Report::new(TrustedServerError::BadRequest {
@@ -235,27 +182,23 @@ fn validate_kid_format(kid: &str) -> Result<(), Report<TrustedServerError>> {
     Ok(())
 }
 
-/// Validates a kid for creation/rotation.
+/// Validates a kid for a new key.
 ///
-/// Enforces the **portable-KID contract**: a kid created through any adapter must
-/// be storable by every platform's key-name encoder, so create/rotate validates
-/// against the strictest common denominator. Concretely the kid must start with a
-/// lowercase ASCII letter, on top of the structural [`validate_kid_format`]
-/// charset checks.
+/// Enforces the **portable-KID contract**: a new kid must be storable by every
+/// platform's key-name encoder, so creation validates against the strictest
+/// common denominator. Concretely the kid must start with a lowercase ASCII
+/// letter, on top of the structural [`validate_kid_format`] charset checks.
 ///
 /// That floor is currently set by the Fermyon Spin variable encoder
 /// (`spin_variable_name` in the Spin adapter's `platform.rs`), which requires a
 /// lowercase ASCII leading character: it would otherwise alias digit-leading keys
 /// (`1foo` and `n1foo` both map to `v_n1foo`) or reject uppercase/punctuation
 /// leading keys (`KidA`, `_kid`, `-kid`, `.kid`, `:kid`) at storage time.
-/// Enforcing the floor here turns those into a client-correctable 400 on every
-/// adapter instead of a runtime 5xx on Spin. [`kid_is_creatable`] exposes this
-/// predicate so adapter crates can pin the contract with a test — core must never
-/// accept a kid its encoder rejects. System-generated KIDs (`ts-YYYY-MM-DD`)
-/// start with `t` and are unaffected.
-///
-/// Deactivation/deletion deliberately uses the looser [`validate_kid_format`] so
-/// legacy KIDs created under earlier validation rules remain removable.
+/// Checking the floor here refuses such a kid for every platform rather than
+/// leaving it to fail at storage time on Spin. [`kid_is_creatable`] exposes
+/// this predicate so adapter crates can pin the contract with a test, because
+/// core must never accept a kid its encoder rejects. System-generated KIDs
+/// (`ts-YYYY-MM-DD`) start with `t` and are unaffected.
 fn validate_kid(kid: &str) -> Result<(), Report<TrustedServerError>> {
     validate_kid_format(kid)?;
 
@@ -268,233 +211,28 @@ fn validate_kid(kid: &str) -> Result<(), Report<TrustedServerError>> {
     Ok(())
 }
 
-/// Returns whether `kid` satisfies the create/rotate portable-KID contract
-/// enforced by [`validate_kid`].
+/// Returns whether `kid` satisfies the portable-KID contract that
+/// [`validate_kid`] checks for a new key.
 ///
-/// Exposed so platform adapter crates can assert their key-name encoder accepts
-/// every kid this validation admits, pinning the cross-adapter contract against
-/// silent drift between this validation floor and an adapter's storage encoder.
+/// Exposed for the tool that creates keys, which asks before it writes
+/// anything, and so platform adapter crates can assert their key-name encoder
+/// accepts every kid this validation admits, pinning the cross-adapter contract
+/// against silent drift between this validation floor and an adapter's storage
+/// encoder.
 #[must_use]
 pub fn kid_is_creatable(kid: &str) -> bool {
     validate_kid(kid).is_ok()
 }
 
-/// Rotates the current active kid by generating and saving a new one.
+/// Returns whether `kid` has the shape of a stored key id, which
+/// [`validate_kid_format`] checks.
 ///
-/// # Response contract
-///
-/// Returns `200 OK` with `success: true` on success, `400 Bad Request` for an
-/// invalid operator-supplied `kid`, or `500 Internal Server Error` when rotation
-/// fails. Failure responses include `success: false` and a populated `error`
-/// field. Unlike [`handle_verify_signature`], the error field contains internal
-/// detail — this is intentional because this endpoint is auth-gated and
-/// operator-facing only.
-///
-/// # Errors
-///
-/// Returns an error if the request signing settings are missing or JSON parsing fails.
-pub fn handle_rotate_key(
-    settings: &Settings,
-    services: &RuntimeServices,
-    req: Request<EdgeBody>,
-) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    let SigningStoreIds {
-        config_store_id,
-        secret_store_id,
-    } = signing_store_ids(settings)?;
-
-    let body = request_body_bytes(req.into_body(), "rotate-key")?;
-    enforce_max_body_size(&body, ADMIN_MAX_BODY_BYTES, "rotate-key")?;
-    let rotate_req: RotateKeyRequest = if body.is_empty() {
-        RotateKeyRequest { kid: None }
-    } else {
-        serde_json::from_slice(&body).change_context(TrustedServerError::Configuration {
-            message: "invalid JSON request body".into(),
-        })?
-    };
-
-    let manager = KeyRotationManager::new(config_store_id, secret_store_id);
-    let validation_result = if let Some(kid) = rotate_req.kid.as_deref() {
-        validate_kid(kid)
-    } else {
-        Ok(())
-    };
-    let result = validation_result.and_then(|()| manager.rotate_key(services, rotate_req.kid));
-
-    match result {
-        Ok(result) => {
-            let jwk_value = serde_json::to_value(&result.jwk).map_err(|e| {
-                Report::new(TrustedServerError::Configuration {
-                    message: format!("failed to serialize JWK: {}", e),
-                })
-            })?;
-
-            let response = RotateKeyResponse {
-                success: true,
-                message: "Key rotated successfully".to_string(),
-                new_kid: result.new_kid,
-                previous_kid: result.previous_kid,
-                active_kids: result.active_kids,
-                jwk: jwk_value,
-                error: None,
-            };
-
-            let response_json = serde_json::to_string(&response).map_err(|e| {
-                Report::new(TrustedServerError::Configuration {
-                    message: format!("failed to serialize response: {}", e),
-                })
-            })?;
-
-            Ok(json_response(StatusCode::OK, response_json))
-        }
-        Err(e) => {
-            let status = e.current_context().status_code();
-            let response = RotateKeyResponse {
-                success: false,
-                message: "Key rotation failed".to_string(),
-                new_kid: String::new(),
-                previous_kid: None,
-                active_kids: vec![],
-                jwk: serde_json::json!({}),
-                error: Some(format!("{}", e)),
-            };
-
-            let response_json = serde_json::to_string(&response).map_err(|e| {
-                Report::new(TrustedServerError::Configuration {
-                    message: format!("failed to serialize response: {}", e),
-                })
-            })?;
-
-            Ok(json_response(status, response_json))
-        }
-    }
-}
-
-/// JSON request body for the key-deactivation endpoint.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct DeactivateKeyRequest {
-    /// Key identifier to deactivate or delete.
-    pub kid: String,
-    /// Whether the key should be deleted from storage after deactivation.
-    #[serde(default)]
-    pub delete: bool,
-}
-
-/// JSON response body for the key-deactivation endpoint.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct DeactivateKeyResponse {
-    /// Whether the deactivation or deletion succeeded.
-    pub success: bool,
-    /// Human-readable summary of the operation result.
-    pub message: String,
-    /// Key identifier that was deactivated or deleted.
-    pub deactivated_kid: String,
-    /// Whether the key was deleted from storage.
-    pub deleted: bool,
-    /// Active key identifiers remaining after the operation.
-    pub remaining_active_kids: Vec<String>,
-    /// Error detail when the operation fails.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-/// Deactivates or deletes an active signing key.
-///
-/// # Response contract
-///
-/// Returns `200 OK` with `success: true` on success, `400 Bad Request` for an
-/// invalid operator-supplied `kid`, or `500 Internal Server Error` when
-/// deactivation fails. Failure responses include `success: false` and a populated
-/// `error` field. Like [`handle_rotate_key`] and unlike
-/// [`handle_verify_signature`], the error field contains internal detail — this
-/// is intentional because this endpoint is auth-gated and operator-facing only.
-///
-/// # Errors
-///
-/// Returns an error if the request signing settings are missing or JSON parsing fails.
-pub fn handle_deactivate_key(
-    settings: &Settings,
-    services: &RuntimeServices,
-    req: Request<EdgeBody>,
-) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    let SigningStoreIds {
-        config_store_id,
-        secret_store_id,
-    } = signing_store_ids(settings)?;
-
-    let body = request_body_bytes(req.into_body(), "deactivate-key")?;
-    enforce_max_body_size(&body, ADMIN_MAX_BODY_BYTES, "deactivate-key")?;
-    let deactivate_req: DeactivateKeyRequest =
-        serde_json::from_slice(&body).change_context(TrustedServerError::Configuration {
-            message: "invalid JSON request body".into(),
-        })?;
-
-    let manager = KeyRotationManager::new(config_store_id, secret_store_id);
-
-    // Use the looser format validation here so legacy KIDs created under earlier
-    // validation rules (e.g. digit- or uppercase-leading) can still be
-    // deactivated or deleted. The stricter validate_kid only gates new key
-    // creation/rotation.
-    let result = validate_kid_format(&deactivate_req.kid).and_then(|()| {
-        if deactivate_req.delete {
-            manager.delete_key(services, &deactivate_req.kid)
-        } else {
-            manager.deactivate_key(services, &deactivate_req.kid)
-        }
-    });
-
-    match result {
-        Ok(()) => {
-            let remaining_keys = manager.list_active_keys(services).unwrap_or_else(|e| {
-                log::warn!("failed to list active keys after deactivation: {}", e);
-                vec![]
-            });
-
-            let response = DeactivateKeyResponse {
-                success: true,
-                message: if deactivate_req.delete {
-                    "Key deleted successfully".to_string()
-                } else {
-                    "Key deactivated successfully".to_string()
-                },
-                deactivated_kid: deactivate_req.kid,
-                deleted: deactivate_req.delete,
-                remaining_active_kids: remaining_keys,
-                error: None,
-            };
-
-            let response_json = serde_json::to_string(&response).map_err(|e| {
-                Report::new(TrustedServerError::Configuration {
-                    message: format!("failed to serialize response: {}", e),
-                })
-            })?;
-
-            Ok(json_response(StatusCode::OK, response_json))
-        }
-        Err(e) => {
-            let status = e.current_context().status_code();
-            let response = DeactivateKeyResponse {
-                success: false,
-                message: if deactivate_req.delete {
-                    "Key deletion failed".to_string()
-                } else {
-                    "Key deactivation failed".to_string()
-                },
-                deactivated_kid: deactivate_req.kid.clone(),
-                deleted: false,
-                remaining_active_kids: vec![],
-                error: Some(format!("{}", e)),
-            };
-
-            let response_json = serde_json::to_string(&response).map_err(|e| {
-                Report::new(TrustedServerError::Configuration {
-                    message: format!("failed to serialize response: {}", e),
-                })
-            })?;
-
-            Ok(json_response(status, response_json))
-        }
-    }
+/// Looser than [`kid_is_creatable`], so that a key created under an earlier
+/// rule can still be deactivated and deleted. Exposed for the tool that
+/// retires keys, which asks before it reads or writes anything.
+#[must_use]
+pub fn kid_is_well_formed(kid: &str) -> bool {
+    validate_kid_format(kid).is_ok()
 }
 
 #[cfg(test)]
@@ -720,266 +458,6 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_rotate_key_with_empty_body() {
-        let settings = crate::test_support::tests::create_test_settings();
-        let req = build_request(Method::POST, "https://test.com/admin/keys/rotate", None);
-
-        let resp = handle_rotate_key(&settings, &noop_services(), req)
-            .expect("should return a response even when stores are unavailable");
-
-        assert_eq!(
-            resp.status(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "should return 500 when store writes fail"
-        );
-
-        let body = response_body_string(resp);
-        let response: RotateKeyResponse =
-            serde_json::from_str(&body).expect("should deserialize rotate response");
-
-        assert!(
-            !response.success,
-            "should report failure when store writes fail"
-        );
-        assert!(
-            response.error.is_some(),
-            "should include error detail in failure response"
-        );
-    }
-
-    #[test]
-    fn test_handle_rotate_key_with_custom_kid() {
-        let settings = crate::test_support::tests::create_test_settings();
-
-        let req_body = RotateKeyRequest {
-            kid: Some("test-custom-key".to_string()),
-        };
-
-        let body_json = serde_json::to_string(&req_body).expect("should serialize rotate request");
-        let req = build_request(
-            Method::POST,
-            "https://test.com/admin/keys/rotate",
-            Some(&body_json),
-        );
-
-        let resp = handle_rotate_key(&settings, &noop_services(), req)
-            .expect("should return a response even when stores are unavailable");
-
-        assert_eq!(
-            resp.status(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "should return 500 when store writes fail"
-        );
-
-        let body = response_body_string(resp);
-        let response: RotateKeyResponse =
-            serde_json::from_str(&body).expect("should deserialize rotate response");
-
-        assert!(
-            !response.success,
-            "should report failure when store writes fail"
-        );
-        assert!(
-            response.error.is_some(),
-            "should include error detail in failure response"
-        );
-    }
-
-    #[test]
-    fn test_handle_rotate_key_invalid_json() {
-        let settings = crate::test_support::tests::create_test_settings();
-        let req = build_request(
-            Method::POST,
-            "https://test.com/admin/keys/rotate",
-            Some("invalid json"),
-        );
-
-        let result = handle_rotate_key(&settings, &noop_services(), req);
-        assert!(result.is_err(), "Invalid JSON should return error");
-    }
-
-    #[test]
-    fn test_handle_rotate_key_rejects_invalid_kid() {
-        let settings = crate::test_support::tests::create_test_settings();
-
-        let req_body = RotateKeyRequest {
-            kid: Some("bad,kid".to_string()),
-        };
-
-        let body_json = serde_json::to_string(&req_body).expect("should serialize rotate request");
-        let req = build_request(
-            Method::POST,
-            "https://test.com/admin/keys/rotate",
-            Some(&body_json),
-        );
-
-        let resp = handle_rotate_key(&settings, &noop_services(), req)
-            .expect("should return a response for invalid kid");
-
-        assert_eq!(
-            resp.status(),
-            StatusCode::BAD_REQUEST,
-            "should reject malformed kid as a bad request"
-        );
-
-        let body = response_body_string(resp);
-        let response: RotateKeyResponse =
-            serde_json::from_str(&body).expect("should deserialize rotate response");
-
-        assert!(
-            !response.success,
-            "should report failure when supplied kid is invalid"
-        );
-        assert!(
-            response
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("kid must contain only")),
-            "should explain the kid character restrictions"
-        );
-    }
-
-    #[test]
-    fn test_handle_deactivate_key_request() {
-        let settings = crate::test_support::tests::create_test_settings();
-
-        let req_body = DeactivateKeyRequest {
-            kid: "test-old-key".to_string(),
-            delete: false,
-        };
-
-        let body_json =
-            serde_json::to_string(&req_body).expect("should serialize deactivate request");
-        let req = build_request(
-            Method::POST,
-            "https://test.com/admin/keys/deactivate",
-            Some(&body_json),
-        );
-
-        let resp = handle_deactivate_key(&settings, &noop_services(), req)
-            .expect("should return a response even when stores are unavailable");
-
-        assert_eq!(
-            resp.status(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "should return 500 when active-kids cannot be read"
-        );
-
-        let body = response_body_string(resp);
-        let response: DeactivateKeyResponse =
-            serde_json::from_str(&body).expect("should deserialize deactivate response");
-
-        assert!(
-            !response.success,
-            "should report failure when store reads fail"
-        );
-        assert!(
-            response.error.is_some(),
-            "should include error detail in failure response"
-        );
-    }
-
-    #[test]
-    fn test_handle_deactivate_key_with_delete() {
-        let settings = crate::test_support::tests::create_test_settings();
-
-        let req_body = DeactivateKeyRequest {
-            kid: "test-old-key".to_string(),
-            delete: true,
-        };
-
-        let body_json =
-            serde_json::to_string(&req_body).expect("should serialize deactivate request");
-        let req = build_request(
-            Method::POST,
-            "https://test.com/admin/keys/deactivate",
-            Some(&body_json),
-        );
-
-        let resp = handle_deactivate_key(&settings, &noop_services(), req)
-            .expect("should return a response even when stores are unavailable");
-
-        assert_eq!(
-            resp.status(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "should return 500 when active-kids cannot be read"
-        );
-
-        let body = response_body_string(resp);
-        let response: DeactivateKeyResponse =
-            serde_json::from_str(&body).expect("should deserialize deactivate response");
-
-        assert!(
-            !response.success,
-            "should report failure when store reads fail"
-        );
-        assert!(
-            !response.deleted,
-            "should not report deletion when the operation failed"
-        );
-        assert!(
-            response.error.is_some(),
-            "should include error detail in failure response"
-        );
-    }
-
-    #[test]
-    fn test_handle_deactivate_key_invalid_json() {
-        let settings = crate::test_support::tests::create_test_settings();
-        let req = build_request(
-            Method::POST,
-            "https://test.com/admin/keys/deactivate",
-            Some("invalid json"),
-        );
-
-        let result = handle_deactivate_key(&settings, &noop_services(), req);
-        assert!(result.is_err(), "Invalid JSON should return error");
-    }
-
-    #[test]
-    fn test_handle_deactivate_key_rejects_invalid_kid() {
-        let settings = crate::test_support::tests::create_test_settings();
-
-        let req_body = DeactivateKeyRequest {
-            kid: "bad kid".to_string(),
-            delete: false,
-        };
-
-        let body_json =
-            serde_json::to_string(&req_body).expect("should serialize deactivate request");
-        let req = build_request(
-            Method::POST,
-            "https://test.com/admin/keys/deactivate",
-            Some(&body_json),
-        );
-
-        let resp = handle_deactivate_key(&settings, &noop_services(), req)
-            .expect("should return a response for invalid kid");
-
-        assert_eq!(
-            resp.status(),
-            StatusCode::BAD_REQUEST,
-            "should reject malformed kid as a bad request"
-        );
-
-        let body = response_body_string(resp);
-        let response: DeactivateKeyResponse =
-            serde_json::from_str(&body).expect("should deserialize deactivate response");
-
-        assert!(
-            !response.success,
-            "should report failure when supplied kid is invalid"
-        );
-        assert!(
-            response
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("kid must contain only")),
-            "should explain the kid character restrictions"
-        );
-    }
-
-    #[test]
     fn verify_signature_rejects_oversized_body() {
         let settings = crate::test_support::tests::create_test_settings();
         let oversized = "x".repeat(VERIFY_MAX_BODY_BYTES + 1);
@@ -1015,63 +493,6 @@ mod tests {
                     if message == "verify-signature request body must be buffered, not streamed"
             ),
             "should explain that verify bodies must be buffered"
-        );
-    }
-
-    #[test]
-    fn rotate_key_rejects_oversized_body() {
-        let settings = crate::test_support::tests::create_test_settings();
-        let oversized = "x".repeat(ADMIN_MAX_BODY_BYTES + 1);
-        let req = build_request(
-            Method::POST,
-            "https://test.com/admin/keys/rotate",
-            Some(&oversized),
-        );
-        let err = handle_rotate_key(&settings, &noop_services(), req)
-            .expect_err("should reject oversized body");
-        assert_eq!(
-            err.current_context().status_code(),
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "should return 413 for rotate-key body over limit"
-        );
-    }
-
-    #[test]
-    fn rotate_key_rejects_streaming_body() {
-        let settings = crate::test_support::tests::create_test_settings();
-        let req = build_streaming_request(Method::POST, "https://test.com/admin/keys/rotate");
-        let err = handle_rotate_key(&settings, &noop_services(), req)
-            .expect_err("should reject streaming rotate body");
-        assert_eq!(
-            err.current_context().status_code(),
-            StatusCode::BAD_REQUEST,
-            "should return 400 for streaming rotate body"
-        );
-        assert!(
-            matches!(
-                err.current_context(),
-                TrustedServerError::BadRequest { message }
-                    if message == "rotate-key request body must be buffered, not streamed"
-            ),
-            "should explain that rotate bodies must be buffered"
-        );
-    }
-
-    #[test]
-    fn deactivate_key_rejects_oversized_body() {
-        let settings = crate::test_support::tests::create_test_settings();
-        let oversized = "x".repeat(ADMIN_MAX_BODY_BYTES + 1);
-        let req = build_request(
-            Method::POST,
-            "https://test.com/admin/keys/deactivate",
-            Some(&oversized),
-        );
-        let err = handle_deactivate_key(&settings, &noop_services(), req)
-            .expect_err("should reject oversized body");
-        assert_eq!(
-            err.current_context().status_code(),
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "should return 413 for deactivate-key body over limit"
         );
     }
 
@@ -1115,7 +536,7 @@ mod tests {
     fn validate_kid_rejects_non_lowercase_leading_ids() {
         // The Spin variable encoder requires a lowercase ASCII leading character,
         // so uppercase- and punctuation-leading KIDs that pass validate_kid_format
-        // must be rejected on the create/rotate path to avoid a runtime 5xx on Spin.
+        // must be rejected for a new key, which Spin could not store.
         for kid in &["KidA", "_kid", "-kid", ".kid", ":kid"] {
             assert!(
                 validate_kid(kid).is_err(),
@@ -1127,63 +548,32 @@ mod tests {
     }
 
     #[test]
-    fn validate_kid_format_allows_digit_leading_for_legacy_removal() {
-        // Deactivation/deletion uses validate_kid_format so digit-leading KIDs
-        // created under earlier rules stay removable, while the stricter
-        // validate_kid still blocks them on the create/rotate path.
+    fn validate_kid_format_allows_digit_leading_ids() {
+        // The leading-letter rule belongs to validate_kid alone, so the
+        // structural check accepts a digit-leading kid that a new key may not
+        // take.
         for kid in &["2026-key", "0abc", "9xyz", "1-key"] {
             validate_kid_format(kid)
-                .unwrap_or_else(|e| panic!("format check should accept legacy kid {kid}: {e:?}"));
+                .unwrap_or_else(|e| panic!("format check should accept kid {kid}: {e:?}"));
             assert!(
                 validate_kid(kid).is_err(),
-                "create/rotate validation must still reject digit-leading kid: {kid}"
+                "new-key validation must still reject digit-leading kid: {kid}"
             );
         }
     }
 
     #[test]
-    fn deactivate_allows_legacy_digit_leading_kid_past_validation() {
-        // A digit-leading legacy kid must pass validation and reach storage
-        // (which fails with the noop test stores -> 500) rather than being
-        // rejected up front as a 400 bad request.
-        let settings = crate::test_support::tests::create_test_settings();
-        let req_body = DeactivateKeyRequest {
-            kid: "1legacy-key".to_string(),
-            delete: true,
-        };
-        let body_json =
-            serde_json::to_string(&req_body).expect("should serialize deactivate request");
-        let req = build_request(
-            Method::POST,
-            "https://test.com/admin/keys/deactivate",
-            Some(&body_json),
-        );
-
-        let resp = handle_deactivate_key(&settings, &noop_services(), req)
-            .expect("should return a response for a legacy digit-leading kid");
-
-        assert_ne!(
-            resp.status(),
-            StatusCode::BAD_REQUEST,
-            "legacy digit-leading kid must not be rejected as a bad request on deactivation"
-        );
-    }
-
-    #[test]
-    fn test_rotate_key_request_deserialization() {
-        let json = r#"{"kid":"custom-key"}"#;
-        let req: RotateKeyRequest =
-            serde_json::from_str(json).expect("should deserialize rotate key request");
-        assert_eq!(req.kid, Some("custom-key".to_string()));
-    }
-
-    #[test]
-    fn test_deactivate_key_request_deserialization() {
-        let json = r#"{"kid":"old-key","delete":true}"#;
-        let req: DeactivateKeyRequest =
-            serde_json::from_str(json).expect("should deserialize deactivate key request");
-        assert_eq!(req.kid, "old-key");
-        assert!(req.delete);
+    fn a_well_formed_kid_need_not_be_one_a_new_key_may_take() {
+        for kid in ["2026-key", "KidA", "-kid", "ts-2026-01-01"] {
+            assert!(kid_is_well_formed(kid), "should accept {kid}");
+        }
+        for kid in ["2026-key", "KidA", "-kid"] {
+            assert!(!kid_is_creatable(kid), "should not create {kid}");
+        }
+        let too_long = "a".repeat(129);
+        for kid in ["", "kid-a,kid-b", "kid a", "kid/a", &too_long] {
+            assert!(!kid_is_well_formed(kid), "should refuse {kid:?}");
+        }
     }
 
     #[test]

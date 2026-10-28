@@ -75,7 +75,7 @@ ts config push --adapter fastly --permissions standard.yaml
 ### Static secret references
 
 Static app-config credentials contain stable key names only. This includes
-publisher, trusted-client-IP, EC, handler, Tinybird, DataDome, and S3 fields:
+publisher, trusted-client-IP, EC, Tinybird, DataDome, and S3 fields:
 
 - `publisher.proxy_secret`
 - `trusted_client_ip.shared_secret`, when trusted client-IP forwarding is configured
@@ -83,7 +83,6 @@ publisher, trusted-client-IP, EC, handler, Tinybird, DataDome, and S3 fields:
 - `ec.host_signals.passphrase`, when `[ec] module = "host_signals"`
 - `ec.partners[*].api_token`, when inbound identify or batch sync is used
 - `ec.partners[*].ts_pull_token`, when pull sync is enabled
-- `handlers[*].password`
 - `tinybird.auction_token_secret`, when Tinybird auction telemetry is enabled
 - `bot-protection.datadome.server_side_key_secret_name`, when protection is enabled
 - `bot-protection.datadome.protection_test_bypass.credential_secret_name`, when the bypass is enabled
@@ -126,7 +125,6 @@ serialization, runtime, and secret axes for every exceptional field:
 | `Ec.passphrase`                                              | canonical  | canonical                           | serialized    | active                  | store resolved           |
 | `EcPartner.api_token`                                        | canonical  | canonical                           | serialized    | active                  | store resolved           |
 | `EcPartner.ts_pull_token`                                    | canonical  | canonical                           | serialized    | active                  | store resolved           |
-| `Handler.password`                                           | canonical  | canonical                           | serialized    | active                  | store resolved           |
 | `Publisher.proxy_secret`                                     | canonical  | canonical                           | serialized    | active                  | store resolved           |
 | `S3SigV4AuthConfig.access_key_id`                            | canonical  | canonical                           | serialized    | active                  | store resolved           |
 | `S3SigV4AuthConfig.secret_access_key`                        | canonical  | canonical                           | serialized    | active                  | store resolved           |
@@ -239,14 +237,13 @@ fail and the service will return its startup-error response.
 | `[ec]`                                                                                                            | one module            | Edge Cookie identity, persistence, and partner sync                                         |
 | `[[fetch]]`                                                                                                       | nothing               | Which page changes run on a page as it is fetched, and in what order                        |
 | `[geo]`                                                                                                           | one module            | Which module resolves location, if any                                                      |
-| `[[handlers]]`                                                                                                    | nothing               | Ordered HTTP Basic-auth rules                                                               |
 | `[image_optimizer]`                                                                                               | nothing               | Reusable Fastly Image Optimizer profiles                                                    |
 | `[inspect]`                                                                                                       | nothing               | What the configuration page at `/_ts/config` shows                                          |
 | `[permission-signal]`                                                                                             | several modules       | Which permission signals are acted on, in order                                             |
 | `[permissions]`                                                                                                   | nothing               | The publisher's permission policy file, by name                                             |
 | `[proxy]`                                                                                                         | several modules       | Proxy allowlist, TLS policy, asset routes, and the first-party script proxy module          |
 | `[publisher]`                                                                                                     | nothing               | Publisher domain, origin, and proxy signing key                                             |
-| `[request_signing]`                                                                                               | nothing               | Outbound Ed25519 request signing and management-store IDs                                   |
+| `[request_signing]`                                                                                               | nothing               | Outbound Ed25519 request signing                                                            |
 | `[response_headers]`                                                                                              | nothing               | Headers added to Trusted Server responses                                                   |
 | `[rewrite]`                                                                                                       | nothing               | First-party URL rewrite exclusions                                                          |
 | `[[serve]]`                                                                                                       | nothing               | Which page changes run on each reader's copy of a page, and in what order                   |
@@ -278,8 +275,6 @@ policy = "standard"
 
 [request_signing]
 enabled = true
-config_store_id = "01GXXX"
-secret_store_id = "01GYYY"
 
 [auction.prebid]
 client_side_bidders = ["example-browser-bidder"]
@@ -693,18 +688,18 @@ defaults.
 Each entry of `show` and `hide` is a path pattern, being keys joined by `.`,
 with `[]` for every element of a list and `[N]` for one, such as
 `publisher.origin_url`, `proxy.asset_routes[].origin_url` or
-`handlers[0].path`. A pattern names the values at exactly its own depth.
+`proxy.asset_routes[0].prefix`. A pattern names the values at exactly its own
+depth.
 
 A masked value shows as `XXXX`, and the page lists every masked path.
 
-| What                                                                                                             | Masked     | Can `show` reveal it             |
-| ---------------------------------------------------------------------------------------------------------------- | ---------- | -------------------------------- |
-| A secret, meaning a value the settings loader fills from the secret store                                        | Always     | No                               |
-| `publisher.origin_url` and `publisher.origin_host_header_override`                                               | By default | Yes                              |
-| `proxy.asset_routes[].origin_url`                                                                                | By default | Yes                              |
-| `handlers[].path` and `handlers[].username`                                                                      | By default | Yes                              |
-| `ec.ec_store`, `request_signing.config_store_id`, `request_signing.secret_store_id` and `auction.creative_store` | By default | Yes                              |
-| Anything `hide` names                                                                                            | When named | It is the publisher's own choice |
+| What                                                                      | Masked     | Can `show` reveal it             |
+| ------------------------------------------------------------------------- | ---------- | -------------------------------- |
+| A secret, meaning a value the settings loader fills from the secret store | Always     | No                               |
+| `publisher.origin_url` and `publisher.origin_host_header_override`        | By default | Yes                              |
+| `proxy.asset_routes[].origin_url`                                         | By default | Yes                              |
+| `ec.ec_store` and `auction.creative_store`                                | By default | Yes                              |
+| Anything `hide` names                                                     | When named | It is the publisher's own choice |
 
 A pattern that would not be honored as written refuses the configuration,
 both when a deployment is validated and when the settings load. That is a
@@ -1134,31 +1129,31 @@ allows those too. Set `proxy.allowed_domains` to bound what the proxy serves.
 
 ## Request Signing
 
-Configuration for Ed25519 request signing and JWKS management.
+Configuration for Ed25519 request signing.
 
 ### `[request_signing]`
 
-| Field             | Type    | Required            | Description                             |
-| ----------------- | ------- | ------------------- | --------------------------------------- |
-| `enabled`         | Boolean | No (default: false) | Enable request signing features         |
-| `config_store_id` | String  | If enabled          | Fastly Config Store ID for JWKS         |
-| `secret_store_id` | String  | If enabled          | Fastly Secret Store ID for private keys |
+| Field     | Type    | Required            | Description                     |
+| --------- | ------- | ------------------- | ------------------------------- |
+| `enabled` | Boolean | No (default: false) | Enable request signing features |
 
 **Example**:
 
 ```toml
 [request_signing]
 enabled = true
-config_store_id = "01GXXX"  # From Fastly dashboard
-secret_store_id = "01GYYY"  # From Fastly dashboard
 ```
+
+The service reads its keys from the stores linked as `jwks_store` and
+`signing_keys`, so the section holds no store id. The ids are given to
+[`ts keys`](./cli.md#request-signing-keys) on its command line, and a
+configuration that still carries `config_store_id` or `secret_store_id` is
+refused when it is validated and when the service starts.
 
 **Environment Override**:
 
 ```bash
 TRUSTED_SERVER__REQUEST_SIGNING__ENABLED=true
-TRUSTED_SERVER__REQUEST_SIGNING__CONFIG_STORE_ID=01GXXX
-TRUSTED_SERVER__REQUEST_SIGNING__SECRET_STORE_ID=01GYYY
 ```
 
 ### Store Setup
@@ -1196,150 +1191,6 @@ fastly secret-store list
 ```
 
 See [Request Signing](/guide/request-signing) and [Key Rotation](/guide/key-rotation) for usage.
-
-## Basic Authentication Handlers
-
-Path-based HTTP Basic Authentication.
-
-### `[[handlers]]`
-
-**Purpose**: Protect specific paths with username/password authentication.
-
-**Format**: Array of handler objects
-
-| Field      | Type           | Required | Description                       |
-| ---------- | -------------- | -------- | --------------------------------- |
-| `path`     | String (Regex) | Yes      | Regular expression matching paths |
-| `username` | String         | Yes      | HTTP Basic Auth username          |
-| `password` | String         | Yes      | HTTP Basic Auth password          |
-
-**Example**:
-
-```toml
-# Single handler
-[[handlers]]
-path = "^/_ts/admin"
-username = "admin"
-password = "admin_password"
-
-# Multiple handlers
-[[handlers]]
-path = "^/secure"
-username = "user1"
-password = "secure_handler_password"
-
-[[handlers]]
-path = "^/api/private"
-username = "api-user"
-password = "api_handler_password"
-```
-
-**Environment Override**:
-
-```bash
-# Handler 0
-TRUSTED_SERVER__HANDLERS__0__PATH="^/_ts/admin"
-TRUSTED_SERVER__HANDLERS__0__USERNAME="admin"
-TRUSTED_SERVER__HANDLERS__0__PASSWORD="admin_password"
-
-# Handler 1
-TRUSTED_SERVER__HANDLERS__1__PATH="^/api/private"
-TRUSTED_SERVER__HANDLERS__1__USERNAME="api-user"
-TRUSTED_SERVER__HANDLERS__1__PASSWORD="api_handler_password"
-```
-
-### Path Patterns
-
-**Regex Syntax**: Standard Rust regex patterns
-
-**Examples**:
-
-```toml
-# Exact path
-path = "^/_ts/admin$"  # Only /_ts/admin
-
-# Prefix match
-path = "^/_ts/admin"   # /_ts/admin, /_ts/admin/users, /_ts/admin/settings
-
-# Multiple paths
-path = "^/(admin|secure|private)"
-
-# File extension
-path = "\\.pdf$"   # All PDF files
-
-# Complex pattern
-path = "^/api/v[0-9]+/private"  # /api/v1/private, /api/v2/private
-```
-
-**Validation**: Application startup fails if regex is invalid.
-
-::: warning Admin coverage and passwords are validated at startup
-
-Startup fails when no handler covers an admin route. The dynamic
-`/_ts/admin/ec/{id}` route accepts any segment after `/_ts/admin/ec/`, and
-Basic Auth runs on the raw path before routing, so coverage cannot be inferred
-from ID-shaped samples: a pattern such as
-`^/_ts/admin/ec/hmac~[a-f0-9]{64}[.][A-Za-z0-9]{6}$` is rejected. Use a prefix-level
-matcher (`^/_ts/admin`, or `^/_ts/admin/ec/` alongside the other admin
-patterns).
-
-Handler expressions match the raw URI path, while a publisher origin may decode
-percent-encoded aliases before routing. For a whole-site staging gate, use
-`path = "^/"`; do not rely on a decoded-path prefix such as `^/secure` to protect
-equivalent origin paths.
-
-Startup also fails when any handler, admin or not, uses a placeholder or
-well-known weak password (`changeme`, `password`, `admin`, or a
-`replace-with-…` template value). Handler selection is first-match-wins, so a
-narrow handler ahead of the admin pattern governs the paths it matches.
-
-:::
-
-::: warning Scope patterns to the paths you mean
-
-Handler patterns are matched against the full request path, so a broad pattern
-covers everything beneath it. The `/_ts/` namespace holds both admin routes and
-browser-facing endpoints that anonymous visitors must be able to reach:
-
-| Path                     | Called by                            |
-| ------------------------ | ------------------------------------ |
-| `/_ts/page-bids`         | Trusted Server JS, on SPA navigation |
-| `/_ts/api/v1/identify`   | Trusted Server JS, in the browser    |
-| `/_ts/api/v1/batch-sync` | Trusted Server JS, in the browser    |
-
-A pattern such as `path = "^/_ts"` puts those behind Basic Auth. Browser
-fetches never carry Basic credentials, so every visitor gets `401`, on
-`/_ts/page-bids` that means no ads after any client-side navigation. Match the
-admin routes specifically (`^/_ts/admin`) instead.
-
-Upgrading from a release before `/_ts/page-bids` existed: if any handler
-pattern covers it, narrow the pattern. The Trusted Server JS bundle falls back
-to the deprecated `/__ts/page-bids` alias in the meantime, but that alias is
-scheduled for removal
-([#970](https://github.com/IABTechLab/trusted-server/issues/970)).
-
-:::
-
-### Security Considerations
-
-**Password Storage**:
-
-- `handlers[*].password` is a key name in `trusted_server_secrets`
-- Store the resolved password only in the platform secret store
-- Rotate passwords through the store and restart/redeploy instances
-
-**Limitations**:
-
-- HTTP Basic Auth (not OAuth/JWT)
-- Single username/password per path
-- No role-based access control
-- No rate limiting (add at edge)
-
-::: warning Production Use
-Do not put handler passwords in `trusted-server.toml`, environment overlays, or
-app-config blobs. Provision the referenced key in `trusted_server_secrets`
-before pushing the config.
-:::
 
 ## URL Rewrite Configuration
 
@@ -2839,14 +2690,6 @@ response and runs a new per-reader auction. Explicit `no-cache`, `no-store`,
 positive or malformed request `max-age`, range, and conditional requests still bypass the template cache.
 Check `X-TS-Template-Cache: hit` to verify template reuse.
 
-Authorization has one narrow exception. A request carrying exactly the same
-single Basic credential that Trusted Server just validated at the edge may share
-a template; pass-through, repeated, appended, or replaced values still bypass.
-Trusted Server does not remove the validated header, so it remains forwarded to
-the publisher origin. If the origin uses that credential to select response
-content, it must declare `Vary: Authorization`; that response is deliberately not
-stored as a shared template.
-
 `template_cache_vary` is necessary because lookup occurs before the origin can
 return `Vary`. Presence, empty values, repeated raw field values, host/scheme,
 origin identity, complete template-shaping settings, TSJS content, core build
@@ -2972,11 +2815,6 @@ The two headers together are the reliable verification signal. Timing alone can
 vary with the origin, auction, compression, browser connection reuse, and local
 proxy buffering.
 
-> **Upgrade note.** This release adds `/_ts/admin/cache/purge` to the admin endpoints
-> startup validation covers. A configuration whose `[[handlers]]` enumerate admin paths
-> individually, rather than using the `^/_ts/admin` prefix, fails to start until that path
-> is covered too. The failure is at startup and explicit, not at request time.
-
 Rollback must preserve configuration compatibility:
 
 1. Change `assembly_mode` to `inline` and deploy/push that configuration.
@@ -2992,17 +2830,16 @@ Rollback must preserve configuration compatibility:
    the lists loses variant separation and session bypass.
    Remove `origin_readthrough_enabled` even when rolling it back: `false` still
    serializes the field and older binaries reject it.
-3. Purge the template cache with `ts cache purge --service <url> --all`, or
+3. Purge the template cache with `ts cache purge --service-id <id> --all`, or
    `--page <url>` for a single reader-facing URL. Use its exact scheme, host, and
    port: `http://example.com/article` and `https://example.com/article` have different
    purge keys. A success acknowledges invalidation of the requested key, not that an
-   object existed. `--service` requires HTTPS, except for loopback development
-   services (`localhost`, `127.0.0.1`, or `::1`). The admin endpoint
-   `POST /_ts/admin/cache/purge` is the same operation for a CMS webhook. Either clears
-   the `ts-template` surrogate key; waiting out the bounded origin-derived lifetime also
-   works. With readthrough caching enabled, `--all` also purges tagged origin
-   documents, so the next requests refetch those documents from the origin. Check
-   whether the origin can absorb that load before purging during a traffic peak.
+   object existed. The command asks Fastly to purge, through the `fastly` CLI with the
+   token in `FASTLY_API_TOKEN`, and `--all` clears the `ts-template` surrogate key.
+   Waiting out the bounded origin-derived lifetime also works. With readthrough
+   caching enabled, `--all` also purges tagged origin documents, so the next requests
+   refetch those documents from the origin. Check whether the origin can absorb that
+   load before purging during a traffic peak.
 
 Run `scripts/template-cache-local-test.sh esi` before a rollout and
 `scripts/template-cache-local-test.sh inline` as its control. The harness uses a temporary
@@ -3151,7 +2988,7 @@ saying nothing about this setting.
    next request with no deploy and restores the previous policy: ad-serving
    requests bypass, while non-ad traffic keeps the platform default. It does not
    disable origin caching globally.
-2. Purge tagged objects with `ts cache purge --service <https-service-url> --all`,
+2. Purge tagged objects with `ts cache purge --service-id <service-id> --all`,
    or `--page <reader-url>` for one exact reader-facing URL. Both the template cache
    and opted-in origin readthrough objects carry the page key and `ts-template`
    purge-all key. The readthrough tags use the original reader URL, before origin
@@ -3316,8 +3153,7 @@ selection is a deploy-time input: a managed `ts deploy --adapter fastly` links
 the physical store named by
 `EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` to the service version
 under the logical ID. On Fastly the CLI rejects a `__KEY` selector other than
-the logical ID, and it pushes a `--key` other than the logical ID only with
-`--local`.
+the logical ID, and it pushes a `--key` other than the logical ID itself.
 
 Keep the `__NAME` selector set in the shell or deploy job for every push, so
 `ts config push` writes into the same physical store the deployment links.
@@ -3341,9 +3177,9 @@ Push each key in lower case. The runtime lowercases the request's host and
 answered `421`.
 
 ```bash
-ts config push --adapter fastly --local --key www.publisher-a.example \
+ts config push --adapter fastly --key www.publisher-a.example \
   --app-config publisher-a.toml --permissions standard.yaml
-ts config push --adapter fastly --local --key www.publisher-b.example \
+ts config push --adapter fastly --key www.publisher-b.example \
   --app-config publisher-b.toml --permissions standard.yaml
 
 fastly config-store-entry update --upsert \
@@ -3352,18 +3188,23 @@ fastly config-store-entry update --upsert \
   --value '{host}'
 ```
 
-`ts config push` writes a key other than `trusted_server_config` only with
-`--local`, into the local store in `fastly.toml`. Copy the entries it writes
-into a live store with `fastly config-store-entry update`, the policy entries
-first and a long value's chunks before its pointer. The selector is read on
-every request, so the blobs come first.
+`ts config push` writes a key other than `trusted_server_config` itself,
+because EdgeZero writes no other key on Fastly. It writes the live store that
+`EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` selects through the
+`fastly` CLI, with the token in `FASTLY_API_TOKEN`, and with `--local` it
+writes the local store in `fastly.toml` instead. The policy entries are
+written first, and a long value's chunks before its pointer. The selector is
+read on every request, so the blobs come first.
 
 Each host's blob names its permission policy file in `[permissions] policy`
 and pins the file's SHA-256, and carries no copy of the file. The push keeps
 each file `--permissions` supplies once, in an entry of its own under
 `permissions_<sha256>`, written before the host's blob, and keeps an entry that
 already holds the file, so a hundred hosts that name three files store three
-entries. A changed file is a new entry, so a host still running an earlier
+entries. A live push that writes a policy entry waits 60 seconds before it
+writes the host's blob, because the store is consistent key by key, and a
+location that reads a blob before the entry it names answers that host
+`500`. A changed file is a new entry, so a host still running an earlier
 blob still finds the file that blob pins. The blob at `trusted_server_config`
 carries its file, as on a service with one blob. `ts config diff` compares only
 that blob, so the policy a host runs is checked on that host's `/_ts/config`.
@@ -3483,12 +3324,6 @@ from the file, and startup checks the rest and runs the first set again.
 
 - Every secret setting holds a key name and no secret value
 
-**Handlers**:
-
-- `path` is a valid regex
-- `username` is ordinary configuration and non-empty
-- At least one handler covers the `/_ts/admin` namespace
-
 **Integrations**:
 
 - Each integration validates its own block, selected or not, so a typo in a
@@ -3512,8 +3347,8 @@ Everything above runs again on the loaded configuration, and these join it:
   running module supplies, or one named in the phase it does not run in,
   stops the service on its next start, because which middleware a build has
   is only known where its modules are registered
-- Resolved secret values, so a passphrase shorter than 32 bytes, a placeholder
-  or a weak handler password fails here
+- Resolved secret values, so a passphrase shorter than 32 bytes or a
+  placeholder fails here
 - The compiled `permissions.yaml` policy, and the `assume_single_jurisdiction`
   acknowledgment an Edge Cookie module needs when no geo module is selected
 - The checks only the host can make, being backend name prediction and
@@ -3607,12 +3442,6 @@ trusted-server.dev.toml      # Development overrides
 - Ensure the resolved value is non-empty and not a known placeholder
 - Do not replace the key name with a plaintext value in the app config
 - Rotate the value in the platform secret store, then restart/redeploy
-
-**"Invalid regex"**:
-
-- Handler `path` must be valid regex
-- Test pattern: `echo "^/_ts/admin" | grep -E "^/_ts/admin"`
-- Escape special characters: `\.`, `\$`, etc.
 
 **"Integration configuration could not be parsed"**:
 

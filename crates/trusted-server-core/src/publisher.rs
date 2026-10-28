@@ -4525,7 +4525,7 @@ pub(crate) struct SharedRequestInputs {
     pub(crate) method_is_cacheable: bool,
     /// A request host was resolved. The post-processed output is host-dependent.
     pub(crate) host_present: bool,
-    /// The request carried an `Authorization` value that did not pass edge auth unchanged.
+    /// The request carried an `Authorization` header, which is bound for the origin.
     pub(crate) authorization_disqualifies: bool,
     /// Cookie policy refuses this cache's key. Readthrough additionally refuses
     /// configured cookie dimensions that only the template key can represent.
@@ -4580,7 +4580,7 @@ fn apply_origin_cache_intent(
     if bypass {
         request.with_cache_bypass()
     } else if readthrough_applies {
-        // The same reader-facing key and all-scope key used by the purge endpoint.
+        // The reader-facing key and the all-scope key that `ts cache purge` names.
         // Fastly accepts multiple space-separated surrogate keys without changing TTL.
         request.with_shared_cache(format!(
             "{TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY} {}",
@@ -4840,18 +4840,10 @@ pub async fn handle_publisher_request(
     // may start before the auction is dispatched, so nothing downstream can read
     // these headers any more.
     //
-    // Capture cache eligibility before the origin send consumes the request. One
-    // unchanged marked Authorization value passed edge auth; unmarked, replaced,
-    // or repeated values remain pass-through and bypass sharing.
-    let authorization_value_count = req.headers().get_all(header::AUTHORIZATION).iter().count();
-    let authorization_disqualifies = match authorization_value_count {
-        0 => false,
-        1 => req
-            .extensions()
-            .get::<crate::auth::EdgeTerminatedAuthorization>()
-            .is_none_or(|marker| !marker.matches(req.headers())),
-        _ => true,
-    };
+    // Capture cache eligibility before the origin send consumes the request. An
+    // Authorization header is bound for the origin, so its response is never
+    // shared.
+    let authorization_disqualifies = req.headers().contains_key(header::AUTHORIZATION);
     // Classify cookies once before the origin consumes the request. The same decision
     // governs lookup and storage, so a bypass cookie can never read a warm template.
     let (key_cookie_names, bypass_cookie_names, cookie_independent) = settings
@@ -6416,9 +6408,8 @@ pub(crate) enum TemplateCacheBypassReason {
     /// still-positive origin lifetime rather than inventing one.
     #[display("origin response has no positive shared freshness")]
     NoPositiveFreshness,
-    /// The request was authenticated. #1009 describes a Basic-Auth-gated
-    /// deployment, so an authorized response entering a shared cache is a live
-    /// concern rather than a hypothetical one.
+    /// The request carried credentials, which are bound for the origin, so its
+    /// response is one reader's and never enters a shared cache.
     #[display("request carried Authorization")]
     AuthorizedRequest,
     /// Not a 200. This is also what covers a bot protection module's block, which
@@ -7102,10 +7093,8 @@ pub const PAGE_BIDS_PATH: &str = "/_ts/page-bids";
 /// The alias is bidirectional in practice: the current tsjs bundle requests
 /// [`PAGE_BIDS_PATH`] first and falls back here when that path does not serve
 /// page-bids on a deployment. That covers a server rolled back to before the
-/// rename, and an operator `[[handlers]]` auth regex broad enough to cover
-/// `/_ts` (which would answer the canonical path with `401`). Both are
-/// transitional — an affected operator must narrow the regex before the alias
-/// is removed.
+/// rename, and a gate in front of the service that answers the canonical path
+/// with `401`. Both are transitional.
 ///
 /// Removal is tracked by IABTechLab/trusted-server#970: drop this const, its
 /// four adapter registrations, and the client fallback once access logs show no
@@ -7247,8 +7236,8 @@ pub async fn handle_page_bids(
     // separates them by the `X-TSJS-Page-Bids` value. A pre-rename bundle sends
     // `1` and disappears on its own as caches turn over. The current bundle
     // sends `fallback` and does *not* — it only reaches the alias when the
-    // canonical path is unusable on this deployment (an operator `[[handlers]]`
-    // regex covering `/_ts`, or a server rolled back past the rename), which
+    // canonical path is unusable on this deployment (a gate in front of the
+    // service covering `/_ts`, or a server rolled back past the rename), which
     // persists until that is fixed. Treating the two as one number would make
     // #970 wait forever on a config problem. The value is client-supplied, so
     // it is a diagnostic hint only; the gate above does not trust it.
@@ -7262,8 +7251,8 @@ pub async fn handle_page_bids(
         if is_client_fallback {
             log::warn!(
                 "page-bids: served deprecated alias {PAGE_BIDS_LEGACY_PATH} to a current \
-                 tsjs bundle that could not use {PAGE_BIDS_PATH} — check `[[handlers]]` for \
-                 a pattern covering `/_ts`; see IABTechLab/trusted-server#970"
+                 tsjs bundle that could not use {PAGE_BIDS_PATH}, so check what answers \
+                 that path ahead of this service; see IABTechLab/trusted-server#970"
             );
         } else {
             log::info!(
@@ -10474,17 +10463,6 @@ mod tests {
             ) -> Result<(), crate::platform::TemplateCacheError> {
                 Ok(())
             }
-
-            async fn purge_url_surrogate_key(
-                &self,
-                _key: &str,
-            ) -> Result<(), crate::platform::TemplateCacheError> {
-                Ok(())
-            }
-
-            async fn purge_all(&self) -> Result<(), crate::platform::TemplateCacheError> {
-                Ok(())
-            }
         }
 
         impl RecordingCache {
@@ -10629,10 +10607,6 @@ mod tests {
             /// Force the lookup transaction to fail, for the fail-open + telemetry
             /// contract. A backend outage must never become a publisher outage.
             fail_lookup: AtomicBool,
-            /// Surrogate keys a purge asked for. This double stores by cache key, so it
-            /// cannot resolve a surrogate key to entries the way the platform does —
-            /// recording the request is what a test can assert on.
-            purged_surrogate_keys: Arc<Mutex<Vec<String>>>,
         }
 
         struct MemoryTemplateReservation {
@@ -10815,26 +10789,6 @@ mod tests {
                     .lock()
                     .expect("should lock entries")
                     .remove(&key.to_cache_key());
-                Ok(())
-            }
-
-            /// Records the key so a test can assert what a purge asked for.
-            ///
-            /// This double stores by cache key, not by surrogate key, so it cannot
-            /// resolve one to the other the way the platform does.
-            async fn purge_url_surrogate_key(
-                &self,
-                key: &str,
-            ) -> Result<(), crate::platform::TemplateCacheError> {
-                self.purged_surrogate_keys
-                    .lock()
-                    .expect("should lock purged surrogate keys")
-                    .push(key.to_owned());
-                Ok(())
-            }
-
-            async fn purge_all(&self) -> Result<(), crate::platform::TemplateCacheError> {
-                self.entries.lock().expect("should lock entries").clear();
                 Ok(())
             }
         }
@@ -12400,7 +12354,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_pass_through_authorization_never_reaches_the_shared_template() {
+        async fn an_authorization_never_reaches_the_shared_template() {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let settings = Arc::new(settings_with_mode("esi"));
@@ -12420,154 +12374,12 @@ mod tests {
                     .get(HEADER_X_TS_TEMPLATE_CACHE)
                     .and_then(|value| value.to_str().ok()),
                 Some("bypass-request"),
-                "a credential TS did not terminate is bound for the origin, so its response must never be shared"
+                "an authorization is bound for the origin, so its response must never be shared"
             );
             assert_eq!(
                 cache.lookups.lock().expect("should lock lookups").len(),
                 0,
-                "an unterminated authorization must bypass before the lookup, not after it"
-            );
-        }
-
-        #[tokio::test]
-        async fn repeated_authorization_never_reaches_the_shared_template() {
-            let stub = Arc::new(StubHttpClient::new());
-            let cache = Arc::new(MemoryTemplateCache::default());
-            let settings = Arc::new(settings_with_mode("esi"));
-            let services = services(Arc::clone(&stub), Arc::clone(&cache));
-            queue_shareable_html(&stub);
-
-            let mut request = navigation_request();
-            request.headers_mut().insert(
-                header::AUTHORIZATION,
-                HeaderValue::from_static("Basic dXNlcjpwYXNz"),
-            );
-            request.headers_mut().append(
-                header::AUTHORIZATION,
-                HeaderValue::from_static("Bearer publisher-origin-credential"),
-            );
-            request
-                .extensions_mut()
-                .insert(crate::auth::EdgeTerminatedAuthorization::for_test(
-                    "Basic dXNlcjpwYXNz",
-                ));
-
-            let response = run(&settings, &services, request).await;
-            assert_eq!(
-                response
-                    .headers()
-                    .get(HEADER_X_TS_TEMPLATE_CACHE)
-                    .and_then(|value| value.to_str().ok()),
-                Some("bypass-request"),
-                "an ambiguous authorization must remain bound for the origin even if a marker is present"
-            );
-            assert_eq!(
-                cache.lookups.lock().expect("should lock lookups").len(),
-                0,
-                "repeated authorization must bypass before the shared template lookup"
-            );
-        }
-
-        #[tokio::test]
-        async fn a_replaced_edge_terminated_authorization_bypasses_the_shared_template() {
-            let stub = Arc::new(StubHttpClient::new());
-            let cache = Arc::new(MemoryTemplateCache::default());
-            let mut settings = settings_with_mode("esi");
-            settings.handlers[0] = toml::from_str(
-                r#"
-                    path = "^/article"
-                    username = "user"
-                    password = "pass"
-                "#,
-            )
-            .expect("should parse article auth handler");
-            let settings = Arc::new(settings);
-            let services = services(Arc::clone(&stub), Arc::clone(&cache));
-            queue_shareable_html(&stub);
-
-            let mut request = navigation_request();
-            request.headers_mut().insert(
-                header::AUTHORIZATION,
-                HeaderValue::from_static("Basic dXNlcjpwYXNz"),
-            );
-            assert!(
-                crate::auth::enforce_basic_auth(&settings, &mut request)
-                    .expect("should evaluate auth")
-                    .is_none(),
-                "the original credential should pass edge auth"
-            );
-            request.headers_mut().insert(
-                header::AUTHORIZATION,
-                HeaderValue::from_static("Bearer publisher-origin-credential"),
-            );
-
-            let response = run(&settings, &services, request).await;
-            assert_eq!(
-                response
-                    .headers()
-                    .get(HEADER_X_TS_TEMPLATE_CACHE)
-                    .and_then(|value| value.to_str().ok()),
-                Some("bypass-request"),
-                "a replacement credential was not validated at the edge and must bypass sharing"
-            );
-            assert_eq!(
-                cache.lookups.lock().expect("should lock lookups").len(),
-                0,
-                "a replaced authorization must bypass before the shared template lookup"
-            );
-        }
-
-        #[tokio::test]
-        async fn an_edge_terminated_authorization_still_shares_its_template() {
-            let stub = Arc::new(StubHttpClient::new());
-            let cache = Arc::new(MemoryTemplateCache::default());
-            let settings = Arc::new(settings_with_mode("esi"));
-            let services = services(Arc::clone(&stub), Arc::clone(&cache));
-
-            // One origin response for two requests: the warm read is asserted by the
-            // fixture running dry, exactly as in the unauthenticated case.
-            queue_shareable_html(&stub);
-
-            let authorized_navigation = || {
-                let mut request = navigation_request();
-                request.headers_mut().insert(
-                    header::AUTHORIZATION,
-                    HeaderValue::from_static("Basic dXNlcjpwYXNz"),
-                );
-                request.extensions_mut().insert(
-                    crate::auth::EdgeTerminatedAuthorization::for_test("Basic dXNlcjpwYXNz"),
-                );
-                request
-            };
-
-            let cold = run(&settings, &services, authorized_navigation()).await;
-            assert_eq!(
-                cold.headers()
-                    .get(HEADER_X_TS_TEMPLATE_CACHE)
-                    .and_then(|value| value.to_str().ok()),
-                Some("miss-stored"),
-                "a credential this edge terminated must be allowed to fill the shared template"
-            );
-            let first = body_of(cold).await;
-
-            let warm = run(&settings, &services, authorized_navigation()).await;
-            assert_eq!(
-                warm.headers()
-                    .get(HEADER_X_TS_TEMPLATE_CACHE)
-                    .and_then(|value| value.to_str().ok()),
-                Some("hit"),
-                "the second gated request must read the template the first one stored"
-            );
-            let second = body_of(warm).await;
-
-            assert_eq!(
-                stub.recorded_request_uris().len(),
-                1,
-                "the warm gated request must not fetch the origin"
-            );
-            assert_eq!(
-                second, first,
-                "the gated warm response must be byte-identical to the stored template"
+                "an authorization must bypass before the lookup, not after it"
             );
         }
 

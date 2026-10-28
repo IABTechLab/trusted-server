@@ -422,7 +422,7 @@ pub struct RequestFilterInput<'a> {
     /// The permission state resolved for this request at the start of the
     /// request cycle, so a filter reads the same permissions the rest of the
     /// request uses rather than resolving its own. `None` only on paths that
-    /// build no EC context, such as batch sync and admin diagnostics.
+    /// build no EC context, such as batch sync.
     pub permissions: Option<&'a crate::permissions::PermissionState>,
     /// Whether the request matches a registered integration proxy route.
     pub is_integration_route: bool,
@@ -506,7 +506,7 @@ pub struct RequestFilterRegistryInput<'a> {
     pub geo_info: Option<&'a GeoInfo>,
     /// The permission state resolved for this request at the start of the
     /// request cycle, passed on to every filter. `None` only on paths that
-    /// build no EC context, such as batch sync and admin diagnostics.
+    /// build no EC context, such as batch sync.
     pub permissions: Option<&'a crate::permissions::PermissionState>,
 }
 

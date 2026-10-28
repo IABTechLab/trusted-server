@@ -6632,7 +6632,6 @@ name = "trusted-server-adapter-fastly"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64",
  "bytes",
  "chrono",
  "derive_more",
@@ -6658,7 +6657,6 @@ dependencies = [
  "trusted-server-permission-signal-mtm",
  "trusted-server-permission-signal-tcf",
  "trusted-server-permission-signal-us-privacy",
- "url",
  "urlencoding",
 ]
 

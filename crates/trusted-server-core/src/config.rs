@@ -266,14 +266,6 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
             ),
             field(
                 vec![
-                    object("handlers"),
-                    SecretPathSegment::ArrayEach,
-                    object("password"),
-                ],
-                false,
-            ),
-            field(
-                vec![
                     optional_object("trusted_client_ip"),
                     object("shared_secret"),
                 ],
@@ -362,7 +354,6 @@ pub fn validate_settings_for_deploy_with(
 
     let mut structural_settings = settings.clone();
     structural_settings.prepare_runtime()?;
-    structural_settings.validate_admin_coverage()?;
 
     // The plan is compiled with the builders the blocks are validated
     // against, so a `[demand]` or `[ad-server]` name one of them supplies
@@ -410,7 +401,6 @@ pub fn validate_settings_for_runtime_with(
     extra_integrations: &[IntegrationBuilder],
 ) -> Result<(), Report<TrustedServerError>> {
     settings.reject_placeholder_secrets()?;
-    settings.validate_admin_handler_passwords()?;
     let plan = crate::auction::compile_auction_plan_with(settings, extra_integrations)?;
     validate_integration_blocks(settings, &plan, extra_integrations)?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
@@ -454,14 +444,6 @@ fn validate_non_secret_deploy_placeholders(
     }
     if crate::settings::Publisher::is_placeholder_origin_url(&settings.publisher.origin_url) {
         insecure_fields.push("publisher.origin_url");
-    }
-    if let Some(request_signing) = &settings.request_signing {
-        if crate::settings::RequestSigning::is_unusable_store_id(&request_signing.config_store_id) {
-            insecure_fields.push("request_signing.config_store_id");
-        }
-        if crate::settings::RequestSigning::is_unusable_store_id(&request_signing.secret_store_id) {
-            insecure_fields.push("request_signing.secret_store_id");
-        }
     }
 
     if insecure_fields.is_empty() {
@@ -507,13 +489,6 @@ fn validate_secret_key_references(
                 token.expose(),
             )?;
         }
-    }
-
-    for (index, handler) in settings.handlers.iter().enumerate() {
-        validate_secret_key_reference(
-            &format!("handlers[{index}].password"),
-            handler.password.expose(),
-        )?;
     }
 
     if let Some(trusted_client_ip) = &settings.trusted_client_ip {
@@ -872,8 +847,6 @@ formats = [{ width = 300, height = 250 }]
         let mut settings = valid_settings();
         settings.publisher.proxy_secret = Redacted::new("publisher_proxy".to_owned());
         select_hmac_module(&mut settings.ec, HMAC_MODULE_KEY, "ec_key");
-        settings.handlers[0].password = Redacted::new("handler_password".to_owned());
-        settings.handlers[1].password = Redacted::new("admin_password".to_owned());
         let app_config = TrustedServerAppConfig::new(settings)
             .expect("should validate key names without values");
 
@@ -1036,7 +1009,6 @@ formats = [{ width = 300, height = 250 }]
                 ("ec.host_signals.passphrase".to_owned(), true),
                 ("ec.partners[*].api_token".to_owned(), true),
                 ("ec.partners[*].ts_pull_token".to_owned(), true),
-                ("handlers[*].password".to_owned(), false),
                 ("trusted_client_ip.shared_secret".to_owned(), false),
                 ("tinybird.auction_token_secret".to_owned(), true),
                 ("proxy.asset_routes[*].auth.access_key_id".to_owned(), true),
@@ -1310,10 +1282,6 @@ module = "hmac"
 [ec.hmac]
 passphrase = "production-secret-key-32-bytes-min"
 
-[[handlers]]
-path = "^/_ts/admin"
-username = "admin"
-password = "production-admin-password-32-bytes"
 "#,
         )
         .expect("should parse placeholder settings before runtime validation");
@@ -1343,90 +1311,6 @@ password = "production-admin-password-32-bytes"
                 && text.contains("publisher.cookie_domain")
                 && text.contains("publisher.origin_url"),
             "should flag all three example publisher placeholders: {err:?}"
-        );
-    }
-
-    #[test]
-    fn deploy_validation_rejects_placeholder_request_signing_store_ids() {
-        let mut settings = valid_settings();
-        settings.request_signing = Some(crate::settings::RequestSigning {
-            enabled: true,
-            config_store_id: "<management-config-store-id>".to_string(),
-            secret_store_id: "<management-secret-store-id>".to_string(),
-        });
-
-        let err = validate_settings_for_deploy(&settings)
-            .expect_err("should reject placeholder request-signing store ids when enabled");
-        let text = format!("{err:?}");
-
-        assert!(
-            text.contains("request_signing.config_store_id")
-                && text.contains("request_signing.secret_store_id"),
-            "should flag both request-signing store ids: {err:?}"
-        );
-    }
-
-    /// The rotate/deactivate admin routes are registered unconditionally and
-    /// read the store IDs without consulting `enabled`, so a disabled block with
-    /// placeholder IDs would still reach key management at runtime.
-    #[test]
-    fn deploy_validation_rejects_placeholder_store_ids_while_request_signing_is_disabled() {
-        let mut settings = valid_settings();
-        settings.request_signing = Some(crate::settings::RequestSigning {
-            enabled: false,
-            config_store_id: "<management-config-store-id>".to_string(),
-            secret_store_id: "<management-secret-store-id>".to_string(),
-        });
-
-        let err = validate_settings_for_deploy(&settings).expect_err(
-            "should reject placeholder store ids even while request signing is disabled",
-        );
-        let text = format!("{err:?}");
-
-        assert!(
-            text.contains("request_signing.config_store_id")
-                && text.contains("request_signing.secret_store_id"),
-            "should flag both request-signing store ids: {err:?}"
-        );
-    }
-
-    #[test]
-    fn deploy_validation_rejects_empty_request_signing_store_ids() {
-        let mut settings = valid_settings();
-        settings.request_signing = Some(crate::settings::RequestSigning {
-            enabled: true,
-            config_store_id: String::new(),
-            secret_store_id: "   ".to_string(),
-        });
-
-        let err = validate_settings_for_deploy(&settings)
-            .expect_err("should reject empty and whitespace-only store ids");
-        let text = format!("{err:?}");
-
-        assert!(
-            text.contains("request_signing.config_store_id")
-                && text.contains("request_signing.secret_store_id"),
-            "should flag both request-signing store ids: {err:?}"
-        );
-    }
-
-    #[test]
-    fn deploy_validation_rejects_padded_request_signing_store_ids() {
-        let mut settings = valid_settings();
-        settings.request_signing = Some(crate::settings::RequestSigning {
-            enabled: false,
-            config_store_id: " management-config-store ".to_string(),
-            secret_store_id: "management-secret-store ".to_string(),
-        });
-
-        let err = validate_settings_for_deploy(&settings)
-            .expect_err("should reject store ids with surrounding whitespace");
-        let text = format!("{err:?}");
-
-        assert!(
-            text.contains("request_signing.config_store_id")
-                && text.contains("request_signing.secret_store_id"),
-            "should flag both padded store ids: {err:?}"
         );
     }
 

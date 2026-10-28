@@ -167,8 +167,7 @@ impl KeyRotationManager {
         signing_key: &SigningKey,
     ) -> Result<(), Report<TrustedServerError>> {
         // The platform secret-store write interface is string-based, so signing
-        // keys are persisted as base64 text. The Fastly adapter applies its own
-        // transport-level base64 encoding when calling the management API.
+        // keys are persisted as base64 text.
         let key_b64 = general_purpose::STANDARD.encode(signing_key.as_bytes());
 
         services

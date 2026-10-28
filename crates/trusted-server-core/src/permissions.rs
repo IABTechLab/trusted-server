@@ -813,6 +813,9 @@ pub struct PermissionPolicy {
     maps: Arc<PermissionMaps>,
 }
 
+/// The name of the policy [`PermissionPolicy::granting_nothing`] builds.
+const GRANTING_NOTHING_NAME: &str = "granting-nothing";
+
 impl PermissionPolicy {
     /// The policy's name, the stem of its file.
     #[must_use]
@@ -830,6 +833,25 @@ impl PermissionPolicy {
     #[must_use]
     pub fn maps(&self) -> &PermissionMaps {
         &self.maps
+    }
+
+    /// A policy that grants nothing, for a services graph that decides no
+    /// request's permissions and carries a policy only because every graph
+    /// does. It is built from the types rather than loaded, so no policy
+    /// text exists for it, and its digest is that of empty text.
+    #[must_use]
+    pub fn granting_nothing() -> Arc<Self> {
+        Arc::new(Self {
+            reference: PolicyReference {
+                policy: GRANTING_NOTHING_NAME.to_owned(),
+                sha256: policy_sha256(""),
+            },
+            maps: Arc::new(
+                PermissionMaps::empty()
+                    .with_default_rules(CountryRules::with_default(Acquisition::Denied))
+                    .with_default_jurisdiction(Jurisdiction::NonRegulated),
+            ),
+        })
     }
 }
 
@@ -2824,5 +2846,23 @@ signals:
             std::ptr::eq(sample.maps(), PermissionMaps::sample()),
             "the sample's rules should be parsed once for every test"
         );
+    }
+
+    #[test]
+    fn the_policy_granting_nothing_grants_nothing() {
+        let policy = PermissionPolicy::granting_nothing();
+        let maps = policy.maps();
+
+        assert!(
+            maps.baseline(None, None).permissions().is_empty(),
+            "no permission should be set without a signal"
+        );
+        assert!(
+            maps.resolve(Some("GB"), |_| true).permissions().is_empty(),
+            "no permission should be set when every signal grants"
+        );
+        assert_eq!(maps.default_jurisdiction(), Jurisdiction::NonRegulated);
+        assert_eq!(policy.name(), GRANTING_NOTHING_NAME);
+        assert_eq!(policy.sha256(), policy_sha256(""));
     }
 }

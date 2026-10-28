@@ -46,10 +46,10 @@ sample permission policy through `--permissions`, which writes the blob
 into the local `trusted_server_config` namespace, and reads it back with
 `wrangler kv key get`.
 
-The generated local Wrangler files define `handler_password`,
-`publisher_proxy_secret`, and `ec_passphrase` separately. Edge Cookie identity
-is off by default, so the smoke's settings select the built-in `hmac` module,
-whose passphrase is the `ec_passphrase` secret. The smoke launches
+The generated local Wrangler files define `publisher_proxy_secret` and
+`ec_passphrase` separately. Edge Cookie identity is off by default, so the
+smoke's settings select the built-in `hmac` module, whose passphrase is the
+`ec_passphrase` secret. The smoke launches
 `wrangler dev` once for each omitted secret. Each case requires a 500 response
 and verifies the exact missing binding against Wrangler's runtime binding
 inventory. The Worker installs no logger, so no case waits for a log line. The
@@ -65,17 +65,14 @@ the checked-in manifests.
 Local `[vars]` are only for the isolated smoke. For a deployed Worker, run
 `ts provision --adapter cloudflare` once, then `ts config push --adapter
 cloudflare --permissions <file>`, which writes the settings and the policy file
-they name into the remote config store. Store the three credential values with
-`wrangler secret put handler_password`, `wrangler secret put
-publisher_proxy_secret`, and `wrangler secret put ec_passphrase`; do not
-commit them to a Wrangler manifest. Deploy only after the config store holds
-the blob and the three secrets are set.
+they name into the remote config store. Store the two credential values with
+`wrangler secret put publisher_proxy_secret` and `wrangler secret put
+ec_passphrase`; do not commit them to a Wrangler manifest. Deploy only after
+the config store holds the blob and the two secrets are set.
 
-Request-time store registries are unwired, so EC KV lookup and key rotation
-are not available. The read-only `/_ts/admin/eids` diagnostic remains
-available. Forwarded client-IP headers are sanitized, but `[trusted_client_ip]`
-is not resolved. See the [API reference](./api-reference) for route-level
-behavior.
+Request-time store registries are unwired, so EC KV lookup is not available.
+Forwarded client-IP headers are sanitized, but `[trusted_client_ip]` is not
+resolved. See the [API reference](./api-reference) for route-level behavior.
 
 Compare the [Fastly](./fastly), [Spin](./spin), and [Axum](./axum-dev)
 adapter journeys.

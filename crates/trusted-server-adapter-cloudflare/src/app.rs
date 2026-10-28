@@ -5,7 +5,7 @@ use std::sync::Arc;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
+use edgezero_core::http::{HeaderValue, Method, Request, Response, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -13,17 +13,13 @@ use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan_with,
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
+use trusted_server_core::closed_paths::closed_path_response;
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::config_payload::{
     DEFAULT_SECRET_STORE_ID, settings_from_config_blob_with,
 };
 use trusted_server_core::ec::EcContext;
-use trusted_server_core::ec::admin::{
-    admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
-    deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
-};
 use trusted_server_core::ec::module::{EdgeCookieModule, build_reusable_module};
-use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::inspect::config::{CONFIG_PATHS, handle_config};
 use trusted_server_core::inspect::data::{DATA_PAGE_PATH, handle_data};
@@ -48,7 +44,7 @@ use trusted_server_core::request_signing::{
 };
 use trusted_server_core::settings::Settings;
 
-use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
+use crate::middleware::{FinalizeResponseMiddleware, SanitizeRequestMiddleware};
 use crate::platform::build_runtime_services;
 
 // ---------------------------------------------------------------------------
@@ -452,55 +448,6 @@ pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     response
 }
 
-fn admin_key_management_not_supported() -> Response {
-    let body = edgezero_core::body::Body::from(
-        "Admin key management is not supported on Cloudflare Workers.\n\
-         Use the Fastly adapter (via Viceroy or deployed) to rotate or deactivate keys.\n",
-    );
-    let mut response = Response::new(body);
-    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
-fn cache_purge_not_supported() -> Response {
-    let body = edgezero_core::body::Body::from(
-        "Template cache purge is not supported on Cloudflare Workers.\n\
-         Use the Fastly adapter (via Viceroy or deployed) to purge.\n",
-    );
-    let mut response = Response::new(body);
-    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
-fn admin_ec_lookup_not_supported() -> Response {
-    core_admin_ec_lookup_not_supported()
-}
-
-/// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
-/// aliases on the Cloudflare adapter.
-///
-/// These non-`/_ts` aliases are not matched by the `^/_ts/admin` basic-auth
-/// handler, so they fail closed locally rather than fall through to the
-/// publisher fallback — which would forward the caller's `Authorization` header
-/// and key-management payload to the origin, leaking admin credentials.
-fn legacy_admin_alias_denied() -> Response {
-    let mut response = Response::new(edgezero_core::body::Body::from("Not found\n"));
-    *response.status_mut() = edgezero_core::http::StatusCode::NOT_FOUND;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
 // ---------------------------------------------------------------------------
 // Startup error fallback
 // ---------------------------------------------------------------------------
@@ -650,7 +597,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         ) -> Result<Response, EdgeError> {
             let services = state.services_for_request(&ctx);
             let mut req = ctx.into_request();
-            if let Some(response) = deny_admin_diagnostic_fallback(&req) {
+            if let Some(response) = closed_path_response(&req) {
                 return Ok(response);
             }
             if let Err(error) = state.registry.prepare_request(&state.settings, &mut req) {
@@ -753,7 +700,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // shared-secret authentication header.
             .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
-            .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             .get(
                 "/.well-known/trusted-server.json",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
@@ -764,42 +710,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 "/verify-signature",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
                     handle_verify_signature(&s.settings, &services, req)
-                }),
-            )
-            // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
-            // and the production basic-auth handler regex (`^/_ts/admin`), so they
-            // are auth-gated under a production-shaped config.
-            //
-            // The legacy non-`/_ts` aliases (`/admin/keys/*`) are registered
-            // below to a local 404 for every publisher-fallback method: the
-            // production handler regex `^/_ts/admin` does not match them, and
-            // letting them fall through would forward the caller's
-            // `Authorization` header and key-management payload to the origin,
-            // leaking admin credentials.
-            .post("/_ts/admin/keys/rotate", |_ctx: RequestContext| async {
-                Ok::<Response, EdgeError>(admin_key_management_not_supported())
-            })
-            .post("/_ts/admin/keys/deactivate", |_ctx: RequestContext| async {
-                Ok::<Response, EdgeError>(admin_key_management_not_supported())
-            })
-            // Admin EC lookup routes. Registered explicitly (like the key
-            // routes above) so they never fall through to the publisher
-            // fallback, and they match `Settings::ADMIN_ENDPOINTS` for auth
-            // coverage. The EC identity graph is Fastly KV backed, so this
-            // adapter has no store to read.
-            .get("/_ts/admin/ec", |_ctx: RequestContext| async {
-                Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
-            })
-            .get("/_ts/admin/ec/{id}", |_ctx: RequestContext| async {
-                Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
-            })
-            // Admin EIDs echo: pure request inspection (no KV), so this
-            // adapter serves the real handler.
-            .get(
-                "/_ts/admin/eids",
-                make_handler(Arc::clone(&state), |s, _services, req| async move {
-                    let partner_registry = PartnerRegistry::from_config(&s.settings.ec.partners)?;
-                    handle_admin_eids_lookup(&partner_registry, &req)
                 }),
             )
             .post(
@@ -915,31 +825,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         });
         router = router.route(DATA_PAGE_PATH, Method::GET, data);
 
-        let cache_purge_unsupported =
-            make_handler(Arc::clone(&state), |_s, _services, _req| async move {
-                Ok(cache_purge_not_supported())
-            });
-        for method in publisher_fallback_methods() {
-            router = router.route(
-                "/_ts/admin/cache/purge",
-                method,
-                cache_purge_unsupported.clone(),
-            );
-        }
-
-        let legacy_admin_deny =
-            make_handler(Arc::clone(&state), |_s, _services, _req| async move {
-                Ok(legacy_admin_alias_denied())
-            });
-        for method in publisher_fallback_methods() {
-            router = router.route(
-                "/admin/keys/rotate",
-                method.clone(),
-                legacy_admin_deny.clone(),
-            );
-            router = router.route("/admin/keys/deactivate", method, legacy_admin_deny.clone());
-        }
-
         for method in publisher_fallback_methods() {
             router = router.route("/", method.clone(), fallback.clone());
             router = router.route("/{*rest}", method, fallback.clone());
@@ -960,11 +845,6 @@ mod tests {
     /// inject, with the `[ec.acme]` block that module's settings live in.
     /// `acme` is a fictional vendor key.
     const UNINJECTED_MODULE_TOML: &str = r#"
-        [[handlers]]
-        path = "^/_ts/admin"
-        username = "admin"
-        password = "admin-pass"
-
         [publisher]
         domain = "test-publisher.example.com"
         cookie_domain = ".test-publisher.example.com"
@@ -1026,11 +906,6 @@ mod tests {
     fn aps_profile_settings() -> Settings {
         let mut settings = Settings::from_toml(
             r#"
-                [[handlers]]
-                path = "^/_ts/admin"
-                username = "admin"
-                password = "admin-password"
-
                 [publisher]
                 domain = "publisher.example"
                 cookie_domain = ".publisher.example"
@@ -1136,11 +1011,6 @@ mod tests {
     fn disabled_startup_accepts_dormant_multi_provider_auction_plan() {
         let mut settings = Settings::from_toml(
             r#"
-                [[handlers]]
-                path = "^/_ts/admin"
-                username = "admin"
-                password = "admin-password"
-
                 [publisher]
                 domain = "publisher.example"
                 cookie_domain = ".publisher.example"
@@ -1167,11 +1037,6 @@ mod tests {
     fn startup_rejects_multi_provider_auction_plan() {
         let mut settings = Settings::from_toml(
             r#"
-                [[handlers]]
-                path = "^/_ts/admin"
-                username = "admin"
-                password = "admin-password"
-
                 [publisher]
                 domain = "publisher.example"
                 cookie_domain = ".publisher.example"

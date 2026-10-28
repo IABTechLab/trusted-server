@@ -17,15 +17,11 @@ use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan_with,
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
+use trusted_server_core::closed_paths::closed_path_response;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use trusted_server_core::config_payload::settings_from_config_blob_with;
 use trusted_server_core::ec::EcContext;
-use trusted_server_core::ec::admin::{
-    admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
-    deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
-};
 use trusted_server_core::ec::module::{EdgeCookieModule, build_reusable_module};
-use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::sanitize_forwarded_headers;
 use trusted_server_core::inspect::config::{CONFIG_JSON_PATH, CONFIG_PAGE_PATH, handle_config};
@@ -56,7 +52,7 @@ use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::{default_config_key, default_secret_store_name};
 
 use crate::middleware::{
-    AuthMiddleware, FinalizeResponseMiddleware, NormalizeMiddleware, SanitizeRequestMiddleware,
+    FinalizeResponseMiddleware, NormalizeMiddleware, SanitizeRequestMiddleware,
 };
 use crate::platform::build_runtime_services;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
@@ -387,17 +383,7 @@ fn publisher_fallback_methods() -> [Method; 7] {
 // registry and rate limiter) that the portability adapters do not yet wire.
 // On Spin these paths fall through to the publisher/integration fallback,
 // identical to the other non-Fastly adapters.
-const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
-    Method::GET,
-    Method::POST,
-    Method::HEAD,
-    Method::OPTIONS,
-    Method::PUT,
-    Method::PATCH,
-    Method::DELETE,
-];
-
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 22] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 14] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
@@ -406,14 +392,6 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 22] {
         (CONFIG_PAGE_PATH, &[Method::GET]),
         (CONFIG_JSON_PATH, &[Method::GET]),
         (DATA_PAGE_PATH, &[Method::GET]),
-        ("/_ts/admin/keys/rotate", &[Method::POST]),
-        ("/_ts/admin/keys/deactivate", &[Method::POST]),
-        ("/_ts/admin/ec", &[Method::GET]),
-        ("/_ts/admin/ec/{id}", &[Method::GET]),
-        ("/_ts/admin/eids", &[Method::GET]),
-        ("/_ts/admin/cache/purge", LEGACY_ADMIN_DENY_METHODS),
-        ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
-        ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
         ("/auction", &[Method::POST]),
         (PAGE_BIDS_PATH, &[Method::GET, Method::OPTIONS]),
         (PAGE_BIDS_LEGACY_PATH, &[Method::GET, Method::OPTIONS]),
@@ -617,38 +595,6 @@ async fn build_ec_context(
     EcContext::read_from_request_resolving_geo(settings, req, services).await
 }
 
-fn cache_purge_not_supported() -> Response {
-    let body = edgezero_core::body::Body::from(
-        "Template cache purge is not supported on Spin.\n\
-         Use the Fastly adapter (via Viceroy or deployed) to purge.\n",
-    );
-    let mut response = Response::new(body);
-    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
-fn admin_key_management_not_supported() -> Response {
-    let body = edgezero_core::body::Body::from(
-        "Admin key management is not supported on Fermyon Spin.\n\
-         Use the Fastly adapter (via Viceroy or deployed) to rotate or deactivate keys.\n",
-    );
-    let mut response = Response::new(body);
-    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
-fn admin_ec_lookup_not_supported() -> Response {
-    core_admin_ec_lookup_not_supported()
-}
-
 // ---------------------------------------------------------------------------
 // Error helper
 // ---------------------------------------------------------------------------
@@ -661,23 +607,6 @@ pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     let body = edgezero_core::body::Body::from(format!("{}\n", root_error.user_message()));
     let mut response = Response::new(body);
     *response.status_mut() = root_error.status_code();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
-/// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
-/// aliases on the Spin adapter.
-///
-/// These non-`/_ts` aliases are not matched by the `^/_ts/admin` basic-auth
-/// handler, so they fail closed locally rather than fall through to the
-/// publisher fallback, which would forward the caller's `Authorization` header
-/// and key-management payload to the origin.
-fn legacy_admin_alias_denied() -> Response {
-    let mut response = Response::new(edgezero_core::body::Body::from("Not found\n"));
-    *response.status_mut() = StatusCode::NOT_FOUND;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
@@ -880,30 +809,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             }
         };
 
-        let admin_not_supported_handler = |_ctx: RequestContext| async {
-            Ok::<Response, EdgeError>(admin_key_management_not_supported())
-        };
-
-        let cache_purge_unsupported_handler =
-            |_ctx: RequestContext| async { Ok::<Response, EdgeError>(cache_purge_not_supported()) };
-
-        let admin_ec_not_supported_handler = |_ctx: RequestContext| async {
-            Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
-        };
-
-        // Admin EIDs echo: pure request inspection (no KV), so this adapter
-        // serves the real handler.
-        let s = Arc::clone(&state);
-        let admin_eids_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let req = ctx.into_request();
-                let result = PartnerRegistry::from_config(&s.settings.ec.partners)
-                    .and_then(|registry| handle_admin_eids_lookup(&registry, &req));
-                Ok::<Response, EdgeError>(result.unwrap_or_else(|e| http_error(&e)))
-            }
-        };
-
         // /auction
         let s = Arc::clone(&state);
         let auction_handler = move |ctx: RequestContext| {
@@ -1044,7 +949,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         ) -> Result<Response, EdgeError> {
             let services = state.services_for_request(&ctx);
             let mut req = ctx.into_request();
-            if let Some(response) = deny_admin_diagnostic_fallback(&req) {
+            if let Some(response) = closed_path_response(&req) {
                 return Ok(response);
             }
             if let Err(error) = state.registry.prepare_request(&state.settings, &mut req) {
@@ -1137,8 +1042,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             dispatch(s, ctx)
         };
-        let legacy_admin_deny =
-            |_ctx: RequestContext| async { Ok::<Response, EdgeError>(legacy_admin_alias_denied()) };
 
         let mut builder = RouterService::builder()
             // Outermost middleware: strips the configured trusted-client-IP
@@ -1147,12 +1050,10 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // shared-secret authentication header.
             .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
-            .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             // Innermost middleware: normalize every routed request (strip
             // spoofable forwarded headers, derive the trusted Host/scheme/client-IP
             // from Spin's synthetic runtime headers) so no handler can opt out of
-            // the de-spoofing invariant. Runs after auth so the basic-auth gate
-            // continues to see the original request, matching prior behaviour.
+            // the de-spoofing invariant.
             .middleware(NormalizeMiddleware::new())
             // Cheap liveness probe, matching the Fastly/Axum adapters. Registered
             // explicitly so it is not absorbed by the publisher `/{*rest}` fallback.
@@ -1166,25 +1067,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .get(CONFIG_PAGE_PATH, config_handler.clone())
             .get(CONFIG_JSON_PATH, config_handler)
             .get(DATA_PAGE_PATH, data_handler)
-            // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
-            // and the production basic-auth handler regex (`^/_ts/admin`), so they
-            // are auth-gated under a production-shaped config.
-            //
-            // The legacy non-`/_ts` aliases (`/admin/keys/*`) are registered below
-            // to a local 404 for every publisher-fallback method: the production
-            // handler regex `^/_ts/admin` does not match them, and letting them
-            // fall through to the publisher fallback would forward admin
-            // credentials and key-management payloads to the origin.
-            .post("/_ts/admin/keys/rotate", admin_not_supported_handler)
-            .post("/_ts/admin/keys/deactivate", admin_not_supported_handler)
-            // Admin EC lookup routes. Registered explicitly (like the key
-            // routes above) so they never fall through to the publisher
-            // fallback, and they match `Settings::ADMIN_ENDPOINTS` for auth
-            // coverage. The EC identity graph is Fastly KV backed, so this
-            // adapter has no store to read.
-            .get("/_ts/admin/ec", admin_ec_not_supported_handler)
-            .get("/_ts/admin/ec/{id}", admin_ec_not_supported_handler)
-            .get("/_ts/admin/eids", admin_eids_handler)
             .post("/auction", auction_handler)
             .get(PAGE_BIDS_PATH, page_bids_handler.clone())
             .route(PAGE_BIDS_PATH, Method::OPTIONS, page_bids_options_handler)
@@ -1204,19 +1086,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .post("/first-party/sign", fp_sign_post_handler)
             .get("/first-party/proxy-rebuild", fp_rebuild_handler)
             .post("/first-party/proxy-rebuild", fp_rebuild_post_handler);
-
-        for method in LEGACY_ADMIN_DENY_METHODS {
-            builder = builder.route(
-                "/_ts/admin/cache/purge",
-                method.clone(),
-                cache_purge_unsupported_handler,
-            );
-        }
-
-        for method in LEGACY_ADMIN_DENY_METHODS {
-            builder = builder.route("/admin/keys/rotate", method.clone(), legacy_admin_deny);
-            builder = builder.route("/admin/keys/deactivate", method.clone(), legacy_admin_deny);
-        }
 
         // Mirror the Fastly/Axum publisher fallback: every supported method that is
         // not a named route's primary method falls through to the publisher origin
@@ -1248,11 +1117,6 @@ mod tests {
     fn multi_provider_settings() -> Settings {
         let mut settings = Settings::from_toml(
             r#"
-                [[handlers]]
-                path = "^/_ts/admin"
-                username = "admin"
-                password = "admin-password"
-
                 [publisher]
                 domain = "publisher.example"
                 cookie_domain = ".publisher.example"
@@ -1400,11 +1264,6 @@ mod tests {
     /// inject, with the `[ec.acme]` block that module's settings live in.
     /// `acme` is a fictional vendor key.
     const UNINJECTED_MODULE_TOML: &str = r#"
-        [[handlers]]
-        path = "^/_ts/admin"
-        username = "admin"
-        password = "admin-pass"
-
         [publisher]
         domain = "test-publisher.example.com"
         cookie_domain = ".test-publisher.example.com"

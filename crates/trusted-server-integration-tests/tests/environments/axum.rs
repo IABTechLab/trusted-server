@@ -21,10 +21,6 @@ fn permissions_dir() -> PathBuf {
 /// Secret-store entries referenced by the integration app-config fixture.
 const INTEGRATION_SECRET_ENV: &[(&str, &str)] = &[
     (
-        "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_INTEGRATION_ADMIN_PASSWORD",
-        "integration-admin-password-32-bytes-ok",
-    ),
-    (
         "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_INTEGRATION_PROXY_SECRET",
         "integration-test-proxy-secret-32-bytes-ok",
     ),

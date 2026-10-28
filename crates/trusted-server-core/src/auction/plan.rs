@@ -335,7 +335,10 @@ impl AuctionPlan {
             .adserver
             .validate("ad-server")
             .map_err(configuration_error)?;
-        let signing_enabled = compile_signing_enabled(config.request_signing.as_ref())?;
+        let signing_enabled = config
+            .request_signing
+            .as_ref()
+            .is_some_and(|signing| signing.enabled);
 
         let mut providers = Vec::new();
         let mut provider_indices = BTreeMap::new();
@@ -714,23 +717,6 @@ fn check_endpoint(
         )));
     }
     Ok(endpoint)
-}
-
-fn compile_signing_enabled(
-    request_signing: Option<&RequestSigning>,
-) -> Result<bool, Report<TrustedServerError>> {
-    let Some(request_signing) = request_signing else {
-        return Ok(false);
-    };
-    if request_signing.enabled
-        && (request_signing.config_store_id.trim().is_empty()
-            || request_signing.secret_store_id.trim().is_empty())
-    {
-        return Err(configuration_error(
-            "enabled request_signing requires nonblank config_store_id and secret_store_id",
-        ));
-    }
-    Ok(request_signing.enabled)
 }
 
 fn compile_notifications(
@@ -1291,40 +1277,11 @@ mod tests {
     }
 
     #[test]
-    fn enabled_signing_requires_nonblank_existing_global_store_ids() {
-        let mut raw = one_source();
-        raw.request_signing = Some(RequestSigning {
-            enabled: true,
-            config_store_id: " ".to_string(),
-            secret_store_id: "example-secret-store".to_string(),
-        });
-        assert!(
-            AuctionPlan::compile(raw).is_err(),
-            "should reject enabled signing without a config store ID"
-        );
-
-        let mut raw = one_source();
-        raw.request_signing = Some(RequestSigning {
-            enabled: true,
-            config_store_id: "example-config-store".to_string(),
-            secret_store_id: "\t".to_string(),
-        });
-        assert!(
-            AuctionPlan::compile(raw).is_err(),
-            "should reject enabled signing without a secret store ID"
-        );
-    }
-
-    #[test]
     fn routing_signing_and_the_selected_ad_server_are_preserved_in_the_plan() {
         let mut plain = table("auction.plain-fixture");
         plain.insert(ROUTING_KEY.to_string(), json!("all_eligible"));
         let mut raw = config(vec![("one", plain)]);
-        raw.request_signing = Some(RequestSigning {
-            enabled: true,
-            config_store_id: "example-config-store".to_string(),
-            secret_store_id: "example-secret-store".to_string(),
-        });
+        raw.request_signing = Some(RequestSigning::new(true));
         raw.adserver = ProviderChoice::new(
             Some("fixture".to_string()),
             BTreeMap::from([(
