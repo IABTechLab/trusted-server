@@ -917,7 +917,9 @@ mod tests {
                 assume_single_jurisdiction = true
             "#,
         )
-        .expect("should parse the settings");
+        .expect("should parse the settings")
+        // A loaded domain carries its policy.
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
         let state = build_state_with_settings(settings).expect("should build the state");
         let request = request_builder()
             .method("GET")
