@@ -37,8 +37,8 @@ use std::sync::Arc;
 use http::{HeaderName, HeaderValue};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-use crate::attestation::PlatformIdentity;
 use crate::integrations::{AttributeRewriteAction, IntegrationDocumentState, ScriptRewriteAction};
+use crate::platform::PlatformIdentity;
 use crate::streaming_processor::StreamProcessor;
 
 /// The media type a document is matched as, and the only one a middleware
@@ -91,8 +91,7 @@ pub struct MiddlewareContext<'a> {
     /// Host the document was fetched from, the same for a page served from
     /// the store as for one fetched for this request.
     pub origin_host: &'a str,
-    /// What the adapter reports about the platform the deployment runs on,
-    /// as the attestation evidence carries it.
+    /// What the adapter reports about the platform the deployment runs on.
     pub platform: &'a PlatformIdentity,
     /// State shared by the middleware working on this document in this
     /// phase.
@@ -662,9 +661,9 @@ pub mod test_support {
     use std::sync::OnceLock;
 
     use super::{MiddlewareContext, MiddlewarePhase};
-    use crate::attestation::PlatformIdentity;
     use crate::html_processor::test_support::{ORIGIN_HOST, REQUEST_HOST};
     use crate::integrations::IntegrationDocumentState;
+    use crate::platform::PlatformIdentity;
 
     /// The platform a test page is served from, which reports its name and
     /// nothing else.

@@ -84,10 +84,10 @@ mod tests {
     use trusted_server_core::permission_signal::SignalInput;
     use trusted_server_core::permissions::{Acquisition, PermissionMaps, SignalPolicy};
 
-    /// The shipped policy lists this scheme as an opt-out and revokes device
-    /// storage on it, and leaves ad measurement alone.
-    fn shipped_policy() -> &'static SignalPolicy {
-        PermissionMaps::standard().signals()
+    /// The repository's sample policy lists this scheme as an opt-out and
+    /// revokes device storage on it, and leaves ad measurement alone.
+    fn sample_policy() -> &'static SignalPolicy {
+        PermissionMaps::sample().signals()
     }
 
     fn with_header(set: bool) -> ConsentContext {
@@ -135,11 +135,11 @@ mod tests {
         assert_eq!(
             answer(
                 &with_header(true),
-                shipped_policy(),
+                sample_policy(),
                 Permission::StoreOnDevice
             ),
             ConsentSignal::Revoke,
-            "the shipped policy revokes device storage on an opt-out"
+            "the sample policy revokes device storage on an opt-out"
         );
     }
 
@@ -148,7 +148,7 @@ mod tests {
         assert_eq!(
             answer(
                 &with_header(true),
-                shipped_policy(),
+                sample_policy(),
                 Permission::MeasureAdPerformance
             ),
             ConsentSignal::Neutral,
@@ -161,7 +161,7 @@ mod tests {
         assert_eq!(
             answer(
                 &with_header(false),
-                shipped_policy(),
+                sample_policy(),
                 Permission::StoreOnDevice
             ),
             ConsentSignal::Neutral,
@@ -187,7 +187,7 @@ mod tests {
         let input = SignalInput::new(
             &consent,
             &evidence,
-            shipped_policy(),
+            sample_policy(),
             Acquisition::RequiresSignal,
         );
         assert!(
