@@ -86,7 +86,7 @@ calls, and never the public resource key, so the table needs one.
 | ------------- | ------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `endpoint`    | URL     | Required | The service's JSON endpoint, with any resource key the deployment requires in its path, whose origin the browser's hints are delegated to |
 | `license_key` | String  | Required | The name of the license key's entry in the secret store                                                                                   |
-| `timeout_ms`  | Integer | `500`    | How long a call to the service waits, `1..=10000` milliseconds                                                                            |
+| `timeout_ms`  | Integer | `500`    | How long a call to the service waits on the Fastly adapter, `1..=10000` milliseconds                                                      |
 
 The middleware's own table, `[middleware.51degrees.client_hints]`, has one
 field, `critical`, on by default. Each table refuses a field it does not
@@ -107,11 +107,9 @@ service's answer for one reader's browser and what the fetch phase leaves is
 stored for every reader. The request filter asks the service only about a page
 navigation whose path an entry naming the middleware covers, by the same rule
 as the headers, so a deployment that names it in no entry sends no client
-hints headers and no tag and asks the service nothing. Only the Fastly adapter
-runs request filters, so on Axum, Cloudflare and Spin the middleware asks the
-service nothing and writes nothing. The headers are written on every response
-the publisher path sends for a path the entry covers, a redirect included, and
-the tag on each page.
+hints headers and no tag and asks the service nothing. The headers are written
+on every response the publisher path sends for a path the entry covers, a
+redirect included, and the tag on each page.
 
 A page the middleware leaves names for keeps to the origin path, because the
 names are left in the request's state, which is what core does for every
@@ -125,8 +123,10 @@ the first call for a `User-Agent` and set of those hints is made, and every
 reader whose browser sends the same values then reads the held answer. On
 Fastly the call fails after one second if it cannot connect, and
 once connected it waits `timeout_ms` for the first byte and again for each gap
-between bytes. A service that does not answer leaves the page with no headers
-and no tag, and a logged line says why.
+between bytes. On Axum, Cloudflare and Spin the adapter's HTTP client applies
+no `timeout_ms`, so a call waits up to 30 seconds on Axum and for the runtime's
+own limit on Cloudflare and Spin. A service that does not answer leaves the
+page with no headers and no tag, and a logged line says why.
 
 ## What is checked
 

@@ -79,7 +79,10 @@ a declared store as required, so a Worker deployed without the binding answers
 every request with `500` before any route runs. No request-time config store
 is declared, and EC KV lookup is not available.
 Forwarded client-IP headers are sanitized, but `[trusted_client_ip]` is not
-resolved. See the [API reference](./api-reference) for route-level behavior.
+resolved. The modules' request filters and the device module `[device]`
+selects run as on Fastly, and `[device] module = "platform"` classifies from
+the `User-Agent`, because the Worker supplies no TLS or HTTP/2 signals. See
+the [API reference](./api-reference) for route-level behavior.
 
 The Worker sends no [auction telemetry](./telemetry#adapter-support), and warns
 at startup when `[analytics]` selects a module.

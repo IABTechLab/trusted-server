@@ -513,9 +513,11 @@ order. `fingerprint` names the settings an answer was given for, so an answer
 held for other settings is never served. Trusted Server hashes it into the key
 the answer is held under, so nothing of it is written to the store.
 
-The Fastly adapter is the one adapter that classifies a request, so a device
-module is asked there and on no other adapter. It is shown the User-Agent and
-the request's cookies.
+Every adapter classifies a request with the device module `[device]` selects,
+and a device module a registration offers is shown the client's IP address,
+the User-Agent and the request's cookies to do so, with the request's method,
+scheme, host, path and query. In an auction it is also asked for the bid
+request's device attributes.
 
 The registry builds only the modules a section selects, so the module that
 supplies one of these has to be selected in its section as well. The probe

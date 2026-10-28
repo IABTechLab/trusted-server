@@ -86,7 +86,10 @@ available. Forwarded client-IP
 headers are sanitized, and Spin derives its
 runtime authority, scheme, and client-address headers in the innermost
 normalization layer. Spin has no geo lookup, so `[geo] module = "platform"` is
-refused at startup.
+refused at startup. The modules' request filters and the device module
+`[device]` selects run as on Fastly, and `[device] module = "platform"`
+classifies from the `User-Agent`, because Spin supplies no TLS or HTTP/2
+signals.
 
 Spin sends no [auction telemetry](./telemetry#adapter-support), and warns at
 startup when `[analytics]` selects a module.

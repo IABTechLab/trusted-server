@@ -1,4 +1,3 @@
-use core::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -6,7 +5,7 @@ use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
-    HandlerFuture, HeaderValue, Method, Request, Response, StatusCode, header,
+    HandlerFuture, HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header,
 };
 use edgezero_core::router::RouterService;
 use error_stack::Report;
@@ -19,16 +18,22 @@ use trusted_server_core::auction::{
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::closed_paths::closed_path_response;
 use trusted_server_core::ec::EcContext;
+use trusted_server_core::ec::device::{
+    BuiltinDeviceModule, DeviceModule, DeviceSignals, build_device_module,
+};
 use trusted_server_core::ec::module::ensure_module_available;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+use trusted_server_core::evidence::BorrowedRequestInfo;
 use trusted_server_core::inspect::config::{CONFIG_JSON_PATH, CONFIG_PAGE_PATH, handle_config};
 use trusted_server_core::inspect::data::{DATA_PAGE_PATH, handle_data};
 use trusted_server_core::inspect::permissions::{
     PERMISSIONS_JSON_PATH, PERMISSIONS_PAGE_PATH, handle_permissions,
 };
 use trusted_server_core::integrations::{
-    IntegrationBuilder, IntegrationRegistry, ProxyDispatchInput,
+    IntegrationBuilder, IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects,
+    RequestFilterRegistryInput, RequestFilterRegistryOutcome,
 };
+use trusted_server_core::module_context::{ModuleContext, ModuleRequest};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
@@ -418,38 +423,60 @@ pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
 }
 
 // ---------------------------------------------------------------------------
-// Shared handler executor
+// Request cycle
 // ---------------------------------------------------------------------------
 
-async fn execute_handler<F, Fut>(
-    state: Arc<AppState>,
-    ctx: RequestContext,
-    handler: F,
-) -> Result<Response, EdgeError>
-where
-    F: FnOnce(Arc<AppState>, RuntimeServices, Request) -> Fut,
-    Fut: Future<Output = Result<Response, Report<TrustedServerError>>>,
-{
-    let services = state.services_for_request(&ctx);
-    let mut req = ctx.into_request();
-    // The single preparation point for the adapter. Every route in the table
-    // except `/health` is registered to `named_route_handler` or
-    // `fallback_handler`, and both wrap this function, so each request has its
-    // modules' preparers run exactly once and always before routing.
-    if let Err(error) = state.registry.prepare_request(&state.settings, &mut req) {
-        return Ok(http_error(&error));
+/// Classifies the request with the device module `[device]` selects.
+///
+/// A module a registration supplies, which the request's services carry, is
+/// shown the `User-Agent` and the cookies, which carry what a page gathers in
+/// the browser. Otherwise [`build_device_module`] gives the built-in module,
+/// which reads only the `User-Agent`. This adapter supplies no TLS or HTTP/2
+/// signals, so `platform` classifies as the built-in module does. The module
+/// is handed a module context carrying the request, that evidence, the
+/// settings and the services.
+async fn derive_device_signals(
+    settings: &Settings,
+    services: &RuntimeServices,
+    req: &Request,
+) -> DeviceSignals {
+    let registered = services.device_module();
+    let mut headers = HeaderMap::new();
+    for (name, shown) in [
+        (header::USER_AGENT, true),
+        (header::COOKIE, registered.is_some()),
+    ] {
+        if shown && let Some(value) = req.headers().get(&name) {
+            headers.insert(name, value.clone());
+        }
     }
-    Ok(handler(state, services, req)
+    let client_ip = services
+        .client_info()
+        .client_ip
+        .map(|ip| ip.to_string())
+        .unwrap_or_default();
+    let request_info = BorrowedRequestInfo::new(&client_ip, None).with_headers(&headers);
+    let built;
+    let module: &dyn DeviceModule = match registered.as_deref() {
+        Some(module) => module,
+        None => {
+            built = build_device_module(settings, || {
+                Box::new(BuiltinDeviceModule::new()) as Box<dyn DeviceModule>
+            });
+            built.as_ref()
+        }
+    };
+    let context = ModuleContext::new(ModuleRequest::of(req, services.client_info()))
+        .with_evidence(&request_info)
+        .with_settings(settings)
+        .with_services(services);
+    module
+        .detect(context.call(module.id(), module.required_permissions()))
         .await
-        .unwrap_or_else(|e| http_error(&e)))
 }
 
-// ---------------------------------------------------------------------------
-// EC context
-// ---------------------------------------------------------------------------
-
-/// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
-/// `/_ts/page-bids`, and the publisher fallback).
+/// Builds the geo-aware [`EcContext`] every route in the request cycle is
+/// handed, carrying the request's device classification.
 ///
 /// The geo lookup runs inside
 /// [`EcContext::read_from_request_resolving_geo`], so every adapter reports the
@@ -469,45 +496,249 @@ where
 /// # Errors
 ///
 /// Returns an error when the selected Edge Cookie module cannot be built for
-/// this request, or when the request's `Cookie` header is not valid UTF-8.
+/// this request, or when the request's `Cookie` header cannot be read as
+/// text, because it holds a byte outside visible ASCII, as an accented letter
+/// in UTF-8 does.
 async fn build_ec_context(
     state: &AppState,
     services: &RuntimeServices,
     req: &Request,
 ) -> Result<EcContext, Report<TrustedServerError>> {
-    EcContext::read_from_request_resolving_geo(&state.settings, req, services).await
+    let device_signals = derive_device_signals(&state.settings, services, req).await;
+    let mut context =
+        EcContext::read_from_request_resolving_geo(&state.settings, req, services).await?;
+    context.set_device_signals(device_signals);
+    Ok(context)
 }
 
-// ---------------------------------------------------------------------------
-// Fallback dispatcher (tsjs / integration proxy / publisher)
-// ---------------------------------------------------------------------------
+/// Result of the request-filter step that runs before a route.
+enum PreRoute {
+    /// A filter answered, or failed, and that answer stands in for the
+    /// route's. Carries the response effects the filters left.
+    ShortCircuit {
+        response: Response,
+        effects: RequestFilterEffects,
+    },
+    /// The route runs, and these response effects are applied afterwards.
+    Continue { effects: RequestFilterEffects },
+}
 
-/// Dispatches the fallback routes: tsjs assets, integration proxy routes, and
-/// the publisher origin.
+/// Runs the integration request filters before the route.
 ///
-/// The request arrives already prepared, and is not to a closed path. Every
-/// route that reaches here is registered to [`fallback_handler`], which
-/// answers a closed path itself and runs any other request through
-/// [`execute_handler`], and [`execute_handler`] calls
-/// `registry.prepare_request` before it calls this function, so there is
-/// nothing left to prepare here.
-async fn dispatch_fallback(
+/// Request header changes are applied to `req`, so the route sees them, and
+/// the response effects are returned for [`FinalizeResponseMiddleware`] to
+/// apply once the response is finalized. A filter that answers, such as a
+/// bot challenge, stands in for the route. Every filter reads the location
+/// and the permissions resolved for the request's Edge Cookie context.
+async fn run_pre_route_filters(
+    state: &AppState,
+    services: &RuntimeServices,
+    req: &mut Request,
+    ec_context: &EcContext,
+) -> PreRoute {
+    match state
+        .registry
+        .filter_request(RequestFilterRegistryInput {
+            settings: &state.settings,
+            services,
+            req,
+            geo_info: ec_context.geo_info(),
+            permissions: Some(ec_context.permissions()),
+        })
+        .await
+    {
+        Ok(RequestFilterRegistryOutcome::Continue(effects)) => PreRoute::Continue { effects },
+        Ok(RequestFilterRegistryOutcome::Respond { response, effects }) => PreRoute::ShortCircuit {
+            response: *response,
+            effects,
+        },
+        Err(report) => {
+            log::error!("Failed to run integration request filters: {report:?}");
+            PreRoute::ShortCircuit {
+                response: http_error(&report),
+                effects: RequestFilterEffects::default(),
+            }
+        }
+    }
+}
+
+/// Leaves non-empty request-filter response effects on `response`, for
+/// [`FinalizeResponseMiddleware`] to apply after it finalizes the response.
+fn attach_request_filter_effects(
+    mut response: Response,
+    effects: RequestFilterEffects,
+) -> Response {
+    if !effects.response_headers.is_empty() {
+        response.extensions_mut().insert(effects);
+    }
+    response
+}
+
+/// Runs a named route's request through the request cycle.
+///
+/// The modules' preparers run first. The inspection endpoints are read only,
+/// so they are answered next, before the Edge Cookie context is read and the
+/// request filters run. Every other route is handed the Edge Cookie context
+/// and runs once the request filters let the request continue.
+async fn execute_named(
+    state: Arc<AppState>,
+    ctx: RequestContext,
+    handler: NamedRouteHandler,
+) -> Result<Response, EdgeError> {
+    let services = state.services_for_request(&ctx);
+    let mut req = ctx.into_request();
+    if let Err(error) = state.registry.prepare_request(&state.settings, &mut req) {
+        return Ok(http_error(&error));
+    }
+
+    match handler {
+        NamedRouteHandler::Permissions => {
+            return Ok(handle_permissions(&state.settings, &services, &req)
+                .await
+                .unwrap_or_else(|error| http_error(&error)));
+        }
+        NamedRouteHandler::Config => return Ok(handle_config(&state.settings, &req)),
+        NamedRouteHandler::Data => {
+            return Ok(handle_data(None, None, services.public_prefix(), &req)
+                .unwrap_or_else(|error| http_error(&error)));
+        }
+        _ => {}
+    }
+
+    let mut ec_context = match build_ec_context(&state, &services, &req).await {
+        Ok(context) => context,
+        Err(report) => return Ok(http_error(&report)),
+    };
+    let effects = match run_pre_route_filters(&state, &services, &mut req, &ec_context).await {
+        PreRoute::ShortCircuit { response, effects } => {
+            return Ok(attach_request_filter_effects(response, effects));
+        }
+        PreRoute::Continue { effects } => effects,
+    };
+
+    let response = run_named_route(&state, &services, req, handler, &mut ec_context)
+        .await
+        .unwrap_or_else(|error| http_error(&error));
+    Ok(attach_request_filter_effects(response, effects))
+}
+
+async fn run_named_route(
     state: &AppState,
     services: &RuntimeServices,
     req: Request,
+    handler: NamedRouteHandler,
+    ec_context: &mut EcContext,
 ) -> Result<Response, Report<TrustedServerError>> {
+    match handler {
+        NamedRouteHandler::TrustedServerDiscovery => {
+            handle_trusted_server_discovery(&state.settings, services, req)
+        }
+        NamedRouteHandler::VerifySignature => {
+            handle_verify_signature(&state.settings, services, req)
+        }
+        NamedRouteHandler::Permissions | NamedRouteHandler::Config | NamedRouteHandler::Data => {
+            unreachable!("the inspection endpoints are answered before the request cycle")
+        }
+        NamedRouteHandler::Auction => {
+            // The auction consent gate reads the caller's jurisdiction from
+            // the geo-aware context, where `EcContext::default()` would fail it
+            // closed for consented users.
+            handle_auction(
+                &state.settings,
+                &state.orchestrator,
+                None,
+                None,
+                ec_context,
+                services,
+                req,
+            )
+            .await
+        }
+        NamedRouteHandler::PageBids => {
+            // SPA re-auction endpoint. `OPTIONS` is a CORS preflight for this
+            // side-effecting GET and is always denied so the GET handler's
+            // `X-TSJS-Page-Bids` gate stays trustworthy.
+            if req.method() == Method::OPTIONS {
+                return Ok(page_bids_preflight_denied());
+            }
+            let auction = AuctionDispatch {
+                orchestrator: &state.orchestrator,
+                slots: state.settings.creative_opportunity_slots(),
+                registry: None,
+            };
+            handle_page_bids(&state.settings, services, None, auction, ec_context, req).await
+        }
+        NamedRouteHandler::FirstPartyProxy => {
+            handle_first_party_proxy(&state.settings, services, req).await
+        }
+        NamedRouteHandler::FirstPartyClick => {
+            handle_first_party_click(&state.settings, services, req).await
+        }
+        NamedRouteHandler::FirstPartySign => {
+            handle_first_party_proxy_sign(&state.settings, services, req).await
+        }
+        NamedRouteHandler::FirstPartyProxyRebuild => {
+            handle_first_party_proxy_rebuild(&state.settings, services, req).await
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fallback dispatcher (robots.txt / tsjs / integration proxy / publisher)
+// ---------------------------------------------------------------------------
+
+async fn execute_fallback(
+    state: Arc<AppState>,
+    ctx: RequestContext,
+) -> Result<Response, EdgeError> {
+    let services = state.services_for_request(&ctx);
+    let mut req = ctx.into_request();
+    if let Err(error) = state.registry.prepare_request(&state.settings, &mut req) {
+        return Ok(http_error(&error));
+    }
+    Ok(dispatch_fallback(&state, &services, req).await)
+}
+
+/// Dispatches the fallback routes: robots.txt, tsjs assets, integration proxy
+/// routes, and the publisher origin.
+///
+/// The request arrives prepared, and is not to a closed path, because
+/// [`fallback_handler`] answers a closed path itself and runs any other
+/// request through [`execute_fallback`], which runs the preparers.
+async fn dispatch_fallback(
+    state: &AppState,
+    services: &RuntimeServices,
+    mut req: Request,
+) -> Response {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
-    if method == Method::GET && path.starts_with("/static/tsjs=") {
-        return handle_tsjs_dynamic(&req, &state.registry, EDGE_CACHE_HEADER);
+    // A crawler asking for robots.txt is answered once the modules have
+    // prepared the request, before the Edge Cookie steps and the request
+    // filters, so its Edge Cookie and consent are not read, no device
+    // module is shown its cookies and no filter's answer stands in for the
+    // file.
+    if asks_for_robots_txt(&state.settings, &method, &path) {
+        return answer_robots_txt(state, services, req, &method).await;
     }
 
-    if state.registry.has_route(&method, &path) {
+    let mut ec_context = match build_ec_context(state, services, &req).await {
+        Ok(context) => context,
+        Err(report) => return http_error(&report),
+    };
+    let effects = match run_pre_route_filters(state, services, &mut req, &ec_context).await {
+        PreRoute::ShortCircuit { response, effects } => {
+            return attach_request_filter_effects(response, effects);
+        }
+        PreRoute::Continue { effects } => effects,
+    };
+
+    let result = if method == Method::GET && path.starts_with("/static/tsjs=") {
+        handle_tsjs_dynamic(&req, &state.registry, EDGE_CACHE_HEADER)
+    } else if state.registry.has_route(&method, &path) {
         // A module route is handed what was resolved for its request, the
         // permissions among them, as the publisher path is.
-        let mut ec_context = build_ec_context(state, services, &req).await?;
-        return state
+        state
             .registry
             .handle_proxy(ProxyDispatchInput {
                 method: &method,
@@ -523,41 +754,100 @@ async fn dispatch_fallback(
                 Err(Report::new(TrustedServerError::BadRequest {
                     message: format!("Unknown integration route: {path}"),
                 }))
-            });
-    }
-
-    // Run the server-side auction with the configured creative-opportunity
-    // slots; `handle_publisher_request` matches them against the request path.
-    let mut ec_context = build_ec_context(state, services, &req).await?;
-    let auction = AuctionDispatch {
-        orchestrator: &state.orchestrator,
-        slots: state.settings.creative_opportunity_slots(),
-        registry: None,
+            })
+    } else {
+        // Run the server-side auction with the configured creative-opportunity
+        // slots; `handle_publisher_request` matches them against the request
+        // path.
+        let auction = AuctionDispatch {
+            orchestrator: &state.orchestrator,
+            slots: state.settings.creative_opportunity_slots(),
+            registry: None,
+        };
+        match handle_publisher_request(
+            AppContext {
+                settings: &state.settings,
+                integration_registry: &state.registry,
+            },
+            services,
+            None,
+            &mut ec_context,
+            auction,
+            req,
+            EDGE_CACHE_HEADER,
+        )
+        .await
+        {
+            // Async finalize so the dispatched auction is collected and its
+            // bids are injected before `</body>` (the sync buffer path would
+            // drop them).
+            Ok(publisher_response) => {
+                buffer_publisher_response_async(
+                    publisher_response,
+                    &method,
+                    &state.settings,
+                    &state.registry,
+                    &state.orchestrator,
+                    services,
+                )
+                .await
+            }
+            Err(report) => Err(report),
+        }
     };
-    let publisher_response = handle_publisher_request(
+
+    attach_request_filter_effects(result.unwrap_or_else(|error| http_error(&error)), effects)
+}
+
+/// Whether the request is a crawler's `GET` or `HEAD` of the robots.txt that
+/// `[robots-txt]` makes.
+fn asks_for_robots_txt(settings: &Settings, method: &Method, path: &str) -> bool {
+    settings.robots_txt.is_some()
+        && path == trusted_server_core::robots_txt::ROBOTS_TXT_PATH
+        && matches!(*method, Method::GET | Method::HEAD)
+}
+
+/// Answers robots.txt through the publisher path with an empty Edge Cookie
+/// context and no auction, so the crawler's Edge Cookie and consent
+/// signals are not read.
+async fn answer_robots_txt(
+    state: &AppState,
+    services: &RuntimeServices,
+    req: Request,
+    method: &Method,
+) -> Response {
+    let answer = handle_publisher_request(
         AppContext {
             settings: &state.settings,
             integration_registry: &state.registry,
         },
         services,
         None,
-        &mut ec_context,
-        auction,
+        &mut EcContext::default(),
+        AuctionDispatch {
+            orchestrator: &state.orchestrator,
+            slots: &[],
+            registry: None,
+        },
         req,
         EDGE_CACHE_HEADER,
     )
-    .await?;
-    // Async finalize so the dispatched auction is collected and its bids are
-    // injected before `</body>` (the sync buffer path would drop them).
-    buffer_publisher_response_async(
-        publisher_response,
-        &method,
-        &state.settings,
-        &state.registry,
-        &state.orchestrator,
-        services,
-    )
-    .await
+    .await;
+    let response = match answer {
+        Ok(answer) => {
+            buffer_publisher_response_async(
+                answer,
+                method,
+                &state.settings,
+                &state.registry,
+                &state.orchestrator,
+                services,
+            )
+            .await
+        }
+        Err(report) => Err(report),
+    };
+    response.unwrap_or_else(|report| http_error(&report))
 }
 
 fn fallback_handler(
@@ -570,11 +860,7 @@ fn fallback_handler(
             return Box::pin(async move { Ok::<_, EdgeError>(response) });
         }
         let state = Arc::clone(&state);
-        Box::pin(execute_handler(
-            state,
-            ctx,
-            |state, services, req| async move { dispatch_fallback(&state, &services, req).await },
-        ))
+        Box::pin(execute_fallback(state, ctx))
     }
 }
 
@@ -697,79 +983,7 @@ fn named_route_handler(
 ) -> impl Fn(RequestContext) -> HandlerFuture + Clone + Send + Sync + 'static {
     move |ctx: RequestContext| {
         let state = Arc::clone(&state);
-        Box::pin(execute_handler(
-            state,
-            ctx,
-            move |state, services, req| async move {
-                match handler {
-                    NamedRouteHandler::TrustedServerDiscovery => {
-                        handle_trusted_server_discovery(&state.settings, &services, req)
-                    }
-                    NamedRouteHandler::VerifySignature => {
-                        handle_verify_signature(&state.settings, &services, req)
-                    }
-                    NamedRouteHandler::Permissions => {
-                        handle_permissions(&state.settings, &services, &req).await
-                    }
-                    NamedRouteHandler::Config => Ok(handle_config(&state.settings, &req)),
-                    NamedRouteHandler::Data => {
-                        handle_data(None, None, services.public_prefix(), &req)
-                    }
-                    NamedRouteHandler::Auction => {
-                        // Build the geo-aware EC context so the auction consent
-                        // gate sees the caller's jurisdiction — `EcContext::default()`
-                        // fails it closed for consented users.
-                        let mut ec_context = build_ec_context(&state, &services, &req).await?;
-                        handle_auction(
-                            &state.settings,
-                            &state.orchestrator,
-                            None,
-                            None,
-                            &mut ec_context,
-                            &services,
-                            req,
-                        )
-                        .await
-                    }
-                    NamedRouteHandler::PageBids => {
-                        // SPA re-auction endpoint. `OPTIONS` is a CORS preflight
-                        // for this side-effecting GET and is always denied so the
-                        // GET handler's `X-TSJS-Page-Bids` gate stays trustworthy.
-                        if req.method() == Method::OPTIONS {
-                            Ok(page_bids_preflight_denied())
-                        } else {
-                            let mut ec_context = build_ec_context(&state, &services, &req).await?;
-                            let auction = AuctionDispatch {
-                                orchestrator: &state.orchestrator,
-                                slots: state.settings.creative_opportunity_slots(),
-                                registry: None,
-                            };
-                            handle_page_bids(
-                                &state.settings,
-                                &services,
-                                None,
-                                auction,
-                                &mut ec_context,
-                                req,
-                            )
-                            .await
-                        }
-                    }
-                    NamedRouteHandler::FirstPartyProxy => {
-                        handle_first_party_proxy(&state.settings, &services, req).await
-                    }
-                    NamedRouteHandler::FirstPartyClick => {
-                        handle_first_party_click(&state.settings, &services, req).await
-                    }
-                    NamedRouteHandler::FirstPartySign => {
-                        handle_first_party_proxy_sign(&state.settings, &services, req).await
-                    }
-                    NamedRouteHandler::FirstPartyProxyRebuild => {
-                        handle_first_party_proxy_rebuild(&state.settings, &services, req).await
-                    }
-                }
-            },
-        ))
+        Box::pin(execute_named(state, ctx, handler))
     }
 }
 
@@ -992,6 +1206,9 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
 
     router.build()
 }
+
+#[cfg(test)]
+mod request_cycle_tests;
 
 #[cfg(test)]
 mod tests {

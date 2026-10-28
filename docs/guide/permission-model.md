@@ -421,11 +421,10 @@ its own, so there is a single decision per request.
 **Server side.** An integration request filter receives
 `permissions: Option<&PermissionState>` on its `RequestFilterInput`, alongside
 the geo result it already receives, so a filter can skip or narrow what it does
-when a permission it depends on is unset. Request filters run on the Fastly
-adapter today, which is the only adapter that runs the filter step, and there
-the state is built before the filters run. None of the shipped filters changes
-its behavior on that input yet, so for now the state is carried and available
-rather than acted on.
+when a permission it depends on is unset. Every adapter builds the state
+before the filters run. None of the shipped filters changes its behavior on
+that input yet, so for now the state is carried and available rather than
+acted on.
 
 **Page side.** The same resolved state reaches the page as
 `window.tsjs.permissions`, an object listing the Data Use names that are set for

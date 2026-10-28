@@ -70,7 +70,10 @@ local debugging sessions.
 
 Axum sanitizes forwarded client-IP headers but does not resolve
 `[trusted_client_ip]`; see the
-[adapter matrix](./api-reference#adapter-and-startup-support).
+[adapter matrix](./api-reference#adapter-and-startup-support). The modules'
+request filters and the device module `[device]` selects run as on Fastly,
+and `[device] module = "platform"` classifies from the `User-Agent`, because
+the dev server supplies no TLS or HTTP/2 signals.
 
 Axum sends no [auction telemetry](./telemetry#adapter-support), and warns at
 startup when `[analytics]` selects a module.
