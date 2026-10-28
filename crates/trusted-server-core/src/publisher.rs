@@ -93,8 +93,9 @@ use crate::response_privacy::{
 };
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::{
-    AUCTION_DEBUG_METADATA_ALLOWLIST, AUCTION_DEBUG_UPSTREAM_METADATA_KEYS,
-    AuctionDebugCommentFormat, AuctionDebugCommentOptions, AuctionDebugCommentVerbosity, Settings,
+    AUCTION_DEBUG_METADATA_ALLOWLIST, AUCTION_DEBUG_UPSTREAM_METADATA_KEYS, AssetOriginAuth,
+    AuctionDebugCommentFormat, AuctionDebugCommentOptions, AuctionDebugCommentVerbosity, Publisher,
+    Settings,
 };
 use crate::streaming_processor::{
     BodyStreamDecoder, BodyStreamEncoder, Compression, GzipDecodeReader, PipelineConfig,
@@ -3838,6 +3839,149 @@ fn rewrite_origin_request(
     Ok(())
 }
 
+/// Builds the path and query of a publisher origin request.
+///
+/// With none of `[publisher]`'s path settings in use this is the reader's path
+/// and query exactly as sent. A path in `origin_url` comes first, joined to
+/// the reader's path with one `/`. `directory_index` is added to a path that
+/// ends in `/`, and the query is left off when `origin_auth` strips it.
+fn publisher_origin_path_and_query<'a>(
+    publisher: &Publisher,
+    origin_path: &str,
+    uri: &'a Uri,
+) -> Cow<'a, str> {
+    let path_and_query = uri
+        .path_and_query()
+        .map_or("/", http::uri::PathAndQuery::as_str);
+    let path = uri
+        .path_and_query()
+        .map_or("/", http::uri::PathAndQuery::path);
+    let folder = origin_path.trim_end_matches('/');
+    let index = publisher
+        .directory_index
+        .as_deref()
+        .filter(|_| path.ends_with('/'));
+    let strip_query = publisher.origin_query_is_stripped();
+    if folder.is_empty() && index.is_none() && !strip_query {
+        return Cow::Borrowed(path_and_query);
+    }
+
+    let mut built =
+        String::with_capacity(folder.len() + path_and_query.len() + index.map_or(0, str::len) + 1);
+    if folder.is_empty() {
+        built.push_str(path);
+    } else {
+        built.push_str(folder);
+        built.push('/');
+        built.push_str(path.strip_prefix('/').unwrap_or(path));
+    }
+    if let Some(index) = index {
+        built.push_str(index);
+    }
+    if let Some(query) = uri.query().filter(|_| !strip_query) {
+        built.push('?');
+        built.push_str(query);
+    }
+    Cow::Owned(built)
+}
+
+/// Returns the status a publisher origin request is refused with before it is
+/// sent, or `None` when it may be sent.
+///
+/// A signed origin is only asked to read, so any method but `GET` or `HEAD` is
+/// refused with `405` rather than signed with the publisher's credentials.
+/// When `origin_url` names a folder, a reader path with a `.` or `..` segment
+/// in any spelling is refused with `400`, so no request climbs out of it.
+fn refused_origin_request(
+    publisher: &Publisher,
+    origin_path: &str,
+    req: &Request<EdgeBody>,
+) -> Option<StatusCode> {
+    if publisher.origin_auth.is_some() && !matches!(*req.method(), Method::GET | Method::HEAD) {
+        return Some(StatusCode::METHOD_NOT_ALLOWED);
+    }
+    if !origin_path.trim_end_matches('/').is_empty() && path_has_dot_segment(req.uri().path()) {
+        return Some(StatusCode::BAD_REQUEST);
+    }
+    None
+}
+
+/// Returns `true` when `path` has a `.` or `..` segment as written or after
+/// any of a bounded number of percent-decoding rounds. A backslash counts as a
+/// separator, and a path still changing after the last round counts as having
+/// one.
+fn path_has_dot_segment(path: &str) -> bool {
+    crate::closed_paths::matches_any_decoding(path, |current| {
+        current
+            .split(['/', '\\'])
+            .any(|segment| segment == "." || segment == "..")
+    })
+}
+
+/// The plain-text answer to a publisher origin request refused before it is
+/// sent.
+fn origin_refusal_response(
+    status: StatusCode,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8");
+    if status == StatusCode::METHOD_NOT_ALLOWED {
+        builder = builder.header(header::ALLOW, "GET, HEAD");
+    }
+    let mut response = builder
+        .body(EdgeBody::from(
+            status.canonical_reason().unwrap_or_default(),
+        ))
+        .change_context(TrustedServerError::Proxy {
+            message: "failed to build publisher origin refusal".to_string(),
+        })?;
+    enforce_terminal_private_cache_privacy(&mut response);
+    Ok(response)
+}
+
+/// Reader headers a signed publisher origin request never carries.
+const READER_HEADERS_NOT_SIGNED: [header::HeaderName; 10] = [
+    header::COOKIE,
+    header::AUTHORIZATION,
+    header::PROXY_AUTHORIZATION,
+    header::REFERER,
+    header::IF_NONE_MATCH,
+    header::IF_MODIFIED_SINCE,
+    header::IF_MATCH,
+    header::IF_UNMODIFIED_SINCE,
+    header::IF_RANGE,
+    header::RANGE,
+];
+
+/// Signs a publisher origin request in place with `[publisher]`'s
+/// `origin_auth`, once the reader's headers a signed read must not carry are
+/// removed.
+///
+/// The request is sent to the address that was signed, the target as a parsed
+/// URL, so the signature and the request line agree byte for byte.
+fn sign_publisher_origin_request(
+    req: &mut Request<EdgeBody>,
+    auth: &AssetOriginAuth,
+) -> Result<(), Report<TrustedServerError>> {
+    for name in READER_HEADERS_NOT_SIGNED {
+        req.headers_mut().remove(name);
+    }
+    crate::proxy::remove_origin_auth_namespace_headers(req.headers_mut(), auth);
+    let target =
+        url::Url::parse(&req.uri().to_string()).change_context(TrustedServerError::Proxy {
+            message: "invalid publisher origin uri".to_string(),
+        })?;
+    *req.uri_mut() = target
+        .as_str()
+        .parse::<Uri>()
+        .change_context(TrustedServerError::Proxy {
+            message: "invalid publisher origin uri".to_string(),
+        })?;
+    let method = req.method().clone();
+    crate::proxy::apply_asset_origin_auth(&method, &target, req.headers_mut(), auth)
+}
+
 /// Build a minimal [`AuctionContext`] for the collect phase.
 ///
 /// See [`AuctionContext::request`]: the orchestrator's collect path runs
@@ -5262,12 +5406,20 @@ pub async fn handle_publisher_request(
         })?;
     let origin_host = settings.publisher.origin_host();
     let origin_host_header = settings.publisher.origin_host_header();
-    let origin_path_and_query = req
+    if let Some(status) = refused_origin_request(&settings.publisher, parsed_origin.path(), &req) {
+        log::debug!("Publisher origin request refused before sending: {status}");
+        return Ok(PublisherResponse::Buffered(origin_refusal_response(
+            status,
+        )?));
+    }
+    let request_path_and_query = req
         .uri()
         .path_and_query()
         .map(http::uri::PathAndQuery::as_str)
-        .unwrap_or("/");
-    let request_path_and_query = origin_path_and_query.to_string();
+        .unwrap_or("/")
+        .to_string();
+    let origin_path_and_query =
+        publisher_origin_path_and_query(&settings.publisher, parsed_origin.path(), req.uri());
     let target_uri = format!("{origin_scheme}://{origin_host}{origin_path_and_query}")
         .parse::<Uri>()
         .change_context(TrustedServerError::Proxy {
@@ -5554,6 +5706,10 @@ pub async fn handle_publisher_request(
         .then(|| target_uri.to_string());
     let reader_carries_cookie = req.headers().contains_key(header::COOKIE);
     rewrite_origin_request(&mut req, target_uri, &origin_host_header)?;
+    // Signed last, once nothing else changes the request the origin is sent.
+    if let Some(auth) = settings.publisher.origin_auth.as_ref() {
+        sign_publisher_origin_request(&mut req, auth)?;
+    }
 
     let request_method = req.method().clone();
     let mut origin_request = Some(req);
@@ -24679,6 +24835,627 @@ mod tests {
             Some("www.example.com"),
             "should send configured host override to outbound request"
         );
+    }
+
+    /// The publisher origin request as `origin_url`'s path, `directory_index`
+    /// and `origin_auth` shape it, for an origin such as object storage.
+    mod object_storage_origin_tests {
+        use super::*;
+        use crate::platform::PlatformHttpClient;
+        use crate::redacted::Redacted;
+        use crate::s3_sigv4::{S3Credentials, sign_headers};
+        use crate::settings::{OriginQueryPolicy, S3SigV4AuthConfig};
+
+        const STORAGE_URL: &str = "https://storage.example.com/bucket/site";
+        const REGION: &str = "test-region-1";
+        const ACCESS_KEY_ID: &str = "TESTACCESSKEYID";
+        const SECRET_ACCESS_KEY: &str = "test-secret-access-key";
+        const READER_AUTHORIZATION: &str = "Bearer reader-token";
+
+        fn signing_auth(origin_query: Option<OriginQueryPolicy>) -> AssetOriginAuth {
+            AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+                region: REGION.to_owned(),
+                secret_store: None,
+                access_key_id: Redacted::new(ACCESS_KEY_ID.to_owned()),
+                secret_access_key: Redacted::new(SECRET_ACCESS_KEY.to_owned()),
+                session_token: None,
+                origin_query,
+            })
+        }
+
+        fn reader_request(method: Method, uri: &str) -> HttpRequest<EdgeBody> {
+            HttpRequest::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::HOST, "publisher.example")
+                .body(EdgeBody::empty())
+                .expect("should build reader request")
+        }
+
+        /// A reader request carrying every header a signed read leaves off,
+        /// and one it keeps.
+        fn reader_request_with_private_headers(method: Method, uri: &str) -> HttpRequest<EdgeBody> {
+            HttpRequest::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::HOST, "publisher.example")
+                .header(header::COOKIE, "session=reader-session")
+                .header(header::AUTHORIZATION, READER_AUTHORIZATION)
+                .header(header::PROXY_AUTHORIZATION, "Basic cmVhZGVyOnNlY3JldA==")
+                .header(header::REFERER, "https://elsewhere.example/page")
+                .header(header::IF_NONE_MATCH, "\"reader-etag\"")
+                .header(header::IF_MODIFIED_SINCE, "Tue, 01 Sep 2026 00:00:00 GMT")
+                .header(header::IF_MATCH, "\"reader-etag\"")
+                .header(header::IF_UNMODIFIED_SINCE, "Tue, 01 Sep 2026 00:00:00 GMT")
+                .header(header::IF_RANGE, "\"reader-etag\"")
+                .header(header::RANGE, "bytes=0-99")
+                .header("x-amz-meta-reader", "reader-chosen")
+                .header(header::USER_AGENT, "reader-agent")
+                .body(EdgeBody::empty())
+                .expect("should build reader request")
+        }
+
+        fn stub_with_responses(count: usize) -> Arc<StubHttpClient> {
+            let stub = Arc::new(StubHttpClient::new());
+            for _ in 0..count {
+                stub.push_response(200, b"origin response".to_vec());
+            }
+            stub
+        }
+
+        fn services_for(stub: &Arc<StubHttpClient>) -> RuntimeServices {
+            build_services_with_http_client(Arc::clone(stub) as Arc<dyn PlatformHttpClient>)
+        }
+
+        /// The origin addresses sent for reader requests to `uris`, in order.
+        async fn origin_uris(settings: &Settings, uris: &[&str]) -> Vec<String> {
+            let stub = stub_with_responses(uris.len());
+            let services = services_for(&stub);
+            for uri in uris {
+                let _ = run_publisher_proxy(settings, &services, reader_request(Method::GET, uri))
+                    .await;
+            }
+            stub.recorded_request_uris()
+        }
+
+        fn sent_header<'a>(sent: &'a [(String, String)], name: &str) -> Option<&'a str> {
+            sent.iter()
+                .find(|(sent_name, _)| sent_name.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        }
+
+        /// Asserts the one origin request `stub` recorded is signed as `method`
+        /// for exactly the address and `Host` it was sent with.
+        fn assert_signed(stub: &StubHttpClient, method: &Method) {
+            let uris = stub.recorded_request_uris();
+            let recorded = stub.recorded_request_headers();
+            let sent = recorded.first().expect("should send one origin request");
+            let host = sent_header(sent, "host").expect("should send a Host header");
+            assert_eq!(
+                host, "storage.example.com",
+                "should sign for the origin host"
+            );
+            let signed_at = sent_header(sent, "x-amz-date").expect("should send the signing time");
+            assert_eq!(
+                sent_header(sent, "authorization"),
+                Some(expected_authorization(method, &uris[0], host, signed_at).as_str()),
+                "should sign exactly the address and host that were sent"
+            );
+        }
+
+        /// The `Authorization` the signer gives `method` on `uri` with `host` at
+        /// the moment the signed request records.
+        fn expected_authorization(
+            method: &Method,
+            uri: &str,
+            host: &str,
+            signed_at: &str,
+        ) -> String {
+            let signed_at = chrono::NaiveDateTime::parse_from_str(signed_at, "%Y%m%dT%H%M%SZ")
+                .expect("should read the signing time")
+                .and_utc();
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                header::HOST,
+                HeaderValue::from_str(host).expect("should build host header"),
+            );
+            sign_headers(
+                method,
+                &url::Url::parse(uri).expect("should parse sent address"),
+                &mut headers,
+                REGION,
+                &S3Credentials {
+                    access_key_id: ACCESS_KEY_ID.to_owned(),
+                    secret_access_key: Redacted::new(SECRET_ACCESS_KEY.to_owned()),
+                    session_token: None,
+                },
+                SystemTime::from(signed_at),
+            )
+            .expect("should sign the expected request");
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .expect("should produce an Authorization header")
+                .to_owned()
+        }
+
+        fn response_status(response: &PublisherResponse) -> StatusCode {
+            match response {
+                PublisherResponse::Buffered(response)
+                | PublisherResponse::PassThrough { response, .. }
+                | PublisherResponse::Stream { response, .. }
+                | PublisherResponse::AssembleTemplate { response, .. } => response.status(),
+            }
+        }
+
+        #[tokio::test]
+        async fn origin_address_without_the_new_settings_is_unchanged() {
+            let settings = create_test_settings();
+
+            let sent = origin_uris(
+                &settings,
+                &[
+                    "https://publisher.example/",
+                    "https://publisher.example/page",
+                    "https://publisher.example/news/",
+                    "https://publisher.example/page?a=1&b=2",
+                    "https://publisher.example/a/../b",
+                    "https://publisher.example//double",
+                ],
+            )
+            .await;
+
+            assert_eq!(
+                sent,
+                vec![
+                    "https://origin.test-publisher.com/",
+                    "https://origin.test-publisher.com/page",
+                    "https://origin.test-publisher.com/news/",
+                    "https://origin.test-publisher.com/page?a=1&b=2",
+                    "https://origin.test-publisher.com/a/../b",
+                    "https://origin.test-publisher.com//double",
+                ],
+                "should send the reader's path and query to the origin host as before"
+            );
+        }
+
+        #[test]
+        fn origin_path_and_query_without_the_new_settings_is_the_reader_s_own() {
+            let publisher = Publisher::default();
+            for request in [
+                "/",
+                "/page",
+                "/news/",
+                "/page?a=1&b=2",
+                "/a/../b",
+                "//double",
+                "/%2e%2e/x",
+                "/x?",
+            ] {
+                let uri: Uri = request.parse().expect("should parse reader path");
+                for origin_path in ["", "/"] {
+                    let built = publisher_origin_path_and_query(&publisher, origin_path, &uri);
+                    assert!(
+                        matches!(built, Cow::Borrowed(_)),
+                        "should reuse the reader's own path for `{request}`"
+                    );
+                    assert_eq!(
+                        built,
+                        uri.path_and_query()
+                            .map_or("/", http::uri::PathAndQuery::as_str),
+                        "should send `{request}` as written"
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn origin_path_is_kept_and_joined_with_one_slash() {
+            let mut settings = create_test_settings();
+            settings.publisher.origin_url = STORAGE_URL.to_owned();
+
+            let sent = origin_uris(
+                &settings,
+                &[
+                    "https://publisher.example/",
+                    "https://publisher.example/page",
+                    "https://publisher.example/news/",
+                    "https://publisher.example/page?a=1&b=2",
+                ],
+            )
+            .await;
+
+            assert_eq!(
+                sent,
+                vec![
+                    "https://storage.example.com/bucket/site/",
+                    "https://storage.example.com/bucket/site/page",
+                    "https://storage.example.com/bucket/site/news/",
+                    "https://storage.example.com/bucket/site/page?a=1&b=2",
+                ],
+                "should send the reader's path under the origin path, query kept"
+            );
+        }
+
+        #[test]
+        fn origin_path_join_has_one_slash_whichever_side_carries_one() {
+            let publisher = Publisher::default();
+            for (origin_path, request, expected) in [
+                ("/bucket/site", "/page", "/bucket/site/page"),
+                ("/bucket/site/", "/page", "/bucket/site/page"),
+                ("/bucket/site", "/news/", "/bucket/site/news/"),
+                ("/bucket/site/", "/news/", "/bucket/site/news/"),
+                ("/bucket/site", "/", "/bucket/site/"),
+                ("/bucket/site/", "/", "/bucket/site/"),
+                ("/bucket/site", "/page?a=1&b=2", "/bucket/site/page?a=1&b=2"),
+                ("/bucket/site/", "/news/?a=1", "/bucket/site/news/?a=1"),
+            ] {
+                let uri: Uri = request.parse().expect("should parse reader path");
+                assert_eq!(
+                    publisher_origin_path_and_query(&publisher, origin_path, &uri),
+                    expected,
+                    "should join `{origin_path}` and `{request}` with one slash"
+                );
+            }
+        }
+
+        #[test]
+        fn directory_index_is_added_only_to_a_path_ending_in_a_slash() {
+            let publisher = Publisher {
+                directory_index: Some("index.html".to_owned()),
+                ..Publisher::default()
+            };
+            for (origin_path, request, expected) in [
+                ("", "/", "/index.html"),
+                ("", "/news/", "/news/index.html"),
+                ("", "/news", "/news"),
+                ("", "/news/?a=1", "/news/index.html?a=1"),
+                ("", "/news?a=1", "/news?a=1"),
+                ("", "/style.css", "/style.css"),
+                ("/bucket/site", "/", "/bucket/site/index.html"),
+                ("/bucket/site", "/news/", "/bucket/site/news/index.html"),
+                ("/bucket/site", "/news", "/bucket/site/news"),
+            ] {
+                let uri: Uri = request.parse().expect("should parse reader path");
+                assert_eq!(
+                    publisher_origin_path_and_query(&publisher, origin_path, &uri),
+                    expected,
+                    "should give `{request}` under `{origin_path}` the expected origin path"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn directory_index_changes_the_origin_address_and_not_the_reader_s() {
+            let mut settings = create_test_settings();
+            settings.publisher.directory_index = Some("index.html".to_owned());
+
+            let sent = origin_uris(
+                &settings,
+                &[
+                    "https://publisher.example/",
+                    "https://publisher.example/news/",
+                    "https://publisher.example/news",
+                    "https://publisher.example/style.css",
+                ],
+            )
+            .await;
+            assert_eq!(
+                sent,
+                vec![
+                    "https://origin.test-publisher.com/index.html",
+                    "https://origin.test-publisher.com/news/index.html",
+                    "https://origin.test-publisher.com/news",
+                    "https://origin.test-publisher.com/style.css",
+                ],
+                "should add the index file only to a path ending in a slash"
+            );
+
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                b"<html><body>news</body></html>".to_vec(),
+                vec![(header::CONTENT_TYPE.as_str(), "text/html; charset=utf-8")],
+            );
+            let services = services_for(&stub);
+            let response = run_publisher_proxy(
+                &settings,
+                &services,
+                reader_request(Method::GET, "https://publisher.example/news/"),
+            )
+            .await;
+            let PublisherResponse::Stream { params, .. } = response else {
+                panic!("should stream the origin page through the page pipeline");
+            };
+            assert_eq!(
+                params.request_path, "/news/",
+                "should give the page pipeline the reader's own path"
+            );
+        }
+
+        #[tokio::test]
+        async fn signed_origin_request_carries_none_of_the_reader_s_private_headers() {
+            let mut settings = create_test_settings();
+            settings.publisher.origin_url = STORAGE_URL.to_owned();
+            settings.publisher.directory_index = Some("index.html".to_owned());
+            settings.publisher.origin_auth = Some(signing_auth(None));
+            let stub = stub_with_responses(1);
+            let services = services_for(&stub);
+
+            let _ = run_publisher_proxy(
+                &settings,
+                &services,
+                reader_request_with_private_headers(
+                    Method::GET,
+                    "https://publisher.example/news/?a=1",
+                ),
+            )
+            .await;
+
+            let uris = stub.recorded_request_uris();
+            assert_eq!(
+                uris,
+                vec!["https://storage.example.com/bucket/site/news/index.html?a=1"],
+                "should send the signed read to the object's address"
+            );
+            let recorded = stub.recorded_request_headers();
+            let sent = recorded.first().expect("should send one origin request");
+            assert_eq!(
+                sent_header(sent, "cookie"),
+                None,
+                "should not send the reader's cookies"
+            );
+            assert_ne!(
+                sent_header(sent, "authorization"),
+                Some(READER_AUTHORIZATION),
+                "should not send the reader's Authorization"
+            );
+            assert_eq!(
+                sent_header(sent, "proxy-authorization"),
+                None,
+                "should not send the reader's proxy credentials"
+            );
+            assert_eq!(
+                sent_header(sent, "referer"),
+                None,
+                "should not send the reader's referrer"
+            );
+            assert_eq!(
+                sent_header(sent, "if-none-match"),
+                None,
+                "should not send the reader's If-None-Match"
+            );
+            assert_eq!(
+                sent_header(sent, "if-modified-since"),
+                None,
+                "should not send the reader's If-Modified-Since"
+            );
+            assert_eq!(
+                sent_header(sent, "if-match"),
+                None,
+                "should not send the reader's If-Match"
+            );
+            assert_eq!(
+                sent_header(sent, "if-unmodified-since"),
+                None,
+                "should not send the reader's If-Unmodified-Since"
+            );
+            assert_eq!(
+                sent_header(sent, "if-range"),
+                None,
+                "should not send the reader's If-Range"
+            );
+            assert_eq!(
+                sent_header(sent, "range"),
+                None,
+                "should not send the reader's Range"
+            );
+            assert_eq!(
+                sent_header(sent, "x-amz-meta-reader"),
+                None,
+                "should not send a header the reader set in the signing namespace"
+            );
+            assert_eq!(
+                sent_header(sent, "user-agent"),
+                Some("reader-agent"),
+                "should still send headers a signed read may carry"
+            );
+            assert_signed(&stub, &Method::GET);
+        }
+
+        #[tokio::test]
+        async fn signed_head_request_is_signed_as_a_head() {
+            let mut settings = create_test_settings();
+            settings.publisher.origin_url = STORAGE_URL.to_owned();
+            settings.publisher.origin_auth = Some(signing_auth(None));
+            let stub = stub_with_responses(1);
+            let services = services_for(&stub);
+
+            let _ = run_publisher_proxy(
+                &settings,
+                &services,
+                reader_request(Method::HEAD, "https://publisher.example/page"),
+            )
+            .await;
+
+            assert_eq!(stub.recorded_request_methods(), vec!["HEAD"]);
+            assert_signed(&stub, &Method::HEAD);
+        }
+
+        #[tokio::test]
+        async fn signed_origin_strips_the_query_when_origin_auth_says_so() {
+            let mut settings = create_test_settings();
+            settings.publisher.origin_url = STORAGE_URL.to_owned();
+            settings.publisher.origin_auth = Some(signing_auth(Some(OriginQueryPolicy::Strip)));
+            let stub = stub_with_responses(1);
+            let services = services_for(&stub);
+
+            let _ = run_publisher_proxy(
+                &settings,
+                &services,
+                reader_request(Method::GET, "https://publisher.example/page?utm=1"),
+            )
+            .await;
+
+            let uris = stub.recorded_request_uris();
+            assert_eq!(
+                uris,
+                vec!["https://storage.example.com/bucket/site/page"],
+                "should leave the reader's query off the signed read"
+            );
+            assert_signed(&stub, &Method::GET);
+        }
+
+        #[tokio::test]
+        async fn signed_origin_refuses_a_method_that_is_not_a_read() {
+            let mut settings = create_test_settings();
+            settings.publisher.origin_auth = Some(signing_auth(None));
+            for method in [Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS] {
+                let stub = stub_with_responses(1);
+                let services = services_for(&stub);
+
+                let response = run_publisher_proxy(
+                    &settings,
+                    &services,
+                    reader_request(method.clone(), "https://publisher.example/page"),
+                )
+                .await;
+
+                assert_eq!(
+                    response_status(&response),
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "should refuse {method} rather than sign it"
+                );
+                let PublisherResponse::Buffered(response) = response else {
+                    panic!("should answer {method} without the origin");
+                };
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::ALLOW)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("GET, HEAD"),
+                    "should name the methods a signed origin answers"
+                );
+                assert!(
+                    stub.recorded_request_uris().is_empty(),
+                    "should send nothing to the origin for {method}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn unsigned_origin_still_receives_the_reader_s_headers_and_methods() {
+            let settings = create_test_settings();
+            let stub = stub_with_responses(2);
+            let services = services_for(&stub);
+
+            let _ = run_publisher_proxy(
+                &settings,
+                &services,
+                reader_request_with_private_headers(Method::GET, "https://publisher.example/page"),
+            )
+            .await;
+            let _ = run_publisher_proxy(
+                &settings,
+                &services,
+                reader_request(Method::POST, "https://publisher.example/form"),
+            )
+            .await;
+
+            let recorded = stub.recorded_request_headers();
+            let sent = recorded.first().expect("should send the GET to the origin");
+            assert_eq!(
+                sent_header(sent, "cookie"),
+                Some("session=reader-session"),
+                "should forward the reader's cookies as before"
+            );
+            assert_eq!(
+                sent_header(sent, "authorization"),
+                Some(READER_AUTHORIZATION),
+                "should forward the reader's Authorization as before"
+            );
+            assert_eq!(
+                sent_header(sent, "referer"),
+                Some("https://elsewhere.example/page"),
+                "should forward the reader's referrer as before"
+            );
+            assert_eq!(
+                stub.recorded_request_methods(),
+                vec!["GET", "POST"],
+                "should forward a POST as before"
+            );
+        }
+
+        #[tokio::test]
+        async fn origin_path_refuses_a_reader_path_that_climbs_out_of_it() {
+            let mut settings = create_test_settings();
+            settings.publisher.origin_url = STORAGE_URL.to_owned();
+            for path in [
+                "/../other-site/page",
+                "/news/../../other-site/page",
+                "/news/./page",
+                "/%2e%2e/other-site/page",
+                "/%2E%2E/other-site/page",
+                "/%252e%252e/other-site/page",
+                "/..%2fother-site/page",
+                "/news/..",
+            ] {
+                let stub = stub_with_responses(1);
+                let services = services_for(&stub);
+
+                let response = run_publisher_proxy(
+                    &settings,
+                    &services,
+                    reader_request(Method::GET, &format!("https://publisher.example{path}")),
+                )
+                .await;
+
+                assert_eq!(
+                    response_status(&response),
+                    StatusCode::BAD_REQUEST,
+                    "should refuse `{path}`"
+                );
+                assert!(
+                    stub.recorded_request_uris().is_empty(),
+                    "should send nothing to the origin for `{path}`"
+                );
+            }
+        }
+
+        #[test]
+        fn dot_segments_are_found_in_any_spelling() {
+            for path in [
+                "/..",
+                "/.",
+                "/a/../b",
+                "/a/./b",
+                "/%2e%2e/b",
+                "/%2E%2e/b",
+                "/%252e%252e/b",
+                "/a%2f..%2fb",
+                "/a\\..\\b",
+            ] {
+                assert!(
+                    path_has_dot_segment(path),
+                    "should find a dot segment in `{path}`"
+                );
+            }
+            for path in [
+                "/",
+                "/page",
+                "/news/",
+                "/.well-known/x",
+                "/a..b",
+                "/...",
+                "/%2e%2ex",
+            ] {
+                assert!(
+                    !path_has_dot_segment(path),
+                    "should find no dot segment in `{path}`"
+                );
+            }
+        }
     }
 
     #[test]

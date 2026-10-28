@@ -919,7 +919,11 @@ fn asset_origin_host_header(
     })
 }
 
-fn apply_asset_origin_auth(
+/// Signs an origin request whose address and headers are otherwise final.
+///
+/// The one signing path for origin auth, used by asset routes and by the
+/// publisher origin alike.
+pub(crate) fn apply_asset_origin_auth(
     method: &Method,
     target_url: &url::Url,
     headers: &mut http::HeaderMap,
@@ -943,6 +947,17 @@ fn apply_asset_origin_auth(
                 crate::ec::std_system_time_now(),
             )
         }
+    }
+}
+
+/// Removes every header in `auth`'s signing namespace, so a header a reader
+/// sent there cannot reach the origin beside the signature.
+pub(crate) fn remove_origin_auth_namespace_headers(
+    headers: &mut http::HeaderMap,
+    auth: &AssetOriginAuth,
+) {
+    match auth {
+        AssetOriginAuth::S3SigV4(_) => s3_sigv4::remove_namespace_headers(headers),
     }
 }
 

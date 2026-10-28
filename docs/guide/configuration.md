@@ -87,6 +87,7 @@ publisher, trusted-client-IP, EC, Tinybird, DataDome, and S3 fields:
 - `bot-protection.datadome.server_side_key_secret_name`, when protection is enabled
 - `bot-protection.datadome.protection_test_bypass.credential_secret_name`, when the bypass is enabled
 - `proxy.asset_routes[*].auth.access_key_id`, `secret_access_key`, and optional `session_token`
+- `publisher.origin_auth.access_key_id`, `secret_access_key`, and optional `session_token`, when `[publisher]` sets `origin_auth`
 
 Their values belong in the logical `trusted_server_secrets` store and are
 resolved only while an instance builds runtime settings. An adapter can map the
@@ -364,10 +365,12 @@ Core publisher settings for domain, origin, and proxy configuration.
 | ----------------------------- | ------- | -------- | --------------------------------------------------------------------------- |
 | `domain`                      | String  | Yes      | Publisher's apex domain name                                                |
 | `cookie_domain`               | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                      |
-| `origin_url`                  | String  | Yes      | Full URL of publisher origin server                                         |
+| `origin_url`                  | String  | Yes      | Publisher origin URL, whose path (if any) comes before the request path     |
 | `origin_host_header_override` | String  | No       | Outbound Host header to send while connecting to `origin_url`               |
 | `proxy_secret`                | String  | Yes      | Secret-store key name for the proxy URL secret                              |
 | `max_buffered_body_bytes`     | Integer | No       | Buffered-body cap / Fastly stream raw+decoded byte ceiling (default 16 MiB) |
+| `origin_auth`                 | Table   | No       | Signs every origin request with the table an asset route's `auth` takes     |
+| `directory_index`             | String  | No       | File name added to an origin request path that ends in `/`                  |
 
 > **Note:** EC cookies (`ts-ec`) derive their domain automatically as `.{domain}` and
 > do not use `cookie_domain`. The `cookie_domain` field is used by other cookie helpers.
@@ -444,9 +447,19 @@ TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
 - ✅ `https://origin.publisher.com`
 - ✅ `https://origin.publisher.com:8080`
 - ✅ `http://192.168.1.1:9000`
+- ✅ `https://storage.publisher.com/bucket/site` (a folder of object storage)
 - ❌ `origin.publisher.com` (missing protocol)
+- ❌ `https://origin.publisher.com/` (trailing slash)
 
 **Port Handling**: Includes port if non-standard (not 80/443).
+
+**Path Handling**: A path in `origin_url` is kept, and the request path is
+added after it with exactly one `/` between them, so a request for `/news/page`
+with the folder above is sent to `/bucket/site/news/page`. The request query is
+kept. A query in `origin_url` itself is ignored. With no path, the request path
+is sent as it arrived, as before. When `origin_url` has a path, a request path
+with a `.` or `..` segment, in any percent-encoded spelling, is refused with
+`400` so no request reaches outside the folder.
 
 #### `origin_host_header_override`
 
@@ -530,6 +543,77 @@ a zero-byte cap fails every non-empty publisher response.
 
 ```bash
 TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
+```
+
+#### `origin_auth`
+
+**Purpose**: Sign every publisher origin request, for an origin such as
+private object storage that answers only signed reads. Pages still pass through
+the page pipeline, which an [asset route](#proxy-asset-routes) skips.
+
+**Format**: The same table as
+[`[proxy.asset_routes.auth]`](#proxy-asset-routes-auth), with the same fields,
+defaults and secret-store key references, signed by the same signer.
+
+```toml
+[publisher]
+domain = "publisher.com"
+cookie_domain = ".publisher.com"
+origin_url = "https://storage.publisher.com/bucket/site"
+proxy_secret = "publisher_proxy_secret"
+directory_index = "index.html"
+
+[publisher.origin_auth]
+type = "s3_sigv4"
+region = "example-region-1"
+access_key_id = "publisher_origin_access_key_id"
+secret_access_key = "publisher_origin_secret_access_key"
+# session_token = "publisher_origin_session_token"
+# origin_query = "strip"
+```
+
+**Behavior**:
+
+- Only `GET` and `HEAD` are signed. Any other method is answered
+  `405 Method Not Allowed` with `Allow: GET, HEAD` and never reaches the origin,
+  so the publisher's credentials are only ever used to read.
+- A signed request carries none of the reader's `Cookie`, `Authorization`,
+  `Proxy-Authorization`, `Referer`, `If-None-Match`, `If-Modified-Since`,
+  `If-Match`, `If-Unmodified-Since`, `If-Range` or `Range` headers, and none in
+  the signing scheme's own header namespace.
+- `origin_query = "strip"` leaves the reader's query off the origin request.
+  By default the query is kept.
+- `origin_url` must use `https`. A table the signer cannot use, such as an
+  empty or malformed `region`, is refused at startup naming
+  `publisher.origin_auth`.
+
+**Default**: Unset, and origin requests are sent unsigned with the reader's
+headers, as before.
+
+#### `directory_index`
+
+**Purpose**: A file name added to the origin request path when the request
+path ends in `/`, for an origin such as object storage that does not answer a
+folder with its index file.
+
+**Usage**:
+
+- `/` is sent to the origin as `/index.html`, and `/news/` as
+  `/news/index.html`.
+- `/news` and `/style.css` are sent as they are.
+- Only the origin request changes. The reader's address, and the path the page
+  pipeline and its middleware see, are unchanged.
+
+**Format**: One file name, made of letters, digits and `-._~!$&'()*+,;=:@`,
+with no `/`, `%`, space, query or fragment, and neither `.` nor `..`. Anything
+else is refused at startup naming `publisher.directory_index`.
+
+**Default**: Unset, and every path is sent as it arrived.
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__PUBLISHER__DIRECTORY_INDEX=index.html
 ```
 
 ## Trusted Client IP Configuration

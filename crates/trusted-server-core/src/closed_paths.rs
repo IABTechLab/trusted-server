@@ -7,8 +7,6 @@
 //! every adapter asks [`closed_path_response`] before its publisher fallback
 //! and the request is answered `404` here.
 
-use std::borrow::Cow;
-
 use edgezero_core::body::Body as EdgeBody;
 use http::{Request, Response, StatusCode, header};
 
@@ -50,30 +48,28 @@ pub fn closed_path_response(req: &Request<EdgeBody>) -> Option<Response<EdgeBody
 /// decode as `/admin%2Fkeys/rotate`, so the check is repeated to a fixed point
 /// rather than applied once.
 fn is_closed(path: &str) -> bool {
-    if is_closed_as_written(path) {
-        return true;
-    }
+    matches_any_decoding(path, is_closed_as_written)
+}
 
+/// Returns whether `matches` holds for `path` as written or after any of
+/// [`MAX_PERCENT_DECODE_ROUNDS`] rounds of percent-decoding.
+///
+/// A path still changing after the last round counts as a match, so a check
+/// built on this fails closed.
+pub(crate) fn matches_any_decoding(path: &str, matches: impl Fn(&str) -> bool) -> bool {
     let mut current = path.to_owned();
-    for _ in 0..MAX_PERCENT_DECODE_ROUNDS {
-        let Some(decoded) = percent_decoded_path(&current) else {
-            return false;
-        };
-
-        // A path whose remaining `%` sequences are not decodable escapes is a
-        // fixed point, so further rounds would repeat the same comparison.
+    for _ in 0..=MAX_PERCENT_DECODE_ROUNDS {
+        if matches(&current) {
+            return true;
+        }
+        let decoded =
+            String::from_utf8_lossy(&urlencoding::decode_binary(current.as_bytes())).into_owned();
         if decoded == current {
             return false;
         }
-
-        if is_closed_as_written(&decoded) {
-            return true;
-        }
-
         current = decoded;
     }
-
-    false
+    true
 }
 
 fn is_closed_as_written(path: &str) -> bool {
@@ -82,16 +78,6 @@ fn is_closed_as_written(path: &str) -> bool {
         || path
             .strip_prefix(ADMIN_KEYS_PREFIX)
             .is_some_and(|remainder| remainder.starts_with('/'))
-}
-
-/// Percent-decodes `path` once, returning `None` when the path contains no
-/// escape sequence or decodes to invalid UTF-8.
-fn percent_decoded_path(path: &str) -> Option<String> {
-    if !path.contains('%') {
-        return None;
-    }
-
-    urlencoding::decode(path).ok().map(Cow::into_owned)
 }
 
 fn not_found() -> Response<EdgeBody> {
@@ -214,6 +200,11 @@ mod tests {
         ] {
             assert_closed(path);
         }
+    }
+
+    #[test]
+    fn a_path_still_decoding_after_the_last_round_is_closed() {
+        assert_closed("/admin%2525252525252Fkeys/rotate");
     }
 
     #[test]

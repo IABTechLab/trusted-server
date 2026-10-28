@@ -279,37 +279,32 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
                 ],
                 true,
             ),
-            field(
-                vec![
-                    optional_object("proxy"),
-                    optional_object("asset_routes"),
-                    SecretPathSegment::ArrayEach,
-                    optional_object("auth"),
-                    object("access_key_id"),
-                ],
-                true,
-            ),
-            field(
-                vec![
-                    optional_object("proxy"),
-                    optional_object("asset_routes"),
-                    SecretPathSegment::ArrayEach,
-                    optional_object("auth"),
-                    object("secret_access_key"),
-                ],
-                true,
-            ),
-            field(
-                vec![
-                    optional_object("proxy"),
-                    optional_object("asset_routes"),
-                    SecretPathSegment::ArrayEach,
-                    optional_object("auth"),
-                    object("session_token"),
-                ],
-                true,
-            ),
         ];
+        // An asset route's `auth` and `[publisher]`'s `origin_auth` take the
+        // same table, so each holds the same three key references.
+        let origin_auth_keys = ["access_key_id", "secret_access_key", "session_token"];
+        fields.extend(origin_auth_keys.map(|key| {
+            field(
+                vec![
+                    optional_object("proxy"),
+                    optional_object("asset_routes"),
+                    SecretPathSegment::ArrayEach,
+                    optional_object("auth"),
+                    object(key),
+                ],
+                true,
+            )
+        }));
+        fields.extend(origin_auth_keys.map(|key| {
+            field(
+                vec![
+                    object("publisher"),
+                    optional_object("origin_auth"),
+                    object(key),
+                ],
+                true,
+            )
+        }));
         // The settings a module declares in its own table, for core's
         // modules and the ones a tool registered for deploy validation.
         let builders = crate::integrations::all_builders(deploy_integrations()).collect::<Vec<_>>();
@@ -551,25 +546,37 @@ fn validate_secret_key_references(
     }
 
     for (index, route) in settings.proxy.asset_routes.iter().enumerate() {
-        let Some(AssetOriginAuth::S3SigV4(auth)) = route.auth.as_ref() else {
-            continue;
-        };
-        validate_secret_key_reference(
-            &format!("proxy.asset_routes[{index}].auth.access_key_id"),
-            auth.access_key_id.expose(),
-        )?;
-        validate_secret_key_reference(
-            &format!("proxy.asset_routes[{index}].auth.secret_access_key"),
-            auth.secret_access_key.expose(),
-        )?;
-        if let Some(token) = &auth.session_token {
-            validate_secret_key_reference(
-                &format!("proxy.asset_routes[{index}].auth.session_token"),
-                token.expose(),
+        if let Some(auth) = route.auth.as_ref() {
+            validate_origin_auth_key_references(
+                &format!("proxy.asset_routes[{index}].auth"),
+                auth,
             )?;
         }
     }
+    if let Some(auth) = settings.publisher.origin_auth.as_ref() {
+        validate_origin_auth_key_references("publisher.origin_auth", auth)?;
+    }
 
+    Ok(())
+}
+
+/// Refuses an empty secret key reference in an origin auth table at `path`.
+fn validate_origin_auth_key_references(
+    path: &str,
+    auth: &AssetOriginAuth,
+) -> Result<(), Report<TrustedServerError>> {
+    let AssetOriginAuth::S3SigV4(auth) = auth;
+    validate_secret_key_reference(
+        &format!("{path}.access_key_id"),
+        auth.access_key_id.expose(),
+    )?;
+    validate_secret_key_reference(
+        &format!("{path}.secret_access_key"),
+        auth.secret_access_key.expose(),
+    )?;
+    if let Some(token) = &auth.session_token {
+        validate_secret_key_reference(&format!("{path}.session_token"), token.expose())?;
+    }
     Ok(())
 }
 
@@ -1044,6 +1051,9 @@ formats = [{ width = 300, height = 250 }]
                     true,
                 ),
                 ("proxy.asset_routes[*].auth.session_token".to_owned(), true),
+                ("publisher.origin_auth.access_key_id".to_owned(), true),
+                ("publisher.origin_auth.secret_access_key".to_owned(), true),
+                ("publisher.origin_auth.session_token".to_owned(), true),
             ],
             "should expose the native EdgeZero secret metadata contract"
         );
@@ -1395,6 +1405,94 @@ passphrase = "production-secret-key-32-bytes-min"
                 && text.contains("publisher.cookie_domain")
                 && text.contains("publisher.origin_url"),
             "should flag all three example publisher placeholders: {err:?}"
+        );
+    }
+
+    /// Valid settings whose `[publisher]` signs its origin requests.
+    fn settings_signing_the_publisher_origin(
+        access_key_id: &str,
+        secret_access_key: &str,
+        session_token: Option<&str>,
+    ) -> Settings {
+        let mut settings = valid_settings();
+        settings.publisher.origin_url = "https://storage.example.com/bucket/site".to_string();
+        settings.publisher.origin_auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+            region: "test-region-1".to_string(),
+            secret_store: None,
+            access_key_id: Redacted::new(access_key_id.to_string()),
+            secret_access_key: Redacted::new(secret_access_key.to_string()),
+            session_token: session_token.map(|token| Redacted::new(token.to_string())),
+            origin_query: None,
+        }));
+        settings
+    }
+
+    #[test]
+    fn deploy_validation_accepts_a_publisher_origin_auth_naming_its_keys() {
+        validate_settings_for_deploy(&settings_signing_the_publisher_origin(
+            "origin_access_key_id",
+            "origin_secret_access_key",
+            Some("origin_session_token"),
+        ))
+        .expect("should accept an origin_auth whose key references are named");
+    }
+
+    #[test]
+    fn deploy_validation_refuses_an_empty_publisher_origin_auth_key_reference() {
+        for (settings, path) in [
+            (
+                settings_signing_the_publisher_origin(" ", "origin_secret_access_key", None),
+                "publisher.origin_auth.access_key_id",
+            ),
+            (
+                settings_signing_the_publisher_origin("origin_access_key_id", "", None),
+                "publisher.origin_auth.secret_access_key",
+            ),
+            (
+                settings_signing_the_publisher_origin(
+                    "origin_access_key_id",
+                    "origin_secret_access_key",
+                    Some(" "),
+                ),
+                "publisher.origin_auth.session_token",
+            ),
+        ] {
+            let err = validate_settings_for_deploy(&settings)
+                .expect_err("should refuse an empty origin_auth key reference");
+            assert!(
+                format!("{err:?}").contains(&format!(
+                    "secret key reference at `{path}` must not be empty"
+                )),
+                "should name `{path}`: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn documented_publisher_object_storage_settings_validate_when_uncommented() {
+        let toml = uncomment_block(
+            &template_with_resolved_required_secrets(),
+            "[publisher.origin_auth]",
+        )
+        .replacen(
+            "# directory_index = \"index.html\"",
+            "directory_index = \"index.html\"",
+            1,
+        );
+        let settings = Settings::from_toml(&toml)
+            .expect("the documented origin_auth and directory_index should parse and validate");
+
+        assert!(
+            matches!(
+                settings.publisher.origin_auth,
+                Some(AssetOriginAuth::S3SigV4(_))
+            ),
+            "the documented origin_auth should be read"
+        );
+        assert_eq!(
+            settings.publisher.directory_index.as_deref(),
+            Some("index.html"),
+            "the documented directory_index should be read"
         );
     }
 

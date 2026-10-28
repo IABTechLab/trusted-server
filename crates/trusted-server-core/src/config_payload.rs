@@ -885,6 +885,45 @@ mod tests {
     }
 
     #[test]
+    fn publisher_origin_auth_resolves_its_credentials_from_the_store() {
+        let mut original = test_settings();
+        original.publisher.origin_url = "https://storage.example.com/bucket/site".to_string();
+        original.publisher.origin_auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+            region: "test-region-1".to_string(),
+            secret_store: None,
+            access_key_id: Redacted::new("s3-access-key".to_string()),
+            secret_access_key: Redacted::new("s3-secret-key".to_string()),
+            session_token: Some(Redacted::new("s3-session-key".to_string())),
+            origin_query: None,
+        }));
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+            PolicyOrigin::Blob,
+        )
+        .expect("should resolve the publisher origin credentials from the mapped store");
+
+        let Some(AssetOriginAuth::S3SigV4(auth)) = reconstructed.publisher.origin_auth.as_ref()
+        else {
+            panic!("should keep the publisher origin_auth");
+        };
+        assert_eq!(auth.access_key_id.expose(), "AKIAIOSFODNN7EXAMPLE");
+        assert_eq!(
+            auth.secret_access_key.expose(),
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+        );
+        assert_eq!(
+            auth.session_token
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("resolved-session-token")
+        );
+    }
+
+    #[test]
     fn partner_without_api_token_loads_without_secret_resolution() {
         let mut original = test_settings();
         let partner = serde_json::from_value(serde_json::json!({

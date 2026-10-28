@@ -91,6 +91,15 @@ pub struct Publisher {
     #[serde(default = "default_max_buffered_body_bytes")]
     #[validate(range(min = 1, message = "must be at least 1 byte"))]
     pub max_buffered_body_bytes: usize,
+    /// Optional signing of publisher origin reads, taking an asset route's `auth` table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_auth: Option<AssetOriginAuth>,
+    /// Optional file name added to a request path that ends in `/` on the way
+    /// to the origin, for an origin such as object storage that does not answer
+    /// a folder with its index file. The reader's address is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = validate_directory_index))]
+    pub directory_index: Option<String>,
 }
 
 fn default_max_buffered_body_bytes() -> usize {
@@ -111,6 +120,8 @@ impl Default for Publisher {
             origin_host_header_override: None,
             proxy_secret: Redacted::default(),
             max_buffered_body_bytes: default_max_buffered_body_bytes(),
+            origin_auth: None,
+            directory_index: None,
         }
     }
 }
@@ -202,6 +213,8 @@ impl Publisher {
     ///     origin_host_header_override: None,
     ///     proxy_secret: Redacted::new("proxy-secret".to_string()),
     ///     max_buffered_body_bytes: 16 * 1024 * 1024,
+    ///     origin_auth: None,
+    ///     directory_index: None,
     /// };
     /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
     /// ```
@@ -226,7 +239,47 @@ impl Publisher {
             .clone()
             .unwrap_or_else(|| self.origin_host())
     }
+
+    /// Returns `true` when [`Self::origin_auth`] says the reader's query is
+    /// left off origin requests, as an asset route's `origin_query` does.
+    #[must_use]
+    pub fn origin_query_is_stripped(&self) -> bool {
+        self.origin_auth
+            .as_ref()
+            .and_then(AssetOriginAuth::origin_query_policy)
+            == Some(OriginQueryPolicy::Strip)
+    }
+
+    fn normalize(&mut self) {
+        if let Some(auth) = &mut self.origin_auth {
+            auth.normalize();
+        }
+    }
+
+    /// Refuses an `origin_auth` the signer cannot use, naming the setting.
+    ///
+    /// As for an asset route, a signed origin must use `https`.
+    fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        let Some(auth) = &self.origin_auth else {
+            return Ok(());
+        };
+        let uses_https = Url::parse(&self.origin_url).is_ok_and(|url| url.scheme() == "https");
+        if !uses_https {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "{PUBLISHER_ORIGIN_AUTH_SETTING} requires publisher.origin_url to use https"
+                ),
+            }));
+        }
+        auth.prepare_runtime(PUBLISHER_ORIGIN_AUTH_SETTING)
+    }
 }
+
+/// The setting named in every refusal of `[publisher]`'s `origin_auth`.
+const PUBLISHER_ORIGIN_AUTH_SETTING: &str = "publisher.origin_auth";
+
+/// The setting named in every refusal of an asset route's `auth`.
+const ASSET_ROUTE_AUTH_SETTING: &str = "proxy.asset_routes auth";
 
 /// Which integrations run, and the settings each one is given.
 ///
@@ -1768,7 +1821,7 @@ pub enum OriginQueryPolicy {
     Strip,
 }
 
-/// Authentication configuration for an asset origin.
+/// Authentication configuration for an asset origin or the publisher origin.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AssetOriginAuth {
@@ -1784,9 +1837,10 @@ impl AssetOriginAuth {
         }
     }
 
-    fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+    /// Refuses a table the signer cannot use, naming `setting` in the message.
+    fn prepare_runtime(&self, setting: &str) -> Result<(), Report<TrustedServerError>> {
         match self {
-            Self::S3SigV4(config) => config.prepare_runtime(),
+            Self::S3SigV4(config) => config.prepare_runtime(setting),
         }
     }
 
@@ -1852,23 +1906,24 @@ impl S3SigV4AuthConfig {
         });
     }
 
-    fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+    fn prepare_runtime(&self, setting: &str) -> Result<(), Report<TrustedServerError>> {
         if self.region.is_empty() {
             return Err(Report::new(TrustedServerError::Configuration {
-                message: "proxy.asset_routes auth s3_sigv4 region must not be empty".to_string(),
+                message: format!("{setting} s3_sigv4 region must not be empty"),
             }));
         }
         if !s3_region_is_valid(&self.region) {
             return Err(Report::new(TrustedServerError::Configuration {
-                message:
-                    "proxy.asset_routes auth s3_sigv4 region must contain only lowercase letters, digits, and '-'"
-                        .to_string(),
+                message: format!(
+                    "{setting} s3_sigv4 region must contain only lowercase letters, digits, and '-'"
+                ),
             }));
         }
         if self.access_key_id.expose().is_empty() || self.secret_access_key.expose().is_empty() {
             return Err(Report::new(TrustedServerError::Configuration {
-                message: "proxy.asset_routes auth s3_sigv4 credentials must not be empty after secret resolution"
-                    .to_string(),
+                message: format!(
+                    "{setting} s3_sigv4 credentials must not be empty after secret resolution"
+                ),
             }));
         }
         Ok(())
@@ -2636,7 +2691,7 @@ impl ProxyAssetRoute {
         }
 
         if let Some(auth) = &self.auth {
-            auth.prepare_runtime()?;
+            auth.prepare_runtime(ASSET_ROUTE_AUTH_SETTING)?;
         }
         if let Some(image_optimizer) = &self.image_optimizer {
             image_optimizer.prepare_runtime()?;
@@ -4549,6 +4604,7 @@ impl Settings {
     /// Returns a configuration error if image optimizer keys collide after trimming.
     pub(crate) fn normalize_deserialized(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.cache.normalize();
+        self.publisher.normalize();
         self.proxy.normalize();
         self.image_optimizer.normalize()?;
         self.debug.auction_html_comment_options.normalize();
@@ -4595,11 +4651,13 @@ impl Settings {
     ///
     /// Returns a configuration error if any cached runtime artifact cannot be
     /// prepared, if any handler path regex does not compile, if a creative
-    /// opportunity slot is invalid, or if
-    /// [`AuctionDebugCommentOptions::metadata_keys`] names an unsupported key.
+    /// opportunity slot is invalid, if `publisher.origin_auth` cannot sign, or
+    /// if [`AuctionDebugCommentOptions::metadata_keys`] names an unsupported
+    /// key.
     pub fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.image_optimizer.prepare_runtime()?;
         self.cache.prepare_runtime()?;
+        self.publisher.prepare_runtime()?;
         self.proxy.prepare_runtime()?;
         if let Some(analytics) = &mut self.analytics {
             analytics.prepare_runtime()?;
@@ -5096,6 +5154,56 @@ fn validate_host_header_override(value: &str) -> Result<(), ValidationError> {
         return Err(err);
     }
 
+    Ok(())
+}
+
+/// Longest `directory_index` accepted, the usual limit on one file name.
+const MAX_DIRECTORY_INDEX_BYTES: usize = 255;
+
+/// Accepts a single file name that can be added to a path as written.
+///
+/// The name is added to the origin request without encoding, so it is limited
+/// to the characters a path segment carries unescaped. A `/` would reach into
+/// another folder, `%` would let an escape stand for one, and `.` or `..`
+/// would name a folder rather than a file.
+fn validate_directory_index(value: &str) -> Result<(), ValidationError> {
+    let is_segment_byte = |byte: u8| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b':'
+                    | b'@'
+            )
+    };
+    let is_file_name = !value.is_empty()
+        && value.len() <= MAX_DIRECTORY_INDEX_BYTES
+        && value != "."
+        && value != ".."
+        && value.bytes().all(is_segment_byte);
+    if !is_file_name {
+        let mut err = ValidationError::new("invalid_directory_index");
+        err.add_param("value".into(), &value);
+        err.message = Some(
+            "directory_index must be one file name such as `index.html`, without `/`, `%`, \
+             spaces, a query or a fragment"
+                .into(),
+        );
+        return Err(err);
+    }
     Ok(())
 }
 
@@ -9169,6 +9277,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            origin_auth: None,
+            directory_index: None,
         };
         assert_eq!(publisher.origin_host(), "origin.example.com:8080");
 
@@ -9180,6 +9290,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            origin_auth: None,
+            directory_index: None,
         };
         assert_eq!(publisher.origin_host(), "origin.example.com");
 
@@ -9191,6 +9303,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            origin_auth: None,
+            directory_index: None,
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -9202,6 +9316,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            origin_auth: None,
+            directory_index: None,
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -9213,6 +9329,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            origin_auth: None,
+            directory_index: None,
         };
         assert_eq!(publisher.origin_host(), "192.168.1.1:8080");
 
@@ -9224,6 +9342,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            origin_auth: None,
+            directory_index: None,
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
     }
@@ -9237,6 +9357,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            origin_auth: None,
+            directory_index: None,
         };
 
         assert_eq!(publisher.origin_host_header(), "origin.example.com:8443");
@@ -9251,6 +9373,8 @@ source_domain = "partner.example.com"
             origin_host_header_override: Some("www.example.com".to_string()),
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            origin_auth: None,
+            directory_index: None,
         };
 
         assert_eq!(publisher.origin_host_header(), "www.example.com");
@@ -9291,6 +9415,258 @@ source_domain = "partner.example.com"
             Publisher::default().max_buffered_body_bytes,
             "TOML default and Publisher::default() must stay aligned"
         );
+    }
+
+    /// The fixture settings with `lines` added to `[publisher]` and its
+    /// `origin_url` replaced by `origin_url`.
+    fn publisher_settings_with(origin_url: &str, lines: &str) -> String {
+        crate_test_settings_str()
+            .replacen(
+                "origin_url = \"https://origin.test-publisher.com\"",
+                &format!("origin_url = \"{origin_url}\""),
+                1,
+            )
+            .replacen(
+                "proxy_secret = \"unit-test-proxy-secret\"",
+                &format!("proxy_secret = \"unit-test-proxy-secret\"\n{lines}"),
+                1,
+            )
+    }
+
+    const STORAGE_ORIGIN_URL: &str = "https://storage.example.com/bucket/site";
+
+    #[test]
+    fn publisher_object_storage_settings_are_off_by_default() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+
+        assert!(
+            settings.publisher.origin_auth.is_none(),
+            "origin_auth should default to unset"
+        );
+        assert!(
+            settings.publisher.directory_index.is_none(),
+            "directory_index should default to unset"
+        );
+        let serialized =
+            serde_json::to_value(&settings.publisher).expect("should serialize publisher");
+        assert!(
+            serialized.get("origin_auth").is_none() && serialized.get("directory_index").is_none(),
+            "unset settings should serialize as a document written before they existed: \
+             {serialized}"
+        );
+    }
+
+    #[test]
+    fn publisher_origin_auth_reads_the_asset_route_auth_table() {
+        let settings = Settings::from_toml(&publisher_settings_with(
+            STORAGE_ORIGIN_URL,
+            r#"origin_auth = { type = "s3_sigv4", region = "test-region-1", access_key_id = "origin_access_key_id", secret_access_key = "origin_secret_access_key", session_token = "origin_session_token", origin_query = "strip" }
+            directory_index = "index.html""#,
+        ))
+        .expect("should parse a publisher with origin_auth and directory_index");
+
+        let Some(AssetOriginAuth::S3SigV4(auth)) = settings.publisher.origin_auth.as_ref() else {
+            panic!("should read origin_auth as the asset route auth table");
+        };
+        assert_eq!(auth.region, "test-region-1");
+        assert_eq!(auth.access_key_id.expose(), "origin_access_key_id");
+        assert_eq!(auth.secret_access_key.expose(), "origin_secret_access_key");
+        assert_eq!(
+            auth.session_token
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("origin_session_token")
+        );
+        assert!(
+            settings.publisher.origin_query_is_stripped(),
+            "origin_query = \"strip\" should leave the query off origin requests"
+        );
+        assert_eq!(
+            settings.publisher.directory_index.as_deref(),
+            Some("index.html")
+        );
+
+        let defaulted = Settings::from_toml(&publisher_settings_with(
+            STORAGE_ORIGIN_URL,
+            r#"origin_auth = { type = "s3_sigv4", region = "test-region-1" }"#,
+        ))
+        .expect("should parse origin_auth naming only its region");
+        let Some(AssetOriginAuth::S3SigV4(auth)) = defaulted.publisher.origin_auth.as_ref() else {
+            panic!("should read origin_auth with defaulted key references");
+        };
+        assert_eq!(
+            (
+                auth.access_key_id.expose().as_str(),
+                auth.secret_access_key.expose().as_str()
+            ),
+            ("access_key_id", "secret_access_key"),
+            "omitted key references should default as an asset route's do"
+        );
+        assert!(
+            !defaulted.publisher.origin_query_is_stripped(),
+            "the query should be kept unless origin_query strips it"
+        );
+    }
+
+    #[test]
+    fn publisher_directory_index_accepts_a_file_name() {
+        for name in [
+            "index.html",
+            "default.htm",
+            "index",
+            "index_v2.html",
+            "home~1.html",
+        ] {
+            let lines = format!("directory_index = {}", toml::Value::String(name.to_owned()));
+            let settings = Settings::from_toml(&publisher_settings_with(
+                "https://origin.test-publisher.com",
+                &lines,
+            ))
+            .unwrap_or_else(|err| panic!("should accept directory_index `{name}`: {err:?}"));
+            assert_eq!(settings.publisher.directory_index.as_deref(), Some(name));
+        }
+    }
+
+    #[test]
+    fn publisher_directory_index_refuses_anything_but_a_file_name() {
+        let too_long = "a".repeat(super::MAX_DIRECTORY_INDEX_BYTES + 1);
+        for name in [
+            "",
+            ".",
+            "..",
+            "pages/index.html",
+            "/index.html",
+            "index.html/",
+            "index\\html",
+            "index.html?lang=en",
+            "index.html#top",
+            "index page.html",
+            " index.html",
+            "%2e%2e",
+            "index%2Ehtml",
+            "\u{e9}t\u{e9}.html",
+            too_long.as_str(),
+        ] {
+            let lines = format!("directory_index = {}", toml::Value::String(name.to_owned()));
+            let err = Settings::from_toml(&publisher_settings_with(
+                "https://origin.test-publisher.com",
+                &lines,
+            ))
+            .expect_err("should refuse a directory_index that is not one file name");
+            assert!(
+                format!("{err:?}").contains("publisher.directory_index"),
+                "the refusal of `{name}` should name the setting: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn publisher_origin_auth_refuses_a_table_it_cannot_sign_with() {
+        for (origin_url, table, expected) in [
+            (
+                STORAGE_ORIGIN_URL,
+                r#"{ type = "s3_sigv4", region = "" }"#,
+                "publisher.origin_auth s3_sigv4 region must not be empty",
+            ),
+            (
+                STORAGE_ORIGIN_URL,
+                r#"{ type = "s3_sigv4", region = "Test_Region" }"#,
+                "publisher.origin_auth s3_sigv4 region must contain only lowercase letters",
+            ),
+            (
+                STORAGE_ORIGIN_URL,
+                r#"{ type = "s3_sigv4", region = "test-region-1", access_key_id = " " }"#,
+                "publisher.origin_auth s3_sigv4 credentials must not be empty",
+            ),
+            (
+                STORAGE_ORIGIN_URL,
+                r#"{ type = "s3_sigv4", region = "test-region-1", secret_access_key = "" }"#,
+                "publisher.origin_auth s3_sigv4 credentials must not be empty",
+            ),
+            (
+                "http://storage.example.com/bucket/site",
+                r#"{ type = "s3_sigv4", region = "test-region-1" }"#,
+                "publisher.origin_auth requires publisher.origin_url to use https",
+            ),
+            (
+                STORAGE_ORIGIN_URL,
+                r#"{ type = "unknown_scheme", region = "test-region-1" }"#,
+                "origin_auth",
+            ),
+            (
+                STORAGE_ORIGIN_URL,
+                r#"{ type = "s3_sigv4", region = "test-region-1", bucket = "site" }"#,
+                "origin_auth",
+            ),
+            (STORAGE_ORIGIN_URL, r#""s3_sigv4""#, "origin_auth"),
+        ] {
+            let err = Settings::from_toml(&publisher_settings_with(
+                origin_url,
+                &format!("origin_auth = {table}"),
+            ))
+            .expect_err("should refuse an origin_auth the signer cannot use");
+            assert!(
+                format!("{err:?}").contains(expected),
+                "the refusal of `{table}` should say `{expected}`: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn asset_route_auth_refusals_still_name_the_asset_route() {
+        let mut route = ProxyAssetRoute::new("/assets/", "https://storage.example.com");
+        route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+            region: String::new(),
+            secret_store: None,
+            access_key_id: Redacted::new("access_key_id".to_owned()),
+            secret_access_key: Redacted::new("secret_access_key".to_owned()),
+            session_token: None,
+            origin_query: None,
+        }));
+
+        let err = route
+            .prepare_runtime()
+            .expect_err("should refuse an asset route auth with no region");
+        assert!(
+            format!("{err:?}")
+                .contains("proxy.asset_routes auth s3_sigv4 region must not be empty"),
+            "the asset route refusal should keep its wording: {err:?}"
+        );
+    }
+
+    #[test]
+    fn publisher_origin_auth_credentials_stay_out_of_debug_output() {
+        let canaries = [
+            "canary-origin-access",
+            "canary-origin-secret",
+            "canary-origin-session",
+        ];
+        let publisher = Publisher {
+            origin_auth: Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+                region: "test-region-1".to_owned(),
+                secret_store: None,
+                access_key_id: Redacted::new(canaries[0].to_owned()),
+                secret_access_key: Redacted::new(canaries[1].to_owned()),
+                session_token: Some(Redacted::new(canaries[2].to_owned())),
+                origin_query: None,
+            })),
+            ..Publisher::default()
+        };
+
+        let debug = format!("{publisher:?}");
+
+        assert!(
+            debug.contains("test-region-1"),
+            "should leave the region visible in debug output: {debug}"
+        );
+        for canary in canaries {
+            assert!(
+                !debug.contains(canary),
+                "should keep `{canary}` out of debug output"
+            );
+        }
     }
 
     #[test]

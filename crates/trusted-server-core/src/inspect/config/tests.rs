@@ -212,6 +212,13 @@ fn a_key_the_inspect_section_does_not_have_is_refused_naming_it() {
 fn documents_holding_every_declared_secret() -> Vec<(&'static str, Value)> {
     let mut main = document("");
     main["publisher"]["proxy_secret"] = json!("proxy");
+    main["publisher"]["origin_auth"] = json!({
+        "type": "s3_sigv4",
+        "region": "test-region-1",
+        "access_key_id": "origin-access",
+        "secret_access_key": "origin-secret",
+        "session_token": "origin-session",
+    });
     main["ec"]["hmac"]["passphrase"] = json!("hmac");
     main["ec"]["partners"] = json!([{
         "name": "Example Partner",
