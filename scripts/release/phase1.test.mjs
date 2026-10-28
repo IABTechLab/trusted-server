@@ -1947,3 +1947,68 @@ test('post-publish reads cannot succeed after the shared deadline', async () => 
     /window exhausted/
   )
 })
+
+test('unavailable ordinary diagnostic has fixed bounded canonical facts and cannot overwrite evidence', async () => {
+  const helper = await import('./phase1.mjs')
+  assert.equal(typeof helper.unavailableOrdinaryDiagnostic, 'function')
+  const root = mkdtempSync(join(tmpdir(), 'ordinary-diagnostic-'))
+  try {
+    const directory = join(root, 'ordinary-diagnostics')
+    helper.unavailableOrdinaryDiagnostic(directory)
+    const file = join(directory, 'ordinary-comparison-diagnostic.json')
+    const bytes = readFileSync(file)
+    const value = JSON.parse(bytes)
+    assert.ok(bytes.length <= 4096)
+    assert.equal(value.outcome, 'unavailable')
+    assert.equal(value.stage, 'transfer')
+    assert.equal(value.code, 'transfer_unavailable')
+    assert.ok(
+      Object.values(value.facts).every((fact) => fact === 'unavailable')
+    )
+    assert.equal(value.profile, undefined)
+    assert.equal(bytes.toString(), JSON.stringify(value) + '\n')
+    assert.deepEqual(Object.keys(value), Object.keys(value).sort())
+    assert.deepEqual(Object.keys(value.facts), Object.keys(value.facts).sort())
+    assert.throws(() => helper.unavailableOrdinaryDiagnostic(directory))
+    assert.deepEqual(readFileSync(file), bytes)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('ordinary diagnostic remains a failure-only CI artifact outside signing and publication', () => {
+  const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const comparison = workflow
+    .split('\n  fastly-comparison:')[1]
+    .split('\n  sign:')[0]
+  const sign = workflow.split('\n  sign:')[1]
+  const release = readFileSync('.github/workflows/release.yml', 'utf8')
+  assert.match(
+    comparison,
+    /Retain bounded nonpublishable comparison diagnostics\n\s+if: failure\(\)/
+  )
+  assert.match(
+    comparison,
+    /ordinary-diagnostics\/ordinary-comparison-diagnostic\.json/
+  )
+  assert.match(
+    comparison,
+    /ordinary-diagnostic "\$RUNNER_TEMP\/ordinary-diagnostics"/
+  )
+  assert.match(comparison, /outcome=failed: ordinary diagnostic writer failed/)
+  assert.match(comparison, /head -c 16384/)
+  assert.doesNotMatch(
+    sign,
+    /ordinary-diagnostics|ordinary-comparison-diagnostic/
+  )
+  assert.doesNotMatch(
+    release,
+    /ordinary-diagnostics|ordinary-comparison-diagnostic/
+  )
+  const fixture = readFileSync(
+    'crates/trusted-server-release/tests/commands.rs',
+    'utf8'
+  )
+  assert.match(fixture, /diagnostic\["outcome"\],\s*"mismatched"/)
+  assert.match(fixture, /diagnostic\["stage"\],\s*"bytes"/)
+})

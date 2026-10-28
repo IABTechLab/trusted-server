@@ -17,6 +17,41 @@ import {
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
+/** Retains CI-only acquisition failure facts without environment or error text. */
+export function unavailableOrdinaryDiagnostic(directory) {
+  const facts = Object.fromEntries(
+    [
+      'canonical_artifact_id',
+      'canonical_observation_artifact_id',
+      'canonical_sha256',
+      'canonical_size',
+      'canonical_window',
+      'first_difference_offset',
+      'reproduction_artifact_id',
+      'reproduction_observation_artifact_id',
+      'reproduction_sha256',
+      'reproduction_size',
+      'reproduction_window',
+    ].map((key) => [key, 'unavailable'])
+  )
+  const bytes =
+    JSON.stringify({
+      code: 'transfer_unavailable',
+      facts,
+      kind: 'ordinary-comparison-diagnostic',
+      outcome: 'unavailable',
+      stage: 'transfer',
+      version: 1,
+    }) + '\n'
+  if (Buffer.byteLength(bytes) > 4096)
+    throw Error('Ordinary diagnostic exceeds cap')
+  mkdirSync(directory, { mode: 0o700 })
+  writeFileSync(join(directory, 'ordinary-comparison-diagnostic.json'), bytes, {
+    flag: 'wx',
+    mode: 0o600,
+  })
+}
+
 /** Fetches only fixed read-only current-run metadata, retaining strict-parser bytes. */
 export async function ordinaryApi(path, token, fetcher = fetch, deadline) {
   if (
@@ -927,6 +962,8 @@ if (
     }
   } else if (command === 'smoke' && args.length === 2) {
     await smokeRelease(...args)
+  } else if (command === 'ordinary-diagnostic' && args.length === 1) {
+    unavailableOrdinaryDiagnostic(args[0])
   } else if (command === 'ordinary-fetch' && args.length === 3) {
     const [producer, input, archives] = args
     await acquireOrdinaryTransfers({

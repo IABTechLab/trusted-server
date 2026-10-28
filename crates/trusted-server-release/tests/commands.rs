@@ -1048,6 +1048,23 @@ fn ordinary_comparison_failure_prevents_signing_and_publication_sentinels() {
         "should reach actual equality, not fail on fixture setup: {}",
         stderr(&result)
     );
+    let diagnostic: Value = serde_json::from_slice(
+        &fs::read(root.join("ordinary-diagnostics/ordinary-comparison-diagnostic.json"))
+            .expect("should retain the real comparator's structured failure evidence"),
+    )
+    .expect("should parse bounded CI-only diagnostic JSON");
+    assert_eq!(
+        diagnostic["outcome"], "mismatched",
+        "should report actual mismatch"
+    );
+    assert_eq!(
+        diagnostic["stage"], "bytes",
+        "should reach complete-byte comparison"
+    );
+    assert_eq!(
+        diagnostic["code"], "final_bytes_mismatch",
+        "should retain fixed mismatch code"
+    );
     assert!(
         result.stdout.is_empty(),
         "should emit no successful comparison output"

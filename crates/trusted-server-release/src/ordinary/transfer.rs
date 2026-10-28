@@ -8,7 +8,7 @@ use std::path::Path;
 
 use super::archive::{self, Profile};
 use super::run::{Archive, Bindings, Build};
-use super::{ASSET, Equality, Observation, compare, observation, require};
+use super::{ASSET, Equality, Observation, compare, diagnostic, observation, require};
 use crate::error::ReleaseError;
 
 /// Four exact-ID downloads in canonical build/observation, reproduction order.
@@ -92,8 +92,10 @@ fn unpack(
             && bytes.len() as u64 == expected.size
             && hex::encode(Sha256::digest(bytes)) == expected.sha256,
         "ordinary archive digest or size disagrees with its upload/service identity",
-    )?;
+    )
+    .map_err(|report| diagnostic::tag(report, diagnostic::Code::TransferRejected))?;
     archive::contents(bytes, profile)
+        .map_err(|report| diagnostic::tag(report, diagnostic::Code::TransferRejected))
 }
 
 fn observed(
@@ -101,7 +103,8 @@ fn observed(
     bindings: &Bindings,
     build: &Build,
 ) -> Result<Observation, Report<ReleaseError>> {
-    let observed = observation(bytes)?;
+    let observed = observation(bytes)
+        .map_err(|report| diagnostic::tag(report, diagnostic::Code::InputsRejected))?;
     let started = observed.facts.environment.started_at_seconds;
     // Observations record whole seconds; the server upload interval above keeps
     // its full precision. Compare the observation's stated resolution here.
@@ -110,7 +113,8 @@ fn observed(
             && started >= build.started.unix_timestamp() as u64
             && started <= build.completed.unix_timestamp() as u64,
         "ordinary observation source or start disagrees with its producing job",
-    )?;
+    )
+    .map_err(|report| diagnostic::tag(report, diagnostic::Code::IdentityMismatch))?;
     Ok(observed)
 }
 
@@ -149,7 +153,12 @@ pub(super) fn check(
             Path::new(&facts.environment.target_root),
             &facts.role,
         )?;
-        super::normalization::scan(bytes, &flags)?;
+        super::normalization::scan(bytes, &flags).map_err(|report| {
+            report.attach(
+                diagnostic::Failure::new(diagnostic::Code::InputsRejected)
+                    .binaries(&left[ASSET], &right[ASSET]),
+            )
+        })?;
     }
     let spdx_name = format!("{ASSET}.spdx.json");
     let reproduction_spdx_sha256 = hex::encode(Sha256::digest(&right[&spdx_name]));

@@ -93,6 +93,15 @@ fn complete_transfer_command_seals_only_real_equality() {
         "trusted-server-fastly.wasm.rebuild-check.json",
         "should preserve the release contract"
     );
+    assert!(
+        !fixture
+            .output
+            .parent()
+            .expect("should have parent")
+            .join("ordinary-diagnostics")
+            .exists(),
+        "should write no diagnostic after success"
+    );
     let error = compare_transfers(
         &fixture.input,
         &fixture.archives,
@@ -225,8 +234,188 @@ fn observation_archive_limit_is_applied_before_reading_its_body() {
         format!("{error:?}").contains("input exceeds role byte limit"),
         "should reject observation archives at their smaller bound"
     );
+    let diagnostic: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .output
+                .parent()
+                .expect("should have parent")
+                .join("ordinary-diagnostics/ordinary-comparison-diagnostic.json"),
+        )
+        .expect("should retain rejected-transfer diagnostic"),
+    )
+    .expect("should parse bounded diagnostic");
+    assert_eq!(
+        diagnostic["code"], "transfer_rejected",
+        "should distinguish unsafe oversized transfer from unavailable input"
+    );
     assert!(
         !fixture.output.exists(),
         "should write no companion for oversized input"
+    );
+}
+
+#[test]
+fn failed_comparison_retains_bounded_diagnostic_with_explicit_unavailable_facts() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.archives.join("canonical.zip"))
+        .expect("should remove one unavailable transfer");
+    let _ = compare_transfers(
+        &fixture.input,
+        &fixture.archives,
+        &fixture.source.checkout,
+        &fixture.output,
+    )
+    .expect_err("should reject unavailable transfer");
+    let bytes = fs::read(
+        fixture
+            .output
+            .parent()
+            .expect("should have parent")
+            .join("ordinary-diagnostics/ordinary-comparison-diagnostic.json"),
+    )
+    .expect("should retain the structured failure diagnostic");
+    assert!(bytes.len() <= 4096, "should enforce diagnostic byte cap");
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("should parse the diagnostic");
+    assert_eq!(
+        value["outcome"], "unavailable",
+        "should distinguish unavailable transfer"
+    );
+    assert_eq!(value["stage"], "transfer", "should identify transfer stage");
+    assert_eq!(
+        value["code"], "transfer_unavailable",
+        "should use fixed transfer code"
+    );
+    assert_eq!(
+        value["facts"]["canonical_sha256"], "unavailable",
+        "should not invent unobserved binary facts"
+    );
+    assert!(
+        !fixture.output.exists(),
+        "should never write a failed companion"
+    );
+}
+
+#[test]
+fn failed_comparison_records_independent_source_input_failure() {
+    let fixture = Fixture::new();
+    fs::write(fixture.source.checkout.join("Cargo.lock"), b"changed lock")
+        .expect("should alter independent source input");
+    let _ = compare_transfers(
+        &fixture.input,
+        &fixture.archives,
+        &fixture.source.checkout,
+        &fixture.output,
+    )
+    .expect_err("should fail independent source check");
+    let bytes = fs::read(
+        fixture
+            .output
+            .parent()
+            .expect("should have parent")
+            .join("ordinary-diagnostics/ordinary-comparison-diagnostic.json"),
+    )
+    .expect("should retain source input diagnostic");
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("should parse diagnostic");
+    assert_eq!(value["outcome"], "failed", "should report failure");
+    assert_eq!(value["stage"], "inputs", "should report input stage");
+    assert!(
+        value["facts"]["canonical_sha256"]
+            .as_str()
+            .is_some_and(|digest| digest.len() == 64),
+        "should retain observed digest after source-input failure"
+    );
+    assert_eq!(
+        value["facts"]["first_difference_offset"], "unavailable",
+        "should not invent difference after verified equality"
+    );
+    assert_eq!(
+        value["code"], "source_inputs_rejected",
+        "should use fixed source code"
+    );
+    assert!(!fixture.output.exists(), "should retain no companion");
+}
+
+#[test]
+fn rejected_companion_writer_retains_observed_facts_without_fabricating_a_difference() {
+    let fixture = Fixture::new();
+    fs::create_dir(&fixture.output).expect("should occupy companion destination");
+    let _ = compare_transfers(
+        &fixture.input,
+        &fixture.archives,
+        &fixture.source.checkout,
+        &fixture.output,
+    )
+    .expect_err("should refuse reused output");
+    let value: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .output
+                .parent()
+                .expect("should have parent")
+                .join("ordinary-diagnostics/ordinary-comparison-diagnostic.json"),
+        )
+        .expect("should retain writer failure facts"),
+    )
+    .expect("should parse writer diagnostic");
+    assert_eq!(
+        value["stage"], "output",
+        "should identify failed companion sealing"
+    );
+    assert_eq!(
+        value["code"], "companion_write_rejected",
+        "should retain fixed writer code"
+    );
+    assert!(
+        value["facts"]["canonical_size"]
+            .as_u64()
+            .is_some_and(|size| size > 0),
+        "should retain actually observed binary size"
+    );
+    assert_eq!(
+        value["facts"]["canonical_sha256"], value["facts"]["reproduction_sha256"],
+        "should retain established equal digests"
+    );
+    assert_eq!(
+        value["facts"]["first_difference_offset"], "unavailable",
+        "should never invent a byte difference after equality"
+    );
+    assert!(
+        !fixture
+            .output
+            .join("trusted-server-fastly.wasm.rebuild-check.json")
+            .exists(),
+        "should emit no companion on writer failure"
+    );
+}
+
+#[test]
+fn diagnostic_writer_failure_remains_a_failed_comparison() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.archives.join("canonical.zip")).expect("should remove transfer");
+    fs::write(
+        fixture
+            .output
+            .parent()
+            .expect("should have parent")
+            .join("ordinary-diagnostics"),
+        b"occupied",
+    )
+    .expect("should prevent diagnostic directory creation");
+    let error = compare_transfers(
+        &fixture.input,
+        &fixture.archives,
+        &fixture.source.checkout,
+        &fixture.output,
+    )
+    .expect_err("should remain failed when diagnostic persistence fails");
+    assert!(
+        format!("{error:?}").contains("outcome=failed: ordinary diagnostic writer failed"),
+        "should state failed outcome in human text"
+    );
+    assert!(
+        !fixture.output.exists(),
+        "should never turn writer failure into a companion"
     );
 }

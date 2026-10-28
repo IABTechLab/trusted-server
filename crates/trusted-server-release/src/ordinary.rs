@@ -16,6 +16,7 @@ use crate::error::ReleaseError;
 
 mod archive;
 mod commands;
+mod diagnostic;
 mod inputs;
 mod normalization;
 mod output;
@@ -73,20 +74,31 @@ pub(crate) fn compare(
     left: &[u8],
     right: &[u8],
 ) -> Result<Equality, Report<ReleaseError>> {
-    pair(&canonical, &reproduction)?;
+    pair(&canonical, &reproduction)
+        .map_err(|report| diagnostic::tag(report, diagnostic::Code::IdentityMismatch))?;
     let mut digests = Vec::new();
     for (observed, bytes) in [(&canonical, left), (&reproduction, right)] {
         let size = u64::try_from(bytes.len())
             .map_err(|_| Report::new(ReleaseError::Document).attach("ordinary size overflow"))?;
         require(
-            size > 0 && size <= Role::Executable.limit(),
-            "ordinary executable byte bound rejected",
-        )?;
+            size > 0 && size <= Role::Executable.limit() && size == observed.facts.artifact.size,
+            "ordinary executable changed after observation: size or byte bound rejected",
+        )
+        .map_err(|report| {
+            report.attach(
+                diagnostic::Failure::new(diagnostic::Code::SizeMismatch).binaries(left, right),
+            )
+        })?;
         let digest = hex::encode(Sha256::digest(bytes));
         require(
-            size == observed.facts.artifact.size && digest == observed.facts.artifact.sha256,
+            digest == observed.facts.artifact.sha256,
             "ordinary executable changed after observation",
-        )?;
+        )
+        .map_err(|report| {
+            report.attach(
+                diagnostic::Failure::new(diagnostic::Code::DigestMismatch).binaries(left, right),
+            )
+        })?;
         digests.push(digest);
     }
     if left != right {
@@ -100,18 +112,20 @@ pub(crate) fn compare(
             let end = start.saturating_add(16).min(bytes.len());
             hex::encode(&bytes[start..end])
         };
-        return Err(Report::new(ReleaseError::Document).attach(format!(
-            "ordinary final-byte mismatch: canonical_size={}, reproduction_size={}, \
+        return Err(Report::new(ReleaseError::Document)
+            .attach(format!(
+                "ordinary final-byte mismatch: canonical_size={}, reproduction_size={}, \
              canonical_sha256={}, reproduction_sha256={}, first_offset={}, \
              canonical_window={}, reproduction_window={}",
-            left.len(),
-            right.len(),
-            digests[0],
-            digests[1],
-            offset,
-            window(left),
-            window(right),
-        )));
+                left.len(),
+                right.len(),
+                digests[0],
+                digests[1],
+                offset,
+                window(left),
+                window(right),
+            ))
+            .attach(diagnostic::Failure::mismatch(left, right, offset)));
     }
     Ok(Equality {
         sha256: canonical.facts.artifact.sha256.clone(),
