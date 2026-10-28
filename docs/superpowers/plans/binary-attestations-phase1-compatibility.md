@@ -378,6 +378,8 @@ This follow-up records only the exact merge SHA and is docs-only after `81020c09
 
 ### Newer stack trunk integration
 
-After main advanced, GitHub's stack CI evaluated Phase 2 against the newer trunk and found a conflict in `prebid_bundle.rs`. The approved follow-up merges main `054c7b777ce67db34744cb1f4100b14e59c4bc5a` into Phase 2 parent `3ae0e191f321ed1d796af0106b9043804d7af452` only. The resolution retains both the upstream Unix permissions-test import and Phase 2's resource-discovery tests; upstream security fixes remain intact.
+After main advanced, GitHub's stack CI evaluated Phase 2 against the newer trunk and found a conflict in `prebid_bundle.rs`. Integration `7d551777daeaee09e24bce9bf4f96edac6e5e0df` merged main `054c7b777ce67db34744cb1f4100b14e59c4bc5a` into Phase 2 parent `3ae0e191f321ed1d796af0106b9043804d7af452` only. The resolution retains both the upstream Unix permissions-test import and Phase 2's resource-discovery tests; upstream security fixes remain intact.
 
 Phase 1 stays at docs head `20152315c01dd5fddcfc84b969f8e9993b0bfc69`, with `.15` still attributed to `68eef902a8bddd9024676cc3806fa5377ed67fee`. The additional Phase 2 integration changes application inputs, with no release-machinery changes and no new Phase 2 rehearsal. `.13` remains exclusively at `770a425df4b28caaaef68dfd930bceabd9928046`.
+
+This exact-SHA record is docs-only after `7d551777daeaee09e24bce9bf4f96edac6e5e0df`; the later application inputs remain unrehearsed.
