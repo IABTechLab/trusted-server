@@ -46,8 +46,7 @@ pub const HEADER_X_DEBUG_FASTLY_POP: HeaderName = HeaderName::from_static("x-deb
 // names it, and by no adapter.
 /// The deployed git version the build compiled in (see [`TS_GIT_VERSION`]).
 pub const HEADER_X_TS_VERSION: HeaderName = HeaderName::from_static("x-ts-version");
-/// The version the adapter reports for the service, which the attestation
-/// document carries as `platform.serviceVersion`.
+/// The version the adapter reports for the service.
 pub const HEADER_X_TS_SERVICE_VERSION: HeaderName = HeaderName::from_static("x-ts-service-version");
 pub const HEADER_X_TS_ENV: HeaderName = HeaderName::from_static("x-ts-env");
 

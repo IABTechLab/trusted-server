@@ -944,6 +944,12 @@ impl PlatformGeo for NoopGeo {
     }
 }
 
+/// A [`RuntimeServices`] builder carrying the repository's sample policy,
+/// which the core tests decide permissions under.
+pub(crate) fn test_services_builder() -> super::RuntimeServicesBuilder {
+    RuntimeServices::builder().permission_policy(crate::permissions::PermissionPolicy::sample())
+}
+
 /// Build a [`RuntimeServices`] instance with a custom config store and a custom secret store.
 ///
 /// Use this when a test exercises code that reads from config AND secret stores,
@@ -952,7 +958,7 @@ pub fn build_services_with_config_and_secret(
     config_store: impl PlatformConfigStore + 'static,
     secret_store: impl PlatformSecretStore + 'static,
 ) -> RuntimeServices {
-    RuntimeServices::builder()
+    test_services_builder()
         .config_store(Arc::new(config_store))
         .secret_store(Arc::new(secret_store))
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -968,7 +974,7 @@ pub fn build_services_with_config_and_secret_and_client_ip(
     secret_store: impl PlatformSecretStore + 'static,
     client_ip: IpAddr,
 ) -> RuntimeServices {
-    RuntimeServices::builder()
+    test_services_builder()
         .config_store(Arc::new(config_store))
         .secret_store(Arc::new(secret_store))
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -1005,7 +1011,7 @@ pub fn build_request_signing_services() -> RuntimeServices {
 pub fn build_services_with_config(
     config_store: impl PlatformConfigStore + 'static,
 ) -> RuntimeServices {
-    RuntimeServices::builder()
+    test_services_builder()
         .config_store(Arc::new(config_store))
         .secret_store(Arc::new(NoopSecretStore))
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -1027,7 +1033,7 @@ pub fn noop_services() -> RuntimeServices {
 /// This is the only way to reach the lookup-failure path, because the seam is
 /// what turns an `Err` into the requires-signal floor.
 pub fn build_services_with_geo(geo: Arc<dyn PlatformGeo>) -> RuntimeServices {
-    RuntimeServices::builder()
+    test_services_builder()
         .config_store(Arc::new(NoopConfigStore))
         .secret_store(Arc::new(NoopSecretStore))
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -1047,7 +1053,7 @@ pub fn build_services_with_geo(geo: Arc<dyn PlatformGeo>) -> RuntimeServices {
 pub fn noop_services_with_device_module(
     device_module: Arc<dyn crate::ec::device::DeviceModule>,
 ) -> RuntimeServices {
-    RuntimeServices::builder()
+    test_services_builder()
         .config_store(Arc::new(NoopConfigStore))
         .secret_store(Arc::new(NoopSecretStore))
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -1197,7 +1203,7 @@ pub fn services_with_ec_module_and_config_store(
     ec_module: Arc<dyn crate::ec::module::EdgeCookieModule>,
     config_store: Arc<dyn PlatformConfigStore>,
 ) -> RuntimeServices {
-    RuntimeServices::builder()
+    test_services_builder()
         .config_store(config_store)
         .secret_store(Arc::new(NoopSecretStore))
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -1222,7 +1228,7 @@ fn noop_services_with_ec_module_and_ip(
     ec_module: Arc<dyn crate::ec::module::EdgeCookieModule>,
     client_ip: Option<IpAddr>,
 ) -> RuntimeServices {
-    RuntimeServices::builder()
+    test_services_builder()
         .config_store(Arc::new(NoopConfigStore))
         .secret_store(Arc::new(NoopSecretStore))
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -1243,7 +1249,7 @@ fn noop_services_with_ec_module_and_ip(
 pub fn noop_services_with_telemetry_sink(
     auction_telemetry_sink: Arc<dyn crate::auction::telemetry::AuctionTelemetrySink>,
 ) -> RuntimeServices {
-    RuntimeServices::builder()
+    test_services_builder()
         .config_store(Arc::new(NoopConfigStore))
         .secret_store(Arc::new(NoopSecretStore))
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -1273,7 +1279,7 @@ pub fn build_services_with_http_client_and_client_ip(
     http_client: Arc<dyn PlatformHttpClient>,
     client_ip: IpAddr,
 ) -> RuntimeServices {
-    RuntimeServices::builder()
+    test_services_builder()
         .config_store(Arc::new(NoopConfigStore))
         .secret_store(Arc::new(NoopSecretStore))
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -1288,7 +1294,7 @@ pub fn build_services_with_http_client_and_client_ip(
 }
 
 pub fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
-    RuntimeServices::builder()
+    test_services_builder()
         .config_store(Arc::new(NoopConfigStore))
         .secret_store(Arc::new(NoopSecretStore))
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -1317,7 +1323,7 @@ pub fn build_services_with_backend_and_http_client(
     backend: Arc<dyn PlatformBackend>,
     http_client: Arc<dyn PlatformHttpClient>,
 ) -> RuntimeServices {
-    RuntimeServices::builder()
+    test_services_builder()
         .config_store(Arc::new(NoopConfigStore))
         .secret_store(Arc::new(NoopSecretStore))
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -1339,7 +1345,7 @@ pub fn build_services_with_config_secret_and_http_client(
     secret_store: impl PlatformSecretStore + 'static,
     http_client: Arc<dyn PlatformHttpClient>,
 ) -> RuntimeServices {
-    RuntimeServices::builder()
+    test_services_builder()
         .config_store(Arc::new(config_store))
         .secret_store(Arc::new(secret_store))
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -1355,7 +1361,7 @@ pub fn build_services_with_secret_http_client_and_client_ip(
     http_client: Arc<dyn PlatformHttpClient>,
     client_ip: Option<IpAddr>,
 ) -> RuntimeServices {
-    RuntimeServices::builder()
+    test_services_builder()
         .config_store(Arc::new(NoopConfigStore))
         .secret_store(Arc::new(secret_store))
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))

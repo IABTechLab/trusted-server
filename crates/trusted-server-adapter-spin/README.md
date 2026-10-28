@@ -5,11 +5,12 @@ Experimental Fermyon Spin adapter for Trusted Server. The component targets
 platform tests.
 
 The crate maps Spin HTTP, variables, and the `default` key-value store into the
-shared runtime. Startup failures install a restricted 503 router that keeps
-`/health` live. The adapter permits one enabled auction provider. It declares
-the `default` store as its key-value store, which every request is given, so a
-component that cannot open that store fails every request. Its entry point
-uses `anyhow::Result` only because the EdgeZero Spin FFI requires that type.
+shared runtime. Startup failures install a restricted router that answers with
+the status of the error's kind and keeps `/health` live. The adapter permits
+one enabled auction provider. It declares the `default` store as its key-value
+store, which every request is given, so a component that cannot open that
+store fails every request. Its entry point uses `anyhow::Result` only because
+the EdgeZero Spin FFI requires that type.
 
 Build and test from the repository root:
 
