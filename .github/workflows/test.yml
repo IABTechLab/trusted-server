@@ -113,6 +113,9 @@ jobs:
       - name: Verify Fastly WASM release build
         run: cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
 
+      - name: Check that no permission policy is compiled into the Fastly WASM
+        run: ./scripts/check-no-compiled-policy.sh target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm
+
   test-cloudflare:
     name: cargo check (cloudflare native + wasm32-unknown-unknown)
     runs-on: ubuntu-latest
@@ -154,6 +157,9 @@ jobs:
 
       - name: Build Spin adapter release WASM
         run: cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
+
+      - name: Check that no permission policy is compiled into the Spin WASM
+        run: ./scripts/check-no-compiled-policy.sh target/wasm32-wasip1/release/trusted_server_adapter_spin.wasm
 
       - name: Run Spin adapter tests (native host)
         run: cargo test-spin
