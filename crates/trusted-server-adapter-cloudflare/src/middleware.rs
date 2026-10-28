@@ -114,6 +114,10 @@ pub(crate) fn apply_finalize_headers(
     trusted_server_core::response_privacy::apply_response_headers_with_cache_privacy(
         settings, response,
     );
+
+    // Last, so that nothing an origin or an operator's header set can loosen
+    // a site taken out of search.
+    trusted_server_core::robots_txt::apply_response_robots_tag(settings, response);
 }
 
 // ---------------------------------------------------------------------------

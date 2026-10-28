@@ -219,38 +219,39 @@ fail and the service will return its startup-error response.
 
 ## Key Sections
 
-7 of these sections select what runs, with `module` where one runs and
+10 of these sections select what runs, with `module` where one runs and
 `modules` where several run, and each gives every selected name its own
 `[<type>.<name>]` settings table, as
 [Configuration Rules](/guide/configuration-rules) describes.
 
-| Section                                                                                                           | Selects               | Purpose                                                                                     |
-| ----------------------------------------------------------------------------------------------------------------- | --------------------- | ------------------------------------------------------------------------------------------- |
-| `[ad-server]`                                                                                                     | one module            | The ad server that picks the winner                                                         |
-| `[auction]`                                                                                                       | several modules       | Auction orchestration, bidder routes, and the modules the auction runs, `prebid` among them |
-| `[cache]`                                                                                                         | nothing               | Static and rehosted asset cache policy                                                      |
-| `[consent]`                                                                                                       | nothing               | Consent interpretation, forwarding, and conflict resolution                                 |
-| `[creative_opportunities]`                                                                                        | nothing               | Server-side page ad opportunities and templates                                             |
-| `[debug]`                                                                                                         | nothing               | Explicit non-production diagnostics                                                         |
-| `[demand]`                                                                                                        | several modules       | The auction's demand sources                                                                |
-| `[device]`                                                                                                        | one module            | Device classification                                                                       |
-| `[ec]`                                                                                                            | one module            | Edge Cookie identity, persistence, and partner sync                                         |
-| `[[fetch]]`                                                                                                       | nothing               | Which page changes run on a page as it is fetched, and in what order                        |
-| `[geo]`                                                                                                           | one module            | Which module resolves location, if any                                                      |
-| `[image_optimizer]`                                                                                               | nothing               | Reusable Fastly Image Optimizer profiles                                                    |
-| `[inspect]`                                                                                                       | nothing               | What the configuration page at `/_ts/config` shows                                          |
-| `[permission-signal]`                                                                                             | several modules       | Which permission signals are acted on, in order                                             |
-| `[permissions]`                                                                                                   | nothing               | The publisher's permission policy file, by name                                             |
-| `[proxy]`                                                                                                         | several modules       | Proxy allowlist, TLS policy, asset routes, and the first-party script proxy module          |
-| `[publisher]`                                                                                                     | nothing               | Publisher domain, origin, and proxy signing key                                             |
-| `[request_signing]`                                                                                               | nothing               | Outbound Ed25519 request signing                                                            |
-| `[response_headers]`                                                                                              | nothing               | Headers added to Trusted Server responses                                                   |
-| `[rewrite]`                                                                                                       | nothing               | First-party URL rewrite exclusions                                                          |
-| `[[serve]]`                                                                                                       | nothing               | Which page changes run on each reader's copy of a page, and in what order                   |
-| `[tester_cookie]`                                                                                                 | nothing               | Optional tester-cookie endpoints                                                            |
-| `[tinybird]`                                                                                                      | nothing               | Direct Tinybird auction telemetry                                                           |
-| `[trusted_client_ip]`                                                                                             | nothing               | Authenticated front-door client-IP forwarding                                               |
-| `[<type>]`, such as `[cmp]`, `[tag]`, `[ad-tag]`, `[bot-protection]`, `[identity]`, `[audience]` or `[framework]` | one module or several | The section of a module type, selecting the modules of that type that run                   |
+| Section                                                                                                           | Selects               | Purpose                                                                                       |
+| ----------------------------------------------------------------------------------------------------------------- | --------------------- | --------------------------------------------------------------------------------------------- |
+| `[ad-server]`                                                                                                     | one module            | The ad server that picks the winner                                                           |
+| `[auction]`                                                                                                       | several modules       | Auction orchestration, bidder routes, and the modules the auction runs, `prebid` among them   |
+| `[cache]`                                                                                                         | nothing               | Static and rehosted asset cache policy                                                        |
+| `[consent]`                                                                                                       | nothing               | Consent interpretation, forwarding, and conflict resolution                                   |
+| `[creative_opportunities]`                                                                                        | nothing               | Server-side page ad opportunities and templates                                               |
+| `[debug]`                                                                                                         | nothing               | Explicit non-production diagnostics                                                           |
+| `[demand]`                                                                                                        | several modules       | The auction's demand sources                                                                  |
+| `[device]`                                                                                                        | one module            | Device classification                                                                         |
+| `[ec]`                                                                                                            | one module            | Edge Cookie identity, persistence, and partner sync                                           |
+| `[[fetch]]`                                                                                                       | nothing               | Which page changes run on a page as it is fetched, and in what order                          |
+| `[geo]`                                                                                                           | one module            | Which module resolves location, if any                                                        |
+| `[image_optimizer]`                                                                                               | nothing               | Reusable Fastly Image Optimizer profiles                                                      |
+| `[inspect]`                                                                                                       | nothing               | What the configuration page at `/_ts/config` shows                                            |
+| `[permission-signal]`                                                                                             | several modules       | Which permission signals are acted on, in order                                               |
+| `[permissions]`                                                                                                   | nothing               | The publisher's permission policy file, by name                                               |
+| `[proxy]`                                                                                                         | several modules       | Proxy allowlist, TLS policy, asset routes, and the first-party script proxy module            |
+| `[publisher]`                                                                                                     | nothing               | Publisher domain, origin, and proxy signing key                                               |
+| `[request_signing]`                                                                                               | nothing               | Outbound Ed25519 request signing                                                              |
+| `[response_headers]`                                                                                              | nothing               | Headers added to Trusted Server responses                                                     |
+| `[rewrite]`                                                                                                       | nothing               | First-party URL rewrite exclusions                                                            |
+| `[robots-txt]`                                                                                                    | several modules       | What `/robots.txt` answers, and `X-Robots-Tag` on its responses when every crawler is refused |
+| `[[serve]]`                                                                                                       | nothing               | Which page changes run on each reader's copy of a page, and in what order                     |
+| `[tester_cookie]`                                                                                                 | nothing               | Optional tester-cookie endpoints                                                              |
+| `[tinybird]`                                                                                                      | nothing               | Direct Tinybird auction telemetry                                                             |
+| `[trusted_client_ip]`                                                                                             | nothing               | Authenticated front-door client-IP forwarding                                                 |
+| `[<type>]`, such as `[cmp]`, `[tag]`, `[ad-tag]`, `[bot-protection]`, `[identity]`, `[audience]` or `[framework]` | one module or several | The section of a module type, selecting the modules of that type that run                     |
 
 ## Example: Production Setup
 
@@ -1126,6 +1127,45 @@ on that host, including `/first-party/proxy`, which serves any target that
 `/first-party/sign` signs. A policy that limited scripts to the origin now
 allows those too. Set `proxy.allowed_domains` to bound what the proxy serves.
 :::
+
+## robots.txt Configuration
+
+What `/robots.txt` answers. With no `[robots-txt]` section the publisher keeps their own file and `/robots.txt` reaches the origin like any other path.
+
+### `[robots-txt]`
+
+| Field          | Type                    | Required | Description                                                                                                                                                                                                                |
+| -------------- | ----------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `modules`      | String or Array[String] | Yes      | What makes the file, in order. `refuse_all` refuses every crawler, `allow_all` allows every crawler everywhere, and any other name is a module that supplies robots.txt rules. A single name is the same as a list of one. |
+| `always_allow` | Array[String]           | No       | Paths kept open to every crawler refused the whole site, each starting with `/`. A narrower rule still applies, so `Disallow: /ads` closes off `/ads.txt`.                                                                 |
+| `sitemap`      | String                  | No       | Added as a `Sitemap:` line.                                                                                                                                                                                                |
+| `top_text`     | String                  | No       | The publisher's own text, placed above the rules.                                                                                                                                                                          |
+| `bottom_text`  | String                  | No       | The publisher's own text, placed below the rules.                                                                                                                                                                          |
+
+A module with settings of its own reads them from its own block, `[robots-txt.<name>]`, where `<name>` is the name `modules` selects it by. Trusted Server does not read those blocks.
+
+**How the file is made.** Modules contribute rules and Trusted Server writes the file, so these hold whatever a module returns.
+
+1. With `refuse_all` selected the file is the refusal and nothing else, whatever else is selected, and every response the deployment finalizes carries `X-Robots-Tag: noindex, nofollow`.
+2. A path in `always_allow` stays open to every crawler a module's rules refuse the whole site to, `*` included. A narrower rule is kept as the module gave it, so `Disallow: /ads` still closes off `/ads.txt`.
+3. The rules appear in the order `modules` names them, between `top_text` above and the `Sitemap` line and `bottom_text` below.
+4. A module is asked for the host the request was addressed to, never one that `Forwarded` or `X-Forwarded-Host` names, and is given nothing of the crawler's connection. Its answer is held for that host in the key-value store a request is given, and served until the module's own refresh is due. A module that cannot answer has its last answer served past its age, for as long as the store keeps it, which is 30 days where the store can give an entry a lifetime. With no answer held at all, or with no rule anywhere in the file, the file is `503` with `Retry-After: 600`, never an empty file, which a crawler would read as permission to crawl everything. Select `allow_all` to allow every crawler.
+5. No adapter gives a request a working key-value store, so nothing is held. Fastly and Axum give one whose every call fails, and Cloudflare and Spin declare no store for EdgeZero to open. Every request for the file asks each module, and a module that cannot answer makes the file `503`.
+6. On Fastly the file is answered once the modules have prepared the request, before the Edge Cookie steps and the request filters, so a filter's answer never stands in for it.
+
+**Which responses carry the header.** An adapter writes `X-Robots-Tag` last when it finalizes a response, replacing any tag already there, so neither an origin page nor `[response_headers]` can loosen it. That covers every route, the publisher fallback and the error path. A response sent before that step does not carry it. On every adapter but Fastly that is the `404` or `405` the router gives a request it does not route. On Fastly it is the two debug endpoints under `/_ts/debug` and a failure before the settings are read.
+
+**Refused when the settings load**: `modules` absent, empty or naming one thing twice, a key that is not a setting, and a block for a module `modules` does not name. A name that nothing the deployment runs supplies is refused at startup.
+
+**A publisher who sells advertising almost certainly wants `/ads.txt` in `always_allow`.** Google's help for publishers says "The ads.txt file for a domain may be ignored by crawlers if the robots.txt file on a domain disallows one of the following", and lists first "The crawling of the URL path on which an ads.txt file is posted" ([AdSense Help](https://support.google.com/adsense/answer/7679060)). A file that refuses everything disallows that path, so a refusal without the allowance can leave the publisher's `ads.txt` unread.
+
+**Example**:
+
+```toml
+[robots-txt]
+modules = ["refuse_all"]
+always_allow = ["/ads.txt"]
+```
 
 ## Request Signing
 

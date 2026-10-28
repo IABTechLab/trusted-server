@@ -363,10 +363,11 @@ builder every integration uses.
 | `.with_ec_module(name, ...)`                          | Offers an Edge Cookie module that `[ec] module` may select by that name                         |
 | `.with_geo_module(name, ...)`                         | Offers a geo module that `[geo] module` may select by that name                                 |
 | `.with_device_module(name, ...)`                      | Offers a device module that `[device] module` may select by that name                           |
+| `.with_robots_txt_contributor(name, ...)`             | Offers rules for `/robots.txt` that `[robots-txt] modules` may select by that name              |
 
 The three script delivery choices are exclusive and the last call wins.
 
-Each of the last three takes the module's name, which is the path under
+Each of the last four takes the module's name, which is the path under
 `crates/` of the crate the module lives in, as `module_name!()` gives it.
 `[ec] module`, `[geo] module` and `[device] module` read a written name the
 way a section does, as written or with the type folder (`edgecookie`, `geo`
@@ -378,6 +379,16 @@ backend call serve all three.
 An Edge Cookie module is declared under the name its own `id` returns.
 Startup refuses a registration where the two differ, and two registrations
 that supply a module of one type under one name.
+
+A robots.txt contributor implements `RobotsTxtContributor`. It returns groups
+of records and never bytes, so it cannot produce a malformed file. Trusted
+Server asks it for the request without its query, on the host the request was
+addressed to and with no client information or host signals in its services,
+holds the answer for that host until the contributor's `refresh` is due, and
+writes the file from every contributor `[robots-txt] modules` names, in that
+order. `fingerprint` names the settings an answer was given for, so an answer
+held for other settings is never served. Trusted Server hashes it into the key
+the answer is held under, so nothing of it is written to the store.
 
 The Fastly adapter is the one adapter that classifies a request, so a device
 module is asked there and on no other adapter. It is shown the User-Agent and

@@ -3908,6 +3908,19 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[validate(nested)]
     pub trusted_client_ip: Option<TrustedClientIpConfig>,
+    /// Optional `robots.txt`, assembled by core from the contributors
+    /// `[robots-txt] modules` selects.
+    ///
+    /// `None` leaves `/robots.txt` to the publisher's origin, and must stay
+    /// omitted from serialized config blobs for the reason given on
+    /// `trusted_client_ip`.
+    #[serde(
+        rename = "robots-txt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[validate(nested)]
+    pub robots_txt: Option<crate::robots_txt::RobotsTxtConfig>,
     #[serde(default)]
     #[validate(nested)]
     pub ec: Ec,
@@ -4237,6 +4250,9 @@ impl Settings {
             .auction_html_comment_options
             .validate_metadata_keys()?;
         self.validate_asset_image_optimizer_profile_sets()?;
+        if let Some(robots_txt) = &self.robots_txt {
+            robots_txt.prepare_runtime()?;
+        }
 
         if let Some(co) = &mut self.creative_opportunities {
             co.compile_slots();
@@ -5017,6 +5033,90 @@ mod tests {
         assert!(
             settings.trusted_client_ip.is_none(),
             "should leave trusted client IP configuration disabled by default"
+        );
+    }
+
+    fn settings_str_with_robots_txt(section: &str) -> String {
+        format!("{}\n[robots-txt]\n{section}\n", crate_test_settings_str())
+    }
+
+    #[test]
+    fn the_robots_txt_section_is_read_by_its_hyphenated_name() {
+        let toml = settings_str_with_robots_txt(
+            "modules = [\"refuse_all\"]\nalways_allow = [\"/ads.txt\"]",
+        );
+
+        let settings = Settings::from_toml(&toml).expect("should read the section");
+
+        let robots_txt = settings
+            .robots_txt
+            .as_ref()
+            .expect("should carry the section");
+        assert_eq!(robots_txt.modules, vec!["refuse_all"]);
+        assert_eq!(robots_txt.always_allow, vec!["/ads.txt"]);
+        assert!(
+            settings
+                .module_sections()
+                .all(|(name, _)| name != "robots-txt"),
+            "should not also be read as the section of a module type"
+        );
+    }
+
+    #[test]
+    fn a_robots_txt_section_naming_no_module_is_refused_when_the_settings_load() {
+        let toml = settings_str_with_robots_txt("sitemap = \"https://example.com/sitemap.xml\"");
+
+        let error = Settings::from_toml(&toml).expect_err("there is no default");
+
+        assert!(
+            format!("{error:?}").contains("[robots-txt] names no module"),
+            "should say a module must be named: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_robots_txt_path_that_could_start_a_second_line_is_refused() {
+        let toml = settings_str_with_robots_txt(
+            "modules = \"refuse_all\"\nalways_allow = [\"/ads.txt\\nDisallow:\"]",
+        );
+
+        assert!(
+            Settings::from_toml(&toml).is_err(),
+            "should refuse a path that holds white space"
+        );
+    }
+
+    #[test]
+    fn settings_without_a_robots_txt_section_are_written_without_one() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should load the test settings fixture");
+
+        let value = serde_json::to_value(&settings).expect("should serialize the settings");
+
+        assert!(
+            value.get("robots-txt").is_none(),
+            "a build that predates the section refuses a key it does not know"
+        );
+    }
+
+    #[test]
+    fn a_robots_txt_section_survives_the_stored_form() {
+        let toml = settings_str_with_robots_txt(
+            "modules = [\"allow_all\"]\nsitemap = \"https://example.com/sitemap.xml\"",
+        );
+        let settings = Settings::from_toml(&toml).expect("should read the section");
+
+        let stored = serde_json::to_value(&settings).expect("should serialize the settings");
+        let reloaded = Settings::from_json_value(stored).expect("should read the section back");
+
+        let robots_txt = reloaded
+            .robots_txt
+            .as_ref()
+            .expect("should still carry the section");
+        assert_eq!(robots_txt.modules, vec!["allow_all"]);
+        assert_eq!(
+            robots_txt.sitemap.as_deref(),
+            Some("https://example.com/sitemap.xml")
         );
     }
 

@@ -21,6 +21,7 @@ use crate::http_util::is_navigation_request;
 use crate::middleware::{Middleware, MiddlewareChain, MiddlewarePhase, PhaseEntries};
 use crate::module_context::{ModuleCall, ModuleContext, ResolvedRequest};
 use crate::platform::{DisabledGeo, PlatformGeo, RuntimeServices};
+use crate::robots_txt::{ALLOW_ALL, REFUSE_ALL, RobotsTxtContributor};
 use crate::settings::Settings;
 
 /// What a middleware's element handler decides about one attribute of an
@@ -666,6 +667,12 @@ pub struct IntegrationRegistration {
     /// Declaring one does not make it active, because the module is only asked
     /// to classify a request when `[device] module` names it.
     pub device_module: Option<(&'static str, Arc<dyn DeviceModule>)>,
+    /// The rules this registration adds to `/robots.txt`, with the name
+    /// `[robots-txt] modules` selects them by.
+    ///
+    /// Declaring them does not put them in the file, because the file is only
+    /// built from the contributors `[robots-txt] modules` names.
+    pub robots_txt_contributor: Option<(&'static str, Arc<dyn RobotsTxtContributor>)>,
 }
 
 impl IntegrationRegistration {
@@ -695,6 +702,7 @@ impl IntegrationRegistrationBuilder {
                 geo_module: None,
                 ec_module: None,
                 device_module: None,
+                robots_txt_contributor: None,
             },
         }
     }
@@ -773,6 +781,21 @@ impl IntegrationRegistrationBuilder {
     #[must_use]
     pub fn with_device_module(mut self, name: &'static str, module: Arc<dyn DeviceModule>) -> Self {
         self.registration.device_module = Some((name, module));
+        self
+    }
+
+    /// Declare the rules this registration adds to `/robots.txt`, under their
+    /// `name`.
+    ///
+    /// They are only asked for when `[robots-txt] modules` names them. Core
+    /// holds what they return and writes the file, see [`crate::robots_txt`].
+    #[must_use]
+    pub fn with_robots_txt_contributor(
+        mut self,
+        name: &'static str,
+        contributor: Arc<dyn RobotsTxtContributor>,
+    ) -> Self {
+        self.registration.robots_txt_contributor = Some((name, contributor));
         self
     }
 
@@ -876,6 +899,10 @@ struct IntegrationRegistryInner {
     // Device modules the running registrations supply, each with its name, in
     // registration order. `[device] module` picks at most one of them.
     device_modules: Vec<(&'static str, Arc<dyn DeviceModule>)>,
+    // The robots.txt contributors the running registrations supply, each with
+    // its name, in registration order. `[robots-txt] modules` picks any of
+    // them, in its own order.
+    robots_txt_contributors: Vec<(&'static str, Arc<dyn RobotsTxtContributor>)>,
     // Every builder's module name, with whether a section selects it, so the
     // refusal of a name a selector wrote can say what that name is.
     builder_modules: Vec<(&'static str, bool)>,
@@ -913,6 +940,7 @@ impl Default for IntegrationRegistryInner {
             geo_modules: Vec::new(),
             ec_modules: Vec::new(),
             device_modules: Vec::new(),
+            robots_txt_contributors: Vec::new(),
             builder_modules: Vec::new(),
             geo_module: None,
             ec_module: None,
@@ -943,6 +971,7 @@ const DEVICE_MODULE_FASTLY: &str = "fastly";
 const EDGECOOKIE_TYPE: &str = crate::ec::module::MODULE_TYPE;
 const DEVICE_TYPE: &str = "device";
 const GEO_TYPE: &str = "geo";
+const ROBOTS_TXT_TYPE: &str = crate::robots_txt::MODULE_TYPE;
 
 impl IntegrationRegistryInner {
     /// The registered middleware an entry means by `name`.
@@ -1183,6 +1212,48 @@ fn resolve_device_module(
     );
 
     Ok(resolved)
+}
+
+/// Refuses a `[robots-txt] modules` that names something nothing this
+/// deployment runs supplies.
+///
+/// Only knowable here, where every registration has been handed over, so it
+/// is checked when the registry is built rather than when the settings load.
+/// The file would otherwise fail on the first request for it rather than at
+/// deploy.
+fn check_robots_txt_selection(
+    settings: &Settings,
+    inner: &IntegrationRegistryInner,
+) -> Result<(), Report<TrustedServerError>> {
+    let Some(robots_txt) = settings.robots_txt.as_ref() else {
+        return Ok(());
+    };
+    for written in &robots_txt.modules {
+        if written == REFUSE_ALL
+            || written == ALLOW_ALL
+            || find_named(ROBOTS_TXT_TYPE, written, &inner.robots_txt_contributors).is_some()
+        {
+            continue;
+        }
+        let offered: Vec<&str> = [REFUSE_ALL, ALLOW_ALL]
+            .into_iter()
+            .chain(
+                inner
+                    .robots_txt_contributors
+                    .iter()
+                    .map(|(name, _)| crate::module_name::short_form(ROBOTS_TXT_TYPE, name)),
+            )
+            .collect();
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "`[robots-txt] modules` names `{written}`, which nothing this deployment runs \
+                 supplies. What it can name is [{}]{}",
+                offered.join(", "),
+                inner.builder_note(ROBOTS_TXT_TYPE, "robots.txt", written)
+            ),
+        }));
+    }
+    Ok(())
 }
 
 /// Resolves `[geo] module` against the registered geo modules.
@@ -1682,6 +1753,15 @@ impl IntegrationRegistry {
                 claim_module_name(&mut claimed, "device", name, registration.integration_id)?;
                 inner.device_modules.push((name, module));
             }
+            if let Some((name, contributor)) = registration.robots_txt_contributor {
+                claim_module_name(
+                    &mut claimed,
+                    "robots.txt",
+                    name,
+                    registration.integration_id,
+                )?;
+                inner.robots_txt_contributors.push((name, contributor));
+            }
             if registration.js_disabled {
                 inner.disabled_js_ids.push(registration.integration_id);
             } else if registration.js_deferred {
@@ -1732,6 +1812,7 @@ impl IntegrationRegistry {
         inner.device_module = resolve_device_module(settings, &inner)?;
         inner.geo_module = geo_module;
         check_middleware(settings, &inner)?;
+        check_robots_txt_selection(settings, &inner)?;
 
         Ok(Self {
             inner: Arc::new(inner),
@@ -1767,6 +1848,23 @@ impl IntegrationRegistry {
     #[must_use]
     pub fn device_module(&self) -> Option<Arc<dyn DeviceModule>> {
         self.inner.device_module.clone()
+    }
+
+    /// The robots.txt contributor `[robots-txt] modules` means by `written`,
+    /// with the name it was declared under, or `None` when nothing this
+    /// deployment runs supplies one under that name.
+    #[must_use]
+    pub fn robots_txt_contributor(
+        &self,
+        written: &str,
+    ) -> Option<(&'static str, Arc<dyn RobotsTxtContributor>)> {
+        let offered = &self.inner.robots_txt_contributors;
+        let names: Vec<&str> = offered.iter().map(|(name, _)| *name).collect();
+        let name = crate::module_name::resolve(ROBOTS_TXT_TYPE, written, &names)?;
+        offered
+            .iter()
+            .find(|(offered_name, _)| *offered_name == name)
+            .map(|(offered_name, contributor)| (*offered_name, Arc::clone(contributor)))
     }
 
     /// The name of every middleware a running module supplies, in
@@ -2274,6 +2372,7 @@ impl IntegrationRegistry {
                 geo_modules: Vec::new(),
                 ec_modules: Vec::new(),
                 device_modules: Vec::new(),
+                robots_txt_contributors: Vec::new(),
                 builder_modules: Vec::new(),
                 geo_module: None,
                 ec_module: None,
@@ -2351,6 +2450,7 @@ impl IntegrationRegistry {
                 geo_modules: Vec::new(),
                 ec_modules: Vec::new(),
                 device_modules: Vec::new(),
+                robots_txt_contributors: Vec::new(),
                 builder_modules: Vec::new(),
                 geo_module: None,
                 ec_module: None,

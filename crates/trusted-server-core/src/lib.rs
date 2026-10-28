@@ -68,6 +68,7 @@ pub mod redacted;
 pub mod request_signing;
 pub(crate) mod response_header_rewrite;
 pub mod response_privacy;
+pub mod robots_txt;
 pub mod rsc_flight;
 pub(crate) mod s3_sigv4;
 pub mod secret_resolution;

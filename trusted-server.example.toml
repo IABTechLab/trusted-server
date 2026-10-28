@@ -27,10 +27,10 @@
 #   [<type>.<name>]       # only when that name has settings
 #   setting = "value"
 #
-# The types are ec, geo, device, permission-signal, demand, ad-server and
-# integration. A settings table its type's selector does not name refuses
-# startup, so there is no stale block to misread. The complete rules, and what
-# is checked when, are in docs/guide/configuration-rules.md.
+# The types are ec, geo, device, permission-signal, demand, ad-server,
+# robots-txt and integration. A settings table its type's selector does not
+# name refuses startup, so there is no stale block to misread. The complete
+# rules, and what is checked when, are in docs/guide/configuration-rules.md.
 #
 # `TRUSTED_SERVER__` env vars can override values when the `ts` CLI builds and
 # validates this config for push (e.g. TRUSTED_SERVER__PUBLISHER__DOMAIN=...;
@@ -183,6 +183,23 @@ pull_sync_concurrency = 3
 # Custom headers added to every response (e.g. X-Robots-Tag: noindex).
 # [response_headers]
 # X-Robots-Tag = "noindex"
+
+# What /robots.txt answers. With this section absent the publisher keeps
+# their own file and /robots.txt reaches their origin like any other path.
+#
+# `modules` names what makes the file, in order, as one name or a list.
+# refuse_all refuses every crawler and puts X-Robots-Tag: noindex, nofollow on
+# the responses it sends, allow_all allows every crawler everywhere, and any
+# other name is a module that supplies rules. Modules contribute rules and
+# Trusted Server writes the file. A module that cannot answer has its last
+# answer served past its age, and with nothing held the answer is 503, never
+# an empty file, which a crawler would read as permission.
+#
+# A module's own settings go in its own block, [robots-txt.<name>].
+# [robots-txt]
+# modules = ["refuse_all"]
+# always_allow = ["/ads.txt"]
+# sitemap = "https://publisher.example.com/sitemap.xml"
 
 # Sign outbound OpenRTB/API requests. The runtime reads its keys from fixed
 # store names (`jwks_store` / `signing_keys`), and `ts keys` writes them. To keep

@@ -416,6 +416,20 @@ impl RuntimeServices {
         }
     }
 
+    /// Returns a clone of this instance with nothing of the connection it was
+    /// built for, being default client metadata and no host signals.
+    ///
+    /// For a module whose answer is held and served to everyone who asks, so
+    /// that nothing of one connection can reach what the others are given.
+    #[must_use]
+    pub(crate) fn without_connection(self) -> Self {
+        Self {
+            client_info: ClientInfo::default(),
+            host_signals: None,
+            ..self
+        }
+    }
+
     /// Returns a clone of this instance with the Edge Cookie module replaced.
     ///
     /// Adapters use this to apply the module-supplied module selected by

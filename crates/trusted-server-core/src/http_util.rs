@@ -165,6 +165,27 @@ pub(crate) fn request_host(req: &Request<EdgeBody>) -> &str {
     extract_request_host(req)
 }
 
+/// The host a request was addressed to, lowercased with any port removed.
+///
+/// Read from `Host`, or from the URI's host when there is no `Host` header,
+/// and never from `Forwarded` or `X-Forwarded-Host`, which a client can set to
+/// any host it likes. What is signed for a host, or held for every request to
+/// it, is keyed on this, so a forwarded header cannot put another host in its
+/// place.
+pub(crate) fn addressed_host(req: &Request<EdgeBody>) -> String {
+    let raw = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| req.uri().host())
+        .unwrap_or_default();
+    let without_port = match raw.rsplit_once(':') {
+        Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => raw,
+    };
+    without_port.to_ascii_lowercase()
+}
+
 /// The scheme a request was made over, read as
 /// [`RequestInfo::from_request`] reads it.
 pub(crate) fn request_scheme(req: &Request<EdgeBody>, client_info: &ClientInfo) -> &'static str {

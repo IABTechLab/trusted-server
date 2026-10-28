@@ -2,11 +2,12 @@
 //! part of the integration seam from a vendor crate's position.
 //!
 //! One registration carries a browser module, a proxy route, a geo module,
-//! an Edge Cookie identity module, a device module and a middleware for
-//! each phase of a page, alongside its own configuration block, and the builder
-//! adds a request preparer, a demand implementation `[demand]` can name and
-//! an ad server implementation `[ad-server]` can name. The round-trip
-//! tests in `crates/trusted-server-adapter-axum/tests/seam_probe.rs` and
+//! an Edge Cookie identity module, a device module, a robots.txt contributor
+//! and a middleware for each phase of a page, alongside its own configuration
+//! block, and the builder adds a request preparer, a demand implementation
+//! `[demand]` can name and an ad server implementation `[ad-server]` can
+//! name. The round-trip tests in
+//! `crates/trusted-server-adapter-axum/tests/seam_probe.rs` and
 //! `crates/trusted-server-adapter-fastly/src/app/seam_probe_tests.rs` drive
 //! each of those through a real adapter, so the seam is proven by a caller that
 //! core does not know about.
@@ -46,10 +47,11 @@ use trusted_server_core::integrations::{
 use trusted_server_core::middleware::{
     AttributeRewrite, Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase, TextHandler,
 };
-use trusted_server_core::module_context::ModuleCall;
+use trusted_server_core::module_context::{ModuleCall, ModuleRequest};
 use trusted_server_core::platform::{
     GeoInfo, PlatformError, PlatformGeo, PlatformResponse, RuntimeServices,
 };
+use trusted_server_core::robots_txt::{Contribution, RobotsTxtContributor};
 use trusted_server_core::settings::{IntegrationConfig, Settings};
 use validator::Validate;
 
@@ -59,11 +61,15 @@ pub const SEAM_PROBE_ID: &str = "seam_probe";
 /// The name this module is selected by, its crate folder below `crates/`, so
 /// `[testing] modules = ["seam-probe"]` selects it. Its geo, Edge Cookie and
 /// device modules carry the same name, so `[geo] module`, `[ec] module` and
-/// `[device] module` select each of them as `testing.seam-probe`.
+/// `[device] module` select each of them as `testing.seam-probe`, and so does
+/// `[robots-txt] modules` its robots.txt contributor.
 #[must_use]
 pub fn module_name() -> &'static str {
     trusted_server_core::module_name!()
 }
+
+/// The crawler the probe's robots.txt rules are addressed to.
+pub const SEAM_PROBE_ROBOTS_AGENT: &str = "SeamProbeBot";
 
 /// Source label the registry uses in duplicate-id errors.
 pub const SEAM_PROBE_SOURCE: &str = "trusted-server-integration-seam-probe";
@@ -404,6 +410,42 @@ impl DeviceModule for SeamProbeDevice {
     }
 }
 
+/// The probe's robots.txt contributor, declared on the same registration.
+///
+/// Its one rule names the request it was asked for, so a test can read back
+/// that the contributor was handed the host and the path and not the query.
+#[derive(Debug)]
+pub struct SeamProbeRobotsTxt;
+
+impl SeamProbeRobotsTxt {
+    fn rules(&self, request: ModuleRequest<'_>) -> Contribution {
+        Contribution::parse(&format!(
+            "User-Agent: {SEAM_PROBE_ROBOTS_AGENT}\nDisallow: /{}{}?{}",
+            request.host(),
+            request.path(),
+            request.query()
+        ))
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl RobotsTxtContributor for SeamProbeRobotsTxt {
+    fn refresh(&self) -> core::time::Duration {
+        core::time::Duration::from_secs(60)
+    }
+
+    fn fingerprint(&self) -> String {
+        "seam-probe".to_owned()
+    }
+
+    async fn contribute(
+        &self,
+        call: ModuleCall<'_>,
+    ) -> Result<Contribution, Report<TrustedServerError>> {
+        Ok(call.inject(self, Self::rules)?)
+    }
+}
+
 #[async_trait::async_trait(?Send)]
 impl PlatformGeo for SeamProbeGeo {
     async fn lookup(
@@ -694,11 +736,13 @@ pub fn register(
             .with_geo_module(module_name(), Arc::new(SeamProbeGeo::new(config.country)));
     }
     {
-        // Identity and device are declared the same way location is, so one
-        // module supplies all three and there is no second mechanism.
+        // Identity, device and robots.txt rules are declared the same way
+        // location is, so one module supplies all four and there is no second
+        // mechanism.
         registration = registration
             .with_ec_module(module_name(), Arc::new(SeamProbeEc))
-            .with_device_module(module_name(), Arc::new(SeamProbeDevice));
+            .with_device_module(module_name(), Arc::new(SeamProbeDevice))
+            .with_robots_txt_contributor(module_name(), Arc::new(SeamProbeRobotsTxt));
     }
 
     Ok(Some(registration.build()))
