@@ -26,6 +26,9 @@ origin_url = "https://origin.publisher.com"
 proxy_secret = "publisher_proxy_secret"
 
 [ec]
+module = "hmac"
+
+[ec.hmac]
 passphrase = "ec_passphrase"
 
 [permissions]
@@ -48,7 +51,8 @@ export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
 export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
 # Secret overrides, when needed, are key names—not secret values.
 export TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=publisher_proxy_secret
-export TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
+export TRUSTED_SERVER__EC__MODULE=hmac
+export TRUSTED_SERVER__EC__HMAC__PASSPHRASE=ec_passphrase
 
 # Replace the rejected placeholder values in trusted-server.toml, then validate.
 ts config validate --permissions standard.yaml
@@ -196,6 +200,7 @@ fail and the service will return its startup-error response.
 | File                  | Purpose                         |
 | --------------------- | ------------------------------- |
 | `trusted-server.toml` | Main application configuration  |
+| `permissions.yaml`    | Country/region permission rules |
 | `fastly.toml`         | Fastly Compute service settings |
 | `.env.dev`            | Local development overrides     |
 
@@ -208,10 +213,13 @@ fail and the service will return its startup-error response.
 | `[consent]`                | Consent interpretation, forwarding, and conflict resolution             |
 | `[creative_opportunities]` | Server-side page ad opportunities and templates                         |
 | `[debug]`                  | Explicit non-production diagnostics                                     |
+| `[device]`                 | Device classification module selection                                  |
 | `[ec]`                     | Edge Cookie identity, persistence, and partner sync                     |
+| `[geo]`                    | Geolocation module selection                                            |
 | `[[handlers]]`             | Ordered HTTP Basic-auth rules                                           |
 | `[image_optimizer]`        | Reusable Fastly Image Optimizer profiles                                |
 | `[integrations.*]`         | Typed partner and browser integration settings                          |
+| `[permission-signal]`      | Permission signal schemes and the order they run in                     |
 | `[permissions]`            | The publisher's permission policy file, by name                         |
 | `[proxy]`                  | Proxy allowlist, TLS policy, and asset routes                           |
 | `[publisher]`              | Publisher domain, origin, and proxy signing key                         |
@@ -235,6 +243,9 @@ origin_url = "https://origin.publisher.com"
 proxy_secret = "publisher_proxy_secret"
 
 [ec]
+module = "hmac"
+
+[ec.hmac]
 passphrase = "ec_passphrase"
 
 [permissions]
@@ -649,17 +660,30 @@ Legacy consent-store records are not read or migrated into `ec.ec_store`. Their 
 
 ### `[ec]`
 
+| Field                     | Type           | Required | Description                                                                                                                                                                                                                                   |
+| ------------------------- | -------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `module`                  | String or null | No       | Name of the active Edge Cookie module: `"hmac"` (built-in), `"host_signals"` (opt-in), or `"none"` (explicitly stateless). Omit to run statelessly with no Edge Cookie. The `"client_fixed"` demo needs the `client-fixed-demo` build feature |
+| `resolve_allowed_origins` | Array          | No       | Extra exact origins allowed to POST the client resolve endpoint, beyond `https://{publisher.domain}`                                                                                                                                          |
+| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state                                                                                                                                                                               |
+| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response                                                                                                                                                                                    |
+| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                                                                                                                                                                                           |
+| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps                                                                                                                                                                       |
+| `partners`                | Array          | No       | Static partner registry entries                                                                                                                                                                                                               |
+
+Each module that has settings is configured in its own `[ec.<name>]` block, and the `module` selector names which block is active. A block may set `implementation = "<id>"` to say which module it configures, which makes the block name a label of your choosing, so `module = "primary"` with `[ec.primary]` holding `implementation = "hmac"` configures the built-in module under a name that means something to your deployment. A module from a crate is named by its folder below `crates/`, so it may be written in full, as `edgecookie.<name>`, or with that type folder left off, and core's own modules such as `hmac` take bare names. A name is parts joined by `.`, each of lower case letters, digits, `_` or `-`.
+
+A module has a block only when it has settings of its own. Both modules that derive an identifier at the edge take a passphrase, so selecting `hmac` or `host_signals` without its block fails at startup, while the `client_fixed` demonstration module needs no block at all. A block the selector does not name also fails at startup, so a stale block cannot sit unnoticed.
+
+### `[ec.hmac]`
+
+The built-in HMAC-over-client-IP module, keyed `hmac`.
+
 `passphrase` is a key name in `trusted_server_secrets`; the resolved value must
 be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 
-| Field                     | Type           | Required | Description                                                             |
-| ------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
-| `passphrase`              | String         | Yes      | Publisher passphrase used as HMAC key                                   |
-| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
-| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response              |
-| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                     |
-| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
-| `partners`                | Array          | No       | Static partner registry entries                                         |
+| Field        | Type   | Required                    | Description                                                |
+| ------------ | ------ | --------------------------- | ---------------------------------------------------------- |
+| `passphrase` | String | Yes when `hmac` is selected | Secret-store key name whose resolved value is the HMAC key |
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.
@@ -674,8 +698,11 @@ outbound pull sync, but cannot authenticate to those inbound APIs.
 
 ```toml
 [ec]
-passphrase = "ec_passphrase"
+module = "hmac"
 ec_store = "ec_identity_store"
+
+[ec.hmac]
+passphrase = "ec_passphrase"
 
 [[ec.partners]]
 name = "Mocktioneer SSP"
@@ -688,15 +715,24 @@ bidstream_enabled = true
 **Environment Override**:
 
 ```bash
-TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
+TRUSTED_SERVER__EC__MODULE=hmac
+TRUSTED_SERVER__EC__HMAC__PASSPHRASE=ec_passphrase
 TRUSTED_SERVER__EC__EC_STORE=ec_identity_store
 ```
 
+These `TRUSTED_SERVER__` overrides apply where deployment tooling merges environment values into the published configuration (for example test harnesses building an app-config blob). The running server reads its settings from the platform config store, so module selection changes take effect when a new configuration is pushed, not per request.
+
 ### Field Details
 
-#### `passphrase`
+#### `module`
 
-**Purpose**: Secret-store key name whose resolved value is the HMAC key for EC ID generation.
+**Purpose**: Names the active Edge Cookie module by its key. Omit to run statelessly with no Edge Cookie.
+
+**Validation**: Application startup fails if the name is not a module name (parts joined by `.`, each of lower case letters, digits, `_` or `-`), if it names a key the `[ec]` section reads as its own setting, if the selected implementation needs an `[ec.<name>]` block it has no block for, or if a block the selector does not name is configured.
+
+#### `hmac.passphrase`
+
+**Purpose**: Secret-store key name whose resolved value is the HMAC key for EC ID generation, read when `module = "hmac"`.
 
 **Security**:
 
@@ -707,6 +743,66 @@ TRUSTED_SERVER__EC__EC_STORE=ec_identity_store
 **Validation**: Application startup fails if:
 
 - Empty string
+- Shorter than 32 characters
+
+## Device Configuration
+
+Selects how a request is classified into the coarse device signals the Edge Cookie bot gate uses, mirroring the Edge Cookie module selection. These signals serve identifier gating and bot detection, not bid enrichment.
+
+### `[device]`
+
+| Field    | Type           | Required | Description                                                                                                                                                                       |
+| -------- | -------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `module` | String or null | No       | Key of the device-detection module. Defaults to `builtin` (User-Agent only, no host-specific call). Set `fastly` to add the host's TLS (JA4) and HTTP/2 probabilistic identifiers |
+
+The default `builtin` module classifies from the User-Agent alone and makes no host-specific call, so the default path stays host-neutral. Selecting an unknown module key fails at startup.
+
+**Example**:
+
+```toml
+[device]
+module = "builtin" # or "fastly" to add TLS and HTTP/2 evidence
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__DEVICE__MODULE=builtin
+```
+
+## Geo Configuration
+
+Selects how a client IP is resolved into geolocation (country, region, coordinates), mirroring the Edge Cookie module selection. The resolved country also feeds the [permission model](/guide/permission-model).
+
+### `[geo]`
+
+| Field                        | Type           | Required        | Description                                                                                                                                                                                                |
+| ---------------------------- | -------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `module`                     | String or null | No              | Key of the geo module. Omit, or set `none`, to resolve no location and make no host geo call. Set `platform` to use the host's own geo lookup.                                                             |
+| `assume_single_jurisdiction` | Boolean        | See description | With no geo module, every request resolves at the top of the `permissions.yaml` rules tree. A deployment that runs an Edge Cookie module without a geo module acknowledges that by setting this to `true`. |
+
+No module is the default, so a default deployment is not tied to any host geo service. Selecting an unknown module key fails at startup. A failed geo lookup at request time resolves every permission to the requires-signal floor and is logged at error level, so an outage is handled protectively.
+
+**Example**:
+
+```toml
+[geo]
+module = "platform"
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__GEO__MODULE=platform
+```
+
+## Module Permissions
+
+A module advertises the technical permissions its data use requires, and Trusted Server runs the module only when every required permission is set. This separates legal policy from the core, so the deployer brings the policy that decides how permissions are established. See the [Permission Model](/guide/permission-model) for the concept, the permission vocabulary, and how a request resolves.
+
+### Country and region rules (`permissions.yaml`)
+
+The country and region permission rules are defined in the publisher's permission policy file, a human-editable YAML document that the settings name in `[permissions] policy` and that `ts config push --permissions <file>` supplies when the service is deployed, as [Permission Policy Configuration](#permission-policy-configuration) describes. No adapter build carries a policy. The repository sample is `config/permissions/sample.yaml`, which is for testing and evaluation only and is neither a production policy nor legal advice. To change the policy, push the settings again with the changed file. The file defines named **groups** (baselines such as `gdpr-eu`, `gdpr-uk`, `us-opt-out`) and **rules** that map a country or country/state to a group, with an optional `permissions` map that overrides single Data Uses (`granted`, `requires_signal`, or `denied`). A request that matches no rule resolves at the top of the rules tree. See the [Permission Model](/guide/permission-model) for the schema and the repository sample.
 
 ## Consent Configuration
 
@@ -755,7 +851,7 @@ legal advice.
 `[permissions]` names the publisher's permission policy file, which decides
 which permissions each request has. The
 [permission model](/guide/permission-model) describes what the file says. No
-build carries a policy, so every deployment names its own file and supplies it
+adapter build carries a policy, so every deployment names its own file and supplies it
 with `ts config push --permissions <file>`.
 
 ### `[permissions]`
@@ -1049,7 +1145,7 @@ Startup fails when no handler covers an admin route. The dynamic
 `/_ts/admin/ec/{id}` route accepts any segment after `/_ts/admin/ec/`, and
 Basic Auth runs on the raw path before routing, so coverage cannot be inferred
 from ID-shaped samples: a pattern such as
-`^/_ts/admin/ec/[a-f0-9]{64}[.][A-Za-z0-9]{6}$` is rejected. Use a prefix-level
+`^/_ts/admin/ec/hmac~[a-f0-9]{64}[.][A-Za-z0-9]{6}$` is rejected. Use a prefix-level
 matcher (`^/_ts/admin`, or `^/_ts/admin/ec/` alongside the other admin
 patterns).
 
@@ -1899,8 +1995,7 @@ unchanged.
 
 Persisting a resolved ID into the Edge Cookie identity graph additionally
 requires a matching `[[ec.partners]]` entry whose `source_domain` equals the
-module's OpenRTB EID source, and, when a TCF signal is present, consent to
-TCF Purpose 1 and Purpose 4.
+module's OpenRTB EID source, and the storage and personalised-ad permissions.
 
 `managed_user_ids` is an array of tables, so it cannot be set through a
 `TRUSTED_SERVER__` environment variable; the scalar overlay only replaces leaves
@@ -2997,7 +3092,8 @@ Configuration is validated at startup:
 
 **EC Validation**:
 
-- The `passphrase` key name is non-empty at push time
+- `module`, when set, is a module name and has the `[ec.<name>]` block its implementation needs, and no unselected block is left configured, or startup fails
+- The `hmac.passphrase` key name is non-empty at push time
 - The resolved passphrase is at least 32 bytes at runtime
 - Known placeholder values are rejected after resolution
 

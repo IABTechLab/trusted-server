@@ -1653,6 +1653,7 @@ pub(crate) mod tests {
     #[derive(Debug, Default)]
     struct EvidenceCapturingModule {
         seen: std::sync::Mutex<Option<(String, String)>>,
+        seen_client_ip: std::sync::Mutex<Option<String>>,
     }
 
     impl EdgeCookieModule for EvidenceCapturingModule {
@@ -1672,6 +1673,11 @@ pub(crate) mod tests {
             let query_id = request_info.query_param("id").unwrap_or_default();
             let cookie = request_info.header("cookie").unwrap_or_default().to_owned();
             *self.seen.lock().expect("should lock seen evidence") = Some((query_id, cookie));
+            *self
+                .seen_client_ip
+                .lock()
+                .expect("should lock the seen client IP") =
+                Some(request_info.client_ip().to_owned());
             Ok(GeneratedEdgeCookie {
                 id: Some("evidence-ec".to_owned()),
                 response_headers: Vec::new(),
@@ -1847,7 +1853,10 @@ pub(crate) mod tests {
         // The requirement for a client IP belongs to the module that uses
         // one, not to core. A module deriving identity from the request
         // query and cookies runs on a host that cannot determine a client IP,
-        // and receives the documented unavailable value, the empty string.
+        // and still creates an identifier. This also pins what the module is
+        // handed in that case, which is the documented unavailable value rather
+        // than something else, because a module cannot decide how to behave
+        // without knowing what absence looks like.
         let module = Arc::new(EvidenceCapturingModule::default());
         let mut settings = create_test_settings();
         settings.ec.module = Some(EcModuleSelection::from("evidence"));
@@ -1873,6 +1882,15 @@ pub(crate) mod tests {
             ec.ec_value(),
             Some("t0ev~evidence-ec"),
             "the identifier should be committed with no client IP available"
+        );
+        assert_eq!(
+            module
+                .seen_client_ip
+                .lock()
+                .expect("should lock the seen client IP")
+                .clone(),
+            Some(String::new()),
+            "a host that cannot determine a client IP should hand the module the documented unavailable value, which is the empty string"
         );
     }
 

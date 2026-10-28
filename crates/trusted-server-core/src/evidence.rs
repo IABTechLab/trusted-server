@@ -7,12 +7,34 @@
 //! per-request is stored on the module, so the same module serves every
 //! request.
 //!
-//! These traits are those views. Request-scoped data outlives the live request
-//! only when snapshotted, so an implementation owns its data where needed.
-//! [`BorrowedRequestInfo`] is the borrowed view core builds on the request
-//! path, and [`OwnedRequestInfo`] is the built-in owned snapshot.
+//! These traits are the service interfaces. Concrete implementations live with
+//! the host or vendor that supplies them (for example `FastlyHostSignals` in
+//! `trusted-server-device-fastly`). An injected service outlives the borrow of
+//! the live request, so an implementation owns its data ([`OwnedRequestInfo`] is
+//! the built-in owned snapshot, while [`BorrowedRequestInfo`] is the borrowed
+//! view core builds on the request path and must not outlive the request).
+//!
+//! [`RequestInfo`] describes what a request carries, not what code in this
+//! repository happens to read today, so it carries the whole of it whether or
+//! not anything here reads it yet. What a module may see is not the control.
+//! What a module may do with what it sees is the control, and that is the
+//! permission model.
 
 use http::HeaderMap;
+
+/// Host-computed client signals that are not carried in request headers.
+///
+/// A host that can compute them supplies an implementation (Fastly exposes the
+/// TLS JA4 and HTTP/2 signals). A module that needs them takes
+/// `Arc<dyn HostSignals>` in its constructor, and on a host that supplies none
+/// the module cannot be built and the request stops.
+pub trait HostSignals: Send + Sync + core::fmt::Debug {
+    /// The full JA4 TLS signal, or `None` when unavailable.
+    fn ja4(&self) -> Option<&str>;
+
+    /// The raw HTTP/2 SETTINGS signal, or `None` when unavailable.
+    fn h2(&self) -> Option<&str>;
+}
 
 /// Read-only access to the current request's basic information.
 ///
@@ -251,20 +273,6 @@ impl RequestInfo for BorrowedRequestInfo<'_> {
     fn query(&self) -> &str {
         self.query
     }
-}
-
-/// Host-computed client signals that are not carried in request headers.
-///
-/// A host that can compute them supplies an implementation (Fastly exposes the
-/// TLS JA4 and HTTP/2 signals). A module that needs them takes
-/// `Arc<dyn HostSignals>` in its constructor, and on a host that supplies none the
-/// module cannot be built and the request stops.
-pub trait HostSignals: Send + Sync + core::fmt::Debug {
-    /// The full JA4 TLS signal, or `None` when unavailable.
-    fn ja4(&self) -> Option<&str>;
-
-    /// The raw HTTP/2 SETTINGS signal, or `None` when unavailable.
-    fn h2(&self) -> Option<&str>;
 }
 
 #[cfg(test)]

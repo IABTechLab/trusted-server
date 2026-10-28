@@ -814,7 +814,7 @@ consent (vendor 97) gate IdentityLink resolution and storage. Purpose 3 has no
 standalone default rule. Purpose 4 controls user-provided-data activity, but
 denying it alone does not block IdentityLink resolution or browser-side storage.
 Persisting the RampID into the Edge Cookie identity graph is a separate,
-server-side step that requires TCF Purpose 1 and Purpose 4.
+server-side step that requires the storage and personalised-ad permissions.
 
 Default EID transmission accepts a qualifying purpose and vendor basis from any
 of Purposes 2–10. Publishers can require Purpose 4 specifically by enabling
@@ -944,7 +944,7 @@ Trusted Server uses a **hybrid EID forwarding model** for Prebid-routed auctions
 4. The merged result is forwarded downstream as `user.ext.eids` in the OpenRTB request.
 5. After the response, Trusted Server adds matched partner UIDs that are missing from the EC identity graph, reading the `ts-eids` cookie, then the `/auction` request-body EIDs, then the `sharedId` cookie. Because the body carries the untrimmed EID set, `/auction` ingestion is not limited by the size-capped `ts-eids` cookie.
 
-The `ts-eids` cookie still matters for requests without an EID body, such as `GET /_ts/page-bids` and page navigations, where it is the source for both EID fallback and identity-graph ingestion. Identity-graph EID writes follow the same consent rule as bidstream forwarding: under GDPR, TCF Purpose 1 and Purpose 4 must both be consented.
+The `ts-eids` cookie still matters for requests without an EID body, such as `GET /_ts/page-bids` and page navigations, where it is the source for both EID fallback and identity-graph ingestion. Identity-graph EID writes follow the same permission rule as bidstream forwarding: the storage and personalised-ad permissions must both be set.
 
 This means Prebid auctions get same-request transparency for browser-resolved IDs without giving up the durability of the server-managed EC identity graph.
 
@@ -966,7 +966,7 @@ sequenceDiagram
     T->>P: OpenRTB request\nuser.ext.eids = merged set
     P-->>T: OpenRTB bid response
     T-->>B: Auction response
-    T->>K: Ingest body eids + ts-eids/sharedId cookies\n(TCF Purpose 1 + 4 under GDPR)
+    T->>K: Ingest body eids + ts-eids/sharedId cookies\n(storage and personalised-ad permissions)
 ```
 
 ### Merge and deduplication rules

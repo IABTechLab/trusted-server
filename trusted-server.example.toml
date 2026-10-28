@@ -126,6 +126,14 @@ pull_sync_concurrency = 3
 # implementation = "hmac"
 # passphrase = "ec_passphrase"
 
+# Built-in host-signal module block. Creates the identifier from the host's TLS
+# JA4 and HTTP/2 signals together with the client IP, so it needs a host that
+# supplies those signals (Fastly does). Uncomment it together with
+# `module = "host_signals"` above, and give it its own secret on the same
+# terms as the hmac block.
+# [ec.host_signals]
+# passphrase = "ec_host_signals_passphrase"
+
 # Example partner configuration. Provision referenced keys in
 # trusted_server_secrets before validating/pushing.
 # [[ec.partners]]
@@ -148,16 +156,19 @@ pull_sync_concurrency = 3
 # OPTIONAL — Core features (disabled/omitted by default)
 # =============================================================================
 
-# Device detection module selection. The built-in module classifies from
-# the User-Agent alone and makes no host-specific call. The opt-in "fastly"
-# module strengthens the browser/bot gate with the host's TLS/H2 signals.
+# Device-detection module. Selects how a request is classified into device
+# signals (browser/bot gating). Default "builtin" classifies from the User-Agent
+# alone and makes no host call, so a default deployment stays host-neutral. The
+# opt-in "fastly" module adds the host's TLS/H2 signals to the gate.
+# Override at deployment with TRUSTED_SERVER__device__module.
 # [device]
-# module = "builtin"
+# module = "builtin"   # or "fastly" to add TLS/H2 signal evidence
 
 [geo]
-# Geo / IP intelligence module selection. No module is the default:
-# Trusted Server resolves no location and makes no host geo call. The host
-# platform's own lookup is opt-in.
+# Geo / IP intelligence module. No module is the default: Trusted Server
+# resolves no geolocation and makes no host geo call, so a default deployment is
+# not tied to any host geo service. Opt into the host lookup with
+# module = "platform". Override with TRUSTED_SERVER__geo__module.
 # module = "platform"
 #
 # The permission baseline for a request the geo module leaves unmatched

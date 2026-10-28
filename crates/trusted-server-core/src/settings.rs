@@ -8004,6 +8004,21 @@ source_domain = "partner.example.com"
     }
 
     #[test]
+    fn from_toml_and_env_loads_while_the_git_version_variable_is_set() {
+        temp_env::with_var(
+            format!(
+                "{}{}GIT_VERSION",
+                ENVIRONMENT_VARIABLE_PREFIX, ENVIRONMENT_VARIABLE_SEPARATOR
+            ),
+            Some("v1.0.0"),
+            || {
+                Settings::from_toml_and_env(&crate_test_settings_str())
+                    .expect("should load settings while the build's git version variable is set");
+            },
+        );
+    }
+
+    #[test]
     fn test_override_env() {
         let toml_str = crate_test_settings_str();
 
