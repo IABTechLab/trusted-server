@@ -1462,25 +1462,6 @@ impl MemoryLoadingCache {
     }
 }
 
-/// The time left to each asset copy `cache` holds, leaving out the records
-/// and the marks of what may not be shared, in no order.
-pub fn asset_copy_lifetimes(cache: &MemoryLoadingCache) -> Vec<Duration> {
-    let copies = format!("/{}/", crate::settings::ASSETS_CACHE);
-    cache
-        .keys()
-        .iter()
-        .filter(|key| key.contains(&copies))
-        .filter_map(|key| cache.held(key))
-        .filter(|(value, _)| {
-            matches!(
-                crate::asset_cache::AssetEntry::decode(value),
-                Ok(crate::asset_cache::AssetEntry::Copy(_))
-            )
-        })
-        .map(|(_, left)| left.unwrap_or(Duration::MAX))
-        .collect()
-}
-
 #[async_trait::async_trait(?Send)]
 impl super::PlatformLoadingCache for MemoryLoadingCache {
     async fn get_or_load(

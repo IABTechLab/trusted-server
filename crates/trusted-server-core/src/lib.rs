@@ -28,7 +28,6 @@
     )
 )]
 
-pub mod asset_cache;
 pub(crate) mod asset_image_optimizer;
 pub mod attestation;
 pub mod auction;
@@ -79,7 +78,6 @@ pub mod secret_resolution;
 pub mod service_version;
 pub mod settings;
 pub mod settings_data;
-pub mod source_cache;
 pub mod streaming_processor;
 pub mod streaming_replacer;
 pub mod tdl;
