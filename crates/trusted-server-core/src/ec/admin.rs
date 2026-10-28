@@ -46,7 +46,7 @@ use super::identity::catalog::ProviderCatalog;
 use super::identity::input::ThreadRandom;
 use super::identity::mutation::{ApplyContext, IdentityMutation, ProviderStateChange};
 use super::identity::policy::PolicySignals;
-use super::identity::removal::{RemovalWriteOutcome, write_removals};
+use super::identity::removal::{RemovalTiming, RemovalWriteOutcome, write_removals};
 use super::identity::request::opted_out;
 use super::identity::servable::ServeContext;
 use super::kv::KvIdentityGraph;
@@ -382,7 +382,7 @@ pub fn handle_admin_opt_out_clear(
         random: &ThreadRandom,
         catalog: &catalog,
     };
-    match write_removals(kv, ec_id, &clear, &context) {
+    match write_removals(kv, ec_id, &clear, &context, RemovalTiming::BeforeSend) {
         RemovalWriteOutcome::Written => {
             log::info!(
                 "Admin cleared the opt-out of identity provider '{provider}' for '{}'",

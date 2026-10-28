@@ -1859,7 +1859,11 @@ tombstone drops its mutation (section 5.4, step 1).
    fail too. When the mutation holds removals, opt-outs or clears, they are
    then written alone, with the CAS loop of the capture removal write
    (section 5.3): a re-read, the removal rules of section 5.4 and up to five
-   attempts. When those fail too, they are lost and counted in
+   attempts. Phase 4 runs after send, so this write first waits one per-key
+   window (1 second), because the usual cause of the failed flush is
+   another tab's write within the last second. A per-key limit on one of its
+   attempts waits another window and counts as an attempt, like a
+   generation mismatch. When those fail too, they are lost and counted in
    `removal_lost`. Nothing else backs the flush, so:
    - browser ingest is re-derived from `ts-eids` by the next navigation
    - every positive provider result is lost: hold-mode answers and
@@ -1909,10 +1913,16 @@ the whole of an SPA session. Revision 15 removes that.
 - reads the row and applies only the capture's removals (with the `ps.iv` or `ps.ov` hashes they derive), its opt-out and its clear, under the rules of
   section 5.4
 - writes with a CAS and the withdrawal path's five attempts, re-reading and
-  trying again only when the generation no longer matches. Any other
-  failure, Fastly's per-key limit included, ends the attempt at once
+  trying again when the generation no longer matches. Before send, any
+  other failure, Fastly's per-key limit included, ends the attempt at once
 - runs before the proxied response is sent and, when that attempt fails,
-  once more after send
+  once more after send. A small proxied JSON response is sent within
+  milliseconds, still inside the per-key window, so the after-send attempt
+  first waits one window (1 second), and a per-key limit on any of its
+  attempts waits another window and is retried as a generation mismatch
+  is. Latency is not at stake after send. The adapter reports the limit
+  apart from other store errors (`EcKvRateLimited`, from Fastly's
+  `TooManyRequests`), and any other error still ends the attempt
 - writes nothing when the read shows a tombstone, a missing row or the
   removal already applied
 - when both attempts fail, logs at error with the provider ID and source
@@ -4085,26 +4095,26 @@ token.
 so adapter tests can use it. `KvIdentityGraph::counting` counts reads only
 (`ec/kv.rs:1596-1605`, `ec/kv_backend.rs:205-221`).
 
-| Scenario                                                            | KV writes                                                                  |
-| ------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| New visitor, navigation                                             | 1 (create, before send)                                                    |
-| New visitor whose first ID collides                                 | 1 (create with a re-minted ID)                                             |
-| Returning visitor, changes pending                                  | 1                                                                          |
-| Returning visitor, nothing changed                                  | 0                                                                          |
-| 304 revalidation with changes pending                               | 1                                                                          |
-| Returning EC, navigation answered with 3xx, 4xx or 5xx              | 0, or 1 when its hold-mode calls returned removals or backoff              |
-| New visitor, prefetch or prerender navigation                       | 1 (create, before send)                                                    |
-| Returning visitor, prefetch or prerender navigation                 | 0                                                                          |
-| New visitor, client without `Sec-Fetch-Dest`                        | 1 (create, before send)                                                    |
-| Returning visitor, iframe HTML or no `Sec-Fetch-Dest`               | 0                                                                          |
-| Integration-proxy navigation that mints an EC                       | 1 (create)                                                                 |
-| `/auction`, `/_ts/page-bids`, `/identify`, assets                   | 0                                                                          |
-| Lockr API proxy, no revocation                                      | 0                                                                          |
-| Captured revocation from a real browser                             | CAS removal write (up to 5 attempts), once more after send                 |
-| Consent withdrawal, on any request                                  | CAS tombstone (up to 5 attempts) plus marker, per ID; once more after send |
-| Global revoke captured from a real browser                          | as a consent withdrawal                                                    |
-| Capture removal, opt-out or global revoke from a non-browser client | 0                                                                          |
-| CAS conflict or per-key limit on the flush                          | 1 attempt; its removals, if any, then written alone (up to 5 attempts)     |
+| Scenario                                                            | KV writes                                                                               |
+| ------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| New visitor, navigation                                             | 1 (create, before send)                                                                 |
+| New visitor whose first ID collides                                 | 1 (create with a re-minted ID)                                                          |
+| Returning visitor, changes pending                                  | 1                                                                                       |
+| Returning visitor, nothing changed                                  | 0                                                                                       |
+| 304 revalidation with changes pending                               | 1                                                                                       |
+| Returning EC, navigation answered with 3xx, 4xx or 5xx              | 0, or 1 when its hold-mode calls returned removals or backoff                           |
+| New visitor, prefetch or prerender navigation                       | 1 (create, before send)                                                                 |
+| Returning visitor, prefetch or prerender navigation                 | 0                                                                                       |
+| New visitor, client without `Sec-Fetch-Dest`                        | 1 (create, before send)                                                                 |
+| Returning visitor, iframe HTML or no `Sec-Fetch-Dest`               | 0                                                                                       |
+| Integration-proxy navigation that mints an EC                       | 1 (create)                                                                              |
+| `/auction`, `/_ts/page-bids`, `/identify`, assets                   | 0                                                                                       |
+| Lockr API proxy, no revocation                                      | 0                                                                                       |
+| Captured revocation from a real browser                             | CAS removal write (up to 5 attempts), once more after send                              |
+| Consent withdrawal, on any request                                  | CAS tombstone (up to 5 attempts) plus marker, per ID; once more after send              |
+| Global revoke captured from a real browser                          | as a consent withdrawal                                                                 |
+| Capture removal, opt-out or global revoke from a non-browser client | 0                                                                                       |
+| CAS conflict or per-key limit on the flush                          | 1 attempt; its removals, if any, then written alone after a 1 s wait (up to 5 attempts) |
 
 **Withdrawal and removal.**
 

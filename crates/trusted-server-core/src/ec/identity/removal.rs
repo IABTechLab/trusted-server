@@ -1,14 +1,33 @@
 //! The shared removal write: a removal-only mutation written with the
 //! withdrawal path's CAS loop (spec 5.2 phase 4, 5.3).
 
+use std::time::Duration;
+
 use super::ids::SourceDomain;
 use super::mutation::{ApplyContext, IdentityMutation, apply_removals_only};
 use crate::ec::kv::{KvIdentityGraph, MAX_CAS_RETRIES};
-use crate::ec::kv_backend::EcKvWriteOutcome;
+use crate::ec::kv_backend::{EcKvRateLimited, EcKvWriteOutcome};
 use crate::ec::{EcKvSnapshot, log_id};
 
 /// Writes the removal write makes at most, as the withdrawal path does.
 pub(crate) const REMOVAL_WRITE_ATTEMPTS: u32 = MAX_CAS_RETRIES;
+
+/// How long Fastly's per-key write limit lasts: about one write per second
+/// to one key.
+pub(crate) const PER_KEY_WRITE_WINDOW: Duration = Duration::from_secs(1);
+
+/// When a removal write runs, which decides whether it may wait out the
+/// per-key write limit (spec 5.2 phase 4, 5.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemovalTiming {
+    /// Before the response is sent. Never waits; a per-key limit ends the
+    /// attempt.
+    BeforeSend,
+    /// After the response is sent, right after a write to the same key
+    /// failed. Waits one per-key window first, and waits again and retries
+    /// after a per-key limit.
+    AfterSend,
+}
 
 /// How a removal write ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,7 +48,7 @@ pub(crate) struct RemovalCost {
 }
 
 /// Reads the row, applies only `removals` and writes them with a CAS,
-/// retrying only a generation mismatch.
+/// retrying a generation mismatch, and after send a per-key limit too.
 ///
 /// Runs whatever the request's consent: a revocation can arrive when consent
 /// is unusable. It does not log a lost removal; see [`log_removal_lost`].
@@ -39,8 +58,9 @@ pub(crate) fn write_removals(
     ec_id: &str,
     removals: &IdentityMutation,
     context: &ApplyContext<'_>,
+    timing: RemovalTiming,
 ) -> RemovalWriteOutcome {
-    write_removals_counted(graph, ec_id, removals, context).0
+    write_removals_counted(graph, ec_id, removals, context, timing).0
 }
 
 /// As [`write_removals`], also returning the reads and writes it made, for
@@ -51,8 +71,12 @@ pub(crate) fn write_removals_counted(
     ec_id: &str,
     removals: &IdentityMutation,
     context: &ApplyContext<'_>,
+    timing: RemovalTiming,
 ) -> (RemovalWriteOutcome, RemovalCost) {
     let mut cost = RemovalCost::default();
+    if timing == RemovalTiming::AfterSend {
+        graph.pause(PER_KEY_WRITE_WINDOW);
+    }
     for _attempt in 0..REMOVAL_WRITE_ATTEMPTS {
         cost.reads = cost.reads.saturating_add(1);
         let (entry, generation) = match graph.load_snapshot(ec_id) {
@@ -73,6 +97,15 @@ pub(crate) fn write_removals_counted(
         match graph.write_if_generation(ec_id, &applied.entry, generation) {
             Ok(EcKvWriteOutcome::Written) => return (RemovalWriteOutcome::Written, cost),
             Ok(EcKvWriteOutcome::PreconditionFailed) => {}
+            Err(error)
+                if timing == RemovalTiming::AfterSend && error.contains::<EcKvRateLimited>() =>
+            {
+                log::debug!(
+                    "Identity removal write for '{}' hit the per-key limit; waiting",
+                    log_id(ec_id)
+                );
+                graph.pause(PER_KEY_WRITE_WINDOW);
+            }
             Err(error) => {
                 log::warn!(
                     "Identity removal write failed for '{}': {error:?}",
@@ -83,7 +116,7 @@ pub(crate) fn write_removals_counted(
         }
     }
     log::warn!(
-        "Identity removal write for '{}': CAS conflict after {REMOVAL_WRITE_ATTEMPTS} attempts",
+        "Identity removal write for '{}': no write after {REMOVAL_WRITE_ATTEMPTS} attempts",
         log_id(ec_id)
     );
     (RemovalWriteOutcome::Failed, cost)
@@ -106,6 +139,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use error_stack::Report;
 
@@ -118,26 +152,35 @@ mod tests {
     use crate::ec::kv::KvIdentityGraph;
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
     use crate::ec::kv_backend::{
-        EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
+        EcKvLookup, EcKvRateLimited, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
     };
     use crate::ec::kv_types::{KvEntry, KvOptOut, KvPartnerId};
     use crate::error::TrustedServerError;
 
     const EC_ID: &str = "0000000000000000000000000000000000000000000000000000000000000000.ABC123";
 
-    /// Write counts the store keeps after seeding.
+    /// Write counts and pauses the store keeps after seeding.
     #[derive(Default)]
     struct WriteCounts {
         all: AtomicUsize,
         generation_checked: AtomicUsize,
+        pauses: Mutex<Vec<Duration>>,
     }
 
-    /// Fails the first `conflicts` generation-checked writes with
-    /// `PreconditionFailed`, or every generation-checked write with an error
-    /// when `error` is set. Counts every write it sees.
+    impl WriteCounts {
+        fn pauses(&self) -> Vec<Duration> {
+            self.pauses.lock().expect("should lock the pauses").clone()
+        }
+    }
+
+    /// Fails the first `rate_limited` generation-checked writes with a
+    /// per-key rate-limit error, then the next `conflicts` with
+    /// `PreconditionFailed`, or every generation-checked write with a plain
+    /// error when `error` is set. Counts every write and pause it sees.
     struct ScriptedEcKv {
         inner: InMemoryEcKv,
         conflicts: Mutex<u32>,
+        rate_limited: Mutex<u32>,
         error: bool,
         counts: Arc<WriteCounts>,
     }
@@ -168,9 +211,19 @@ mod tests {
                 if self.error {
                     return Err(Report::new(TrustedServerError::KvStore {
                         store_name: self.inner.store_name().to_owned(),
-                        message: "per-key write limit".to_owned(),
+                        message: "store unavailable".to_owned(),
                     }));
                 }
+                let mut limited = self.rate_limited.lock().expect("should lock the counter");
+                if *limited > 0 {
+                    *limited -= 1;
+                    return Err(Report::new(TrustedServerError::KvStore {
+                        store_name: self.inner.store_name().to_owned(),
+                        message: "per-key write limit".to_owned(),
+                    })
+                    .attach_opaque(EcKvRateLimited));
+                }
+                drop(limited);
                 let mut remaining = self.conflicts.lock().expect("should lock the counter");
                 if *remaining > 0 {
                     *remaining -= 1;
@@ -191,6 +244,14 @@ mod tests {
         fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
             self.inner.delete(key)
         }
+
+        fn pause(&self, duration: Duration) {
+            self.counts
+                .pauses
+                .lock()
+                .expect("should lock the pauses")
+                .push(duration);
+        }
     }
 
     /// Seeds `entry` with `create`, then wraps the store and zeroes the counts.
@@ -199,10 +260,21 @@ mod tests {
         conflicts: u32,
         error: bool,
     ) -> (KvIdentityGraph, Arc<WriteCounts>) {
+        graph_limited(entry, 0, conflicts, error)
+    }
+
+    /// As [`graph_with`], rate-limiting the first `rate_limited` writes.
+    fn graph_limited(
+        entry: Option<&KvEntry>,
+        rate_limited: u32,
+        conflicts: u32,
+        error: bool,
+    ) -> (KvIdentityGraph, Arc<WriteCounts>) {
         let counts = Arc::new(WriteCounts::default());
         let graph = KvIdentityGraph::new(ScriptedEcKv {
             inner: InMemoryEcKv::new("removal-store"),
             conflicts: Mutex::new(conflicts),
+            rate_limited: Mutex::new(rate_limited),
             error,
             counts: Arc::clone(&counts),
         });
@@ -238,6 +310,14 @@ mod tests {
     }
 
     fn run(graph: &KvIdentityGraph, removals: &IdentityMutation) -> RemovalWriteOutcome {
+        run_at(graph, removals, RemovalTiming::BeforeSend)
+    }
+
+    fn run_at(
+        graph: &KvIdentityGraph,
+        removals: &IdentityMutation,
+        timing: RemovalTiming,
+    ) -> RemovalWriteOutcome {
         let random = SeededRandom::new(1);
         let catalog = ProviderCatalog::new(
             vec![fixed_provider("owner", &["a.example.com"])],
@@ -257,7 +337,99 @@ mod tests {
                 random: &random,
                 catalog: &catalog,
             },
+            timing,
         )
+    }
+
+    #[test]
+    fn before_send_neither_waits_nor_retries_a_per_key_limit() {
+        let (graph, counts) = graph_limited(Some(&live()), 1, 0, false);
+
+        assert_eq!(
+            run_at(&graph, &removal(), RemovalTiming::BeforeSend),
+            RemovalWriteOutcome::Failed,
+            "should end the attempt at the per-key limit"
+        );
+
+        assert_eq!(
+            counts.generation_checked.load(Ordering::SeqCst),
+            1,
+            "should write once"
+        );
+        assert!(counts.pauses().is_empty(), "should not wait before send");
+    }
+
+    #[test]
+    fn after_send_waits_the_per_key_window_before_its_first_write() {
+        let (graph, counts) = graph_with(Some(&live()), 0, false);
+
+        assert_eq!(
+            run_at(&graph, &removal(), RemovalTiming::AfterSend),
+            RemovalWriteOutcome::Written,
+            "should write"
+        );
+
+        assert_eq!(
+            counts.pauses(),
+            vec![PER_KEY_WRITE_WINDOW],
+            "should wait one per-key window first"
+        );
+    }
+
+    #[test]
+    fn after_send_retries_a_per_key_limit_after_another_window() {
+        let (graph, counts) = graph_limited(Some(&live()), 1, 0, false);
+
+        assert_eq!(
+            run_at(&graph, &removal(), RemovalTiming::AfterSend),
+            RemovalWriteOutcome::Written,
+            "should win after the rate-limited write"
+        );
+
+        assert_eq!(
+            counts.generation_checked.load(Ordering::SeqCst),
+            2,
+            "should re-read and write again"
+        );
+        assert_eq!(
+            counts.pauses(),
+            vec![PER_KEY_WRITE_WINDOW, PER_KEY_WRITE_WINDOW],
+            "should wait before the first write and after the limit"
+        );
+    }
+
+    #[test]
+    fn after_send_gives_up_on_a_per_key_limit_after_five_writes() {
+        let (graph, counts) = graph_limited(Some(&live()), 5, 0, false);
+
+        assert_eq!(
+            run_at(&graph, &removal(), RemovalTiming::AfterSend),
+            RemovalWriteOutcome::Failed,
+            "should give up"
+        );
+
+        assert_eq!(
+            counts.generation_checked.load(Ordering::SeqCst),
+            5,
+            "should stop at five writes"
+        );
+    }
+
+    #[test]
+    fn after_send_does_not_retry_other_errors() {
+        let (graph, counts) = graph_with(Some(&live()), 0, true);
+
+        assert_eq!(
+            run_at(&graph, &removal(), RemovalTiming::AfterSend),
+            RemovalWriteOutcome::Failed,
+            "should stop at a non-CAS, non-limit error"
+        );
+
+        assert_eq!(
+            counts.generation_checked.load(Ordering::SeqCst),
+            1,
+            "should write once"
+        );
     }
 
     #[test]
@@ -325,7 +497,7 @@ mod tests {
         assert_eq!(
             counts.generation_checked.load(Ordering::SeqCst),
             1,
-            "should not retry a per-key limit"
+            "should not retry a non-CAS error"
         );
     }
 

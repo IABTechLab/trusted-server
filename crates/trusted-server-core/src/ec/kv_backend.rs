@@ -66,6 +66,12 @@ pub enum EcKvWriteOutcome {
     PreconditionFailed,
 }
 
+/// Attached to an [`EcKvStore::insert`] error when the platform refused the
+/// write under its per-key write rate limit, so a caller that can wait may
+/// try again after [`EcKvStore::pause`].
+#[derive(Debug, Clone, Copy)]
+pub struct EcKvRateLimited;
+
 /// Raw KV store primitives backing the EC identity graph.
 ///
 /// Implementations map these operations onto the platform KV API.
@@ -120,8 +126,9 @@ pub trait EcKvStore: Send + Sync {
     /// # Errors
     ///
     /// Returns [`TrustedServerError::KvStore`] on store open or write
-    /// failure. Precondition failures are reported through the
-    /// [`EcKvWriteOutcome`] instead.
+    /// failure, with an [`EcKvRateLimited`] attachment when the platform's
+    /// per-key write limit refused it. Precondition failures are reported
+    /// through the [`EcKvWriteOutcome`] instead.
     fn insert(
         &self,
         key: &str,
@@ -174,6 +181,15 @@ pub trait EcKvStore: Send + Sync {
     ///
     /// Returns [`TrustedServerError::KvStore`] on store open or delete failure.
     fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>>;
+
+    /// Blocks the request for `duration`, so a write made after the response
+    /// was sent can outlast the platform's per-key write limit.
+    ///
+    /// The default returns at once, for platforms and test doubles that have
+    /// no such limit.
+    fn pause(&self, duration: Duration) {
+        let _ = duration;
+    }
 }
 
 /// Counts of KV operations one request makes, shared by every clone.
@@ -256,6 +272,10 @@ impl EcKvStore for OperationCountingEcKv {
     fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
         self.counts.record_write();
         self.inner.delete(key)
+    }
+
+    fn pause(&self, duration: Duration) {
+        self.inner.pause(duration);
     }
 }
 

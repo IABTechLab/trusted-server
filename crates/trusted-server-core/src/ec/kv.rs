@@ -187,6 +187,12 @@ impl KvIdentityGraph {
         }
     }
 
+    /// Blocks the request for `duration` through the store, so an
+    /// after-send write can outlast the platform's per-key write limit.
+    pub(crate) fn pause(&self, duration: core::time::Duration) {
+        self.store.pause(duration);
+    }
+
     /// Returns the configured store name.
     #[must_use]
     pub fn store_name(&self) -> &str {

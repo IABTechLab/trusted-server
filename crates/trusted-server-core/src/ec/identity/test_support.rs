@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use error_stack::Report;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
@@ -690,6 +691,7 @@ pub struct WriteCountingEcKv {
     lookups: AtomicUsize,
     refusals: Mutex<BTreeMap<String, usize>>,
     failing: Mutex<BTreeSet<String>>,
+    pauses: Mutex<Vec<Duration>>,
 }
 
 impl WriteCountingEcKv {
@@ -704,12 +706,12 @@ impl WriteCountingEcKv {
             lookups: AtomicUsize::new(0),
             refusals: Mutex::new(BTreeMap::new()),
             failing: Mutex::new(BTreeSet::new()),
+            pauses: Mutex::new(Vec::new()),
         }
     }
 
-    /// Fails every generation-checked write to `key` with a store error, the
-    /// non-retryable failure (Fastly's per-key write limit). A failed write
-    /// is still counted.
+    /// Fails every generation-checked write to `key` with a store error that
+    /// is never retried. A failed write is still counted.
     ///
     /// # Panics
     ///
@@ -733,6 +735,16 @@ impl WriteCountingEcKv {
             .lock()
             .expect("should lock the refusals")
             .insert(key.to_owned(), count);
+    }
+
+    /// Every [`EcKvStore::pause`] so far, in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the pause list is poisoned.
+    #[must_use]
+    pub fn pauses(&self) -> Vec<Duration> {
+        self.pauses.lock().expect("should lock the pauses").clone()
     }
 
     /// The counts so far, seeding included.
@@ -793,7 +805,7 @@ impl EcKvStore for WriteCountingEcKv {
             {
                 return Err(Report::new(TrustedServerError::KvStore {
                     store_name: self.inner.store_name().to_owned(),
-                    message: "per-key write limit".to_owned(),
+                    message: "store unavailable".to_owned(),
                 }));
             }
             let mut refusals = self.refusals.lock().expect("should lock the refusals");
@@ -817,6 +829,13 @@ impl EcKvStore for WriteCountingEcKv {
 
     fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
         self.inner.delete(key)
+    }
+
+    fn pause(&self, duration: Duration) {
+        self.pauses
+            .lock()
+            .expect("should lock the pauses")
+            .push(duration);
     }
 }
 

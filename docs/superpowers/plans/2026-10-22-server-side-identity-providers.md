@@ -7435,7 +7435,7 @@ git commit --signoff -S -m "Add the ts-eids-s mirror payload and its size cap" -
 - Produces:
   - `KvIdentityGraph::write_if_generation(&self, ec_id: &str, entry: &KvEntry, generation: u64) -> Result<EcKvWriteOutcome, Report<TrustedServerError>>`, `pub(crate)`: serializes with `serialize_entry` (so `validate` runs) and writes with `ENTRY_TTL` and `EcKvWriteMode::IfGenerationMatch(generation)`. Phase 4's flush (Task 29) uses it too, so every identity write goes through one path.
   - `pub(crate) const REMOVAL_WRITE_ATTEMPTS: u32 = MAX_CAS_RETRIES;` (5)
-  - `pub enum RemovalWriteOutcome { Written, NothingToWrite, Failed }`. `NothingToWrite` covers a tombstone, `consent.ok = false`, a missing row and removals that are already applied. `Failed` covers a failed read, a non-CAS write error such as Fastly's per-key limit, and five generation mismatches in a row. It is `pub`, not `pub(crate)`, because the public `FlushOutcome::WriteFailed` (Task 29) carries it, and `private_interfaces` would fail the clippy gate otherwise.
+  - `pub enum RemovalWriteOutcome { Written, NothingToWrite, Failed }`. `NothingToWrite` covers a tombstone, `consent.ok = false`, a missing row and removals that are already applied. `Failed` covers a failed read, a store error other than the per-key limit, a per-key limit before send, and five generation mismatches or per-key limits in a row. It is `pub`, not `pub(crate)`, because the public `FlushOutcome::WriteFailed` (Task 29) carries it, and `private_interfaces` would fail the clippy gate otherwise.
   - `pub(crate) fn write_removals(graph: &KvIdentityGraph, ec_id: &str, removals: &IdentityMutation, context: &ApplyContext<'_>) -> RemovalWriteOutcome`
   - `pub(crate) fn log_removal_lost(ec_id: &str, removals: &IdentityMutation)`: logs at error with `log_id(ec_id)` and the provider IDs and sources from `removal_labels()`, never a UID. The caller increments `removal_lost` (Task 23 adds the counter to `RequestIdentity`).
 
@@ -7445,7 +7445,10 @@ The loop (spec 5.3):
 
 1. `graph.load_snapshot(ec_id)`. `Missing` gives `NothingToWrite`. `Failed` gives `Failed`. `Present` without a generation is treated as `Failed`, as `upsert_partner_ids_from_snapshot` does (`kv.rs:775-781`).
 2. `apply_removals_only(removals, &entry, context)`. `None` (a tombstone, `consent.ok = false`, or a removals-only row that fails validation) gives `NothingToWrite`. `changed == false` gives `NothingToWrite`: the removals already applied.
-3. `graph.write_if_generation(ec_id, &applied.entry, generation)`. `Written` gives `Written`. `PreconditionFailed` re-reads and goes back to step 1, up to `REMOVAL_WRITE_ATTEMPTS` writes in total. Any `Err` gives `Failed` at once: an immediate retry after a per-key limit would fail too.
+3. `graph.write_if_generation(ec_id, &applied.entry, generation)`. `Written` gives `Written`. `PreconditionFailed` re-reads and goes back to step 1, up to `REMOVAL_WRITE_ATTEMPTS` writes in total. With `RemovalTiming::AfterSend`, an `Err` carrying `EcKvRateLimited` calls `graph.pause(PER_KEY_WRITE_WINDOW)` and is retried the same way. Any other `Err` gives `Failed` at once.
+
+   `write_removals` takes a `RemovalTiming`: `BeforeSend` for the capture write before send and the admin clear, `AfterSend` for the phase 4 removal-only retry and the capture's after-send attempt. `AfterSend` first calls `graph.pause(PER_KEY_WRITE_WINDOW)` (1 second), because the write it follows failed moments ago on the same key. `EcKvStore::pause` defaults to a no-op; the Fastly adapter sleeps, and maps `KVStoreError::TooManyRequests` to an error with an `EcKvRateLimited` attachment. Tests: before send never waits and stops at the limit; after send waits once before writing, waits again and retries a limit, gives up after five, and does not retry other errors; a failed flush waits one window before its removal write, and a written flush never waits.
+
 4. Five `PreconditionFailed` in a row give `Failed`.
 
 `write_removals` runs whatever the request's consent: a revocation can arrive when consent is unusable. It does not log a lost removal itself, because a capture tries once more after send (Task 38) before the removal counts as lost. `removals` must hold only removals, opt-outs and clears: callers pass `mutation.removals()`. `apply_removals_only` ignores anything else anyway.
@@ -7533,7 +7536,7 @@ mod tests {
 
         let (graph, store) = graph_with(Some(&live()), 0, true);
         assert_eq!(run(&graph, &removal()), RemovalWriteOutcome::Failed, "should stop at a non-CAS error");
-        assert_eq!(store.generation_checked_writes(), 1, "should not retry a per-key limit");
+        assert_eq!(store.generation_checked_writes(), 1, "should not retry a non-CAS error");
     }
 
     #[test]

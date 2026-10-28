@@ -26,7 +26,7 @@ use super::mutation::{
 };
 use super::policy::{FP_US_OPT_OUT_MASK, PolicySignals, fingerprint_bits, policy_allows};
 use super::provider::IdentityProvider;
-use super::removal::{RemovalWriteOutcome, write_removals_counted};
+use super::removal::{RemovalTiming, RemovalWriteOutcome, write_removals_counted};
 use super::resolution::{
     EntrySet, EntrySets, IdentityProviderError, Resolution, ResolvedEid, StateChange, entry_sets,
 };
@@ -2131,7 +2131,13 @@ pub(crate) fn run_capture(
         random: deps.random,
         catalog: deps.catalog,
     };
-    let (outcome, cost) = write_removals_counted(graph, ec_id, &mutation, &apply_context);
+    let (outcome, cost) = write_removals_counted(
+        graph,
+        ec_id,
+        &mutation,
+        &apply_context,
+        RemovalTiming::BeforeSend,
+    );
     context
         .identity_mut()
         .record_capture_kv(cost.reads, cost.writes);

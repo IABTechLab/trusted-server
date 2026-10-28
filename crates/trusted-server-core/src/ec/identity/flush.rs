@@ -22,7 +22,7 @@ use super::input::{ProviderConsent, Region, ResolveSignals, StoredId, ThreadRand
 use super::mutation::{ApplyContext, IdentityMutation, ProviderStateChange, apply};
 use super::policy::{PolicySignals, fingerprint_bits};
 use super::provider::IdentityProvider;
-use super::removal::{log_removal_lost, write_removals};
+use super::removal::{RemovalTiming, log_removal_lost, write_removals};
 use super::revision::StateRevision;
 use super::runtime::IdentityRuntime;
 use crate::consent::allows_eid_persistence;
@@ -287,7 +287,14 @@ fn write_failed(
             removals: RemovalWriteOutcome::NothingToWrite,
         };
     }
-    let outcome = write_removals(graph, ec_id, &removals, apply_context);
+    // Phase 4 runs after send, right after the failed flush.
+    let outcome = write_removals(
+        graph,
+        ec_id,
+        &removals,
+        apply_context,
+        RemovalTiming::AfterSend,
+    );
     if outcome == RemovalWriteOutcome::Failed {
         log_removal_lost(ec_id, &removals);
         for _ in removals.removal_labels() {
@@ -324,6 +331,7 @@ pub fn retry_pending_removals(context: &mut EcContext, graph: &KvIdentityGraph) 
             random: &random,
             catalog: runtime.catalog(),
         },
+        RemovalTiming::AfterSend,
     );
     if outcome == RemovalWriteOutcome::Failed {
         lose_pending_removals(context);
@@ -578,6 +586,7 @@ mod tests {
     use crate::consent::types::GppConsent;
     use crate::ec::identity::denials::{denials, filter_browser_candidates};
     use crate::ec::identity::mutation::PartnerIdChange;
+    use crate::ec::identity::removal::PER_KEY_WRITE_WINDOW;
     use crate::ec::identity::request::WriterDecision;
     use crate::ec::identity::revision::{record_revision, uid_hash, visitor_key};
     use crate::ec::identity::test_support::fake_http::{
@@ -1085,6 +1094,32 @@ mod tests {
                 .map(|o| o.at),
             Some(at),
             "should store the opt-out"
+        );
+    }
+
+    #[test]
+    fn failed_flush_waits_the_per_key_window_before_its_removal_retry() {
+        let (mut fixture, _) = removal_fixture();
+        fixture.store.refuse_conditional_writes(TEST_EC_ID, 1);
+
+        fixture.run(&ScriptedLimiter::allowing());
+
+        assert_eq!(
+            fixture.store.pauses(),
+            vec![PER_KEY_WRITE_WINDOW],
+            "should wait one per-key window after the failed flush"
+        );
+    }
+
+    #[test]
+    fn written_flush_never_waits() {
+        let (mut fixture, _) = removal_fixture();
+
+        fixture.run(&ScriptedLimiter::allowing());
+
+        assert!(
+            fixture.store.pauses().is_empty(),
+            "should not wait when the flush is written"
         );
     }
 
