@@ -5,7 +5,7 @@
 **Related specs:** `2026-08-27-integration-provider-seam-design.md`, `2026-03-19-edgezero-migration-design.md` and `2026-10-15-fastly-per-host-selector-design.md`, which replaces where this design reads the selector from
 **Related PRs:** IABTechLab/trusted-server#1348, IABTechLab/trusted-server#1352
 **Issues:** IABTechLab/trusted-server#1270
-**Last updated:** 2026-10-26
+**Last updated:** 2026-10-27
 
 > **Why this spec exists.** An operator who runs several publishers needs a Fastly service for each. This row lets one service read the settings of the publisher whose host a request names.
 
@@ -182,7 +182,7 @@ The behaviors below are stated in the sections above. A change to the code would
 | 2026-10-12 | First draft, from the pull request and its issue as they stand.                                                                                                                                                                                                                                                                                                                          |
 | 2026-10-16 | Round 1 fixes. The header points at the open draft pull request, the risk table is repaired, the fallback to the logical store ID is stated, the host rules, the answers, the steps for moving a service and acceptance criteria that name their tests are added, and the code findings sit under Open questions. The selector store points at the Fastly per-host selector design.      |
 | 2026-10-16 | Round 2 fixes. The pointer to the Fastly per-host selector design names section 2.4, whose `500` answers replace the fallback to the logical store ID, and sections 2.6 and 2.8, which replace the push and selector-writing steps. The same sections are named where this spec describes the fallback and the steps for moving a service.                                               |
-| 2026-10-26 | Each host's blob names the policy file row 4 selects, and one policy entry for each SHA-256 serves every host that pins it, as this row's keyed push and Fastly adapter do. Chunks and pointers are defined, the EdgeZero versions are anchored, `ts config diff` is said not to reach a host's blob, and Open questions, item 9, asks about a selector that forms a policy entry's key. |
+| 2026-10-27 | Each host's blob names the policy file row 4 selects, and one policy entry for each SHA-256 serves every host that pins it, as this row's keyed push and Fastly adapter do. Chunks and pointers are defined, the EdgeZero versions are anchored, `ts config diff` is said not to reach a host's blob, and Open questions, item 9, asks about a selector that forms a policy entry's key. |
 
 ## Review log
 

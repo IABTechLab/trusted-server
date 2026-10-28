@@ -19,7 +19,7 @@ name a module by its crate folder, so the selector reads
 `[permission-signal] modules`. Revised on 2026-10-15 after a review of this
 page against the code at `split/3-permissions` (see the Review log), so that
 §1 to §8 and the records in §10 to §13 state what that code does. Revised on
-2026-10-26 for the policy file, which is never compiled into a build, as
+2026-10-27 for the policy file, which is never compiled into a build, as
 agreed with IAB Tech Lab at the Trusted Server Touchbase on 2026-10-23, and
 which is selected and supplied when a service is deployed, as decided by
 51Degrees after the Touchbase (§3.1, §3.6 and §3.7). Row 4 builds that design,
@@ -31,7 +31,7 @@ IABTechLab/trusted-server#1350 and IABTechLab/trusted-server#1352.
 **Issue references:** #779
 **Related specs:** `2026-07-30-pluggable-providers-design.md`,
 `2026-07-30-provider-migration-rollout-design.md`
-**Last updated:** 2026-10-26
+**Last updated:** 2026-10-27
 
 > **Context.** PR #838 proposed a permission model whose review surfaced two
 > classes of defect this spec exists to prevent. The first was silent
@@ -2029,7 +2029,7 @@ include the changes that followed the first revision of this section on
 | 2026-10-07 | A module is named by its crate folder, so the selector reads `[permission-signal] modules`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | 2026-10-15 | Fixes from review round 1. An unreadable record answered by its own module with nothing ahead of the modules, the fifth module `mtm` with its own section, registration through each adapter, the four members of the page state, the sharing pair on navigation and page-bids, the persisted consent, resolve endpoint and device module check named as built by other rows or not at all, what the policy parser does not reject, the Data Uses a signal reaches, the raw strings removed after assembly, a table of what each adapter runs, the upgrade list, the open questions and the review log. |
 | 2026-10-16 | Review round 2, approved with one minor point recorded in the Review log.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| 2026-10-26 | The policy file is never compiled into a build, as agreed with IAB Tech Lab at the Touchbase on 2026-10-23, and is selected and supplied when a service is deployed, as decided by 51Degrees after the Touchbase (§3.1). What row 4 builds and later rows add, Cloudflare reading its blob from the config store, the push, answers that follow the error's kind, and a blob's propagation (§3.1). What the build carries (§3.6), the cost of the fetch (§3.7), the failure modes (§6), the upgrade list (§6.1), the tests (§8), the records in §10 and §11, and the sample named as the sample.        |
+| 2026-10-27 | The policy file is never compiled into a build, as agreed with IAB Tech Lab at the Touchbase on 2026-10-23, and is selected and supplied when a service is deployed, as decided by 51Degrees after the Touchbase (§3.1). What row 4 builds and later rows add, Cloudflare reading its blob from the config store, the push, answers that follow the error's kind, and a blob's propagation (§3.1). What the build carries (§3.6), the cost of the fetch (§3.7), the failure modes (§6), the upgrade list (§6.1), the tests (§8), the records in §10 and §11, and the sample named as the sample.        |
 
 ## Review log
 

@@ -5,7 +5,7 @@
 **Related specs:** `2026-08-27-integration-provider-seam-design.md`, in IABTechLab/trusted-server#1342, which holds every design document of the stack
 **Related PRs:** IABTechLab/trusted-server#1350, IABTechLab/trusted-server#1348, jwrosewell/trusted-server#4 (closed), IABTechLab/trusted-server#1294 (closed)
 **Issues:** IABTechLab/trusted-server#1268
-**Last updated:** 2026-10-26
+**Last updated:** 2026-10-27
 
 > **Why this spec exists.** A reader, a regulator or an auditor has only the operator's word for what a deployment runs, decides and keeps. Three endpoints in this change show those three things, and this spec says where each endpoint answers, what each shows and to whom.
 
@@ -189,7 +189,7 @@ On `33282f0c9`, the last of the five original commits, the whole check also pass
 | 2026-10-12 | First draft, from the pull request and its issue as they stand.                                                                                                                                                                                                                                                                                                                                                                         |
 | 2026-10-15 | Fixes from review round 1. The addresses with their methods, forms, statuses and headers, the defaults and the one switch, what runs around each handler, the data page's full header set and its protection from an operator's headers, the failure paths, the rollout, the tests and the untested paths, the open questions, the header and the acceptance lines brought to the series head, and the review log.                      |
 | 2026-10-16 | Fixes from review round 2. The statement that the preparers and filters never run for these addresses on Fastly and Spin, where a request with a method other than `GET` goes on Cloudflare, the matching wording of the second open question, and the review log.                                                                                                                                                                      |
-| 2026-10-26 | The permissions answer names the policy file row 4 selects, the configuration view shows its name and SHA-256 but never its text, a pattern under `permissions.text` is refused, and checks count `permissions.sha256` as present, as this row's code does. A failed load answers its error's status on every adapter, Spin included, because row 4 moved Spin off a fixed `503`. The status names the pull request but not as a draft. |
+| 2026-10-27 | The permissions answer names the policy file row 4 selects, the configuration view shows its name and SHA-256 but never its text, a pattern under `permissions.text` is refused, and checks count `permissions.sha256` as present, as this row's code does. A failed load answers its error's status on every adapter, Spin included, because row 4 moved Spin off a fixed `503`. The status names the pull request but not as a draft. |
 
 ## Review log
 

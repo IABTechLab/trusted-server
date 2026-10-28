@@ -5,7 +5,7 @@
 **Related specs:** `2026-10-14-last-names-in-core-design.md`, `2026-10-14-backend-naming-design.md`
 **Related PRs:** IABTechLab/trusted-server#1399, jwrosewell/trusted-server#44
 **Issues:** IABTechLab/trusted-server#777 (its Fastly row)
-**Last updated:** 2026-10-26
+**Last updated:** 2026-10-27
 
 > **Why this spec exists.** After the series before this one, core's shipped code still names one hosting platform, Fastly, in small pieces. They are the format of a long configuration document, a staging variable, three request headers, a device module selector and the names of two functions. Each is a place where a change by one platform is a change in core. Core's comments, tests and README files name Fastly, Cloudflare, Spin, Fermyon, Viceroy and Axum as well, and three tests use a host under Fastly's `edgecompute.app` domain. After this change no line of core names a hosting platform, and a guard outside core keeps it so (section 2.6). One Fastly header, `x-compress-hint`, whose name does not name the platform, is still set by core after this change (section 3).
 
@@ -178,8 +178,8 @@ Not tested:
 | 2026-10-15 | Fixes from review round 1. The readers of each declared list and the open questions on them, `x-debug-fastly-pop`, the scheme change, the effects on the other adapters, where each refusal happens, the rollout, the narrowed constants, `x-compress-hint`, the file count, the untested paths and the review log.   |
 | 2026-10-15 | Corrections from review round 2. The Fastly sentence of 2.3 and the changelog on the `x-debug-fastly-pop` refusal, the changelog on the spoofable strip and the scheme change, when the Axum, Cloudflare and Spin adapters strip `fastly-client-ip`, and the comment in `request_headers.rs` left for a later change. |
 | 2026-10-16 | Core names no hosting platform or platform domain in any line. Section 2.6 with the counts, the `_vercel` prefix and the test host, the guard and the tests that moved to the Fastly adapter, and section 3 no longer leaves core's comments and tests for later.                                                     |
-| 2026-10-26 | Row 12 no longer adds `ORIGIN_ASSET_PREFIXES`, so core holds no `_vercel` entry before this change. Section 2.6 names the commit it counts at, `13d57b03f`, where the guard finds 173 lines, that entry and 172 comments, documents or test code, and no other section names the prefix.                              |
-| 2026-10-26 | The header no longer calls the pull request a draft.                                                                                                                                                                                                                                                                  |
+| 2026-10-27 | Row 12 no longer adds `ORIGIN_ASSET_PREFIXES`, so core holds no `_vercel` entry before this change. Section 2.6 names the commit it counts at, `13d57b03f`, where the guard finds 173 lines, that entry and 172 comments, documents or test code, and no other section names the prefix.                              |
+| 2026-10-27 | The header no longer calls the pull request a draft.                                                                                                                                                                                                                                                                  |
 
 ## Review log
 

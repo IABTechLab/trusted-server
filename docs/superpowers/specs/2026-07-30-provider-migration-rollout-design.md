@@ -13,7 +13,7 @@ and the `consent.gdpr.applies_in` and `consent.us_states.privacy_states`
 lists retire into the same tree (permission-model spec §3.2, §3.4 and §12).
 Updated on 2026-10-06 to say module where it said provider, with `provider`
 kept for the two auction selectors (pluggable spec §2.1). Updated on
-2026-10-26, where the permission policy is the publisher's file, selected
+2026-10-27, where the permission policy is the publisher's file, selected
 and supplied when a service is deployed and never compiled into a build
 (permission-model spec §3.1), which row 4 of the stack (#1345) builds.
 **Author:** Engineering
@@ -22,7 +22,7 @@ and supplied when a service is deployed and never compiled into a build
 `2026-07-30-permission-model-design.md`,
 `2026-07-30-integration-response-header-hook-design.md` (not implemented in
 the series, see its status)
-**Last updated:** 2026-10-26
+**Last updated:** 2026-10-27
 
 > **Context.** The module/permission epic is a breaking change to a live
 > identity system. PR #838's review showed that the riskiest part of such a

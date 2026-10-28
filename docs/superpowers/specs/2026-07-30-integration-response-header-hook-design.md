@@ -15,7 +15,7 @@ retained as the design bar for the hook when its first consumer arrives (an
 integration that must set response headers such as Accept-CH or detection
 results). Revised 2026-08-25, on 2026-10-06 for the module wording, on
 2026-10-15 and 2026-10-16 after its round 1 and round 2 reviews (Review log),
-and on 2026-10-26 for the permission policy, which is selected when a service
+and on 2026-10-27 for the permission policy, which is selected when a service
 is deployed.
 **Author:** Engineering
 **Issue references:** #782
@@ -23,7 +23,7 @@ is deployed.
 `2026-07-30-permission-model-design.md`,
 `2026-07-30-provider-migration-rollout-design.md` and the baseline DataDome
 design `2026-06-11-datadome-server-side-protection-design.md`
-**Last updated:** 2026-10-26
+**Last updated:** 2026-10-27
 
 > **Context.** Issue #782 already specifies this feature well; its done-when
 > is the contract. PR #838 shipped the trait and registry wiring with **no
@@ -1630,7 +1630,7 @@ changes no code and decides none of them.
 | 2026-10-06 | Module wording.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | 2026-10-15 | Fixes from review round 1. The status and the closed pull request, a new section 1a on what the code does today, the cookie rule, the shared finalization code and the DataDome section name stated as the code has them, the reserved CDN cache fields taken from `EDGE_CACHE_HEADER_NAMES`, the three ids the id rule refuses, the template cache and the cache revision tuple marked as unreconciled or not built, the changes to shipped DataDome behavior in section 4a.4, the order of sections 4 and 4a, the sign-off rows, `must-revalidate` precedence, the duplicate-ID test in the done-when, the existing tests, the open questions and the review log. |
 | 2026-10-16 | Fixes from review round 2. What the providers design now says (section 1a), the two core functions that every adapter's `apply_finalize_headers` calls (sections 1a and 2), the closed pull request that carried the documentation set (#1047, section 7), the revision dates and the review log.                                                                                                                                                                                                                                                                                                                                                                   |
-| 2026-10-26 | Section 1a keeps that each build embeds the repository's sample at its commit, and says that row 4 of the stack (#1345) builds section 3.1 of the permission model design, so that once row 4 is merged forward a domain's blob, which names its policy file by name and SHA-256, is the policy identity and gives `active_policy_digest` its value. Open question 2 says that row 4's policy `sha256` reaches the template fingerprint, which leaves the policy's text out and which the compiled sample never reached. The stack's pull requests are named without calling them drafts.                                                                           |
+| 2026-10-27 | Section 1a keeps that each build embeds the repository's sample at its commit, and says that row 4 of the stack (#1345) builds section 3.1 of the permission model design, so that once row 4 is merged forward a domain's blob, which names its policy file by name and SHA-256, is the policy identity and gives `active_policy_digest` its value. Open question 2 says that row 4's policy `sha256` reaches the template fingerprint, which leaves the policy's text out and which the compiled sample never reached. The stack's pull requests are named without calling them drafts.                                                                           |
 
 ## Review log
 
