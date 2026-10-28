@@ -19,7 +19,10 @@ Axum, or Spin SDK types.
 Build one `IntegrationRegistration` with only the hooks the feature needs.
 Use `with_deferred_js()` only for a separately loaded integration module and
 `without_js()` when another asset path owns delivery. Proxy routes should be
-namespaced and bounded; do not introduce a general outbound proxy.
+bounded, and sit beneath the integration's prefix unless the module serves an
+endpoint of its own, as
+[Serving an endpoint from a module](#serving-an-endpoint-from-a-module)
+describes. Do not introduce a general outbound proxy.
 
 ## Compiling core-neutral fixture
 
@@ -220,6 +223,51 @@ Streaming support is an adapter capability. Request
 checked `supports_streaming_responses()`; unsupported adapters must reject
 the request instead of silently buffering it.
 
+## Serving an endpoint from a module
+
+A module can answer a path of its own, outside `/integrations/`, with nothing
+added to core. `IntegrationProxy::routes()` may declare any path.
+`IntegrationEndpoint::new` and `IntegrationEndpoint::get`, `post`, `put`,
+`delete` and `patch` keep the path as written, while the proxy's own `get`,
+`post`, `put`, `delete` and `patch` put `proxy_prefix()` in front of it. A
+path ending in `/*` covers every path beneath it.
+
+```rust
+fn routes(&self) -> Vec<IntegrationEndpoint> {
+    vec![
+        // Beneath the prefix, at /integrations/example/status.
+        self.get("/status"),
+        // As written.
+        IntegrationEndpoint::get("/example/status"),
+        IntegrationEndpoint::new(Method::HEAD, "/example/status"),
+    ]
+}
+```
+
+A route answers only the method it declares. A `GET` route answers neither
+`HEAD` nor `OPTIONS`, so a module that answers either declares a route for
+that method too, and a request whose method has no module route on its path
+is handled as if the module declared nothing there. Nothing in core, the
+adapters or EdgeZero strips the body from an answer to `HEAD`, so the
+handler of a `HEAD` route sends no body itself.
+
+Two routes on one method and path are refused when the registry is built,
+whether one module declares both or two modules declare one each. The
+message names the method and the path, as in
+`Integration route registration failed for GET /example/status`.
+
+A module route is reached only when the adapter answers no route of its own
+for that method and path. Every adapter answers `GET /_ts/config` itself, so
+a module's `GET` route there never runs, while a `POST` of that path reaches
+a module route as any other request does. The registry does not know the
+adapter's routes, so it accepts a module route that can never run, and
+nothing reports that it never runs.
+
+The steps that run before a module route are the adapter's request cycle,
+the same steps a request for one of the publisher's own pages goes through.
+A step that answers a request, such as a request filter turning it back,
+answers in place of the route.
+
 ## Browser and script guards
 
 Add a browser module only when browser state is required. Immediate modules
@@ -251,7 +299,7 @@ points at the functions that do the work.
 
 | Part                                          | Purpose                                                                                                                                                                                                   |
 | --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Id                                            | Names the integration in its routes under `/integrations/<id>/`, in its browser module and in diagnostics                                                                                                 |
+| Id                                            | Names the integration in its browser module, in diagnostics and in the prefix `/integrations/<id>/` of its proxy routes, unless a route takes [a path of its own](#serving-an-endpoint-from-a-module)     |
 | Source                                        | The crate or package name, reported when two builders claim one id, so an operator can tell which crates collided                                                                                         |
 | Build function                                | Reads `Settings` and returns the registration. It is called only when a section selects the module                                                                                                        |
 | Validate function                             | The integration's own deploy rules. It runs for every builder, selected or not                                                                                                                            |

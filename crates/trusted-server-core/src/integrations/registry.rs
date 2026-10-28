@@ -4493,6 +4493,121 @@ mod tests {
         );
     }
 
+    /// A path outside `/integrations/` that the route clash test declares.
+    const OWN_ENDPOINT_PATH: &str = "/own-endpoint";
+
+    /// A proxy that declares the routes it holds and answers each with an
+    /// empty body.
+    struct DeclaredRoutes {
+        name: &'static str,
+        routes: Vec<IntegrationEndpoint>,
+    }
+
+    #[async_trait(?Send)]
+    impl IntegrationProxy for DeclaredRoutes {
+        fn integration_name(&self) -> &'static str {
+            self.name
+        }
+
+        fn routes(&self) -> Vec<IntegrationEndpoint> {
+            self.routes.clone()
+        }
+
+        async fn handle(
+            &self,
+            _call: crate::module_context::ModuleCall<'_>,
+            _req: Request<EdgeBody>,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+            Ok(Response::new(EdgeBody::empty()))
+        }
+    }
+
+    /// A registration under `id` whose proxy declares `methods` on
+    /// [`OWN_ENDPOINT_PATH`], one route for each.
+    fn declaring(id: &'static str, methods: &[Method]) -> Option<IntegrationRegistration> {
+        let routes = methods
+            .iter()
+            .map(|method| IntegrationEndpoint::new(method.clone(), OWN_ENDPOINT_PATH))
+            .collect();
+        Some(
+            IntegrationRegistration::builder(id)
+                .with_proxy(Arc::new(DeclaredRoutes { name: id, routes }))
+                .build(),
+        )
+    }
+
+    /// A test module, as its integration id, its module name and its build
+    /// function.
+    type RouteModule = (
+        &'static str,
+        &'static str,
+        crate::integrations::IntegrationBuilderFn,
+    );
+
+    const GETS: RouteModule = ("gets", "testing.gets", |_| {
+        Ok(declaring("gets", &[Method::GET]))
+    });
+    const ALSO_GETS: RouteModule = ("also-gets", "testing.also-gets", |_| {
+        Ok(declaring("also-gets", &[Method::GET]))
+    });
+    const GETS_TWICE: RouteModule = ("gets-twice", "testing.gets-twice", |_| {
+        Ok(declaring("gets-twice", &[Method::GET, Method::GET]))
+    });
+    const POSTS: RouteModule = ("posts", "testing.posts", |_| {
+        Ok(declaring("posts", &[Method::POST]))
+    });
+
+    /// Builds a registry from `modules`, with every one of them selected.
+    fn registry_selecting(
+        modules: &[RouteModule],
+    ) -> Result<IntegrationRegistry, Report<TrustedServerError>> {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        let mut builders = Vec::new();
+        for &(id, module, register) in modules {
+            settings.select_module("testing", module);
+            builders.push(
+                crate::integrations::IntegrationBuilder::new(
+                    id,
+                    "route-clash-test",
+                    register,
+                    validate_nothing,
+                )
+                .with_module_name(module),
+            );
+        }
+        IntegrationRegistry::with_registrations(&settings, &builders)
+    }
+
+    #[test]
+    fn two_routes_on_one_method_and_path_are_refused_when_the_registry_is_built() {
+        let expected = format!("Integration route registration failed for GET {OWN_ENDPOINT_PATH}");
+        // Two modules declaring one route each, and one module declaring the
+        // route twice.
+        for modules in [&[GETS, ALSO_GETS][..], &[GETS_TWICE]] {
+            let Err(error) = registry_selecting(modules) else {
+                panic!("should refuse a second GET route on {OWN_ENDPOINT_PATH}");
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains(&expected),
+                "should name the method and the path: {message}"
+            );
+        }
+
+        let registry =
+            registry_selecting(&[GETS, POSTS]).expect("should accept two methods on one path");
+        let routed_to = |method: &Method| {
+            registry
+                .find_route(method, OWN_ENDPOINT_PATH)
+                .map(|(_, integration)| *integration)
+        };
+        assert_eq!(
+            (routed_to(&Method::GET), routed_to(&Method::POST)),
+            (Some("gets"), Some("posts")),
+            "should route each method to the module that declares it"
+        );
+    }
+
     /// Selects core's stand-in, which registers a deferred browser module.
     fn enable_deferred_module(settings: &mut Settings) {
         settings.select_module("testing", test_support::deferred_fixture::MODULE);

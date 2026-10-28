@@ -401,6 +401,284 @@ fn duplicate_integration_id_is_rejected_naming_both_sources() {
     );
 }
 
+/// The probe's route at a path of its own, reached through this adapter's
+/// router, and the two things a module route can meet there, being another
+/// route on its method and path and a route of the adapter's own.
+mod module_endpoints {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use edgezero_core::body::Body;
+    use edgezero_core::http::{Method, Request, Response, request_builder};
+    use edgezero_core::router::RouterService;
+    use error_stack::Report;
+    use futures::executor::block_on;
+    use trusted_server_core::error::TrustedServerError;
+    use trusted_server_core::integrations::{
+        IntegrationBuilder, IntegrationBuilderFn, IntegrationEndpoint, IntegrationProxy,
+        IntegrationRegistration,
+    };
+    use trusted_server_core::module_context::ModuleCall;
+    use trusted_server_core::settings::Settings;
+
+    use super::{
+        HMAC_BLOCK, PROBE_BLOCK, body_text, build_state_with_registrations, router_with,
+        seam_probe, settings_with,
+    };
+
+    /// The inspection page's path, which this adapter answers for `GET`.
+    const CONFIG_PAGE_PATH: &str = "/_ts/config";
+
+    /// Integration id of the test's own module.
+    const OWN_MODULE_ID: &str = "own_module";
+
+    /// The name a section selects the test's own module by.
+    const OWN_MODULE_NAME: &str = "testing.own-module";
+
+    /// Body the test's own module answers every request with.
+    const OWN_MODULE_BODY: &str = "answered by the test's own module";
+
+    /// How many requests the test's own module answered.
+    static OWN_MODULE_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    /// The test's own module, which answers each route it declares with
+    /// [`OWN_MODULE_BODY`] and counts the runs.
+    struct OwnModule(fn() -> Vec<IntegrationEndpoint>);
+
+    #[async_trait::async_trait(?Send)]
+    impl IntegrationProxy for OwnModule {
+        fn integration_name(&self) -> &'static str {
+            OWN_MODULE_ID
+        }
+
+        fn routes(&self) -> Vec<IntegrationEndpoint> {
+            (self.0)()
+        }
+
+        async fn handle(
+            &self,
+            _call: ModuleCall<'_>,
+            _req: Request,
+        ) -> Result<Response, Report<TrustedServerError>> {
+            OWN_MODULE_RUNS.fetch_add(1, Ordering::SeqCst);
+            Ok(Response::new(Body::from(OWN_MODULE_BODY)))
+        }
+    }
+
+    /// The registration of the test's own module, declaring `routes`.
+    fn declaring(
+        routes: fn() -> Vec<IntegrationEndpoint>,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder(OWN_MODULE_ID)
+                .with_proxy(Arc::new(OwnModule(routes)))
+                .build(),
+        ))
+    }
+
+    /// The test's own module declaring `GET` on the probe's own path.
+    fn declaring_the_probe_s_path(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        declaring(|| vec![IntegrationEndpoint::get(seam_probe::SEAM_PROBE_OWN_PATH)])
+    }
+
+    /// The test's own module declaring `GET` and `POST` on the inspection
+    /// page's path.
+    fn declaring_the_config_page(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        declaring(|| {
+            vec![
+                IntegrationEndpoint::get(CONFIG_PAGE_PATH),
+                IntegrationEndpoint::post(CONFIG_PAGE_PATH),
+            ]
+        })
+    }
+
+    /// A builder for the test's own module, built by `register`.
+    fn own_module(register: IntegrationBuilderFn) -> IntegrationBuilder {
+        IntegrationBuilder::new(OWN_MODULE_ID, "own-module-test", register, |settings| {
+            Ok(settings.selects_module(OWN_MODULE_NAME))
+        })
+        .with_module_name(OWN_MODULE_NAME)
+    }
+
+    /// Sends one request with `method` to `path`, carrying the probe's
+    /// counting header when `token` is given.
+    fn send(router: &RouterService, method: Method, path: &str, token: Option<&str>) -> Response {
+        let mut builder = request_builder()
+            .method(method)
+            .uri(format!("https://test-publisher.com{path}"));
+        if let Some(token) = token {
+            builder = builder.header(seam_probe::SEAM_PROBE_COUNT_HEADER, token);
+        }
+        let request = builder.body(Body::empty()).expect("should build request");
+        block_on(router.oneshot(request)).expect("should route request")
+    }
+
+    /// The response's `Content-Type`.
+    fn content_type(response: &Response) -> Option<&str> {
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+    }
+
+    /// A router with the probe selected.
+    fn probe_router() -> RouterService {
+        router_with(
+            settings_with(&format!("{HMAC_BLOCK}{PROBE_BLOCK}")),
+            &[seam_probe::builder()],
+        )
+    }
+
+    #[test]
+    fn a_get_of_the_probe_s_own_path_answers_from_the_module() {
+        let response = send(
+            &probe_router(),
+            Method::GET,
+            seam_probe::SEAM_PROBE_OWN_PATH,
+            None,
+        );
+
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "the module's route should answer"
+        );
+        assert_eq!(content_type(&response), Some("text/plain"));
+        assert_eq!(
+            body_text(response),
+            seam_probe::SEAM_PROBE_OWN_BODY,
+            "should carry the module's body"
+        );
+    }
+
+    #[test]
+    fn a_head_of_the_probe_s_own_path_answers_with_no_body() {
+        let response = send(
+            &probe_router(),
+            Method::HEAD,
+            seam_probe::SEAM_PROBE_OWN_PATH,
+            None,
+        );
+
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "the module's HEAD route should answer"
+        );
+        assert_eq!(content_type(&response), Some("text/plain"));
+        assert_eq!(body_text(response), "", "should carry no body");
+    }
+
+    /// The probe declares no `POST` on its own path, so a `POST` there goes
+    /// to the publisher path and the module's handler never runs.
+    #[test]
+    fn a_post_of_the_probe_s_own_path_never_reaches_the_module() {
+        const TOKEN: &str = "fastly-own-path-post";
+
+        let response = send(
+            &probe_router(),
+            Method::POST,
+            seam_probe::SEAM_PROBE_OWN_PATH,
+            Some(TOKEN),
+        );
+
+        assert_eq!(
+            seam_probe::prepare_runs_for(TOKEN),
+            1,
+            "the preparers should run once, so the token reached the modules"
+        );
+        assert_eq!(
+            seam_probe::own_path_runs_for(TOKEN),
+            0,
+            "the module's handler should not run for a method it does not declare"
+        );
+        assert_ne!(
+            body_text(response),
+            seam_probe::SEAM_PROBE_OWN_BODY,
+            "the answer should not be the module's"
+        );
+    }
+
+    #[test]
+    fn a_second_get_route_on_the_probe_s_own_path_is_refused() {
+        let settings = settings_with(&format!(
+            r#"{HMAC_BLOCK}
+        [testing]
+        modules = ["seam-probe", "own-module"]
+
+        [testing.seam-probe]
+        country = "ZZ"
+        "#
+        ));
+
+        let error = build_state_with_registrations(
+            settings,
+            &[
+                seam_probe::builder(),
+                own_module(declaring_the_probe_s_path),
+            ],
+        )
+        .err()
+        .expect("should refuse a second GET route on the probe's own path");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!(
+                "Integration route registration failed for GET {}",
+                seam_probe::SEAM_PROBE_OWN_PATH
+            )),
+            "should name the method and the path: {message}"
+        );
+    }
+
+    /// The adapter answers `GET /_ts/config` itself, so a module's route
+    /// there never runs, and it has no route of its own for `POST` there, so
+    /// the same module's route for that method runs.
+    #[test]
+    fn a_module_route_runs_only_where_the_adapter_answers_no_route_of_its_own() {
+        let router = router_with(
+            settings_with(&format!(
+                r#"{HMAC_BLOCK}
+        [testing]
+        modules = ["own-module"]
+        "#
+            )),
+            &[own_module(declaring_the_config_page)],
+        );
+
+        let page = send(&router, Method::GET, CONFIG_PAGE_PATH, None);
+        assert_eq!(
+            page.status().as_u16(),
+            200,
+            "the inspection page should answer"
+        );
+        assert_eq!(content_type(&page), Some("text/html; charset=utf-8"));
+        assert_ne!(body_text(page), OWN_MODULE_BODY);
+        assert_eq!(
+            OWN_MODULE_RUNS.load(Ordering::SeqCst),
+            0,
+            "the module's GET route should never run"
+        );
+
+        let posted = send(&router, Method::POST, CONFIG_PAGE_PATH, None);
+        assert_eq!(
+            posted.status().as_u16(),
+            200,
+            "the module's POST route should answer"
+        );
+        assert_eq!(body_text(posted), OWN_MODULE_BODY);
+        assert_eq!(
+            OWN_MODULE_RUNS.load(Ordering::SeqCst),
+            1,
+            "the module's POST route should run once"
+        );
+    }
+}
+
 /// A demand source a crate outside core supplies builds this adapter's state,
 /// and the same settings are refused without that crate's builder.
 #[test]

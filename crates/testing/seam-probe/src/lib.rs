@@ -15,8 +15,7 @@
 //! reports internal request state over an unauthenticated route, serves a
 //! browser module that does nothing useful, and resolves location from static
 //! configuration rather than from the request. It is a development dependency
-//! of the Axum and Fastly adapters only, so no adapter's production build
-//! reaches it.
+//! of the four adapters only, so no adapter's production build reaches it.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -27,7 +26,7 @@ use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
 use http::header::{self, HeaderValue};
-use http::{Request, Response};
+use http::{Method, Request, Response};
 use serde::Deserialize;
 use serde_json::json;
 use trusted_server_core::auction::demand::{
@@ -79,6 +78,13 @@ pub const SEAM_PROBE_REPORT_PATH: &str = "/integrations/seam_probe/report";
 /// Path suffix of the report route, relative to the proxy prefix.
 const REPORT_ROUTE_SUFFIX: &str = "/report";
 
+/// Path of the probe's route outside `/integrations/`, which the proxy
+/// declares as written rather than beneath its prefix.
+pub const SEAM_PROBE_OWN_PATH: &str = "/seam-probe/own-path";
+
+/// Body the probe answers a `GET` of [`SEAM_PROBE_OWN_PATH`] with.
+pub const SEAM_PROBE_OWN_BODY: &str = "answered by the seam probe";
+
 /// The browser module this registration carries, built outside
 /// `trusted-server-js`.
 pub const PROBE_JS: &str = include_str!("../js/probe.js");
@@ -97,7 +103,8 @@ pub const PROBE_JS_SHA256: &str =
 pub const SEAM_PROBE_COUNTRY_MESSAGE: &str =
     "`[testing.seam-probe] country` must be exactly two letters";
 
-/// Request header a caller sets to have the preparer count that request.
+/// Request header a caller sets to have the preparer, and the handler of
+/// [`SEAM_PROBE_OWN_PATH`], count that request.
 ///
 /// The header's value is a token the caller chooses, so tests running in
 /// parallel count into separate entries.
@@ -112,6 +119,11 @@ pub const SEAM_PROBE_COUNT_HEADER: &str = "x-seam-probe-count";
 static PREPARE_COUNTS: LazyLock<Mutex<BTreeMap<String, usize>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
+/// How many times the handler of [`SEAM_PROBE_OWN_PATH`] ran for each
+/// counting token, so a caller can tell that a request never reached it.
+static OWN_PATH_COUNTS: LazyLock<Mutex<BTreeMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
 /// How many times the preparer ran for requests carrying `token` in
 /// [`SEAM_PROBE_COUNT_HEADER`].
 ///
@@ -120,9 +132,25 @@ static PREPARE_COUNTS: LazyLock<Mutex<BTreeMap<String, usize>>> =
 /// Panics when the counter's lock is poisoned.
 #[must_use]
 pub fn prepare_runs_for(token: &str) -> usize {
-    PREPARE_COUNTS
+    runs_for(&PREPARE_COUNTS, token)
+}
+
+/// How many times the handler of [`SEAM_PROBE_OWN_PATH`] ran for requests
+/// carrying `token` in [`SEAM_PROBE_COUNT_HEADER`].
+///
+/// # Panics
+///
+/// Panics when the counter's lock is poisoned.
+#[must_use]
+pub fn own_path_runs_for(token: &str) -> usize {
+    runs_for(&OWN_PATH_COUNTS, token)
+}
+
+/// The runs `counts` holds for `token`.
+fn runs_for(counts: &Mutex<BTreeMap<String, usize>>, token: &str) -> usize {
+    counts
         .lock()
-        .expect("should lock the seam probe prepare counts")
+        .expect("should lock a seam probe counter")
         .get(token)
         .copied()
         .unwrap_or(0)
@@ -130,6 +158,12 @@ pub fn prepare_runs_for(token: &str) -> usize {
 
 /// Records one preparer run against the token the request carries, if any.
 fn count_prepare_run(request: &Request<EdgeBody>) {
+    count_run(&PREPARE_COUNTS, request);
+}
+
+/// Records one run in `counts` against the token the request carries, if
+/// any.
+fn count_run(counts: &Mutex<BTreeMap<String, usize>>, request: &Request<EdgeBody>) {
     let Some(token) = request
         .headers()
         .get(SEAM_PROBE_COUNT_HEADER)
@@ -137,9 +171,7 @@ fn count_prepare_run(request: &Request<EdgeBody>) {
     else {
         return;
     };
-    let mut counts = PREPARE_COUNTS
-        .lock()
-        .expect("should lock the seam probe prepare counts");
+    let mut counts = counts.lock().expect("should lock a seam probe counter");
     *counts.entry(token.to_string()).or_insert(0) += 1;
 }
 
@@ -557,6 +589,24 @@ impl SeamProbeProxy {
         );
         Ok(response)
     }
+
+    /// Answers [`SEAM_PROBE_OWN_PATH`] and counts the run against the
+    /// request's token. A `HEAD` answer carries the headers a `GET` answer
+    /// carries and no body, which the handler leaves out itself because
+    /// nothing in core, the adapters or `EdgeZero` strips one.
+    fn own_path(&self, req: &Request<EdgeBody>) -> Response<EdgeBody> {
+        count_run(&OWN_PATH_COUNTS, req);
+        let body = if req.method() == Method::HEAD {
+            EdgeBody::empty()
+        } else {
+            EdgeBody::from(SEAM_PROBE_OWN_BODY)
+        };
+        let mut response = Response::new(body);
+        response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        response
+    }
 }
 
 #[async_trait(?Send)]
@@ -566,7 +616,11 @@ impl IntegrationProxy for SeamProbeProxy {
     }
 
     fn routes(&self) -> Vec<IntegrationEndpoint> {
-        vec![self.get(REPORT_ROUTE_SUFFIX)]
+        vec![
+            self.get(REPORT_ROUTE_SUFFIX),
+            IntegrationEndpoint::get(SEAM_PROBE_OWN_PATH),
+            IntegrationEndpoint::new(Method::HEAD, SEAM_PROBE_OWN_PATH),
+        ]
     }
 
     async fn handle(
@@ -574,6 +628,9 @@ impl IntegrationProxy for SeamProbeProxy {
         call: trusted_server_core::module_context::ModuleCall<'_>,
         req: Request<EdgeBody>,
     ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        if req.uri().path() == SEAM_PROBE_OWN_PATH {
+            return Ok(call.inject_with(self, &req, Self::own_path)?);
+        }
         call.inject_with(self, req, Self::route)?.await
     }
 }
@@ -1019,12 +1076,21 @@ mod tests {
 
     #[test]
     fn report_route_is_the_documented_path() {
-        let routes = SeamProbeProxy.routes();
+        let routes: Vec<(Method, String)> = SeamProbeProxy
+            .routes()
+            .into_iter()
+            .map(|route| (route.method, route.path))
+            .collect();
 
-        assert_eq!(routes.len(), 1, "should register exactly one route");
         assert_eq!(
-            routes[0].path, SEAM_PROBE_REPORT_PATH,
-            "should route the documented report path"
+            routes,
+            [
+                (Method::GET, SEAM_PROBE_REPORT_PATH.to_owned()),
+                (Method::GET, SEAM_PROBE_OWN_PATH.to_owned()),
+                (Method::HEAD, SEAM_PROBE_OWN_PATH.to_owned()),
+            ],
+            "should route the documented report path, and the probe's own path for GET and \
+             HEAD"
         );
     }
 
