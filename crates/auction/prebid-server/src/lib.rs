@@ -2898,10 +2898,6 @@ mod tests {
     struct PredictOnlyBackend;
 
     impl PlatformBackend for PredictOnlyBackend {
-        fn naming_policy(&self) -> trusted_server_core::platform::BackendNamingPolicy {
-            trusted_server_core::platform::BackendNamingPolicy::Axum
-        }
-
         fn predict_name(
             &self,
             spec: &PlatformBackendSpec,
@@ -7449,7 +7445,6 @@ mod engine_tests {
     };
     use trusted_server_core::consent::jurisdiction::Jurisdiction;
     use trusted_server_core::consent::{ConsentContext, ConsentSource, SignalRecord, SignalStatus};
-    use trusted_server_core::platform::BackendNamingPolicy;
     use trusted_server_core::platform::test_support::{
         NamingBackend, StubHttpClient, build_services_with_backend_and_http_client,
     };
@@ -8089,7 +8084,7 @@ mod engine_tests {
             }))
             .expect("should serialize PBS response b"),
         );
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Fastly));
+        let backend = Arc::new(NamingBackend::new());
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
             Arc::clone(&http) as Arc<_>,

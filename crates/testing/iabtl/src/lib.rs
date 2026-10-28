@@ -1097,9 +1097,8 @@ mod tests {
 
     use sha2::{Digest as _, Sha256};
     use trusted_server_core::platform::{
-        BackendNamingPolicy, ClientInfo, DisabledGeo, PlatformBackend, PlatformBackendSpec,
-        PlatformConfigStore, PlatformSecretStore, StoreId, StoreName, UnavailableHttpClient,
-        UnavailableKvStore,
+        ClientInfo, DisabledGeo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
+        PlatformSecretStore, StoreId, StoreName, UnavailableHttpClient, UnavailableKvStore,
     };
 
     /// Config store that answers nothing, so a test can build
@@ -1162,10 +1161,6 @@ mod tests {
     struct StubBackend;
 
     impl PlatformBackend for StubBackend {
-        fn naming_policy(&self) -> BackendNamingPolicy {
-            BackendNamingPolicy::Axum
-        }
-
         fn predict_name(
             &self,
             _spec: &PlatformBackendSpec,

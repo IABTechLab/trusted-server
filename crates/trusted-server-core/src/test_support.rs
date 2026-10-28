@@ -549,10 +549,10 @@ pub mod nextjs_auction {
 
     use crate::geo::GeoInfo;
     use crate::platform::{
-        BackendNamingPolicy, ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
-        PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
-        PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult,
-        RuntimeServices, StoreId, StoreName, UnavailableKvStore,
+        ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
+        PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
+        PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
+        StoreName, UnavailableKvStore,
     };
     use crate::settings::Settings;
 
@@ -846,10 +846,6 @@ pub mod nextjs_auction {
     }
 
     impl PlatformBackend for FixtureStore {
-        fn naming_policy(&self) -> BackendNamingPolicy {
-            BackendNamingPolicy::Axum
-        }
-
         fn predict_name(
             &self,
             _spec: &PlatformBackendSpec,

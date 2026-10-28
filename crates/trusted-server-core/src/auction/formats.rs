@@ -27,9 +27,7 @@ use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::module_context::{ModuleContext, ModuleRequest};
 use crate::permissions::PermissionState;
-use crate::platform::{
-    BackendNamingPolicy, PlatformBackend, PlatformBackendSpec, PlatformError, RuntimeServices,
-};
+use crate::platform::{PlatformBackend, PlatformBackendSpec, PlatformError, RuntimeServices};
 use crate::settings::Settings;
 
 use super::orchestrator::OrchestrationResult;
@@ -672,10 +670,6 @@ impl CappedBackend {
 }
 
 impl PlatformBackend for CappedBackend {
-    fn naming_policy(&self) -> BackendNamingPolicy {
-        self.inner.naming_policy()
-    }
-
     fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
         self.inner.predict_name(&self.capped(spec))
     }
@@ -687,6 +681,14 @@ impl PlatformBackend for CappedBackend {
     fn canonicalize_transport_timeout_ms(&self, remaining_ms: u32, configured_ms: u32) -> u32 {
         self.inner
             .canonicalize_transport_timeout_ms(remaining_ms, configured_ms)
+    }
+
+    fn auction_backend_budget(&self) -> Option<usize> {
+        self.inner.auction_backend_budget()
+    }
+
+    fn transport_timeout_bucket_count(&self, configured_ms: u32) -> usize {
+        self.inner.transport_timeout_bucket_count(configured_ms)
     }
 }
 

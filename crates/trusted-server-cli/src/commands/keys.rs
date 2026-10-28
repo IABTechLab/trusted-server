@@ -17,9 +17,9 @@ use std::sync::{Arc, OnceLock};
 use error_stack::Report;
 use trusted_server_core::permissions::PermissionPolicy;
 use trusted_server_core::platform::{
-    BackendNamingPolicy, ClientInfo, DisabledGeo, PlatformBackend, PlatformBackendSpec,
-    PlatformConfigStore, PlatformError, PlatformGeoModule, PlatformSecretStore, RuntimeServices,
-    StoreId, StoreName, UnavailableHttpClient, UnavailableKvStore,
+    ClientInfo, DisabledGeo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
+    PlatformError, PlatformGeoModule, PlatformSecretStore, RuntimeServices, StoreId, StoreName,
+    UnavailableHttpClient, UnavailableKvStore,
 };
 use trusted_server_core::request_signing::rotation::KeyRotationManager;
 use trusted_server_core::request_signing::{kid_is_creatable, kid_is_well_formed};
@@ -266,10 +266,6 @@ impl PlatformSecretStore for FastlySecretStore {
 struct NoBackend;
 
 impl PlatformBackend for NoBackend {
-    fn naming_policy(&self) -> BackendNamingPolicy {
-        BackendNamingPolicy::Axum
-    }
-
     fn predict_name(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
         Err(Report::new(PlatformError::Unsupported))
     }

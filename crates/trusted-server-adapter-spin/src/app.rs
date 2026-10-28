@@ -226,7 +226,7 @@ fn build_state_with_registrations_and_services(
     // here. Compiling without them would drop the implementation and report the
     // name as one no builder registers.
     let plan = Arc::new(compile_auction_plan_with(&settings, integrations)?);
-    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Spin)?;
+    plan.validate_for_target(&crate::platform::auction_target())?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan))?;
     let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?
         .with_platform(PlatformIdentity::named("spin"));

@@ -6,17 +6,18 @@ use error_stack::{Report, ResultExt};
 use fastly::{ConfigStore, Request, SecretStore};
 use std::io::Read as _;
 use std::net::IpAddr;
+use std::sync::Arc;
 
-use crate::backend::BackendConfig;
+use crate::backend::{self, BackendConfig};
 use trusted_server_core::permissions::PolicyReference;
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
-    BackendNamingPolicy, ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformCacheIntent,
-    PlatformConfigStore, PlatformError, PlatformHttpClient, PlatformHttpRequest,
-    PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions,
-    PlatformImageOptimizerParams, PlatformImageOptimizerRegion, PlatformPendingRequest,
-    PlatformPolicySource, PlatformResponse, PlatformSecretStore, PlatformSelectResult, StoreId,
-    StoreName, policy_entry_text, policy_key,
+    AuctionTargetCapabilities, AuctionTargetDescriptor, ClientInfo, PlatformBackend,
+    PlatformBackendSpec, PlatformCacheIntent, PlatformConfigStore, PlatformError,
+    PlatformHttpClient, PlatformHttpRequest, PlatformImageOptimizerCrop,
+    PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions, PlatformImageOptimizerParams,
+    PlatformImageOptimizerRegion, PlatformPendingRequest, PlatformPolicySource, PlatformResponse,
+    PlatformSecretStore, PlatformSelectResult, StoreId, StoreName, policy_entry_text, policy_key,
 };
 use trusted_server_core::settings::TrustedClientIpConfig;
 use trusted_server_core::settings_data::resolve_fastly_chunk_pointer;
@@ -166,15 +167,14 @@ impl PlatformSecretStore for FastlyPlatformSecretStore {
 
 /// Fastly dynamic-backend implementation of [`PlatformBackend`].
 ///
-/// Delegates name computation and registration to [`BackendConfig`], preserving
-/// the existing deterministic naming scheme (scheme + host + port + cert +
-/// timeout → unique name).
+/// Delegates naming and registration to [`BackendConfig`], and answers the
+/// transport timer, the backend budget and the timer buckets from the same
+/// policy in `backend`, so the names startup validation predicts through
+/// [`auction_target`] are the names this registers.
 pub struct FastlyPlatformBackend;
 
 #[cfg(test)]
-const TRANSPORT_TIMEOUT_QUANTUM_MS: u32 = 250;
-#[cfg(test)]
-const SUB_QUANTUM_LADDER_MS: [u32; 4] = [200, 150, 100, 50];
+use crate::backend::{SUB_QUANTUM_LADDER_MS, TRANSPORT_TIMEOUT_QUANTUM_MS};
 
 fn backend_config_from_spec(spec: &PlatformBackendSpec) -> BackendConfig<'_> {
     BackendConfig::new(&spec.scheme, &spec.host)
@@ -187,10 +187,6 @@ fn backend_config_from_spec(spec: &PlatformBackendSpec) -> BackendConfig<'_> {
 }
 
 impl PlatformBackend for FastlyPlatformBackend {
-    fn naming_policy(&self) -> BackendNamingPolicy {
-        BackendNamingPolicy::Fastly
-    }
-
     fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
         // Use the same host normalization as registration. In particular,
         // URL-derived IPv6 hosts arrive bracketed, but both forms must predict
@@ -205,6 +201,29 @@ impl PlatformBackend for FastlyPlatformBackend {
             .ensure()
             .change_context(PlatformError::Backend)
     }
+
+    fn canonicalize_transport_timeout_ms(&self, remaining_ms: u32, configured_ms: u32) -> u32 {
+        backend::canonicalize_transport_timeout_ms(remaining_ms, configured_ms)
+    }
+
+    fn auction_backend_budget(&self) -> Option<usize> {
+        Some(backend::AUCTION_BACKEND_BUDGET)
+    }
+
+    fn transport_timeout_bucket_count(&self, configured_ms: u32) -> usize {
+        backend::transport_timeout_bucket_count(configured_ms)
+    }
+}
+
+/// This adapter as auction plan validation sees it. Fastly can fan out to
+/// several providers at once, and its first-byte and between-byte timers are
+/// not a total request deadline.
+pub(crate) fn auction_target() -> AuctionTargetDescriptor {
+    AuctionTargetDescriptor::new(
+        "fastly",
+        Arc::new(FastlyPlatformBackend),
+        AuctionTargetCapabilities::new(true, false),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1273,9 +1292,14 @@ mod tests {
     #[test]
     fn auction_http_capabilities_are_explicit() {
         let client = FastlyPlatformHttpClient;
-        let capabilities = trusted_server_core::platform::AuctionTargetId::Fastly
-            .descriptor()
-            .capabilities();
+        let target = auction_target();
+        let capabilities = target.capabilities();
+        assert_eq!(target.id(), "fastly");
+        assert_eq!(
+            target.backend().auction_backend_budget(),
+            Some(160),
+            "the auction keeps 160 of the 200 dynamic backend names"
+        );
         assert!(client.supports_concurrent_fanout());
         assert!(capabilities.supports_concurrent_provider_fanout());
         assert!(!client.has_enforceable_total_request_deadline());

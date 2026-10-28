@@ -47,7 +47,7 @@ use trusted_server_core::middleware::{
     MiddlewareContext, MiddlewarePhase,
 };
 use trusted_server_core::platform::{
-    BackendNamingPolicy, ClientInfo, GeoInfo, PlatformBackend,
+    ClientInfo, GeoInfo, PlatformBackend,
     PlatformBackendSpec, PlatformConfigStore, PlatformError, PlatformGeo, PlatformGeoModule,
     PlatformSecretStore, RuntimeServices, StoreId, StoreName,
     UnavailableHttpClient, UnavailableKvStore,
@@ -112,10 +112,6 @@ impl PlatformSecretStore for ReadOnlyStore {
 struct FixtureBackend;
 
 impl PlatformBackend for FixtureBackend {
-    fn naming_policy(&self) -> BackendNamingPolicy {
-        BackendNamingPolicy::Axum
-    }
-
     fn predict_name(
         &self,
         spec: &PlatformBackendSpec,

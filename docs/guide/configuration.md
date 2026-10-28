@@ -1707,6 +1707,12 @@ See [First-Party Proxy](/guide/first-party-proxy#proxy-allowlist) for usage deta
 
 Set this to `false` only for local development with self-signed certificates.
 
+Only the Fastly adapter honors `false`. The Axum adapter always verifies
+certificates, and logs a warning at startup when the setting is `false`. The
+Cloudflare and Spin adapters use the setting only in the name each gives a
+backend, because the HTTP client each platform provides has no option to turn
+verification off, and they log nothing about it.
+
 ### `[[proxy.asset_routes]]`
 
 Asset routes proxy selected first-party paths to an alternate asset origin without requiring signed `/first-party/proxy` URLs.

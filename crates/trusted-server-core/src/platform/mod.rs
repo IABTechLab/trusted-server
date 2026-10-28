@@ -37,7 +37,7 @@
 
 use std::time::Duration;
 
-mod backend_naming;
+mod auction_target;
 mod cache_headers;
 mod error;
 mod geo;
@@ -63,10 +63,7 @@ mod traits;
 mod types;
 mod value_cache;
 
-pub use backend_naming::{
-    AuctionTargetCapabilities, AuctionTargetDescriptor, AuctionTargetId, BackendNamingError,
-    BackendNamingPolicy, PredictedBackend,
-};
+pub use auction_target::{AuctionTargetCapabilities, AuctionTargetDescriptor};
 pub use cache_headers::{declare_platform_cache_headers, platform_cache_headers};
 pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformKvStore};
 pub use error::PlatformError;

@@ -326,7 +326,7 @@ mod plan_sharing_tests {
     }
 
     #[test]
-    fn cloudflare_and_spin_reject_multi_provider_plans_before_runtime_construction() {
+    fn a_target_without_fanout_rejects_multi_provider_plans_before_runtime_construction() {
         let mut settings = create_test_settings();
         settings.auction.enabled = true;
         settings.demand = demand_named(
@@ -335,18 +335,18 @@ mod plan_sharing_tests {
         );
         let plan = compile_auction_plan(&settings).expect("should compile target-independent plan");
 
-        for target in [
-            crate::platform::AuctionTargetId::Cloudflare,
-            crate::platform::AuctionTargetId::Spin,
-        ] {
-            let error = plan
-                .validate_for_target(target)
-                .expect_err("should reject unsupported multi-provider fanout");
-            assert!(
-                error
-                    .to_string()
-                    .contains("does not support concurrent provider fanout")
-            );
-        }
+        let one_at_a_time = crate::platform::AuctionTargetDescriptor::new(
+            "one-at-a-time",
+            Arc::new(crate::platform::test_support::NamingBackend::new()),
+            crate::platform::AuctionTargetCapabilities::new(false, false),
+        );
+        let error = plan
+            .validate_for_target(&one_at_a_time)
+            .expect_err("should reject unsupported multi-provider fanout");
+        assert!(
+            error
+                .to_string()
+                .contains("does not support concurrent provider fanout")
+        );
     }
 }

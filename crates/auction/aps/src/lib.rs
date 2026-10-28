@@ -3627,10 +3627,10 @@ mod engine_tests {
         AdFormat, AdSlot, AuctionContext, AuctionRequest, BidStatus, MediaType, PublisherInfo,
         UserInfo,
     };
+    use trusted_server_core::platform::PlatformResponse;
     use trusted_server_core::platform::test_support::{
         NamingBackend, StubHttpClient, build_services_with_backend_and_http_client,
     };
-    use trusted_server_core::platform::{BackendNamingPolicy, PlatformResponse};
     use trusted_server_core::test_support::tests::create_test_settings;
 
     use super::{APS_RENDERER_TYPE, ApsRendererV1, MODULE, builder};
@@ -4131,7 +4131,7 @@ mod engine_tests {
     async fn planned_aps_transport_omits_accept_header() {
         let http = Arc::new(StubHttpClient::new());
         http.push_response(400, Vec::new());
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Fastly));
+        let backend = Arc::new(NamingBackend::new());
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
             Arc::clone(&http) as Arc<_>,
@@ -4212,7 +4212,7 @@ mod engine_tests {
                 ("authorization", "fictional-secret"),
             ],
         );
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Fastly));
+        let backend = Arc::new(NamingBackend::new());
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
             Arc::clone(&http) as Arc<_>,
@@ -4336,7 +4336,7 @@ mod engine_tests {
                 .expect("should serialize APS instance response"),
             );
         }
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Fastly));
+        let backend = Arc::new(NamingBackend::new());
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
             Arc::clone(&http) as Arc<_>,
@@ -4573,7 +4573,7 @@ mod engine_tests {
         let (profile, provider_id) = ("aps", "aps_instance");
         let http = Arc::new(StubHttpClient::new());
         http.push_response(200, vec![b'x'; 1024 * 1024 + 1]);
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let backend = Arc::new(NamingBackend::new());
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
             Arc::clone(&http) as Arc<_>,

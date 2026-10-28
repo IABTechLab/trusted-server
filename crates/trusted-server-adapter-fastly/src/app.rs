@@ -344,7 +344,7 @@ pub(crate) fn build_state_with_registrations(
     // here. Compiling without them would drop the implementation and report the
     // name as one no builder registers.
     let plan = Arc::new(compile_auction_plan_with(&settings, integrations)?);
-    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Fastly)?;
+    plan.validate_for_target(&crate::platform::auction_target())?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan))?;
     let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?
         .with_platform(fastly_platform_identity());
@@ -3115,10 +3115,6 @@ mod tests {
     struct FixedBackend;
 
     impl PlatformBackend for FixedBackend {
-        fn naming_policy(&self) -> trusted_server_core::platform::BackendNamingPolicy {
-            trusted_server_core::platform::BackendNamingPolicy::Fastly
-        }
-
         fn predict_name(
             &self,
             spec: &PlatformBackendSpec,

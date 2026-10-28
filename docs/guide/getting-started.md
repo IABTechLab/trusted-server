@@ -142,7 +142,8 @@ values in the TOML config, config-store blob, or a source-controlled environment
 file.
 
 > **Dev server limitations:** The Axum adapter does not support KV store or
-> geo lookup.
+> geo lookup, and always verifies HTTPS origin certificates whatever
+> `proxy.certificate_check` says.
 > See [Architecture](/guide/architecture) for the full list.
 
 ### Build the Project

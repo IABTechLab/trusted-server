@@ -15,8 +15,8 @@ use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::key_value_store::{KvError, KvPage, KvStore};
 use error_stack::Report;
 use trusted_server_core::platform::{
-    BackendNamingPolicy, ClientInfo, DisabledGeo, PlatformBackend, PlatformBackendSpec,
-    PlatformConfigStore, PlatformError, PlatformGeoModule, PlatformHttpClient, PlatformHttpRequest,
+    ClientInfo, DisabledGeo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
+    PlatformError, PlatformGeoModule, PlatformHttpClient, PlatformHttpRequest,
     PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult,
     PlatformValueCache, RuntimeServices, StoreId, StoreName, UnavailableKvStore,
 };
@@ -71,10 +71,6 @@ impl PlatformSecretStore for StubStore {
 pub struct ResolvingBackend;
 
 impl PlatformBackend for ResolvingBackend {
-    fn naming_policy(&self) -> BackendNamingPolicy {
-        BackendNamingPolicy::Axum
-    }
-
     fn predict_name(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
         Ok("fiftyone_degrees_test".to_owned())
     }

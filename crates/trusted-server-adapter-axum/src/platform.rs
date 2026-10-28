@@ -11,10 +11,10 @@ use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, header};
 use error_stack::{Report, ResultExt as _};
 use trusted_server_core::permissions::PolicyReference;
 use trusted_server_core::platform::{
-    BackendNamingPolicy, ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec,
-    PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
-    PlatformPendingRequest, PlatformPolicySource, PlatformResponse, PlatformSecretStore,
-    PlatformSelectResult, RuntimeServices, StoreId, StoreName,
+    AuctionTargetCapabilities, AuctionTargetDescriptor, ClientInfo, GeoInfo, PlatformBackend,
+    PlatformBackendSpec, PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient,
+    PlatformHttpRequest, PlatformPendingRequest, PlatformPolicySource, PlatformResponse,
+    PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId, StoreName,
 };
 
 // ---------------------------------------------------------------------------
@@ -233,24 +233,50 @@ fn is_plain_file_stem(name: &str) -> bool {
 /// No-op backend for the Axum dev server.
 ///
 /// Returns a deterministic name; `ensure` is a no-op returning the same name.
-/// The Axum HTTP client sends directly to URIs and ignores backend names.
+/// The Axum HTTP client sends directly to URIs and ignores backend names, so
+/// the name is a correlation key alone, in the shape of an environment
+/// variable segment, and the transport timer is the exact bounded value.
 pub struct AxumPlatformBackend;
 
-impl PlatformBackend for AxumPlatformBackend {
-    fn naming_policy(&self) -> BackendNamingPolicy {
-        BackendNamingPolicy::Axum
-    }
+/// The correlation name for a backend: scheme, host and port as environment
+/// segments, then the discriminator so two providers behind one host differ.
+fn backend_name(spec: &PlatformBackendSpec) -> String {
+    let port = spec
+        .port
+        .unwrap_or(if spec.scheme == "https" { 443 } else { 80 });
+    let discriminator = spec
+        .discriminator
+        .as_deref()
+        .map(|value| format!("_p_{}", normalize_env_segment(value)))
+        .unwrap_or_default();
+    format!(
+        "{}_{}_{}{}",
+        normalize_env_segment(&spec.scheme),
+        normalize_env_segment(&spec.host),
+        port,
+        discriminator
+    )
+}
 
+impl PlatformBackend for AxumPlatformBackend {
     fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-        self.naming_policy()
-            .predict(spec)
-            .map(|prediction| prediction.name)
-            .change_context(PlatformError::Backend)
+        Ok(backend_name(spec))
     }
 
     fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
         self.predict_name(spec)
     }
+}
+
+/// This adapter as auction plan validation sees it. The dev server can fan
+/// out to several providers at once, and its transport timeout is not a
+/// total request deadline.
+pub(crate) fn auction_target() -> AuctionTargetDescriptor {
+    AuctionTargetDescriptor::new(
+        "axum",
+        Arc::new(AxumPlatformBackend),
+        AuctionTargetCapabilities::new(true, false),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -802,9 +828,14 @@ mod tests {
     #[test]
     fn auction_http_capabilities_are_explicit() {
         let client = AxumPlatformHttpClient::new();
-        let capabilities = trusted_server_core::platform::AuctionTargetId::Axum
-            .descriptor()
-            .capabilities();
+        let target = auction_target();
+        let capabilities = target.capabilities();
+        assert_eq!(target.id(), "axum");
+        assert_eq!(
+            target.backend().auction_backend_budget(),
+            None,
+            "a correlation name is not a limited resource"
+        );
         assert!(client.supports_concurrent_fanout());
         assert!(capabilities.supports_concurrent_provider_fanout());
         assert!(!client.has_enforceable_total_request_deadline());
@@ -812,6 +843,34 @@ mod tests {
             !capabilities.has_enforceable_total_request_deadline(),
             "reqwest's transport timeout is not an adapter-enforced auction deadline"
         );
+    }
+
+    #[test]
+    fn the_backend_name_and_transport_timer_are_pinned() {
+        let backend = AxumPlatformBackend;
+        let spec = PlatformBackendSpec {
+            scheme: "https".to_owned(),
+            host: "origin.example.com".to_owned(),
+            port: None,
+            host_header_override: None,
+            certificate_check: true,
+            first_byte_timeout: Duration::from_millis(1500),
+            between_bytes_timeout: Duration::from_millis(1500),
+            discriminator: Some("provider-one".to_owned()),
+        };
+        assert_eq!(
+            backend
+                .predict_name(&spec)
+                .expect("should name the backend"),
+            "HTTPS_ORIGIN_EXAMPLE_COM_443_p_PROVIDER_ONE"
+        );
+        assert_eq!(
+            backend.ensure(&spec).expect("should register nothing"),
+            "HTTPS_ORIGIN_EXAMPLE_COM_443_p_PROVIDER_ONE"
+        );
+        assert_eq!(backend.canonicalize_transport_timeout_ms(999, 2000), 999);
+        assert_eq!(backend.canonicalize_transport_timeout_ms(2000, 100), 100);
+        assert_eq!(backend.transport_timeout_bucket_count(2000), 1);
     }
 
     #[test]

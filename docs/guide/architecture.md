@@ -53,11 +53,12 @@ Native Axum dev/test adapter (native binary):
 
 **Current limitations compared to the Fastly adapter:**
 
-| Feature                  | Axum dev server                                                                                                                              |
-| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| KV store                 | Unavailable — synthetic-ID and consent routes degrade gracefully                                                                             |
-| Geo lookup               | None, and `[geo] module = "platform"` is refused at startup                                                                                  |
-| Auction fan-out ordering | Requests run concurrently via `tokio::spawn`; `select` returns first-to-complete but does not replicate Fastly's priority-queue tie-breaking |
+| Feature                   | Axum dev server                                                                                                                              |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| KV store                  | Unavailable — synthetic-ID and consent routes degrade gracefully                                                                             |
+| Geo lookup                | None, and `[geo] module = "platform"` is refused at startup                                                                                  |
+| Auction fan-out ordering  | Requests run concurrently via `tokio::spawn`; `select` returns first-to-complete but does not replicate Fastly's priority-queue tie-breaking |
+| `proxy.certificate_check` | `false` is not honored, so HTTPS origin certificates are always verified, and startup logs a warning                                         |
 
 ### trusted-server-adapter-spin
 

@@ -19,7 +19,7 @@ use super::demand::{
     AdServerImplementation, CompiledDemand, DemandImplementation, DemandTimeoutDefault,
 };
 use crate::error::TrustedServerError;
-use crate::platform::{AuctionTargetId, PlatformBackendSpec};
+use crate::platform::{AuctionTargetDescriptor, PlatformBackendSpec};
 use crate::provider_table::{ProviderChoice, ProviderList};
 use crate::settings::RequestSigning;
 
@@ -505,66 +505,67 @@ impl ProviderPlan {
 impl AuctionPlan {
     /// Validate adapter capabilities and backend-name correlation before I/O.
     ///
-    /// Each provider is predicted from a canonical backend specification using
-    /// its exact configured provider timeout as both transport timers and its
-    /// provider ID as the stable discriminator. These transport timers do not
-    /// replace the auction-wide logical budget.
+    /// The target is the adapter's own description of itself, so each
+    /// provider's name is predicted by the backend implementation that will
+    /// register it. Each provider is predicted from a canonical backend
+    /// specification using its exact configured provider timeout as both
+    /// transport timers and its provider ID as the stable discriminator. These
+    /// transport timers do not replace the auction-wide logical budget.
     ///
     /// # Errors
     ///
     /// Returns a configuration error when the target cannot fan out to every
-    /// configured provider, backend prediction fails, or two predicted names
+    /// configured provider, the providers could need more backend names than
+    /// the target allows, backend prediction fails, or two predicted names
     /// collide.
     pub fn validate_for_target(
         &self,
-        target_id: AuctionTargetId,
+        target: &AuctionTargetDescriptor,
     ) -> Result<(), Report<TrustedServerError>> {
         if !self.enabled {
             return Ok(());
         }
-        let target = target_id.descriptor();
         if self.providers.len() > 1 && !target.capabilities().supports_concurrent_provider_fanout()
         {
             return Err(configuration_error(format!(
                 "auction target `{}` does not support concurrent provider fanout; configured {} providers",
-                target_id.adapter_id(),
+                target.id(),
                 self.providers.len()
             )));
         }
 
-        let naming_policy = target.naming_policy();
-        let backend_budget = naming_policy.auction_dynamic_backend_budget();
+        let backend = target.backend();
+        let backend_budget = backend.auction_backend_budget();
         let mut required_backend_names = 0_usize;
         let mut predicted_names = BTreeMap::<String, &ProviderId>::new();
         for provider in &self.providers {
             let reachable_timeout_ms = provider.timeout_ms.min(self.timeout_ms);
             required_backend_names = required_backend_names
-                .saturating_add(naming_policy.transport_timeout_bucket_count(reachable_timeout_ms));
+                .saturating_add(backend.transport_timeout_bucket_count(reachable_timeout_ms));
             if let Some(budget) = backend_budget
                 && required_backend_names > budget
             {
                 return Err(configuration_error(format!(
                     "auction target `{}` requires up to {required_backend_names} dynamic provider backends, exceeding its auction budget of {budget}",
-                    target_id.adapter_id(),
+                    target.id(),
                 )));
             }
             let spec = provider.backend_spec();
-            let prediction =
-                naming_policy
-                    .predict(&spec)
+            let name =
+                backend
+                    .predict_name(&spec)
                     .change_context(TrustedServerError::Configuration {
                         message: format!(
                             "provider `{}` backend prediction failed for target `{}`",
                             provider.id,
-                            target_id.adapter_id()
+                            target.id()
                         ),
                     })?;
-            if let Some(existing) = predicted_names.insert(prediction.name.clone(), &provider.id) {
+            if let Some(existing) = predicted_names.insert(name.clone(), &provider.id) {
                 return Err(configuration_error(format!(
-                    "providers `{existing}` and `{}` predict the same backend name `{}` for target `{}`",
+                    "providers `{existing}` and `{}` predict the same backend name `{name}` for target `{}`",
                     provider.id,
-                    prediction.name,
-                    target_id.adapter_id()
+                    target.id()
                 )));
             }
         }
@@ -818,33 +819,127 @@ mod tests {
         BidderId::from_str(value).expect("should parse bidder ID")
     }
 
-    #[test]
-    fn target_validation_accepts_fanout_and_rejects_unsupported_targets() {
-        let plan = AuctionPlan::compile(config(vec![
+    /// A target described by the backend it names with and whether it can
+    /// call more than one provider at once.
+    fn target(
+        backend: std::sync::Arc<dyn crate::platform::PlatformBackend>,
+        fanout: bool,
+    ) -> crate::platform::AuctionTargetDescriptor {
+        crate::platform::AuctionTargetDescriptor::new(
+            "fixture",
+            backend,
+            crate::platform::AuctionTargetCapabilities::new(fanout, false),
+        )
+    }
+
+    fn two_providers() -> AuctionPlan {
+        AuctionPlan::compile(config(vec![
             ("provider_one", table("auction.plain-fixture")),
             ("provider_two", table("auction.plain-fixture")),
         ]))
-        .expect("should compile plan");
+        .expect("should compile plan")
+    }
 
+    #[test]
+    fn target_validation_accepts_fanout_and_rejects_a_target_without_it() {
+        let plan = two_providers();
+
+        plan.validate_for_target(&target(
+            std::sync::Arc::new(crate::platform::test_support::NamingBackend::new()),
+            true,
+        ))
+        .expect("a target that fans out should accept two providers");
+
+        let error = plan
+            .validate_for_target(&target(
+                std::sync::Arc::new(crate::platform::test_support::NamingBackend::new()),
+                false,
+            ))
+            .expect_err("a target that runs one demand source at a time should refuse fanout");
+        let message = error.to_string();
         assert!(
-            plan.validate_for_target(crate::platform::AuctionTargetId::Fastly)
-                .is_ok(),
-            "Fastly should accept provider fanout"
+            message.contains("`fixture` does not support concurrent provider fanout")
+                && message.contains("configured 2 providers"),
+            "should name the target and the provider count: {message}"
         );
+    }
+
+    #[test]
+    fn target_validation_refuses_more_backend_names_than_the_target_allows() {
+        let plan = two_providers();
+
+        plan.validate_for_target(&target(
+            std::sync::Arc::new(
+                crate::platform::test_support::NamingBackend::new().with_auction_backend_budget(2),
+            ),
+            true,
+        ))
+        .expect("two providers reaching one name each fit a budget of two");
+
+        let error = plan
+            .validate_for_target(&target(
+                std::sync::Arc::new(
+                    crate::platform::test_support::NamingBackend::new()
+                        .with_auction_backend_budget(3)
+                        .with_transport_timeout_buckets(2),
+                ),
+                true,
+            ))
+            .expect_err("two providers reaching two names each exceed a budget of three");
+        let message = error.to_string();
         assert!(
-            plan.validate_for_target(crate::platform::AuctionTargetId::Axum)
-                .is_ok(),
-            "Axum should accept provider fanout"
+            message.contains("requires up to 4 dynamic provider backends")
+                && message.contains("exceeding its auction budget of 3"),
+            "should say how many names the plan needs and how many the target allows: {message}"
         );
-        for target in [
-            crate::platform::AuctionTargetId::Spin,
-            crate::platform::AuctionTargetId::Cloudflare,
-        ] {
-            assert!(
-                plan.validate_for_target(target).is_err(),
-                "{target:?} runs one demand source at a time and should refuse fanout"
-            );
-        }
+    }
+
+    #[test]
+    fn target_validation_reports_a_backend_the_target_cannot_name() {
+        let plan = two_providers();
+
+        let error = plan
+            .validate_for_target(&target(
+                std::sync::Arc::new(crate::platform::test_support::NoopBackend),
+                true,
+            ))
+            .expect_err("a backend that cannot predict a name should fail validation");
+        let message = format!("{error:?}");
+        assert!(
+            message
+                .contains("provider `provider_one` backend prediction failed for target `fixture`"),
+            "should name the provider and the target: {message}"
+        );
+    }
+
+    #[test]
+    fn target_validation_refuses_two_providers_with_one_backend_name() {
+        let plan = two_providers();
+
+        let error = plan
+            .validate_for_target(&target(
+                std::sync::Arc::new(crate::platform::test_support::StubBackend),
+                true,
+            ))
+            .expect_err("a backend naming every provider alike should fail validation");
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "providers `provider_one` and `provider_two` predict the same backend name `stub-backend` for target `fixture`"
+            ),
+            "should name both providers and the shared name: {message}"
+        );
+    }
+
+    #[test]
+    fn a_disabled_plan_validates_against_any_target() {
+        let plan = two_providers().with_enabled(false);
+
+        plan.validate_for_target(&target(
+            std::sync::Arc::new(crate::platform::test_support::StubBackend),
+            false,
+        ))
+        .expect("a disabled auction asks nothing of the target");
     }
 
     #[test]

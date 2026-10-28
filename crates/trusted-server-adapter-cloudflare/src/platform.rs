@@ -5,11 +5,14 @@ use std::time::Duration;
 use bytes::Bytes;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
-use error_stack::{Report, ResultExt as _};
+use error_stack::Report;
+#[cfg(target_arch = "wasm32")]
+use error_stack::ResultExt as _;
 use trusted_server_core::platform::{
-    BackendNamingPolicy, ClientInfo, GeoInfo, KvError, PlatformBackend, PlatformBackendSpec,
-    PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformKvStore,
-    PlatformSecretStore, RuntimeServices, StoreId, StoreName, UnavailableKvStore,
+    AuctionTargetCapabilities, AuctionTargetDescriptor, ClientInfo, GeoInfo, KvError,
+    PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError, PlatformGeo,
+    PlatformHttpClient, PlatformKvStore, PlatformSecretStore, RuntimeServices, StoreId, StoreName,
+    UnavailableKvStore,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -56,23 +59,55 @@ impl PlatformSecretStore for NoopSecretStore {
     }
 }
 
+/// Workers fetch registers no backend, so the name is a correlation key
+/// alone, made from every field of the specification, and the transport
+/// timer is the exact bounded value.
 struct NoopBackend;
 
-impl PlatformBackend for NoopBackend {
-    fn naming_policy(&self) -> BackendNamingPolicy {
-        BackendNamingPolicy::Cloudflare
-    }
+/// The correlation name for a backend, carrying the first-byte timer so two
+/// timers to one host are two backends, as the host's own naming would make
+/// them.
+fn backend_name(spec: &PlatformBackendSpec) -> String {
+    let port = spec
+        .port
+        .unwrap_or(if spec.scheme == "https" { 443 } else { 80 });
+    let cert_suffix = if spec.certificate_check {
+        ""
+    } else {
+        "_nocert"
+    };
+    let discriminator = spec
+        .discriminator
+        .as_deref()
+        .map(|value| format!("_p_{value}"))
+        .unwrap_or_default();
+    format!(
+        "{}_{}_{}_{}ms{cert_suffix}{discriminator}",
+        spec.scheme,
+        spec.host,
+        port,
+        spec.first_byte_timeout.as_millis()
+    )
+}
 
+impl PlatformBackend for NoopBackend {
     fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-        self.naming_policy()
-            .predict(spec)
-            .map(|prediction| prediction.name)
-            .change_context(PlatformError::Backend)
+        Ok(backend_name(spec))
     }
 
     fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
         self.predict_name(spec)
     }
+}
+
+/// This adapter as auction plan validation sees it. Workers fetch runs one
+/// provider request at a time, and it exposes no total request deadline.
+pub(crate) fn auction_target() -> AuctionTargetDescriptor {
+    AuctionTargetDescriptor::new(
+        "cloudflare",
+        Arc::new(NoopBackend),
+        AuctionTargetCapabilities::new(false, false),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -813,14 +848,47 @@ mod tests {
 
     #[test]
     fn auction_http_capabilities_are_explicit() {
-        let capabilities = trusted_server_core::platform::AuctionTargetId::Cloudflare
-            .descriptor()
-            .capabilities();
+        let target = auction_target();
+        let capabilities = target.capabilities();
+        assert_eq!(target.id(), "cloudflare");
+        assert_eq!(
+            target.backend().auction_backend_budget(),
+            None,
+            "a correlation name is not a limited resource"
+        );
         assert!(!capabilities.supports_concurrent_provider_fanout());
         assert!(
             !capabilities.has_enforceable_total_request_deadline(),
             "Workers fetch does not expose an enforceable hard total request deadline"
         );
+    }
+
+    #[test]
+    fn the_backend_name_and_transport_timer_are_pinned() {
+        let backend = NoopBackend;
+        let spec = PlatformBackendSpec {
+            scheme: "https".to_owned(),
+            host: "origin.example.com".to_owned(),
+            port: None,
+            host_header_override: None,
+            certificate_check: true,
+            first_byte_timeout: Duration::from_millis(1500),
+            between_bytes_timeout: Duration::from_millis(1500),
+            discriminator: Some("provider-one".to_owned()),
+        };
+        assert_eq!(
+            backend
+                .predict_name(&spec)
+                .expect("should name the backend"),
+            "https_origin.example.com_443_1500ms_p_provider-one"
+        );
+        assert_eq!(
+            backend.ensure(&spec).expect("should register nothing"),
+            "https_origin.example.com_443_1500ms_p_provider-one"
+        );
+        assert_eq!(backend.canonicalize_transport_timeout_ms(999, 2000), 999);
+        assert_eq!(backend.canonicalize_transport_timeout_ms(2000, 100), 100);
+        assert_eq!(backend.transport_timeout_bucket_count(2000), 1);
     }
     use edgezero_core::http::{HeaderValue, request_builder};
     use edgezero_core::params::PathParams;

@@ -25,9 +25,9 @@ use trusted_server_core::integrations::{
 };
 use trusted_server_core::module_context::{ModuleContext, ModuleRequest};
 use trusted_server_core::platform::{
-    BackendNamingPolicy, ClientInfo, DisabledGeo, PlatformBackend, PlatformBackendSpec,
-    PlatformConfigStore, PlatformError, PlatformGeoModule, PlatformSecretStore, RuntimeServices,
-    StoreId, StoreName, UnavailableHttpClient, UnavailableKvStore,
+    ClientInfo, DisabledGeo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
+    PlatformError, PlatformGeoModule, PlatformSecretStore, RuntimeServices, StoreId, StoreName,
+    UnavailableHttpClient, UnavailableKvStore,
 };
 use trusted_server_core::settings::Settings;
 use trusted_server_core::tsjs::tsjs_script_src;
@@ -1593,10 +1593,6 @@ impl PlatformSecretStore for StubSecretStore {
 struct StubBackend;
 
 impl PlatformBackend for StubBackend {
-    fn naming_policy(&self) -> BackendNamingPolicy {
-        BackendNamingPolicy::Axum
-    }
-
     fn predict_name(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
         Err(Report::new(PlatformError::Unsupported))
     }

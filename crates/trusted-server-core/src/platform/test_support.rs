@@ -132,10 +132,6 @@ impl PlatformSecretStore for HashMapSecretStore {
 pub struct NoopBackend;
 
 impl PlatformBackend for NoopBackend {
-    fn naming_policy(&self) -> super::BackendNamingPolicy {
-        super::BackendNamingPolicy::Axum
-    }
-
     fn predict_name(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
         Err(Report::new(PlatformError::Unsupported))
     }
@@ -182,10 +178,6 @@ impl PlatformHttpClient for NoopHttpClient {
 pub struct StubBackend;
 
 impl PlatformBackend for StubBackend {
-    fn naming_policy(&self) -> super::BackendNamingPolicy {
-        super::BackendNamingPolicy::Axum
-    }
-
     fn predict_name(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
         Ok("stub-backend".to_owned())
     }
@@ -199,11 +191,12 @@ impl PlatformBackend for StubBackend {
 // NamingBackend
 // ---------------------------------------------------------------------------
 
-/// Test stub for [`PlatformBackend`] that names a backend the way the given
-/// policy does, so two demand sources get two names, and records what it was
-/// asked.
+/// Test stub for [`PlatformBackend`] that names a backend from every field
+/// of its specification, so two demand sources get two names and two timers
+/// get two names, and records what it was asked. It declares the backend
+/// budget and the timeout buckets a test gives it, so plan validation can be
+/// driven to each refusal without a host.
 pub struct NamingBackend {
-    pub policy: super::BackendNamingPolicy,
     /// How many names were predicted.
     pub predicted: std::sync::atomic::AtomicUsize,
     /// How many backends were registered or refused.
@@ -212,17 +205,34 @@ pub struct NamingBackend {
     pub specs: Mutex<Vec<PlatformBackendSpec>>,
     /// The discriminators whose registration fails.
     pub fail_ensure_for: Mutex<std::collections::HashSet<String>>,
+    auction_backend_budget: Option<usize>,
+    transport_timeout_buckets: usize,
 }
 
 impl NamingBackend {
-    pub fn new(policy: super::BackendNamingPolicy) -> Self {
+    pub fn new() -> Self {
         Self {
-            policy,
             predicted: std::sync::atomic::AtomicUsize::new(0),
             ensured: std::sync::atomic::AtomicUsize::new(0),
             specs: Mutex::new(Vec::new()),
             fail_ensure_for: Mutex::new(std::collections::HashSet::new()),
+            auction_backend_budget: None,
+            transport_timeout_buckets: 1,
         }
+    }
+
+    /// Declares how many backend names the auction may register.
+    #[must_use]
+    pub fn with_auction_backend_budget(mut self, budget: usize) -> Self {
+        self.auction_backend_budget = Some(budget);
+        self
+    }
+
+    /// Declares how many names one provider reaches through its timeout.
+    #[must_use]
+    pub fn with_transport_timeout_buckets(mut self, buckets: usize) -> Self {
+        self.transport_timeout_buckets = buckets;
+        self
     }
 
     /// Makes registration fail for the source `provider_id`.
@@ -233,23 +243,35 @@ impl NamingBackend {
             .insert(provider_id.to_string());
     }
 
-    fn name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-        self.policy
-            .predict(spec)
-            .map(|prediction| prediction.name)
-            .change_context(PlatformError::Backend)
+    fn name(spec: &PlatformBackendSpec) -> String {
+        let port = spec
+            .port
+            .unwrap_or(if spec.scheme == "https" { 443 } else { 80 });
+        let cert_suffix = if spec.certificate_check {
+            ""
+        } else {
+            "_nocert"
+        };
+        let discriminator = spec
+            .discriminator
+            .as_deref()
+            .map(|value| format!("_p_{value}"))
+            .unwrap_or_default();
+        format!(
+            "{}_{}_{}_{}ms{cert_suffix}{discriminator}",
+            spec.scheme,
+            spec.host,
+            port,
+            spec.first_byte_timeout.as_millis()
+        )
     }
 }
 
 impl PlatformBackend for NamingBackend {
-    fn naming_policy(&self) -> super::BackendNamingPolicy {
-        self.policy
-    }
-
     fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
         self.predicted
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.name(spec)
+        Ok(Self::name(spec))
     }
 
     fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
@@ -267,7 +289,15 @@ impl PlatformBackend for NamingBackend {
             .lock()
             .expect("should lock planned backend specs")
             .push(spec.clone());
-        self.name(spec)
+        Ok(Self::name(spec))
+    }
+
+    fn auction_backend_budget(&self) -> Option<usize> {
+        self.auction_backend_budget
+    }
+
+    fn transport_timeout_bucket_count(&self, _configured_ms: u32) -> usize {
+        self.transport_timeout_buckets
     }
 }
 
