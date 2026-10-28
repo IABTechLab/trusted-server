@@ -195,11 +195,13 @@ can be written, and each extra write is another CAS race between tabs.
 - **G7.** IDs that expire (LiveRamp envelopes) are refreshed, and are never
   sent to bidders or returned by `/_ts/api/v1/identify` after expiry.
 - **G8.** Today's pull sync becomes one implementation of the trait. Its
-  protocol and fill-missing contract are unchanged. Section 10.4 lists the
+  protocol and fill-missing contract are unchanged. It runs only on writer
+  navigations, so it holds for clients that make them (section 2.3). Section 10.4 lists the
   behaviour that does change.
 - **G9.** The trait can model a provider that needs a HEM, even though v1
   has no way to obtain one.
-- **G10.** No browser EID that reaches KV today is lost, within one bound.
+- **G10.** For clients that make writer navigations (section 5.1), no
+  browser EID that reaches KV today is lost, within one bound.
   Browser ingest runs only on the writer request, from `ts-eids`. The shim
   writes only registered sources into `ts-eids` and merges them per source
   (section 5.3), so the next writer request ingests every registered source
@@ -298,6 +300,16 @@ these costs for it:
 - **No provider runs on a new visitor's first navigation.** A visitor who
   leaves after one page never gets a provider ID. Section 15 asks whether
   hold-mode providers should feed the create.
+- **Clients without Fetch Metadata never write.** A writer navigation
+  needs `Sec-Fetch-Dest: document` (section 5.1). Safari before 16.4, older
+  embedded web views and any client that strips the header are stagers
+  forever. For them this is a regression: today's `/auction` ingest writes
+  their body EIDs to KV, and under this design nothing does. Pull sync
+  never runs for them, and orphan recovery, which moves into the writer's
+  phase 1, never runs either. Their consent withdrawals and capture
+  removals still apply (sections 5.1, 5.3). A fallback writer built from
+  `Accept: text/html` and `Upgrade-Insecure-Requests` was rejected because
+  `fetch()` can send both.
 - **Rollback past rollout step 1 is unsupported.** Step 1 writes KV schema
   version 2, which older builds reject (sections 6.1, 14).
 
@@ -358,11 +370,20 @@ follows the same split.
   extensions require `Clone + Send + Sync`, which a pending platform request
   is not (`platform/http.rs:178-183`), so an in-flight provider call cannot
   outlive the router.
-- **The navigation auction is dispatched before the origin fetch**
-  (`publisher.rs:4886-4889`). The origin overlaps the EC preload only when the
-  preload runs, the request has no template-cache key and the platform
-  supports concurrent fan-out and pending streaming responses
-  (`publisher.rs:4832-4844`).
+- **The origin fetch can start before the navigation auction.** When the
+  EC preload runs, the request has no template-cache key and the platform
+  supports concurrent fan-out and pending streaming responses, the origin
+  request is sent with `send_async` (`publisher.rs:4825-4852`), then the
+  preload runs (`:4859`) and then `dispatch_auction` (`:4947`). That is
+  Fastly's default path for a returning EC in Inline mode. In the other
+  modes (a template-cache key, ESI, or no preload) the auction is
+  dispatched first and the origin fetch waits for it.
+- **Outbound deadlines are soft on Fastly.** The Fastly adapter does not
+  offer an enforceable total request deadline
+  (`has_enforceable_total_request_deadline()` is false,
+  `platform/http.rs:375-383`): first-byte and between-byte timers still let
+  connection setup or a byte-trickling response overrun. Dynamic backends
+  use a fixed 1-second connect timeout (`adapter-fastly/src/backend.rs:240`).
 - **Navigation detection.** `is_navigation_request` checks
   `Sec-Fetch-Dest: document`, which excludes iframes, and falls back to
   `Accept: text/html`, which a `fetch()` can also send (`http_util.rs:93-118`).
@@ -1572,11 +1593,35 @@ Why 100 ms:
 The coordinator logs each provider's response time. An operator raises the
 budget only when a provider's measured p95 latency at the edge exceeds it.
 
-On the navigation, holding has a latency cost. The navigation auction is
-dispatched before the origin fetch (section 3.4), so a due hold-mode
-provider delays bid dispatch. In modes where the origin fetch waits for
-dispatch, it also delays the page's first byte by up to `hold_budget_ms`. A
-provider is due rarely (step 4), so few navigations pay this.
+On the navigation, holding has a latency cost, and it depends on the
+order of section 3.4:
+
+- **Origin first** (Fastly's default for a returning EC in Inline mode).
+  The origin request is already in flight, so the first byte slips by
+  `max(0, preload + hold + dispatch - origin TTFB)`. A fast origin pays up
+  to the whole hold; a slow one pays nothing.
+- **Auction first** (a template-cache key, ESI, or no preload). The origin
+  fetch waits for dispatch, so the first byte slips by the whole hold.
+
+`hold_budget_ms` is a soft bound. The Fastly adapter cannot enforce a total
+deadline (section 3.4). Each hold-mode call gets a first-byte timeout of
+`min(hold_timeout_ms, remaining budget)`, and the coordinator waits for
+every dispatched call until the platform settles it
+(`ec/identity/coordinator.rs:1140-1162`). The first-byte timer starts only
+once the connection is up, so a call stalled in connection setup can hold
+the navigation for the backend's connect timeout plus its first-byte
+timeout: the worst case is the fixed 1-second connect timeout plus
+`hold_budget_ms`.
+
+How often a provider is due depends on its refresh interval (step 4). The
+default `refresh_after_sec` of one day is a product decision that departs
+from vendor guidance: UID2 recommends refreshing hourly, LiveRamp every
+30 minutes of active navigation, and ID5 every 2 hours. Following that
+guidance means one KV write per active visitor every 30 to 120 minutes for
+each owned expiring source, more navigations that hold, and more HTML
+responses made private by `Set-Cookie`. Operators who follow a vendor's
+guidance set `refresh_after_sec` or the provider's refresh hint to it and
+accept those costs.
 
 **Results.** A hold-mode call either answers within its budget or is cut
 off; no call outlives the router (section 3.4). An answer feeds that
@@ -2085,15 +2130,20 @@ cookie.
   consent denies EID persistence returns a clear for `ts-eids-s`, never a
   value, so a concurrent `/auction` that started before a withdrawal cannot
   bring IDs back.
-- **Cluster size rides on a write.** `/_ts/api/v1/identify` is a
-  cross-site, bearer-token endpoint (`ec/identify.rs:23-60`), so it cannot
-  rely on TS cookies. When it reads a row without `cluster_size`, it
-  computes the value for its response and does not store it. A writer whose
-  phase 1 or phase 4 read finds a live row without `cluster_size` adds the
-  evaluation to its mutation, run in phase 4 after send, so its KV prefix
-  list (`ec/kv.rs:1460-1469`) never delays a page. That is one list and at
-  most one write per EC, once, as today (`ec/kv.rs:1497-1529`); the write
-  is the page load's one write.
+- **Cluster size rides on a write.** `/_ts/api/v1/identify` authenticates
+  the partner with a bearer token and reads the EC from the `ts-ec` cookie,
+  with credentialed CORS for the publisher's host and its subdomains
+  (`ec/identify.rs:32-75`, `:226-263`). It stops writing (section 5.1).
+  When it reads a row without `cluster_size`, it computes the value for its
+  response and does not store it. A writer whose phase 1 or phase 4 read
+  finds a live row without `cluster_size` adds the evaluation to its
+  mutation, run in phase 4 after send, so its KV prefix list
+  (`ec/kv.rs:1460-1469`) never delays a page. That is at most one write per
+  EC, once (`ec/kv.rs:1497-1529`), and the write is the page load's one
+  write. The list cost is new: today the prefix list runs only when a
+  partner calls `/identify` for an EC, and under this design it runs once
+  for every EC that reaches a writer navigation, including ECs no partner
+  ever looks up.
 - **EC minting on non-writer navigations.** Today a real browser gets an EC
   on any navigation `is_navigation_request` accepts, including prefetch and
   the `Accept: text/html` fallback (`adapter-fastly/src/app.rs:846-857`).
@@ -2408,9 +2458,13 @@ out. It never holds anything from `ts-eids-s`. The server set requires
 what today's KV path requires: `ec_allowed()`, and a live consenting row
 whenever the request read KV (`endpoints.rs:446-460`). Each server-side ID
 must also pass, for this request, the consent policy of the provider that
-wrote it (`w`) and, for an owned source, the owner's policy as well. So the
-sharing and targeted-advertising opt-outs and GPC stop it even when the
-generic gates pass, and an unowned source that a strict provider wrote is
+wrote it (`w`) and, for an owned source, the owner's policy as well. So for a
+provider under the strict policy, the sharing and targeted-advertising
+opt-outs and GPC stop it even when the generic gates pass. The generic pull
+provider keeps today's pull sync policy (section 10.4): `ec_allowed()` and
+`allows_eid_persistence`, which these opt-outs do not reach. Putting it
+under the strict policy would change behaviour that predates this spec, and
+is left to a later change. Also, an unowned source that a strict provider wrote is
 not disclosed once that provider's policy fails. A record whose writer is
 disabled or no longer configured has no policy left to check, so it is
 never served, and it counts as absent for `FillMissing` and for unowned
@@ -2519,12 +2573,12 @@ never returned by any of them (G7).
 **Consent for `/identify`.** The policies are checked against the visitor's
 consent on this request, never against the row's stored `consent.tcf` and
 `consent.gpp`, which are snapshots from creation and authorize nothing.
-`/identify` has the visitor's context by construction. Its EC comes only
-from the `ts-ec` cookie, never from a header (`ec/mod.rs:325`), and its
-consent is built from the same request's cookies, `Sec-GPC` and
-geolocation (`ec/mod.rs:338-345`). A call that does not carry the visitor's
-own cookies has no EC and gets 204 (`ec/identify.rs:73-83`), so a partner's
-server cannot ask on a visitor's behalf. Within such a request:
+`/identify` takes its EC only from the `ts-ec` cookie, never from a
+header (`ec/mod.rs:325`), and builds its consent from the same request's
+cookies, `Sec-GPC` and geolocation (`ec/mod.rs:338-345`). That does not
+prove the visitor's browser sent the call: the EC ID is a bearer value
+(section 9.5), and a server that holds it can send `Cookie: ts-ec=<id>`
+with its own consent cookies. Within a request:
 
 - An absent consent string is treated as the auction treats it. Where TCF
   applies, a strict policy finds no vendor consent and blocks. Elsewhere
@@ -2671,8 +2725,12 @@ Rules:
   `gdpr_applies` or a jurisdiction of `Gdpr` or `Unknown`, matching
   `consent_allows_server_side_auction` (`consent/mod.rs:298-308`). Each check
   maps to a signal TS decodes:
-  - TCF purposes and vendor consents (`consent/tcf.rs:145`). Vendor consent
-    uses the existing `TcfConsent::has_vendor_consent` (`consent/types.rs:278`).
+  - TCF purposes and vendor consents (`consent/tcf.rs:145`), read through
+    `effective_tcf` (`consent/mod.rs:283-289`), so a GPP EU TCF section
+    counts as a TC string does. Vendor consent uses the existing
+    `TcfConsent::has_vendor_consent` (`consent/types.rs:278`). Publisher
+    restrictions are not decoded (`consent/types.rs:176`), so a CMP's
+    per-vendor "not allowed" restriction is not applied.
   - The US sale opt-out, from GPP US sections (`consent/gpp.rs:74`, `:125`)
     or the US Privacy string (`consent/us_privacy.rs:50-63`).
   - The US sharing and targeted-advertising opt-outs. This work extends the
@@ -2747,7 +2805,7 @@ Rules:
   gets one too, because it derives `Debug` over the raw consent strings today
   (`consent/types.rs:109`).
 - The Lockr proxy logs only the path of the upstream URL, not its query
-  (`integrations/lockr.rs:202-204`).
+  (`integrations/lockr.rs:204-205`).
 - The rate-limit visitor key is an HMAC of the full EC ID with a key
   derived from `ec.passphrase`, because it leaves the row for the rate
   limiter. Its windows last 60 seconds, so a passphrase rotation costs
@@ -2784,6 +2842,31 @@ the shim writes it from JSON responses that are already private (section
 6.2). Returning-visitor HTML keeps today's cacheability, and removing the
 pull-complete marker (section 10.4) takes away the one `Set-Cookie` a
 returning-visitor navigation could carry today (section 3.4).
+
+### 9.5 The EC ID is a bearer value
+
+The EC ID is the value of the `ts-ec` cookie (`ec/mod.rs:197-203`, `:325`),
+and any server can send that cookie. Partners and the origin already hold
+raw EC IDs: every `/identify` 200 returns `ec` (`ec/identify.rs:139`), pull
+sync appends `ec_id` to the partner URL (`ec/pull_sync.rs:368-371`), and the
+origin receives `ts-ec`. A call with no `Origin` header is accepted
+(`CorsDecision::NoOrigin`, `ec/identify.rs:52`). Consent comes from the
+caller's own cookies and IP geolocation (`ec/mod.rs:338-345`).
+
+So a holder of an EC ID can present its own consent, which skips the
+visitor's vendor denials, US opt-outs and GPC. Sealing and CAS prove that
+TS wrote a value, never that the visitor's browser carried the request.
+This spec designs against that:
+
+- Removals, opt-outs and invalidations only remove, so a replayed EC can
+  make TS forget an ID but never disclose one.
+- A capture clear (section 8) re-enables a capture-only provider. A holder
+  that replays the EC through the vendor's proxied API and gets a 2xx with
+  IDs can clear that provider's opt-out. Accepted: the vendor issued again
+  for that request, and the IDs reach KV only through the browser path.
+- `x-ts-eids` on `/auction` is accepted as a troubleshooting header
+  (section 16): a replayed EC with granting consent reads the server set
+  through it, as it reads the browser's own IDs today.
 
 ## 10. Configuration
 
@@ -3038,14 +3121,16 @@ API.
 
 LiveRamp exercises refresh of an existing ID, expiring IDs, region-dependent
 lifetimes, initial resolution that needs a HEM, and headers built from
-inputs. The request parameters come from #1245 §9; the response shape and the
-consent parameter names are assumed.
+inputs. The request parameters come from #1245 §9 and LiveRamp's envelope
+API documentation; the response shape is assumed. The vendor's own plan
+(#1461) is the source of truth for the real protocol.
 
 ```rust
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct LiveRampConfig {
     pub enabled: bool,
     /// For example `https://ats.example.com/api/identity/v2/envelope`.
+    /// Refreshes go to `<endpoint>/refresh`.
     #[validate(url)]
     pub endpoint: String,
     /// LiveRamp placement ID. An operator identifier, not a secret.
@@ -3104,6 +3189,8 @@ const ATS_ENVELOPE_SOURCE: &str = "envelopeLiveramp";
 /// Identifier types (#1245 §2): 4 is a hashed email, 19 an envelope refresh.
 const IT_HASHED_EMAIL: &str = "4";
 const IT_ENVELOPE: &str = "19";
+/// Consent type 4: `cv` carries a TCF v2 string.
+const CT_TCF: &str = "4";
 
 impl IdentityProvider for LiveRampProvider {
     fn descriptor(&self) -> &ProviderDescriptor {
@@ -3128,7 +3215,11 @@ impl IdentityProvider for LiveRampProvider {
         };
 
         let consent = input.consent();
-        let mut request = ProviderRequest::get(input.endpoint()?)
+        let endpoint = match call {
+            LiveRampCall::Refresh => join(input.endpoint()?, "refresh")?,
+            LiveRampCall::Initial => input.endpoint()?.clone(),
+        };
+        let mut request = ProviderRequest::get(&endpoint)
             .with_query("pid", &self.placement_id)
             .with_query("it", identifier_type)
             .with_query("iv", &identifier_value)
@@ -3137,10 +3228,14 @@ impl IdentityProvider for LiveRampProvider {
             .try_with_header("origin", &format!("https://{}", input.publisher_domain()))?
             .try_with_header("x-forwarded-for", &input.client_ip()?.to_string())?;
         if let Some(tc_string) = consent.raw_tc_string() {
-            request = request.with_query("gdpr_consent", tc_string);
+            request = request.with_query("ct", CT_TCF).with_query("cv", tc_string);
         }
         if let Some(gpp) = consent.raw_gpp_string() {
             request = request.with_query("gpp", gpp);
+        }
+        if let Some(ids) = consent.gpp_section_ids() {
+            let ids: Vec<String> = ids.iter().map(u16::to_string).collect();
+            request = request.with_query("gpp_sid", &ids.join(","));
         }
         Ok(Some(request))
     }
@@ -3158,7 +3253,8 @@ impl IdentityProvider for LiveRampProvider {
         if response.status() == StatusCode::NO_CONTENT {
             return Ok(match call {
                 LiveRampCall::Refresh => Resolution::invalidate(source),
-                LiveRampCall::Initial => Resolution::no_match(),
+                // The user, or the browser through DNT or GPC, opted out.
+                LiveRampCall::Initial => Resolution::opted_out(),
             });
         }
 
@@ -3180,8 +3276,14 @@ impl IdentityProvider for LiveRampProvider {
 What this shows:
 
 - `request` and `response` both need to know whether the call was an
-  initial lookup or a refresh, because a 204 means different things. The
-  call context carries it (section 12.5).
+  initial lookup or a refresh, because a 204 means different things: on a
+  refresh LiveRamp no longer accepts the envelope, and on an initial lookup
+  the user, or the browser through DNT or GPC, is opted out. The call
+  context carries it (section 12.5).
+- A refresh goes to its own path, `<endpoint>/refresh`, with `it=19`.
+- The example sends the HEM as a query parameter for brevity. LiveRamp
+  takes it in a request body, which the vendor plan builds once HEM intake
+  exists.
 - A `Refresh` is attempted for an expired envelope too (section 4.4,
   `ResolveKind`). LiveRamp answers 204 for one it no longer accepts, and the
   record is invalidated.
@@ -3421,6 +3523,9 @@ pub struct Uid2Config {
     /// Secret-store key names at rest, resolved values at runtime. Listed in
     /// `secret_fields()` (section 10.2), so `build_descriptor` never reads them.
     pub api_key: Redacted<String>,
+    /// The UID2 operator's IAB GVL ID, when it is a TCF vendor. UID2 itself
+    /// has none.
+    pub tcf_vendor_id: Option<u16>,
     pub client_secret: Redacted<String>,
 }
 
@@ -3477,7 +3582,12 @@ impl IdentityProviderConfig for Uid2Config {
                     .with_needs_for(ResolveKind::Initial, [Input::HashedEmail])
                     .with_private_state(),
             )
-            .with_consent_policy(ConsentPolicy::strict().with_tcf_vendor(UID2_GVL_ID))
+            // UID2 has no GVL ID. An operator whose UID2 operator is a TCF
+            // vendor names its ID in config.
+            .with_consent_policy(match self.tcf_vendor_id {
+                Some(vendor) => ConsentPolicy::strict().with_tcf_vendor(vendor),
+                None => ConsentPolicy::strict(),
+            })
             .build()
     }
 }
@@ -3501,7 +3611,8 @@ impl IdentityProvider for Uid2Provider {
             }
             let url = join(base, "v2/token/refresh")?;
             return Ok(Some(
-                ProviderRequest::post_text(&url, &state.refresh_token).with_bearer(&self.api_key),
+                // The refresh endpoint needs no API key.
+                ProviderRequest::post_text(&url, &state.refresh_token),
             ));
         }
 
@@ -3539,6 +3650,9 @@ impl IdentityProvider for Uid2Provider {
 
         match reply.status.as_str() {
             "optout" => Ok(Resolution::opted_out()),
+            // A dead refresh token clears the state instead of backing off
+            // until `refresh_expires`.
+            "expired_token" | "invalid_token" => Err(IdentityProviderError::InvalidState.into()),
             "success" => {
                 let identity = reply.body.ok_or_else(IdentityProviderError::malformed)?;
                 let uid = ResolvedUid::new(identity.advertising_token).with_atype(3);
@@ -3871,8 +3985,9 @@ The harness also:
   EID-level fields bidders will see
 
 The examples in section 12 are the first harness cases: LiveRamp's initial
-and refresh 204s, Lockr's page-view and revoke-consent, and UID2's success,
-refresh and opt-out.
+and refresh 204s (opted out and invalidated), Lockr's page-view and
+revoke-consent, and UID2's success, refresh, opt-out and dead refresh
+token.
 
 **Coordinator.**
 
