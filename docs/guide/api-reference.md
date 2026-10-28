@@ -61,7 +61,7 @@ authority, scheme, and client-address headers in the innermost middleware.
 | normal  | `/verify-signature`                    | `POST`                                                     | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `publisher_fallback`                  | publisher fallback    | publisher fallback    | publisher fallback    | publisher fallback    |
 | normal  | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `publisher_fallback`                  | publisher fallback    | publisher fallback    | publisher fallback    | publisher fallback    |
-| normal  | `<proxy.asset_routes[].prefix>{*rest}` | `GET`, `HEAD`                                              | config derived | `settings.proxy.asset_routes[]`       | real                  | —                     | —                     | —                     |
+| normal  | `<proxy.asset_routes[].prefix>{*rest}` | `GET`, `HEAD`                                              | config derived | `settings.proxy.asset_routes[]`       | real                  | real                  | real                  | real                  |
 | startup | `/health`                              | `GET`                                                      | literal        | `startup_error`                       | real                  | —                     | —                     | real                  |
 | startup | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `startup_error`                       | startup error (`500`) | startup error (`500`) | startup error (`500`) | startup error (`500`) |
 | startup | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `startup_error`                       | startup error (`500`) | startup error (`500`) | startup error (`500`) | startup error (`500`) |
@@ -1013,8 +1013,8 @@ https://edge.example.com/_ts/debug/ja4`.
 
 ### GET or HEAD `<proxy.asset_routes[].prefix>{path}`
 
-**Contract:** Fastly-only and registered once for each
-`[[proxy.asset_routes]]` entry. Auth: optional origin signing by the signer
+**Contract:** Answered on every adapter for each `[[proxy.asset_routes]]`
+entry. Auth: optional origin signing by the signer
 the route's `auth` table names, which authenticates Trusted Server to the
 origin rather than the caller.
 Request body: not applicable. The route maps the remainder of the path and the
@@ -1022,8 +1022,11 @@ configured query policy to the selected origin, preserves range and conditional
 request semantics, and returns the origin status/body after stripping unsafe
 response headers. Cache behavior follows the route's normalized cache policy;
 credentialed or otherwise private responses are forced `private, no-store`.
-No dedicated CORS grant or rate limiter is installed. Example: if the prefix is
-`/assets/`, request `curl -I https://edge.example.com/assets/logo.svg`.
+No dedicated CORS grant or rate limiter is installed. On Axum, Cloudflare and
+Spin a request the route's Image Optimizer would optimize answers `502`, and
+on Spin so does a request to a source whose `host_header` names another
+host. Example: if the prefix is `/assets/`, request
+`curl -I https://edge.example.com/assets/logo.svg`.
 
 ### Publisher fallback: `/` and `/{*rest}`
 
@@ -1035,7 +1038,9 @@ streaming where supported. The origin status is normally preserved; fetch or
 processing failures use shared adapter errors. Cacheability is decided from
 the origin response plus personalization, cookie, template, and rewrite
 effects. CORS is therefore the sanitized publisher-origin policy, not a global
-Trusted Server policy. There is no built-in endpoint rate limiter. Example:
+Trusted Server policy. There is no built-in endpoint rate limiter. On Spin,
+where `[source.origin] host_header` names a host other than the one in `url`,
+every request answers `502` and the origin is not asked. Example:
 `curl -i https://edge.example.com/article`.
 
 When startup fails, the degraded router replaces normal routing. Every

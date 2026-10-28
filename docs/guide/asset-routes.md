@@ -18,6 +18,8 @@ For a matching `GET` or `HEAD` request, Trusted Server runs this sequence:
 
 The origin query policy runs before S3 signing, so the signature covers the exact URL sent to S3. Image Optimizer metadata stays separate from the origin URL and is translated by the Fastly adapter.
 
+Every adapter serves asset routes. The Axum, Cloudflare and Spin adapters hold the asset body whole, which Cloudflare limits to 10 MiB and Spin to 8 MiB, answering a larger one with `502`. They cannot optimize images, so each logs a warning naming every route that enables the Image Optimizer, once for each instance of the adapter, which on Axum is the process (the [Cloudflare](./cloudflare) and [Spin](./spin) guides say where the lines appear), and answers each request such a route would optimize with `502 Bad Gateway` and `Cache-Control: no-store, private`. A signed route first asks its origin for the object with a `HEAD`, and where that fails it answers with the origin's own error. SVG and SVGZ paths, and a request that sets the profile set's debug parameter to `1`, carry no Image Optimizer metadata, so they are served unoptimized.
+
 ## Basic route
 
 Each route names where its content comes from in a `source` table, in the same shape as the publisher's [`[source]`](/guide/configuration#source). `module = "origin"` selects core's HTTP origin, and `[proxy.asset_routes.source.origin]` holds its settings. Write the route's own keys, `prefix`, `path_pattern` and `target_path`, before the source tables, because a table header ends the route's own keys.
@@ -44,7 +46,7 @@ https://assets.example.com/assets/logo.png?v=1
 Plain asset routes preserve the incoming query string by default.
 `url` must be an absolute `http` or `https` address with a host, without a user name or password, a query, a fragment, or a trailing `/`. A path in `url` names a folder, and the route's target path is added under it. With `url = "https://storage.example.com/bucket/site"`, a request for `/assets/logo.png` is sent to `https://storage.example.com/bucket/site/assets/logo.png`.
 
-`host_header` sets the outbound `Host` header where it is not the host of `url`. Trusted Server still connects, uses SNI, and checks certificates against the host in `url`.
+`host_header` sets the outbound `Host` header where it is not the host of `url`. Trusted Server still connects, uses SNI, and checks certificates against the host in `url`. Spin sends the host in `url` as the `Host`, so there every request under a route whose `host_header` names another host answers `502` before its origin is asked. Cloudflare documents that a Worker cannot set a `Host` naming a host outside its zone unless the request goes to that host (see [Cloudflare](./cloudflare)).
 
 ## Path rewrite
 

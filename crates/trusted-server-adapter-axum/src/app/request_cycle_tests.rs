@@ -4,9 +4,11 @@
 //! without making the response less private, the route's module call carries
 //! the device classification, an Edge Cookie context that cannot be read
 //! answers before the filters, robots.txt and the inspection endpoints are
-//! answered without them, and the Edge Cookie is created and written for a
-//! real browser's page view, set by the resolve route for a client-side
-//! module and expired on a withdrawal.
+//! answered without them, the Edge Cookie is created and written for a real
+//! browser's page view, set by the resolve route for a client-side module and
+//! expired on a withdrawal, and a request under an asset route is answered
+//! from the route's own source, with the route's cache rule written after the
+//! finalize headers, an error that no cache stores and no Edge Cookie.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1066,6 +1068,217 @@ fn startup_warns_that_this_adapter_opens_no_identity_graph() {
     assert!(
         super::IDENTITY_GRAPH_UNAVAILABLE_LOGGED.load(Ordering::Relaxed),
         "startup should warn that the identity graph is unavailable"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Asset routes
+// ---------------------------------------------------------------------------
+
+/// Settings with an asset route under `/assets/` whose source signs its
+/// requests with the stock `s3_sigv4` signer.
+fn settings_with_a_signed_asset_route() -> Settings {
+    settings_with(
+        r#"
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/assets/"
+
+            [proxy.asset_routes.source]
+            module = "origin"
+
+            [proxy.asset_routes.source.origin]
+            url = "https://assets.example.com"
+
+            [proxy.asset_routes.source.origin.auth]
+            type = "s3_sigv4"
+            region = "us-east-1"
+        "#,
+    )
+}
+
+/// What the origin was asked, being each request's address and whether it
+/// carried an `s3_sigv4` signature.
+fn asked(origin: &StubHttpClient) -> Vec<(String, bool)> {
+    origin
+        .recorded_request_uris()
+        .into_iter()
+        .zip(origin.recorded_request_headers())
+        .map(|(uri, headers)| {
+            let signed = headers.iter().any(|(name, value)| {
+                name == "authorization" && value.starts_with("AWS4-HMAC-SHA256 ")
+            });
+            (uri, signed)
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_under_an_asset_route_reaches_the_route_s_origin_signed() {
+    let origin = Arc::new(StubHttpClient::new());
+    origin.push_response_with_headers(
+        200,
+        b"image bytes".to_vec(),
+        vec![("content-type", "image/png")],
+    );
+    let router = router_with(settings_with_a_signed_asset_route(), &[], &origin);
+
+    let response = route(&router, get("/assets/logo.png", None)).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(text(response), "image bytes");
+    assert_eq!(
+        asked(&origin),
+        [(
+            "https://assets.example.com/assets/logo.png".to_owned(),
+            true
+        )],
+        "the route's origin should be asked, signed by the route's signer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_outside_the_asset_routes_reaches_the_publisher_s_origin() {
+    let origin = Arc::new(StubHttpClient::new());
+    origin.push_response_with_headers(
+        200,
+        b"body { color: black; }".to_vec(),
+        vec![("content-type", "text/css")],
+    );
+    let router = router_with(settings_with_a_signed_asset_route(), &[], &origin);
+
+    let response = route(&router, get("/styles/site.css", None)).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        asked(&origin),
+        [(
+            "https://origin.test-publisher.example.com/styles/site.css".to_owned(),
+            false
+        )],
+        "the publisher's origin should be asked, unsigned"
+    );
+}
+
+/// Settings with an asset route under `/assets/` and a cache rule covering
+/// it, which keeps an answer for a minute in a browser and an hour in a
+/// shared cache.
+fn settings_with_a_cached_asset_route() -> Settings {
+    settings_with(
+        r#"
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/assets/"
+
+            [proxy.asset_routes.source]
+            module = "origin"
+
+            [proxy.asset_routes.source.origin]
+            url = "https://assets.example.com"
+
+            [[cache.asset_rules]]
+            id = "assets"
+            enabled = true
+            path_prefix = "/assets/"
+            browser_ttl_seconds = 60
+            edge_ttl_seconds = 3600
+        "#,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_asset_route_s_cache_rule_is_written_after_the_finalize_headers() {
+    let origin = Arc::new(StubHttpClient::new());
+    origin.push_response_with_headers(
+        200,
+        b"image bytes".to_vec(),
+        vec![("content-type", "image/png")],
+    );
+    let router = router_with(settings_with_a_cached_asset_route(), &[], &origin);
+
+    let response = route(&router, get("/assets/logo.png", None)).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header(&response, "cache-control"),
+        Some("public, max-age=60, s-maxage=3600"),
+        "the rule should be written with this adapter's `s-maxage` for shared caches"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_asset_route_whose_origin_fails_answers_502_and_is_not_stored() {
+    // No answer is queued, so the request to the route's origin fails.
+    let origin = Arc::new(StubHttpClient::new());
+    let router = router_with(settings_with_a_cached_asset_route(), &[], &origin);
+
+    let response = route(&router, get("/assets/logo.png", None)).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        header(&response, "cache-control"),
+        Some("no-store, private"),
+        "an asset route's error should not be stored by any cache"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_page_view_under_an_asset_route_gets_no_edge_cookie() {
+    let origin = origin_answering(1);
+    let mut settings = settings_with_a_cached_asset_route();
+    settings.geo.module = Some("platform".to_owned());
+    let router = router_for(settings, &[], services_for_a_reader(&origin));
+
+    let response = route(&router, page_view("/assets/guide.html", BROWSER, None)).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        edge_cookie(&response),
+        None,
+        "an asset response skips the Edge Cookie steps, so none is written"
+    );
+    assert_eq!(
+        origin.recorded_request_uris(),
+        ["https://assets.example.com/assets/guide.html"],
+        "the route's origin should answer the page view"
+    );
+}
+
+#[test]
+fn startup_warns_when_an_asset_route_enables_the_image_optimizer() {
+    let settings = settings_with(
+        r#"
+            [image_optimizer.profile_sets.photos]
+            default_profile = "default"
+
+            [image_optimizer.profile_sets.photos.profiles]
+            default = "width=640"
+
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/images/"
+
+            [proxy.asset_routes.source]
+            module = "origin"
+
+            [proxy.asset_routes.source.origin]
+            url = "https://images.example.com"
+
+            [proxy.asset_routes.image_optimizer]
+            region = "us_east"
+            profile_set = "photos"
+        "#,
+    );
+    let origin = Arc::new(StubHttpClient::new());
+
+    let _router = router_with(settings, &[], &origin);
+
+    assert!(
+        super::IMAGE_OPTIMIZER_UNAVAILABLE_LOGGED.load(std::sync::atomic::Ordering::Relaxed),
+        "startup should warn that this adapter cannot optimize the route's images"
     );
 }
 

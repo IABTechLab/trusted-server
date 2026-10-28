@@ -89,6 +89,7 @@ run_case() {
     local missing_key="$3"
     local expected_status="$4"
     local missing_binding="${5:-}"
+    local expected_diagnostic="${6:-}"
     local config_path="$CLOUDFLARE_WORK/wrangler.$case_name.toml"
     local log_path="$WORKSPACE/$case_name.log"
     local body_path="$WORKSPACE/$case_name.body"
@@ -105,8 +106,6 @@ run_case() {
             --ip 127.0.0.1
     ) >"$log_path" 2>&1 &
     APP_PID=$!
-    # The Worker installs no logger, so a negative case is checked by its
-    # status alone, which smoke_wait_http waits for.
     smoke_wait_http "http://127.0.0.1:$port/" "$expected_status" \
         "$body_path" "$headers_path"
     smoke_assert_process_alive "$APP_PID" "Wrangler" "$log_path"
@@ -115,6 +114,8 @@ run_case() {
     APP_PID=""
 
     if [ "$expected_status" != 200 ]; then
+        [ -n "$expected_diagnostic" ] ||
+            smoke_die "negative case $case_name names no log line to wait for"
         grep --fixed-strings --quiet 'Your Worker has access to the following bindings:' "$log_path" ||
             smoke_die "Wrangler did not report the runtime binding inventory"
         grep --fixed-strings --quiet "env.$CONFIG_BINDING" "$log_path" ||
@@ -122,13 +123,18 @@ run_case() {
         if [ -n "$missing_binding" ] && grep --fixed-strings --quiet "$missing_binding" "$log_path"; then
             smoke_die "negative case unexpectedly exposed $missing_binding"
         fi
+        # The Worker's log must name the missing input, so a failure of another
+        # kind cannot pass the case. Wrangler prints the Worker's console lines
+        # with its own.
+        smoke_assert_failure "$expected_status" "$expected_diagnostic" "$log_path"
     else
         smoke_assert_success "$body_path" "$ORIGIN_PORT" "$port"
     fi
 }
 
 # Before the push the config store holds no blob, so the Worker cannot load.
-run_case missing-config "$BASE_PORT" "" 500 ""
+run_case missing-config "$BASE_PORT" "" 500 "" \
+    "failed to read Trusted Server app config key \`trusted_server_config\` from config store \`$CONFIG_BINDING\`"
 
 (
     cd "$WORKSPACE"
@@ -151,8 +157,10 @@ ENVELOPE=$(
 [ -n "$ENVELOPE" ] || smoke_die "Wrangler KV read-back returned an empty envelope"
 
 run_case missing-proxy "$((BASE_PORT + 1))" publisher_proxy_secret 500 \
-    'env.publisher_proxy_secret'
-run_case missing-ec "$((BASE_PORT + 2))" ec_passphrase 500 'env.ec_passphrase'
+    'env.publisher_proxy_secret' \
+    "failed to resolve secret reference at \`publisher.proxy_secret\`"
+run_case missing-ec "$((BASE_PORT + 2))" ec_passphrase 500 'env.ec_passphrase' \
+    "failed to resolve secret reference at \`ec.hmac.passphrase\`"
 run_case positive "$((BASE_PORT + 3))" "" 200 ""
 
 echo "Cloudflare first-success smoke passed"

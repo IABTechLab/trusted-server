@@ -84,7 +84,25 @@ impl PlatformSecretStore for NoopSecretStore {
 /// Spin outbound HTTP registers no backend, so the name is a correlation
 /// key alone, made from every field of the specification, and the transport
 /// timer is the exact bounded value.
-struct NoopBackend;
+///
+/// Spin sends the address's own host as the `Host` of every request, so a
+/// backend asked to send another `Host`, as a source's `host_header` asks, is
+/// refused rather than reached with the wrong one.
+pub(crate) struct NoopBackend;
+
+/// Whether `host_header` names the host Spin sends as `Host`, which is the
+/// backend's host, with its port where that is not the scheme's default.
+fn is_the_address_s_own_host(spec: &PlatformBackendSpec, host_header: &str) -> bool {
+    let default_port = if spec.scheme == "https" { 443 } else { 80 };
+    let (name, port) = match host_header.rsplit_once(':') {
+        Some((name, port)) => match port.parse::<u16>() {
+            Ok(port) => (name, port),
+            Err(_) => (host_header, default_port),
+        },
+        None => (host_header, default_port),
+    };
+    name.eq_ignore_ascii_case(&spec.host) && port == spec.port.unwrap_or(default_port)
+}
 
 /// The correlation name for a backend, carrying the first-byte timer so two
 /// timers to one host are two backends, as the host's own naming would make
@@ -118,6 +136,15 @@ impl PlatformBackend for NoopBackend {
     }
 
     fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+        if let Some(host_header) = spec.host_header_override.as_deref()
+            && !is_the_address_s_own_host(spec, host_header)
+        {
+            return Err(Report::new(PlatformError::Backend).attach(format!(
+                "Spin sends the address's own host as `Host`, so the `Host` \
+                 `{host_header}` asked for `{}` cannot be sent",
+                spec.host
+            )));
+        }
         self.predict_name(spec)
     }
 }
@@ -892,6 +919,55 @@ mod tests {
         assert_eq!(backend.canonicalize_transport_timeout_ms(999, 2000), 999);
         assert_eq!(backend.canonicalize_transport_timeout_ms(2000, 100), 100);
         assert_eq!(backend.transport_timeout_bucket_count(2000), 1);
+    }
+
+    /// A backend for `origin.example.com` at `port`, asked to send
+    /// `host_header` as the `Host`.
+    fn spec_sending(port: Option<u16>, host_header: &str) -> PlatformBackendSpec {
+        PlatformBackendSpec {
+            scheme: "https".to_owned(),
+            host: "origin.example.com".to_owned(),
+            port,
+            host_header_override: Some(host_header.to_owned()),
+            certificate_check: true,
+            first_byte_timeout: std::time::Duration::from_secs(15),
+            between_bytes_timeout: std::time::Duration::from_secs(15),
+            discriminator: None,
+        }
+    }
+
+    #[test]
+    fn a_backend_asked_to_send_another_host_is_refused() {
+        for (port, host_header) in [
+            (None, "www.example.com"),
+            (None, "origin.example.com:8443"),
+            (Some(8443), "origin.example.com"),
+        ] {
+            let error = NoopBackend
+                .ensure(&spec_sending(port, host_header))
+                .expect_err("Spin cannot send a Host other than the address's own");
+            assert!(
+                matches!(error.current_context(), PlatformError::Backend),
+                "the refusal should be a backend error for {host_header} at {port:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_backend_asked_to_send_the_address_s_own_host_is_named() {
+        for (port, host_header) in [
+            (None, "origin.example.com"),
+            (None, "Origin.Example.com:443"),
+            (Some(8443), "origin.example.com:8443"),
+        ] {
+            assert_eq!(
+                NoopBackend
+                    .ensure(&spec_sending(port, host_header))
+                    .expect("the address's own host is the Host Spin sends"),
+                backend_name(&spec_sending(port, host_header)),
+                "the backend should be named for {host_header} at {port:?}"
+            );
+        }
     }
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::request_builder;

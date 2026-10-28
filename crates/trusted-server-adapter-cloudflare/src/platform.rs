@@ -330,14 +330,14 @@ impl CloudflareHttpClient {
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         use worker::{CacheMode, Fetch, Headers, Method, Request};
 
-        // The Cloudflare fetch path cannot honor Fastly-style Image Optimizer
-        // metadata, and it always buffers the response body (see below). The
+        // The Cloudflare fetch path cannot honor Image Optimizer metadata, and
+        // it always buffers the response body (see below). The
         // `PlatformHttpRequest` contract requires adapters that cannot honor
         // these to reject rather than silently drop the behavior, so surface a
         // typed error instead of returning an untransformed or fully-buffered
-        // response. These fields are only set by asset routes, which are not
-        // routed to the Cloudflare adapter today; the guard keeps the contract
-        // honest if that changes.
+        // response. Only an asset route sets these fields. A route that
+        // enables the Image Optimizer answers with this error, and none asks
+        // for a stream, because this client reports that it cannot stream.
         if request.image_optimizer.is_some() {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("Image Optimizer is not supported on the Cloudflare Workers runtime"));

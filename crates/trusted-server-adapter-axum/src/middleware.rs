@@ -11,6 +11,7 @@ use trusted_server_core::http_util::{
     ROUTE_NAMESPACE, sanitize_trusted_client_ip_headers, strip_deployment_headers,
 };
 use trusted_server_core::integrations::RequestFilterEffects;
+use trusted_server_core::proxy::AssetProxyCachePolicy;
 use trusted_server_core::response_privacy::{
     TerminalPrivateResponse, enforce_private_no_store, enforce_set_cookie_cache_privacy,
     enforce_uncacheable_cache_privacy,
@@ -66,8 +67,9 @@ impl Middleware for SanitizeRequestMiddleware {
 ///
 /// Registered directly inside [`SanitizeRequestMiddleware`], so that every
 /// outgoing response carries a consistent set of headers. Once the response
-/// is finalized it finalizes the Edge Cookie and then applies the response
-/// effects the request filters left.
+/// is finalized it applies an asset response's cache policy, finalizes the
+/// Edge Cookie and then applies the response effects the request filters
+/// left.
 pub struct FinalizeResponseMiddleware {
     settings: Arc<Settings>,
 }
@@ -85,11 +87,15 @@ impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
         let path = ctx.request().uri().path().to_owned();
         let mut response = next.run(ctx).await?;
+        let asset_cache_policy = response.extensions_mut().remove::<AssetProxyCachePolicy>();
         let ec_state = response.extensions_mut().remove::<EcFinalizeState>();
         let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
         // Before finalizing, so a header finalizing writes is kept.
         strip_deployment_headers(&path, ROUTE_NAMESPACE, &mut response);
         apply_finalize_headers(&self.settings, &mut response);
+        if let Some(policy) = asset_cache_policy {
+            policy.apply_after_route_finalization(&mut response, crate::app::EDGE_CACHE_HEADER);
+        }
         if let Some(mut ec_state) = ec_state {
             finalize_edge_cookie(&self.settings, &mut ec_state, &mut response).await;
         }

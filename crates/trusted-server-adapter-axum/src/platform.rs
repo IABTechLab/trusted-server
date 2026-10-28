@@ -438,10 +438,25 @@ impl AxumPlatformHttpClient {
         }
     }
 
+    /// Refuses a request carrying Image Optimizer metadata, on both send
+    /// paths, rather than send it untransformed, as the request contract asks
+    /// of a client that cannot honor it. Only an asset route that enables the
+    /// Image Optimizer sets it.
+    fn refuse_image_optimizer_metadata(
+        request: &PlatformHttpRequest,
+    ) -> Result<(), Report<PlatformError>> {
+        if request.image_optimizer.is_some() {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("the Axum dev server has no Image Optimizer"));
+        }
+        Ok(())
+    }
+
     async fn execute(
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
+        Self::refuse_image_optimizer_metadata(&request)?;
         let uri = request.request.uri().to_string();
         let method = reqwest::Method::from_bytes(request.request.method().as_str().as_bytes())
             .change_context(PlatformError::HttpClient)?;
@@ -506,6 +521,7 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+        Self::refuse_image_optimizer_metadata(&request)?;
         let backend_name = request.backend_name.clone();
 
         // Extract all Send-compatible parts before spawning.
@@ -1005,6 +1021,42 @@ mod tests {
                 .get(edgezero_core::http::header::LOCATION)
                 .and_then(|value| value.to_str().ok()),
             Some("https://redirect.example/next")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_with_image_optimizer_metadata_is_refused() {
+        use trusted_server_core::platform::{
+            PlatformImageOptimizerOptions, PlatformImageOptimizerParams,
+        };
+
+        // A request to an origin that would answer, so only the refusal can
+        // fail the send.
+        async fn optimized_request() -> PlatformHttpRequest {
+            let url = serve_raw_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+            let request = edgezero_core::http::request_builder()
+                .uri(url)
+                .body(EdgeBody::empty())
+                .expect("should build outbound request");
+            PlatformHttpRequest::new(request, "test_backend").with_image_optimizer(
+                PlatformImageOptimizerOptions::new(
+                    "us_west",
+                    PlatformImageOptimizerParams::default(),
+                ),
+            )
+        }
+        let client = AxumPlatformHttpClient::new();
+
+        let sent = client.send(optimized_request().await).await;
+        let sent_async = client.send_async(optimized_request().await).await;
+
+        assert!(
+            sent.is_err(),
+            "send should refuse Image Optimizer metadata rather than drop it"
+        );
+        assert!(
+            sent_async.is_err(),
+            "send_async should refuse Image Optimizer metadata rather than drop it"
         );
     }
 

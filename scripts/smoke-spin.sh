@@ -63,6 +63,7 @@ run_case() {
     local port="$2"
     local missing_variable="$3"
     local expected_status="$4"
+    local expected_diagnostic="${5:-}"
     local log_path="$WORKSPACE/$case_name.log"
     local body_path="$WORKSPACE/$case_name.body"
     local headers_path="$WORKSPACE/$case_name.headers"
@@ -84,8 +85,6 @@ run_case() {
 
     "${spin_args[@]}" >"$log_path" 2>&1 &
     APP_PID=$!
-    # The component installs no logger, so a negative case is checked by
-    # its status alone, which smoke_wait_http waits for.
     smoke_wait_http "http://127.0.0.1:$port/" "$expected_status" \
         "$body_path" "$headers_path"
     smoke_assert_process_alive "$APP_PID" "Spin" "$log_path"
@@ -94,6 +93,8 @@ run_case() {
     APP_PID=""
 
     if [ "$expected_status" != 200 ]; then
+        [ -n "$expected_diagnostic" ] ||
+            smoke_die "negative case $case_name names no log line to wait for"
         grep --fixed-strings --quiet "Serving http://127.0.0.1:$port" "$log_path" ||
             smoke_die "Spin launcher did not reach the requested listener"
         if [ "$case_name" = "missing-config" ]; then
@@ -103,12 +104,20 @@ run_case() {
             [ "$CONFIG_PUSHED" = true ] ||
                 smoke_die "missing-secret case ran before the config push"
         fi
+        # The component's log must name the missing input, so a failure of
+        # another kind cannot pass the case. Spin keeps the component's
+        # standard error under --log-dir.
+        smoke_assert_failure \
+            "$expected_status" \
+            "$expected_diagnostic" \
+            "$component_log_dir/trusted-server_stderr.txt"
     else
         smoke_assert_success "$body_path" "$ORIGIN_PORT" "$port"
     fi
 }
 
-run_case missing-config "$BASE_PORT" "" 500
+run_case missing-config "$BASE_PORT" "" 500 \
+    'failed to read Spin Trusted Server app-config blob'
 
 EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=default \
     "$SMOKE_TS_BIN" config push \
@@ -121,8 +130,10 @@ EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=default \
     --no-diff
 CONFIG_PUSHED=true
 
-run_case missing-proxy "$((BASE_PORT + 1))" "$SPIN_PROXY_VAR" 500
-run_case missing-ec "$((BASE_PORT + 2))" "$SPIN_EC_VAR" 500
+run_case missing-proxy "$((BASE_PORT + 1))" "$SPIN_PROXY_VAR" 500 \
+    "resolved secret at \`publisher.proxy_secret\` must not be empty"
+run_case missing-ec "$((BASE_PORT + 2))" "$SPIN_EC_VAR" 500 \
+    "resolved secret at \`ec.hmac.passphrase\` must not be empty"
 run_case positive "$((BASE_PORT + 3))" "" 200
 
 echo "Spin first-success smoke passed"
