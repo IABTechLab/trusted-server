@@ -270,10 +270,19 @@ valid.
 
 - `v0.0.0-rehearsal.9` at `149754d357901ec874eab6140e92bce3d8613085`: all seven builds/signing jobs, immutable prerelease publication and complete independent verification passed. The publisher found the release attestation available on its first check (no live availability wait), then re-downloaded and byte-compared all 29 assets. All bundle/online-store/offline predicates and signer pins, SPDX comparisons, checksums, macOS floor and CLI source checks passed. Axum smokes proved 0.0.0.0:8080 from outside each container and rejected primary/legacy port zero. Pinned Fastly pack/validate/inspect/cmp and Viceroy runtime checks passed, with visible no-Build-facts check/result. [Full transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6364827112).
 
-The latest rehearsed implementation is `149754d357901ec874eab6140e92bce3d8613085` from `.9`.
-This review-head update is docs-only since rehearsed `149754d35`; workflows, scripts, tests and runtime code retain the rehearsed implementation.
+The original Phase 1 batch was rehearsed at `149754d357901ec874eab6140e92bce3d8613085` in `.9`.
+Later source updates and their exact rehearsal attributions are recorded below.
 
 The immutable `.2`, `.3`, `.4`, `.5`, `.6`, `.8` and `.9` releases remain intact; no drafts remain. The `.7` tag has no release. No upstream tags, releases or repository settings were changed.
+
+### Main merge and exact-head rehearsal
+
+- `.12` passed at `ab6e5493636fd3d1db4b22a071189070f90a189a`. Its [verification transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6440880360) remains evidence for that source only.
+- Main at `fd2bf10e709092a796ebad2f6de371b2ea8dfd56` was merged, without rebasing, into Phase 1 at `68eef902a8bddd9024676cc3806fa5377ed67fee`. [Exact-head CI passed](https://github.com/IABTechLab/trusted-server/actions/runs/40524031740), including all seven release builds; PR signing/publication were skipped. Release workflows, producer scripts, build facts and tool pins were unchanged by this merge; application code changed.
+- `.14` at that merge failed because GitHub could not acquire a hosted ARM64 macOS runner. Six started builds passed; signing/publication were skipped, and no release or draft was created. Its tag remains untouched. See the [failure record](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6446482013).
+- Fresh lightweight `.15` passed at `68eef902a8bddd9024676cc3806fa5377ed67fee`: [all 16 workflow jobs passed](https://github.com/prk-Jr/trusted-server/actions/runs/40536697334/attempts/1). Independent verification passed all 29 immutable prerelease assets (not Latest), 28 checksum entries, all seven binaries with both predicates and both signer identities online and offline, 14 SPDX comparisons, native CI smokes, macOS 13.0 checks and CLI source identity. See [transcript part 1](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6460657878) and [part 2](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6460658274).
+
+The latest rehearsed Phase 1 implementation is `68eef902a8bddd9024676cc3806fa5377ed67fee` from `.15`. This evidence update is docs-only since that exact SHA; it does not extend `.12` to later source. No IAB tags, releases or settings changed. Both PRs remain draft with no reviewers.
 
 ### Phase 1 review boundary notes
 
@@ -307,9 +316,9 @@ and state that startup is refused. They no longer forward EdgeZero's fallback
 warnings. Each port alias is still validated with the pinned EdgeZero resolver;
 existing defaults, accepted values and conflict rejection are preserved.
 
-This correction and the current-main integration change the binary inputs.
-Rehearsal `.9` remains evidence for its recorded implementation only; a fresh
-rehearsal is required for the updated binaries.
+This correction and the current-main integration changed the binary inputs.
+Rehearsal `.9` remains evidence for its recorded implementation only; `.12` and
+the fresh main-merge rehearsal `.15` are attributed separately above.
 
 ## Approved Phase 2 rebuild-check compatibility
 
@@ -357,4 +366,10 @@ Online consumers keep every repository, workflow/certificate, tag/ref, source/si
 
 Phase 1 `.11` failed at the single draft-create POST with HTTP 403; no release or draft existed. Fresh `.12` placed the same reviewed source at the fork Phase 1 branch head as well as a new lightweight tag and passed, without source, settings or token-permission changes. The failure log did not retain the response body, so the exact permission cause remains unconfirmed. The [failed attempt](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6439851715) remains recorded and its tag was not reused. Phase 1's bundle-based single-result examples remain unchanged.
 
-The Phase 2 `.10` reproduction job took 293 seconds and comparison 91 seconds, overlapping native builds. Its [online-SBOM positive and one-byte-negative checks](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6439619901) passed against fully verified pinned results. The negative copy remained valid JSON, changed exactly one byte, and returned false with `jq -e` exit 1; the authenticated published document remained untouched. The merged head's `.13` reproduction took 378 seconds and comparison 116 seconds, also overlapping native builds. These records identify their exact implementation SHAs; subsequent completion edits are docs-only since rehearsed `770a425df4b28caaaef68dfd930bceabd9928046`.
+The Phase 2 `.10` reproduction job took 293 seconds and comparison 91 seconds, overlapping native builds. Its [online-SBOM positive and one-byte-negative checks](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6439619901) passed against fully verified pinned results. The negative copy remained valid JSON, changed exactly one byte, and returned false with `jq -e` exit 1; the authenticated published document remained untouched. The merged head's `.13` reproduction took 378 seconds and comparison 116 seconds, also overlapping native builds. These records identify their exact implementation SHAs; the completion commit `2ed1b941a212aeb27e08f8d1e27cb8353f40f535` was docs-only since rehearsed `770a425df4b28caaaef68dfd930bceabd9928046`.
+
+### Phase 2 merge after rehearsal .13
+
+This merge joins Phase 2 parent `2ed1b941a212aeb27e08f8d1e27cb8353f40f535` with updated Phase 1 parent `20152315c01dd5fddcfc84b969f8e9993b0bfc69`. Phase 1 carries the main integration rehearsed in `.15` at `68eef902a8bddd9024676cc3806fa5377ed67fee`, followed by its docs-only evidence update.
+
+The new Phase 2 head is a **no-release-machinery merge**, not a docs-only change: application code from main changes binary inputs, while release workflows, producer scripts, build facts, manifests/lock and tool pins retain their Phase 2 values. No new Phase 2 rehearsal is performed, as requested. `.13` stays attributed exclusively to `770a425df4b28caaaef68dfd930bceabd9928046`; its release is not evidence for binaries from this new merge head. Gate 1 activation and all closed qualification/design gates remain unchanged.

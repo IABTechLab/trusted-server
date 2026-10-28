@@ -1,6 +1,6 @@
 # Ordinary Fastly release gate implementation plan
 
-**Status:** Gate 1 design approved on 2026-10-26 and independently reviewed. The ordinary adapter and frozen-source port are implemented in draft #1449. Rehearsal `.13` passed at implementation `770a425df4b28caaaef68dfd930bceabd9928046`; this completion record is docs-only after that rehearsed source. Controlled qualification and later design gates remain closed.
+**Status:** Gate 1 design approved on 2026-10-26 and independently reviewed. The ordinary adapter and frozen-source port are implemented in draft #1449. Rehearsal `.13` passed at implementation `770a425df4b28caaaef68dfd930bceabd9928046`; completion commit `2ed1b941a212aeb27e08f8d1e27cb8353f40f535` was docs-only after that rehearsed source. The later main merge changes application inputs without changing release machinery and is not re-rehearsed; `.13` remains evidence for its exact source only. Controlled qualification and later design gates remain closed.
 
 **Goal:** Compare the actual canonical Fastly release bytes to a second fresh ordinary build, write and attest the approved version-1 informational rebuild-check, and block release on any mismatch.
 
