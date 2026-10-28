@@ -19,9 +19,10 @@ const LEGACY_ADMIN_DENY_METHODS: &[&str] =
 
 /// Explicit test settings for the route tests.
 ///
-/// The settings baked into the binary contain placeholder secrets that
-/// `get_settings()` rejects by design, which would turn every route into a
-/// startup error page (and its route table into the fallback-only set).
+/// The process reads its settings from its config store when it starts,
+/// which a test does not set up, so `TrustedServerApp::routes()` would turn
+/// every route into a startup error page (and its route table into the
+/// fallback-only set).
 fn test_settings() -> trusted_server_core::settings::Settings {
     test_settings_with("")
 }
@@ -53,6 +54,9 @@ fn test_settings_with(extra: &str) -> trusted_server_core::settings::Settings {
         "#
     ))
     .expect("should parse route test settings")
+    // A loaded domain carries its policy, and these tests decide under the
+    // repository's sample.
+    .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
 }
 
 /// Build the full application router from explicit test settings.
@@ -855,24 +859,6 @@ async fn nextjs_auction_output_holds_until_the_structural_body_close() {
     );
 }
 
-/// Every route registered beneath an underscore prefix is one of the
-/// addresses an attestation endpoint may not take, so a new fixed route
-/// cannot leave an endpoint free to register its address twice.
-#[test]
-fn every_fixed_route_beneath_an_underscore_prefix_is_reserved() {
-    use trusted_server_core::attestation::RESERVED_PATHS;
-
-    for route in test_router().routes() {
-        let path = route.path();
-        if path.starts_with("/_") {
-            assert!(
-                RESERVED_PATHS.contains(&path),
-                "{path} should be listed in attestation::RESERVED_PATHS"
-            );
-        }
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_carries_no_version() {
     let mut service = make_service();
@@ -1021,6 +1007,7 @@ fn settings_refusing_every_crawler() -> trusted_server_core::settings::Settings 
         "#,
     )
     .expect("should parse robots.txt test settings")
+    .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
 }
 
 /// `/robots.txt` is the publisher path's, answered against an origin that

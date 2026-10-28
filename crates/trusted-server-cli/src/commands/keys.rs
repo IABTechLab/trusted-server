@@ -15,6 +15,7 @@ use std::io::Write as _;
 use std::sync::{Arc, OnceLock};
 
 use error_stack::Report;
+use trusted_server_core::permissions::PermissionPolicy;
 use trusted_server_core::platform::{
     BackendNamingPolicy, ClientInfo, DisabledGeo, PlatformBackend, PlatformBackendSpec,
     PlatformConfigStore, PlatformError, PlatformGeoModule, PlatformSecretStore, RuntimeServices,
@@ -298,6 +299,9 @@ fn services(runner: Arc<dyn FastlyRunner>, stores: &StoreArgs) -> RuntimeService
             Arc::new(DisabledGeo),
         )))
         .client_info(ClientInfo::default())
+        // The commands decide no request's permissions, and every services
+        // graph carries a policy, so they carry the one that grants nothing.
+        .permission_policy(PermissionPolicy::granting_nothing())
         .build()
 }
 
