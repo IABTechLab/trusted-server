@@ -36,7 +36,6 @@ log = { workspace = true }
 lol_html = { workspace = true }
 matchit = { workspace = true }
 mime = { workspace = true }
-p256 = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
@@ -89,10 +88,8 @@ tempfile = { workspace = true }
 [build-dependencies]
 # tests/template_build_digest.rs includes build.rs, so its dependencies must also
 # be available through normal or dev-dependencies.
-base64 = { workspace = true }
 edgezero-core = { workspace = true }
 hex = { workspace = true }
-p256 = { workspace = true }
 sha2 = { workspace = true }
 
 [[bench]]
