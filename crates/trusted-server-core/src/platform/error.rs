@@ -23,6 +23,9 @@ pub enum PlatformError {
     /// Geo lookup failed.
     #[display("geo lookup error")]
     Geo,
+    /// A permission policy file could not be read.
+    #[display("permission policy source error")]
+    PolicySource,
     /// Operation is not supported by this platform adapter.
     #[display("unsupported platform operation")]
     Unsupported,
