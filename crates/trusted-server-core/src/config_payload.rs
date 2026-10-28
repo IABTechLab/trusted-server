@@ -13,7 +13,7 @@ use error_stack::{Report, ResultExt as _};
 use crate::config::TrustedServerAppConfig;
 use crate::error::TrustedServerError;
 use crate::integrations::IntegrationBuilder;
-use crate::permissions::{PermissionPolicy, PolicyReference, load_policy};
+use crate::permissions::{PermissionPolicy, PolicyReference, held_policy, load_policy};
 use crate::platform::{PlatformSecretStore, PolicyOrigin, StoreName};
 use crate::secret_resolution::resolve_secret_references_with;
 use crate::settings::{PermissionsConfig, Settings};
@@ -42,7 +42,8 @@ pub const CONFIG_BLOB_KEY: &str = DEFAULT_CONFIG_STORE_ID;
 /// deserialization. The envelope data itself is never mutated or rewritten.
 /// The permission policy the settings name is then read from
 /// `policy_origin`, checked and parsed, and kept with the settings, which
-/// keep only its name and digest in `[permissions]`.
+/// keep only its name and digest in `[permissions]`. A policy source is not
+/// read for a digest whose rules this instance already holds.
 ///
 /// A deployment that composes builders of its own calls
 /// [`settings_from_config_blob_with`] instead, so a `[demand]` or
@@ -133,7 +134,9 @@ pub fn settings_from_config_blob_with(
 /// Loads the permission policy `permissions` names from `origin`.
 ///
 /// The policy's text is parsed into the policy, so `permissions` keeps only
-/// its name and digest.
+/// its name and digest. A digest names one file, so a source is not read
+/// for a digest whose rules this instance already holds. Text the blob
+/// carries is always checked, because that text is already in hand.
 fn load_domain_policy(
     permissions: &mut PermissionsConfig,
     origin: PolicyOrigin<'_>,
@@ -155,24 +158,28 @@ fn load_domain_policy(
     };
     let blob_text = permissions.text.take();
     let reference = PolicyReference { policy, sha256 };
-    let text =
-        match origin {
-            PolicyOrigin::Blob => blob_text.ok_or_else(|| {
-                refuse(format!(
-                    "the configuration carries no text for the permission policy `{}`, which \
+    let text = match origin {
+        PolicyOrigin::Blob => blob_text.ok_or_else(|| {
+            refuse(format!(
+                "the configuration carries no text for the permission policy `{}`, which \
                  `ts config push --permissions <file>` writes for this adapter",
-                    reference.policy
-                ))
-            })?,
-            PolicyOrigin::Source(source) => source.policy_text(&reference).change_context(
-                TrustedServerError::Configuration {
+                reference.policy
+            ))
+        })?,
+        PolicyOrigin::Source(source) => {
+            if let Some(policy) = held_policy(&reference) {
+                return Ok(policy);
+            }
+            source
+                .policy_text(&reference)
+                .change_context(TrustedServerError::Configuration {
                     message: format!(
                         "the permission policy `{}` cannot be read",
                         reference.policy
                     ),
-                },
-            )?,
-        };
+                })?
+        }
+    };
     load_policy(reference, &text)
 }
 
@@ -1291,27 +1298,67 @@ mod tests {
 
     mod permission_policy {
         use std::collections::BTreeMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         use super::*;
         use crate::permissions::{SAMPLE_POLICY_NAME, SAMPLE_POLICY_TEXT, policy_sha256};
         use crate::platform::PlatformPolicySource;
+        use crate::test_support::tests::policy_only_this_test_loads;
 
-        /// Policy files by name, as a folder of them would hold them.
-        struct MemoryPolicies(BTreeMap<&'static str, &'static str>);
+        /// Policy files by name, as a store of them would hold them, counting
+        /// every read.
+        #[derive(Default)]
+        struct MemoryPolicies {
+            files: BTreeMap<String, String>,
+            reads: AtomicUsize,
+        }
+
+        impl MemoryPolicies {
+            fn holding<'a>(files: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+                Self {
+                    files: files
+                        .into_iter()
+                        .map(|(name, text)| (name.to_owned(), text.to_owned()))
+                        .collect(),
+                    reads: AtomicUsize::new(0),
+                }
+            }
+
+            fn reads(&self) -> usize {
+                self.reads.load(Ordering::SeqCst)
+            }
+        }
 
         impl PlatformPolicySource for MemoryPolicies {
             fn policy_text(
                 &self,
                 reference: &PolicyReference,
             ) -> Result<String, Report<PlatformError>> {
-                self.0
-                    .get(reference.policy.as_str())
-                    .map(|text| (*text).to_owned())
-                    .ok_or_else(|| {
-                        Report::new(PlatformError::PolicySource)
-                            .attach(format!("no file named `{}`", reference.policy))
-                    })
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                self.files.get(&reference.policy).cloned().ok_or_else(|| {
+                    Report::new(PlatformError::PolicySource)
+                        .attach(format!("no file named `{}`", reference.policy))
+                })
             }
+        }
+
+        /// The `[permissions]` a push writes for an adapter with a policy
+        /// source: the name and the digest of `text`, and no file.
+        fn pinned(policy: &str, text: &str) -> PermissionsConfig {
+            PermissionsConfig {
+                policy: Some(policy.to_owned()),
+                sha256: Some(policy_sha256(text)),
+                text: None,
+            }
+        }
+
+        fn maps(settings: &Settings) -> *const crate::permissions::PermissionMaps {
+            std::ptr::from_ref(
+                settings
+                    .permission_policy()
+                    .expect("should keep the policy")
+                    .maps(),
+            )
         }
 
         fn load_with(
@@ -1437,14 +1484,6 @@ mod tests {
             };
             let (first, second) = (load(), load());
 
-            let maps = |settings: &Settings| {
-                std::ptr::from_ref(
-                    settings
-                        .permission_policy()
-                        .expect("should keep the policy")
-                        .maps(),
-                )
-            };
             assert!(
                 std::ptr::eq(maps(&first), maps(&second)),
                 "the second load should keep the rules the first one parsed"
@@ -1453,37 +1492,127 @@ mod tests {
 
         #[test]
         fn a_policy_source_supplies_the_file_and_any_text_in_the_blob_is_unused() {
-            let source = MemoryPolicies(BTreeMap::from([(SAMPLE_POLICY_NAME, SAMPLE_POLICY_TEXT)]));
-
-            for text in [None, Some("not the pushed file".to_owned())] {
+            for (group, blob_text) in [
+                ("source-without-blob-text", None),
+                ("source-over-blob-text", Some("not the pushed file")),
+            ] {
+                let text = policy_only_this_test_loads(group);
+                let source = MemoryPolicies::holding([("standard", text.as_str())]);
                 let permissions = PermissionsConfig {
-                    text,
-                    ..sample_permissions()
+                    text: blob_text.map(str::to_owned),
+                    ..pinned("standard", &text)
                 };
+
                 let settings = load_with(permissions, PolicyOrigin::Source(&source))
                     .expect("the source's file should load");
+
+                assert_eq!(source.reads(), 1, "the file should come from the source");
                 assert_eq!(
                     settings
                         .permission_policy()
                         .expect("should keep the policy")
                         .name(),
-                    SAMPLE_POLICY_NAME
+                    "standard"
                 );
             }
         }
 
         #[test]
         fn a_policy_the_source_cannot_read_does_not_load() {
-            let source = MemoryPolicies(BTreeMap::new());
+            let text = policy_only_this_test_loads("source-cannot-read");
 
             let message = refusal(load_with(
-                sample_permissions(),
-                PolicyOrigin::Source(&source),
+                pinned("standard", &text),
+                PolicyOrigin::Source(&MemoryPolicies::default()),
             ));
 
             assert!(
-                message.contains("`sample` cannot be read") && message.contains("no file named"),
+                message.contains("`standard` cannot be read") && message.contains("no file named"),
                 "should name the policy and the source's reason: {message}"
+            );
+        }
+
+        #[test]
+        fn a_second_host_pinning_a_held_digest_reads_nothing() {
+            let text = policy_only_this_test_loads("second-host");
+            let source = MemoryPolicies::holding([("standard", text.as_str())]);
+
+            let first = load_with(pinned("standard", &text), PolicyOrigin::Source(&source))
+                .expect("the first host should load");
+            assert_eq!(source.reads(), 1, "the first host should read the file");
+            let second = load_with(pinned("standard", &text), PolicyOrigin::Source(&source))
+                .expect("the second host should load");
+
+            assert_eq!(
+                source.reads(),
+                1,
+                "the second host should read nothing while the rules are held"
+            );
+            let policy = second.permission_policy().expect("should keep the policy");
+            assert_eq!(policy.name(), "standard");
+            assert_eq!(policy.sha256(), policy_sha256(&text));
+            assert!(
+                std::ptr::eq(maps(&first), maps(&second)),
+                "the second host should be given the rules the first one loaded"
+            );
+        }
+
+        #[test]
+        fn the_first_load_of_a_digest_reads_the_file_and_checks_it() {
+            let text = policy_only_this_test_loads("first-load");
+            let edited = format!("{text}# edited after the push\n");
+            let source = MemoryPolicies::holding([("standard", edited.as_str())]);
+
+            for reads in 1..=2 {
+                let message = refusal(load_with(
+                    pinned("standard", &text),
+                    PolicyOrigin::Source(&source),
+                ));
+
+                assert!(
+                    message.contains("`standard` is not the file that was pushed"),
+                    "{message}"
+                );
+                assert_eq!(
+                    source.reads(),
+                    reads,
+                    "a refused file should leave nothing held, so each load reads it"
+                );
+            }
+        }
+
+        #[test]
+        fn a_digest_the_instance_does_not_hold_is_read() {
+            let pushed_first = policy_only_this_test_loads("pushed-first");
+            let pushed_next = policy_only_this_test_loads("pushed-next");
+            let first_source = MemoryPolicies::holding([("standard", pushed_first.as_str())]);
+            let next_source = MemoryPolicies::holding([("standard", pushed_next.as_str())]);
+
+            let first = load_with(
+                pinned("standard", &pushed_first),
+                PolicyOrigin::Source(&first_source),
+            )
+            .expect("the first digest should load");
+            let next = load_with(
+                pinned("standard", &pushed_next),
+                PolicyOrigin::Source(&next_source),
+            )
+            .expect("the next digest should load");
+
+            assert_eq!(
+                next_source.reads(),
+                1,
+                "a digest the instance does not hold should be read, whatever its name"
+            );
+            assert_eq!(
+                next.permission_policy()
+                    .expect("should keep the policy")
+                    .sha256(),
+                policy_sha256(&pushed_next)
+            );
+            assert!(
+                !std::ptr::eq(maps(&first), maps(&next)),
+                "each digest should have its own rules"
             );
         }
     }
