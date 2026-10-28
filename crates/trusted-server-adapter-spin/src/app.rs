@@ -581,16 +581,20 @@ fn legacy_admin_alias_denied() -> Response {
 // Startup error fallback
 // ---------------------------------------------------------------------------
 
-/// Returns a [`RouterService`] that responds to every route with a generic
-/// 503 Service Unavailable. The startup error is logged but not echoed in the
-/// response body so that deployment state is not leaked to anonymous callers.
+/// Returns a [`RouterService`] that responds to every route with the status
+/// of the startup error's kind, as the other adapters do: 500 for a
+/// configuration or settings error and 503 for a key-value store error. The
+/// startup error is logged but not echoed in the response body so that
+/// deployment state is not leaked to anonymous callers.
 fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
     log::error!("startup failed, serving error fallback: {:?}", e);
 
-    let handler = |_ctx: RequestContext| {
-        let body = edgezero_core::body::Body::from("Service Unavailable\n");
+    let status = e.current_context().status_code();
+    let reason = status.canonical_reason().unwrap_or("Error");
+    let handler = move |_ctx: RequestContext| {
+        let body = edgezero_core::body::Body::from(format!("{reason}\n"));
         let mut resp = Response::new(body);
-        *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+        *resp.status_mut() = status;
         resp.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/plain; charset=utf-8"),
@@ -600,8 +604,8 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
 
     // Cover the full publisher fallback method set (GET, POST, HEAD, OPTIONS,
     // PUT, PATCH, DELETE) so degraded behaviour stays consistent with the
-    // healthy router: every method on `/` and `/{*rest}` returns the generic
-    // 503 instead of a router-level 405 for HEAD/OPTIONS/PATCH.
+    // healthy router: every method on `/` and `/{*rest}` returns the startup
+    // error's status instead of a router-level 405 for HEAD/OPTIONS/PATCH.
     let mut builder = RouterService::builder().middleware(FinalizeResponseMiddleware::new(
         Arc::new(Settings::default()),
     ));
@@ -1524,33 +1528,49 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn startup_error_router_serves_503_for_all_fallback_methods() {
+    async fn startup_error_router_answers_the_error_kinds_status_for_all_fallback_methods() {
         // The degraded router must answer every publisher-fallback method
         // (including HEAD/OPTIONS/PATCH) on both "/" and nested paths with the
-        // generic 503, never a router-level 405, so startup-failure behaviour
-        // stays consistent with the healthy router.
-        let report = Report::new(TrustedServerError::BadRequest {
-            message: "startup failure".to_string(),
+        // status of the startup error's kind, never a router-level 405, so
+        // startup-failure behaviour stays consistent with the healthy router.
+        let configuration = Report::new(TrustedServerError::Configuration {
+            message: "the configuration names no permission policy".to_string(),
         });
-        let router = startup_error_router(&report);
+        let kv_store = Report::new(TrustedServerError::KvStore {
+            store_name: "trusted_server_kv".to_string(),
+            message: "unavailable".to_string(),
+        });
 
-        for method in ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
-            for path in ["/", "/some/nested/page"] {
-                let req = edgezero_core::http::request_builder()
-                    .method(method)
-                    .uri(path)
-                    .body(edgezero_core::body::Body::empty())
-                    .expect("should build request");
-                let status = router
-                    .oneshot(req)
-                    .await
-                    .expect("should route startup-error request")
-                    .status()
-                    .as_u16();
-                assert_eq!(
-                    status, 503,
-                    "{method} {path} must return 503 from the startup fallback, got {status}"
-                );
+        for (report, expected, reason) in [
+            (configuration, 500, "Internal Server Error\n"),
+            (kv_store, 503, "Service Unavailable\n"),
+        ] {
+            let router = startup_error_router(&report);
+            for method in ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+                for path in ["/", "/some/nested/page"] {
+                    let req = edgezero_core::http::request_builder()
+                        .method(method)
+                        .uri(path)
+                        .body(edgezero_core::body::Body::empty())
+                        .expect("should build request");
+                    let resp = router
+                        .oneshot(req)
+                        .await
+                        .expect("should route startup-error request");
+                    let status = resp.status().as_u16();
+                    assert_eq!(
+                        status, expected,
+                        "{method} {path} must return {expected} from the startup fallback, got {status}"
+                    );
+                    if method != "HEAD" {
+                        let body = resp.into_body().into_bytes().unwrap_or_default();
+                        assert_eq!(
+                            &body[..],
+                            reason.as_bytes(),
+                            "{method} {path} should answer the status's reason and not the error"
+                        );
+                    }
+                }
             }
         }
     }

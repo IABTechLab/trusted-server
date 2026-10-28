@@ -21,7 +21,7 @@ Quick reference for all Trusted Server HTTP endpoints.
 | `axum`       | development    | real       | `500`          | no             | multiple         | outermost sanitize             | none                             |
 | `cloudflare` | development    | absent     | `500`          | no             | single           | outermost sanitize             | none                             |
 | `fastly`     | production     | pre router | `500`          | yes            | multiple         | entry-point resolve + sanitize | none                             |
-| `spin`       | experimental   | real       | `503`          | yes            | single           | outermost sanitize             | innermost Spin-header derivation |
+| `spin`       | experimental   | real       | `500`          | yes            | single           | outermost sanitize             | innermost Spin-header derivation |
 
 `trusted client IP handling` describes the optional
 `[trusted_client_ip]` configuration. Fastly resolves the authenticated header
@@ -63,8 +63,8 @@ authority, scheme, and client-address headers in the innermost middleware.
 | normal  | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `publisher_fallback`                  | publisher fallback    | publisher fallback    | publisher fallback    | publisher fallback    |
 | normal  | `<proxy.asset_routes[].prefix>{*rest}` | `GET`, `HEAD`                                              | config derived | `settings.proxy.asset_routes[]`       | real                  | —                     | —                     | —                     |
 | startup | `/health`                              | `GET`                                                      | literal        | `startup_error`                       | real                  | —                     | —                     | real                  |
-| startup | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `startup_error`                       | startup error (`500`) | startup error (`500`) | startup error (`500`) | startup error (`503`) |
-| startup | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `startup_error`                       | startup error (`500`) | startup error (`500`) | startup error (`500`) | startup error (`503`) |
+| startup | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `startup_error`                       | startup error (`500`) | startup error (`500`) | startup error (`500`) | startup error (`500`) |
+| startup | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `startup_error`                       | startup error (`500`) | startup error (`500`) | startup error (`500`) | startup error (`500`) |
 
 `real`, `unsupported`, `guarded`, `publisher fallback`, and `startup error` are
 distinct observable dispositions. An em dash means that the adapter has no
@@ -996,10 +996,11 @@ effects. CORS is therefore the sanitized publisher-origin policy, not a global
 Trusted Server policy. There is no built-in endpoint rate limiter. Example:
 `curl -i https://edge.example.com/article`.
 
-When startup fails, the degraded router replaces normal routing: Fastly,
-Axum, and Cloudflare return `500` for both fallback shapes and all seven
-methods; Spin returns a generic `503`. Only the health behavior shown in the
-table survives.
+When startup fails, the degraded router replaces normal routing. Every
+adapter answers both fallback shapes and all seven methods with the status of
+the startup error's kind, which is `500` for a configuration or settings
+error and `503` for a key-value store error, and Spin's body names only the
+status. Only the health behavior shown in the table survives.
 
 ---
 

@@ -8,11 +8,12 @@ through Spin variables.
 
 | Adapter | Release status | Health | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling | Request normalization            |
 | ------- | -------------- | ------ | -------------- | -------------- | ---------------- | -------------------------- | -------------------------------- |
-| `spin`  | experimental   | real   | `503`          | yes            | single           | outermost sanitize         | innermost Spin-header derivation |
+| `spin`  | experimental   | real   | `500`          | yes            | single           | outermost sanitize         | innermost Spin-header derivation |
 
 This row is the canonical status summary. Spin supports one enabled
 auction provider. When startup fails, its hardened router preserves `/health`
-but answers publisher routes with 503; neither response proves successful
+but answers publisher routes with the status of the startup error's kind,
+500 for a configuration error; neither response proves successful
 configuration.
 
 ## Prerequisites
@@ -60,9 +61,9 @@ variables:
 - `v_trusted_x5fserver_x5fsecrets_v_ec_x5fpassphrase`
 
 It first launches `spin up` before config is pushed, then relaunches it while
-omitting each variable independently. Every publisher request must return 503,
-and the controlled config or variable delta must identify the intended missing
-input. A generic degraded response cannot satisfy the check.
+omitting each variable independently. Every publisher request must return 500.
+The component installs no logger, so the smoke checks these cases by their
+status alone.
 
 The final non-health publisher request must return 200, retain the stub-origin
 sentinel, rewrite its origin URL to the Spin listener, and omit the original
