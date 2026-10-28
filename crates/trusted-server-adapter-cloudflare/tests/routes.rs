@@ -995,6 +995,8 @@ mod module_endpoints {
             "#
         ))
         .expect("should parse route test settings")
+        // A loaded domain carries its policy.
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
     }
 
     /// The router with the `builders` composed in.
