@@ -3,8 +3,8 @@
 //! route in the cycle, and their response effects after the finalize headers,
 //! without making the response less private, the route's module call carries
 //! the device classification, an Edge Cookie context that cannot be read
-//! answers before the filters, and robots.txt, the inspection endpoints and
-//! the attestation pages are answered without them.
+//! answers before the filters, and robots.txt and the inspection endpoints
+//! are answered without them.
 
 use std::sync::{Arc, Mutex};
 
@@ -779,18 +779,13 @@ async fn platform_classifies_the_request_with_the_built_in_module() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_inspection_endpoints_and_the_attestation_pages_skip_the_request_filters() {
+async fn the_inspection_endpoints_skip_the_request_filters() {
     let origin = Arc::new(StubHttpClient::new());
     let router = router_with(
         settings_with(
             r#"
             [testing]
             modules = ["answering-filter"]
-
-            [attestation]
-            operator = "Example Operator"
-            context = "example-attestation:v1"
-            verify_url = "https://verifier.example/verify?host=test-publisher.example.com"
             "#,
         ),
         &[answering_builder()],
@@ -809,8 +804,6 @@ async fn the_inspection_endpoints_and_the_attestation_pages_skip_the_request_fil
         "/_ts/config",
         "/_ts/config.json",
         "/_ts/data",
-        "/_ts/attestation",
-        "/_ts/attestation.json",
     ] {
         let response = route(&router, get(path, None)).await;
         assert_eq!(

@@ -75,6 +75,12 @@ impl MainIntegration {
 
 /// The sections that select several modules, written with `modules` even
 /// when one is selected.
+/// The item left to do in a document that names no permission policy file.
+pub(crate) const POLICY_TO_DO: &str = "`[permissions] policy` names no permission policy \
+     file, and a domain whose settings name none does not start. Name the publisher's file \
+     there by its stem, as `policy = \"standard\"` names `standard.yaml`, and supply the \
+     file with `ts config push --permissions <file>`";
+
 const LIST_SECTIONS: &[&str] = &["tag", "ad-tag", "auction", "proxy", "ads-txt", "headers"];
 
 /// Core's script proxy, which no linked builder describes.
@@ -223,6 +229,7 @@ impl Migrator {
         self.tinybird();
         self.debug_options();
         self.consent_lists();
+        self.permission_policy();
         self.template_cookies();
         if self.for_main {
             self.main_defaults();
@@ -1293,8 +1300,8 @@ impl Migrator {
         }
     }
 
-    /// The lists of places `[consent]` held, which the stack reads from
-    /// `permissions.yaml`.
+    /// The lists of places `[consent]` held, which the stack reads from the
+    /// publisher's permission policy file.
     fn consent_lists(&mut self) {
         let Some(consent) = self.root().get("consent") else {
             return;
@@ -1306,9 +1313,24 @@ impl Migrator {
         for key in held {
             self.push_to_do(format!(
                 "`[consent.{key}]` is not read. The places it covers are the `jurisdiction` \
-                 values in the `permissions.yaml` compiled into the build, so carry any change of \
-                 yours there, then remove the table"
+                 values in the publisher's permission policy file, the one `[permissions] \
+                 policy` names, so carry any change of yours there, then remove the table"
             ));
+        }
+    }
+
+    /// A document that names no permission policy file, which no domain
+    /// starts without. No policy ships with Trusted Server, so the command
+    /// chooses none and leaves naming one to do.
+    fn permission_policy(&mut self) {
+        let named = self
+            .root()
+            .get("permissions")
+            .and_then(|permissions| permissions.get("policy"))
+            .and_then(Item::as_str)
+            .is_some_and(|policy| !policy.is_empty());
+        if !named {
+            self.push_to_do(POLICY_TO_DO);
         }
     }
 

@@ -685,6 +685,7 @@ mod tests {
                 trusted_server_core::platform::PlatformGeoModule::new("noop", Arc::new(NoopGeo)),
             ))
             .client_info(ClientInfo::default())
+            .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
             .build()
     }
 
@@ -1174,14 +1175,17 @@ mod tests {
 
     #[test]
     fn the_full_name_loads_from_the_stored_form_with_its_token() {
-        let stored = serde_json::to_value(settings_selecting_the_full_name(TABLE))
-            .expect("should serialize the settings");
+        let mut settings = settings_selecting_the_full_name(TABLE);
+        // The blob a push writes names the policy and carries its file.
+        settings.permissions = trusted_server_core::test_support::tests::sample_permissions();
+        let stored = serde_json::to_value(settings).expect("should serialize the settings");
         let envelope = BlobEnvelope::new(stored, "2026-01-01T00:00:00Z".to_owned());
 
         let loaded = settings_from_config_blob_with(
             &serde_json::to_string(&envelope).expect("should serialize the envelope"),
             &StoredSecrets,
             &StoreName::from("trusted_server_secrets"),
+            trusted_server_core::platform::PolicyOrigin::Blob,
             &[builder()],
         )
         .expect("should load the stored configuration");
