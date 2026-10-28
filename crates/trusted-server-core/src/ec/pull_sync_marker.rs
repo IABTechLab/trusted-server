@@ -9,7 +9,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::constants::COOKIE_TS_EC_PULL_COMPLETE;
 use crate::redacted::Redacted;
-use crate::settings::Settings;
+use crate::settings::{EcModuleBlock, Settings};
 
 use super::pull_sync::entry_is_pull_complete;
 use super::registry::PartnerRegistry;
@@ -290,10 +290,29 @@ fn validate_marker(
 }
 
 fn marker_key(settings: &Settings) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(settings.ec.passphrase.expose().as_bytes())
+    let mut mac = HmacSha256::new_from_slice(marker_secret(settings).as_bytes())
         .expect("should create marker key HMAC");
     mac.update(MARKER_KEY_LABEL);
     mac.finalize().into_bytes().into()
+}
+
+/// The secret the marker key derives from.
+///
+/// A marker covers identifiers the selected module created, so when that
+/// module is the built-in HMAC one the marker is bound to its passphrase
+/// and a rotation retires the markers with the identifiers. A selected
+/// module with no passphrase binds the marker to the proxy secret.
+fn marker_secret(settings: &Settings) -> &str {
+    settings
+        .ec
+        .module
+        .as_ref()
+        .and_then(|selection| settings.ec.module_blocks.get(selection.key()))
+        .and_then(EcModuleBlock::hmac_settings)
+        .map_or_else(
+            || settings.publisher.proxy_secret.expose(),
+            |hmac| hmac.passphrase.expose(),
+        )
 }
 
 fn marker_payload(ec_id: &str, expires_at: u64, fingerprint: &str) -> String {
@@ -329,9 +348,10 @@ fn sorted_pull_partner_domains(registry: &PartnerRegistry) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::ec::kv_types::KvEntry;
+    use crate::ec::module::HMAC_MODULE_KEY;
     use crate::redacted::Redacted;
     use crate::settings::{EcPartner, Settings};
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{create_test_settings, select_hmac_module};
 
     const EC_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ABC123";
 
@@ -667,8 +687,11 @@ mod tests {
         let marker =
             create_marker(&settings, &registry, EC_ID, 4_600).expect("should create marker");
         let mut changed_settings = settings.clone();
-        changed_settings.ec.passphrase =
-            Redacted::new("different-secret-key-32-bytes-minimum".to_owned());
+        select_hmac_module(
+            &mut changed_settings.ec,
+            HMAC_MODULE_KEY,
+            "different-secret-key-32-bytes-minimum",
+        );
         let empty = PartnerRegistry::empty();
 
         assert!(

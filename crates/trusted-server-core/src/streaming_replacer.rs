@@ -16,6 +16,9 @@ pub struct Replacement {
 }
 
 /// A generic streaming replacer that processes content in chunks
+///
+/// The replacements are made in one pass, so what a replacement writes is
+/// never matched again.
 pub struct StreamingReplacer {
     /// List of replacements to apply
     pub replacements: Vec<Replacement>,
@@ -117,12 +120,7 @@ impl StreamingReplacer {
             // Check if this is a valid UTF-8 boundary
             if let Ok(s) = std::str::from_utf8(&combined[..adjusted_end_bytes]) {
                 // Valid UTF-8 up to this point, process it
-                let mut processed = s.to_owned();
-
-                // Apply all replacements
-                for replacement in &self.replacements {
-                    processed = processed.replace(&replacement.find, &replacement.replace_with);
-                }
+                let processed = replace_each_once(s, &self.replacements);
 
                 // Save the overlap for the next chunk
                 if is_last_chunk {
@@ -147,11 +145,60 @@ impl StreamingReplacer {
     }
 }
 
+/// `text` with each occurrence of a replacement's `find` written as its
+/// `replace_with`, in one pass from the start, so no replacement is read
+/// again.
+///
+/// The earliest match is taken each time, and the longer of two that start at
+/// the same place. A replacement with an empty `find` is ignored. Each
+/// replacement's next match is kept until the pass moves beyond it, so the
+/// text is searched once for each replacement however many matches it holds.
+fn replace_each_once(text: &str, replacements: &[Replacement]) -> String {
+    let find_from = |replacement: &Replacement, from: usize| {
+        if replacement.find.is_empty() {
+            return None;
+        }
+        text[from..]
+            .find(replacement.find.as_str())
+            .map(|at| from + at)
+    };
+    // Where each replacement next matches, at or after `done`.
+    let mut next_match: Vec<Option<usize>> = replacements
+        .iter()
+        .map(|replacement| find_from(replacement, 0))
+        .collect();
+    let mut out = String::with_capacity(text.len());
+    let mut done = 0;
+    while let Some((at, replacement)) = next_match
+        .iter()
+        .zip(replacements)
+        .filter_map(|(at, replacement)| at.map(|at| (at, replacement)))
+        .min_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| b.1.find.len().cmp(&a.1.find.len()))
+        })
+    {
+        out.push_str(&text[done..at]);
+        out.push_str(&replacement.replace_with);
+        done = at + replacement.find.len();
+        for (start, each) in next_match.iter_mut().zip(replacements) {
+            if start.is_some_and(|start| start < done) {
+                *start = find_from(each, done);
+            }
+        }
+    }
+    out.push_str(&text[done..]);
+    out
+}
+
 // Note: The stream_process function has been removed in favor of using
 // `StreamingPipeline` from the `streaming_processor` module, which provides
 // a more comprehensive solution with compression support.
 
 /// Helper function to create a `StreamingReplacer` for URL replacements
+///
+/// Each of the origin's addresses is written once, so a request host that
+/// contains the origin host is not matched again inside its replacement.
 #[must_use]
 pub fn create_url_replacer(
     origin_host: &str,
@@ -401,6 +448,96 @@ mod tests {
         assert!(result.contains("//test.example.com/script.js"));
     }
 
+    /// A request host that begins with the origin host, as a local host named
+    /// after the publisher does, is written once in every address over either
+    /// scheme, in one chunk or in many, rather than matched again inside its
+    /// own replacement.
+    #[test]
+    fn a_request_host_that_begins_with_the_origin_host_is_written_once() {
+        let content = r#"{"a":"https://publisher.example/news","b":"http://publisher.example/old","c":"//publisher.example/c.png","d":"publisher.example/bare"}"#;
+
+        for scheme in ["http", "https"] {
+            let expected = format!(
+                r#"{{"a":"{scheme}://publisher.example.localhost/news","b":"{scheme}://publisher.example.localhost/old","c":"//publisher.example.localhost/c.png","d":"publisher.example.localhost/bare"}}"#
+            );
+            for chunk_size in [content.len(), 7] {
+                let replacer = create_url_replacer(
+                    "publisher.example",
+                    "https://publisher.example",
+                    "publisher.example.localhost",
+                    scheme,
+                );
+
+                assert_eq!(
+                    process_with_fixed_chunk_size(replacer, content.as_bytes(), chunk_size),
+                    expected,
+                    "should write the request host once over {scheme} in chunks of {chunk_size}"
+                );
+            }
+        }
+    }
+
+    /// Hosts that do not begin with the origin host are written as before,
+    /// both one with no part of the origin host in it and a `www.` host in
+    /// front of an apex origin, whose addresses must not become `www.www.`.
+    #[test]
+    fn a_request_host_that_does_not_begin_with_the_origin_host_is_written_as_before() {
+        for (origin, request) in [
+            ("publisher.example", "publisher-example.localhost"),
+            ("example.com", "www.example.com"),
+        ] {
+            let mut replacer =
+                create_url_replacer(origin, &format!("https://{origin}"), request, "https");
+            let content = format!(
+                r#"{{"a":"https://{origin}/a","b":"http://{origin}/b","c":"//{origin}/c.png","d":"{origin}/d"}}"#
+            );
+
+            let processed = replacer.process_chunk(content.as_bytes(), true);
+
+            assert_eq!(
+                String::from_utf8(processed).expect("output should be valid UTF-8"),
+                format!(
+                    r#"{{"a":"https://{request}/a","b":"https://{request}/b","c":"//{request}/c.png","d":"{request}/d"}}"#
+                ),
+                "should write {request} once for {origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_replacement_is_made_once_from_the_start() {
+        let replacements = [
+            ("https://a.example", "http://a.example.localhost"),
+            ("http://a.example", "http://a.example.localhost"),
+            ("//a.example", "//a.example.localhost"),
+            ("a.example", "a.example.localhost"),
+            ("", "never"),
+        ]
+        .map(|(find, replace_with)| Replacement {
+            find: find.to_owned(),
+            replace_with: replace_with.to_owned(),
+        });
+
+        assert_eq!(
+            replace_each_once(
+                "https://a.example/1 http://a.example/2 //a.example/3 a.example/4",
+                &replacements
+            ),
+            "http://a.example.localhost/1 http://a.example.localhost/2 //a.example.localhost/3 a.example.localhost/4"
+        );
+        let reversed: Vec<Replacement> = replacements.iter().rev().cloned().collect();
+        assert_eq!(
+            replace_each_once("https://a.example/1 a.example/4", &reversed),
+            "http://a.example.localhost/1 a.example.localhost/4",
+            "should take the earliest match whatever the order of the list"
+        );
+        assert_eq!(
+            replace_each_once("nothing here", &replacements),
+            "nothing here"
+        );
+        assert_eq!(replace_each_once("", &replacements), "");
+    }
+
     #[test]
     fn test_process_chunk_utf8_boundary_cases() {
         struct Utf8BoundaryCase<'a> {
@@ -536,7 +673,7 @@ mod tests {
 
     #[test]
     fn test_pattern_priority() {
-        // Test that longer patterns are replaced first (order matters)
+        // The longer of two patterns that start at the same place is replaced
         let replacements = vec![
             Replacement {
                 find: "hello world".to_owned(),
@@ -554,7 +691,7 @@ mod tests {
         let processed = replacer.process_chunk(input, true);
         let result = String::from_utf8(processed).expect("output should be valid UTF-8");
 
-        // Note: Since we apply replacements in order, "hello world" gets replaced first
+        // "hello world" and "hello" start at the same place, so the longer is taken
         assert_eq!(result, "Say greetings universe and hi there!");
     }
 
@@ -578,7 +715,7 @@ mod tests {
         let processed = replacer.process_chunk(input, true);
         let result = String::from_utf8(processed).expect("output should be valid UTF-8");
 
-        // "abc" gets replaced first, so "bcd" is no longer found
+        // "abc" starts first, so "bcd", which overlaps it, is not replaced
         assert_eq!(result, "xyzdef");
     }
 

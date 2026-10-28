@@ -186,7 +186,7 @@ run_case missing-proxy "$((BASE_PORT + 2))" "$CONFIG_JSON" publisher_proxy_secre
     "failed to resolve secret reference at \`publisher.proxy_secret\` from secret store \`trusted_server_secrets\`"
 run_case missing-ec "$((BASE_PORT + 3))" "$CONFIG_JSON" ec_passphrase 500 \
     'env.ec_passphrase' \
-    "failed to resolve secret reference at \`ec.passphrase\` from secret store \`trusted_server_secrets\`"
+    "failed to resolve secret reference at \`ec.hmac.passphrase\` from secret store \`trusted_server_secrets\`"
 run_case positive "$((BASE_PORT + 4))" "$CONFIG_JSON" "" 200 "" ""
 
 echo "Cloudflare first-success smoke passed"

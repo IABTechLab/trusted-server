@@ -109,7 +109,7 @@ run_case missing-proxy "$((BASE_PORT + 2))" "$ENVELOPE" \
     "failed to resolve secret reference at \`publisher.proxy_secret\`"
 run_case missing-ec "$((BASE_PORT + 3))" "$ENVELOPE" \
     "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "" 500 \
-    "failed to resolve secret reference at \`ec.passphrase\`"
+    "failed to resolve secret reference at \`ec.hmac.passphrase\`"
 run_case positive "$((BASE_PORT + 4))" "$ENVELOPE" \
     "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 200
 

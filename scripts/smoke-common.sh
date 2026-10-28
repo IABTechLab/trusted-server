@@ -184,6 +184,17 @@ smoke_initialize_config() {
     local origin_port="$3"
     SMOKE_APP_CONFIG="$workspace/trusted-server.toml"
     "$SMOKE_TS_BIN" config init --app-config "$SMOKE_APP_CONFIG"
+    # The example settings leave Edge Cookie identity off. Select the built-in
+    # hmac module and its block, so the missing-ec case has a secret to omit.
+    sed -e 's/^# module = "hmac"$/module = "hmac"/' \
+        -e '/^# \[ec\.hmac\]$/,/^# passphrase = /s/^# //' \
+        "$SMOKE_APP_CONFIG" >"$SMOKE_APP_CONFIG.hmac"
+    mv "$SMOKE_APP_CONFIG.hmac" "$SMOKE_APP_CONFIG"
+    local line
+    for line in 'module = "hmac"' '[ec.hmac]' 'passphrase = "ec_passphrase"'; do
+        grep --fixed-strings --line-regexp --quiet -- "$line" "$SMOKE_APP_CONFIG" ||
+            smoke_die "could not uncomment '$line' in $SMOKE_APP_CONFIG"
+    done
     export TRUSTED_SERVER__PUBLISHER__DOMAIN="127.0.0.1"
     export TRUSTED_SERVER__PUBLISHER__COOKIE_DOMAIN="127.0.0.1"
     export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL="http://127.0.0.1:$origin_port"

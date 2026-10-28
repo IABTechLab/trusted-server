@@ -133,7 +133,7 @@ run_case missing-handler "$((BASE_PORT + 1))" "$SPIN_HANDLER_VAR" 503 \
 run_case missing-proxy "$((BASE_PORT + 2))" "$SPIN_PROXY_VAR" 503 \
     "resolved secret at \`publisher.proxy_secret\` must not be empty"
 run_case missing-ec "$((BASE_PORT + 3))" "$SPIN_EC_VAR" 503 \
-    "resolved secret at \`ec.passphrase\` must not be empty"
+    "resolved secret at \`ec.hmac.passphrase\` must not be empty"
 run_case positive "$((BASE_PORT + 4))" "" 200
 
 echo "Spin first-success smoke passed"

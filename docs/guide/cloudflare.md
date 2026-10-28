@@ -33,7 +33,9 @@ value of `app_config` in a JSON object; that outer JSON is assigned to the
 the current startup reader.
 
 The generated local Wrangler files define `handler_password`,
-`publisher_proxy_secret`, and `ec_passphrase` separately. The smoke launches
+`publisher_proxy_secret`, and `ec_passphrase` separately. Edge Cookie identity
+is off by default, so the smoke's settings select the built-in `hmac` module,
+whose passphrase is the `ec_passphrase` secret. The smoke launches
 `wrangler dev` once without the config binding and once for each omitted
 secret. Each case requires a 500 response and verifies the exact missing
 binding against Wrangler's runtime binding inventory. The positive publisher

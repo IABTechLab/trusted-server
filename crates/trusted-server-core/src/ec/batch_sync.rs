@@ -23,9 +23,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::TrustedServerError;
 
 use super::auth::authenticate_bearer;
-use super::generation::{is_valid_ec_id, normalize_ec_id_for_kv};
 use super::kv::{KvIdentityGraph, UpsertResult};
 use super::log_id;
+use super::module::{AcceptedModules, EdgeCookieModule};
 use super::rate_limiter::RateLimiter;
 use super::registry::PartnerRegistry;
 
@@ -115,15 +115,17 @@ pub fn handle_batch_sync(
     kv: &KvIdentityGraph,
     registry: &PartnerRegistry,
     rate_limiter: &dyn RateLimiter,
+    module: Option<&dyn EdgeCookieModule>,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    handle_batch_sync_with_writer(kv, registry, rate_limiter, req)
+    handle_batch_sync_with_writer(kv, registry, rate_limiter, module, req)
 }
 
 fn handle_batch_sync_with_writer(
     writer: &dyn BatchSyncWriter,
     registry: &PartnerRegistry,
     rate_limiter: &dyn RateLimiter,
+    module: Option<&dyn EdgeCookieModule>,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     // 1. Authenticate
@@ -167,7 +169,12 @@ fn handle_batch_sync_with_writer(
     }
 
     // 4. Process mappings with per-item validation and rejection reasons.
-    let (accepted, errors) = process_mappings(writer, &partner.source_domain, &body.mappings);
+    let (accepted, errors) = process_mappings(
+        writer,
+        &partner.source_domain,
+        &body.mappings,
+        &AcceptedModules::active(module),
+    );
 
     let rejected = errors.len();
     let status = if rejected > 0 {
@@ -203,6 +210,7 @@ fn process_mappings(
     writer: &dyn BatchSyncWriter,
     partner_id: &str,
     mappings: &[SyncMapping],
+    accepted_modules: &AcceptedModules<'_>,
 ) -> (usize, Vec<MappingError>) {
     let mut errors = Vec::new();
     let mut groups: Vec<MappingGroup> = Vec::new();
@@ -211,14 +219,18 @@ fn process_mappings(
     // Validate all inputs before beginning KV work. The vector preserves group
     // order; the map only locates an existing group in constant time.
     for (index, mapping) in mappings.iter().enumerate() {
-        let ec_id = normalize_ec_id_for_kv(&mapping.ec_id);
-        if !is_valid_ec_id(&ec_id) {
+        // The global cookie bounds, then the module that owns the
+        // identifier's code, which canonicalizes its own value part and decides
+        // whether the canonical form is one of its own. A partner echoing back
+        // an identifier a non-HMAC module created is accepted here; an
+        // identifier under a code this deployment does not read is not.
+        let Some(ec_id) = accepted_modules.canonical_kv_key(&mapping.ec_id) else {
             errors.push(MappingError {
                 index,
                 reason: REASON_INVALID_EC_ID,
             });
             continue;
-        }
+        };
 
         if mapping.partner_uid.trim().is_empty() || mapping.partner_uid.len() > MAX_UID_LENGTH {
             errors.push(MappingError {
@@ -308,17 +320,15 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
+    use crate::ec::module::HmacModule;
+    use crate::ec::tests::OpaqueModule;
     use crate::error::TrustedServerError;
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
 
-    // EC ID validation tests are in generation.rs (is_valid_ec_id).
-    // Verify the import works here with a basic smoke test.
-    #[test]
-    fn is_valid_ec_id_smoke_test() {
-        let valid = format!("{}.ABC123", "a".repeat(64));
-        assert!(is_valid_ec_id(&valid));
-        assert!(!is_valid_ec_id(&"a".repeat(64)));
+    /// The built-in module, standing in for a deployment that selected it.
+    fn hmac_module() -> HmacModule {
+        HmacModule::new(Redacted::new("test-secret-key-32-bytes-minimum".to_owned()))
     }
 
     struct MockRateLimiter {
@@ -489,7 +499,7 @@ mod tests {
             .body(EdgeBody::from("not-json"))
             .expect("should build test request");
 
-        let response = handle_batch_sync_with_writer(&writer, &registry, &limiter, req)
+        let response = handle_batch_sync_with_writer(&writer, &registry, &limiter, None, req)
             .expect("should return oversized response");
 
         assert_eq!(
@@ -515,7 +525,7 @@ mod tests {
             .body(EdgeBody::from(oversized_body))
             .expect("should build test request");
 
-        let response = handle_batch_sync_with_writer(&writer, &registry, &limiter, req)
+        let response = handle_batch_sync_with_writer(&writer, &registry, &limiter, None, req)
             .expect("should return oversized response");
 
         assert_eq!(
@@ -534,7 +544,13 @@ mod tests {
             mapping(&format!("{}.ABC123", "a".repeat(64)), "u3", 1),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let module = hmac_module();
+        let (accepted, errors) = process_mappings(
+            &writer,
+            "partner",
+            &mappings,
+            &AcceptedModules::active(Some(&module)),
+        );
 
         assert_eq!(accepted, 1, "should count successful writes as accepted");
         assert_eq!(errors.len(), 2, "should reject invalid mappings only");
@@ -560,7 +576,13 @@ mod tests {
             mapping(&format!("{}.ABC123", "c".repeat(64)), "u3", 1),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let module = hmac_module();
+        let (accepted, errors) = process_mappings(
+            &writer,
+            "partner",
+            &mappings,
+            &AcceptedModules::active(Some(&module)),
+        );
 
         assert_eq!(accepted, 1, "should keep accepted count before failure");
         assert_eq!(
@@ -593,7 +615,7 @@ mod tests {
             .expect("should build test request");
 
         let response =
-            handle_batch_sync(&kv, &registry, &limiter, req).expect("should return response");
+            handle_batch_sync(&kv, &registry, &limiter, None, req).expect("should return response");
         assert_eq!(
             response.status(),
             StatusCode::UNAUTHORIZED,
@@ -657,7 +679,13 @@ mod tests {
             mapping(&withdrawn_ec_id, "uid-2", 101),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let module = hmac_module();
+        let (accepted, errors) = process_mappings(
+            &writer,
+            "partner",
+            &mappings,
+            &AcceptedModules::active(Some(&module)),
+        );
 
         assert_eq!(accepted, 0, "should not accept ineligible mappings");
         assert_eq!(errors.len(), 2, "should report both errors");
@@ -669,12 +697,110 @@ mod tests {
     }
 
     #[test]
+    fn process_mappings_accepts_an_identifier_from_the_active_non_hmac_module() {
+        // An identifier the active non-HMAC module owns is accepted, so a
+        // partner can sync a mapping against an identifier the HMAC grammar
+        // would reject.
+        let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
+        let mappings = vec![mapping("t0op~Opaque_Value_MixedCase", "uid-1", 100)];
+
+        let (accepted, errors) = process_mappings(
+            &writer,
+            "partner",
+            &mappings,
+            &AcceptedModules::active(Some(&OpaqueModule)),
+        );
+
+        assert_eq!(accepted, 1, "the active module's identifier is accepted");
+        assert!(
+            errors.is_empty(),
+            "should report no errors, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn process_mappings_rejects_a_code_no_configured_module_reads() {
+        // The other side of the dispatch: a code belonging to a module this
+        // deployment neither runs nor reads is not an identifier here, whatever
+        // its shape.
+        let writer = MockWriter::new(vec![]);
+        let hmac_shaped = format!("t0zz~{}.ABC123", "a".repeat(64));
+        let mappings = vec![
+            mapping("t0zz~Opaque_Value", "uid-1", 100),
+            mapping(&hmac_shaped, "uid-2", 100),
+        ];
+
+        let (accepted, errors) = process_mappings(
+            &writer,
+            "partner",
+            &mappings,
+            &AcceptedModules::active(Some(&OpaqueModule)),
+        );
+
+        assert_eq!(accepted, 0, "an unknown module code is not accepted");
+        assert_eq!(errors.len(), 2, "both mappings should be rejected");
+        assert!(
+            errors
+                .iter()
+                .all(|error| error.reason == REASON_INVALID_EC_ID),
+            "should reject as an invalid EC ID, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn process_mappings_canonicalizes_through_the_owning_module() {
+        // KV normalization is dispatched the same way as validation. The
+        // built-in module lowercases its hash segment, so a partner echoing
+        // uppercase hex still writes the row created at generation time, while
+        // the opaque module's own normalization leaves its value untouched.
+        let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
+        let uppercase = format!("hmac~{}.ABC123", "A".repeat(64));
+        let module = hmac_module();
+        let accepted_modules = AcceptedModules::active(Some(&module));
+
+        assert_eq!(
+            accepted_modules.canonical_kv_key(&uppercase),
+            Some(format!("hmac~{}.ABC123", "a".repeat(64))),
+            "the built-in module should lowercase only its hash segment"
+        );
+        assert_eq!(
+            AcceptedModules::active(Some(&OpaqueModule))
+                .canonical_kv_key("t0op~Opaque_Value_MixedCase"),
+            Some("t0op~Opaque_Value_MixedCase".to_owned()),
+            "an opaque module's identifier should be keyed verbatim"
+        );
+
+        let mappings = vec![mapping(&uppercase, "uid-1", 100)];
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings, &accepted_modules);
+        assert_eq!(accepted, 1, "uppercase hex should still be accepted");
+        assert!(
+            errors.is_empty(),
+            "should report no errors, got: {errors:?}"
+        );
+        assert_eq!(
+            writer
+                .calls()
+                .into_iter()
+                .map(|call| call.ec_id)
+                .collect::<Vec<_>>(),
+            vec![format!("hmac~{}.ABC123", "a".repeat(64))],
+            "the write should go to the row under the lowercase canonical key"
+        );
+    }
+
+    #[test]
     fn process_mappings_fans_out_unchanged_to_group_members() {
         let writer = MockWriter::new(vec![Ok(UpsertResult::Unchanged)]);
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mappings = vec![mapping(&ec_id, "uid-1", 100), mapping(&ec_id, "uid-1", 101)];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let module = hmac_module();
+        let (accepted, errors) = process_mappings(
+            &writer,
+            "partner",
+            &mappings,
+            &AcceptedModules::active(Some(&module)),
+        );
 
         assert_eq!(accepted, 2, "should accept every unchanged group member");
         assert!(
@@ -693,7 +819,13 @@ mod tests {
             mapping(&ec_id, "uid-old", 100),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let module = hmac_module();
+        let (accepted, errors) = process_mappings(
+            &writer,
+            "partner",
+            &mappings,
+            &AcceptedModules::active(Some(&module)),
+        );
 
         assert_eq!(
             accepted, 2,
@@ -723,7 +855,12 @@ mod tests {
             mapping(&ec_id_a_upper, "a-last", 3),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(
+            &writer,
+            "partner",
+            &mappings,
+            &AcceptedModules::active(Some(&hmac_module())),
+        );
 
         assert_eq!(accepted, 3, "should accept every valid group member");
         assert!(errors.is_empty(), "should report no errors");
@@ -753,7 +890,12 @@ mod tests {
             .map(|index| mapping(&ec_id, &format!("uid-{index}"), index as u64))
             .collect::<Vec<_>>();
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(
+            &writer,
+            "partner",
+            &mappings,
+            &AcceptedModules::active(Some(&hmac_module())),
+        );
 
         assert_eq!(
             accepted, MAX_BATCH_SIZE,
@@ -781,7 +923,12 @@ mod tests {
             mapping(&mixed_suffix, "mixed", 2),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(
+            &writer,
+            "partner",
+            &mappings,
+            &AcceptedModules::active(Some(&hmac_module())),
+        );
 
         assert_eq!(accepted, 2, "should accept both distinct EC IDs");
         assert!(errors.is_empty(), "should report no errors");
@@ -813,7 +960,12 @@ mod tests {
             mapping(&ec_id, "   ", 3),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(
+            &writer,
+            "partner",
+            &mappings,
+            &AcceptedModules::active(Some(&hmac_module())),
+        );
 
         assert_eq!(accepted, 2, "should accept valid group members");
         assert_eq!(errors.len(), 1, "should retain the invalid UID error");
@@ -841,7 +993,12 @@ mod tests {
             mapping(&ec_id_b, "b-2", 4),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(
+            &writer,
+            "partner",
+            &mappings,
+            &AcceptedModules::active(Some(&hmac_module())),
+        );
 
         assert_eq!(accepted, 0, "should reject all ineligible group members");
         assert_eq!(
@@ -882,7 +1039,12 @@ mod tests {
             mapping(&ec_id_c, "", 6),
         ];
 
-        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+        let (accepted, errors) = process_mappings(
+            &writer,
+            "partner",
+            &mappings,
+            &AcceptedModules::active(Some(&hmac_module())),
+        );
 
         assert_eq!(
             accepted, 2,
@@ -929,6 +1091,7 @@ mod tests {
             &writer,
             &registry,
             &limiter,
+            Some(&hmac_module()),
             authorized_batch_request(&body),
         )
         .expect("should return success response");
@@ -959,6 +1122,7 @@ mod tests {
             &writer,
             &registry,
             &limiter,
+            Some(&hmac_module()),
             authorized_batch_request(&body),
         )
         .expect("should return multi-status response");
@@ -997,6 +1161,7 @@ mod tests {
             &writer,
             &registry,
             &limiter,
+            Some(&hmac_module()),
             authorized_batch_request(&body),
         )
         .expect("should return validation response");
@@ -1042,6 +1207,7 @@ mod tests {
             &writer,
             &registry,
             &limiter,
+            Some(&hmac_module()),
             authorized_batch_request(&body),
         )
         .expect("should return infrastructure failure response");
@@ -1072,6 +1238,29 @@ mod tests {
                 },
             ],
             "should stop after the failing group and accept A's later duplicate"
+        );
+    }
+
+    #[test]
+    fn process_mappings_accepts_a_created_coded_ec_id() {
+        let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
+        // Partners echo the identifier identify gave them, which carries the
+        // module-code envelope since the creation path applies it.
+        let ec_id = format!("hmac~{}.ABC123", "a".repeat(64));
+        let mappings = vec![mapping(&ec_id, "uid-1", 1)];
+
+        let module = hmac_module();
+        let (accepted, errors) = process_mappings(
+            &writer,
+            "partner",
+            &mappings,
+            &AcceptedModules::active(Some(&module)),
+        );
+
+        assert_eq!(accepted, 1, "should accept a coded HMAC identifier");
+        assert!(
+            errors.is_empty(),
+            "should report no format error for a coded HMAC identifier"
         );
     }
 }
