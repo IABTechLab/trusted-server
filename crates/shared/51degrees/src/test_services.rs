@@ -415,6 +415,7 @@ pub fn services_with(
     store: Arc<MemoryKvStore>,
 ) -> RuntimeServices {
     RuntimeServices::builder()
+        .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
         .config_store(Arc::new(StubStore))
         .secret_store(Arc::new(StubStore))
         .kv_store(store)
@@ -440,6 +441,7 @@ pub fn services_with_value_cache(
     cache: Arc<MemoryValueCache>,
 ) -> RuntimeServices {
     RuntimeServices::builder()
+        .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
         .config_store(Arc::new(StubStore))
         .secret_store(Arc::new(StubStore))
         .kv_store(Arc::new(UnavailableKvStore))
