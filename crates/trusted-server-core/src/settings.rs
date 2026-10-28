@@ -21,7 +21,9 @@ use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
 use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
-use crate::ec::module::{EcModuleSelection, HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY};
+use crate::ec::module::{
+    EcModuleSelection, HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY, check_named_module_configuration,
+};
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
@@ -585,6 +587,23 @@ pub struct Ec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passphrase: Option<Redacted<String>>,
 
+    /// Extra exact origins allowed to POST the client resolve endpoint.
+    ///
+    /// The endpoint always accepts `https://{publisher.domain}` and nothing
+    /// else by default. A publisher whose pages are served from another origin,
+    /// `www` being the common case, lists those origins here. Each entry is a
+    /// serialized origin (RFC 6454 §6.1), being `http://` or `https://` and a
+    /// host with an optional port and nothing after it, and
+    /// [`validate_resolve_allowed_origins`](Self::validate_resolve_allowed_origins)
+    /// refuses any other entry when the settings load. Each is compared with
+    /// the request's `Origin` by the same-origin test of RFC 6454 §5, so the
+    /// scheme, the host and the port all have to match, with a missing port
+    /// meaning the scheme's default. A suffix or subdomain match is never
+    /// performed, because control of a DNS namespace does not make every host
+    /// under it a trusted identity-setting origin.
+    #[serde(default)]
+    pub resolve_allowed_origins: Vec<String>,
+
     /// Fastly KV store name for the EC identity graph.
     #[serde(default)]
     pub ec_store: Option<String>,
@@ -685,6 +704,35 @@ impl Ec {
         Ok(())
     }
 
+    /// Refuses a [`resolve_allowed_origins`](Self::resolve_allowed_origins)
+    /// entry that is not a serialized origin.
+    ///
+    /// The resolve endpoint reads each entry with
+    /// [`parse_serialized_origin`](crate::ec::resolve::parse_serialized_origin),
+    /// and an entry that parse rejects matches no request, so every resolve
+    /// from the origin it was meant to allow would answer `403`. Checking with
+    /// the same parse here means an entry that loads is one a request can
+    /// match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] naming the first entry
+    /// that is not a serialized origin and what is wrong with it.
+    pub fn validate_resolve_allowed_origins(&self) -> Result<(), Report<TrustedServerError>> {
+        for entry in &self.resolve_allowed_origins {
+            if let Err(reason) = crate::ec::resolve::parse_serialized_origin(entry) {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "[ec] resolve_allowed_origins entry `{entry}` {reason}. \
+                         Each entry is a bare origin, being `http://` or `https://` and a \
+                         host with an optional port, such as `https://www.example.com`"
+                    ),
+                }));
+            }
+        }
+        Ok(())
+    }
+
     /// Validates the module selection against the configured blocks.
     ///
     /// When [`module`](Self::module) is set, the selection has to resolve
@@ -700,12 +748,19 @@ impl Ec {
     /// one place that knows both the implementations built into core and the
     /// one this deployment's adapter injects.
     ///
+    /// Whether this build compiles an implementation in at all is answered by
+    /// `check_named_module_configuration` in [`crate::ec::module`], beside
+    /// the resolution it belongs to, rather than here, because the settings
+    /// cannot know which implementations are compiled out of this build. Only
+    /// the resolution knows that.
+    ///
     /// # Errors
     ///
     /// Returns [`TrustedServerError::Configuration`] when a module name or
     /// implementation is not a module name, when a block is configured with no
     /// selector or alongside `"none"`, when the selector names a key `[ec]`
-    /// reads as its own setting, when a block the selector does not name is
+    /// reads as its own setting, when the selected implementation is not
+    /// compiled into this build, when a block the selector does not name is
     /// configured, or when the selected module resolves to an implementation
     /// that needs settings and has no block.
     pub fn validate_module_selection(&self) -> Result<(), Report<TrustedServerError>> {
@@ -755,12 +810,18 @@ impl Ec {
             }));
         }
 
-        // A module has a block only when it has settings, and core knows
-        // which of its own implementations need them. Both modules built
-        // into core take a passphrase, so both need one. A module an adapter
-        // injects has the contents of its block read by that adapter when it
-        // builds the module, so core cannot say whether it needs one.
+        // Whether this build compiles the implementation in at all is the
+        // resolution's question, not the settings', so it is asked there.
         let implementation = self.module_blocks.implementation(name);
+        check_named_module_configuration(implementation)?;
+
+        // A module has a block only when it has settings, and core knows
+        // which of its own implementations need them. Both modules that
+        // derive an identifier at the edge take a passphrase, so both need one.
+        // The demonstration module is built from nothing and needs none. A
+        // module an adapter injects has the contents of its block read by
+        // that adapter when it builds the module, so core cannot say whether
+        // it needs one.
         if (implementation == HMAC_MODULE_KEY || implementation == HOST_SIGNALS_MODULE_KEY)
             && !self.module_blocks.contains_key(name)
         {
@@ -910,6 +971,7 @@ impl Validate for Ec {
 const EC_SECTION_KEYS: &[&str] = &[
     "module",
     "passphrase",
+    "resolve_allowed_origins",
     "ec_store",
     "pull_sync_concurrency",
     "cluster_trust_threshold",
@@ -4077,6 +4139,7 @@ impl Settings {
 
         settings.ec.migrate_legacy_ec_layout()?;
         settings.ec.validate_module_selection()?;
+        settings.ec.validate_resolve_allowed_origins()?;
         settings.device.validate_module_selection()?;
         settings.geo.validate_module_selection()?;
         settings
@@ -4800,6 +4863,8 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeSet;
     use std::sync::Arc;
+
+    use crate::ec::resolve::NotAnOrigin;
 
     /// `DebugConfig` denies unknown fields, so a binary built before
     /// `sandbox_metrics_enabled` existed must still accept a default blob.
@@ -6156,6 +6221,101 @@ mod tests {
         assert!(
             settings.ec.module_blocks.is_empty(),
             "the selection should stand on its own with no block configured"
+        );
+    }
+
+    /// The fixture settings with `line` added to `[ec]`.
+    fn settings_toml_with_ec_line(line: &str) -> String {
+        crate_test_settings_str_with_ec_section(&format!(
+            "[ec]\nmodule = \"hmac\"\n{line}\n\n[ec.hmac]\n\
+             passphrase = \"test-secret-key-32-bytes-minimum\"\n"
+        ))
+    }
+
+    /// The `resolve_allowed_origins` line listing `entries`, each written as a
+    /// TOML basic string.
+    fn resolve_allowed_origins_line(entries: &[&str]) -> String {
+        let written: Vec<String> = entries
+            .iter()
+            .map(|entry| serde_json::to_string(entry).expect("should write a string"))
+            .collect();
+        format!("resolve_allowed_origins = [{}]", written.join(", "))
+    }
+
+    #[test]
+    fn resolve_allowed_origins_load_only_as_bare_origins() {
+        let accepted: [(&str, Option<&[&str]>); 7] = [
+            ("an absent list", None),
+            ("an empty list", Some(&[])),
+            ("https with no port", Some(&["https://www.example.com"])),
+            ("https with :443", Some(&["https://www.example.com:443"])),
+            ("http with :80", Some(&["http://www.example.com:80"])),
+            (
+                "a non-default port",
+                Some(&["https://www.example.com:8443"]),
+            ),
+            (
+                "the generator's https://{domain} shape",
+                Some(&["https://www.example.com", "https://m.example.com"]),
+            ),
+        ];
+        for (label, entries) in accepted {
+            let line = entries
+                .map(resolve_allowed_origins_line)
+                .unwrap_or_default();
+
+            let settings = Settings::from_toml(&settings_toml_with_ec_line(&line))
+                .unwrap_or_else(|err| panic!("should load {label}: {err:?}"));
+
+            assert_eq!(
+                settings.ec.resolve_allowed_origins,
+                entries.unwrap_or_default(),
+                "should keep the entries of {label} as written"
+            );
+        }
+
+        let refused = [
+            ("https://www.example.com/", NotAnOrigin::Path),
+            ("https://www.example.com/path", NotAnOrigin::Path),
+            ("https://www.example.com\\", NotAnOrigin::Path),
+            ("https://www.example.com?a=1", NotAnOrigin::Query),
+            ("https://www.example.com#top", NotAnOrigin::Fragment),
+            ("https://user@www.example.com", NotAnOrigin::Userinfo),
+            ("https://user:pass@www.example.com", NotAnOrigin::Userinfo),
+            ("www.example.com", NotAnOrigin::Scheme),
+            ("www.example.com:443", NotAnOrigin::Scheme),
+            ("ftp://www.example.com", NotAnOrigin::Scheme),
+            ("wss://www.example.com", NotAnOrigin::Scheme),
+            ("null", NotAnOrigin::Scheme),
+            ("", NotAnOrigin::Empty),
+            ("https://", NotAnOrigin::Host),
+            ("https://www.example.com ", NotAnOrigin::Host),
+        ];
+        for (entry, reason) in refused {
+            let line = resolve_allowed_origins_line(&["https://www.example.com", entry]);
+
+            let Err(err) = Settings::from_toml(&settings_toml_with_ec_line(&line)) else {
+                panic!("should refuse `{entry}` at load");
+            };
+
+            assert!(
+                format!("{err:?}")
+                    .contains(&format!("resolve_allowed_origins entry `{entry}` {reason}")),
+                "should name `{entry}` and say it {reason}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resolve_allowed_origin_with_a_trailing_slash_is_refused_at_load() {
+        let line = resolve_allowed_origins_line(&["https://www.example.com/"]);
+
+        let err = Settings::from_toml(&settings_toml_with_ec_line(&line))
+            .expect_err("should refuse an entry that would never match a request's Origin");
+
+        assert!(
+            format!("{err:?}").contains("`https://www.example.com/`"),
+            "should name the entry: {err:?}"
         );
     }
 

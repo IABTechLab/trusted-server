@@ -30,6 +30,7 @@
 //! | GET | `/_ts/set-tester` | [`handle_set_tester`] |
 //! | GET | `/_ts/clear-tester` | [`handle_clear_tester`] |
 //! | OPTIONS | `/_ts/api/v1/identify` | [`cors_preflight_identify`] |
+//! | POST | `/_ts/api/v1/ec/resolve` | [`handle_ec_resolve`] |
 //! | POST | `/auction` | [`handle_auction`] |
 //! | GET | `/first-party/proxy` | [`handle_first_party_proxy`] |
 //! | GET | `/first-party/click` | [`handle_first_party_click`] |
@@ -116,6 +117,7 @@ use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::module::request_module;
 use trusted_server_core::ec::module::{EdgeCookieModule, build_reusable_module};
 use trusted_server_core::ec::registry::PartnerRegistry;
+use trusted_server_core::ec::resolve::handle_ec_resolve;
 use trusted_server_core::ec::{EcContext, EidSyncSource};
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::is_navigation_request;
@@ -128,8 +130,6 @@ use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformKvStore, PolicyOrigin, RuntimeServices, StoreName,
     build_geo_module,
 };
-use trusted_server_device_fastly::FastlyHostSignals;
-
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
     handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
@@ -146,6 +146,7 @@ use trusted_server_core::request_signing::{
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::{DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
+use trusted_server_device_fastly::FastlyHostSignals;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
@@ -797,6 +798,12 @@ async fn run_named_route(
         }
         NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
+        NamedRouteHandler::EcResolve => {
+            // The resolve endpoint persists the identity-graph row before
+            // creating, so it takes the same bot-gated graph as generation: an
+            // unrecognized client gets no graph, and therefore no new Edge Cookie.
+            handle_ec_resolve(&state.settings, req, &ec.ec_context, ec.kv_graph.as_ref())
+        }
         NamedRouteHandler::Auction => {
             ec.ec_context.set_eid_sync_source(EidSyncSource::Auction);
             let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
@@ -1223,6 +1230,7 @@ enum NamedRouteHandler {
     Identify,
     SetTester,
     ClearTester,
+    EcResolve,
     Auction,
     PageBids,
     FirstPartyProxy,
@@ -1336,6 +1344,11 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/_ts/clear-tester",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::ClearTester,
+    },
+    NamedRoute {
+        path: "/_ts/api/v1/ec/resolve",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::EcResolve,
     },
     NamedRoute {
         path: "/auction",
@@ -2458,6 +2471,25 @@ mod tests {
             set_cookie,
             "ts-tester=; Domain=.test-publisher.com; Path=/; Secure; SameSite=Lax; Max-Age=0",
             "tester cookie clear should use publisher.cookie_domain"
+        );
+    }
+
+    #[test]
+    fn dispatch_ec_resolve_routes_to_resolve_handler() {
+        // Parity guard: POST /_ts/api/v1/ec/resolve must reach the resolve
+        // handler, not the publisher fallback or a router-level 405. The test
+        // request carries no Origin, so the handler's own origin guard answers
+        // 403, proving the request was handled here rather than proxied to
+        // the publisher origin (which would error without a live backend).
+        let router = test_router();
+        let response =
+            block_on(router.oneshot(empty_request(Method::POST, "/_ts/api/v1/ec/resolve")))
+                .expect("should route request");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "POST ec/resolve should reach the resolve handler's origin guard, not the publisher"
         );
     }
 

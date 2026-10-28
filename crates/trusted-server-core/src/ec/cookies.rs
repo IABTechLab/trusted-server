@@ -16,7 +16,7 @@
 use edgezero_core::body::Body as EdgeBody;
 use http::{HeaderValue, Response, header};
 
-use crate::constants::COOKIE_TS_EC;
+use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_RESOLVED};
 use crate::settings::Settings;
 
 /// Maximum age for the EC cookie (1 year in seconds).
@@ -125,6 +125,61 @@ pub fn expire_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>) 
             log::warn!("Skipping EC cookie expiry Set-Cookie: invalid header value: {e}");
         }
     }
+    // Expire the resolved marker together with the Edge Cookie, so a page
+    // whose visitor later re-establishes the permission can resolve again.
+    expire_ec_resolved_marker(settings, response);
+}
+
+/// Expires the resolved marker on its own, leaving the Edge Cookie alone.
+///
+/// The marker records only that some client-cycle module resolved in the
+/// past. It is not namespaced by the module code the way the cookie value,
+/// the identity-graph key and withdrawal are, so on a switch from one
+/// client-cycle module to another the marker outlives the identity it was
+/// set for. The new module's page script would then see the marker, skip the
+/// resolve it should perform, and the visitor would sit with no identity
+/// rather than a restarted one. Expiring the marker whenever the incoming
+/// value is not one the selected module owns restarts the cycle without
+/// depending on any vendor page script comparing a marker value correctly.
+pub fn expire_ec_resolved_marker(settings: &Settings, response: &mut Response<EdgeBody>) {
+    let marker = format!(
+        "{COOKIE_TS_EC_RESOLVED}=; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age=0",
+        settings.publisher.ec_cookie_domain(),
+    );
+    match HeaderValue::from_str(&marker) {
+        Ok(val) => {
+            response.headers_mut().append(header::SET_COOKIE, val);
+        }
+        Err(e) => {
+            log::warn!("Skipping resolved-marker expiry Set-Cookie: invalid header value: {e}");
+        }
+    }
+}
+
+/// Sets the `non-HttpOnly` resolved-marker cookie alongside a client-cycle Edge
+/// Cookie.
+///
+/// The Edge Cookie itself is `HttpOnly`, so the page script cannot see it and
+/// would otherwise post to the resolve endpoint on every page view. The marker
+/// carries no identity (its value is `1`); it only signals that a resolve
+/// succeeded. It shares the Edge Cookie's `Domain`, `Path`, `Secure`,
+/// `SameSite`, and lifetime, and is expired together with it by
+/// [`expire_ec_cookie`].
+pub(crate) fn set_resolved_marker_cookie(settings: &Settings, response: &mut Response<EdgeBody>) {
+    let cookie = format!(
+        "{COOKIE_TS_EC_RESOLVED}=1; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={COOKIE_MAX_AGE}",
+        settings.publisher.ec_cookie_domain(),
+    );
+    match HeaderValue::from_str(&cookie) {
+        Ok(val) => {
+            response.headers_mut().append(header::SET_COOKIE, val);
+        }
+        Err(e) => {
+            // Unreachable in practice: the value is a constant and the domain
+            // comes from operator-trusted configuration.
+            log::warn!("Skipping resolved-marker Set-Cookie: invalid header value: {e}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -194,91 +249,68 @@ mod tests {
         );
     }
 
+    /// Every value in the identifier alphabet is written verbatim, whatever
+    /// module made it, with the standard security attributes.
     #[test]
-    fn set_ec_cookie_appends_header() {
+    fn set_ec_cookie_writes_an_identifier_in_the_alphabet_verbatim() {
         let settings = create_test_settings();
-        let mut response = empty_response();
-        set_ec_cookie(&settings, &mut response, TEST_EC_ID);
+        for (case, value) in [
+            ("an HMAC identifier", TEST_EC_ID),
+            (
+                "another HMAC identifier",
+                "abc123def0123456789abcdef0123456789abcdef0123456789abcdef01234567.xk92ab",
+            ),
+            ("a module's opaque value", "8473625190"),
+            // Unpadded base64url (RFC 4648 section 5) fits the alphabet, so a
+            // module that carries binary data encodes it that way.
+            ("a base64url value", "abcDEF123-_x"),
+        ] {
+            let mut response = empty_response();
 
-        let cookie_header = response
-            .headers()
-            .get(header::SET_COOKIE)
-            .expect("should have Set-Cookie header");
-        let cookie_str = cookie_header.to_str().expect("should be valid UTF-8");
+            set_ec_cookie(&settings, &mut response, value);
 
-        assert_eq!(
-            cookie_str,
-            create_ec_cookie(&settings, TEST_EC_ID),
-            "should match create_ec_cookie output"
-        );
+            let cookie = response
+                .headers()
+                .get(header::SET_COOKIE)
+                .unwrap_or_else(|| panic!("{case}: should set the cookie"))
+                .to_str()
+                .expect("should be valid UTF-8");
+            assert_eq!(
+                cookie,
+                format!(
+                    "{}={value}; Domain=.{}; Path=/; Secure; SameSite=Lax; Max-Age={}; HttpOnly",
+                    COOKIE_TS_EC, settings.publisher.domain, COOKIE_MAX_AGE,
+                ),
+                "{case}"
+            );
+            assert_eq!(cookie, create_ec_cookie(&settings, value), "{case}");
+        }
     }
 
+    /// A value outside the alphabet sets no cookie at all, never a rewritten
+    /// one, so the cookie and the identity graph key cannot diverge and no
+    /// value can inject an attribute or a header.
     #[test]
-    fn set_ec_cookie_rejects_disallowed_chars_outright() {
-        // Rejection, never rewriting: an identifier outside the alphabet must
-        // not produce a cookie at all, so the cookie value and the identity
-        // graph key can never silently diverge.
+    fn set_ec_cookie_refuses_a_value_outside_the_alphabet() {
         let settings = create_test_settings();
-        let mut response = Response::new(EdgeBody::empty());
-        set_ec_cookie(
-            &settings,
-            &mut response,
-            "evil;injected
-foo=bar",
-        );
-        assert!(
-            response.headers().get(header::SET_COOKIE).is_none(),
-            "an identifier outside the alphabet should set no cookie"
-        );
-    }
+        for (case, value) in [
+            ("a semicolon", "evil; Domain=.attacker.com"),
+            (
+                "a carriage return and line feed",
+                "evil\r\nX-Injected: header",
+            ),
+            ("a line feed", "evil;injected\nfoo=bar"),
+            ("a space", "bad value"),
+        ] {
+            let mut response = empty_response();
 
-    #[test]
-    fn create_ec_cookie_preserves_well_formed_id() {
-        let settings = create_test_settings();
-        let id = "abc123def0123456789abcdef0123456789abcdef0123456789abcdef01234567.xk92ab";
-        let result = create_ec_cookie(&settings, id);
-        let value = result
-            .strip_prefix(&format!("{COOKIE_TS_EC}="))
-            .and_then(|s| s.split_once(';').map(|(v, _)| v))
-            .expect("should have cookie value portion");
+            set_ec_cookie(&settings, &mut response, value);
 
-        assert_eq!(value, id, "should not modify a well-formed EC ID");
-    }
-
-    #[test]
-    fn set_ec_cookie_rejects_semicolon() {
-        let settings = create_test_settings();
-        let mut response = empty_response();
-        set_ec_cookie(&settings, &mut response, "evil; Domain=.attacker.com");
-
-        assert!(
-            response.headers().get(header::SET_COOKIE).is_none(),
-            "should not set Set-Cookie when value contains a semicolon"
-        );
-    }
-
-    #[test]
-    fn set_ec_cookie_rejects_crlf() {
-        let settings = create_test_settings();
-        let mut response = empty_response();
-        set_ec_cookie(&settings, &mut response, "evil\r\nX-Injected: header");
-
-        assert!(
-            response.headers().get(header::SET_COOKIE).is_none(),
-            "should not set Set-Cookie when value contains CRLF"
-        );
-    }
-
-    #[test]
-    fn set_ec_cookie_rejects_space() {
-        let settings = create_test_settings();
-        let mut response = empty_response();
-        set_ec_cookie(&settings, &mut response, "bad value");
-
-        assert!(
-            response.headers().get(header::SET_COOKIE).is_none(),
-            "should not set Set-Cookie when value contains whitespace"
-        );
+            assert!(
+                response.headers().get(header::SET_COOKIE).is_none(),
+                "{case}: should set no cookie"
+            );
+        }
     }
 
     #[test]
