@@ -14,7 +14,7 @@
 # as it stands. Read it, change it, or replace it, and have whoever is
 # accountable for the deployment decide what it should say.
 #
-# No policy ships with Trusted Server and no build carries one. A domain's
+# No policy ships with Trusted Server and no adapter build carries one. A domain's
 # settings name the publisher's own policy file in [permissions] policy, the
 # file is supplied with `ts config push --permissions <file>` when the service
 # is deployed, and the visitor's signals decide the rest at runtime. This copy
