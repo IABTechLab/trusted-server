@@ -454,12 +454,31 @@ mod tests {
     /// The entries a config store holds, as Viceroy serves them.
     struct GeneratedConfigStore(HashMap<String, String>);
 
-    impl PlatformConfigStore for GeneratedConfigStore {
-        fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+    impl GeneratedConfigStore {
+        fn entry(&self, key: &str) -> Result<String, Report<PlatformError>> {
             self.0
                 .get(key)
                 .cloned()
                 .ok_or_else(|| Report::new(PlatformError::ConfigStore))
+        }
+    }
+
+    impl PlatformConfigStore for GeneratedConfigStore {
+        /// The entry at `key`, its chunks joined in order when it is a chunk
+        /// pointer, as the Fastly config store returns a long entry whole.
+        fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+            let value = self.entry(key)?;
+            let pointer: serde_json::Value =
+                serde_json::from_str(&value).unwrap_or(serde_json::Value::Null);
+            if pointer["edgezero_kind"] != CHUNK_POINTER_KIND {
+                return Ok(value);
+            }
+            pointer["chunks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|chunk| self.entry(chunk["key"].as_str().unwrap_or_default()))
+                .collect()
         }
 
         fn put(
