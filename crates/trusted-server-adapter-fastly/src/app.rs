@@ -3157,7 +3157,9 @@ mod tests {
             middleware = ["robots_txt"]
             "#,
         )
-        .expect("should parse robots.txt test settings");
+        .expect("should parse robots.txt test settings")
+        // A loaded domain carries its policy.
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
         let state = build_state_from_settings(settings).expect("should build state");
         let origin = Arc::new(StubHttpClient::new());
         origin.push_response_with_headers(
