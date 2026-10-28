@@ -33,6 +33,12 @@ use crate::redacted::Redacted;
 pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
 #[cfg(test)]
 pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
+/// Build inputs that share the settings prefix but are not settings.
+///
+/// The core build script exports these with `cargo:rustc-env`, and Cargo sets
+/// them on every `cargo test` run of this crate.
+#[cfg(test)]
+const BUILD_ENVIRONMENT_VARIABLES: [&str; 1] = ["TRUSTED_SERVER__GIT_VERSION"];
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
@@ -3995,16 +4001,26 @@ impl Settings {
     /// Runtime loading does not use this legacy helper; `EdgeZero` CLI app-config
     /// overlays are applied before deserializing [`crate::config::TrustedServerAppConfig`].
     /// This helper remains available to existing tests that exercise legacy
-    /// parsing behavior.
+    /// parsing behavior. Build inputs such as `TRUSTED_SERVER__GIT_VERSION`
+    /// are not treated as overrides.
     ///
     /// # Errors
     ///
     /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
     #[cfg(test)]
     pub fn from_toml_and_env(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
+        let overrides = std::env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+            .filter(|(key, _)| {
+                !BUILD_ENVIRONMENT_VARIABLES
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(key))
+            })
+            .collect();
         let environment = Environment::default()
             .prefix(ENVIRONMENT_VARIABLE_PREFIX)
-            .separator(ENVIRONMENT_VARIABLE_SEPARATOR);
+            .separator(ENVIRONMENT_VARIABLE_SEPARATOR)
+            .source(Some(overrides));
 
         let toml = File::from_str(toml_str, FileFormat::Toml);
         let config = Config::builder()
@@ -7972,6 +7988,25 @@ source_domain = "partner.example.com"
                 );
             },
         );
+    }
+
+    #[test]
+    fn legacy_env_loader_ignores_build_time_git_version() {
+        let toml_str = crate_test_settings_str();
+
+        for key in [
+            "TRUSTED_SERVER__GIT_VERSION",
+            "trusted_server__git_version",
+            "Trusted_Server__Git_Version",
+        ] {
+            for value in ["v0.0.0-example", ""] {
+                temp_env::with_var(key, Some(value), || {
+                    Settings::from_toml_and_env(&toml_str).expect(
+                        "should ignore the build-time git version input regardless of case",
+                    );
+                });
+            }
+        }
     }
 
     #[test]
