@@ -499,7 +499,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_contributor_is_handed_nothing_of_the_reader_who_asks_first() {
         let reading: Arc<dyn RobotsTxtContributor> = Arc::new(ReaderEcho);
-        let services = crate::platform::RuntimeServices::builder()
+        let services = crate::platform::test_support::test_services_builder()
             .config_store(Arc::new(crate::platform::test_support::NoopConfigStore))
             .secret_store(Arc::new(crate::platform::test_support::NoopSecretStore))
             .kv_store(Arc::new(MemoryKvStore::default()))
@@ -1089,7 +1089,7 @@ pub(crate) mod tests {
         scripted.refresh = Duration::ZERO;
         let scripted = Arc::new(scripted);
         let value_cache = Arc::new(MemoryValueCache::default());
-        let services = crate::platform::RuntimeServices::builder()
+        let services = crate::platform::test_support::test_services_builder()
             .config_store(Arc::new(crate::platform::test_support::NoopConfigStore))
             .secret_store(Arc::new(crate::platform::test_support::NoopSecretStore))
             .kv_store(Arc::new(crate::platform::UnavailableKvStore))
