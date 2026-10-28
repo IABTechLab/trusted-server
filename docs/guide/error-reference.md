@@ -112,7 +112,7 @@ names the origin in `[publisher]` is refused with a message naming the
 the configuration names no permission policy, so name the publisher's policy file in `[permissions] policy` and push it with `ts config push --permissions <file>`
 ```
 
-**Cause:** No build carries a permission policy, so a domain's settings name
+**Cause:** No adapter build carries a permission policy, so a domain's settings name
 the publisher's own policy file, and settings written before this change name none.
 The domain does not start, and every route answers `500`, except `/health` on
 the adapters whose startup router keeps it. A push of such settings is refused
