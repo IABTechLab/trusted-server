@@ -89,7 +89,8 @@ normalization layer. Spin has no geo lookup, so `[geo] module = "platform"` is
 refused at startup. The modules' request filters and the device module
 `[device]` selects run as on Fastly, and `[device] module = "platform"`
 classifies from the `User-Agent`, because Spin supplies no TLS or HTTP/2
-signals.
+signals. An Edge Cookie module creates and writes its cookie with no identity
+graph behind it, and `POST /_ts/api/v1/ec/resolve` sets one the same way.
 
 Spin sends no [auction telemetry](./telemetry#adapter-support), and warns at
 startup when `[analytics]` selects a module.

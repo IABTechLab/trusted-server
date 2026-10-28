@@ -3,16 +3,22 @@
 //! route in the cycle, and their response effects after the finalize headers,
 //! without making the response less private, the route's module call carries
 //! the device classification, an Edge Cookie context that cannot be read
-//! answers before the filters, and robots.txt and the inspection endpoints
-//! are answered without them.
+//! answers before the filters, robots.txt and the inspection endpoints are
+//! answered without them, and the Edge Cookie is created and written for a
+//! real browser's page view, set by the resolve route for a client-side
+//! module and expired on a withdrawal.
 
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use edgezero_core::body::Body;
 use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, request_builder};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
+use trusted_server_core::addressing::addressed_router;
 use trusted_server_core::ec::device::{DeviceModule, DeviceSignals};
+use trusted_server_core::ec::module::{EdgeCookieModule, GeneratedEdgeCookie, ModuleCode};
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::evidence::RequestInfo;
 use trusted_server_core::integrations::{
@@ -21,13 +27,18 @@ use trusted_server_core::integrations::{
     RequestFilterInput,
 };
 use trusted_server_core::module_context::ModuleCall;
-use trusted_server_core::platform::PlatformHttpClient;
+use trusted_server_core::permissions::{Permission, PermissionSet};
 use trusted_server_core::platform::test_support::{
-    StubHttpClient, build_services_with_http_client,
+    NoopConfigStore, NoopSecretStore, StubBackend, StubHttpClient, build_services_with_http_client,
+};
+use trusted_server_core::platform::{
+    ClientInfo, GeoInfo, PlatformError, PlatformGeo, PlatformGeoModule, PlatformHttpClient,
+    RuntimeServices, UnavailableKvStore,
 };
 use trusted_server_core::publisher::{PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH};
 use trusted_server_core::response_privacy::enforce_terminal_private_cache_privacy;
 use trusted_server_core::settings::Settings;
+use trusted_server_core::test_support::addressing::FirstSegment;
 
 use super::{build_router, build_state_with_registrations_and_services};
 
@@ -392,21 +403,29 @@ fn settings_with(extra: &str) -> Settings {
 }
 
 /// The router built through the composition root with `builders`, every
+/// request handed `services`.
+fn router_for(
+    settings: Settings,
+    builders: &[IntegrationBuilder],
+    services: RuntimeServices,
+) -> RouterService {
+    let state = build_state_with_registrations_and_services(settings, builders, Some(services))
+        .expect("should build the state");
+    build_router(&state)
+}
+
+/// The router built through the composition root with `builders`, every
 /// request sent to `origin`.
 fn router_with(
     settings: Settings,
     builders: &[IntegrationBuilder],
     origin: &Arc<StubHttpClient>,
 ) -> RouterService {
-    let state = build_state_with_registrations_and_services(
+    router_for(
         settings,
         builders,
-        Some(build_services_with_http_client(
-            Arc::clone(origin) as Arc<dyn PlatformHttpClient>
-        )),
+        build_services_with_http_client(Arc::clone(origin) as Arc<dyn PlatformHttpClient>),
     )
-    .expect("should build the state");
-    build_router(&state)
 }
 
 fn get(path: &str, cookie: Option<&str>) -> Request {
@@ -645,6 +664,410 @@ async fn robots_txt_is_answered_before_the_request_filters() {
         "User-agent: *\nAllow: /ads.txt\nDisallow: /\n"
     );
     assert_eq!(origin.recorded_request_methods(), ["GET"]);
+}
+
+// ---------------------------------------------------------------------------
+// The Edge Cookie
+// ---------------------------------------------------------------------------
+
+/// The `User-Agent` of a desktop browser, which the bot gate passes.
+const BROWSER: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                       (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+
+/// The `User-Agent` of a crawler, which the bot gate stops.
+const CRAWLER: &str = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+
+/// A page the publisher's origin answers.
+const PAGE: &[u8] = b"<html><head></head><body>article</body></html>";
+
+/// An Edge Cookie identifier in the shape the `hmac` module gives one.
+const CARRIED_EC: &str =
+    "hmac~0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.abc123";
+
+/// A TC String that consents to no purpose, so it refuses storage, Purpose 1.
+/// It is version 2 from CMP 1, in English, for vendor list 1 and no vendor,
+/// last updated at time zero, so the settings that read it turn the TCF
+/// module's expiry check off.
+const STORAGE_REFUSING_TC_STRING: &str = "CAAAAAAAAAAAAABABAENABCAAAAAAAAAAAhoAAA";
+
+/// A location in the US, where the sample permission rules grant the Edge
+/// Cookie with no signal.
+struct UsGeo;
+
+#[async_trait::async_trait(?Send)]
+impl PlatformGeo for UsGeo {
+    async fn lookup(
+        &self,
+        _client_ip: Option<IpAddr>,
+        _services: &RuntimeServices,
+    ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+        Ok(Some(GeoInfo {
+            city: String::new(),
+            country: "US".to_owned(),
+            continent: String::new(),
+            latitude: 0.0,
+            longitude: 0.0,
+            metro_code: 0,
+            region: None,
+            asn: None,
+        }))
+    }
+}
+
+/// The services of a reader in the US with an address, carrying the
+/// permission signal modules this adapter links, every request sent to
+/// `origin`.
+fn services_for_a_reader(origin: &Arc<StubHttpClient>) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(UnavailableKvStore))
+        .backend(Arc::new(StubBackend))
+        .http_client(Arc::clone(origin) as Arc<dyn PlatformHttpClient>)
+        .geo(Arc::new(PlatformGeoModule::new(
+            "platform",
+            Arc::new(UsGeo),
+        )))
+        .client_info(ClientInfo {
+            client_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))),
+            ..ClientInfo::default()
+        })
+        .permission_signal_modules(super::shipped_signal_modules().into())
+        .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
+        .build()
+}
+
+/// Settings whose `[geo] module = "platform"` leaves the location the
+/// reader's services give standing, where an unset selector resolves the
+/// disabled module.
+fn settings_for_a_reader() -> Settings {
+    let mut settings = settings_with("");
+    settings.geo.module = Some("platform".to_owned());
+    settings
+}
+
+/// An origin answering each of `pages` requests with [`PAGE`].
+fn origin_answering(pages: usize) -> Arc<StubHttpClient> {
+    let origin = Arc::new(StubHttpClient::new());
+    for _ in 0..pages {
+        origin.push_response_with_headers(
+            200,
+            PAGE.to_vec(),
+            vec![("content-type", "text/html; charset=utf-8")],
+        );
+    }
+    origin
+}
+
+/// A page navigation to `path` by a client with `user_agent`, carrying
+/// `cookie` when there is one.
+fn page_view(path: &str, user_agent: &str, cookie: Option<&str>) -> Request {
+    let mut builder = request_builder()
+        .method("GET")
+        .uri(format!("https://test-publisher.example.com{path}"))
+        .header("host", "test-publisher.example.com")
+        .header("user-agent", user_agent)
+        .header("accept", "text/html")
+        .header("sec-fetch-dest", "document")
+        .header("sec-fetch-mode", "navigate");
+    if let Some(cookie) = cookie {
+        builder = builder.header("cookie", cookie);
+    }
+    builder
+        .body(Body::empty())
+        .expect("should build the page view")
+}
+
+/// The `Set-Cookie` line that writes the Edge Cookie, if the response has one.
+/// A response writes it at most once, because core alone writes it.
+fn edge_cookie(response: &Response) -> Option<String> {
+    let lines: Vec<String> = response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter(|line| line.starts_with("ts-ec="))
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        lines.len() <= 1,
+        "the Edge Cookie should be written at most once: {lines:?}"
+    );
+    lines.into_iter().next()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_first_page_view_gets_the_edge_cookie_under_the_public_prefix_and_path() {
+    let origin = origin_answering(1);
+    let router = addressed_router(
+        router_for(settings_for_a_reader(), &[], services_for_a_reader(&origin)),
+        Arc::new(FirstSegment),
+    );
+
+    let response = route(
+        &router,
+        page_view("/publisher.example/article", BROWSER, None),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = edge_cookie(&response).expect("a first page view should get the Edge Cookie");
+    assert!(
+        cookie.contains("Path=/publisher.example"),
+        "the Edge Cookie should be written under the publisher's path: {cookie}"
+    );
+    assert_eq!(
+        origin.recorded_request_uris(),
+        ["https://origin.test-publisher.example.com/article"],
+        "the page should be asked for at the path the addressing continues with"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_returning_page_view_keeps_its_edge_cookie() {
+    let origin = origin_answering(2);
+    let router = router_for(settings_for_a_reader(), &[], services_for_a_reader(&origin));
+
+    let first = route(&router, page_view("/article", BROWSER, None)).await;
+    let written = edge_cookie(&first).expect("the first page view should get the Edge Cookie");
+    assert!(
+        written.contains("Path=/;") || written.ends_with("Path=/"),
+        "a request addressed by host writes the Edge Cookie under the root: {written}"
+    );
+    let pair = written
+        .split(';')
+        .next()
+        .expect("a Set-Cookie line starts with its pair")
+        .to_owned();
+
+    let returning = route(&router, page_view("/article", BROWSER, Some(&pair))).await;
+
+    assert_eq!(returning.status(), StatusCode::OK);
+    assert_eq!(
+        edge_cookie(&returning),
+        None,
+        "a returning page view should keep the Edge Cookie it carries"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bot_s_page_view_gets_no_edge_cookie() {
+    let origin = origin_answering(1);
+    let router = router_for(settings_for_a_reader(), &[], services_for_a_reader(&origin));
+
+    let response = route(&router, page_view("/article", CRAWLER, None)).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        edge_cookie(&response),
+        None,
+        "the bot gate should keep a crawler from getting an Edge Cookie"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withdrawal_expires_the_edge_cookie_the_browser_carries() {
+    // No `[geo]` module, so the reader resolves at the top of the sample
+    // rules, the `gdpr-eu` group, where storage needs a signal, so a TC String
+    // refusing storage withdraws it.
+    let origin = origin_answering(1);
+    let router = router_for(
+        settings_with("[consent]\ncheck_expiration = false"),
+        &[],
+        services_for_a_reader(&origin),
+    );
+    let cookies = format!("ts-ec={CARRIED_EC}; euconsent-v2={STORAGE_REFUSING_TC_STRING}");
+
+    let response = route(&router, page_view("/article", BROWSER, Some(&cookies))).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let expired =
+        edge_cookie(&response).expect("a withdrawal should expire the Edge Cookie it carries");
+    assert!(
+        expired.starts_with("ts-ec=;") && expired.contains("Max-Age=0"),
+        "the Edge Cookie should be expired: {expired}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_resolve_route_answers() {
+    let origin = Arc::new(StubHttpClient::new());
+    let router = router_for(settings_for_a_reader(), &[], services_for_a_reader(&origin));
+    let resolve = |page_origin: &str| {
+        request_builder()
+            .method("POST")
+            .uri("https://test-publisher.example.com/_ts/api/v1/ec/resolve")
+            .header("host", "test-publisher.example.com")
+            .header("origin", page_origin)
+            .header("content-type", "text/plain")
+            .header("user-agent", BROWSER)
+            .body(Body::from("posted value"))
+            .expect("should build the resolve request")
+    };
+
+    let foreign = route(&router, resolve("https://elsewhere.example")).await;
+    assert_eq!(
+        foreign.status(),
+        StatusCode::FORBIDDEN,
+        "a foreign Origin should be refused"
+    );
+    assert_eq!(header(&foreign, "cache-control"), Some("no-store"));
+
+    let own = route(&router, resolve("https://test-publisher.example.com")).await;
+    assert_eq!(
+        own.status(),
+        StatusCode::NO_CONTENT,
+        "a server-side module creates nothing from a posted value"
+    );
+    assert_eq!(edge_cookie(&own), None);
+
+    assert!(
+        origin.recorded_request_uris().is_empty(),
+        "the resolve route should be answered here, never by the origin"
+    );
+}
+
+/// The id and module name of an Edge Cookie module that creates nothing at
+/// the edge and takes its identifier from the value the page posts, as a
+/// client-side module does.
+const POSTED_VALUE_ID: &str = "posted_value";
+const POSTED_VALUE_MODULE: &str = "testing.posted-value";
+
+/// The value the page posts, which the module takes as its identifier.
+const POSTED_VALUE: &str = "a-posted-value";
+
+#[derive(Debug)]
+struct PostedValueModule;
+
+#[async_trait::async_trait(?Send)]
+impl EdgeCookieModule for PostedValueModule {
+    fn id(&self) -> &'static str {
+        POSTED_VALUE_MODULE
+    }
+
+    fn code(&self) -> ModuleCode {
+        trusted_server_core::module_code!("t0pv")
+    }
+
+    async fn generate(
+        &self,
+        _call: ModuleCall<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        Ok(GeneratedEdgeCookie::default())
+    }
+
+    async fn resolve_from_client(
+        &self,
+        _call: ModuleCall<'_>,
+        payload: &[u8],
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        Ok(GeneratedEdgeCookie {
+            id: (payload == POSTED_VALUE.as_bytes()).then(|| POSTED_VALUE.to_owned()),
+            response_headers: Vec::new(),
+        })
+    }
+
+    fn accepts_id(&self, value: &str) -> bool {
+        value == POSTED_VALUE
+    }
+
+    fn required_permissions(&self) -> PermissionSet {
+        PermissionSet::none().with(Permission::StoreOnDevice)
+    }
+}
+
+fn register_posted_value(
+    _settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    Ok(Some(
+        IntegrationRegistration::builder(POSTED_VALUE_ID)
+            .without_js()
+            .with_ec_module(POSTED_VALUE_MODULE, Arc::new(PostedValueModule))
+            .build(),
+    ))
+}
+
+fn posted_value_builder() -> IntegrationBuilder {
+    IntegrationBuilder::new(
+        POSTED_VALUE_ID,
+        "adapter-tests",
+        register_posted_value,
+        always,
+    )
+    .with_module_name(POSTED_VALUE_MODULE)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_resolve_route_sets_a_client_side_module_s_edge_cookie() {
+    let mut settings = settings_for_a_reader();
+    settings.select_module("testing", POSTED_VALUE_MODULE);
+    settings.ec.module = Some(POSTED_VALUE_MODULE.into());
+    settings.ec.module_blocks.clear();
+    let origin = Arc::new(StubHttpClient::new());
+    let router = router_for(
+        settings,
+        &[posted_value_builder()],
+        services_for_a_reader(&origin),
+    );
+    let resolve = request_builder()
+        .method("POST")
+        .uri("https://test-publisher.example.com/_ts/api/v1/ec/resolve")
+        .header("host", "test-publisher.example.com")
+        .header("origin", "https://test-publisher.example.com")
+        .header("content-type", "text/plain")
+        .header("user-agent", BROWSER)
+        .body(Body::from(POSTED_VALUE))
+        .expect("should build the resolve request");
+
+    let response = route(&router, resolve).await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the module's identifier should be set with no identity graph"
+    );
+    assert_eq!(header(&response, "cache-control"), Some("no-store"));
+    let cookie = edge_cookie(&response).expect("the resolve route should set the Edge Cookie");
+    assert!(
+        cookie.starts_with("ts-ec=t0pv~a-posted-value;"),
+        "the Edge Cookie should carry the module's coded identifier: {cookie}"
+    );
+    assert!(
+        response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .any(|line| line.starts_with("ts-ecr=1;")),
+        "the resolved marker should be set beside the Edge Cookie"
+    );
+    assert!(
+        origin.recorded_request_uris().is_empty(),
+        "the resolve route should be answered here, never by the origin"
+    );
+}
+
+#[test]
+fn startup_warns_that_this_adapter_opens_no_identity_graph() {
+    // The flag is set as the warning is logged, so a deployment whose
+    // `[ec] ec_store` names no store logs nothing.
+    let logged = AtomicBool::new(false);
+    super::warn_once_when_the_identity_graph_is_unavailable(&settings_for_a_reader(), &logged);
+    assert!(
+        !logged.load(Ordering::Relaxed),
+        "with no ec_store there is no identity graph to warn about"
+    );
+
+    let mut settings = settings_for_a_reader();
+    settings.ec.ec_store = Some("ec_identity_store".to_owned());
+    let origin = Arc::new(StubHttpClient::new());
+
+    let _router = router_for(settings, &[], services_for_a_reader(&origin));
+
+    assert!(
+        super::IDENTITY_GRAPH_UNAVAILABLE_LOGGED.load(Ordering::Relaxed),
+        "startup should warn that the identity graph is unavailable"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

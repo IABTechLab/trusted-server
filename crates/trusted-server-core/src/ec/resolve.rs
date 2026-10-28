@@ -42,23 +42,21 @@ const MAX_BODY_SIZE: usize = 64 * 1024;
 /// sets identity state, so a foreign page must not be able to drive it) and a
 /// `text/plain` or `application/json` body. Gates on the configured module's
 /// required permissions, then asks the module to create an Edge Cookie from
-/// the posted payload. A created identifier is persisted to the identity graph
-/// before the cookie is set, so withdrawal reaches a client-set identity the
-/// same way it reaches an edge-created one. With no graph available this
-/// endpoint sets no cookie at all, which is stricter than the organic
-/// generation path, where the identifier is committed and only the row write
-/// is skipped. On
-/// success the EC cookie and its `non-HttpOnly` resolved marker are set and the
-/// status is `200`.
+/// the posted payload. With an identity graph, a created identifier is
+/// persisted to it before the cookie is set, so withdrawal reaches a
+/// client-set identity the same way it reaches an edge-created one. Without
+/// one, the cookie is set with no row, as on the organic generation path,
+/// because a missing graph does not stop the cookie. On success the EC cookie
+/// and its `non-HttpOnly` resolved marker are set and the status is `200`.
 ///
 /// Rejections: `403` for a missing or foreign `Origin`, `415` for another
 /// content type, `413` for an oversized body, `400` when the module creates an
 /// identifier outside the identifier bounds, `409` when the request already
 /// carries a different identity (a resolve must not silently replace one), and
 /// `503` when the identity-graph write fails. When the permission gate is
-/// closed, no module is configured, no graph is available, or the module
-/// creates nothing, the response is `204` with no cookie. Every response this
-/// handler builds carries `Cache-Control: no-store`; a module or
+/// closed, no module is configured, the module creates nothing, or the request
+/// did not pass the bot gate, the response is `204` with no cookie. Every
+/// response this handler builds carries `Cache-Control: no-store`; a module or
 /// configuration error propagates to the adapter's error response instead,
 /// and so does a module asking for a response header inside core's reserved
 /// surface, which is a broken module contract rather than a bad request.
@@ -207,30 +205,32 @@ pub async fn handle_ec_resolve(
         return Ok(status_only(StatusCode::CONFLICT));
     }
 
-    // Persist the identity-graph row before setting the cookie, keyed by the
-    // module's canonical form, exactly like the organic generation path.
-    // Without a row, withdrawal could never reach this identity, so with no
-    // graph available this endpoint creates no cookie at all, which is stricter
-    // than the organic generation path, where the identifier is committed and
-    // only the row write is skipped.
-    let Some(graph) = kv else {
-        log::warn!("EC resolve skipped: no identity graph available, so no cookie is created");
+    // The same bot gate the organic generation path writes a created cookie
+    // behind.
+    if !ec_context.passed_bot_gate() {
+        log::info!("EC resolve skipped: the request did not pass the bot gate");
         return Ok(status_only(StatusCode::NO_CONTENT));
-    };
-    let now = super::current_timestamp();
-    let mut entry = KvEntry::new(
-        ec_context.consent(),
-        ec_context.geo_info(),
-        now,
-        &settings.publisher.domain,
-    );
-    entry.device = ec_context
-        .device_signals()
-        .map(super::device::DeviceSignals::to_kv_device);
-    let kv_key = super::module::module_kv_key(module.as_ref(), &ec_id);
-    if let Err(err) = graph.create_or_revive(&kv_key, &entry) {
-        log::error!("EC resolve failed to write the identity-graph row: {err:?}");
-        return Ok(status_only(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    // With an identity graph, persist the row before setting the cookie,
+    // keyed by the module's canonical form, exactly like the organic
+    // generation path, so withdrawal reaches this identity.
+    if let Some(graph) = kv {
+        let now = super::current_timestamp();
+        let mut entry = KvEntry::new(
+            ec_context.consent(),
+            ec_context.geo_info(),
+            now,
+            &settings.publisher.domain,
+        );
+        entry.device = ec_context
+            .device_signals()
+            .map(super::device::DeviceSignals::to_kv_device);
+        let kv_key = super::module::module_kv_key(module.as_ref(), &ec_id);
+        if let Err(err) = graph.create_or_revive(&kv_key, &entry) {
+            log::error!("EC resolve failed to write the identity-graph row: {err:?}");
+            return Ok(status_only(StatusCode::SERVICE_UNAVAILABLE));
+        }
     }
 
     let mut response = status_only(StatusCode::OK);
@@ -478,13 +478,15 @@ mod tests {
         crate::ec::kv::KvIdentityGraph::in_memory("test-ec-store")
     }
 
-    /// A context whose gate is set by hand, carrying the module the settings
-    /// select, resolved as a request's own context resolves it.
+    /// A browser's context whose gate is set by hand, carrying the module the
+    /// settings select, resolved as a request's own context resolves it.
     fn gated(settings: &Settings, ec_allowed: bool) -> EcContext {
-        with_selected_module(
+        let mut context = with_selected_module(
             settings,
             EcContext::new_for_test_gated(None, ConsentContext::default(), ec_allowed),
-        )
+        );
+        context.set_device_signals(crate::ec::tests::browser_signals());
+        context
     }
 
     fn with_selected_module(settings: &Settings, context: EcContext) -> EcContext {
@@ -655,8 +657,8 @@ mod tests {
         resolve_request_with_header_module(headers, id, post(HEADER_MODULE_ID), graph).await
     }
 
-    /// Drives `request` through [`ResolveHeaderModule`], threaded the way a
-    /// composition root threads a module.
+    /// Drives a browser's `request` through [`ResolveHeaderModule`], threaded
+    /// the way a composition root threads a module.
     async fn resolve_request_with_header_module(
         headers: &'static [(&'static str, &'static str)],
         id: Option<&'static str>,
@@ -671,8 +673,9 @@ mod tests {
             .uri("https://edge.example.com/")
             .body(EdgeBody::empty())
             .expect("should build organic request");
-        let ec = EcContext::read_from_request(&settings, &organic, &services)
+        let mut ec = EcContext::read_from_request(&settings, &organic, &services)
             .expect("should read EC context");
+        ec.set_device_signals(crate::ec::tests::browser_signals());
         handle_ec_resolve(&settings, request, &ec, graph, &services).await
     }
 
@@ -856,6 +859,7 @@ mod tests {
             .expect("should build organic request");
         let mut ec = EcContext::read_from_request(&settings, &organic, &services)
             .expect("should read EC context");
+        ec.set_device_signals(crate::ec::tests::browser_signals());
         assert!(
             ec.ec_value().is_none(),
             "no EC should exist on the first visit"
@@ -998,28 +1002,18 @@ mod tests {
     async fn resolve_answers_204_with_no_cookie_when_it_creates_nothing() {
         let mut no_module = create_test_settings();
         no_module.ec.module = None;
-        for (case, settings, body, allowed, has_graph) in [
+        for (case, settings, body, allowed) in [
             (
                 "the permission gate is closed",
                 settings_with_client_fixed(),
                 FIXED_WORD,
                 false,
-                true,
             ),
-            ("no module is configured", no_module, "123", true, true),
-            (
-                "there is no identity graph to hold the row, so a cookie would be a \
-                 phantom identity",
-                settings_with_client_fixed(),
-                FIXED_WORD,
-                true,
-                false,
-            ),
+            ("no module is configured", no_module, "123", true),
             (
                 "the posted value fails verification",
                 settings_with_client_fixed(),
                 "not-the-word",
-                true,
                 true,
             ),
         ] {
@@ -1028,7 +1022,7 @@ mod tests {
                 &settings,
                 post(body),
                 &gated(&settings, allowed),
-                has_graph.then_some(&graph),
+                Some(&graph),
                 &noop_services(),
             )
             .await
@@ -1039,6 +1033,103 @@ mod tests {
                 response.headers().get(header::SET_COOKIE).is_none(),
                 "{case}: should set no cookie"
             );
+        }
+    }
+
+    /// The identity graph is one optional store of the data kept with the
+    /// Edge Cookie, so without one the endpoint answers as it does with one,
+    /// setting the cookie and its marker with no row behind them.
+    #[tokio::test]
+    async fn resolve_answers_as_it_does_with_a_graph_when_there_is_none() {
+        let settings = settings_with_client_fixed();
+        let graph = in_memory_graph();
+        let with_graph = handle_ec_resolve(
+            &settings,
+            post(FIXED_WORD),
+            &gated(&settings, true),
+            Some(&graph),
+            &noop_services(),
+        )
+        .await
+        .expect("should handle resolve with a graph");
+
+        let response = handle_ec_resolve(
+            &settings,
+            post(FIXED_WORD),
+            &gated(&settings, true),
+            None,
+            &noop_services(),
+        )
+        .await
+        .expect("should handle resolve without a graph");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a verified value should return 200 without a graph"
+        );
+        assert_eq!(
+            response.headers(),
+            with_graph.headers(),
+            "the Edge Cookie, its marker and no-store should be the ones a graph gets"
+        );
+        assert!(
+            response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .any(|value| value
+                    .to_str()
+                    .is_ok_and(|cookie| cookie.starts_with("ts-ec=cfix~an-ec;"))),
+            "should set the coded verified word as the Edge Cookie"
+        );
+    }
+
+    /// A request the bot gate stops, being a crawler's or one with no device
+    /// signals, creates no Edge Cookie and no row, with a graph or without.
+    #[tokio::test]
+    async fn resolve_creates_nothing_for_a_request_that_did_not_pass_the_bot_gate() {
+        let settings = settings_with_client_fixed();
+        for (case, signals) in [
+            ("a crawler", Some(crate::ec::tests::crawler_signals())),
+            ("a request with no device signals", None),
+        ] {
+            for with_graph in [true, false] {
+                let mut ec = with_selected_module(
+                    &settings,
+                    EcContext::new_for_test_gated(None, ConsentContext::default(), true),
+                );
+                if let Some(signals) = signals.clone() {
+                    ec.set_device_signals(signals);
+                }
+                let graph = in_memory_graph();
+                let response = handle_ec_resolve(
+                    &settings,
+                    post(FIXED_WORD),
+                    &ec,
+                    with_graph.then_some(&graph),
+                    &noop_services(),
+                )
+                .await
+                .expect("should handle resolve");
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NO_CONTENT,
+                    "{case}, with a graph {with_graph}"
+                );
+                assert!(
+                    response.headers().get(header::SET_COOKIE).is_none(),
+                    "{case}, with a graph {with_graph}: should set no cookie"
+                );
+                assert!(
+                    graph
+                        .get("cfix~an-ec")
+                        .expect("should read the graph")
+                        .is_none(),
+                    "{case}, with a graph {with_graph}: should write no row"
+                );
+            }
         }
     }
 
@@ -1071,8 +1162,10 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build organic request");
         let geo = open_gate_geo();
-        let ec = EcContext::read_from_request_with_geo(settings, &organic, &services, Some(&geo))
-            .expect("should read EC context");
+        let mut ec =
+            EcContext::read_from_request_with_geo(settings, &organic, &services, Some(&geo))
+                .expect("should read EC context");
+        ec.set_device_signals(crate::ec::tests::browser_signals());
         assert!(
             ec.ec_allowed(),
             "the gate must be open for this to test anything"
@@ -1137,13 +1230,14 @@ mod tests {
             .insert(crate::addressing::RemovedPathPrefix::new(
                 "/publisher-a.example".to_owned(),
             ));
-        let ec = EcContext::read_from_request_with_geo(
+        let mut ec = EcContext::read_from_request_with_geo(
             &settings,
             &req,
             &services,
             Some(&open_gate_geo()),
         )
         .expect("should read EC context");
+        ec.set_device_signals(crate::ec::tests::browser_signals());
 
         let response = handle_ec_resolve(&settings, req, &ec, Some(&in_memory_graph()), &services)
             .await
@@ -1494,8 +1588,9 @@ mod tests {
     }
 
     /// The demo page script's post as the adapter handles it: the context is
-    /// read from the post, the handler answers, and the response is
-    /// finalized before the browser stores what it sets.
+    /// read from the post with a browser's device signals, the handler
+    /// answers, and the response is finalized before the browser stores what
+    /// it sets.
     async fn post_fixed_word(
         settings: &Settings,
         services: &RuntimeServices,
@@ -1506,6 +1601,7 @@ mod tests {
         send_cookies(&mut req, jar);
         let mut ec =
             EcContext::read_from_request(settings, &req, services).expect("should read EC context");
+        ec.set_device_signals(crate::ec::tests::browser_signals());
         let mut response = handle_ec_resolve(settings, req, &ec, Some(graph), services)
             .await
             .expect("should handle resolve");

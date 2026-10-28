@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
@@ -22,8 +22,10 @@ use trusted_server_core::ec::device::{
     BuiltinDeviceModule, DeviceModule, DeviceSignals, build_device_module,
 };
 use trusted_server_core::ec::module::ensure_module_available;
+use trusted_server_core::ec::resolve::handle_ec_resolve;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::evidence::BorrowedRequestInfo;
+use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::inspect::config::{CONFIG_JSON_PATH, CONFIG_PAGE_PATH, handle_config};
 use trusted_server_core::inspect::data::{DATA_PAGE_PATH, handle_data};
 use trusted_server_core::inspect::permissions::{
@@ -91,6 +93,32 @@ pub struct AppState {
 
 /// Set once startup has logged that this adapter sends no auction telemetry.
 static UNSENT_ANALYTICS_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Set once startup has logged that this adapter opens no identity graph. The
+/// state can be built more than once, so the flag keeps the warning to one for
+/// each instance.
+static IDENTITY_GRAPH_UNAVAILABLE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Logs once, at warning level, that `[ec] ec_store` names an identity graph
+/// this adapter does not open, so the Edge Cookie is still written but the
+/// data the graph would keep with it, such as partner IDs, is not. `logged`
+/// is set as the line is logged, and once set, nothing more is logged.
+///
+/// The identity graph needs strongly consistent reads and conditional writes,
+/// which the key-value store this adapter can open does not offer.
+fn warn_once_when_the_identity_graph_is_unavailable(settings: &Settings, logged: &AtomicBool) {
+    let Some(store) = settings.ec.ec_store.as_deref() else {
+        return;
+    };
+    if logged.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    log::warn!(
+        "[ec] ec_store names `{store}`, but the Axum adapter opens no identity \
+         graph, so the Edge Cookie is still written but the data the graph would \
+         keep with it, such as partner IDs, is not"
+    );
+}
 
 /// The permission signal modules this adapter links, in the order they run
 /// when configuration names none. Global Privacy Control is first because it
@@ -300,6 +328,7 @@ fn build_state_with_registrations_and_services(
         &UNSENT_ANALYTICS_LOGGED,
     );
     warn_when_certificate_check_is_off(&settings);
+    warn_once_when_the_identity_graph_is_unavailable(&settings, &IDENTITY_GRAPH_UNAVAILABLE_LOGGED);
     let permission_policy = settings.required_permission_policy()?;
 
     Ok(Arc::new(AppState {
@@ -511,6 +540,65 @@ async fn build_ec_context(
     Ok(context)
 }
 
+/// The request's Edge Cookie state, read before its route runs.
+struct EcRequestState {
+    ec_context: EcContext,
+    /// Whether the request passed the bot gate, which creating an Edge Cookie
+    /// on a page navigation sits behind.
+    is_real_browser: bool,
+}
+
+/// The Edge Cookie state a route leaves on its response.
+/// [`FinalizeResponseMiddleware`] takes it off the response and finalizes the
+/// Edge Cookie once the response is finalized.
+#[derive(Clone)]
+pub(crate) struct EcFinalizeState {
+    pub(crate) ec_context: EcContext,
+    /// The request's services, which finalizing hands to the selected Edge
+    /// Cookie module.
+    pub(crate) services: RuntimeServices,
+}
+
+/// Reads the request's Edge Cookie state, with the bot gate's answer taken
+/// from the device classification.
+///
+/// # Errors
+///
+/// The errors of [`build_ec_context`].
+async fn build_ec_request_state(
+    state: &AppState,
+    services: &RuntimeServices,
+    req: &Request,
+) -> Result<EcRequestState, Report<TrustedServerError>> {
+    let ec_context = build_ec_context(state, services, req).await?;
+    let is_real_browser = ec_context
+        .device_signals()
+        .is_some_and(|signals| signals.looks_like_browser);
+    if !is_real_browser {
+        log::info!("Bot gate: blocking EC operations");
+    }
+    Ok(EcRequestState {
+        ec_context,
+        is_real_browser,
+    })
+}
+
+/// Leaves the Edge Cookie state and the non-empty request-filter response
+/// effects on a response of the request cycle, for
+/// [`FinalizeResponseMiddleware`].
+fn attach_dispatch_extensions(
+    mut response: Response,
+    ec: EcRequestState,
+    services: &RuntimeServices,
+    effects: RequestFilterEffects,
+) -> Response {
+    response.extensions_mut().insert(EcFinalizeState {
+        ec_context: ec.ec_context,
+        services: services.clone(),
+    });
+    attach_request_filter_effects(response, effects)
+}
+
 /// Result of the request-filter step that runs before a route.
 enum PreRoute {
     /// A filter answered, or failed, and that answer stands in for the
@@ -605,21 +693,21 @@ async fn execute_named(
         _ => {}
     }
 
-    let mut ec_context = match build_ec_context(&state, &services, &req).await {
-        Ok(context) => context,
+    let mut ec = match build_ec_request_state(&state, &services, &req).await {
+        Ok(ec) => ec,
         Err(report) => return Ok(http_error(&report)),
     };
-    let effects = match run_pre_route_filters(&state, &services, &mut req, &ec_context).await {
+    let effects = match run_pre_route_filters(&state, &services, &mut req, &ec.ec_context).await {
         PreRoute::ShortCircuit { response, effects } => {
-            return Ok(attach_request_filter_effects(response, effects));
+            return Ok(attach_dispatch_extensions(response, ec, &services, effects));
         }
         PreRoute::Continue { effects } => effects,
     };
 
-    let response = run_named_route(&state, &services, req, handler, &mut ec_context)
+    let response = run_named_route(&state, &services, req, handler, &mut ec.ec_context)
         .await
         .unwrap_or_else(|error| http_error(&error));
-    Ok(attach_request_filter_effects(response, effects))
+    Ok(attach_dispatch_extensions(response, ec, &services, effects))
 }
 
 async fn run_named_route(
@@ -638,6 +726,11 @@ async fn run_named_route(
         }
         NamedRouteHandler::Permissions | NamedRouteHandler::Config | NamedRouteHandler::Data => {
             unreachable!("the inspection endpoints are answered before the request cycle")
+        }
+        NamedRouteHandler::EcResolve => {
+            // This adapter opens no identity graph, so a created Edge Cookie
+            // is set with no graph row.
+            handle_ec_resolve(&state.settings, req, ec_context, None, services).await
         }
         NamedRouteHandler::Auction => {
             // The auction consent gate reads the caller's jurisdiction from
@@ -722,13 +815,13 @@ async fn dispatch_fallback(
         return answer_robots_txt(state, services, req, &method).await;
     }
 
-    let mut ec_context = match build_ec_context(state, services, &req).await {
-        Ok(context) => context,
+    let mut ec = match build_ec_request_state(state, services, &req).await {
+        Ok(ec) => ec,
         Err(report) => return http_error(&report),
     };
-    let effects = match run_pre_route_filters(state, services, &mut req, &ec_context).await {
+    let effects = match run_pre_route_filters(state, services, &mut req, &ec.ec_context).await {
         PreRoute::ShortCircuit { response, effects } => {
-            return attach_request_filter_effects(response, effects);
+            return attach_dispatch_extensions(response, ec, services, effects);
         }
         PreRoute::Continue { effects } => effects,
     };
@@ -745,7 +838,7 @@ async fn dispatch_fallback(
                 path: &path,
                 settings: &state.settings,
                 kv: None,
-                ec_context: &mut ec_context,
+                ec_context: &mut ec.ec_context,
                 services,
                 req,
             })
@@ -756,6 +849,17 @@ async fn dispatch_fallback(
                 }))
             })
     } else {
+        // A real browser's page navigation is given an Edge Cookie when it has
+        // none. Another request may lack consent signals such as `Sec-GPC`.
+        if ec.is_real_browser
+            && is_navigation_request(&req)
+            && let Err(err) = ec
+                .ec_context
+                .generate_if_needed(&state.settings, None, services)
+                .await
+        {
+            log::error!("EC generation failed for publisher proxy: {err:?}");
+        }
         // Run the server-side auction with the configured creative-opportunity
         // slots; `handle_publisher_request` matches them against the request
         // path.
@@ -771,7 +875,7 @@ async fn dispatch_fallback(
             },
             services,
             None,
-            &mut ec_context,
+            &mut ec.ec_context,
             auction,
             req,
             EDGE_CACHE_HEADER,
@@ -796,7 +900,12 @@ async fn dispatch_fallback(
         }
     };
 
-    attach_request_filter_effects(result.unwrap_or_else(|error| http_error(&error)), effects)
+    attach_dispatch_extensions(
+        result.unwrap_or_else(|error| http_error(&error)),
+        ec,
+        services,
+        effects,
+    )
 }
 
 /// Whether the request is a crawler's `GET` or `HEAD` of the robots.txt that
@@ -875,6 +984,7 @@ enum NamedRouteHandler {
     Permissions,
     Config,
     Data,
+    EcResolve,
     Auction,
     PageBids,
     FirstPartyProxy,
@@ -889,7 +999,7 @@ struct NamedRoute {
     handler: NamedRouteHandler,
 }
 
-fn named_routes() -> [NamedRoute; 14] {
+fn named_routes() -> [NamedRoute; 15] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -929,6 +1039,11 @@ fn named_routes() -> [NamedRoute; 14] {
             path: DATA_PAGE_PATH,
             primary_methods: &[Method::GET],
             handler: NamedRouteHandler::Data,
+        },
+        NamedRoute {
+            path: "/_ts/api/v1/ec/resolve",
+            primary_methods: &[Method::POST],
+            handler: NamedRouteHandler::EcResolve,
         },
         NamedRoute {
             path: "/auction",

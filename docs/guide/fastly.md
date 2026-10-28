@@ -388,9 +388,11 @@ When upgrading an existing service:
 
 ## Create EC KV Store
 
-Edge Cookie flows require one KV store:
+The data kept with the Edge Cookie needs one KV store. Without it the Edge Cookie is still created and written, and that data is not kept:
 
 - Identity graph store (`ec_store`) - EC identity graph, source-domain keyed partner UIDs, minimal consent metadata, and withdrawal tombstones
+
+Adding the store to a service that ran without it gives each browser holding a cookie that a server-side module, such as `hmac`, wrote without it a new identifier on its first page view, because the identity graph replaces an identifier it has no row for. A client-side module, such as `client_fixed`, creates nothing at the edge to replace its cookie with, so that cookie keeps its identifier with no row, and nothing is kept for that reader, for as long as the browser keeps the cookie and its `ts-ecr` marker. Each of that reader's page views meanwhile pays for an extra read of the store and a strongly consistent existence check.
 
 Partners are configured statically in `[[ec.partners]]` and loaded into an in-memory registry at startup. There is no separate consent KV store. Consent is interpreted from live request cookies, headers, geolocation, and policy defaults.
 

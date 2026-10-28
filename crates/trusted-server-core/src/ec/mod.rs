@@ -1015,7 +1015,8 @@ impl EcContext {
     /// Sets the device signals derived from the adapter layer.
     ///
     /// Must be called before [`generate_if_needed`] so that new entries
-    /// include the [`KvDevice`] record. The adapter derives these from
+    /// include the [`KvDevice`] record, and before the Edge Cookie is
+    /// finalized, whose bot gate reads them. The adapter derives these from
     /// `req.get_tls_ja4()`, `req.get_client_h2_fingerprint()`, and UA.
     ///
     /// [`KvDevice`]: super::kv_types::KvDevice
@@ -1036,6 +1037,17 @@ impl EcContext {
     #[must_use]
     pub fn device_signals(&self) -> Option<&DeviceSignals> {
         self.device_signals.as_ref()
+    }
+
+    /// Whether the request passed the bot gate, being whether its device
+    /// signals say it looks like a real browser. A created Edge Cookie is
+    /// written only for a request that passed, and a request with no device
+    /// signals has not.
+    #[must_use]
+    pub(crate) fn passed_bot_gate(&self) -> bool {
+        self.device_signals
+            .as_ref()
+            .is_some_and(|signals| signals.looks_like_browser)
     }
 
     /// Returns the normalized client IP, if available.
@@ -2406,9 +2418,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// Runs generation through `module` and hands back the context whether or
-    /// not generation succeeded, so a test can finalize a response on a context
-    /// whose generation returned an error.
+    /// Runs generation through `module` for a browser and hands back the
+    /// context whether or not generation succeeded, so a test can finalize a
+    /// response on a context whose generation returned an error.
     async fn generate_with_header_setting_module(
         module: HeaderSettingModule,
         graph: Option<&KvIdentityGraph>,
@@ -2421,6 +2433,7 @@ pub(crate) mod tests {
         let req = create_test_request(&[]);
         let mut ec = EcContext::read_from_request(&settings, &req, &services)
             .expect("should read EC context");
+        ec.set_device_signals(browser_signals());
         let outcome = ec.generate_if_needed(&settings, graph, &services).await;
         (settings, ec, outcome)
     }
@@ -2606,6 +2619,7 @@ pub(crate) mod tests {
         let req = addressed_test_request(&[]);
         let mut ec = EcContext::read_from_request(&settings, &req, &services)
             .expect("should read EC context");
+        ec.set_device_signals(browser_signals());
         let graph = KvIdentityGraph::in_memory("test-ec-store");
         ec.generate_if_needed(&settings, Some(&graph), &services)
             .await
@@ -2965,6 +2979,44 @@ pub(crate) mod tests {
         Arc::new(crate::ec::module::HmacModule::new(
             crate::redacted::Redacted::new("test-secret-key-32-bytes-minimum".to_owned()),
         ))
+    }
+
+    /// The device signals of a desktop browser, which the bot gate passes.
+    ///
+    /// A created Edge Cookie is written only for a request whose device
+    /// signals pass the bot gate, so a test that expects one sets these, as
+    /// an adapter sets the signals it derives on every request.
+    pub(crate) fn browser_signals() -> DeviceSignals {
+        DeviceSignals::derive_ua_only(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+        )
+    }
+
+    /// The device signals of a crawler, which the bot gate stops.
+    pub(crate) fn crawler_signals() -> DeviceSignals {
+        DeviceSignals::derive_ua_only(
+            "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+        )
+    }
+
+    #[test]
+    fn the_bot_gate_passes_a_browser_and_stops_a_crawler_or_a_request_with_no_signals() {
+        let mut context = EcContext::new_for_test(None, ConsentContext::default());
+        assert!(
+            !context.passed_bot_gate(),
+            "a request with no device signals has not passed the bot gate"
+        );
+        context.set_device_signals(crawler_signals());
+        assert!(
+            !context.passed_bot_gate(),
+            "the bot gate should stop a crawler"
+        );
+        context.set_device_signals(browser_signals());
+        assert!(
+            context.passed_bot_gate(),
+            "the bot gate should pass a browser"
+        );
     }
 
     #[tokio::test]

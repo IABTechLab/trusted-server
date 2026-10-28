@@ -1053,9 +1053,9 @@ async fn run_named_route(
             unreachable!("the inspection endpoints are answered before EC setup")
         }
         NamedRouteHandler::EcResolve => {
-            // The resolve endpoint persists the identity-graph row before
-            // creating, so it takes the same bot-gated graph as generation: an
-            // unrecognized client gets no graph, and therefore no new Edge Cookie.
+            // The resolve endpoint takes the same bot-gated graph as
+            // generation, so an unrecognized client writes no graph row, and
+            // core's bot gate gives it no new Edge Cookie.
             handle_ec_resolve(
                 &state.settings,
                 req,
@@ -2963,6 +2963,115 @@ mod tests {
         assert!(
             !finalize.is_real_browser,
             "a request without captured device signals should not be classified as a real browser"
+        );
+    }
+
+    /// A location in the US, where the sample permission rules grant the Edge
+    /// Cookie with no signal.
+    struct UsGeo;
+
+    #[async_trait::async_trait(?Send)]
+    impl trusted_server_core::platform::PlatformGeo for UsGeo {
+        async fn lookup(
+            &self,
+            _client_ip: Option<IpAddr>,
+            _services: &RuntimeServices,
+        ) -> Result<Option<trusted_server_core::platform::GeoInfo>, Report<PlatformError>> {
+            Ok(Some(trusted_server_core::platform::GeoInfo {
+                city: String::new(),
+                country: "US".to_owned(),
+                continent: String::new(),
+                latitude: 0.0,
+                longitude: 0.0,
+                metro_code: 0,
+                region: None,
+                asn: None,
+            }))
+        }
+    }
+
+    #[test]
+    fn with_no_ec_store_the_entry_point_writes_a_created_edge_cookie() {
+        // The test settings name no `[ec] ec_store`, so the service opens no
+        // identity graph. A browser's page view still gets the Edge Cookie it
+        // creates, because a missing graph does not stop the cookie.
+        use trusted_server_core::platform::test_support::{
+            NoopBackend, NoopConfigStore, NoopHttpClient, NoopSecretStore,
+        };
+
+        let settings = test_settings();
+        assert_eq!(
+            settings.ec.ec_store, None,
+            "the test settings should name no ec_store"
+        );
+        let services = RuntimeServices::builder()
+            .config_store(Arc::new(NoopConfigStore))
+            .secret_store(Arc::new(NoopSecretStore))
+            .kv_store(Arc::new(NoopKvStore))
+            .backend(Arc::new(NoopBackend))
+            .http_client(Arc::new(NoopHttpClient))
+            .geo(Arc::new(
+                trusted_server_core::platform::PlatformGeoModule::new("platform", Arc::new(UsGeo)),
+            ))
+            .client_info(ClientInfo {
+                client_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))),
+                ..ClientInfo::default()
+            })
+            .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
+            .build();
+        let request = browser_request(Method::GET, "/article", "document");
+
+        let mut ec = block_on(super::build_ec_request_state(
+            &settings, &services, &request,
+        ));
+        assert!(
+            ec.is_real_browser,
+            "the browser's page view should pass the bot gate"
+        );
+        assert!(
+            ec.kv_graph.is_none() && ec.finalize_kv_graph.is_none(),
+            "with no ec_store the service should open no identity graph"
+        );
+        // The publisher fallback's step for a browser's page navigation.
+        block_on(
+            ec.ec_context
+                .generate_if_needed(&settings, ec.kv_graph.as_ref(), &services),
+        )
+        .expect("should create the Edge Cookie");
+        let ec_id = ec
+            .ec_context
+            .ec_value()
+            .expect("the page view should create an Edge Cookie")
+            .to_owned();
+        let mut finalize = ec.into_finalize_state();
+        let mut response = edgezero_core::http::response_builder()
+            .status(StatusCode::OK)
+            .body(Body::empty())
+            .expect("should build the page response");
+
+        block_on(crate::apply_edgezero_ec_finalize(
+            &settings,
+            &mut finalize,
+            &mut response,
+        ))
+        .expect("the partner registry should build");
+
+        let cookies: Vec<&str> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .filter(|cookie| cookie.starts_with("ts-ec="))
+            .collect();
+        assert_eq!(
+            cookies.len(),
+            1,
+            "the entry point should write the created Edge Cookie once, got {cookies:?}"
+        );
+        assert!(
+            cookies[0].starts_with(&format!("ts-ec={ec_id};")),
+            "the Edge Cookie should carry the created identifier, got {}",
+            cookies[0]
         );
     }
 

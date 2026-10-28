@@ -32680,6 +32680,7 @@ mod tests {
                 };
                 let mut ec_context = EcContext::new_for_test(None, consent)
                     .with_module_for_test(Arc::new(CanonicalizingModule));
+                ec_context.set_device_signals(crate::ec::tests::browser_signals());
                 ec_context
                     .generate_if_needed(
                         &settings,
