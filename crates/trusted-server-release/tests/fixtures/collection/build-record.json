@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "recipe_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "asset": "trusted-server-fastly.wasm",
+  "role": "A",
+  "job": "fastly-a",
+  "attempt": 1,
+  "inputs": {
+    "cargo_lock": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "materials": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "rust_tools": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "js_settings": "1111111111111111111111111111111111111111111111111111111111111111",
+    "js_tools": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "inventory_sha256": "",
+  "artifact_sha256": "",
+  "artifact_size": 0,
+  "composition_sha256": "",
+  "ambient": {
+    "umask": 18,
+    "jobs": 4,
+    "checkout_root": "/external-release-A",
+    "started_at_seconds": 100,
+    "execution_uid": 1000,
+    "host_locale": "C",
+    "host_timezone": "UTC",
+    "child_locale": "C",
+    "child_timezone": "UTC"
+  },
+  "claim": {
+    "varied": ["umask", "jobs", "checkout_root", "start_time"],
+    "normalized": ["locale", "timezone"],
+    "unsupported": ["execution_user"]
+  },
+  "boundary": {
+    "fingerprint": "3333333333333333333333333333333333333333333333333333333333333333",
+    "execution_fingerprint": "3333333333333333333333333333333333333333333333333333333333333333",
+    "invocation_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+    "confined": true,
+    "control_exit": 0,
+    "control_accepts": 1,
+    "probe_exit": 3,
+    "probe_errno": 1,
+    "probe_accepts": 0
+  },
+  "runtime": null
+}

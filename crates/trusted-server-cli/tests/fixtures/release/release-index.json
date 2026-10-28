@@ -1,0 +1,218 @@
+{
+  "artifacts": [
+    {
+      "assurance_profile": "provenance-sbom-repeatable",
+      "capabilities": ["fastly-production"],
+      "companions": {
+        "build_evidence": {
+          "name": "trusted-server-fastly.wasm.build-evidence.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 2048
+        },
+        "build_recipe": {
+          "name": "trusted-server-fastly.wasm.build-recipe.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 1024
+        },
+        "provenance": {
+          "name": "trusted-server-fastly.wasm.provenance.sigstore.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 8192
+        },
+        "rebuild_check": {
+          "name": "trusted-server-fastly.wasm.rebuild-check.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 512
+        },
+        "sbom": {
+          "name": "trusted-server-fastly.wasm.spdx.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 4096
+        },
+        "sbom_attestation": {
+          "name": "trusted-server-fastly.wasm.sbom.sigstore.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 8192
+        }
+      },
+      "compatibility": {
+        "architecture": "wasm32",
+        "minimum_version": "wasip1",
+        "runtime": "fastly-compute"
+      },
+      "js_inventory_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "kind": "wasm-core",
+      "name": "trusted-server-fastly.wasm",
+      "package": "trusted-server-adapter-fastly",
+      "role": "server",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "size": 1048576,
+      "target": "wasm32-wasip1",
+      "variant": "default"
+    },
+    {
+      "assurance_profile": "provenance-sbom",
+      "capabilities": ["cli-execute"],
+      "companions": {
+        "build_evidence": {
+          "name": "ts-aarch64-apple-darwin.build-evidence.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 2048
+        },
+        "build_recipe": {
+          "name": "ts-aarch64-apple-darwin.build-recipe.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 1024
+        },
+        "provenance": {
+          "name": "ts-aarch64-apple-darwin.provenance.sigstore.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 8192
+        },
+        "rebuild_check": {
+          "name": "ts-aarch64-apple-darwin.rebuild-check.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 512
+        },
+        "sbom": {
+          "name": "ts-aarch64-apple-darwin.spdx.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 4096
+        },
+        "sbom_attestation": {
+          "name": "ts-aarch64-apple-darwin.sbom.sigstore.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 8192
+        }
+      },
+      "compatibility": {
+        "architecture": "aarch64",
+        "minimum_version": "13.0",
+        "runtime": "macos"
+      },
+      "js_inventory_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "kind": "native-executable",
+      "name": "ts-aarch64-apple-darwin",
+      "package": "trusted-server-cli",
+      "role": "operator-cli",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "size": 1048576,
+      "target": "aarch64-apple-darwin",
+      "variant": "default"
+    },
+    {
+      "assurance_profile": "provenance-sbom",
+      "capabilities": ["cli-execute"],
+      "companions": {
+        "build_evidence": {
+          "name": "ts-x86_64-apple-darwin.build-evidence.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 2048
+        },
+        "build_recipe": {
+          "name": "ts-x86_64-apple-darwin.build-recipe.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 1024
+        },
+        "provenance": {
+          "name": "ts-x86_64-apple-darwin.provenance.sigstore.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 8192
+        },
+        "rebuild_check": {
+          "name": "ts-x86_64-apple-darwin.rebuild-check.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 512
+        },
+        "sbom": {
+          "name": "ts-x86_64-apple-darwin.spdx.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 4096
+        },
+        "sbom_attestation": {
+          "name": "ts-x86_64-apple-darwin.sbom.sigstore.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 8192
+        }
+      },
+      "compatibility": {
+        "architecture": "x86_64",
+        "minimum_version": "13.0",
+        "runtime": "macos"
+      },
+      "js_inventory_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "kind": "native-executable",
+      "name": "ts-x86_64-apple-darwin",
+      "package": "trusted-server-cli",
+      "role": "operator-cli",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "size": 1048576,
+      "target": "x86_64-apple-darwin",
+      "variant": "default"
+    },
+    {
+      "assurance_profile": "provenance-sbom",
+      "capabilities": ["cli-execute"],
+      "companions": {
+        "build_evidence": {
+          "name": "ts-x86_64-unknown-linux-gnu.build-evidence.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 2048
+        },
+        "build_recipe": {
+          "name": "ts-x86_64-unknown-linux-gnu.build-recipe.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 1024
+        },
+        "provenance": {
+          "name": "ts-x86_64-unknown-linux-gnu.provenance.sigstore.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 8192
+        },
+        "rebuild_check": {
+          "name": "ts-x86_64-unknown-linux-gnu.rebuild-check.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 512
+        },
+        "sbom": {
+          "name": "ts-x86_64-unknown-linux-gnu.spdx.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 4096
+        },
+        "sbom_attestation": {
+          "name": "ts-x86_64-unknown-linux-gnu.sbom.sigstore.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 8192
+        }
+      },
+      "compatibility": {
+        "architecture": "x86_64",
+        "minimum_version": "glibc-2.34",
+        "runtime": "linux-gnu"
+      },
+      "js_inventory_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "kind": "native-executable",
+      "name": "ts-x86_64-unknown-linux-gnu",
+      "package": "trusted-server-cli",
+      "role": "operator-cli",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "size": 1048576,
+      "target": "x86_64-unknown-linux-gnu",
+      "variant": "default"
+    }
+  ],
+  "cohort": "phase1-fastly-cli",
+  "cohort_source_commit": "0123456789abcdef0123456789abcdef01234567",
+  "policy_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "policy_version": 1,
+  "recipe_source_commit": "0123456789abcdef0123456789abcdef01234567",
+  "repository": "IABTechLab/trusted-server",
+  "schema_version": 1,
+  "source_commit": "0123456789abcdef0123456789abcdef01234567",
+  "tag": "v1.2.0",
+  "tsjs_inventory": {
+    "name": "tsjs-inventory.json",
+    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "size": 4096
+  }
+}
