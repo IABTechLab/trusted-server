@@ -2208,8 +2208,8 @@ store_idle_seconds = 86400
 | `[cache.51degrees-assets]`      | `store_idle_seconds` | `86400`, a day           | 1 to 31536000 | How long a copy or a record in the shared store lasts unused.                                         |
 | `[cache.51degrees-assets-vary]` | `module`             | the one the build links  |               | The loading cache module that holds the records.                                                      |
 
-Both caches take the lifetimes of `[cache.51degrees-assets]`, so the lifetimes
-in `[cache.51degrees-assets-vary]` are checked and not used. A build that links
+Both caches take the lifetimes of `[cache.51degrees-assets]`, so a lifetime set
+in `[cache.51degrees-assets-vary]` is refused. A build that links
 two or more loading cache modules names one in each table. The module reads
 no table of its own, so an `[asset-cache.51degrees]` table is refused, an
 empty one included, and a table that names `none` as its loading cache module
@@ -3920,6 +3920,11 @@ that blob, so the policy a host runs is checked on that host's `/_ts/config`.
 | Any host, under a malformed selector                        | None                      | `500`                            |
 | Any host, where the store cannot be read                    | None                      | `500`                            |
 | A host whose policy entry is missing or is another file     | The host's blob           | `500`, with the reason logged    |
+
+An instance that already holds the rules for the SHA-256 a host's blob pins
+does not read that host's policy entry, so a missing or replaced entry is
+answered with `500` only by an instance that has not loaded that SHA-256
+before.
 
 A selector is malformed when it is empty, carries whitespace, a control
 character or `{host}` more than once, carries a brace outside its `{host}`
