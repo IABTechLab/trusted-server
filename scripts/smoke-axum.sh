@@ -47,6 +47,7 @@ sed \
         --local \
         --manifest "$WORKSPACE/edgezero.toml" \
         --app-config "$SMOKE_APP_CONFIG" \
+        --permissions "$SMOKE_POLICY_FILE" \
         --yes \
         --no-diff
 )
@@ -54,26 +55,32 @@ ENVELOPE=$(jq --exit-status --raw-output \
     '.trusted_server_config' \
     "$WORKSPACE/.edgezero/local-config-trusted_server_config.json")
 
+SMOKE_POLICY_ENV=TRUSTED_SERVER_PERMISSIONS_DIR
+SMOKE_POLICY_DIR=$(dirname "$SMOKE_POLICY_FILE")
+
 run_case() {
     local case_name="$1"
     local port="$2"
     local config_value="$3"
-    local handler_value="$4"
-    local proxy_value="$5"
-    local ec_value="$6"
-    local expected_status="$7"
-    local expected_diagnostic="${8:-}"
+    local policy_dir="$4"
+    local handler_value="$5"
+    local proxy_value="$6"
+    local ec_value="$7"
+    local expected_status="$8"
+    local expected_diagnostic="${9:-}"
     local log_path="$WORKSPACE/$case_name.log"
     local body_path="$WORKSPACE/$case_name.body"
     local headers_path="$WORKSPACE/$case_name.headers"
     local env_args=(
         env
         -u "$SMOKE_CONFIG_ENV"
+        -u "$SMOKE_POLICY_ENV"
         -u "$SMOKE_HANDLER_ENV"
         -u "$SMOKE_PROXY_ENV"
         -u "$SMOKE_EC_ENV"
     )
     [ -z "$config_value" ] || env_args+=("$SMOKE_CONFIG_ENV=$config_value")
+    [ -z "$policy_dir" ] || env_args+=("$SMOKE_POLICY_ENV=$policy_dir")
     [ -z "$handler_value" ] || env_args+=("$SMOKE_HANDLER_ENV=$handler_value")
     [ -z "$proxy_value" ] || env_args+=("$SMOKE_PROXY_ENV=$proxy_value")
     [ -z "$ec_value" ] || env_args+=("$SMOKE_EC_ENV=$ec_value")
@@ -98,19 +105,22 @@ run_case() {
     fi
 }
 
-run_case missing-config "$BASE_PORT" "" \
+run_case missing-config "$BASE_PORT" "" "$SMOKE_POLICY_DIR" \
     "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 500 \
     "env var '$SMOKE_CONFIG_ENV' not set"
-run_case missing-handler "$((BASE_PORT + 1))" "$ENVELOPE" \
+run_case missing-policy "$((BASE_PORT + 1))" "$ENVELOPE" "" \
+    "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 500 \
+    "$SMOKE_POLICY_ENV is not set"
+run_case missing-handler "$((BASE_PORT + 2))" "$ENVELOPE" "$SMOKE_POLICY_DIR" \
     "" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 500 \
     "failed to resolve secret reference at \`handlers[0].password\`"
-run_case missing-proxy "$((BASE_PORT + 2))" "$ENVELOPE" \
+run_case missing-proxy "$((BASE_PORT + 3))" "$ENVELOPE" "$SMOKE_POLICY_DIR" \
     "$SMOKE_HANDLER_VALUE" "" "$SMOKE_EC_VALUE" 500 \
     "failed to resolve secret reference at \`publisher.proxy_secret\`"
-run_case missing-ec "$((BASE_PORT + 3))" "$ENVELOPE" \
+run_case missing-ec "$((BASE_PORT + 4))" "$ENVELOPE" "$SMOKE_POLICY_DIR" \
     "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "" 500 \
     "failed to resolve secret reference at \`ec.hmac.passphrase\`"
-run_case positive "$((BASE_PORT + 4))" "$ENVELOPE" \
+run_case positive "$((BASE_PORT + 5))" "$ENVELOPE" "$SMOKE_POLICY_DIR" \
     "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 200
 
 echo "Axum first-success smoke passed"

@@ -64,7 +64,7 @@ impl<'a> From<Option<&'a GeoInfo>> for GeoStatus<'a> {
 }
 
 /// The jurisdiction the consent gates apply to a request, from its resolved
-/// location or, with none, from the permission policy's top node.
+/// location or, with none, from the top node of the policy in `maps`.
 ///
 /// The consent gates (for example the server-side auction gate) detect a
 /// jurisdiction from geolocation. With no location they would resolve
@@ -74,15 +74,16 @@ impl<'a> From<Option<&'a GeoInfo>> for GeoStatus<'a> {
 /// unknown, so the consent gates fail closed alongside the requires-signal
 /// floor.
 #[must_use]
-pub fn default_jurisdiction(geo: GeoStatus<'_>) -> Jurisdiction {
+pub fn default_jurisdiction(maps: &PermissionMaps, geo: GeoStatus<'_>) -> Jurisdiction {
     match geo {
-        GeoStatus::NoLocation => PermissionMaps::standard().default_jurisdiction(),
+        GeoStatus::NoLocation => maps.default_jurisdiction(),
         GeoStatus::Located(_) | GeoStatus::Failed => Jurisdiction::Unknown,
     }
 }
 
 /// Assembles the permission state for a request: the place baseline from the
-/// tree in `permissions.yaml`, amended by what the signal modules say.
+/// rules tree of the policy in `maps`, amended by what the signal modules
+/// say.
 ///
 /// Permissions exist without a consent model. With no module having an
 /// opinion the result is simply the baseline for the request's country and
@@ -104,12 +105,12 @@ pub fn default_jurisdiction(geo: GeoStatus<'_>) -> Jurisdiction {
 /// [`PermissionState::tdls`].
 #[must_use]
 pub fn assemble_permissions(
+    maps: &PermissionMaps,
     consent: &ConsentContext,
     evidence: &dyn RequestInfo,
     geo: GeoStatus<'_>,
     modules: &[Arc<dyn PermissionSignalModule>],
 ) -> PermissionState {
-    let maps = PermissionMaps::standard();
     let signal = permission_signal(consent, evidence, maps.signals(), modules);
     let state = match geo {
         GeoStatus::Failed => PermissionMaps::floor_with(signal),
@@ -128,7 +129,7 @@ pub fn assemble_permissions(
         consent,
         evidence,
         maps.signals(),
-        storage_acquisition(geo),
+        storage_acquisition(maps, geo),
     );
     state
         // Only a permission some configured module could still grant is
@@ -142,24 +143,23 @@ pub fn assemble_permissions(
 /// The acquisition rule for Edge Cookie storage in the request's resolved
 /// jurisdiction, used to scope destructive withdrawal.
 ///
-/// Resolves the same rules as [`assemble_permissions`] (the request's
-/// country/region, the policy's top node when unmatched, and the
-/// requires-signal floor when the lookup failed) and returns the rule for
-/// [`Permission::StoreOnDevice`].
+/// Resolves the same rules of the policy in `maps` as
+/// [`assemble_permissions`] (the request's country/region, the policy's top
+/// node when unmatched, and the requires-signal floor when the lookup
+/// failed) and returns the rule for [`Permission::StoreOnDevice`].
 #[must_use]
-pub fn storage_acquisition(geo: GeoStatus<'_>) -> Acquisition {
+pub fn storage_acquisition(maps: &PermissionMaps, geo: GeoStatus<'_>) -> Acquisition {
     match geo {
         GeoStatus::Failed => Acquisition::RequiresSignal,
         GeoStatus::Located(_) | GeoStatus::NoLocation => {
             let info = geo.info();
-            PermissionMaps::standard()
-                .rules_or_default(
-                    info.map(|info| info.country.as_str()),
-                    info.and_then(|info| info.region.as_deref()),
-                )
-                .map_or(Acquisition::RequiresSignal, |rules| {
-                    rules.rule_for(Permission::StoreOnDevice)
-                })
+            maps.rules_or_default(
+                info.map(|info| info.country.as_str()),
+                info.and_then(|info| info.region.as_deref()),
+            )
+            .map_or(Acquisition::RequiresSignal, |rules| {
+                rules.rule_for(Permission::StoreOnDevice)
+            })
         }
     }
 }
@@ -258,7 +258,13 @@ mod tests {
         geo: GeoStatus<'_>,
         modules: &[Arc<dyn PermissionSignalModule>],
     ) -> PermissionState {
-        assemble_permissions(consent, &no_evidence(), geo, modules)
+        assemble_permissions(
+            PermissionMaps::sample(),
+            consent,
+            &no_evidence(),
+            geo,
+            modules,
+        )
     }
 
     fn us_ca_geo() -> GeoInfo {
@@ -328,7 +334,13 @@ mod tests {
     fn a_module_declaring_terms_reaches_the_assembled_state() {
         let consent = ConsentContext::default();
         let modules: Vec<Arc<dyn PermissionSignalModule>> = vec![Arc::new(DeclaringTerms)];
-        let state = assemble_permissions(&consent, &no_evidence(), GeoStatus::NoLocation, &modules);
+        let state = assemble_permissions(
+            PermissionMaps::sample(),
+            &consent,
+            &no_evidence(),
+            GeoStatus::NoLocation,
+            &modules,
+        );
         let addresses: Vec<&str> = state.tdls().iter().map(crate::tdl::Tdl::as_str).collect();
         assert_eq!(
             addresses,
@@ -340,8 +352,13 @@ mod tests {
     #[test]
     fn a_state_assembled_from_the_shipped_kind_of_module_declares_no_terms() {
         let consent = ConsentContext::default();
-        let state =
-            assemble_permissions(&consent, &no_evidence(), GeoStatus::NoLocation, &granting());
+        let state = assemble_permissions(
+            PermissionMaps::sample(),
+            &consent,
+            &no_evidence(),
+            GeoStatus::NoLocation,
+            &granting(),
+        );
         assert!(
             state.tdls().is_empty(),
             "should declare nothing, because a scheme carrying no terms says nothing about them"
@@ -531,7 +548,7 @@ mod tests {
             "a lookup failure must not fall back to any node of the policy tree"
         );
         assert_eq!(
-            storage_acquisition(GeoStatus::Failed),
+            storage_acquisition(PermissionMaps::sample(), GeoStatus::Failed),
             Acquisition::RequiresSignal,
             "the storage baseline follows the same floor on failure"
         );
@@ -539,7 +556,7 @@ mod tests {
 
     #[test]
     fn no_location_falls_back_to_the_policy_top_node() {
-        // The shipped policy's top node is the gdpr-eu group, which requires a
+        // The sample policy's top node is the gdpr-eu group, which requires a
         // signal for storage, so an unplaced visitor gets no identifier until
         // one arrives.
         let state = assembled(&ConsentContext::default(), GeoStatus::NoLocation, &[]);
@@ -548,7 +565,7 @@ mod tests {
             "the top node requires a signal for storage"
         );
         assert_eq!(
-            storage_acquisition(GeoStatus::NoLocation),
+            storage_acquisition(PermissionMaps::sample(), GeoStatus::NoLocation),
             Acquisition::RequiresSignal,
             "the storage baseline follows the top node on no location"
         );
@@ -557,14 +574,48 @@ mod tests {
     #[test]
     fn no_location_takes_the_jurisdiction_from_the_policy_top_node() {
         assert_eq!(
-            default_jurisdiction(GeoStatus::NoLocation),
+            default_jurisdiction(PermissionMaps::sample(), GeoStatus::NoLocation),
             Jurisdiction::Gdpr,
             "no location should resolve the top node's declared jurisdiction"
         );
         assert_eq!(
-            default_jurisdiction(GeoStatus::Failed),
+            default_jurisdiction(PermissionMaps::sample(), GeoStatus::Failed),
             Jurisdiction::Unknown,
             "a failed lookup must not adopt the policy's declared jurisdiction"
+        );
+    }
+
+    #[test]
+    fn the_loaded_policy_decides_and_not_the_sample() {
+        // A policy whose whole world sets device storage without a signal.
+        let open = PermissionMaps::from_yaml(
+            "groups:\n  open:\n    default: granted\nrules:\n  group: open\n  jurisdiction: non-regulated\n",
+        )
+        .expect("should parse the open policy");
+
+        let state = assemble_permissions(
+            &open,
+            &ConsentContext::default(),
+            &no_evidence(),
+            GeoStatus::NoLocation,
+            &[],
+        );
+        assert!(
+            state.is_set(Permission::StoreOnDevice),
+            "the open policy should set storage without a signal"
+        );
+        assert_eq!(
+            storage_acquisition(&open, GeoStatus::NoLocation),
+            Acquisition::Granted
+        );
+        assert_eq!(
+            default_jurisdiction(&open, GeoStatus::NoLocation),
+            Jurisdiction::NonRegulated
+        );
+        assert_ne!(
+            storage_acquisition(PermissionMaps::sample(), GeoStatus::NoLocation),
+            Acquisition::Granted,
+            "the sample should not grant storage without a signal, or this test proves nothing"
         );
     }
 }

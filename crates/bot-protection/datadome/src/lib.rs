@@ -1890,6 +1890,7 @@ mod tests {
             &envelope,
             &KeyStore,
             &trusted_server_core::platform::StoreName::from("ts_secrets"),
+            trusted_server_core::platform::PolicyOrigin::Blob,
             &[builder()],
         )
         .expect("should load the settings")

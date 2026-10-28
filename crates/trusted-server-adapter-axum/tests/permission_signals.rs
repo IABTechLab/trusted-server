@@ -26,7 +26,7 @@ use trusted_server_core::evidence::OwnedRequestInfo;
 use trusted_server_core::permission_signal::{
     PermissionSignalModule, build_permission_signal_modules,
 };
-use trusted_server_core::permissions::{Permission, PermissionState};
+use trusted_server_core::permissions::{Permission, PermissionMaps, PermissionState};
 use trusted_server_core::platform::GeoInfo;
 use trusted_server_core::settings::Settings;
 use trusted_server_permission_signal_gpc::GpcModule;
@@ -89,7 +89,13 @@ fn assembled(
     geo: GeoStatus<'_>,
     modules: &[Arc<dyn PermissionSignalModule>],
 ) -> PermissionState {
-    assemble_permissions(consent, &no_evidence(), geo, modules)
+    assemble_permissions(
+        PermissionMaps::sample(),
+        consent,
+        &no_evidence(),
+        geo,
+        modules,
+    )
 }
 
 /// Builds a minimal decoded TCF record consenting to the given 1-indexed
@@ -619,6 +625,7 @@ fn a_pmp_answer_in_the_eu_settles_what_the_model_terms_cover_and_declares_them()
         OwnedRequestInfo::new(String::new(), headers)
     };
     let standard = assemble_permissions(
+        PermissionMaps::sample(),
         &ConsentContext::default(),
         &evidence("standard"),
         GeoStatus::Located(&geo),
@@ -648,6 +655,7 @@ fn a_pmp_answer_in_the_eu_settles_what_the_model_terms_cover_and_declares_them()
         "an answer is given under the versioned Model Terms"
     );
     let personalized = assemble_permissions(
+        PermissionMaps::sample(),
         &ConsentContext::default(),
         &evidence("personalized"),
         GeoStatus::Located(&geo),
@@ -658,6 +666,7 @@ fn a_pmp_answer_in_the_eu_settles_what_the_model_terms_cover_and_declares_them()
         "personalized grants targeting too"
     );
     let unanswered = assemble_permissions(
+        PermissionMaps::sample(),
         &ConsentContext::default(),
         &no_evidence(),
         GeoStatus::Located(&geo),
