@@ -76,14 +76,14 @@ impl MainIntegration {
     }
 }
 
-/// The sections that select several modules, written with `modules` even
-/// when one is selected.
 /// The item left to do in a document that names no permission policy file.
 pub(crate) const POLICY_TO_DO: &str = "`[permissions] policy` names no permission policy \
      file, and a domain whose settings name none does not start. Name the publisher's file \
      there by its stem, as `policy = \"standard\"` names `standard.yaml`, and supply the \
      file with `ts config push --permissions <file>`";
 
+/// The sections that select several modules, written with `modules` even
+/// when one is selected.
 const LIST_SECTIONS: &[&str] = &["tag", "ad-tag", "auction", "proxy", "ads-txt", "headers"];
 
 /// Core's script proxy, which no linked builder describes.
