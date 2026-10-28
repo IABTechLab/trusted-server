@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+bytes = { workspace = true }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }
 http = { workspace = true }

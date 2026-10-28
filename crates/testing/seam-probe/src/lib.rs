@@ -702,6 +702,9 @@ impl SeamProbeProxy {
             "request_preparer_runs": prepared.map_or(0, |marker| marker.runs),
             "public_prefix": services.public_prefix().as_str(),
             "server_key_prefix": services.server_key_prefix().as_str(),
+            "answers_cache_keeps_values": services
+                .loading_cache_for(SEAM_PROBE_ANSWERS_CACHE)
+                .keeps_values(),
         })
         .to_string();
 
@@ -886,6 +889,66 @@ pub fn builder() -> IntegrationBuilder {
         .with_request_preparer(prepare_request)
         .with_demand(&SEAM_PROBE_DEMAND)
         .with_adserver(&SEAM_PROBE_ADSERVER)
+        .with_cache_features(&[SEAM_PROBE_ANSWERS_CACHE])
+}
+
+/// The cache the probe declares and loads its answers through, selected in
+/// `[cache.seam-probe-answers]`. The report route says whether the cache
+/// that table selected keeps values.
+pub const SEAM_PROBE_ANSWERS_CACHE: &str = "seam-probe-answers";
+
+/// The id of the loading cache module the probe offers, selected in a
+/// `[cache.<name>]` table as `module = "seam-probe"`.
+pub const SEAM_PROBE_LOADING_CACHE_ID: &str = "loading-cache.seam-probe";
+
+/// A loading cache that keeps every value in this process's memory for as
+/// long as the process runs, enough to prove from outside core that a table
+/// selected it.
+#[derive(Default)]
+struct MemoryLoadingCache {
+    held: Mutex<BTreeMap<String, bytes::Bytes>>,
+}
+
+#[async_trait(?Send)]
+impl trusted_server_core::platform::PlatformLoadingCache for MemoryLoadingCache {
+    async fn get_or_load(
+        &self,
+        _services: &RuntimeServices,
+        _spec: &trusted_server_core::platform::CacheSpec,
+        key: &trusted_server_core::platform::StoreKey,
+        load: trusted_server_core::platform::Loader,
+    ) -> Result<bytes::Bytes, trusted_server_core::platform::LoadError> {
+        if let Some(held) = self.held.lock().expect("lock").get(&key.to_string()) {
+            return Ok(held.clone());
+        }
+        let loaded = load().await?.bytes;
+        self.held
+            .lock()
+            .expect("lock")
+            .insert(key.to_string(), loaded.clone());
+        Ok(loaded)
+    }
+
+    async fn remove(
+        &self,
+        _services: &RuntimeServices,
+        _spec: &trusted_server_core::platform::CacheSpec,
+        key: &trusted_server_core::platform::StoreKey,
+    ) {
+        self.held.lock().expect("lock").remove(&key.to_string());
+    }
+}
+
+fn memory_loading_cache() -> Arc<dyn trusted_server_core::platform::PlatformLoadingCache> {
+    Arc::new(MemoryLoadingCache::default())
+}
+
+/// The builder offering the probe's loading cache, for a test that proves a
+/// declared cache's table selects a module from outside core.
+#[must_use]
+pub fn loading_cache_builder() -> IntegrationBuilder {
+    IntegrationBuilder::implementations(SEAM_PROBE_LOADING_CACHE_ID, SEAM_PROBE_SOURCE)
+        .with_loading_cache(memory_loading_cache)
 }
 
 /// The vendor's name, which names the table `[shared.seam-probe]` that runs

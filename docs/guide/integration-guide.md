@@ -423,6 +423,7 @@ points at the functions that do the work.
 | `.with_plan_validator(...)`                   | Optional. Checks the module's settings against the compiled auction plan, when a deployment is validated and as the settings load                                                                         |
 | `.with_demand(...)` and `.with_adserver(...)` | Optional. Registers an auction implementation that `[demand]` or `[ad-server]` can name. A crate that supplies nothing else starts from `IntegrationBuilder::implementations(...)`                        |
 | `.with_loading_cache(...)`                    | Optional. Offers the loading cache the crate supplies, which a feature selects by the module's name in its `[cache.<name>]` table. An adapter takes the selections with `loading_caches_from`             |
+| `.with_cache_features(...)`                   | Optional. Declares the caches the module loads through, by name, each selected in its own `[cache.<name>]` table as `[cache.robots-txt]` is. A name core or another builder declares is refused           |
 | `.with_shared_settings(...)`                  | Optional. Runs the builder when its vendor's `[shared.<vendor>]` table is present, for a vendor whose modules all read that one table. A builder the table runs is selected by no section                 |
 
 ```rust

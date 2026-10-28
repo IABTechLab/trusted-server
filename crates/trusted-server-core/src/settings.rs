@@ -3080,7 +3080,6 @@ impl AnalyticsConfig {
 
 /// Cache behavior configuration.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct CacheSettings {
     /// Ordered static/rehosted asset rules. The first enabled matching rule wins.
     #[serde(default)]
@@ -3093,6 +3092,12 @@ pub struct CacheSettings {
         skip_serializing_if = "LoadingCacheConfig::is_default"
     )]
     pub robots_txt: LoadingCacheConfig,
+    /// The caches modules declare and load through, each in its own
+    /// `[cache.<name>]` table with the same settings as `[cache.robots-txt]`.
+    /// A name no linked module declares is refused when the deployment's
+    /// caches are resolved, see `integrations::loading_caches_from`.
+    #[serde(flatten, default)]
+    pub declared: BTreeMap<String, LoadingCacheConfig>,
 }
 
 /// The most seconds a loading cache lifetime setting accepts, a year.
@@ -3188,10 +3193,17 @@ fn check_loading_cache_seconds(
 
 impl CacheSettings {
     /// Each cache a loading cache may hold, by its name, with the settings
-    /// its `[cache.<name>]` table carries.
+    /// its `[cache.<name>]` table carries: core's own first, then the ones
+    /// modules declare, in name order.
     #[must_use]
-    pub fn loading_caches(&self) -> [(&'static str, &LoadingCacheConfig); 1] {
-        [(ROBOTS_TXT_CACHE, &self.robots_txt)]
+    pub fn loading_caches(&self) -> Vec<(&str, &LoadingCacheConfig)> {
+        std::iter::once((ROBOTS_TXT_CACHE, &self.robots_txt))
+            .chain(
+                self.declared
+                    .iter()
+                    .map(|(name, config)| (name.as_str(), config)),
+            )
+            .collect()
     }
 
     fn normalize(&mut self) {
@@ -3209,6 +3221,9 @@ impl CacheSettings {
     /// invalid policy/matcher or cannot compile its regex/glob.
     pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
         self.robots_txt.check("cache.robots-txt")?;
+        for (name, config) in &self.declared {
+            config.check(&format!("cache.{name}"))?;
+        }
         let mut seen_ids = HashSet::new();
         for rule in &self.asset_rules {
             if rule.id.is_empty() {
@@ -7113,6 +7128,24 @@ module = \"none\"",
     }
 
     #[test]
+    fn a_cache_a_module_declares_is_read_from_its_own_table() {
+        let toml_str = format!(
+            "{}\n[cache.answers]\nmodule = \"51degrees\"\nstore_seconds = 3600\n",
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse a declared cache");
+
+        let caches = settings.cache.loading_caches();
+
+        assert_eq!(caches.len(), 2);
+        assert_eq!(caches[1].0, "answers");
+        assert_eq!(caches[1].1.module.as_deref(), Some("51degrees"));
+        assert_eq!(caches[1].1.store_seconds, Some(3600));
+        let written = serde_json::to_value(&settings.cache).expect("should serialize");
+        assert_eq!(written["answers"]["module"], "51degrees");
+    }
+
+    #[test]
     fn a_loading_cache_module_is_read_and_written_back() {
         let toml_str = format!(
             r#"{}
@@ -7131,7 +7164,7 @@ module = \"none\"",
         assert!(!settings.cache.robots_txt.is_default());
         assert_eq!(
             settings.cache.loading_caches(),
-            [(super::ROBOTS_TXT_CACHE, &settings.cache.robots_txt)],
+            vec![(super::ROBOTS_TXT_CACHE, &settings.cache.robots_txt)],
             "should list the robots.txt cache by its name"
         );
         let written = serde_json::to_value(&settings.cache).expect("should serialize");

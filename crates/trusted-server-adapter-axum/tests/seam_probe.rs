@@ -547,6 +547,123 @@ fn deploy_validation_rejects_a_violation_of_the_modules_own_rule() {
 }
 
 // ---------------------------------------------------------------------------
+// 3b. A cache the probe declares is selected in its own table
+// ---------------------------------------------------------------------------
+
+/// Reads the probe's report through the router, as a page would.
+async fn report_with(settings: Settings, integrations: &[IntegrationBuilder]) -> serde_json::Value {
+    let mut service = service_with(settings, integrations);
+    let response = get(&mut service, seam_probe::SEAM_PROBE_REPORT_PATH).await;
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "the report route should answer"
+    );
+    let body = body_text(response).await;
+    serde_json::from_str(&body).expect("the report route should return JSON")
+}
+
+/// The id of a loading cache module these tests link beside the probe's.
+const SECOND_LOADING_CACHE_ID: &str = "loading-cache.memory";
+
+/// Core's `MemoryLoadingCache`, which keeps what it loads.
+fn memory_loading_cache() -> Arc<dyn trusted_server_core::platform::PlatformLoadingCache> {
+    Arc::new(trusted_server_core::platform::test_support::MemoryLoadingCache::default())
+}
+
+/// A loading cache module other than the probe's, so a build can link two.
+fn second_loading_cache_builder() -> IntegrationBuilder {
+    IntegrationBuilder::implementations(SECOND_LOADING_CACHE_ID, env!("CARGO_PKG_NAME"))
+        .with_loading_cache(memory_loading_cache)
+}
+
+/// `[cache.seam-probe-answers]` selects the loading cache the probe's answers
+/// are held in, the way `[cache.robots-txt]` selects core's. Left out, the
+/// cache takes the one loading cache module the build links, and keeps
+/// nothing when the build links none or several. A stock build links none,
+/// so the first two cases link a second module beside the probe's, and only
+/// the one whose table is read keeps values.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cache_the_probe_declares_is_selected_in_its_own_table() {
+    let named = settings_with(&format!(
+        r#"
+            [cache.seam-probe-answers]
+            module = "seam-probe"
+            {PROBE_BLOCK}
+        "#
+    ));
+    let two = [
+        seam_probe::builder(),
+        seam_probe::loading_cache_builder(),
+        second_loading_cache_builder(),
+    ];
+
+    let report = report_with(named, &two).await;
+    assert_eq!(
+        report["answers_cache_keeps_values"], true,
+        "the table should select the module it names: {report}"
+    );
+
+    let report = report_with(settings_with(PROBE_BLOCK), &two).await;
+    assert_eq!(
+        report["answers_cache_keeps_values"], false,
+        "with two loading cache modules linked and no table the cache should keep nothing: {report}"
+    );
+
+    let both = [seam_probe::builder(), seam_probe::loading_cache_builder()];
+    let report = report_with(settings_with(PROBE_BLOCK), &both).await;
+    assert_eq!(
+        report["answers_cache_keeps_values"], true,
+        "a declared cache with no table should take the one loading cache module linked: {report}"
+    );
+
+    let report = report_with(settings_with(PROBE_BLOCK), &[seam_probe::builder()]).await;
+    assert_eq!(
+        report["answers_cache_keeps_values"], false,
+        "with no loading cache module linked the cache should keep nothing: {report}"
+    );
+}
+
+/// A `[cache.<name>]` table naming a cache no linked module declares is
+/// refused by the deploy check and at startup with one message, naming the
+/// caches that could be written, so a misspelt name fails `ts config
+/// validate` and not the deployment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cache_table_no_module_declares_is_refused_by_the_deploy_check_and_at_startup() {
+    let settings = settings_with(&format!(
+        r#"
+            [cache.seam-probe-answres]
+            module = "seam-probe"
+            {PROBE_BLOCK}
+        "#
+    ));
+    let both = [seam_probe::builder(), seam_probe::loading_cache_builder()];
+
+    let deploy = validate_settings_for_deploy_with(&settings, &both)
+        .expect_err("the deploy check should refuse the misspelt table");
+    let startup = TrustedServerApp::routes_with_registrations(settings, &both)
+        .err()
+        .expect("startup should refuse the misspelt table");
+
+    // The message alone: the debug form carries a backtrace where the
+    // runner asks for one, and the two are raised on different stacks.
+    let message = format!("{deploy}");
+    assert!(
+        message.contains("[cache.seam-probe-answres]"),
+        "should name the table: {message}"
+    );
+    assert!(
+        message.contains("robots-txt, seam-probe-answers"),
+        "should list the caches this build declares: {message}"
+    );
+    assert_eq!(
+        message,
+        format!("{startup}"),
+        "the deploy check should refuse what startup refuses"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 4. A geo selector naming a module that supplies no module fails at startup
 // ---------------------------------------------------------------------------
 
