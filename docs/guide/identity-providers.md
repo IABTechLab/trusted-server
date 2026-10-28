@@ -135,13 +135,13 @@ fn response(
 
 Return `Rejected` (through `success_json` or `IdentityProviderError::rejected`) for a refusal and `Malformed` for a body you cannot parse. Both back the visitor off. Do not return an error for "this visitor is unknown": that is `Resolution::no_match()`.
 
-| Constructor                         | Meaning                                                             |
-| ----------------------------------- | ------------------------------------------------------------------- |
-| `Resolution::found(entries)`        | One or more `ResolvedEid` entries                                   |
-| `Resolution::no_match()`            | Nobody recognized. `with_retry_in` sets the wait (default 24 hours) |
-| `Resolution::invalidate(source)`    | The stored ID for `source` is no longer valid                       |
-| `found(..).also_invalidate(source)` | Return some sources and drop others in one response                 |
-| `Resolution::opted_out()`           | The visitor opted out with the vendor. Sticky until a re-grant      |
+| Constructor                         | Meaning                                                                                                                                                                                                  |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Resolution::found(entries)`        | One or more `ResolvedEid` entries                                                                                                                                                                        |
+| `Resolution::no_match()`            | Nobody recognized. `with_retry_in` sets the wait (default 24 hours)                                                                                                                                      |
+| `Resolution::invalidate(source)`    | The stored ID for `source` is no longer valid                                                                                                                                                            |
+| `found(..).also_invalidate(source)` | Return some sources and drop others in one response                                                                                                                                                      |
+| `Resolution::opted_out()`           | The visitor opted out with the vendor. Sticky until a re-grant: consent that was denied when the opt-out was recorded is granted again, the vendor issues again (capture-only), or an operator clears it |
 
 ## Complete provider EIDs
 

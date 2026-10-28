@@ -586,14 +586,16 @@ fn apply_removals(entry: &mut KvEntry, mutation: &IdentityMutation, context: &Ap
         }
     }
 
-    for (provider, change) in mutation.all_states() {
-        if let Some(opt_out) = &change.opt_out {
-            apply_opt_out(entry, provider, opt_out, context);
-        }
-    }
+    // A clear's watermark names an opt-out the clearing request read, so it
+    // applies before this mutation's own opt-outs, which it never saw.
     for (provider, change) in mutation.all_states() {
         if let Some(clear) = change.opt_out_clear {
             apply_clear(entry, provider, clear);
+        }
+    }
+    for (provider, change) in mutation.all_states() {
+        if let Some(opt_out) = &change.opt_out {
+            apply_opt_out(entry, provider, opt_out, context);
         }
     }
 }
@@ -612,7 +614,7 @@ fn apply_opt_out(
         .is_none_or(|existing| opt_out.at > existing.at);
     let not_cleared_later = live
         .and_then(|state| state.oc)
-        .is_none_or(|cleared| opt_out.at >= cleared);
+        .is_none_or(|cleared| opt_out.at > cleared);
     if !(newer && not_cleared_later) {
         return;
     }
@@ -637,12 +639,20 @@ fn apply_opt_out(
 
 // Temporary: first used by a later identity task.
 #[allow(dead_code)]
-fn apply_clear(entry: &mut KvEntry, provider: &IdentityProviderId, clear: u64) {
+/// Lifts the opt-out when `watermark`, the `at` of the newest opt-out the
+/// clearing request read, reaches it (spec 8). An opt-out the request never
+/// saw is newer than its watermark and stays.
+fn apply_clear(entry: &mut KvEntry, provider: &IdentityProviderId, watermark: u64) {
     let Some(state) = entry.ps.get_mut(provider.as_str()) else {
         return;
     };
-    if state.o.as_ref().is_some_and(|opt_out| clear > opt_out.at) {
-        state.oc = Some(clear);
+    let lifts = state
+        .o
+        .as_ref()
+        .is_some_and(|opt_out| opt_out.at <= watermark)
+        && state.oc.is_none_or(|cleared| cleared < watermark);
+    if lifts {
+        state.oc = Some(watermark);
         state.ov.clear();
     }
 }
@@ -653,7 +663,7 @@ pub(crate) fn is_opted_out(entry: &KvEntry, provider: &str) -> bool {
         .ps
         .get(provider)
         .and_then(|state| state.o.as_ref().map(|o| (o, state.oc)))
-        .is_some_and(|(opt_out, cleared)| cleared.is_none_or(|cleared| cleared <= opt_out.at))
+        .is_some_and(|(opt_out, cleared)| cleared.is_none_or(|cleared| cleared < opt_out.at))
 }
 
 // Temporary: first used by a later identity task.
@@ -1618,6 +1628,56 @@ mod tests {
     }
 
     #[test]
+    fn a_clear_lifts_only_the_opt_out_it_saw() {
+        let mut opted = KvEntry::minimal("b.example.com", "x", 1);
+        opted.ps.insert(
+            "owner".to_owned(),
+            KvProviderState {
+                o: Some(KvOptOut {
+                    at: 900,
+                    fp: "1".to_owned(),
+                }),
+                ov: vec![uid_hash("opted-out")],
+                ..KvProviderState::default()
+            },
+        );
+        let clear_up_to = |watermark: u64| {
+            let mut clear = IdentityMutation::default();
+            clear.merge_state(
+                pid("owner"),
+                ProviderStateChange {
+                    opt_out_clear: Some(watermark),
+                    ..ProviderStateChange::default()
+                },
+            );
+            run(&clear, &opted)
+        };
+
+        let seen = clear_up_to(900).expect("should apply");
+        assert_eq!(
+            seen.entry.ps["owner"].oc,
+            Some(900),
+            "should store the at of the opt-out the clear saw"
+        );
+        assert!(
+            !is_opted_out(&seen.entry, "owner"),
+            "should lift the opt-out it saw"
+        );
+        assert!(
+            clear_up_to(899).is_none_or(|applied| is_opted_out(&applied.entry, "owner")),
+            "should leave an opt-out newer than the one the clear saw"
+        );
+
+        let mut reopted = IdentityMutation::default();
+        reopted.merge_state(pid("owner"), opt_out(901));
+        let again = run(&reopted, &seen.entry).expect("should apply");
+        assert!(
+            is_opted_out(&again.entry, "owner"),
+            "should apply a later opt-out over the clear"
+        );
+    }
+
+    #[test]
     fn opt_out_and_clear_ordering() {
         let live = KvEntry::minimal("b.example.com", "x", 1);
         let mut same_second = IdentityMutation::default();
@@ -1673,7 +1733,7 @@ mod tests {
             },
         );
         let state = &run(&clear, &opted).expect("should apply").entry.ps["owner"];
-        assert_eq!(state.oc, Some(NOW), "should store a later clear");
+        assert_eq!(state.oc, Some(NOW), "should store the clear's watermark");
         assert!(state.ov.is_empty(), "should empty ov");
         assert_eq!(
             state.iv,

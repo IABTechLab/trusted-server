@@ -25,9 +25,9 @@ impl PolicySignals {
 }
 
 /// The highest TCF purpose the fingerprint has a bit for.
-const FP_PURPOSES: u8 = 10;
+pub(crate) const FP_PURPOSES: u8 = 10;
 /// Fingerprint bit of the vendor consent. Purposes 1 to 10 hold bits 0 to 9.
-const FP_VENDOR: u32 = 10;
+pub(crate) const FP_VENDOR: u32 = 10;
 /// Fingerprint bit of the US sale opt-out.
 pub(crate) const FP_US_SALE: u32 = 11;
 /// Fingerprint bit of Global Privacy Control.
@@ -38,6 +38,9 @@ const FP_DNT: u32 = 13;
 pub(crate) const FP_US_SHARING: u32 = 14;
 /// Fingerprint bit of the US targeted-advertising opt-out.
 pub(crate) const FP_US_TARGETED: u32 = 15;
+/// Fingerprint bit set when TCF applied and a TC string was decoded, so the
+/// purpose and vendor bits record a grant or a denial rather than nothing.
+pub(crate) const FP_TCF: u32 = 16;
 /// The US opt-out bits: sale, sharing, targeted advertising and GPC.
 pub(crate) const FP_US_OPT_OUT_MASK: u64 =
     (1 << FP_US_SALE) | (1 << FP_US_SHARING) | (1 << FP_US_TARGETED) | (1 << FP_GPC);
@@ -113,6 +116,7 @@ pub(crate) fn fingerprint_bits(
         if tcf_applies(consent)
             && let Some(tcf) = effective_tcf(consent)
         {
+            bits |= 1 << FP_TCF;
             for purpose in policy.tcf_purposes() {
                 if (1..=FP_PURPOSES).contains(purpose)
                     && tcf.has_purpose_consent(usize::from(*purpose))
@@ -747,8 +751,8 @@ mod tests {
         );
         assert_eq!(
             fingerprint(&strict, &first),
-            "9",
-            "should set bits 0 and 3 for purposes 1 and 4"
+            "10009",
+            "should set bits 0 and 3 for purposes 1 and 4, and bit 16 for the decoded TC string"
         );
         assert_ne!(
             fingerprint(&strict, &first),
@@ -757,8 +761,8 @@ mod tests {
         );
         assert_eq!(
             fingerprint(&strict, &without_purpose_four),
-            "1",
-            "should keep only bit 0 when purpose 4 is dropped"
+            "10001",
+            "should keep only bit 0 and the TCF bit when purpose 4 is dropped"
         );
     }
 
@@ -848,8 +852,8 @@ mod tests {
         consent.gpc = true;
         assert_eq!(
             fingerprint_bits(&policy, &consent, PolicySignals { dnt: true }),
-            "3e0b",
-            "should keep purposes 1, 2, 4 and 10 at bits 0, 1, 3 and 9, vendor 10, sale 11, GPC 12 and DNT 13"
+            "13e0b",
+            "should keep purposes 1, 2, 4 and 10 at bits 0, 1, 3 and 9, vendor 10, sale 11, GPC 12, DNT 13 and TCF 16"
         );
     }
 }

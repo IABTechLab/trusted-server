@@ -1686,7 +1686,8 @@ matching the request:
 - **A clear** needs a positive result under the request's consent:
   eligibility steps 1 to 3 pass, and the provider has a sticky `ps.o` that
   only a capture can clear (a capture-only provider without a GVL ID,
-  section 8). The same capture removal write stores it as `ps.oc = now`.
+  section 8). The same capture removal write stores it as `ps.oc`, set to
+  the `at` of the opt-out this request read (its watermark, section 8).
 - **The real-browser gate applies to clears only.** Removals, opt-outs and
   global revokes apply whatever the client, as consent withdrawals do: the
   bot gate keeps the write path for revocations so tombstones stay
@@ -2060,16 +2061,20 @@ Applying the mutation to a live entry, in order:
    hash of every UID of the live record it removes, so the hashes always
    come from the record KV held. One that no longer
    applies adds none: the record it named is gone or was replaced.
-   An opt-out applies when its `at` is after the live `ps.o.at` and at or
-   after the live `ps.oc`, so an opt-out and a clear in the same second
-   leave the provider opted out. Then apply a clear (section 4.7) when it
-   is strictly later than the provider's live opt-out `at`, and store it as
-   the live `ps.oc`, so the next step sees the provider as not opted out. A
-   clear that applies also empties the provider's `ps.ov`, so the IDs its
-   opt-out removed can come back through the browser path. `ps.iv` is never
-   emptied: an invalidation is about the ID, not about consent.
-   A clear that is not later is dropped. A clear with no live opt-out to
-   clear is dropped too and writes nothing.
+   A clear carries a watermark: the `at` of the opt-out the clearing
+   request read (section 8). Apply clears first: a clear applies when the
+   live `ps.o.at` is at or before its watermark and the live `ps.oc` is
+   before it, and stores the watermark as `ps.oc`, so the next step sees the
+   provider as not opted out. A provider is opted out while `ps.oc` is
+   absent or before `ps.o.at`. Then apply opt-outs: one applies when its
+   `at` is after the live `ps.o.at` and after the live `ps.oc`. An opt-out
+   the clearing request never saw is newer than the watermark, so it stays,
+   and an opt-out in the same mutation as a clear still wins. A clear that
+   applies also empties the provider's `ps.ov`, so the IDs its opt-out
+   removed can come back through the browser path. `ps.iv` is never
+   emptied: an invalidation is about the ID, not about consent. A clear
+   whose watermark is before the live opt-out, or with no live opt-out to
+   clear, is dropped and writes nothing.
 3. Apply the positive changes by their own rules. Every change written by
    a provider the live `ps.o` marks opted out is skipped, `OwnerWrite` and
    `FillMissing` alike. A `FillMissing` any of whose UIDs matches the live
@@ -2302,7 +2307,7 @@ literals move to them. `PartnerIdUpdate` (`ec/kv.rs:75-90`) gains
 | `ps.n`  | Unix seconds before which the provider must not be called                                                                                   |
 | `ps.f`  | Consecutive failures, for backoff                                                                                                           |
 | `ps.o`  | Sticky opt-out: `{at, fp}`, when it was reported and the consent bits the provider's policy read then (section 8)                           |
-| `ps.oc` | When the provider's opt-out was last cleared. An opt-out reported before it is stale and never re-applied                                   |
+| `ps.oc` | The watermark of the last clear: the `at` of the newest opt-out it lifted. An opt-out at or before it is cleared and never re-applied       |
 | `ps.iv` | Hashes of UIDs the owner invalidated, oldest first, at most 128, so they are not re-seeded (section 7.2)                                    |
 | `ps.ov` | Hashes of UIDs the provider's opt-out removed, oldest first, at most 128. Emptied when the opt-out clears (section 8)                       |
 | `ps.st` | The provider's private state, as embedded JSON (a raw value, not an escaped string) of at most 1,024 bytes. KV only                         |
@@ -2724,8 +2729,15 @@ is set no record that provider wrote is served, and the browser's values it
 denies are dropped (section 7.1). It is cleared only by an affirmative
 re-grant for this provider, and clearing it empties `ps.ov` (section 5.4):
 
-- **A provider with a GVL ID:** a TC string whose `LastUpdated` is after `at`
-  and that grants the provider's vendor and purposes.
+- **A provider with a GVL ID:** `fp` at `at` records a decoded TC string
+  that denied the provider's vendor or a purpose its policy requires, and
+  the current TC string grants the vendor and every required purpose. Only
+  that denied-to-granted transition clears. TCF `Created` and `LastUpdated`
+  are day-level and set by the client, so neither is compared with `at`: a
+  same-day re-grant clears, and a later CMP re-save under signals that
+  already granted the vendor does not. A vendor-reported opt-out recorded
+  under full TCF consent is cleared only by the vendor issuing again, for a
+  capture-only provider, or by an operator.
 - **Any provider, under GPP:** the applicable US section showing no sale,
   sharing or targeted-advertising opt-out for the signals the provider's
   policy reads, where `fp` at `at` recorded one. GPP carries no creation
@@ -2736,14 +2748,21 @@ re-grant for this provider, and clearing it empties `ps.ov` (section 5.4):
 - **A capture-only provider without a GVL ID, such as Lockr:** a later 2xx
   capture that returns IDs, under the request's consent. That is the
   vendor issuing again after the visitor re-consented through it. The
-  capture removal write stores the clear as `ps.oc = now` on that request,
+  capture removal write stores the clear on that request, with the `at` of
+  the opt-out the request read as its watermark,
   under the ordering of section 5.4 (section 5.3). The captured IDs
   themselves are not stored; once the clear is in KV, the browser path
   carries them through browser ingest.
 - **An operator,** through the admin endpoints.
 
 A change of jurisdiction, a newly present GPP string, or a privacy signal the
-provider relaxes never clears it. A clear is written to KV as `ps.oc`. A
+provider relaxes never clears it. A clear is written to KV as `ps.oc`, its
+**watermark**: the `at` of the opt-out the clearing request read, not the
+time it ran. A slow request that left before a revoke, or a writer whose
+phase-1 read predates a revoke staged by another request, therefore names an
+older opt-out and cannot dismiss the newer one (section 5.4, step 3). The
+operator's clear uses the time it runs, so it lifts every opt-out up to
+then. A
 consent withdrawal's
 tombstone removes everything, provider opt-outs included: after it, the
 visitor starts again with a new EC.
@@ -2761,7 +2780,9 @@ provider-scoped.
 The **consent fingerprint** `fp` is a bitmask, written as hex, of the
 consent signals the provider's policy reads:
 
-- its TCF purpose bits and vendor bit
+- its TCF purpose bits and vendor bit, set when granted, and a TCF bit
+  (bit 16) set when TCF applied and a TC string was decoded, so an unset
+  purpose or vendor bit records a denial only when the TCF bit is set
 - the US sale, sharing and targeted-advertising opt-outs it does not relax
 - GPC and DNT, unless relaxed
 
@@ -4531,18 +4552,19 @@ Decisions made while writing this spec, with the user:
 Revision 15 applies these decisions, made by the user after the round 14
 review, which allowed breaking changes:
 
-| Decision             | Choice                                                                                                                                                                                                                      |
-| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Stager providers     | None. Resolving providers run only on writer navigations, so every outcome, backoff included, is stored. Stagers serve KV                                                                                                   |
-| Removals             | Written to KV on the request that carries them. `ts-eids-r`, its keyring and secrets, the overflow write and the strips-only rollout step are removed                                                                       |
-| Non-browser removals | Applied, as consent withdrawals are; only clears need a real browser. Changed after the round 14 review from dropping them                                                                                                  |
-| Expiry scope         | G7 covers owned expiring sources. A stateless owner keeps its expired record as a refresh anchor until `exp` plus its declared refresh grace. Unowned IDs keep no lifetime (section 2.3). Changed after the round 14 review |
-| Capture              | Revoke-only: removals, opt-out and clear. Positive IDs are counted, never stored. `capture_enabled` and request-body consent are removed                                                                                    |
-| Capture-only opt-out | Also removes the records of its sources that no provider wrote, and blocks the browser's values for them. A capture-only provider cannot own a source and must list its `sources`                                           |
-| Provider denials     | A provider's `ps.iv` and `ps.ov` filter browser candidates for unowned sources too. An opt-out's removals go to `ps.ov`, which its clear empties                                                                            |
-| Mirror feedback      | The shim never copies `ts-eids-s` into `ts-eids` or the `/auction` body                                                                                                                                                     |
-| Dry run              | Removed, with `is_dry_run`                                                                                                                                                                                                  |
-| KV schema            | Version 2 with one record shape. Version 1 rows are read and upgraded on write. Rollback past rollout step 1 is unsupported                                                                                                 |
-| Stored hashes        | `ps.iv` hashes are unkeyed and the consent fingerprint is a plain bitmask, because the row already holds the raw values. No legacy revision hash                                                                            |
-| Pull sync            | The pull-complete marker and the legacy pull sync config keys are removed                                                                                                                                                   |
-| Withdrawal retry     | A tombstone that fails before send gets one more attempt after send                                                                                                                                                         |
+| Decision             | Choice                                                                                                                                                                                                                                             |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Stager providers     | None. Resolving providers run only on writer navigations, so every outcome, backoff included, is stored. Stagers serve KV                                                                                                                          |
+| Removals             | Written to KV on the request that carries them. `ts-eids-r`, its keyring and secrets, the overflow write and the strips-only rollout step are removed                                                                                              |
+| Non-browser removals | Applied, as consent withdrawals are; only clears need a real browser. Changed after the round 14 review from dropping them                                                                                                                         |
+| Expiry scope         | G7 covers owned expiring sources. A stateless owner keeps its expired record as a refresh anchor until `exp` plus its declared refresh grace. Unowned IDs keep no lifetime (section 2.3). Changed after the round 14 review                        |
+| Opt-out clears       | A TCF re-grant clears only a denial `fp` recorded (new TCF bit 16), with no `LastUpdated` comparison. A clear stores a watermark, the `at` of the opt-out it read, as `ps.oc`, and clears apply before opt-outs. Changed after the round 14 review |
+| Capture              | Revoke-only: removals, opt-out and clear. Positive IDs are counted, never stored. `capture_enabled` and request-body consent are removed                                                                                                           |
+| Capture-only opt-out | Also removes the records of its sources that no provider wrote, and blocks the browser's values for them. A capture-only provider cannot own a source and must list its `sources`                                                                  |
+| Provider denials     | A provider's `ps.iv` and `ps.ov` filter browser candidates for unowned sources too. An opt-out's removals go to `ps.ov`, which its clear empties                                                                                                   |
+| Mirror feedback      | The shim never copies `ts-eids-s` into `ts-eids` or the `/auction` body                                                                                                                                                                            |
+| Dry run              | Removed, with `is_dry_run`                                                                                                                                                                                                                         |
+| KV schema            | Version 2 with one record shape. Version 1 rows are read and upgraded on write. Rollback past rollout step 1 is unsupported                                                                                                                        |
+| Stored hashes        | `ps.iv` hashes are unkeyed and the consent fingerprint is a plain bitmask, because the row already holds the raw values. No legacy revision hash                                                                                                   |
+| Pull sync            | The pull-complete marker and the legacy pull sync config keys are removed                                                                                                                                                                          |
+| Withdrawal retry     | A tombstone that fails before send gets one more attempt after send                                                                                                                                                                                |

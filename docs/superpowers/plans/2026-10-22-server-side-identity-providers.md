@@ -9498,7 +9498,8 @@ git commit --signoff -S -m "Add a per-provider circuit breaker on transport fail
 - Consumes: Task 28's `ServerSet`, `Denials` and `filter_browser_candidates`, which already drop denied browser UIDs and every source of an opted-out owner or capture-only provider; Task 34's `fingerprint_bits` and `FP_US_OPT_OUT_MASK`; Task 15's `opt_out_clear`, which also empties `ps.ov`
 - Produces:
   - `pub(crate) fn regrant_clears_opt_out(descriptor: &ProviderDescriptor, opt_out: &KvOptOut, consent: &ConsentContext, signals: PolicySignals) -> bool` (spec 8):
-    - **GVL vendor:** a TC string whose `LastUpdated` is after `o.at` and that grants the vendor and purposes.
+    - **GVL vendor:** `o.fp` has the TCF bit (`FP_TCF`, bit 16) and lacks the vendor bit or a required purpose bit, and the current TC string grants the vendor and every required purpose. No `LastUpdated` comparison (revised after the round 14 review; test `tcf_regrant_clears_only_a_denial_the_opt_out_recorded`).
+    - **Watermark:** `opt_out_clears` returns `(provider, o.at)` for the opt-out the request read, and the clear stores that `at` as `oc`, not `now`. `apply_clear` lifts the opt-out when `o.at <= watermark` and `oc < watermark`; `is_opted_out` holds while `oc` is absent or `< o.at`; an opt-out applies when `at > oc`. Clears apply before opt-outs in `apply_state`. Tests: `opt_out_clears_carry_the_opt_out_they_saw`, `a_clear_lifts_only_the_opt_out_it_saw`, `a_clear_watermark_lifts_the_opt_out_it_saw`.
     - **Any provider, under GPP:** parse `o.fp` as a `u64` (Task 6 validates it as hex). Clear when `fp & FP_US_OPT_OUT_MASK` is not 0 and the current `fingerprint_bits` has none of the US opt-out bits `fp` recorded set: `current & fp & FP_US_OPT_OUT_MASK == 0`. Other bits may differ; the spec clears "whatever else changed" (spec 13).
     - A jurisdiction change, a newly present GPP string, or a relaxed signal never clears. A `fp` that does not parse never clears.
   - When it clears, the writer adds `opt_out_clear = Some(now)` to that provider's `ProviderStateChange`. Clears are writer-only on the resolve path, so they ride the one flush; Task 38 adds the capture-only clear through the capture removal write.
@@ -9632,7 +9633,7 @@ Using `capture_registration` and `ExampleCaptureProvider` (Task 32), and `KvIden
 - `capture_removal_write_skips_a_tombstone_a_missing_row_and_an_applied_removal` (0 writes each)
 - `capture_opt_out_removes_every_record_the_provider_wrote`
 - `capture_only_opt_out_also_removes_browser_records_of_its_sources`
-- `capture_only_provider_clears_its_opt_out_on_a_consenting_positive_result`: a later 2xx capture with IDs writes `ps.oc = now` and no ID. Two controls: the same capture under denied consent writes no clear, and a provider with a GVL ID never clears by capture.
+- `capture_only_provider_clears_its_opt_out_on_a_consenting_positive_result`: a later 2xx capture with IDs writes `ps.oc` set to the `at` of the opt-out it read (its watermark) and no ID. Two controls: the same capture under denied consent writes no clear, and a provider with a GVL ID never clears by capture.
 - `capture_global_revoke_from_a_real_browser_tombstones_the_row_and_clears_the_ec_cookie`: `revoke_scope = "global"`. Exactly one tombstone write and the EC cookie's expiry header. The control with `"provider"` removes only that provider's records and keeps the row live.
 - `capture_from_a_non_browser_applies_its_removals_and_opt_out`: a client that fails the check has its invalidation and opt-out written, and a `"global"` revoke requests the tombstone.
 - `capture_from_a_non_browser_never_clears_an_opt_out`: a positive result from such a client writes nothing and still counts the ID in `capture_unpersisted`.

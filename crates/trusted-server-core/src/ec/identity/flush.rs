@@ -201,11 +201,11 @@ pub fn run_after_send(input: AfterSendInput<'_>) -> FlushOutcome {
         ));
     }
 
-    for provider in regranted {
+    for (provider, watermark) in regranted {
         mutation.merge_state(
             provider,
             ProviderStateChange {
-                opt_out_clear: Some(now),
+                opt_out_clear: Some(watermark),
                 ..ProviderStateChange::default()
             },
         );
@@ -1416,9 +1416,10 @@ mod tests {
             .ps
             .get(PULL_ID)
             .expect("should keep the provider state");
-        assert!(
-            state.oc.is_some_and(|clear| clear > 1_000),
-            "should store the clear as oc"
+        assert_eq!(
+            state.oc,
+            Some(1_000),
+            "should store the clear with the opt-out it read as its watermark"
         );
         assert!(state.ov.is_empty(), "should empty ps.ov");
         assert!(

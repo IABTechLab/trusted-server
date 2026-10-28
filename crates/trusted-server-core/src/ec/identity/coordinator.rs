@@ -24,7 +24,10 @@ use super::mutation::{
     ApplyContext, IdentityMutation, PartnerIdChange, ProviderResult, ProviderStateChange,
     StateUpdate, apply,
 };
-use super::policy::{FP_US_OPT_OUT_MASK, PolicySignals, fingerprint_bits, policy_allows};
+use super::policy::{
+    FP_PURPOSES, FP_TCF, FP_US_OPT_OUT_MASK, FP_VENDOR, PolicySignals, fingerprint_bits,
+    policy_allows,
+};
 use super::provider::IdentityProvider;
 use super::removal::{RemovalTiming, RemovalWriteOutcome, write_removals_counted};
 use super::resolution::{
@@ -43,8 +46,6 @@ use crate::platform::{
 use crate::settings::{IdentitySettings, ProviderMode, ProviderSettings, RevokeScope, Settings};
 use crate::streaming_processor::{BodyStreamDecoder, Compression};
 
-/// Deciseconds in a second: `LastUpdated` of a TC string counts deciseconds.
-const DECISECONDS_PER_SECOND: u64 = 10;
 /// How long a burst-capped provider waits: one limiter window.
 const BURST_WAIT_SECS: u64 = 60;
 /// The wait after a `no_match` that gives no `retry_in`.
@@ -177,13 +178,13 @@ impl EligibilityView {
             .is_some_and(|view| view.iv.iter().any(|known| known == hash))
     }
 
-    /// Whether `o` is set and `oc` is not strictly later than `o.at`.
+    /// Whether `o` is set and no clear's watermark `oc` reaches `o.at`.
     #[must_use]
     pub(crate) fn is_opted_out(&self, provider: &IdentityProviderId) -> bool {
         self.providers.get(provider).is_some_and(|view| {
             view.o
                 .as_ref()
-                .is_some_and(|opt_out| view.oc.is_none_or(|clear| clear <= opt_out.at))
+                .is_some_and(|opt_out| view.oc.is_none_or(|clear| clear < opt_out.at))
         })
     }
 
@@ -1541,10 +1542,14 @@ async fn drain_batch(
 }
 
 /// Whether the visitor's consent now re-grants `descriptor`'s provider after
-/// the sticky opt-out `opt_out` (spec 8).
+/// the sticky opt-out `opt_out` (spec 8). Each rule needs a denial the
+/// opt-out's `fp` recorded to turn into a grant, so a CMP re-save that was
+/// already granting never clears a vendor-reported opt-out.
 ///
-/// - A provider with a GVL ID: a TC string whose `LastUpdated` is after
-///   `opt_out.at` and that grants the vendor and every purpose.
+/// - A provider with a GVL ID: `fp` records a decoded TC string that denied
+///   the vendor or a required purpose, and the current TC string grants the
+///   vendor and every required purpose. TCF timestamps are day-level, so
+///   `LastUpdated` is not compared.
 /// - Any provider, under a GPP string with a readable US section: `fp` records
 ///   at least one US opt-out bit and the current fingerprint holds none of
 ///   the US opt-out bits `fp` recorded. Other bits may differ.
@@ -1562,8 +1567,9 @@ pub(crate) fn regrant_clears_opt_out(
         || gpp_regrants(descriptor, opt_out, consent, signals)
 }
 
-/// Whether a TC string newer than the opt-out grants the provider's GVL
-/// vendor and every purpose its policy requires.
+/// Whether the opt-out's `fp` recorded a TCF denial of the provider's GVL
+/// vendor or a purpose its policy requires, and the current TC string grants
+/// them all.
 fn tcf_regrants(
     descriptor: &ProviderDescriptor,
     opt_out: &KvOptOut,
@@ -1573,7 +1579,18 @@ fn tcf_regrants(
     let (Some(vendor), Some(tcf)) = (policy.tcf_vendor(), effective_tcf(consent)) else {
         return false;
     };
-    tcf.last_updated_ds / DECISECONDS_PER_SECOND > opt_out.at
+    let Ok(recorded) = u64::from_str_radix(&opt_out.fp, 16) else {
+        return false;
+    };
+    let required = policy
+        .tcf_purposes()
+        .iter()
+        .filter(|purpose| (1..=FP_PURPOSES).contains(*purpose))
+        .fold(1_u64 << FP_VENDOR, |mask, purpose| {
+            mask | 1 << (purpose - 1)
+        });
+    let recorded_denial = recorded & (1 << FP_TCF) != 0 && recorded & required != required;
+    recorded_denial
         && tcf.has_vendor_consent(vendor)
         && policy
             .tcf_purposes()
@@ -1616,14 +1633,15 @@ fn gpp_regrants(
 }
 
 /// The providers whose sticky opt-out the request's consent re-grants, each
-/// to be cleared at `now`.
+/// with its clear's watermark: the `at` of the opt-out the request read
+/// (spec 8). An opt-out written after that read is newer and stays.
 #[must_use]
 pub(crate) fn opt_out_clears(
     view: &EligibilityView,
     catalog: &ProviderCatalog,
     consent: &ConsentContext,
     signals: PolicySignals,
-) -> Vec<IdentityProviderId> {
+) -> Vec<(IdentityProviderId, u64)> {
     catalog
         .providers()
         .filter_map(|provider| {
@@ -1632,7 +1650,7 @@ pub(crate) fn opt_out_clears(
             let opt_out = state.o.as_ref()?;
             (view.is_opted_out(descriptor.id())
                 && regrant_clears_opt_out(descriptor, opt_out, consent, signals))
-            .then(|| descriptor.id().clone())
+            .then(|| (descriptor.id().clone(), opt_out.at))
         })
         .collect()
 }
@@ -1983,7 +2001,12 @@ fn capture_ask(
         && view.is_opted_out(id)
         && passes_consent_steps(descriptor, context, now.as_secs())
     {
-        ask.state.opt_out_clear = Some(now.as_secs());
+        // Clear only the opt-out this request read (spec 8).
+        ask.state.opt_out_clear = view
+            .providers
+            .get(id)
+            .and_then(|state| state.o.as_ref())
+            .map(|opt_out| opt_out.at);
     }
     ask
 }
@@ -2850,7 +2873,7 @@ mod tests {
     }
 
     #[test]
-    fn a_later_clear_lifts_the_opt_out() {
+    fn a_clear_watermark_lifts_the_opt_out_it_saw() {
         let mut view = EligibilityView::empty();
         view.set_opt_out_for_test("p", 500, Some(600));
         assert!(
@@ -2860,8 +2883,8 @@ mod tests {
 
         view.set_opt_out_for_test("p", 500, Some(500));
         assert!(
-            view.is_opted_out(&pid("p")),
-            "should keep the opt-out when oc is not strictly later"
+            !view.is_opted_out(&pid("p")),
+            "should lift the opt-out when oc names it as the opt-out the clear saw"
         );
 
         view.set_opt_out_for_test("p", 500, Some(400));
@@ -2928,12 +2951,12 @@ mod tests {
         };
 
         // Purposes 1, 2, 4 and 10 are read and granted: bits 0, 1, 3, 9.
-        // Vendor 5 is granted: bit 10.
+        // Vendor 5 is granted: bit 10. A TC string was decoded: bit 16.
         let control = bits(&gdpr, signals);
         assert_eq!(
             control,
-            (1 << 0) | (1 << 1) | (1 << 3) | (1 << 9) | (1 << 10),
-            "should set one bit per granted purpose and the vendor bit"
+            (1 << 0) | (1 << 1) | (1 << 3) | (1 << 9) | (1 << 10) | (1 << 16),
+            "should set one bit per granted purpose, the vendor bit and the TCF bit"
         );
 
         let mut without_purpose_two = gdpr.clone();
@@ -5038,30 +5061,81 @@ mod tests {
     }
 
     #[test]
-    fn tcf_regrant_after_opt_out_clears_it() {
+    fn tcf_regrant_clears_only_a_denial_the_opt_out_recorded() {
         let descriptor = regrant_descriptor(ConsentPolicy::strict().with_tcf_vendor(5));
-        let opt_out = stored_opt_out(1_000, "0");
-        let regranted = |last_updated_ds: u64, vendor: u16| {
-            let mut consent = test_consent_gdpr_without_vendor(vendor);
+        let signals = PolicySignals::default();
+        // `test_consent_gdpr_without_vendor(v)` grants every purpose and every
+        // vendor but `v`, so 99 grants vendor 5 and 5 denies it.
+        let tcf_with = |denied_vendor: u16, last_updated_ds: u64| {
+            let mut consent = test_consent_gdpr_without_vendor(denied_vendor);
             consent
                 .tcf
                 .as_mut()
                 .expect("should carry a TC string")
                 .last_updated_ds = last_updated_ds;
-            regrant_clears_opt_out(&descriptor, &opt_out, &consent, PolicySignals::default())
+            consent
         };
+        let recorded_under = |consent: &ConsentContext| {
+            stored_opt_out(
+                1_000,
+                &fingerprint_bits(descriptor.consent_policy(), consent, signals),
+            )
+        };
+        let denied = recorded_under(&tcf_with(5, 0));
+        let granted = recorded_under(&tcf_with(99, 0));
 
         assert!(
-            regranted(10_010, 99),
-            "should clear on a newer TC string that grants the vendor and purposes"
+            regrant_clears_opt_out(&descriptor, &denied, &tcf_with(99, 0), signals),
+            "should clear when the vendor goes from denied to granted, even on a day-level LastUpdated before the opt-out"
         );
         assert!(
-            !regranted(10_000, 99),
-            "control: a TC string not after the opt-out should not clear"
+            !regrant_clears_opt_out(&descriptor, &denied, &tcf_with(5, 20_000), signals),
+            "should not clear while the vendor stays denied"
         );
         assert!(
-            !regranted(10_010, 5),
-            "control: a newer TC string without the vendor should not clear"
+            !regrant_clears_opt_out(&descriptor, &granted, &tcf_with(99, 20_000), signals),
+            "should not clear a vendor-reported opt-out on a later CMP re-save that was already granting"
+        );
+        assert!(
+            !regrant_clears_opt_out(
+                &descriptor,
+                &stored_opt_out(1_000, "0"),
+                &tcf_with(99, 20_000),
+                signals
+            ),
+            "should not clear an opt-out recorded where TCF did not apply"
+        );
+    }
+
+    #[test]
+    fn opt_out_clears_carry_the_opt_out_they_saw() {
+        let catalog = ProviderCatalog::new(
+            vec![custom_provider(
+                "regrant",
+                &["a.example.com"],
+                Resolves::new(),
+                ConsentPolicy::strict(),
+            )],
+            BTreeMap::new(),
+        );
+        let mut view = EligibilityView::empty();
+        let sale = gpp_consent(Some(true), None);
+        let fp = fingerprint_bits(&ConsentPolicy::strict(), &sale, PolicySignals::default());
+        view.set_opt_out_for_test("regrant", 700, None);
+        view.providers
+            .get_mut(&pid("regrant"))
+            .expect("should hold the provider")
+            .o = Some(stored_opt_out(700, &fp));
+
+        assert_eq!(
+            opt_out_clears(
+                &view,
+                &catalog,
+                &gpp_consent(Some(false), None),
+                PolicySignals::default()
+            ),
+            vec![(pid("regrant"), 700)],
+            "should clear up to the opt-out the request read, not to its own time"
         );
     }
 
@@ -6044,9 +6118,10 @@ mod tests {
             let mut fixture = CaptureFixture::new(vec![lockr()], Some(&seeded));
             fixture.capture(&lockr_path(), &positive);
             let row = fixture.row();
-            assert!(
-                row.ps["lockr"].oc.is_some_and(|clear| clear > 100),
-                "should store the clear"
+            assert_eq!(
+                row.ps["lockr"].oc,
+                Some(100),
+                "should store the clear with the opt-out it saw as its watermark"
             );
             assert!(row.ids.is_empty(), "should store no ID");
             assert_eq!(fixture.store.writes().total(), 1, "should write once");
