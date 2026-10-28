@@ -25,8 +25,13 @@ Trusted Server uses a two-phase pipeline:
 
 ## Where This Runs
 
-- HTML responses: streaming rewrite with optional post-processing.
-- RSC Flight responses (`text/x-component`): direct Flight parsing and rewrite.
+- HTML responses: streaming rewrite with optional post-processing, by the
+  middleware `framework.nextjs` where a `[[fetch]]` entry for `text/html`
+  names it.
+- RSC Flight responses (`text/x-component`): direct Flight parsing and
+  rewrite, by the middleware `framework.nextjs.flight` where a `[[fetch]]`
+  entry for `text/x-component` names it. Without the entry a Flight response
+  passes through as the origin sent it.
 
 ## Internals
 
@@ -178,7 +183,7 @@ The rewrite logic handles multiple URL formats in RSC content:
 The current implementation lives in:
 
 - `crates/framework/nextjs/src/rsc.rs`
-- `crates/trusted-server-core/src/rsc_flight.rs`
+- `crates/framework/nextjs/src/flight.rs`
 
 ## Related Docs
 

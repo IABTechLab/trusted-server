@@ -35,15 +35,24 @@ max_combined_payload_bytes = 10485760
 ```
 
 What the integration changes in a page is the middleware `framework.nextjs`, which runs
-on the pages a `[[fetch]]` entry names it for:
+on the pages a `[[fetch]]` entry names it for. A navigation in the App Router
+is answered with a React Server Components Flight response, `text/x-component`,
+and what the integration changes in one is the middleware
+`framework.nextjs.flight`, which runs on the responses a `[[fetch]]` entry for
+that media type names it for:
 
 ```toml
 [[fetch]]
 media_type = "text/html"
 middleware = ["framework.nextjs"]
+
+[[fetch]]
+media_type = "text/x-component"
+middleware = ["framework.nextjs.flight"]
 ```
 
-See [Placing page changes](/guide/configuration#placing-page-changes).
+Without the second entry a Flight response passes through as the origin sent
+it. See [Placing page changes](/guide/configuration#placing-page-changes).
 
 ### Configuration Options
 
@@ -107,6 +116,7 @@ The Next.js integration is implemented across multiple files:
 
 - [crates/framework/nextjs/src/lib.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/framework/nextjs/src/lib.rs) - Main integration
 - [crates/framework/nextjs/src/rsc.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/framework/nextjs/src/rsc.rs) - RSC parsing
+- [crates/framework/nextjs/src/flight.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/framework/nextjs/src/flight.rs) - The Flight response middleware
 - [crates/framework/nextjs/src/script_rewriter.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/framework/nextjs/src/script_rewriter.rs) - Script rewriting
 
 ### Key Components

@@ -2354,25 +2354,28 @@ do. An entry carries none and switches nothing on.
 
 ### Entries for a media type other than HTML
 
-An entry covers `text/html`, another `text/` type other than
-`text/x-component`, `application/javascript` or `application/json`, written
-as a bare `type/subtype` in lower case with no parameters. A response is
-matched by the type and subtype of its `Content-Type`, without the
-parameters, so `text/plain; charset=utf-8` takes the entry for
-`text/plain`. Anything else, an image or a length prefixed stream among
-them, passes through untouched and no entry can cover it. So does a
-response that declares a charset other than UTF-8 or whose status is not
-`200`, such as a partial `206` or an error page.
+An entry covers `text/html`, another `text/` type, `application/javascript`
+or `application/json`, written as a bare `type/subtype` in lower case with
+no parameters. A response is matched by the type and subtype of its
+`Content-Type`, without the parameters, so `text/plain; charset=utf-8` takes
+the entry for `text/plain`. Anything else, an image among them, passes
+through untouched and no entry can cover it. So does a response that
+declares a charset other than UTF-8 or whose status is not `200`, such as a
+partial `206` or an error page.
 
 A middleware says which media types it works on, HTML alone unless it says
 otherwise, and an entry naming one under a media type it does not handle is
 refused when the registry is built, with the entry and the middleware named.
 On a media type other than HTML a middleware changes the body as a stream,
 after core has moved the origin's addresses in it, in the order the entry
-names them. Head markup and the element and text handlers are decisions
-about HTML, and a middleware that makes one there is refused by name. The
-template cache stores HTML alone, so the fetch entry's middleware and then
-the serve entry's run on each response as it is fetched. A response an entry
+names them. A middleware may say that it moves the origin's addresses
+itself, for a format whose rows count their bytes, and core then leaves the
+addresses in a body of that media type to it whether or not an entry names
+it, so with no entry such a body passes through as the origin sent it. Head
+markup and the element and text handlers are decisions about HTML, and a
+middleware that makes one there is refused by name. The template cache
+stores HTML alone, so the fetch entry's middleware and then the serve
+entry's run on each response as it is fetched. A response an entry
 covers loses the origin's `ETag` and `Last-Modified`, because a middleware
 may change its body, and when a module left state on the request, one a
 `[[serve]]` entry covers is sent `private, no-store`, as a page is.
@@ -2410,6 +2413,7 @@ generated configuration places it in.
 | `js_asset_proxy`              | `[[fetch]]` | Points each configured script at its first-party path and removes one that is blocked. It is asked about an address as the middleware named before it left it, so name it ahead of one that moves the same script                                                                                                                                                 |
 | `testing.testlight`           | `[[fetch]]` | Points a `src` or `href` that names `testlight.js` at the shim, when `rewrite_scripts` is set                                                                                                                                                                                                                                                                     |
 | `framework.nextjs`            | `[[fetch]]` | Moves the origin's address to the publisher's in the data Next.js writes into a page, being the `__NEXT_DATA__` script and the React Server Components payload scripts                                                                                                                                                                                            |
+| `framework.nextjs.flight`     | `[[fetch]]` | Moves the origin's address to the publisher's in a React Server Components Flight response and writes each length prefixed row's length again, on `text/x-component` alone. It moves the addresses itself, so core leaves a Flight response as sent where no entry names it                                                                                       |
 | `audience.permutive`          | `[[fetch]]` | Points a `src` or `href` that is the Permutive SDK's address at `/integrations/permutive/sdk`, when `rewrite_sdk` is set                                                                                                                                                                                                                                          |
 | `identity.lockr`              | `[[fetch]]` | Points a `src` or `href` that is the lockr SDK's address at `/integrations/lockr/sdk`, when `rewrite_sdk` is set                                                                                                                                                                                                                                                  |
 | `cmp.didomi`                  | `[[fetch]]` | Writes `window.__tsjs_didomi` into the head, which hands the browser module the path Didomi is served under                                                                                                                                                                                                                                                       |

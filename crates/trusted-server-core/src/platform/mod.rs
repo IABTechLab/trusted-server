@@ -27,7 +27,7 @@
 //! any content-rewriting implementation:
 //!
 //! - **Content rewriting** — `html_processor`, `streaming_processor`,
-//!   `streaming_replacer`, and `rsc_flight` modules use only standard Rust
+//!   and `streaming_replacer` modules use only standard Rust
 //!   (`std::io::Read`/`Write`, `lol_html`, `flate2`, `brotli`). The pipeline
 //!   is accessed via [`StreamingPipeline::process`](crate::streaming_processor::StreamingPipeline::process) which
 //!   accepts any reader that implements `std::io::Read`.

@@ -63,12 +63,11 @@ pub const HTML_MEDIA_TYPE: &str = "text/html";
 /// bare `type/subtype` in lower case.
 ///
 /// HTML and the text assets that stream through core as text: every `text/`
-/// type except `text/x-component`, and JavaScript and JSON.
+/// type, and JavaScript and JSON.
 #[must_use]
 pub fn is_dispatched_media_type(media_type: &str) -> bool {
-    media_type != "text/x-component"
-        && (media_type.starts_with("text/")
-            || matches!(media_type, "application/javascript" | "application/json"))
+    media_type.starts_with("text/")
+        || matches!(media_type, "application/javascript" | "application/json")
 }
 
 /// The type and subtype of a content type header, in lower case and without
@@ -557,6 +556,16 @@ pub trait Middleware: Send + Sync {
         false
     }
 
+    /// Whether this middleware moves the origin's address to the reader's
+    /// host itself, in a body of a media type it handles other than HTML.
+    /// Core then leaves the addresses in such a body alone, whether or not
+    /// an entry names the middleware, for a format whose rows count their
+    /// bytes and that core's plain replacement would break. False by
+    /// default, where core moves the addresses before the middleware runs.
+    fn moves_origin_address(&self) -> bool {
+        false
+    }
+
     /// The phases an entry may name this middleware in.
     fn phases(&self) -> &[MiddlewarePhase];
 
@@ -759,8 +768,7 @@ impl PhaseEntries {
                 return Err(format!(
                     "{at} covers `{}`, which is not a media type a middleware runs on. Write a \
                      bare `type/subtype` in lower case with no parameters, being `text/html`, \
-                     another `text/` type other than `text/x-component`, \
-                     `application/javascript` or `application/json`",
+                     another `text/` type, `application/javascript` or `application/json`",
                     entry.media_type
                 ));
             }

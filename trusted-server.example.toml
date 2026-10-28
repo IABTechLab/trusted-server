@@ -393,8 +393,8 @@ pull_sync_concurrency = 3
 # A module changes a page through a middleware, and a middleware runs only on
 # the pages where a [[fetch]] or [[serve]] entry names it. A page takes the
 # first entry that covers it and runs that entry's middleware in the order
-# written. The two entries below name every middleware the modules further
-# down supply, in the order `ts audit` writes them, and core's own
+# written. The three entries below name every middleware the modules further
+# down supply, in the order `ts audit` writes them for HTML, and core's own
 # `service_version` last. Keep the names of the modules that are selected and
 # remove the rest, because an entry that names the middleware of a module no
 # section selects refuses startup. See "Placing page changes" in the
@@ -415,6 +415,15 @@ pull_sync_concurrency = 3
 #   "bot-protection.datadome",
 #   "ad-tag.google",
 # ]
+
+# A navigation in the Next.js App Router is answered with a React Server
+# Components Flight response, text/x-component, and the framework module's
+# second middleware moves the origin's address in one where this entry names
+# it. Without the entry a Flight response passes through as the origin sent
+# it. Remove the entry with the module.
+# [[fetch]]
+# media_type = "text/x-component"
+# middleware = ["framework.nextjs.flight"]
 
 # [[serve]]
 # media_type = "text/html"

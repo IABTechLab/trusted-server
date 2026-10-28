@@ -131,6 +131,12 @@ pub fn middleware() -> Vec<StockMiddleware> {
         row(js_asset_proxy::MODULE, Fetch, js_asset_proxy::MODULE),
         row(testlight::builder().id(), Fetch, testlight::MODULE),
         row(nextjs::builder().id(), Fetch, nextjs::MODULE),
+        StockMiddleware {
+            integration: nextjs::builder().id(),
+            phase: Fetch,
+            media_type: nextjs::FLIGHT_MEDIA_TYPE,
+            name: nextjs::FLIGHT_MIDDLEWARE,
+        },
         row(permutive::builder().id(), Fetch, permutive::MODULE),
         row(lockr::builder().id(), Fetch, lockr::MODULE),
         row(didomi::builder().id(), Fetch, didomi::MODULE),
@@ -385,7 +391,11 @@ middleware = [\"robots_txt\"]
                     .iter()
                     .filter(|entry| entry.media_type == media_type)
                     .collect();
-                if media_type == HTML_MEDIA_TYPE {
+                if media_type == HTML_MEDIA_TYPE
+                    || covering.iter().any(|entry| entry.path.is_none())
+                {
+                    // One entry covers every page, for HTML and for a media
+                    // type a page's own responses come in.
                     assert_eq!(
                         covering.len(),
                         1,
@@ -399,7 +409,7 @@ middleware = [\"robots_txt\"]
                     // A file's middleware is placed on the file's own path, one
                     // entry for each file.
                     assert!(
-                        !covering.is_empty() && covering.iter().all(|entry| entry.path.is_some()),
+                        !covering.is_empty(),
                         "should document a [[{phase}]] entry on a path for each {media_type} file"
                     );
                 }

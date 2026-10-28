@@ -361,7 +361,6 @@ fn an_entry_for_a_media_type_a_middleware_does_not_run_on_is_refused() {
         "text/*",
         "image/png",
         "application/octet-stream",
-        "text/x-component",
         "image/svg+xml",
         "text/",
         "text",
@@ -388,6 +387,7 @@ fn an_entry_may_cover_a_text_media_type_that_is_not_html() {
     for media_type in [
         "text/plain",
         "text/css",
+        "text/x-component",
         "application/javascript",
         "application/json",
     ] {
@@ -409,8 +409,8 @@ fn a_media_type_is_the_type_and_subtype_of_a_content_type_in_lower_case() {
     assert!(is_dispatched_media_type("text/plain"));
     assert!(!is_dispatched_media_type("image/svg+xml"));
     assert!(
-        !is_dispatched_media_type("text/x-component"),
-        "a length prefixed stream is not changed"
+        is_dispatched_media_type("text/x-component"),
+        "a text type whose rows count their bytes is one a middleware may move the addresses of"
     );
     assert!(!is_dispatched_media_type("image/png"));
 }
