@@ -111,6 +111,8 @@ fn push(project: &TempDir, args: &[&str]) -> Output {
         .current_dir(project.path())
         // Do not inherit operator configuration or credentials from the test runner.
         .env_clear()
+        // The push hands its settings over in a file in the temp folder.
+        .envs(["TMPDIR", "TMP", "TEMP"].map(|name| (name, std::env::temp_dir().into_os_string())))
         .env("RUST_LOG", "info")
         .env("TRUSTED_SERVER__PUBLISHER__DOMAIN", HOST)
         .env(
