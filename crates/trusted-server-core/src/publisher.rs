@@ -75,8 +75,8 @@ use crate::html_processor::ServePass;
 use crate::http_util::{
     RequestInfo, is_navigation_request, remove_deployment_headers, serve_static_with_etag,
 };
-use crate::integrations::{IntegrationRegistry, IntegrationRequestState};
-use crate::middleware::{ResponseHeader, write_response_headers};
+use crate::integrations::{IntegrationDocumentState, IntegrationRegistry, IntegrationRequestState};
+use crate::middleware::{MiddlewarePhase, ResponseHeader, media_type_of, write_response_headers};
 use crate::permissions::PermissionState;
 use crate::platform::{
     GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices,
@@ -645,6 +645,8 @@ struct ProcessResponseParams<'a> {
     request_path: &'a str,
     settings: &'a Settings,
     content_type: &'a str,
+    /// See [`OwnedProcessResponseParams::status`].
+    status: StatusCode,
     integration_registry: &'a IntegrationRegistry,
     /// Head script carrying this request's permission state, or [`None`] under a
     /// shared-template mode. See [`template_permissions_script`].
@@ -664,6 +666,163 @@ struct PublisherBodyProcessor {
     /// What the serve middleware write on the response, taken by the
     /// caller before the response leaves.
     response_headers: Vec<ResponseHeader>,
+}
+
+/// A response that is not HTML, as the middleware the entries covering it
+/// are told of it.
+struct TextResponse<'a> {
+    /// The response's `Content-Type`, parameters and all.
+    content_type: &'a str,
+    status: StatusCode,
+    request_path: &'a str,
+    request_host: &'a str,
+    request_scheme: &'a str,
+    origin_host: &'a str,
+    request_state: &'a IntegrationRequestState,
+    max_buffered_script_bytes: usize,
+}
+
+/// The stream processors the entries covering a response that is not HTML
+/// run on its body, the fetch entry's and then the serve entry's, with the
+/// headers the serve entry's middleware write on the response, or none
+/// when [`text_entry_media_type`] gives no media type or no entry covers
+/// it. Both phases run here because the template cache stores HTML alone.
+///
+/// # Errors
+///
+/// When a middleware decides about HTML on a response that is not HTML, or
+/// asks for a selector that does not parse.
+fn middleware_stream_processors(
+    response: &TextResponse<'_>,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) -> Result<TextPass, Report<TrustedServerError>> {
+    use crate::middleware::MiddlewareContext;
+
+    let Some(media_type) = text_entry_media_type(response.content_type, response.status) else {
+        return Ok(TextPass::default());
+    };
+    let mut processors = Vec::new();
+    let mut response_headers = Vec::new();
+    for phase in &MiddlewarePhase::ALL {
+        let chain = integration_registry.middleware_chain(
+            settings.phase_entries(*phase),
+            *phase,
+            &media_type,
+            response.request_path,
+        );
+        if chain.is_empty() {
+            continue;
+        }
+        let document_state = IntegrationDocumentState::default();
+        if *phase == MiddlewarePhase::Serve {
+            response.request_state.seed(&document_state);
+        }
+        let plan = chain
+            .plan(&MiddlewareContext {
+                phase: *phase,
+                request_host: response.request_host,
+                request_scheme: response.request_scheme,
+                origin_host: response.origin_host,
+                platform: integration_registry.platform(),
+                document_state: &document_state,
+                max_buffered_script_bytes: response.max_buffered_script_bytes,
+            })
+            .map_err(|message| Report::new(TrustedServerError::Configuration { message }))?;
+        processors.extend(plan.processors);
+        response_headers.extend(plan.response_headers);
+    }
+    Ok(TextPass {
+        processors,
+        response_headers,
+    })
+}
+
+/// The media type the entries match a response that is not HTML by, or
+/// `None` when no middleware runs on it: HTML and the React Server
+/// Components stream, which have processors of their own, a type no entry
+/// may cover, a charset other than UTF-8, and a status other than `200`.
+/// Only a `200` carries the whole file, so a partial `206` or an error
+/// body is left as the origin sent it.
+fn text_entry_media_type(content_type: &str, status: StatusCode) -> Option<String> {
+    use crate::middleware::{is_dispatched_media_type, is_utf8_or_undeclared_charset};
+
+    let media_type = media_type_of(content_type);
+    let runs = status == StatusCode::OK
+        && !is_html_content_type(content_type)
+        && !content_type_contains_ascii_case_insensitive(content_type, "text/x-component")
+        && is_dispatched_media_type(&media_type)
+        && is_utf8_or_undeclared_charset(content_type);
+    runs.then_some(media_type)
+}
+
+/// Fits the headers of a response that is not HTML to the entries covering
+/// it. A body an entry covers loses the origin's `ETag` and `Last-Modified`,
+/// because its middleware may change it while the origin's file stays the
+/// same, so a conditional request carrying them would bring a `304` for the
+/// body as it was. A body a `[[serve]]` entry covers is also kept out of
+/// shared caches when a module left state on the request, because the
+/// entry's middleware are handed that state. Called once the serve
+/// middleware's headers are written, so none of them can undo it.
+fn apply_text_entry_cache_rules(
+    response: &mut Response<EdgeBody>,
+    params: &OwnedProcessResponseParams,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) {
+    let Some(media_type) = text_entry_media_type(&params.content_type, params.status) else {
+        return;
+    };
+    let covered = |phase: MiddlewarePhase| {
+        !integration_registry
+            .middleware_chain(
+                settings.phase_entries(phase),
+                phase,
+                &media_type,
+                &params.request_path,
+            )
+            .is_empty()
+    };
+    let served = covered(MiddlewarePhase::Serve);
+    if served && !params.request_state.is_empty() {
+        // Removes the validators too.
+        enforce_terminal_private_cache_privacy(response);
+    } else if served || covered(MiddlewarePhase::Fetch) {
+        response.headers_mut().remove(header::ETAG);
+        response.headers_mut().remove(header::LAST_MODIFIED);
+    }
+}
+
+/// What the entries covering a text response do to it: the processors over
+/// its body and the headers the serve entry's middleware write.
+#[derive(Default)]
+struct TextPass {
+    processors: Vec<Box<dyn StreamProcessor>>,
+    response_headers: Vec<ResponseHeader>,
+}
+
+/// A processor followed by the ones the entries add, each handed what the
+/// one before produced.
+struct WithStreamProcessors {
+    inner: Box<dyn StreamProcessor>,
+    processors: Vec<Box<dyn StreamProcessor>>,
+}
+
+impl StreamProcessor for WithStreamProcessors {
+    fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, std::io::Error> {
+        let mut output = self.inner.process_chunk(chunk, is_last)?;
+        for processor in &mut self.processors {
+            output = processor.process_chunk(&output, is_last)?;
+        }
+        Ok(output)
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+        for processor in &mut self.processors {
+            processor.reset();
+        }
+    }
 }
 
 impl PublisherBodyProcessor {
@@ -716,12 +875,30 @@ impl PublisherBodyProcessor {
                 &params.request_scheme,
             ))
         } else {
-            Box::new(create_url_replacer(
-                &params.origin_host,
-                &params.origin_url,
-                &params.request_host,
-                &params.request_scheme,
-            ))
+            let pass = middleware_stream_processors(
+                &TextResponse {
+                    content_type: &params.content_type,
+                    status: params.status,
+                    request_path: &params.request_path,
+                    request_host: &params.request_host,
+                    request_scheme: &params.request_scheme,
+                    origin_host: &params.origin_host,
+                    request_state: &params.request_state,
+                    max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
+                },
+                settings,
+                integration_registry,
+            )?;
+            response_headers = pass.response_headers;
+            Box::new(WithStreamProcessors {
+                inner: Box::new(create_url_replacer(
+                    &params.origin_host,
+                    &params.origin_url,
+                    &params.request_host,
+                    &params.request_scheme,
+                )),
+                processors: pass.processors,
+            })
         };
 
         Ok((
@@ -822,13 +999,31 @@ fn process_response_streaming<W: Write>(
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
             .process(body_as_reader(body)?, output)?;
     } else {
-        let replacer = create_url_replacer(
-            params.origin_host,
-            params.origin_url,
-            params.request_host,
-            params.request_scheme,
-        );
-        StreamingPipeline::new(config, replacer)
+        let pass = middleware_stream_processors(
+            &TextResponse {
+                content_type: params.content_type,
+                status: params.status,
+                request_path: params.request_path,
+                request_host: params.request_host,
+                request_scheme: params.request_scheme,
+                origin_host: params.origin_host,
+                request_state: params.request_state,
+                max_buffered_script_bytes: params.settings.publisher.max_buffered_body_bytes,
+            },
+            params.settings,
+            params.integration_registry,
+        )?;
+        response_headers = pass.response_headers;
+        let processor = WithStreamProcessors {
+            inner: Box::new(create_url_replacer(
+                params.origin_host,
+                params.origin_url,
+                params.request_host,
+                params.request_scheme,
+            )),
+            processors: pass.processors,
+        };
+        StreamingPipeline::new(config, processor)
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
             .process(body_as_reader(body)?, output)?;
     }
@@ -1848,6 +2043,9 @@ pub struct OwnedProcessResponseParams {
     /// `[[serve]]` entries that cover the document.
     pub(crate) request_path: String,
     pub(crate) content_type: String,
+    /// The origin's status, which decides whether the entries' middleware
+    /// run on a body that is not HTML. See [`text_entry_media_type`].
+    pub(crate) status: StatusCode,
     pub(crate) ad_slots_script: Option<String>,
     pub(crate) ad_bids_state: AdBidsState,
     /// Observation context for the in-flight auction.
@@ -1974,6 +2172,7 @@ pub async fn buffer_publisher_response_async(
             )
             .await?;
             write_response_headers(&mut response, response_headers);
+            apply_text_entry_cache_rules(&mut response, &params, settings, integration_registry);
             // Authorized template cache transforms are emitted as identity by
             // `process_response_streaming_async`; inline transforms retain the origin
             // coding. This avoids recompressing and immediately decoding a full document.
@@ -2347,6 +2546,7 @@ fn build_template_assembly_params(
         // Set by the caller, with the rest of what belongs to the request.
         request_path: String::new(),
         content_type: entry.metadata.content_type.clone(),
+        status: StatusCode::OK,
         // The template already carries the head seam; re-injecting would duplicate it.
         permissions_json,
         ad_slots_script: None,
@@ -2809,6 +3009,7 @@ pub async fn publisher_response_into_streaming_response(
                     }
                 };
             write_response_headers(&mut response, processor.take_response_headers());
+            apply_text_entry_cache_rules(&mut response, &params, &settings, integration_registry);
             // The guard is created before the lazy stream so an auction whose
             // response body is dropped unpolled still logs the loss.
             let dispatched_auction = params.dispatched_auction.take().map(|dispatched| {
@@ -3141,6 +3342,7 @@ pub fn stream_publisher_body<W: Write>(
         request_path: &params.request_path,
         settings,
         content_type: &params.content_type,
+        status: params.status,
         integration_registry,
         permissions_script: permissions_script.as_deref(),
         ad_slots_script: params.ad_slots_script.as_deref(),
@@ -5782,6 +5984,7 @@ pub async fn handle_publisher_request(
                     request_scheme: request_scheme.to_string(),
                     request_path: request_path.clone(),
                     content_type,
+                    status,
                     permissions_json,
                     ad_slots_script: ad_slots_script.clone(),
                     ad_bids_state: ad_bids_state.clone(),
@@ -7886,6 +8089,7 @@ mod tests {
     use crate::integrations::{
         CarriedJsModule, IntegrationBuilder, IntegrationRegistration, IntegrationRegistry,
     };
+    use crate::middleware::{PhaseEntries, PhaseEntry};
     use crate::permissions::{Permission, PermissionSet};
     use crate::platform::test_support::{
         StubHttpClient, build_services_with_http_client, noop_services,
@@ -9425,6 +9629,7 @@ mod tests {
             request_scheme: "https".to_owned(),
             request_path: "/".to_owned(),
             content_type: "application/json".to_owned(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -21463,6 +21668,481 @@ mod tests {
         ))
     }
 
+    /// The settings of a deployment running the middleware fixture, with the
+    /// `[[fetch]]` entry given.
+    fn settings_running_the_middleware_fixture(fetch: Vec<PhaseEntry>) -> Settings {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let mut settings = create_test_settings();
+        settings.select_module("testing", fixture::MODULE);
+        settings.fetch = PhaseEntries::new(fetch);
+        settings
+    }
+
+    /// A text body of `content_type` streamed through the publisher path, as
+    /// a reader gets it.
+    fn text_body_through_the_publisher(
+        settings: &Settings,
+        content_type: &str,
+        body: &str,
+    ) -> String {
+        let registry = IntegrationRegistry::new(settings).expect("should build a registry");
+        let params = OwnedProcessResponseParams {
+            csp_nonce_observed: None,
+            template_cache_key: None,
+            seam_ad_slots: None,
+            policy_headers: Vec::new(),
+            content_encoding: "identity".to_string(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            request_path: "/a.txt".to_owned(),
+            content_type: content_type.to_string(),
+            status: http::StatusCode::OK,
+            permissions_json: String::new(),
+            ad_slots_script: None,
+            ad_bids_state: AdBidsState::default(),
+            auction_observation: None,
+            auction_request: None,
+            dispatched_auction: None,
+            price_granularity: crate::price_bucket::PriceGranularity::default(),
+            request_state: IntegrationRequestState::default(),
+        };
+        let mut output = Vec::new();
+        stream_publisher_body(
+            EdgeBody::from(body.as_bytes().to_vec()),
+            &mut output,
+            &params,
+            settings,
+            &registry,
+        )
+        .expect("should stream a text body");
+        String::from_utf8(output).expect("text")
+    }
+
+    #[test]
+    fn a_text_body_passes_through_the_middleware_of_the_entry_covering_it() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let settings = settings_running_the_middleware_fixture(vec![PhaseEntry {
+            media_type: fixture::TEXT_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::TEXT.to_owned()],
+        }]);
+        let body = "User-agent: *\nSee https://origin.example.com/more\n";
+
+        let output = text_body_through_the_publisher(&settings, "text/plain; charset=utf-8", body);
+
+        assert_eq!(
+            output,
+            format!(
+                "User-agent: *\nSee https://proxy.example.com/more\n{}",
+                fixture::TEXT_LINE
+            ),
+            "should move the origin's address and then run the entry's middleware"
+        );
+    }
+
+    /// The same through the response path a streamed body takes, which
+    /// builds its processor apart from the buffered path's.
+    #[tokio::test]
+    async fn a_streamed_text_body_passes_through_the_middleware_of_the_entry_covering_it() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::platform::test_support::noop_services;
+
+        let settings = settings_running_the_middleware_fixture(vec![PhaseEntry {
+            media_type: fixture::TEXT_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::TEXT.to_owned()],
+        }]);
+        let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
+        let orchestrator = AuctionOrchestrator::new(
+            crate::auction::test_support::legacy_auction_config(&settings),
+        );
+        let services = noop_services();
+        let mut params = OwnedProcessResponseParams {
+            csp_nonce_observed: None,
+            template_cache_key: None,
+            seam_ad_slots: None,
+            policy_headers: Vec::new(),
+            content_encoding: String::new(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            request_path: "/a.txt".to_owned(),
+            content_type: "text/plain; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
+            permissions_json: String::new(),
+            ad_slots_script: None,
+            ad_bids_state: AdBidsState::default(),
+            auction_observation: None,
+            auction_request: None,
+            dispatched_auction: None,
+            price_granularity: crate::price_bucket::PriceGranularity::default(),
+            request_state: IntegrationRequestState::default(),
+        };
+        let body = EdgeBody::stream(futures::stream::iter(vec![
+            bytes::Bytes::from_static(b"User-agent: *\nSee https://origin.example.com/"),
+            bytes::Bytes::from_static(b"more\n"),
+        ]));
+        let mut output = Vec::new();
+
+        stream_publisher_body_async(
+            body,
+            &mut output,
+            &mut params,
+            &settings,
+            &registry,
+            &orchestrator,
+            &services,
+        )
+        .await
+        .expect("should stream a text body");
+
+        assert_eq!(
+            String::from_utf8(output).expect("text"),
+            format!(
+                "User-agent: *\nSee https://proxy.example.com/more\n{}",
+                fixture::TEXT_LINE
+            ),
+            "should move the origin's address and then run the entry's middleware"
+        );
+    }
+
+    /// The parameters of a text response at `/a.txt`, from the origin as
+    /// `content_type` says, for a reader of `proxy.example.com`.
+    fn text_params(content_type: &str) -> OwnedProcessResponseParams {
+        OwnedProcessResponseParams {
+            csp_nonce_observed: None,
+            template_cache_key: None,
+            seam_ad_slots: None,
+            policy_headers: Vec::new(),
+            content_encoding: "identity".to_string(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            request_path: "/a.txt".to_owned(),
+            content_type: content_type.to_string(),
+            status: http::StatusCode::OK,
+            permissions_json: String::new(),
+            ad_slots_script: None,
+            ad_bids_state: AdBidsState::default(),
+            auction_observation: None,
+            auction_request: None,
+            dispatched_auction: None,
+            price_granularity: crate::price_bucket::PriceGranularity::default(),
+            request_state: IntegrationRequestState::default(),
+        }
+    }
+
+    /// Settings running the fixture with a serve entry on `text/plain`
+    /// naming its header-writing middleware.
+    fn settings_serving_the_text_header() -> Settings {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let mut settings = settings_running_the_middleware_fixture(Vec::new());
+        settings.serve = PhaseEntries::new(vec![PhaseEntry {
+            media_type: fixture::TEXT_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::TEXT_HEADER.to_owned()],
+        }]);
+        settings
+    }
+
+    fn named_headers(headers: &[ResponseHeader]) -> Vec<(&str, &[u8])> {
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
+            .collect()
+    }
+
+    #[test]
+    fn a_text_body_s_serve_middleware_write_their_headers_on_the_response() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let settings = settings_serving_the_text_header();
+        let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
+        let params = text_params("text/plain; charset=utf-8");
+        let mut output = Vec::new();
+
+        let headers = stream_publisher_body(
+            EdgeBody::from(b"plain\n".to_vec()),
+            &mut output,
+            &params,
+            &settings,
+            &registry,
+        )
+        .expect("should stream a text body");
+
+        assert_eq!(
+            named_headers(&headers),
+            [(
+                fixture::TEXT_HEADER_NAME,
+                fixture::TEXT_HEADER_VALUE.as_bytes()
+            )],
+            "should hand back the header the serve middleware writes on a text response"
+        );
+        assert_eq!(String::from_utf8(output).expect("text"), "plain\n");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_text_body_s_serve_middleware_write_their_headers_on_the_response() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::platform::test_support::noop_services;
+
+        let settings = settings_serving_the_text_header();
+        let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
+        let orchestrator = AuctionOrchestrator::new(
+            crate::auction::test_support::legacy_auction_config(&settings),
+        );
+        let services = noop_services();
+        let mut params = text_params("text/plain; charset=utf-8");
+        let body = EdgeBody::stream(futures::stream::iter(vec![
+            bytes::Bytes::from_static(b"pla"),
+            bytes::Bytes::from_static(b"in\n"),
+        ]));
+        let mut output = Vec::new();
+
+        let headers = stream_publisher_body_async(
+            body,
+            &mut output,
+            &mut params,
+            &settings,
+            &registry,
+            &orchestrator,
+            &services,
+        )
+        .await
+        .expect("should stream a text body");
+
+        assert_eq!(
+            named_headers(&headers),
+            [(
+                fixture::TEXT_HEADER_NAME,
+                fixture::TEXT_HEADER_VALUE.as_bytes()
+            )],
+            "should hand back the header the serve middleware writes on a streamed text response"
+        );
+        assert_eq!(String::from_utf8(output).expect("text"), "plain\n");
+    }
+
+    /// The answers to `GET /a.txt` through the publisher path, the origin
+    /// answering `status` with `plain\n` as UTF-8 text and the headers given,
+    /// finalized as the adapters that buffer do and then as Fastly does.
+    /// With `marked`, a module leaves state on the request.
+    async fn text_answers_through_the_publisher(
+        settings: Settings,
+        marked: bool,
+        status: u16,
+        origin_headers: &[(&str, &str)],
+    ) -> Vec<(Response<EdgeBody>, String)> {
+        let settings = Arc::new(settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
+        let orchestrator = Arc::new(AuctionOrchestrator::new(
+            crate::auction::test_support::legacy_auction_config(&settings),
+        ));
+        let mut answers = Vec::new();
+        for streaming in [false, true] {
+            let stub = Arc::new(StubHttpClient::new());
+            let mut headers = vec![("content-type", "text/plain; charset=utf-8")];
+            headers.extend_from_slice(origin_headers);
+            stub.push_response_with_headers(status, b"plain\n".to_vec(), headers);
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let mut request = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://publisher.example/a.txt")
+                .header(header::HOST, "publisher.example")
+                .body(EdgeBody::empty())
+                .expect("should build request");
+            if marked {
+                crate::integrations::registry_test_support::request_fixture::mark(&mut request);
+            }
+            let consent = crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            };
+            let mut ec_context = EcContext::new_for_test_with_ip(None, consent, None);
+            let proxied = handle_publisher_request(
+                AppContext {
+                    settings: &settings,
+                    integration_registry: &registry,
+                },
+                &services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &[],
+                    registry: None,
+                },
+                request,
+                EdgeCacheHeader::SMaxageFallback,
+            )
+            .await
+            .expect("should proxy the request");
+            let response = if streaming {
+                publisher_response_into_streaming_response(
+                    proxied,
+                    &Method::GET,
+                    Arc::clone(&settings),
+                    &registry,
+                    Arc::clone(&orchestrator),
+                    services.clone(),
+                )
+                .await
+            } else {
+                buffer_publisher_response_async(
+                    proxied,
+                    &Method::GET,
+                    &settings,
+                    &registry,
+                    &orchestrator,
+                    &services,
+                )
+                .await
+            }
+            .expect("should finalize the response");
+            let (parts, body) = response.into_parts();
+            let body = match body {
+                EdgeBody::Stream(mut stream) => {
+                    let mut out = Vec::new();
+                    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+                        out.extend_from_slice(&chunk.expect("should read a chunk"));
+                    }
+                    out
+                }
+                other => other.into_bytes().expect("should hold the bytes").to_vec(),
+            };
+            answers.push((
+                Response::from_parts(parts, EdgeBody::empty()),
+                String::from_utf8(body).expect("text"),
+            ));
+        }
+        answers
+    }
+
+    #[tokio::test]
+    async fn a_text_response_whose_serve_entry_is_handed_request_state_is_private() {
+        let origin = [("cache-control", "public, max-age=600"), ("etag", "\"v1\"")];
+        for (marked, cache_control) in [(true, "no-store, private"), (false, "public, max-age=600")]
+        {
+            let answers = text_answers_through_the_publisher(
+                settings_serving_the_text_header(),
+                marked,
+                200,
+                &origin,
+            )
+            .await;
+            for (response, _) in &answers {
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(cache_control),
+                    "should keep a text response shaped from one reader's state out of \
+                     shared caches, and no other"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_text_body_is_handed_to_a_middleware_only_when_the_status_is_200() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let settings = settings_running_the_middleware_fixture(vec![PhaseEntry {
+            media_type: fixture::TEXT_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::TEXT.to_owned()],
+        }]);
+        for (status, body) in [
+            (200, format!("plain\n{}", fixture::TEXT_LINE)),
+            (206, "plain\n".to_owned()),
+            (404, "plain\n".to_owned()),
+            (500, "plain\n".to_owned()),
+        ] {
+            let answers =
+                text_answers_through_the_publisher(settings.clone(), false, status, &[]).await;
+            for (response, text) in &answers {
+                assert_eq!(response.status().as_u16(), status);
+                assert_eq!(
+                    text, &body,
+                    "should change a whole file and leave a {status} as the origin sent it"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_text_body_a_middleware_changes_loses_the_origin_validators() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let origin = [
+            ("etag", "\"v1\""),
+            ("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ];
+        for (path, keeps_validators) in [(None, false), (Some("/elsewhere/"), true)] {
+            let settings = settings_running_the_middleware_fixture(vec![PhaseEntry {
+                media_type: fixture::TEXT_MEDIA_TYPE.to_owned(),
+                path: path.map(str::to_owned),
+                middleware: vec![fixture::TEXT.to_owned()],
+            }]);
+            let answers = text_answers_through_the_publisher(settings, false, 200, &origin).await;
+            for (response, _) in &answers {
+                for name in [header::ETAG, header::LAST_MODIFIED] {
+                    assert_eq!(
+                        response.headers().contains_key(&name),
+                        keeps_validators,
+                        "{name} should stay on a body no middleware changes, and on no other"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_text_body_no_entry_covers_is_left_as_it_was() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let settings = settings_running_the_middleware_fixture(vec![PhaseEntry {
+            media_type: fixture::TEXT_MEDIA_TYPE.to_owned(),
+            path: Some("/elsewhere/".to_owned()),
+            middleware: vec![fixture::TEXT.to_owned()],
+        }]);
+
+        let output = text_body_through_the_publisher(&settings, "text/plain", "plain\n");
+
+        assert_eq!(
+            output, "plain\n",
+            "should run nothing on a path the entry does not cover"
+        );
+    }
+
+    #[test]
+    fn a_text_body_in_a_charset_other_than_utf8_is_left_as_it_was() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let settings = settings_running_the_middleware_fixture(vec![PhaseEntry {
+            media_type: fixture::TEXT_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::TEXT.to_owned()],
+        }]);
+
+        let output =
+            text_body_through_the_publisher(&settings, "text/plain; charset=utf-16", "plain\n");
+
+        assert_eq!(
+            output, "plain\n",
+            "should hand a middleware no body it would corrupt by writing UTF-8"
+        );
+    }
+
     #[test]
     fn tsjs_dynamic_serves_a_standalone_module_by_registration_flag_not_by_name() {
         // The module the registration marks standalone is one a vendor crate
@@ -21650,6 +22330,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/css".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -21713,6 +22394,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -21797,6 +22479,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -21890,6 +22573,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -21998,6 +22682,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -22047,6 +22732,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -22176,6 +22862,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -22243,6 +22930,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -22313,6 +23001,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -22383,6 +23072,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -22453,6 +23143,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -22503,6 +23194,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/css".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -22729,6 +23421,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: Some(
                     r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -22807,6 +23500,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: Some(
                     r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -22887,6 +23581,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -22961,6 +23656,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/css".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -23117,6 +23813,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -23793,6 +24490,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -23991,6 +24689,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -24073,6 +24772,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "Text/HTML; Charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -24138,6 +24838,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -24258,6 +24959,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -24318,6 +25020,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),

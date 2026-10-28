@@ -11,7 +11,7 @@ use crate::html_processor::{
     create_html_processor_with_middleware, create_serve_processor,
 };
 use crate::integrations::registry_test_support::request_fixture;
-use crate::integrations::{IntegrationRegistry, IntegrationRequestState};
+use crate::integrations::{IntegrationDocumentState, IntegrationRegistry, IntegrationRequestState};
 use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
 use crate::test_support::tests::create_test_settings;
 
@@ -54,11 +54,11 @@ fn middleware(
 }
 
 fn chain_of(middleware: Vec<Arc<dyn Middleware>>) -> MiddlewareChain {
-    MiddlewareChain::new(MiddlewarePhase::Fetch, middleware)
+    MiddlewareChain::new(MiddlewarePhase::Fetch, HTML_MEDIA_TYPE, middleware)
 }
 
 fn serve_chain_of(middleware: Vec<Arc<dyn Middleware>>) -> MiddlewareChain {
-    MiddlewareChain::new(MiddlewarePhase::Serve, middleware)
+    MiddlewareChain::new(MiddlewarePhase::Serve, HTML_MEDIA_TYPE, middleware)
 }
 
 /// What a serve chain is told of a reader whose request left `request_state`.
@@ -324,19 +324,147 @@ fn entries_from_the_longest_path_to_every_path_are_accepted() {
 }
 
 #[test]
-fn an_entry_for_a_media_type_other_than_html_is_refused() {
-    for media_type in ["text/css", "text/html; charset=utf-8", "TEXT/HTML", "*/*"] {
-        let mut css = entry(None, &["example.a"]);
-        css.media_type = media_type.to_owned();
+fn an_entry_for_a_media_type_a_middleware_does_not_run_on_is_refused() {
+    for media_type in [
+        "text/html; charset=utf-8",
+        "TEXT/HTML",
+        "text/PLAIN",
+        "*/*",
+        "text/*",
+        "image/png",
+        "application/octet-stream",
+        "text/x-component",
+        "image/svg+xml",
+        "text/",
+        "text",
+        "text/plain\t",
+        "text/ plain",
+    ] {
+        let mut other = entry(None, &["example.a"]);
+        other.media_type = media_type.to_owned();
 
-        let message = refusal(vec![css]);
+        let message = refusal(vec![other]);
 
         assert!(
             message.contains("[[fetch]] entry 1")
                 && message.contains(&format!("covers `{media_type}`"))
-                && message.contains("media_type = \"text/html\""),
-            "should name the entry and the media type to write: {message}"
+                && message.contains("is not a media type a middleware runs on")
+                && message.contains("`text/html`"),
+            "should name the entry, the media type and what to write: {message}"
         );
+    }
+}
+
+#[test]
+fn an_entry_may_cover_a_text_media_type_that_is_not_html() {
+    for media_type in [
+        "text/plain",
+        "text/css",
+        "application/javascript",
+        "application/json",
+    ] {
+        let mut text = entry(None, &["example.a"]);
+        text.media_type = media_type.to_owned();
+
+        PhaseEntries::new(vec![text])
+            .validate(MiddlewarePhase::Fetch)
+            .unwrap_or_else(|message| panic!("{media_type} should be accepted: {message}"));
+    }
+}
+
+#[test]
+fn a_media_type_is_the_type_and_subtype_of_a_content_type_in_lower_case() {
+    assert_eq!(media_type_of("text/html; charset=utf-8"), "text/html");
+    assert_eq!(media_type_of(" Text/Plain "), "text/plain");
+    assert_eq!(media_type_of("application/json"), "application/json");
+    assert_eq!(media_type_of(""), "");
+    assert!(is_dispatched_media_type("text/plain"));
+    assert!(!is_dispatched_media_type("image/svg+xml"));
+    assert!(
+        !is_dispatched_media_type("text/x-component"),
+        "a length prefixed stream is not changed"
+    );
+    assert!(!is_dispatched_media_type("image/png"));
+}
+
+#[test]
+fn a_body_is_handed_to_a_middleware_only_in_utf8_or_an_undeclared_charset() {
+    assert!(is_utf8_or_undeclared_charset("text/plain"));
+    assert!(is_utf8_or_undeclared_charset("text/plain; charset=utf-8"));
+    assert!(is_utf8_or_undeclared_charset(
+        "text/plain; Charset=\"UTF-8\""
+    ));
+    assert!(is_utf8_or_undeclared_charset("text/plain; format=flowed"));
+    assert!(!is_utf8_or_undeclared_charset("text/plain; charset=utf-16"));
+    assert!(!is_utf8_or_undeclared_charset(
+        "text/plain; charset=iso-8859-1"
+    ));
+}
+
+#[test]
+fn a_chain_on_another_media_type_runs_a_stream_processor_alone() {
+    let document_state = IntegrationDocumentState::default();
+    let context = super::test_support::context(MiddlewarePhase::Fetch, &document_state);
+    let head = middleware("example.head", |_context| MiddlewareAction {
+        head_inserts: vec!["<meta>".to_owned()],
+        ..MiddlewareAction::pass()
+    });
+    let stream = middleware("example.stream", |_context| MiddlewareAction {
+        stream: Some(Box::new(Append("# more".to_owned()))),
+        ..MiddlewareAction::pass()
+    });
+
+    let refused = MiddlewareChain::new(MiddlewarePhase::Fetch, "text/plain", vec![head])
+        .plan(&context)
+        .expect_err("a head insert is a decision about HTML");
+    assert!(
+        refused.contains("`example.head`")
+            && refused.contains("cannot run on `text/plain`")
+            && refused.contains("decides about HTML"),
+        "should name the middleware, the media type and the reason: {refused}"
+    );
+
+    let plan = MiddlewareChain::new(MiddlewarePhase::Fetch, "text/plain", vec![stream])
+        .plan(&context)
+        .expect("a stream processor runs on any media type");
+    assert_eq!(plan.processors.len(), 1);
+    assert!(plan.head_inserts.is_empty());
+}
+
+#[test]
+fn a_serve_chain_on_another_media_type_may_write_a_header() {
+    let document_state = IntegrationDocumentState::default();
+    let context = super::test_support::context(MiddlewarePhase::Serve, &document_state);
+
+    let plan = MiddlewareChain::new(
+        MiddlewarePhase::Serve,
+        "text/plain",
+        vec![header("example.version", "x-example", "1")],
+    )
+    .plan(&context)
+    .expect("a header is not a decision about HTML");
+
+    assert_eq!(
+        plan.response_headers.len(),
+        1,
+        "should keep the header for the response"
+    );
+    assert!(
+        plan.processors.is_empty() && plan.head_inserts.is_empty(),
+        "should change nothing in the body"
+    );
+}
+
+/// A stream processor that adds `text` at the end of a body.
+struct Append(String);
+
+impl crate::streaming_processor::StreamProcessor for Append {
+    fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
+        let mut output = chunk.to_vec();
+        if is_last {
+            output.extend_from_slice(self.0.as_bytes());
+        }
+        Ok(output)
     }
 }
 
@@ -1680,8 +1808,8 @@ fn settings_without_entries_write_no_fetch_key() {
 fn settings_with_a_misshapen_entry_are_refused() {
     let cases = [
         (
-            "\n[[fetch]]\nmedia_type = \"text/css\"\nmiddleware = [\"example.all\"]\n",
-            "[[fetch]] entry 1 covers `text/css`",
+            "\n[[fetch]]\nmedia_type = \"image/png\"\nmiddleware = [\"example.all\"]\n",
+            "[[fetch]] entry 1 covers `image/png`",
         ),
         (
             "\n[fetch]\nmedia_type = \"text/html\"\nmiddleware = [\"example.all\"]\n",

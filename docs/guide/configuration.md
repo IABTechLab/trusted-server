@@ -1808,7 +1808,7 @@ An entry of either list has the same three fields.
 
 | Field        | Type             | Required | Description                                                                                    |
 | ------------ | ---------------- | -------- | ---------------------------------------------------------------------------------------------- |
-| `media_type` | String           | Yes      | The media type the entry covers. Only `text/html` is accepted                                  |
+| `media_type` | String           | Yes      | The media type the entry covers, a bare `type/subtype` in lower case, see below                |
 | `path`       | String           | No       | A prefix of the request path, compared as written. Absent, or `/`, the entry covers every path |
 | `middleware` | Array of strings | Yes      | The middleware to run, in order, each handed the page as the one before it left it             |
 
@@ -1847,6 +1847,38 @@ script bundle, after the fetch middleware's.
 A middleware takes its settings from its module's own `[<section>.<name>]`
 table. An entry carries none and switches nothing on.
 
+### Entries for a media type other than HTML
+
+An entry covers `text/html`, another `text/` type other than
+`text/x-component`, `application/javascript` or `application/json`, written
+as a bare `type/subtype` in lower case with no parameters. A response is
+matched by the type and subtype of its `Content-Type`, without the
+parameters, so `text/plain; charset=utf-8` takes the entry for
+`text/plain`. Anything else, an image or a length prefixed stream among
+them, passes through untouched and no entry can cover it. So does a
+response that declares a charset other than UTF-8 or whose status is not
+`200`, such as a partial `206` or an error page.
+
+A middleware says which media types it works on, HTML alone unless it says
+otherwise, and an entry naming one under a media type it does not handle is
+refused when the registry is built, with the entry and the middleware named.
+On a media type other than HTML a middleware changes the body as a stream,
+after core has moved the origin's addresses in it, in the order the entry
+names them. Head markup and the element and text handlers are decisions
+about HTML, and a middleware that makes one there is refused by name. The
+template cache stores HTML alone, so the fetch entry's middleware and then
+the serve entry's run on each response as it is fetched. A response an entry
+covers loses the origin's `ETag` and `Last-Modified`, because a middleware
+may change its body, and when a module left state on the request, one a
+`[[serve]]` entry covers is sent `private, no-store`, as a page is.
+
+```toml
+[[fetch]]
+media_type = "text/plain"
+path = "/ads.txt"
+middleware = ["example.sellers"]
+```
+
 The modules this repository ships supply the middleware below. A deployment
 that runs several of them names them all in one entry's list, because a page
 takes one entry, and the order written is the order they run in. The table
@@ -1873,7 +1905,7 @@ the names in and the order `trusted-server.example.toml` shows them in.
 
 An entry that could not do what it says refuses the configuration, both when
 a deployment is validated and when the settings load. That is a media type
-other than `text/html`, a path that does not start with `/` or that holds a
+no middleware runs on, a path that does not start with `/` or that holds a
 `*`, a `?` or a `#`, an entry that names no middleware or names one twice, a
 key an entry does not read, and an entry that an earlier one already covers.
 An entry naming a middleware that no running module supplies refuses startup,

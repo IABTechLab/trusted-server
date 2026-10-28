@@ -200,6 +200,47 @@ Production adapters replace every unavailable or fixture service with the
 target implementation. The builder deliberately panics when a required service
 is omitted, so adapter startup must construct the complete service graph.
 
+### A middleware for a media type other than HTML
+
+A middleware works on `text/html` unless it says otherwise, with
+`handles_media_type`, and an entry naming it under a media type it does not
+handle is refused when the registry is built. On a media type other than
+HTML an action may carry a stream processor alone, which is handed the body
+after core has moved the origin's addresses in it, chunk by chunk, with the
+last chunk marked, and only for a `200`, whose body is the whole file. Head
+markup and the element and text handlers are decisions about HTML, and an
+action that makes one on another media type is refused by name when the
+chain is planned.
+
+```rust
+struct Sellers;
+
+impl Middleware for Sellers {
+    fn middleware_id(&self) -> &'static str {
+        "example.sellers"
+    }
+
+    fn handles_media_type(&self, media_type: &str) -> bool {
+        media_type == "text/plain"
+    }
+
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
+    }
+
+    fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        MiddlewareAction {
+            stream: Some(Box::new(AppendLines::new(["example-ssp.com, 1, DIRECT"]))),
+            ..MiddlewareAction::pass()
+        }
+    }
+}
+```
+
+The entry that places it names the media type and, where the change is for
+one file, its path. See "Entries for a media type other than HTML" in the
+[configuration guide](/guide/configuration#entries-for-a-media-type-other-than-html).
+
 ## Proxy implementation rules
 
 An `IntegrationProxy::handle` implementation receives the request and its
