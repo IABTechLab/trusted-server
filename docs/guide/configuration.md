@@ -3341,8 +3341,10 @@ Push each key in lower case. The runtime lowercases the request's host and
 answered `421`.
 
 ```bash
-ts config push --adapter fastly --local --key www.publisher-a.example --app-config publisher-a.toml
-ts config push --adapter fastly --local --key www.publisher-b.example --app-config publisher-b.toml
+ts config push --adapter fastly --local --key www.publisher-a.example \
+  --app-config publisher-a.toml --permissions standard.yaml
+ts config push --adapter fastly --local --key www.publisher-b.example \
+  --app-config publisher-b.toml --permissions standard.yaml
 
 fastly config-store-entry update --upsert \
   --store-id <id of the store linked as trusted_server_config> \
@@ -3352,9 +3354,19 @@ fastly config-store-entry update --upsert \
 
 `ts config push` writes a key other than `trusted_server_config` only with
 `--local`, into the local store in `fastly.toml`. Copy the entries it writes
-into a live store with `fastly config-store-entry update`, a long blob's
-chunks before its pointer. The selector is read on every request, so the
-blobs come first.
+into a live store with `fastly config-store-entry update`, the policy entries
+first and a long value's chunks before its pointer. The selector is read on
+every request, so the blobs come first.
+
+Each host's blob names its permission policy file in `[permissions] policy`
+and pins the file's SHA-256, and carries no copy of the file. The push keeps
+each file `--permissions` supplies once, in an entry of its own under
+`permissions_<sha256>`, written before the host's blob, and keeps an entry that
+already holds the file, so a hundred hosts that name three files store three
+entries. A changed file is a new entry, so a host still running an earlier
+blob still finds the file that blob pins. The blob at `trusted_server_config`
+carries its file, as on a service with one blob. `ts config diff` compares only
+that blob, so the policy a host runs is checked on that host's `/_ts/config`.
 
 | A request for                                               | Reads the blob at         | Is answered                      |
 | ----------------------------------------------------------- | ------------------------- | -------------------------------- |
@@ -3367,6 +3379,7 @@ blobs come first.
 | `/health`, for any host                                     | None                      | `200`, before any config is read |
 | Any host, under a malformed selector                        | None                      | `500`                            |
 | Any host, where the store cannot be read                    | None                      | `500`                            |
+| A host whose policy entry is missing or is another file     | The host's blob           | `500`, with the reason logged    |
 
 A selector is malformed when it is empty, carries whitespace, a control
 character or `{host}` more than once, carries a brace outside its `{host}`

@@ -291,7 +291,14 @@ commands above do.
 `--staging` on `config push` / `config diff` writes and compares the
 `<logical-store-id>` key in the physical store selected by the current
 environment. It is mutually exclusive with `--key`. On Fastly, `ts` pushes a
-`--key` other than the logical store ID itself, and only with `--local`.
+`--key` other than the logical store ID itself, and only with `--local`. That
+push makes the same policy checks, writes the named file's SHA-256 and not the
+file into the blob, and keeps each file `--permissions` supplies once, under
+`permissions_<sha256>`, before the blob
+([One blob for each host](/guide/configuration#one-blob-for-each-host)).
+`config diff` compares only the logical store ID on Fastly, because EdgeZero
+refuses every other key, so the policy a host runs is checked on that host's
+`/_ts/config`, which shows the policy's name and SHA-256.
 
 Inspect and verify deployments with the deploy lifecycle commands. All three are
 Fastly-only — the axum, cloudflare, and spin adapters reject them:
