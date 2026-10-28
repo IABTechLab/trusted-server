@@ -137,13 +137,17 @@ jobs:
       - name: Verify Fastly WASM release build
         run: cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
 
+      # The guard's two steps are written for bash and run on Linux alone,
+      # because the WASM they check is the same on every system.
       - name: Check that no permission policy is compiled into the Fastly WASM
+        if: runner.os == 'Linux'
         run: ./scripts/check-no-compiled-policy.sh target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm
 
       # The sample carries both markers the guard looks for, so a guard that
       # stops finding them passes the sample and fails the job here. Exit 1 is
       # the refusal; exit 2 means the guard could not run.
       - name: Check that the policy guard refuses a file that carries a policy
+        if: runner.os == 'Linux'
         run: |
           status=0
           ./scripts/check-no-compiled-policy.sh config/permissions/sample.yaml || status=$?
