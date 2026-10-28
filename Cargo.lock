@@ -7064,6 +7064,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-server-headers-geo"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "http",
+ "log",
+ "serde",
+ "trusted-server-core",
+ "validator",
+]
+
+[[package]]
 name = "trusted-server-identity-lockr"
 version = "0.1.0"
 dependencies = [
@@ -7178,6 +7193,7 @@ dependencies = [
  "trusted-server-cmp-sourcepoint",
  "trusted-server-core",
  "trusted-server-framework-nextjs",
+ "trusted-server-headers-geo",
  "trusted-server-identity-lockr",
  "trusted-server-tag-google-tag",
  "trusted-server-tag-google-tag-manager",

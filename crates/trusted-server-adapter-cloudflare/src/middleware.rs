@@ -3,9 +3,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderValue, Response};
+use edgezero_core::http::Response;
 use edgezero_core::middleware::{Middleware, Next};
-use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
 use trusted_server_core::http_util::{
     ROUTE_NAMESPACE, sanitize_trusted_client_ip_headers, strip_deployment_headers,
 };
@@ -53,10 +52,6 @@ impl Middleware for SanitizeRequestMiddleware {
 
 /// Response-finalization middleware: injects all standard TS response headers.
 ///
-/// Geo availability is determined by the presence of the `cf-ipcountry` header
-/// (injected by the Cloudflare Workers runtime). On the native host target the
-/// header is absent, so `X-Geo-Info-Available: false` is emitted.
-///
 /// Registered directly inside [`SanitizeRequestMiddleware`], so that every
 /// outgoing response carries a consistent set of headers.
 pub struct FinalizeResponseMiddleware {
@@ -74,19 +69,11 @@ impl FinalizeResponseMiddleware {
 #[async_trait(?Send)]
 impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        let geo_available = ctx
-            .request()
-            .headers()
-            .get("cf-ipcountry")
-            .and_then(|v| v.to_str().ok())
-            .filter(|s| !s.is_empty() && *s != "XX")
-            .is_some();
-
         let path = ctx.request().uri().path().to_owned();
         let mut response = next.run(ctx).await?;
         // Before finalizing, so a header finalizing writes is kept.
         strip_deployment_headers(&path, ROUTE_NAMESPACE, &mut response);
-        apply_finalize_headers(&self.settings, geo_available, &mut response);
+        apply_finalize_headers(&self.settings, &mut response);
         Ok(response)
     }
 }
@@ -97,20 +84,10 @@ impl Middleware for FinalizeResponseMiddleware {
 
 /// Applies standard Trusted Server response headers to the given response.
 ///
-/// `geo_available` controls `X-Geo-Info-Available`; pass `true` when
-/// `cf-ipcountry` was present and non-`XX` in the incoming request.
-/// Operator-configured `settings.response_headers` are applied last (with the
-/// shared cookie cache-privacy hardening) and can override any managed header.
-pub(crate) fn apply_finalize_headers(
-    settings: &Settings,
-    geo_available: bool,
-    response: &mut Response,
-) {
-    response.headers_mut().insert(
-        HEADER_X_GEO_INFO_AVAILABLE,
-        HeaderValue::from_static(if geo_available { "true" } else { "false" }),
-    );
-
+/// Operator-configured `settings.response_headers` are applied with the
+/// shared cookie cache-privacy hardening and can override any header already
+/// written.
+pub(crate) fn apply_finalize_headers(settings: &Settings, response: &mut Response) {
     // Cloudflare is a real shared cache: cookie-bearing responses must stay
     // private and operator headers must not re-enable caching for uncacheable
     // per-user payloads.
@@ -190,54 +167,21 @@ mod tests {
     }
 
     #[test]
-    fn sets_geo_available_false_when_no_country_header() {
+    fn finalizing_writes_no_geo_header() {
         let settings = settings_with_response_headers(vec![]);
         let mut response = empty_response();
 
-        apply_finalize_headers(&settings, false, &mut response);
+        apply_finalize_headers(&settings, &mut response);
 
-        assert_eq!(
-            response
-                .headers()
-                .get("x-geo-info-available")
-                .and_then(|v| v.to_str().ok()),
-            Some("false"),
-            "should set X-Geo-Info-Available: false when geo is unavailable"
-        );
-    }
-
-    #[test]
-    fn sets_geo_available_true_when_country_header_present() {
-        let settings = settings_with_response_headers(vec![]);
-        let mut response = empty_response();
-
-        apply_finalize_headers(&settings, true, &mut response);
-
-        assert_eq!(
-            response
-                .headers()
-                .get("x-geo-info-available")
-                .and_then(|v| v.to_str().ok()),
-            Some("true"),
-            "should set X-Geo-Info-Available: true when cf-ipcountry is present"
-        );
-    }
-
-    #[test]
-    fn operator_response_headers_override_geo_header() {
-        let settings =
-            settings_with_response_headers(vec![("X-Geo-Info-Available", "operator-override")]);
-        let mut response = empty_response();
-
-        apply_finalize_headers(&settings, false, &mut response);
-
-        assert_eq!(
-            response
-                .headers()
-                .get("x-geo-info-available")
-                .and_then(|v| v.to_str().ok()),
-            Some("operator-override"),
-            "should override the managed geo header with the operator-configured value"
+        let geo_headers: Vec<&str> = response
+            .headers()
+            .keys()
+            .map(edgezero_core::http::HeaderName::as_str)
+            .filter(|name| name.starts_with("x-geo-"))
+            .collect();
+        assert!(
+            geo_headers.is_empty(),
+            "should write no x-geo-* header, which a serve middleware writes: {geo_headers:?}"
         );
     }
 
@@ -246,7 +190,7 @@ mod tests {
         let settings = settings_with_response_headers(vec![("X-Custom-Header", "custom-value")]);
         let mut response = empty_response();
 
-        apply_finalize_headers(&settings, false, &mut response);
+        apply_finalize_headers(&settings, &mut response);
 
         assert_eq!(
             response

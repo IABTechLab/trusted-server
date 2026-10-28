@@ -459,9 +459,24 @@ impl DidomiIntegration {
             && matches!(backend, DidomiBackend::Sdk)
             && is_notice_loader(&parts.method, consent_path)
         {
+            // The geo module is called as every geo call is, with the
+            // request as evidence, its services and its client.
+            let host = parts
+                .headers
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            let scheme = parts.uri.scheme_str().unwrap_or("https");
+            let request = trusted_server_core::module_context::ModuleRequest::new(
+                &parts.method,
+                host,
+                scheme,
+                parts.uri.path(),
+            )
+            .with_query(parts.uri.query().unwrap_or_default());
             let geo = match services
                 .geo()
-                .lookup(services.client_info().client_ip, services)
+                .locate_request(request, Some(&parts.headers), None, services)
                 .await
             {
                 Ok(Some(geo)) => match normalize_didomi_geo(&geo) {
@@ -711,7 +726,12 @@ mod tests {
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
             .backend(Arc::new(StubBackend))
             .http_client(http_client)
-            .geo(Arc::new(StubGeo(geo_result)))
+            .geo(Arc::new(
+                trusted_server_core::platform::PlatformGeoModule::new(
+                    "stub",
+                    Arc::new(StubGeo(geo_result)),
+                ),
+            ))
             .client_info(ClientInfo {
                 client_ip: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
                 ..ClientInfo::default()

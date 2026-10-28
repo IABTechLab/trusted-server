@@ -1,4 +1,4 @@
-use crate::common::config::integration_app_config_envelope;
+use crate::common::config::axum_app_config_envelope;
 use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult, origin_port,
 };
@@ -60,7 +60,7 @@ impl RuntimeEnvironment for AxumDevServer {
         let binary = self.binary_path();
         let port = super::find_available_port().unwrap_or(AXUM_DEFAULT_PORT);
 
-        let app_config = integration_app_config_envelope(origin_port())?;
+        let app_config = axum_app_config_envelope(origin_port())?;
         let store_name = default_config_store_name();
         let config_key = default_config_key();
         let config_variable = config_env_var(store_name.as_ref(), &config_key);

@@ -26,8 +26,8 @@ use trusted_server_core::integrations::{
 use trusted_server_core::module_context::{ModuleContext, ModuleRequest};
 use trusted_server_core::platform::{
     BackendNamingPolicy, ClientInfo, DisabledGeo, PlatformBackend, PlatformBackendSpec,
-    PlatformConfigStore, PlatformError, PlatformSecretStore, RuntimeServices, StoreId, StoreName,
-    UnavailableHttpClient, UnavailableKvStore,
+    PlatformConfigStore, PlatformError, PlatformGeoModule, PlatformSecretStore, RuntimeServices,
+    StoreId, StoreName, UnavailableHttpClient, UnavailableKvStore,
 };
 use trusted_server_core::settings::Settings;
 use trusted_server_core::tsjs::tsjs_script_src;
@@ -1604,7 +1604,10 @@ fn stub_services() -> RuntimeServices {
         .kv_store(Arc::new(UnavailableKvStore))
         .backend(Arc::new(StubBackend))
         .http_client(Arc::new(UnavailableHttpClient))
-        .geo(Arc::new(DisabledGeo))
+        .geo(Arc::new(PlatformGeoModule::new(
+            "none",
+            Arc::new(DisabledGeo),
+        )))
         .client_info(ClientInfo::default())
         .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
         .build()

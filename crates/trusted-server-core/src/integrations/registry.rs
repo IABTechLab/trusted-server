@@ -20,7 +20,9 @@ use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
 use crate::middleware::{Middleware, MiddlewareChain, MiddlewarePhase, PhaseEntries};
 use crate::module_context::{ModuleCall, ModuleContext, ModuleRequest, ResolvedRequest};
-use crate::platform::{DisabledGeo, PlatformGeo, PlatformIdentity, RuntimeServices};
+use crate::platform::{
+    DisabledGeo, GeoModule, PlatformGeoModule, PlatformIdentity, RuntimeServices,
+};
 use crate::prefix::{PrefixModule, Prefixes, SelectedPrefixModule};
 use crate::robots_txt::{ALLOW_ALL, REFUSE_ALL, RobotsTxtContributor};
 use crate::settings::Settings;
@@ -655,7 +657,7 @@ pub struct IntegrationRegistration {
     ///
     /// Declaring one does not make it active, because the module is only asked
     /// to resolve location when `[geo] module` names it.
-    pub geo_module: Option<(&'static str, Arc<dyn PlatformGeo>)>,
+    pub geo_module: Option<(&'static str, Arc<dyn GeoModule>)>,
     /// Edge Cookie module this registration supplies, with the name
     /// `[ec] module` selects it by.
     ///
@@ -764,7 +766,7 @@ impl IntegrationRegistrationBuilder {
     /// `[geo] module` names it, and a module the selector does not choose is
     /// logged as a warning when the registry is built.
     #[must_use]
-    pub fn with_geo_module(mut self, name: &'static str, module: Arc<dyn PlatformGeo>) -> Self {
+    pub fn with_geo_module(mut self, name: &'static str, module: Arc<dyn GeoModule>) -> Self {
         self.registration.geo_module = Some((name, module));
         self
     }
@@ -914,7 +916,7 @@ struct IntegrationRegistryInner {
     // Geo modules the running registrations supply, each with the name
     // `[geo] module` selects it by, in registration order. Declaring one does
     // not activate it.
-    geo_modules: Vec<(&'static str, Arc<dyn PlatformGeo>)>,
+    geo_modules: Vec<(&'static str, Arc<dyn GeoModule>)>,
     // Edge Cookie modules the running registrations supply, each with its
     // name, in registration order. `[ec] module` picks at most one of them.
     ec_modules: Vec<(&'static str, Arc<dyn EdgeCookieModule>)>,
@@ -933,7 +935,7 @@ struct IntegrationRegistryInner {
     // The module `[geo] module` resolved to, or `None` when the selector
     // is `platform` and the adapter's own host lookup stands. Unset and `none`
     // both resolve the disabled module.
-    geo_module: Option<Arc<dyn PlatformGeo>>,
+    geo_module: Option<Arc<dyn GeoModule>>,
     ec_module: Option<Arc<dyn EdgeCookieModule>>,
     device_module: Option<Arc<dyn DeviceModule>>,
     // The prefix modules the running registrations supply, each with its
@@ -1371,13 +1373,16 @@ fn check_robots_txt_selection(
 fn resolve_geo_module(
     settings: &Settings,
     inner: &IntegrationRegistryInner,
-) -> Result<Option<Arc<dyn PlatformGeo>>, Report<TrustedServerError>> {
+) -> Result<Option<Arc<dyn GeoModule>>, Report<TrustedServerError>> {
     let selector = settings.geo.module.as_deref();
     let resolved = match selector {
         // Unset resolves nothing and makes no host geo call, so a default
         // deployment is not tied to any host geo service. `none` spells the
         // same choice explicitly.
-        None | Some(GEO_MODULE_NONE) => Some(Arc::new(DisabledGeo) as Arc<dyn PlatformGeo>),
+        None | Some(GEO_MODULE_NONE) => Some(Arc::new(PlatformGeoModule::new(
+            GEO_MODULE_NONE,
+            Arc::new(DisabledGeo),
+        )) as Arc<dyn GeoModule>),
         // `platform` opts in to the adapter's own host lookup, so the registry
         // supplies nothing and the adapter's module stands.
         Some(GEO_MODULE_PLATFORM) => None,
@@ -2037,7 +2042,7 @@ impl IntegrationRegistry {
     /// is `platform` and the adapter's own host lookup stands. Unset and `none`
     /// both resolve the disabled module.
     #[must_use]
-    pub fn geo_module(&self) -> Option<Arc<dyn PlatformGeo>> {
+    pub fn geo_module(&self) -> Option<Arc<dyn GeoModule>> {
         self.inner.geo_module.clone()
     }
 
@@ -6082,12 +6087,34 @@ mod tests {
     const GEO_PROBE_MODULE: &str = "testing.geo-probe";
 
     /// Builds a `geo-probe` registration that declares a geo module.
+    /// Calls a geo module as a request from no address does: with the
+    /// services and no client, so a platform lookup is asked about nothing.
+    async fn locate_without_a_client(
+        module: &dyn GeoModule,
+    ) -> Result<Option<crate::platform::GeoInfo>, Report<crate::platform::PlatformError>> {
+        let services = noop_services();
+        let method = http::Method::GET;
+        let context = crate::module_context::ModuleContext::new(
+            crate::module_context::ModuleRequest::new(&method, "publisher.example", "https", "/"),
+        )
+        .with_services(&services);
+        module
+            .locate(context.call(module.id(), module.required_permissions()))
+            .await
+    }
+
     fn geo_probe_registration(
         _settings: &Settings,
     ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
         Ok(Some(
             IntegrationRegistration::builder("geo-probe")
-                .with_geo_module(GEO_PROBE_MODULE, Arc::new(FixedCountryGeo))
+                .with_geo_module(
+                    GEO_PROBE_MODULE,
+                    Arc::new(PlatformGeoModule::new(
+                        GEO_PROBE_MODULE,
+                        Arc::new(FixedCountryGeo),
+                    )),
+                )
                 .build(),
         ))
     }
@@ -6397,8 +6424,7 @@ mod tests {
         let module = registry
             .geo_module()
             .expect("should resolve the module's geo module");
-        let resolved = module
-            .lookup(None, &noop_services())
+        let resolved = locate_without_a_client(&*module)
             .await
             .expect("should look up without failing")
             .expect("should resolve a location");
@@ -6419,8 +6445,7 @@ mod tests {
             .geo_module()
             .expect("should resolve the disabled geo module");
         assert!(
-            module
-                .lookup(None, &noop_services())
+            locate_without_a_client(&*module)
                 .await
                 .expect("should look up without failing")
                 .is_none(),
@@ -6447,8 +6472,7 @@ mod tests {
             .geo_module()
             .expect("an unset selector should resolve the disabled module, not nothing");
         assert!(
-            module
-                .lookup(None, &noop_services())
+            locate_without_a_client(&*module)
                 .await
                 .expect("should look up without failing")
                 .is_none(),
@@ -6664,7 +6688,13 @@ mod tests {
     ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
         Ok(Some(
             IntegrationRegistration::builder("example-vendor")
-                .with_geo_module("geo.example", Arc::new(FixedCountryGeo))
+                .with_geo_module(
+                    "geo.example",
+                    Arc::new(PlatformGeoModule::new(
+                        "geo.example",
+                        Arc::new(FixedCountryGeo),
+                    )),
+                )
                 .with_device_module("device.example", Arc::new(ExampleDevice))
                 .with_ec_module("edgecookie.example", Arc::new(ExampleEc))
                 .build(),
@@ -6837,7 +6867,13 @@ mod tests {
     ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
         Ok(Some(
             IntegrationRegistration::builder("geo-second")
-                .with_geo_module(GEO_PROBE_MODULE, Arc::new(FixedCountryGeo))
+                .with_geo_module(
+                    GEO_PROBE_MODULE,
+                    Arc::new(PlatformGeoModule::new(
+                        GEO_PROBE_MODULE,
+                        Arc::new(FixedCountryGeo),
+                    )),
+                )
                 .build(),
         ))
     }

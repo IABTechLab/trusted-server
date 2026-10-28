@@ -18,8 +18,8 @@ use error_stack::Report;
 use trusted_server_core::permissions::PermissionPolicy;
 use trusted_server_core::platform::{
     BackendNamingPolicy, ClientInfo, DisabledGeo, PlatformBackend, PlatformBackendSpec,
-    PlatformConfigStore, PlatformError, PlatformSecretStore, RuntimeServices, StoreId, StoreName,
-    UnavailableHttpClient, UnavailableKvStore,
+    PlatformConfigStore, PlatformError, PlatformGeoModule, PlatformSecretStore, RuntimeServices,
+    StoreId, StoreName, UnavailableHttpClient, UnavailableKvStore,
 };
 use trusted_server_core::request_signing::rotation::KeyRotationManager;
 use trusted_server_core::request_signing::{kid_is_creatable, kid_is_well_formed};
@@ -294,7 +294,10 @@ fn services(runner: Arc<dyn FastlyRunner>, stores: &StoreArgs) -> RuntimeService
         .kv_store(Arc::new(UnavailableKvStore))
         .backend(Arc::new(NoBackend))
         .http_client(Arc::new(UnavailableHttpClient))
-        .geo(Arc::new(DisabledGeo))
+        .geo(Arc::new(PlatformGeoModule::new(
+            "none",
+            Arc::new(DisabledGeo),
+        )))
         .client_info(ClientInfo::default())
         // The commands decide no request's permissions, and every services
         // graph carries a policy, so they carry the one that grants nothing.

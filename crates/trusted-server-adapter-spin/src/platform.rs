@@ -1098,15 +1098,7 @@ mod tests {
             services.client_info().client_ip.is_none(),
             "should not set client IP without Spin request context"
         );
-        assert!(
-            services
-                .geo()
-                .lookup(None, &test_services())
-                .await
-                .expect("should not fail")
-                .is_none(),
-            "should use null geo"
-        );
+        assert!(services.geo().id() == "none", "should use null geo");
         assert!(
             services
                 .config_store()

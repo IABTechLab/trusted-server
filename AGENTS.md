@@ -37,6 +37,7 @@ crates/
     fastly/                             # trusted-server-device-fastly (opt-in TLS/H2 device module)
   edgecookie/                           # vendor Edge Cookie module crates (built-in HMAC module is in core)
   geo/                                  # vendor geo module crates (host geo is injected by the adapter)
+  headers/                              # response header module crates (geo, which writes the x-geo-* headers)
   permission-signal/                    # permission signal module crates, one per scheme (gpc, gpp, tcf, us-privacy), and core links none
   trusted-server-js/                    # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline

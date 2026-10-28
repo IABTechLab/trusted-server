@@ -869,7 +869,7 @@ TRUSTED_SERVER__DEVICE__MODULE=builtin
 
 ## Geo Configuration
 
-Selects how a client IP is resolved into geolocation (country, region, coordinates), mirroring the Edge Cookie module selection. The resolved country also feeds the [permission model](/guide/permission-model).
+Selects the module that resolves the request into geolocation (country, region, coordinates), mirroring the Edge Cookie module selection. The module is called with the request as a device module is, so a module may resolve from more than the client address. The resolved country also feeds the [permission model](/guide/permission-model).
 
 ### `[geo]`
 
@@ -883,11 +883,30 @@ module, so it sits directly in `[geo]`.
 
 No module is the default, so a default deployment is not tied to any host geo service. A module from a crate at `crates/geo/<name>` is written `<name>` or `geo.<name>`, and the crate's own module has to be selected in the section of its type as well. Naming a module this deployment does not run fails at startup, with the geo modules it does run. A failed geo lookup at request time resolves every permission to the requires-signal floor and is logged at error level, so an outage is handled protectively.
 
+**What `platform` selects.** On Fastly it is Fastly's geo lookup of the client address. On Cloudflare the location is read from the `cf-*` request headers, and the region from `cf-region-code` alone, which Cloudflare's Add visitor location headers managed transform adds. Without that header a US visitor is placed in no state, so the rules `permissions.yaml` gives a US state, and the opt-out signals they read, do not apply. The Axum dev server and Spin have no geo lookup, and refuse `platform` at startup naming the setting.
+
 **Example**:
 
 ```toml
 [geo]
 module = "platform"
+```
+
+**Location headers.** No response carries an `x-geo-*` header unless the
+deployment selects `headers.geo` and names it in a `[[serve]]` entry. On the
+responses the entry covers, the middleware then writes the location already
+resolved for the request, being `x-geo-city`, `x-geo-country`,
+`x-geo-continent`, `x-geo-coordinates`, `x-geo-metro-code` and `x-geo-region`
+where the answer has them, and `x-geo-info-available` as `true` or `false`.
+Selecting the module without such an entry is refused when the settings load.
+
+```toml
+[headers]
+modules = ["geo"]
+
+[[serve]]
+media_type = "text/html"
+middleware = ["headers.geo"]
 ```
 
 **Environment Override**:
@@ -2096,6 +2115,7 @@ generated configuration places it in.
 | `ad-tag.google.loader`        | `[[serve]]` | Writes the loader tag into the head, after the bootstrap, when `write_loader` is set, for a reader whose permissions allow storage on the device                                                                                                                                                                                                                  |
 | `ad-tag.google.diagnostics`   | `[[serve]]` | For a request that activated diagnostics, writes the bootstrap ahead of the script bundle and the tag that loads the diagnostics module straight after it                                                                                                                                                                                                         |
 | `ads-txt.sellers`             | `[[fetch]]` | Writes the lines `[ads-txt.sellers]` gives at the end of the publisher's `ads.txt`, on `text/plain` alone                                                                                                                                                                                                                                                         |
+| `headers.geo`                 | `[[serve]]` | Writes the location the request resolved as the `x-geo-*` response headers, or `x-geo-info-available: false` where none is known. `[headers] modules = ["geo"]` selects it                                                                                                                                                                                        |
 | `robots_txt`                  | `[[fetch]]` | Makes the `robots.txt` that `[robots-txt]` describes, in place of whatever the origin answers, on `text/plain` and at `/robots.txt` alone                                                                                                                                                                                                                         |
 | `service_version`             | `[[serve]]` | Writes `X-TS-Version`, the git version the build compiled in, and `X-TS-Service-Version`, the platform's version number of the service, when each is known. Core supplies it, so no section selects it                                                                                                                                                            |
 

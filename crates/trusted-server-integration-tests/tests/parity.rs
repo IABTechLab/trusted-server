@@ -2,7 +2,7 @@
 //!
 //! Sends identical requests to all host-runnable adapters and asserts that:
 //! - Response status codes match
-//! - Critical headers (X-Geo-Info-Available) match
+//! - No adapter writes an `x-geo-*` header on its own routes
 //!
 //! Fastly parity is verified via cargo test-fastly + Viceroy in CI.
 
@@ -660,7 +660,7 @@ async fn verify_signature_route_parity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn geo_header_parity_on_all_responses() {
+async fn no_adapter_writes_a_geo_header_on_its_own_routes() {
     let routes_to_check: &[(&str, &str, &str)] = &[
         ("GET", "/.well-known/trusted-server.json", ""),
         ("POST", "/auction", r#"{"adUnits":[]}"#),
@@ -684,36 +684,24 @@ async fn geo_header_parity_on_all_responses() {
             spin_post_headers(path, body).await
         };
 
-        assert!(
-            axum_headers.contains_key("x-geo-info-available"),
-            "Axum: {method} {path} (status={axum_status}) must have X-Geo-Info-Available"
-        );
-        assert!(
-            cf_headers.contains_key("x-geo-info-available"),
-            "Cloudflare: {method} {path} (status={cf_status}) must have X-Geo-Info-Available"
-        );
-        let axum_geo = axum_headers
-            .get("x-geo-info-available")
-            .expect("should have x-geo-info-available after assert")
-            .to_str()
-            .expect("should be valid UTF-8");
-        let cf_geo = cf_headers
-            .get("x-geo-info-available")
-            .expect("should have x-geo-info-available after assert")
-            .to_str()
-            .expect("should be valid UTF-8");
-        assert_eq!(
-            axum_geo, cf_geo,
-            "{method} {path}: X-Geo-Info-Available value must match across adapters \
-             (axum={axum_geo:?} cf={cf_geo:?})"
-        );
-        // Spin hardcodes X-Geo-Info-Available: false (no geo headers available in the
-        // Spin runtime). Value comparison against axum/cf would lock in a known asymmetry,
-        // so presence is the gate here.
-        assert!(
-            spin_headers.contains_key("x-geo-info-available"),
-            "Spin: {method} {path} (status={spin_status}) must have X-Geo-Info-Available"
-        );
+        // The x-geo-* headers are written by a serve middleware on the pages
+        // an entry names it for, and never on a route of the server's own.
+        for (adapter, status, headers) in [
+            ("Axum", axum_status, &axum_headers),
+            ("Cloudflare", cf_status, &cf_headers),
+            ("Spin", spin_status, &spin_headers),
+        ] {
+            let geo_headers: Vec<&str> = headers
+                .keys()
+                .map(http::HeaderName::as_str)
+                .filter(|name| name.starts_with("x-geo-"))
+                .collect();
+            assert!(
+                geo_headers.is_empty(),
+                "{adapter}: {method} {path} (status={status}) must carry no x-geo-* header: \
+                 {geo_headers:?}"
+            );
+        }
     }
 }
 

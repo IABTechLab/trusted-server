@@ -84,5 +84,11 @@ resolved. See the [API reference](./api-reference) for route-level behavior.
 The Worker sends no [auction telemetry](./telemetry#adapter-support), and warns
 at startup when `[analytics]` selects a module.
 
+With `[geo] module = "platform"` the Worker reads the location from the `cf-*`
+request headers and the region from `cf-region-code` alone, which Cloudflare's
+Add visitor location headers managed transform adds. Without that header a US
+visitor is placed in no state, so the rules `permissions.yaml` gives a US
+state do not apply to them.
+
 Compare the [Fastly](./fastly), [Spin](./spin), and [Axum](./axum-dev)
 adapter journeys.

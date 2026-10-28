@@ -56,7 +56,7 @@ Native Axum dev/test adapter (native binary):
 | Feature                  | Axum dev server                                                                                                                              |
 | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | KV store                 | Unavailable — synthetic-ID and consent routes degrade gracefully                                                                             |
-| Geo lookup               | Always returns `None`                                                                                                                        |
+| Geo lookup               | None, and `[geo] module = "platform"` is refused at startup                                                                                  |
 | Auction fan-out ordering | Requests run concurrently via `tokio::spawn`; `select` returns first-to-complete but does not replicate Fastly's priority-queue tie-breaking |
 
 ### trusted-server-adapter-spin

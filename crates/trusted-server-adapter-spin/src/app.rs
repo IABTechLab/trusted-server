@@ -245,6 +245,11 @@ fn build_state_with_registrations_and_services(
             .and_then(RuntimeServices::resolved_ec_module)
             .or_else(|| registry.ec_module()),
     )?;
+    // Services a caller supplies carry a geo lookup of their own for
+    // `platform` to select, and this host's own resolves nothing.
+    if services.is_none() {
+        refuse_platform_geo(&settings)?;
+    }
     let permission_signal_modules =
         trusted_server_core::permission_signal::build_permission_signal_modules(
             &settings,
@@ -271,6 +276,25 @@ fn build_state_with_registrations_and_services(
         permission_policy,
         services,
         loading_caches,
+    }))
+}
+
+/// Refuses `[geo] module = "platform"`, because this host has no geo lookup.
+///
+/// The selection would locate no request and still count as a geo module,
+/// so a deployment running an Edge Cookie module would never be asked to
+/// acknowledge single-jurisdiction operation.
+fn refuse_platform_geo(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    if settings.geo.module.as_deref() != Some("platform") {
+        return Ok(());
+    }
+    Err(Report::new(TrustedServerError::Configuration {
+        message: "`[geo] module = \"platform\"` selects the host's own geo lookup, and \
+                  Spin has no geo lookup, so no request would be located. Select a geo \
+                  module a linked crate offers, or leave `[geo] module` unset, which needs \
+                  `[geo] assume_single_jurisdiction = true` when an Edge Cookie module is \
+                  configured"
+            .to_owned(),
     }))
 }
 

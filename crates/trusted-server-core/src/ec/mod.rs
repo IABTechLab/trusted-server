@@ -392,9 +392,18 @@ impl EcContext {
         req: &Request<EdgeBody>,
         services: &RuntimeServices,
     ) -> Result<Self, Report<TrustedServerError>> {
+        // The geo module is called as the device module is, with the
+        // request's evidence, its settings and its services, so a module
+        // that answers location and device from one service can answer both
+        // from one call.
         let lookup = services
             .geo()
-            .lookup(services.client_info().client_ip, services)
+            .locate_request(
+                ModuleRequest::of(req, services.client_info()),
+                Some(req.headers()),
+                Some(settings),
+                services,
+            )
             .await;
         let geo_info = match &lookup {
             Ok(info) => info.clone(),
@@ -1971,7 +1980,10 @@ pub(crate) mod tests {
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
             .backend(Arc::new(crate::platform::test_support::NoopBackend))
             .http_client(Arc::new(crate::platform::test_support::NoopHttpClient))
-            .geo(Arc::new(ConfigReadingGeo))
+            .geo(Arc::new(crate::platform::PlatformGeoModule::new(
+                "config-reading",
+                Arc::new(ConfigReadingGeo),
+            )))
             .client_info(crate::platform::ClientInfo::default())
             .build();
 
@@ -1983,6 +1995,62 @@ pub(crate) mod tests {
             ec.geo_info().map(|info| info.country.as_str()),
             Some("DE"),
             "the resolved country must come from the value the geo module read              through the services it was handed"
+        );
+    }
+
+    /// A geo module that answers from the request's User-Agent, which only a
+    /// module called with the request's evidence can read, the way a device
+    /// module is called.
+    #[derive(Debug)]
+    struct UserAgentReadingGeo;
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::platform::GeoModule for UserAgentReadingGeo {
+        fn id(&self) -> &'static str {
+            "testing.user-agent-geo"
+        }
+
+        async fn locate(
+            &self,
+            call: crate::module_context::ModuleCall<'_>,
+        ) -> Result<Option<GeoInfo>, Report<crate::platform::PlatformError>> {
+            use crate::module_context::FromModuleContext;
+
+            let evidence = <&dyn crate::evidence::RequestInfo>::from_module_context(&call)
+                .map_err(|_| Report::new(crate::platform::PlatformError::Geo))?;
+            let country = match evidence.header("user-agent") {
+                Some(agent) if agent.contains("Kiosk/1.0") => "FR",
+                _ => "ZZ",
+            };
+            Ok(Some(GeoInfo {
+                country: country.to_owned(),
+                ..non_regulated_geo()
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_geo_module_is_called_with_the_request_as_evidence() {
+        let settings = create_test_settings();
+        let req = create_test_request(&[("user-agent", "Mozilla/5.0 Kiosk/1.0")]);
+        let services = crate::platform::test_support::test_services_builder()
+            .config_store(Arc::new(crate::platform::test_support::NoopConfigStore))
+            .secret_store(Arc::new(crate::platform::test_support::NoopSecretStore))
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+            .backend(Arc::new(crate::platform::test_support::NoopBackend))
+            .http_client(Arc::new(crate::platform::test_support::NoopHttpClient))
+            .geo(Arc::new(UserAgentReadingGeo))
+            .client_info(crate::platform::ClientInfo::default())
+            .build();
+
+        let ec = EcContext::read_from_request_resolving_geo(&settings, &req, &services)
+            .await
+            .expect("should read EC context");
+
+        assert_eq!(
+            ec.geo_info().map(|info| info.country.as_str()),
+            Some("FR"),
+            "the country can only be FR if the module read the User-Agent from the call's evidence"
         );
     }
 

@@ -43,6 +43,7 @@ pub fn builders() -> Vec<IntegrationBuilder> {
         trusted_server_ad_tag_google::builder(),
         trusted_server_ad_tag_google::diagnostics::builder(),
         trusted_server_ads_txt_sellers::builder(),
+        trusted_server_headers_geo::builder(),
         // Implementations `[demand]` and `[ad-server]` can name, which no
         // section selects.
         trusted_server_auction_protocol_openrtb::builder(),
@@ -112,6 +113,7 @@ pub fn middleware() -> Vec<StockMiddleware> {
     use trusted_server_core::robots_txt::middleware as robots_txt;
     use trusted_server_core::service_version;
     use trusted_server_framework_nextjs as nextjs;
+    use trusted_server_headers_geo as geo_headers;
     use trusted_server_identity_lockr as lockr;
     use trusted_server_tag_google_tag as google_tag;
     use trusted_server_tag_google_tag_manager as google_tag_manager;
@@ -155,6 +157,7 @@ pub fn middleware() -> Vec<StockMiddleware> {
             media_type: ads_txt_sellers::MEDIA_TYPE,
             name: ads_txt_sellers::MODULE,
         },
+        row(geo_headers::builder().id(), Serve, geo_headers::MODULE),
         // Core makes the file `[robots-txt]` describes under the module's
         // own name, on the file's path alone.
         StockMiddleware {
@@ -216,6 +219,7 @@ mod tests {
         include_str!("../../bot-protection/datadome/src/fixtures/page-change.settings.toml"),
         include_str!("../../ad-tag/google/src/fixtures/page-change.settings.toml"),
         include_str!("../../ads-txt/sellers/src/fixtures/sellers.settings.toml"),
+        include_str!("../../headers/geo/src/fixtures/geo-headers.settings.toml"),
     ];
 
     #[test]
@@ -498,6 +502,7 @@ middleware = [\"robots_txt\"]
                 "ad-tag.google",
                 "ad-tag.google.diagnostics",
                 "ads-txt.sellers",
+                "headers.geo",
                 "auction-protocol.openrtb",
                 "auction.prebid-server",
                 "auction.aps",

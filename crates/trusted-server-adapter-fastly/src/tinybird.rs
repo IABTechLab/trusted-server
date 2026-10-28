@@ -416,7 +416,9 @@ mod tests {
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
             .backend(backend)
             .http_client(http_client)
-            .geo(Arc::new(NoopGeo))
+            .geo(Arc::new(
+                trusted_server_core::platform::PlatformGeoModule::new("noop", Arc::new(NoopGeo)),
+            ))
             .client_info(ClientInfo::default())
             .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
             .build()

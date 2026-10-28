@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::auction::telemetry::{AuctionTelemetrySink, NoopAuctionTelemetrySink};
 
 use super::{
-    PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformHttpClient, PlatformKvStore,
+    GeoModule, PlatformBackend, PlatformConfigStore, PlatformHttpClient, PlatformKvStore,
     PlatformSecretStore,
 };
 use crate::ec::device::DeviceModule;
@@ -200,7 +200,7 @@ pub struct RuntimeServices {
     /// Outbound HTTP client abstraction.
     pub(crate) http_client: Arc<dyn PlatformHttpClient>,
     /// Geographic information lookup.
-    pub(crate) geo: Arc<dyn PlatformGeo>,
+    pub(crate) geo: Arc<dyn GeoModule>,
     /// Auction telemetry sink.
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
     /// Per-request client metadata extracted at the entry point.
@@ -336,9 +336,9 @@ impl RuntimeServices {
         &*self.http_client
     }
 
-    /// Returns the platform geo lookup service.
+    /// Returns the geo module the request is located by.
     #[must_use]
-    pub fn geo(&self) -> &dyn PlatformGeo {
+    pub fn geo(&self) -> &dyn GeoModule {
         &*self.geo
     }
 
@@ -475,7 +475,7 @@ impl RuntimeServices {
     /// the host's own lookup without the rest of the runtime services graph
     /// being rebuilt.
     #[must_use]
-    pub fn with_geo(self, geo: Arc<dyn PlatformGeo>) -> Self {
+    pub fn with_geo(self, geo: Arc<dyn GeoModule>) -> Self {
         Self { geo, ..self }
     }
 
@@ -623,7 +623,7 @@ pub struct RuntimeServicesBuilder {
     template_assembler: Option<Arc<dyn super::PlatformTemplateAssembler>>,
     backend: Option<Arc<dyn PlatformBackend>>,
     http_client: Option<Arc<dyn PlatformHttpClient>>,
-    geo: Option<Arc<dyn PlatformGeo>>,
+    geo: Option<Arc<dyn GeoModule>>,
     auction_telemetry_sink: Option<Arc<dyn AuctionTelemetrySink>>,
     client_info: Option<ClientInfo>,
     host_signals: Option<Arc<dyn HostSignals>>,
@@ -726,7 +726,7 @@ impl RuntimeServicesBuilder {
 
     /// Set the geo lookup implementation.
     #[must_use]
-    pub fn geo(mut self, geo: Arc<dyn PlatformGeo>) -> Self {
+    pub fn geo(mut self, geo: Arc<dyn GeoModule>) -> Self {
         self.geo = Some(geo);
         self
     }

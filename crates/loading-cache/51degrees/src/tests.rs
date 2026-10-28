@@ -179,7 +179,9 @@ fn services_builder(
         .kv_store(kv)
         .backend(Arc::new(NoopBackend))
         .http_client(Arc::new(NoopHttpClient))
-        .geo(Arc::new(NoopGeo))
+        .geo(Arc::new(
+            trusted_server_core::platform::PlatformGeoModule::new("noop", Arc::new(NoopGeo)),
+        ))
         .client_info(ClientInfo::default())
 }
 

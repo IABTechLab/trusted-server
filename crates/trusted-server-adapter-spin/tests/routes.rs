@@ -19,7 +19,13 @@ use trusted_server_core::settings::Settings;
 /// every route into a startup error page (and its route table into the
 /// fallback-only set).
 fn test_router() -> RouterService {
-    let settings = Settings::from_toml(
+    TrustedServerApp::routes_with_settings(test_settings())
+        .expect("should build router from test settings")
+}
+
+/// The settings [`test_router`] is built from.
+fn test_settings() -> Settings {
+    Settings::from_toml(
         r#"
             [publisher]
             domain = "test-publisher.example.com"
@@ -39,10 +45,29 @@ fn test_router() -> RouterService {
     )
     .expect("should parse route test settings")
     // A loaded domain carries its policy.
-    .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
+    .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
+}
 
+/// A router whose settings add one operator header, which only
+/// `FinalizeResponseMiddleware` writes, so a response carrying it passed
+/// through that middleware.
+fn router_writing_an_operator_header() -> RouterService {
+    let mut settings = test_settings();
+    settings
+        .response_headers
+        .insert("X-Finalized".to_owned(), "1".to_owned());
     TrustedServerApp::routes_with_settings(settings)
         .expect("should build router from test settings")
+}
+
+/// The `x-geo-*` headers on `response`, by name.
+fn geo_header_names(response: &Response) -> Vec<String> {
+    response
+        .headers()
+        .keys()
+        .map(|name| name.as_str().to_owned())
+        .filter(|name| name.starts_with("x-geo-"))
+        .collect()
 }
 
 async fn route(router: RouterService, req: Request) -> Response {
@@ -137,10 +162,11 @@ async fn health_route_returns_ok() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn finalize_middleware_injects_geo_header() {
-    // The X-Geo-Info-Available header is injected by FinalizeResponseMiddleware.
-    // Its absence on any response means the middleware was not wired.
-    let router = test_router();
+async fn finalize_middleware_writes_the_operators_headers_and_no_geo_header() {
+    // The operator's header is written by FinalizeResponseMiddleware alone, so
+    // its absence on a response means the middleware was not wired. No
+    // x-geo-* header is written there, because a serve middleware writes them.
+    let router = router_writing_an_operator_header();
 
     let req = request_builder()
         .method("GET")
@@ -150,17 +176,25 @@ async fn finalize_middleware_injects_geo_header() {
 
     let resp = route(router, req).await;
 
+    assert_eq!(
+        resp.headers()
+            .get("x-finalized")
+            .and_then(|value| value.to_str().ok()),
+        Some("1"),
+        "FinalizeResponseMiddleware must write the operator's headers on every response"
+    );
     assert!(
-        resp.headers().contains_key("x-geo-info-available"),
-        "FinalizeResponseMiddleware must inject X-Geo-Info-Available on every response"
+        geo_header_names(&resp).is_empty(),
+        "no adapter writes an x-geo-* header: {:?}",
+        geo_header_names(&resp)
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_middleware_chain_runs_for_a_routed_request() {
-    // Asserts that the finalizing middleware ran (X-Geo-Info-Available present)
-    // and that the route is actually reached (status != 404).
-    let router = test_router();
+    // Asserts that the finalizing middleware ran (the operator's header
+    // present) and that the route is actually reached (status != 404).
+    let router = router_writing_an_operator_header();
 
     let req = request_builder()
         .method("POST")
@@ -172,8 +206,8 @@ async fn the_middleware_chain_runs_for_a_routed_request() {
     let resp = route(router, req).await;
 
     assert!(
-        resp.headers().contains_key("x-geo-info-available"),
-        "middleware chain must inject X-Geo-Info-Available"
+        resp.headers().contains_key("x-finalized"),
+        "middleware chain must write the operator's headers"
     );
     assert_ne!(
         resp.status().as_u16(),
@@ -1108,6 +1142,25 @@ fn selecting_a_module_this_adapter_cannot_supply_fails_at_startup() {
     assert!(
         error.to_string().contains("acme"),
         "the startup error should name the selected module, got: {error}"
+    );
+}
+
+/// `[geo] module = "platform"` selects the host's own geo lookup, which Spin
+/// does not have, so startup refuses it rather than come up locating no
+/// request with the single-jurisdiction check skipped.
+#[test]
+fn selecting_the_platform_geo_lookup_fails_at_startup() {
+    let mut settings = test_settings();
+    settings.geo.module = Some("platform".to_owned());
+
+    let error = TrustedServerApp::routes_with_settings(settings)
+        .err()
+        .expect("should refuse the host's geo lookup on a host that has none");
+    let message = error.to_string();
+
+    assert!(
+        message.contains(r#"`[geo] module = "platform"`"#) && message.contains("has no geo lookup"),
+        "should name the setting and say the host has no geo lookup: {message}"
     );
 }
 

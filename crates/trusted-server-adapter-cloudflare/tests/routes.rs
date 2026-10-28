@@ -20,7 +20,13 @@ const LEGACY_ADMIN_DENY_METHODS: &[&str] =
 /// serves the startup error router on every route (and its route table is the
 /// fallback-only set).
 fn test_router() -> RouterService {
-    let settings = Settings::from_toml(
+    TrustedServerApp::routes_with_settings(test_settings())
+        .expect("should build router from test settings")
+}
+
+/// The settings [`test_router`] is built from.
+fn test_settings() -> Settings {
+    Settings::from_toml(
         r#"
             [publisher]
             domain = "test-publisher.example.com"
@@ -40,10 +46,29 @@ fn test_router() -> RouterService {
     )
     .expect("should parse route test settings")
     // A loaded domain carries its policy.
-    .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
+    .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
+}
 
+/// A router whose settings add one operator header, which only
+/// `FinalizeResponseMiddleware` writes, so a response carrying it passed
+/// through that middleware.
+fn router_writing_an_operator_header() -> RouterService {
+    let mut settings = test_settings();
+    settings
+        .response_headers
+        .insert("X-Finalized".to_owned(), "1".to_owned());
     TrustedServerApp::routes_with_settings(settings)
         .expect("should build router from test settings")
+}
+
+/// The `x-geo-*` headers on `response`, by name.
+fn geo_header_names(response: &Response) -> Vec<String> {
+    response
+        .headers()
+        .keys()
+        .map(|name| name.as_str().to_owned())
+        .filter(|name| name.starts_with("x-geo-"))
+        .collect()
 }
 
 /// Return the set of (METHOD, path) pairs explicitly registered on the router.
@@ -111,10 +136,11 @@ fn routes_build_without_panic() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn finalize_middleware_injects_geo_header() {
-    // The X-Geo-Info-Available header is injected by FinalizeResponseMiddleware.
-    // Its absence on any response means the middleware was not wired.
-    let router = test_router();
+async fn finalize_middleware_writes_the_operators_headers_and_no_geo_header() {
+    // The operator's header is written by FinalizeResponseMiddleware alone, so
+    // its absence on a response means the middleware was not wired. No
+    // x-geo-* header is written there, because a serve middleware writes them.
+    let router = router_writing_an_operator_header();
 
     let req = request_builder()
         .method("GET")
@@ -124,9 +150,17 @@ async fn finalize_middleware_injects_geo_header() {
 
     let resp = route(router, req).await;
 
+    assert_eq!(
+        resp.headers()
+            .get("x-finalized")
+            .and_then(|value| value.to_str().ok()),
+        Some("1"),
+        "FinalizeResponseMiddleware must write the operator's headers on every response"
+    );
     assert!(
-        resp.headers().contains_key("x-geo-info-available"),
-        "FinalizeResponseMiddleware must inject X-Geo-Info-Available on every response"
+        geo_header_names(&resp).is_empty(),
+        "no adapter writes an x-geo-* header: {:?}",
+        geo_header_names(&resp)
     );
 }
 

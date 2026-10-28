@@ -964,7 +964,10 @@ pub fn build_services_with_config_and_secret(
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(Arc::new(NoopBackend))
         .http_client(Arc::new(NoopHttpClient))
-        .geo(Arc::new(NoopGeo))
+        .geo(Arc::new(super::PlatformGeoModule::new(
+            "noop",
+            Arc::new(NoopGeo),
+        )))
         .client_info(ClientInfo::default())
         .build()
 }
@@ -980,7 +983,10 @@ pub fn build_services_with_config_and_secret_and_client_ip(
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(Arc::new(NoopBackend))
         .http_client(Arc::new(NoopHttpClient))
-        .geo(Arc::new(NoopGeo))
+        .geo(Arc::new(super::PlatformGeoModule::new(
+            "noop",
+            Arc::new(NoopGeo),
+        )))
         .client_info(ClientInfo {
             client_ip: Some(client_ip),
             ..ClientInfo::default()
@@ -1017,7 +1023,10 @@ pub fn build_services_with_config(
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(Arc::new(NoopBackend))
         .http_client(Arc::new(NoopHttpClient))
-        .geo(Arc::new(NoopGeo))
+        .geo(Arc::new(super::PlatformGeoModule::new(
+            "noop",
+            Arc::new(NoopGeo),
+        )))
         .client_info(ClientInfo::default())
         .build()
 }
@@ -1033,6 +1042,7 @@ pub fn noop_services() -> RuntimeServices {
 /// This is the only way to reach the lookup-failure path, because the seam is
 /// what turns an `Err` into the requires-signal floor.
 pub fn build_services_with_geo(geo: Arc<dyn PlatformGeo>) -> RuntimeServices {
+    let geo: Arc<dyn super::GeoModule> = Arc::new(super::PlatformGeoModule::new("test", geo));
     test_services_builder()
         .config_store(Arc::new(NoopConfigStore))
         .secret_store(Arc::new(NoopSecretStore))
@@ -1059,7 +1069,10 @@ pub fn noop_services_with_device_module(
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(Arc::new(NoopBackend))
         .http_client(Arc::new(NoopHttpClient))
-        .geo(Arc::new(NoopGeo))
+        .geo(Arc::new(super::PlatformGeoModule::new(
+            "noop",
+            Arc::new(NoopGeo),
+        )))
         .client_info(ClientInfo::default())
         .build()
         .with_device_module(device_module)
@@ -1209,7 +1222,10 @@ pub fn services_with_ec_module_and_config_store(
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(Arc::new(NoopBackend))
         .http_client(Arc::new(NoopHttpClient))
-        .geo(Arc::new(NoopGeo))
+        .geo(Arc::new(super::PlatformGeoModule::new(
+            "noop",
+            Arc::new(NoopGeo),
+        )))
         .client_info(ClientInfo {
             client_ip: Some("203.0.113.10".parse().expect("should parse test client IP")),
             ..ClientInfo::default()
@@ -1234,7 +1250,10 @@ fn noop_services_with_ec_module_and_ip(
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(Arc::new(NoopBackend))
         .http_client(Arc::new(NoopHttpClient))
-        .geo(Arc::new(NoopGeo))
+        .geo(Arc::new(super::PlatformGeoModule::new(
+            "noop",
+            Arc::new(NoopGeo),
+        )))
         .client_info(ClientInfo {
             client_ip,
             ..ClientInfo::default()
@@ -1255,7 +1274,10 @@ pub fn noop_services_with_telemetry_sink(
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(Arc::new(NoopBackend))
         .http_client(Arc::new(NoopHttpClient))
-        .geo(Arc::new(NoopGeo))
+        .geo(Arc::new(super::PlatformGeoModule::new(
+            "noop",
+            Arc::new(NoopGeo),
+        )))
         .auction_telemetry_sink(auction_telemetry_sink)
         .client_info(ClientInfo::default())
         .build()
@@ -1285,7 +1307,10 @@ pub fn build_services_with_http_client_and_client_ip(
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(Arc::new(StubBackend))
         .http_client(http_client)
-        .geo(Arc::new(NoopGeo))
+        .geo(Arc::new(super::PlatformGeoModule::new(
+            "noop",
+            Arc::new(NoopGeo),
+        )))
         .client_info(ClientInfo {
             client_ip: Some(client_ip),
             ..ClientInfo::default()
@@ -1300,7 +1325,10 @@ pub fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(Arc::new(NoopBackend))
         .http_client(Arc::new(NoopHttpClient))
-        .geo(Arc::new(NoopGeo))
+        .geo(Arc::new(super::PlatformGeoModule::new(
+            "noop",
+            Arc::new(NoopGeo),
+        )))
         .client_info(ClientInfo {
             client_ip: Some(ip),
             ..ClientInfo::default()
@@ -1329,7 +1357,10 @@ pub fn build_services_with_backend_and_http_client(
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(backend)
         .http_client(http_client)
-        .geo(Arc::new(NoopGeo))
+        .geo(Arc::new(super::PlatformGeoModule::new(
+            "noop",
+            Arc::new(NoopGeo),
+        )))
         .client_info(ClientInfo {
             client_ip: None,
             tls_protocol: None,
@@ -1351,7 +1382,10 @@ pub fn build_services_with_config_secret_and_http_client(
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(Arc::new(StubBackend))
         .http_client(http_client)
-        .geo(Arc::new(NoopGeo))
+        .geo(Arc::new(super::PlatformGeoModule::new(
+            "noop",
+            Arc::new(NoopGeo),
+        )))
         .client_info(ClientInfo::default())
         .build()
 }
@@ -1367,7 +1401,10 @@ pub fn build_services_with_secret_http_client_and_client_ip(
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(Arc::new(StubBackend))
         .http_client(http_client)
-        .geo(Arc::new(NoopGeo))
+        .geo(Arc::new(super::PlatformGeoModule::new(
+            "noop",
+            Arc::new(NoopGeo),
+        )))
         .client_info(ClientInfo {
             client_ip,
             tls_protocol: None,

@@ -187,6 +187,12 @@ pull_sync_concurrency = 3
 # instead.
 # assume_single_jurisdiction = true
 
+# The x-geo-* response headers, written from the location the geo module
+# resolved by the `headers.geo` middleware, on the responses the [[serve]]
+# entry naming it covers. No response carries them without both.
+# [headers]
+# modules = ["geo"]
+
 # Custom headers added to every response (e.g. X-Robots-Tag: noindex).
 # [response_headers]
 # X-Robots-Tag = "noindex"
@@ -390,6 +396,7 @@ pull_sync_concurrency = 3
 #   "bot-protection.datadome.tag",
 #   "ad-tag.google.loader",
 #   "ad-tag.google.diagnostics",
+#   "headers.geo",
 #   "service_version",
 # ]
 

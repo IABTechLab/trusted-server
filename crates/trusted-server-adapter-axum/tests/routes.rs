@@ -284,8 +284,15 @@ async fn tsjs_route_matching_hash_uses_s_maxage_fallback() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn finalize_middleware_sets_geo_unavailable_header() {
-    let mut svc = make_service();
+async fn finalize_middleware_writes_the_operators_headers_and_no_geo_header() {
+    let mut settings = test_settings();
+    settings
+        .response_headers
+        .insert("X-Finalized".to_owned(), "1".to_owned());
+    let mut svc = EdgeZeroAxumService::new(
+        TrustedServerApp::routes_with_settings(settings)
+            .expect("should build router from test settings"),
+    );
 
     let req = Request::builder()
         .method("POST")
@@ -304,10 +311,20 @@ async fn finalize_middleware_sets_geo_unavailable_header() {
 
     assert_eq!(
         resp.headers()
-            .get("x-geo-info-available")
+            .get("x-finalized")
             .and_then(|v| v.to_str().ok()),
-        Some("false"),
-        "finalize middleware should set X-Geo-Info-Available: false on every response"
+        Some("1"),
+        "the finalize middleware should write the operator's headers on every response"
+    );
+    let geo_headers: Vec<&str> = resp
+        .headers()
+        .keys()
+        .map(axum::http::HeaderName::as_str)
+        .filter(|name| name.starts_with("x-geo-"))
+        .collect();
+    assert!(
+        geo_headers.is_empty(),
+        "the finalize middleware should write no x-geo-* header: {geo_headers:?}"
     );
 }
 
@@ -697,6 +714,23 @@ fn selecting_a_module_this_adapter_cannot_supply_fails_at_startup() {
     assert!(
         error.to_string().contains("acme"),
         "the startup error should name the selected module, got: {error}"
+    );
+}
+
+/// `[geo] module = "platform"` selects the host's own geo lookup, which the
+/// Axum dev server does not have, so startup refuses it rather than come up
+/// locating no request with the single-jurisdiction check skipped.
+#[test]
+fn selecting_the_platform_geo_lookup_fails_at_startup() {
+    let error =
+        TrustedServerApp::routes_with_settings(test_settings_with(r#"module = "platform""#))
+            .err()
+            .expect("should refuse the host's geo lookup on a host that has none");
+    let message = error.to_string();
+
+    assert!(
+        message.contains(r#"`[geo] module = "platform"`"#) && message.contains("has no geo lookup"),
+        "should name the setting and say the host has no geo lookup: {message}"
     );
 }
 

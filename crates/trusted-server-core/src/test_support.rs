@@ -685,7 +685,10 @@ pub mod nextjs_auction {
             .kv_store(Arc::new(UnavailableKvStore))
             .backend(Arc::new(FixtureStore))
             .http_client(client)
-            .geo(Arc::new(FixtureGeo))
+            .geo(Arc::new(crate::platform::PlatformGeoModule::new(
+                "fixture",
+                Arc::new(FixtureGeo),
+            )))
             .client_info(ClientInfo::default())
             .permission_policy(crate::permissions::PermissionPolicy::sample())
             .build()

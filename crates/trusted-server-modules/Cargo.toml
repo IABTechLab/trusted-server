@@ -29,6 +29,7 @@ trusted-server-cmp-osano = { workspace = true }
 trusted-server-cmp-sourcepoint = { workspace = true }
 trusted-server-core = { workspace = true }
 trusted-server-framework-nextjs = { workspace = true }
+trusted-server-headers-geo = { workspace = true }
 trusted-server-identity-lockr = { workspace = true }
 trusted-server-tag-google-tag = { workspace = true }
 trusted-server-tag-google-tag-manager = { workspace = true }

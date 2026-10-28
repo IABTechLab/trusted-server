@@ -8,23 +8,25 @@
 //! outcomes on the dev server.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use edgezero_core::body::Body;
-use edgezero_core::http::{HeaderMap, Method, Response, request_builder};
+use edgezero_core::http::{HeaderMap, HeaderName, Method, Response, request_builder};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use futures::executor::block_on;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::evidence::OwnedRequestInfo;
 use trusted_server_core::integrations::{IntegrationBuilder, IntegrationRegistration};
-use trusted_server_core::module_context::{ModuleContext, ModuleRequest};
+use trusted_server_core::module_context::{ModuleCall, ModuleContext, ModuleRequest};
+use trusted_server_core::platform::{GeoInfo, GeoModule, PlatformError};
 use trusted_server_core::settings::Settings;
 use trusted_server_core::tsjs::tsjs_script_src;
 use trusted_server_core::tsjs_bundle::{JsModulePart, compile_time_parts};
 use trusted_server_integration_seam_probe as seam_probe;
 
 use super::{
-    AppState, TrustedServerApp, build_finalize_services, build_state_from_settings,
+    AppState, TrustedServerApp, build_entry_point_services, build_state_from_settings,
     build_state_with_registrations, register_integrations,
 };
 
@@ -207,6 +209,98 @@ fn proxy_route_reports_the_modules_geo_and_that_the_preparer_ran() {
     assert_eq!(
         report["request_preparer_runs"], 1,
         "the adapter should run the module's request preparer exactly once: {body}"
+    );
+}
+
+/// The name a section and `[geo] module` select the counting geo module by.
+const COUNTING_GEO: &str = "testing.counting-geo";
+
+/// How many times the counting geo module has been asked.
+static COUNTED_GEO_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// A geo module that answers one location for every request and counts the
+/// calls it is asked.
+struct CountingGeo;
+
+#[async_trait::async_trait(?Send)]
+impl GeoModule for CountingGeo {
+    fn id(&self) -> &'static str {
+        COUNTING_GEO
+    }
+
+    async fn locate(
+        &self,
+        _call: ModuleCall<'_>,
+    ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+        COUNTED_GEO_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(GeoInfo {
+            city: "Paris".to_owned(),
+            country: "FR".to_owned(),
+            continent: "Europe".to_owned(),
+            latitude: 48.8566,
+            longitude: 2.3522,
+            metro_code: 0,
+            region: Some("IDF".to_owned()),
+            asn: None,
+        }))
+    }
+}
+
+fn register_counting_geo(
+    settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    Ok(settings.selects_module(COUNTING_GEO).then(|| {
+        IntegrationRegistration::builder("counting_geo")
+            .without_js()
+            .with_geo_module(COUNTING_GEO, Arc::new(CountingGeo))
+            .build()
+    }))
+}
+
+fn validate_counting_geo(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    Ok(settings.selects_module(COUNTING_GEO))
+}
+
+/// A response this adapter finishes carries no `x-geo-*` header, even where
+/// the request resolved a location, and the geo module is asked once, for
+/// the request's state, and not again when the response is finished.
+#[test]
+fn a_finished_response_carries_no_geo_header_and_the_geo_module_is_asked_once() {
+    let settings = settings_with(&format!(
+        r#"
+        [geo]
+        module = "{COUNTING_GEO}"
+
+        [testing]
+        modules = ["counting-geo"]
+        {HMAC_BLOCK}
+        "#
+    ));
+    let counting_geo = IntegrationBuilder::new(
+        "counting_geo",
+        "counting-geo-test",
+        register_counting_geo,
+        validate_counting_geo,
+    )
+    .with_module_name(COUNTING_GEO);
+    let router = router_with(settings, &[counting_geo]);
+
+    let response = get(&router, "/some-page", None);
+
+    let geo_headers: Vec<&str> = response
+        .headers()
+        .keys()
+        .map(HeaderName::as_str)
+        .filter(|name| name.starts_with("x-geo-"))
+        .collect();
+    assert!(
+        geo_headers.is_empty(),
+        "should write no x-geo-* header when finishing a response: {geo_headers:?}"
+    );
+    assert_eq!(
+        COUNTED_GEO_CALLS.load(Ordering::SeqCst),
+        1,
+        "should ask the geo module once, for the request's state"
     );
 }
 
@@ -982,7 +1076,7 @@ fn ec_and_device_selectors_naming_a_module_resolve_the_modules_it_declares() {
         "the Edge Cookie module should be the one the module declared"
     );
 
-    let services = build_finalize_services(
+    let services = build_entry_point_services(
         &state.settings,
         Arc::clone(&state.default_kv_store),
         Arc::default(),
@@ -1030,7 +1124,7 @@ fn device_selector_naming_a_module_classifies_a_request_with_it() {
         )),
         &[seam_probe::builder()],
     );
-    let services = build_finalize_services(
+    let services = build_entry_point_services(
         &selected.settings,
         Arc::clone(&selected.default_kv_store),
         Arc::default(),
@@ -1051,7 +1145,7 @@ fn device_selector_naming_a_module_classifies_a_request_with_it() {
         settings_with(&format!("{HMAC_BLOCK}{PROBE_BLOCK}")),
         &[seam_probe::builder()],
     );
-    let services = build_finalize_services(
+    let services = build_entry_point_services(
         &unset.settings,
         Arc::clone(&unset.default_kv_store),
         Arc::default(),

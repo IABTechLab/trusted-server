@@ -85,7 +85,8 @@ so request signing cannot read its key metadata, and EC KV lookup is not
 available. Forwarded client-IP
 headers are sanitized, and Spin derives its
 runtime authority, scheme, and client-address headers in the innermost
-normalization layer.
+normalization layer. Spin has no geo lookup, so `[geo] module = "platform"` is
+refused at startup.
 
 Spin sends no [auction telemetry](./telemetry#adapter-support), and warns at
 startup when `[analytics]` selects a module.

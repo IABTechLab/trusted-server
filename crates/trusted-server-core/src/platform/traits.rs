@@ -180,3 +180,39 @@ pub trait PlatformGeo: Send + Sync {
         crate::permissions::PermissionSet::none()
     }
 }
+
+/// A geo module as core calls it, with the request's module call, which
+/// carries the request's evidence, the settings and the services as a device
+/// module's call does, so a module whose one service answers location and
+/// device from the same request can answer both from one call. A type that
+/// resolves from the client address alone implements [`PlatformGeo`] and is
+/// called through [`PlatformGeoModule`](super::PlatformGeoModule).
+///
+/// Core builds the call in one place, `locate_request` on `dyn GeoModule`,
+/// so every path that asks for a location hands the module the same
+/// evidence. No path asks again when a response is finished.
+///
+/// Uses `#[async_trait(?Send)]` for the same reason as [`PlatformGeo`].
+#[async_trait::async_trait(?Send)]
+pub trait GeoModule: Send + Sync {
+    /// The name the module is called as, for the call and the logs.
+    fn id(&self) -> &'static str;
+
+    /// Resolves the request's location, `None` when the module has no data
+    /// for it, with the country as an ISO 3166-1 alpha-2 code and the region
+    /// as the ISO 3166-2 subdivision code without the country prefix, as
+    /// [`PlatformGeo::lookup`] gives them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::Geo`] when the lookup fails unexpectedly.
+    async fn locate(
+        &self,
+        call: crate::module_context::ModuleCall<'_>,
+    ) -> Result<Option<GeoInfo>, Report<PlatformError>>;
+
+    /// The permissions this module's data use requires. Empty by default.
+    fn required_permissions(&self) -> crate::permissions::PermissionSet {
+        crate::permissions::PermissionSet::none()
+    }
+}

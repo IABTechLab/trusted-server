@@ -68,7 +68,7 @@ pub use backend_naming::{
 };
 pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformKvStore};
 pub use error::PlatformError;
-pub use geo::DisabledGeo;
+pub use geo::{DisabledGeo, PlatformGeoModule};
 pub use http::{
     PlatformCacheIntent, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
     PlatformResponse, PlatformSelectResult, UnavailableHttpClient,
@@ -99,7 +99,9 @@ pub use template_cache::{
     TemplateCookieValue, TemplateEntry, TemplateMetadata, TemplateMetadataEncodeError,
     UnavailableTemplateCache, VaryHeaderValues, VarySpec, reader_url_surrogate_key,
 };
-pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
+pub use traits::{
+    GeoModule, PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore,
+};
 pub use types::{
     ClientInfo, GeoInfo, PlatformBackendSpec, RuntimeServices, RuntimeServicesBuilder, StoreId,
     StoreName,
@@ -133,10 +135,10 @@ use crate::settings::Settings;
 pub fn build_geo_module(
     settings: &Settings,
     host_default: Arc<dyn PlatformGeo>,
-) -> Arc<dyn PlatformGeo> {
+) -> Arc<dyn GeoModule> {
     match settings.geo.module.as_deref() {
-        Some("platform") => host_default,
-        _ => Arc::new(DisabledGeo),
+        Some("platform") => Arc::new(PlatformGeoModule::new("platform", host_default)),
+        _ => Arc::new(PlatformGeoModule::new("none", Arc::new(DisabledGeo))),
     }
 }
 
@@ -233,9 +235,15 @@ mod tests {
     #[tokio::test]
     async fn runtime_services_geo_lookup_returns_none_for_no_ip() {
         let services = noop_services();
-        let result = services
-            .geo()
-            .lookup(services.client_info().client_ip, &noop_services())
+        let method = ::http::Method::GET;
+        let context = crate::module_context::ModuleContext::new(
+            crate::module_context::ModuleRequest::new(&method, "publisher.example", "https", "/"),
+        )
+        .with_services(&services)
+        .with_client(services.client_info());
+        let module = services.geo();
+        let result = module
+            .locate(context.call(module.id(), module.required_permissions()))
             .await
             .expect("should not fail for noop geo with no ip");
         assert!(result.is_none(), "should return None when no IP is present");
@@ -246,16 +254,25 @@ mod tests {
         let settings = Settings::default();
         let host: Arc<dyn PlatformGeo> = Arc::new(test_support::NoopGeo);
         let selected = build_geo_module(&settings, Arc::clone(&host));
-        assert!(
-            !Arc::ptr_eq(&host, &selected),
+        assert_eq!(
+            selected.id(),
+            "none",
             "default settings should not use the host geo"
         );
+        let client = ClientInfo {
+            client_ip: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
+            ..ClientInfo::default()
+        };
+        let services = noop_services().with_client_info(client.clone());
+        let method = ::http::Method::GET;
+        let context = crate::module_context::ModuleContext::new(
+            crate::module_context::ModuleRequest::new(&method, "publisher.example", "https", "/"),
+        )
+        .with_services(&services)
+        .with_client(&client);
         assert!(
             selected
-                .lookup(
-                    Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
-                    &noop_services()
-                )
+                .locate(context.call(selected.id(), selected.required_permissions()))
                 .await
                 .expect("disabled geo lookup should not fail")
                 .is_none(),
@@ -269,8 +286,9 @@ mod tests {
         settings.geo.module = Some("none".to_owned());
         let host: Arc<dyn PlatformGeo> = Arc::new(test_support::NoopGeo);
         let selected = build_geo_module(&settings, Arc::clone(&host));
-        assert!(
-            !Arc::ptr_eq(&host, &selected),
+        assert_eq!(
+            selected.id(),
+            "none",
             "module none should not use the host geo"
         );
     }
@@ -281,8 +299,9 @@ mod tests {
         settings.geo.module = Some("platform".to_owned());
         let host: Arc<dyn PlatformGeo> = Arc::new(test_support::NoopGeo);
         let selected = build_geo_module(&settings, Arc::clone(&host));
-        assert!(
-            Arc::ptr_eq(&host, &selected),
+        assert_eq!(
+            selected.id(),
+            "platform",
             "the platform selector should use the host geo"
         );
     }
