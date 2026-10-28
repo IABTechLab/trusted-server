@@ -666,6 +666,7 @@ mod tests {
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
             between_bytes_timeout: Duration::from_secs(15),
+            connect_timeout: None,
             host_header_override: None,
             discriminator: None,
         };
@@ -687,6 +688,7 @@ mod tests {
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
             between_bytes_timeout: Duration::from_secs(15),
+            connect_timeout: None,
             host_header_override: None,
             discriminator: None,
         };

@@ -396,6 +396,7 @@ impl ProviderPlan {
             certificate_check: true,
             first_byte_timeout: timeout,
             between_bytes_timeout: timeout,
+            connect_timeout: None,
             discriminator: Some(self.id.as_str().to_owned()),
         }
     }

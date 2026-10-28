@@ -156,6 +156,7 @@ fn integration_backend_spec(
         certificate_check,
         first_byte_timeout,
         between_bytes_timeout: first_byte_timeout,
+        connect_timeout: None,
         // Distinguish this integration's backend from any other provider that
         // targets the same origin, so auction response correlation by backend
         // name cannot cross providers.

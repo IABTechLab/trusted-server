@@ -46,6 +46,9 @@ use crate::platform::{
 use crate::settings::{IdentitySettings, ProviderMode, ProviderSettings, RevokeScope, Settings};
 use crate::streaming_processor::{BodyStreamDecoder, Compression};
 
+/// The longest connect timeout a hold call asks for: the adapters' default.
+const HOLD_CONNECT_TIMEOUT_CAP: Duration = Duration::from_secs(1);
+
 /// How long a burst-capped provider waits: one limiter window.
 const BURST_WAIT_SECS: u64 = 60;
 /// The wait after a `no_match` that gives no `retry_in`.
@@ -1359,6 +1362,9 @@ async fn prepare_call<'a>(
         certificate_check: deps.settings.proxy.certificate_check,
         first_byte_timeout: timeout,
         between_bytes_timeout: timeout,
+        // A hold call must not wait past the budget to connect, so its
+        // connect timeout is capped at the call timeout (spec 3.4).
+        connect_timeout: budget.map(|_| timeout.min(HOLD_CONNECT_TIMEOUT_CAP)),
         discriminator: Some(id.to_string()),
     });
     let backend = match backend {
@@ -4678,6 +4684,23 @@ mod tests {
         assert!(
             timeouts[1] <= Duration::from_millis(30),
             "should wait no longer than the remaining budget"
+        );
+    }
+
+    #[test]
+    fn hold_dispatch_caps_the_connect_timeout_at_the_call_timeout() {
+        let mut fixture =
+            DispatchFixture::new(vec![scripted("p", "p.example.com", "p.example.com")]);
+        fixture.settings.ec.identity.hold_budget_ms = 80;
+        fixture.client.respond("p.example.com", 200, b"{}");
+
+        fixture.run(&["p"], 1_000, Some(Duration::from_secs(10)), None);
+        fixture.run(&["p"], 1_000, None, None);
+
+        assert_eq!(
+            fixture.backend.connect_timeouts(),
+            vec![Some(Duration::from_millis(80)), None],
+            "should cap a hold call's connect timeout at its call timeout and leave an after-send call on the adapter default"
         );
     }
 

@@ -2325,6 +2325,16 @@ pub mod fake_http {
                 .map(|spec| spec.first_byte_timeout)
         }
 
+        /// The connect timeouts the backends were registered with, in order.
+        pub fn connect_timeouts(&self) -> Vec<Option<Duration>> {
+            self.specs
+                .lock()
+                .expect("should lock the specs")
+                .iter()
+                .map(|spec| spec.connect_timeout)
+                .collect()
+        }
+
         /// The first-byte timeouts the backends were registered with, in order.
         pub fn first_byte_timeouts(&self) -> Vec<Duration> {
             self.specs

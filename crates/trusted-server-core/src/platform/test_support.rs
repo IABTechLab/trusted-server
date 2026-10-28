@@ -1292,6 +1292,7 @@ mod tests {
             certificate_check: true,
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
             between_bytes_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+            connect_timeout: None,
             discriminator: None,
         };
         let name = stub.ensure(&spec).expect("should return a backend name");

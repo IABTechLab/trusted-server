@@ -393,7 +393,10 @@ follows the same split.
   (`has_enforceable_total_request_deadline()` is false,
   `platform/http.rs:375-383`): first-byte and between-byte timers still let
   connection setup or a byte-trickling response overrun. Dynamic backends
-  use a fixed 1-second connect timeout (`adapter-fastly/src/backend.rs:240`).
+  use a fixed 1-second connect timeout (`adapter-fastly/src/backend.rs:240`)
+  today. This spec adds `PlatformBackendSpec::connect_timeout`, `None` by
+  default, so only hold-mode identity calls set a shorter one (section
+  4.7).
 - **Navigation detection.** `is_navigation_request` checks
   `Sec-Fetch-Dest: document`, which excludes iframes, and falls back to
   `Accept: text/html`, which a `fetch()` can also send (`http_util.rs:93-118`).
@@ -1624,10 +1627,15 @@ deadline (section 3.4). Each hold-mode call gets a first-byte timeout of
 `min(hold_timeout_ms, remaining budget)`, and the coordinator waits for
 every dispatched call until the platform settles it
 (`ec/identity/coordinator.rs:1140-1162`). The first-byte timer starts only
-once the connection is up, so a call stalled in connection setup can hold
-the navigation for the backend's connect timeout plus its first-byte
-timeout: the worst case is the fixed 1-second connect timeout plus
-`hold_budget_ms`.
+once the connection is up, so a hold-mode call also sets its connect
+timeout to the same call timeout, capped at the adapters' 1-second
+default (`PlatformBackendSpec::connect_timeout`). On Fastly a call stalled
+in connection setup then holds the navigation for at most twice its call
+timeout: the worst case is about `2 × hold_budget_ms`, plus a response that
+trickles bytes inside the between-bytes timer. A spec that sets no connect
+timeout keeps today's 1 second and today's backend name, so origin,
+auction and after-send calls are unchanged. The other adapters have no
+per-backend connect timer and ignore the field.
 
 How often a provider is due depends on its refresh interval (step 4). The
 default `refresh_after_sec` of one day is a product decision that departs

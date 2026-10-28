@@ -335,6 +335,10 @@ fn fastly_canonical_spec(spec: &PlatformBackendSpec, target_port: u16) -> String
         &mut buffer,
         &spec.between_bytes_timeout.as_millis().to_string(),
     );
+    if let Some(timeout) = spec.connect_timeout {
+        buffer.push('c');
+        push_field(&mut buffer, &timeout.as_millis().to_string());
+    }
     buffer
 }
 
@@ -395,14 +399,21 @@ fn predict_fastly(
         .as_deref()
         .map(|value| format!("_p_{}", sanitize_fastly_component(value)))
         .unwrap_or_default();
+    // Only a spec that sets a connect timeout names it, so every name from
+    // before the field existed is unchanged.
+    let connect_suffix = spec
+        .connect_timeout
+        .map(|timeout| format!("_ct{}", timeout.as_millis()))
+        .unwrap_or_default();
     let readable_full = format!(
-        "{}{}{}{}_fb{}_bb{}",
+        "{}{}{}{}_fb{}_bb{}{}",
         sanitize_fastly_component(&name_base),
         host_override_suffix,
         cert_suffix,
         discriminator_suffix,
         spec.first_byte_timeout.as_millis(),
-        spec.between_bytes_timeout.as_millis()
+        spec.between_bytes_timeout.as_millis(),
+        connect_suffix
     );
     let readable = readable_full
         .chars()
@@ -516,6 +527,7 @@ mod tests {
             certificate_check: true,
             first_byte_timeout: Duration::from_millis(1500),
             between_bytes_timeout: Duration::from_millis(1500),
+            connect_timeout: None,
             discriminator: Some("provider-one".to_owned()),
         }
     }
@@ -556,6 +568,27 @@ mod tests {
                 .predict(&spec)
                 .expect("should predict Spin backend"),
             no_registration
+        );
+    }
+
+    #[test]
+    fn fastly_prediction_names_a_connect_timeout_only_when_set() {
+        let default = BackendNamingPolicy::Fastly
+            .predict(&spec())
+            .expect("should predict the default backend");
+        let mut capped = spec();
+        capped.connect_timeout = Some(Duration::from_millis(80));
+        let capped = BackendNamingPolicy::Fastly
+            .predict(&capped)
+            .expect("should predict the capped backend");
+
+        assert_ne!(
+            default.name, capped.name,
+            "should register a capped connect timeout as its own backend"
+        );
+        assert!(
+            capped.name.contains("_bb1500_ct80_"),
+            "should name the connect timeout in the readable part"
         );
     }
 

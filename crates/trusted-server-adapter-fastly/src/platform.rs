@@ -159,6 +159,7 @@ fn backend_config_from_spec(spec: &PlatformBackendSpec) -> BackendConfig<'_> {
         .certificate_check(spec.certificate_check)
         .first_byte_timeout(spec.first_byte_timeout)
         .between_bytes_timeout(spec.between_bytes_timeout)
+        .connect_timeout(spec.connect_timeout)
         .discriminator(spec.discriminator.as_deref())
 }
 
@@ -1013,6 +1014,7 @@ mod tests {
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
             between_bytes_timeout: Duration::from_secs(15),
+            connect_timeout: None,
             discriminator: None,
         };
 
@@ -1037,6 +1039,7 @@ mod tests {
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
             between_bytes_timeout: Duration::from_secs(15),
+            connect_timeout: None,
             discriminator: None,
         };
 
@@ -1063,6 +1066,7 @@ mod tests {
             certificate_check: false,
             first_byte_timeout: Duration::from_secs(15),
             between_bytes_timeout: Duration::from_secs(15),
+            connect_timeout: None,
             discriminator: None,
         };
 
@@ -1087,6 +1091,7 @@ mod tests {
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
             between_bytes_timeout: Duration::from_secs(15),
+            connect_timeout: None,
             discriminator: None,
         };
 
@@ -1106,6 +1111,7 @@ mod tests {
             certificate_check: true,
             first_byte_timeout: Duration::from_millis(2000),
             between_bytes_timeout: Duration::from_millis(2000),
+            connect_timeout: None,
             discriminator: None,
         };
 
@@ -1135,6 +1141,7 @@ mod tests {
             certificate_check: true,
             first_byte_timeout: Duration::from_millis(750),
             between_bytes_timeout: Duration::from_millis(750),
+            connect_timeout: None,
             discriminator: None,
         };
 
@@ -1162,6 +1169,7 @@ mod tests {
             certificate_check: true,
             first_byte_timeout: Duration::from_millis(750),
             between_bytes_timeout: Duration::from_millis(750),
+            connect_timeout: None,
             discriminator: Some("ipv6-provider".to_string()),
         };
         let mut bare = bracketed.clone();
@@ -1703,6 +1711,7 @@ mod tests {
             certificate_check: true,
             first_byte_timeout: Duration::from_millis(750),
             between_bytes_timeout: Duration::from_millis(750),
+            connect_timeout: None,
             discriminator: Some("prebid".to_string()),
         };
         let prebid_name = backend

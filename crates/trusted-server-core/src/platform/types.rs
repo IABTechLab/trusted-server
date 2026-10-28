@@ -143,6 +143,10 @@ pub struct PlatformBackendSpec {
     pub first_byte_timeout: Duration,
     /// Maximum time to wait between response body bytes.
     pub between_bytes_timeout: Duration,
+    /// Maximum time to wait for the connection, or `None` for the adapter's
+    /// default (one second on Fastly). Only the Fastly adapter applies it;
+    /// the others have no per-backend connect timer.
+    pub connect_timeout: Option<Duration>,
     /// Optional stable discriminator folded into the backend name.
     ///
     /// Two callers can target the same origin (scheme, host, port, TLS) with
