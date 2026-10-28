@@ -21,9 +21,8 @@ crates/
   trusted-server-adapter-cloudflare/    # Cloudflare Workers entry point (wasm32-unknown-unknown binary)
   trusted-server-adapter-spin/          # Fermyon Spin entry point (wasm32-wasip1 component)
   trusted-server-cli/                   # Host-target `ts` operator CLI
-  trusted-server-modules/               # the modules a stock build ships, in the order their hooks run
-  ad-server/                            # ad server implementation crates (mock)
-  ads-txt/                              # ads.txt line module crates (sellers)
+  ad-server/                            # ad server implementation crates (iabtl)
+  ads-txt/                              # ads.txt line module crates (iabtl)
   ad-tag/                               # ad tag module crates (google, which holds its diagnostics module too)
   auction/                              # auction module crates (aps, prebid, prebid-server)
   audience/                             # audience module crates (permutive)
@@ -32,7 +31,7 @@ crates/
   framework/                            # framework module crates (nextjs)
   identity/                             # identity module crates (lockr)
   tag/                                  # tag module crates (google-tag, google-tag-manager)
-  testing/                              # test module crates (seam-probe, testlight)
+  testing/                              # test module crates (iabtl, testlight)
   device/
     fastly/                             # trusted-server-device-fastly (opt-in TLS/H2 device module)
   edgecookie/                           # vendor Edge Cookie module crates (built-in HMAC module is in core)
@@ -412,10 +411,10 @@ to read before changing any module configuration.
 | Geo / IP intelligence | `PlatformGeo` (`platform/traits.rs`)                  | `[geo] module`                                                                                                                                                                                                           | None, no location (the default), or `platform`                                                                                                                                                                                                                                         | `crates/geo/<vendor>`               |
 | Permission signals    | `PermissionSignalModule` (`permission_signal/mod.rs`) | `[permission-signal] modules` (an ordered list)                                                                                                                                                                          | `gpc`, `gpp`, `us-privacy`, `tcf`, all of them with no list                                                                                                                                                                                                                            | `crates/permission-signal/<scheme>` |
 | Auction demand        | `DemandImplementation` (`auction/demand.rs`)          | `[demand] modules` (a list)                                                                                                                                                                                              | `auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps`                                                                                                                                                                                                                     | an integration builder              |
-| Ad server             | `AdServerImplementation` (`auction/demand.rs`)        | `[ad-server] module`                                                                                                                                                                                                     | `mock` (`ad-server.mock`)                                                                                                                                                                                                                                                              | an integration builder              |
+| Ad server             | `AdServerImplementation` (`auction/demand.rs`)        | `[ad-server] module`                                                                                                                                                                                                     | `iabtl` (`ad-server.iabtl`)                                                                                                                                                                                                                                                            | an integration builder              |
 | Page integrations     | `IntegrationBuilder` (`integrations/mod.rs`)          | the section of the module's type: `[cmp] module`, `[tag] modules`, `[ad-tag] modules`, `[bot-protection] module`, `[identity] module`, `[audience] module`, `[framework] module`, `[auction] modules`, `[proxy] modules` | `cmp.didomi`, `cmp.sourcepoint`, `cmp.osano`, `tag.google-tag`, `tag.google-tag-manager`, `ad-tag.google`, `ad-tag.google.diagnostics`, `bot-protection.datadome`, `identity.lockr`, `audience.permutive`, `framework.nextjs`, `auction.prebid`, `testing.testlight`, `js_asset_proxy` | an adapter-supplied builder         |
 
-`auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps` and `ad-server.mock` supply implementations
+`auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps` and `ad-server.iabtl` supply implementations
 only. No module section selects them.
 
 Principles for adding or changing a module:
@@ -454,8 +453,8 @@ IntegrationRegistration::builder(ID)
 ```
 
 - Integration IDs match JS directory names: `prebid` (deferred), `lockr`, `permutive`, `datadome`, `didomi`, `testlight`.
-- An integration runs when the section of its type selects its module. A module with a crate of its own is named by that crate's path under `crates/` (`permission-signal.gpc`, `testing.seam-probe`). Each page integration lives in a crate of its own and holds that name in a `MODULE` constant (`cmp.didomi`, `tag.google-tag`, `tag.google-tag-manager`, `ad-tag.google`, `bot-protection.datadome`, `identity.lockr`, `audience.permutive`, `framework.nextjs`, `auction.prebid`, `testing.testlight`), which a test in the crate holds to the crate's folder. A name is written in its section with the type left off. There is no `enabled` flag and no `[integration]` table.
-- `creative` is JS-only (no Rust registration), and `nextjs` is Rust-only. `auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps` and `ad-server.mock` register demand or ad server implementations rather than page integrations.
+- An integration runs when the section of its type selects its module. A module with a crate of its own is named by that crate's path under `crates/` (`permission-signal.gpc`, `testing.iabtl`). Each page integration lives in a crate of its own and holds that name in a `MODULE` constant (`cmp.didomi`, `tag.google-tag`, `tag.google-tag-manager`, `ad-tag.google`, `bot-protection.datadome`, `identity.lockr`, `audience.permutive`, `framework.nextjs`, `auction.prebid`, `testing.testlight`), which a test in the crate holds to the crate's folder. A name is written in its section with the type left off. There is no `enabled` flag and no `[integration]` table.
+- `creative` is JS-only (no Rust registration), and `nextjs` is Rust-only. `auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps` and `ad-server.iabtl` register demand or ad server implementations rather than page integrations.
 - Integrations opt into deferred loading via `.with_deferred_js()` on the registration builder. Deferred modules are served as separate `<script defer>` tags instead of being concatenated into the main bundle.
 - `IntegrationRegistry::js_module_ids_immediate()` returns modules for the main bundle; `js_module_ids_deferred()` returns modules loaded with `defer`.
 

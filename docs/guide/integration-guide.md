@@ -397,7 +397,7 @@ and core never names the vendor. The crates in this repository sit under
 `crates/<type>/<vendor>/`, and a vendor's crate can equally live in a
 repository of its own.
 
-`crates/testing/seam-probe` is the worked example. It is a test fixture rather
+`crates/testing/iabtl` is the worked example. It is a test fixture rather
 than something to deploy, and it exercises every part of the seam from a
 vendor crate's position. The round-trip tests in
 `crates/trusted-server-adapter-axum/tests/seam_probe.rs` drive each part
@@ -408,23 +408,24 @@ through the Axum adapter, and the Fastly adapter carries the same round trip.
 The crate hands out an `IntegrationBuilder`, which names the integration and
 points at the functions that do the work.
 
-| Part                                          | Purpose                                                                                                                                                                                                   |
-| --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Id                                            | Names the integration in its browser module, in diagnostics and in the prefix `/integrations/<id>/` of its proxy routes, unless a route takes [a path of its own](#serving-an-endpoint-from-a-module)     |
-| Source                                        | The crate or package name, reported when two builders claim one id, so an operator can tell which crates collided                                                                                         |
-| Build function                                | Reads `Settings` and returns the registration. It is called only when a section selects the module                                                                                                        |
-| Validate function                             | The integration's own deploy rules. It runs for every builder, selected or not                                                                                                                            |
-| `.with_module_name("<type>.<name>")`          | The name a section selects the module by, which is the crate's path under `crates/` with `.` between the parts. `module_name!()` derives it from the crate's folder                                       |
-| `.with_request_preparer(...)`                 | Optional. Runs before routing, once for a request, whether or not the module is selected                                                                                                                  |
-| `.with_response_finalizer(...)`               | Optional. Finishes the response the page path returns, from what the module's request hooks left for the request                                                                                          |
-| `.with_auction_token()`                       | Optional. Declares that the module's browser script reads the token an auction publishes with its winning bids, which is made only when a selected module reads one                                       |
-| `.with_secret_settings(...)`                  | Optional. Lists the settings in the module's own table that hold the name of a secret, so each is looked up as the settings load                                                                          |
-| `.with_plan_registration(...)`                | Optional. Registers the module from the compiled auction plan, for a module whose page support follows what the plan selects. It runs whether or not a section selects the module, and its hooks go first |
-| `.with_plan_validator(...)`                   | Optional. Checks the module's settings against the compiled auction plan, when a deployment is validated and as the settings load                                                                         |
-| `.with_demand(...)` and `.with_adserver(...)` | Optional. Registers an auction implementation that `[demand]` or `[ad-server]` can name. A crate that supplies nothing else starts from `IntegrationBuilder::implementations(...)`                        |
-| `.with_loading_cache(...)`                    | Optional. Offers the loading cache the crate supplies, which a feature selects by the module's name in its `[cache.<name>]` table. An adapter takes the selections with `loading_caches_from`             |
-| `.with_cache_features(...)`                   | Optional. Declares the caches the module loads through, by name, each selected in its own `[cache.<name>]` table as `[cache.robots-txt]` is. A name core or another builder declares is refused           |
-| `.with_shared_settings(...)`                  | Optional. Runs the builder when its vendor's `[shared.<vendor>]` table is present, for a vendor whose modules all read that one table. A builder the table runs is selected by no section                 |
+| Part                                          | Purpose                                                                                                                                                                                                                                                              |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Id                                            | Names the integration in its browser module, in diagnostics and in the prefix `/integrations/<id>/` of its proxy routes, unless a route takes [a path of its own](#serving-an-endpoint-from-a-module)                                                                |
+| Source                                        | The crate or package name, reported when two builders claim one id, so an operator can tell which crates collided                                                                                                                                                    |
+| Build function                                | Reads `Settings` and returns the registration. It is called only when a section selects the module                                                                                                                                                                   |
+| Validate function                             | The integration's own deploy rules. It runs for every builder, selected or not                                                                                                                                                                                       |
+| `.with_module_name("<type>.<name>")`          | The name a section selects the module by, which is the crate's path under `crates/` with `.` between the parts. `module_name!()` derives it from the crate's folder                                                                                                  |
+| `.with_request_preparer(...)`                 | Optional. Runs before routing, once for a request, whether or not the module is selected                                                                                                                                                                             |
+| `.with_response_finalizer(...)`               | Optional. Finishes the response the page path returns, from what the module's request hooks left for the request                                                                                                                                                     |
+| `.with_auction_token()`                       | Optional. Declares that the module's browser script reads the token an auction publishes with its winning bids, which is made only when a selected module reads one                                                                                                  |
+| `.with_secret_settings(...)`                  | Optional. Lists the settings in the module's own table that hold the name of a secret, so each is looked up as the settings load                                                                                                                                     |
+| `.with_middleware(...)`                       | Optional. Describes the page changes the registration supplies, each with the phase and the media type an entry names it for, so `ts audit` places them without reading the module. The registry refuses a registration whose middleware contradicts the description |
+| `.with_plan_registration(...)`                | Optional. Registers the module from the compiled auction plan, for a module whose page support follows what the plan selects. It runs whether or not a section selects the module, and its hooks go first                                                            |
+| `.with_plan_validator(...)`                   | Optional. Checks the module's settings against the compiled auction plan, when a deployment is validated and as the settings load                                                                                                                                    |
+| `.with_demand(...)` and `.with_adserver(...)` | Optional. Registers an auction implementation that `[demand]` or `[ad-server]` can name. A crate that supplies nothing else starts from `IntegrationBuilder::implementations(...)`                                                                                   |
+| `.with_loading_cache(...)`                    | Optional. Offers the loading cache the crate supplies, which a feature selects by the module's name in its `[cache.<name>]` table. An adapter takes the selections with `loading_caches_from`                                                                        |
+| `.with_cache_features(...)`                   | Optional. Declares the caches the module loads through, by name, each selected in its own `[cache.<name>]` table as `[cache.robots-txt]` is. A name core or another builder declares is refused                                                                      |
+| `.with_shared_settings(...)`                  | Optional. Runs the builder when its vendor's `[shared.<vendor>]` table is present, for a vendor whose modules all read that one table. A builder the table runs is selected by no section                                                                            |
 
 ```rust
 pub fn module_name() -> &'static str {
@@ -456,8 +457,8 @@ status = "vendor owned"
 `status` is `vendor owned` once the vendor has adopted the crate,
 `seeking vendor owner` while the Trusted Server maintainers hold it for a
 vendor, and `project owned` for a crate that is the project's own, such as a
-test module. A test in `crates/trusted-server-modules` fails for a crate in
-this repository that leaves the declaration out.
+test module. A test of the Axum adapter fails for a crate in this repository
+that leaves the declaration out.
 
 ### What a registration can declare
 
@@ -521,8 +522,8 @@ the request's cookies.
 
 The registry builds only the modules a section selects, so the module that
 supplies one of these has to be selected in its section as well. The probe
-is run with `[testing] modules = ["seam-probe"]` and its geo module is
-selected with `[geo] module = "testing.seam-probe"`. A `[geo] module` or
+is run with `[testing] modules = ["iabtl"]` and its geo module is
+selected with `[geo] module = "testing.iabtl"`. A `[geo] module` or
 `[device] module` naming something no running module supplies refuses
 startup. The message lists the modules of that type the deployment runs, and
 says when the name is a module no section selects or one that supplies no
@@ -853,17 +854,43 @@ The round-trip tests in
 `crates/trusted-server-adapter-fastly/src/app/seam_probe_tests.rs` drive the
 probe through the Fastly adapter under Viceroy.
 
-### The modules a stock build ships
+### The modules an adapter links
 
-`crates/trusted-server-modules` lists the modules a stock build ships from
-crates of their own, in the order their request hooks run. Every adapter
-builds its state with that list followed by the builders a deployment added,
-and loads its settings against the same list. The `ts` tool registers it for
-deploy validation. A module joins a stock build by adding its crate and its
-builder to that list, in the place its request hooks should run. The order of
-the list does not order page changes, which run in the order an entry names
-them. Offering a module does not run it, because the registry builds a module
-only when a section of the settings selects it.
+Each adapter lists the module builders it links in its own `app.rs`, in the
+order their request hooks run, the way it lists the permission signal schemes
+it links. It builds its state with that list followed by the builders a
+deployment added, and loads its settings against the same list. The `ts` tool
+lists the builders it links the same way, for deploy validation and for the
+configuration `ts audit` writes. A module joins a build by adding its crate
+and its builder to the list of each adapter that links it, in the place its
+request hooks should run, and a deployment that wants a different set links a
+different set. The order of the list does not order page changes, which run
+in the order an entry names them. Offering a module does not run it, because
+the registry builds a module only when a section of the settings selects it.
+
+A module describes the page changes it supplies on its builder, with
+`.with_middleware(...)`, each as a `SuppliedMiddleware` naming the middleware,
+the phase an entry names it in and the media type the entry covers. A
+middleware that runs in either phase is described in the one a generated
+configuration places it in. `ts audit` asks
+`trusted_server_core::integrations::supplied_middleware` for what the builders
+it links describe, in the order the registry registers them, and writes the
+entries from that, so a module's page changes are placed without a table
+anywhere else. The registry refuses a registration whose middleware
+contradicts the description.
+
+```rust
+const SUPPLIED_MIDDLEWARE: &[SuppliedMiddleware] = &[
+    SuppliedMiddleware::on_html(MODULE, MiddlewarePhase::Fetch),
+    SuppliedMiddleware::on_html(TAG_MIDDLEWARE, MiddlewarePhase::Serve),
+];
+
+pub fn builder() -> IntegrationBuilder {
+    IntegrationBuilder::new(ID, env!("CARGO_PKG_NAME"), register, validate)
+        .with_module_name(MODULE)
+        .with_middleware(SUPPLIED_MIDDLEWARE)
+}
+```
 
 ### Giving the deployment its prefixes
 

@@ -7,7 +7,7 @@ members = [
     # workspace member so it shares workspace settings and lints; no default
     # member and no adapter build reaches it, and only the Axum and Fastly
     # adapters' tests depend on it.
-    "crates/testing/seam-probe",
+    "crates/testing/iabtl",
     "crates/permission-signal/gpc",
     "crates/permission-signal/gpp",
     "crates/permission-signal/mtm",
@@ -19,7 +19,7 @@ members = [
     "crates/cmp/sourcepoint",
     "crates/cmp/didomi",
     "crates/cmp/inmobi",
-    "crates/ads-txt/sellers",
+    "crates/ads-txt/iabtl",
     "crates/headers/geo",
     "crates/loading-cache/51degrees",
     "crates/asset-cache/51degrees",
@@ -29,7 +29,7 @@ members = [
     "crates/framework/nextjs",
     "crates/ad-tag/google",
     "crates/bot-protection/datadome",
-    "crates/ad-server/mock",
+    "crates/ad-server/iabtl",
     "crates/auction/aps",
     "crates/auction/prebid",
     "crates/auction/prebid-server",
@@ -42,7 +42,6 @@ members = [
     "crates/trusted-server-core",
     "crates/trusted-server-integration-tests",
     "crates/trusted-server-js",
-    "crates/trusted-server-modules",
     "crates/trusted-server-openrtb",
     # Manual protobuf codegen tool — a member so it shares workspace settings,
     # but no default member or alias builds it. Run it explicitly with `-p`.
@@ -170,7 +169,7 @@ trusted-server-audience-permutive = { path = "crates/audience/permutive" }
 trusted-server-cmp-sourcepoint = { path = "crates/cmp/sourcepoint" }
 trusted-server-cmp-didomi = { path = "crates/cmp/didomi" }
 trusted-server-cmp-inmobi = { path = "crates/cmp/inmobi" }
-trusted-server-ads-txt-sellers = { path = "crates/ads-txt/sellers" }
+trusted-server-ads-txt-iabtl = { path = "crates/ads-txt/iabtl" }
 trusted-server-headers-geo = { path = "crates/headers/geo" }
 trusted-server-loading-cache-51degrees = { path = "crates/loading-cache/51degrees" }
 trusted-server-asset-cache-51degrees = { path = "crates/asset-cache/51degrees" }
@@ -180,13 +179,12 @@ trusted-server-testing-testlight = { path = "crates/testing/testlight" }
 trusted-server-framework-nextjs = { path = "crates/framework/nextjs" }
 trusted-server-ad-tag-google = { path = "crates/ad-tag/google" }
 trusted-server-bot-protection-datadome = { path = "crates/bot-protection/datadome" }
-trusted-server-ad-server-mock = { path = "crates/ad-server/mock" }
+trusted-server-ad-server-iabtl = { path = "crates/ad-server/iabtl" }
 trusted-server-auction-aps = { path = "crates/auction/aps" }
 trusted-server-auction-prebid = { path = "crates/auction/prebid" }
 trusted-server-auction-prebid-server = { path = "crates/auction/prebid-server" }
 trusted-server-auction-protocol-openrtb = { path = "crates/auction-protocol/openrtb" }
 trusted-server-js = { path = "crates/trusted-server-js" }
-trusted-server-modules = { path = "crates/trusted-server-modules" }
 trusted-server-openrtb = { path = "crates/trusted-server-openrtb" }
 url = "2.5.8"
 urlencoding = "2.1"

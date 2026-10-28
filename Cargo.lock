@@ -6587,7 +6587,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "trusted-server-ad-server-mock"
+name = "trusted-server-ad-server-iabtl"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -6641,14 +6641,32 @@ dependencies = [
  "tempfile",
  "tokio",
  "tower 0.4.13",
+ "trusted-server-ad-server-iabtl",
+ "trusted-server-ad-tag-google",
+ "trusted-server-ads-txt-iabtl",
+ "trusted-server-auction-aps",
+ "trusted-server-auction-prebid",
+ "trusted-server-auction-prebid-server",
+ "trusted-server-auction-protocol-openrtb",
+ "trusted-server-audience-permutive",
+ "trusted-server-bot-protection-datadome",
+ "trusted-server-cmp-didomi",
+ "trusted-server-cmp-inmobi",
+ "trusted-server-cmp-osano",
+ "trusted-server-cmp-sourcepoint",
  "trusted-server-core",
- "trusted-server-integration-seam-probe",
- "trusted-server-modules",
+ "trusted-server-framework-nextjs",
+ "trusted-server-headers-geo",
+ "trusted-server-identity-lockr",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
  "trusted-server-permission-signal-mtm",
  "trusted-server-permission-signal-tcf",
  "trusted-server-permission-signal-us-privacy",
+ "trusted-server-tag-google-tag",
+ "trusted-server-tag-google-tag-manager",
+ "trusted-server-testing-iabtl",
+ "trusted-server-testing-testlight",
 ]
 
 [[package]]
@@ -6667,15 +6685,33 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+ "trusted-server-ad-server-iabtl",
+ "trusted-server-ad-tag-google",
+ "trusted-server-ads-txt-iabtl",
+ "trusted-server-auction-aps",
+ "trusted-server-auction-prebid",
+ "trusted-server-auction-prebid-server",
+ "trusted-server-auction-protocol-openrtb",
+ "trusted-server-audience-permutive",
+ "trusted-server-bot-protection-datadome",
+ "trusted-server-cmp-didomi",
+ "trusted-server-cmp-inmobi",
+ "trusted-server-cmp-osano",
+ "trusted-server-cmp-sourcepoint",
  "trusted-server-core",
- "trusted-server-integration-seam-probe",
+ "trusted-server-framework-nextjs",
+ "trusted-server-headers-geo",
+ "trusted-server-identity-lockr",
  "trusted-server-js",
- "trusted-server-modules",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
  "trusted-server-permission-signal-mtm",
  "trusted-server-permission-signal-tcf",
  "trusted-server-permission-signal-us-privacy",
+ "trusted-server-tag-google-tag",
+ "trusted-server-tag-google-tag-manager",
+ "trusted-server-testing-iabtl",
+ "trusted-server-testing-testlight",
  "worker",
 ]
 
@@ -6699,16 +6735,34 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+ "trusted-server-ad-server-iabtl",
+ "trusted-server-ad-tag-google",
+ "trusted-server-ads-txt-iabtl",
+ "trusted-server-auction-aps",
+ "trusted-server-auction-prebid",
+ "trusted-server-auction-prebid-server",
+ "trusted-server-auction-protocol-openrtb",
+ "trusted-server-audience-permutive",
+ "trusted-server-bot-protection-datadome",
+ "trusted-server-cmp-didomi",
+ "trusted-server-cmp-inmobi",
+ "trusted-server-cmp-osano",
+ "trusted-server-cmp-sourcepoint",
  "trusted-server-core",
  "trusted-server-device-fastly",
+ "trusted-server-framework-nextjs",
  "trusted-server-geo-fastly",
- "trusted-server-integration-seam-probe",
- "trusted-server-modules",
+ "trusted-server-headers-geo",
+ "trusted-server-identity-lockr",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
  "trusted-server-permission-signal-mtm",
  "trusted-server-permission-signal-tcf",
  "trusted-server-permission-signal-us-privacy",
+ "trusted-server-tag-google-tag",
+ "trusted-server-tag-google-tag-manager",
+ "trusted-server-testing-iabtl",
+ "trusted-server-testing-testlight",
  "urlencoding",
 ]
 
@@ -6731,19 +6785,37 @@ dependencies = [
  "serde_json",
  "spin-sdk",
  "tokio",
+ "trusted-server-ad-server-iabtl",
+ "trusted-server-ad-tag-google",
+ "trusted-server-ads-txt-iabtl",
+ "trusted-server-auction-aps",
+ "trusted-server-auction-prebid",
+ "trusted-server-auction-prebid-server",
+ "trusted-server-auction-protocol-openrtb",
+ "trusted-server-audience-permutive",
+ "trusted-server-bot-protection-datadome",
+ "trusted-server-cmp-didomi",
+ "trusted-server-cmp-inmobi",
+ "trusted-server-cmp-osano",
+ "trusted-server-cmp-sourcepoint",
  "trusted-server-core",
- "trusted-server-integration-seam-probe",
+ "trusted-server-framework-nextjs",
+ "trusted-server-headers-geo",
+ "trusted-server-identity-lockr",
  "trusted-server-js",
- "trusted-server-modules",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
  "trusted-server-permission-signal-mtm",
  "trusted-server-permission-signal-tcf",
  "trusted-server-permission-signal-us-privacy",
+ "trusted-server-tag-google-tag",
+ "trusted-server-tag-google-tag-manager",
+ "trusted-server-testing-iabtl",
+ "trusted-server-testing-testlight",
 ]
 
 [[package]]
-name = "trusted-server-ads-txt-sellers"
+name = "trusted-server-ads-txt-iabtl"
 version = "0.1.0"
 dependencies = [
  "error-stack",
@@ -6939,10 +7011,26 @@ dependencies = [
  "toml",
  "toml_edit 0.23.10+spec-1.0.0",
  "tracing",
+ "trusted-server-ad-server-iabtl",
+ "trusted-server-ad-tag-google",
+ "trusted-server-ads-txt-iabtl",
+ "trusted-server-auction-aps",
  "trusted-server-auction-prebid",
  "trusted-server-auction-prebid-server",
+ "trusted-server-auction-protocol-openrtb",
+ "trusted-server-audience-permutive",
+ "trusted-server-bot-protection-datadome",
+ "trusted-server-cmp-didomi",
+ "trusted-server-cmp-inmobi",
+ "trusted-server-cmp-osano",
+ "trusted-server-cmp-sourcepoint",
  "trusted-server-core",
- "trusted-server-modules",
+ "trusted-server-framework-nextjs",
+ "trusted-server-headers-geo",
+ "trusted-server-identity-lockr",
+ "trusted-server-tag-google-tag",
+ "trusted-server-tag-google-tag-manager",
+ "trusted-server-testing-testlight",
  "url",
  "uuid",
  "webpki-roots",
@@ -7124,25 +7212,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "trusted-server-integration-seam-probe"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "edgezero-core",
- "error-stack",
- "hex",
- "http",
- "log",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "tokio",
- "trusted-server-core",
- "validator",
-]
-
-[[package]]
 name = "trusted-server-integration-tests"
 version = "0.1.0"
 dependencies = [
@@ -7171,7 +7240,6 @@ dependencies = [
  "trusted-server-adapter-cloudflare",
  "trusted-server-adapter-spin",
  "trusted-server-core",
- "trusted-server-modules",
  "urlencoding",
 ]
 
@@ -7198,36 +7266,6 @@ dependencies = [
  "tokio",
  "trusted-server-core",
  "web-time",
-]
-
-[[package]]
-name = "trusted-server-modules"
-version = "0.1.0"
-dependencies = [
- "edgezero-core",
- "http",
- "serde_json",
- "tokio",
- "trusted-server-ad-server-mock",
- "trusted-server-ad-tag-google",
- "trusted-server-ads-txt-sellers",
- "trusted-server-auction-aps",
- "trusted-server-auction-prebid",
- "trusted-server-auction-prebid-server",
- "trusted-server-auction-protocol-openrtb",
- "trusted-server-audience-permutive",
- "trusted-server-bot-protection-datadome",
- "trusted-server-cmp-didomi",
- "trusted-server-cmp-inmobi",
- "trusted-server-cmp-osano",
- "trusted-server-cmp-sourcepoint",
- "trusted-server-core",
- "trusted-server-framework-nextjs",
- "trusted-server-headers-geo",
- "trusted-server-identity-lockr",
- "trusted-server-tag-google-tag",
- "trusted-server-tag-google-tag-manager",
- "trusted-server-testing-testlight",
 ]
 
 [[package]]
@@ -7336,6 +7374,25 @@ dependencies = [
  "trusted-server-core",
  "trusted-server-framework-nextjs",
  "url",
+ "validator",
+]
+
+[[package]]
+name = "trusted-server-testing-iabtl"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "edgezero-core",
+ "error-stack",
+ "hex",
+ "http",
+ "log",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokio",
+ "trusted-server-core",
  "validator",
 ]
 

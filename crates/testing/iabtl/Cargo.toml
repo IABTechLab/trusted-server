@@ -1,5 +1,5 @@
 [package]
-name = "trusted-server-integration-seam-probe"
+name = "trusted-server-testing-iabtl"
 description = "Test fixture integration that exercises the Trusted Server integration seam from outside the core crate. Never ship in a deployment."
 authors = { workspace = true }
 edition = { workspace = true }

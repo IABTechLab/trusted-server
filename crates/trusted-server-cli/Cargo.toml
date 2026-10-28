@@ -58,9 +58,26 @@ tokio = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
 tracing = { workspace = true }
+trusted-server-ad-server-iabtl = { workspace = true }
+trusted-server-ad-tag-google = { workspace = true }
+trusted-server-ads-txt-iabtl = { workspace = true }
+trusted-server-auction-aps = { workspace = true }
+trusted-server-auction-prebid = { workspace = true }
 trusted-server-auction-prebid-server = { workspace = true }
+trusted-server-auction-protocol-openrtb = { workspace = true }
+trusted-server-audience-permutive = { workspace = true }
+trusted-server-bot-protection-datadome = { workspace = true }
+trusted-server-cmp-didomi = { workspace = true }
+trusted-server-cmp-inmobi = { workspace = true }
+trusted-server-cmp-osano = { workspace = true }
+trusted-server-cmp-sourcepoint = { workspace = true }
 trusted-server-core = { workspace = true }
-trusted-server-modules = { workspace = true }
+trusted-server-framework-nextjs = { workspace = true }
+trusted-server-headers-geo = { workspace = true }
+trusted-server-identity-lockr = { workspace = true }
+trusted-server-tag-google-tag = { workspace = true }
+trusted-server-tag-google-tag-manager = { workspace = true }
+trusted-server-testing-testlight = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 which = { workspace = true }
@@ -121,4 +138,3 @@ predicates = { workspace = true }
 temp-env = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-trusted-server-auction-prebid = { workspace = true }

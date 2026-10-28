@@ -565,7 +565,7 @@ mod module_endpoints {
     };
     use trusted_server_core::module_context::ModuleCall;
     use trusted_server_core::settings::Settings;
-    use trusted_server_integration_seam_probe as seam_probe;
+    use trusted_server_testing_iabtl as seam_probe;
 
     /// The inspection page's path, which this adapter answers for `GET`.
     const CONFIG_PAGE_PATH: &str = "/_ts/config";
@@ -582,9 +582,9 @@ mod module_endpoints {
     /// The probe's own section and table.
     const PROBE_BLOCK: &str = r#"
         [testing]
-        modules = ["seam-probe"]
+        modules = ["iabtl"]
 
-        [testing.seam-probe]
+        [testing.iabtl]
         country = "ZZ"
     "#;
 
@@ -793,9 +793,9 @@ mod module_endpoints {
         let settings = settings_with(
             r#"
             [testing]
-            modules = ["seam-probe", "own-module"]
+            modules = ["iabtl", "own-module"]
 
-            [testing.seam-probe]
+            [testing.iabtl]
             country = "ZZ"
             "#,
         );

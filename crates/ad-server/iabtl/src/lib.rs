@@ -1,4 +1,4 @@
-//! The demonstration ad server implementation, `ad-server.mock`.
+//! The demonstration ad server implementation, `ad-server.iabtl`.
 //!
 //! It calls mocktioneer's decision endpoint, which picks the winning bid by
 //! price, so a deployment can exercise the ad server seam without a real ad
@@ -49,8 +49,8 @@ use trusted_server_core::platform::{PlatformHttpRequest, PlatformResponse, Runti
 // ============================================================================
 
 /// The name this implementation is selected by, its module path, which
-/// `[ad-server]` shortens to `mock`. It also serves as its builder's id.
-pub const MODULE: &str = "ad-server.mock";
+/// `[ad-server]` shortens to `iabtl`. It also serves as its builder's id.
+pub const MODULE: &str = "ad-server.iabtl";
 
 /// The demonstration ad server implementation.
 pub static ADSERVER: AdServerImplementation = AdServerImplementation { id: MODULE, build };
@@ -106,7 +106,7 @@ pub struct AdServerMockSettings {
     /// to the ad server decision endpoint without hard-coding integration knowledge.
     ///
     /// ```toml
-    /// [ad-server.mock.context_query_params]
+    /// [ad-server.iabtl.context_query_params]
     /// permutive_segments = "permutive"
     /// ```
     #[serde(default)]

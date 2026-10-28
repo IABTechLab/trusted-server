@@ -26,8 +26,10 @@ hex = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 toml = { workspace = true }
+# The fixture configurations are validated against the modules the Axum
+# adapter links, which are the modules every adapter links.
+trusted-server-adapter-axum = { path = "../trusted-server-adapter-axum" }
 trusted-server-core = { workspace = true, features = ["test-utils"] }
-trusted-server-modules = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
@@ -46,7 +48,6 @@ scraper = { workspace = true }
 testcontainers = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tower = { workspace = true, features = ["util"] }
-trusted-server-adapter-axum = { path = "../trusted-server-adapter-axum" }
 trusted-server-adapter-cloudflare = { path = "../trusted-server-adapter-cloudflare" }
 trusted-server-adapter-spin = { path = "../trusted-server-adapter-spin" }
 urlencoding = { workspace = true }

@@ -56,9 +56,11 @@ fn app_config_envelope(
     })?;
     origin.url = origin_url;
     settings.set_origin_source(&origin);
-    // The fixture selects modules a stock build ships, so validation needs
-    // the stock list as the adapters and the `ts` tool have it.
-    trusted_server_core::config::register_deploy_integrations(trusted_server_modules::builders());
+    // The fixture selects modules the adapters link, so validation needs the
+    // list as the adapters and the `ts` tool have it.
+    trusted_server_core::config::register_deploy_integrations(
+        trusted_server_adapter_axum::app::shipped_module_builders(),
+    );
     // What `ts config push --permissions` writes for the sample the fixture
     // names. Axum reads the file from its folder and leaves the text unused.
     settings.permissions.sha256 = Some(policy_sha256(SAMPLE_POLICY_TEXT));

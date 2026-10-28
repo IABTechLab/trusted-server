@@ -900,15 +900,15 @@ async fn the_sellers_module_makes_an_ads_txt_the_origin_does_not_have() {
 
     const SELLERS: &str = r#"
         [ads-txt]
-        modules = ["sellers"]
+        modules = ["iabtl"]
 
-        [ads-txt.sellers]
+        [ads-txt.iabtl]
         lines = ["ssp.example, 12345, DIRECT, f08c47fec0942fa0"]
 
         [[fetch]]
         media_type = "text/plain"
         path = "/ads.txt"
-        middleware = ["ads-txt.sellers"]
+        middleware = ["ads-txt.iabtl"]
     "#;
 
     let origin = Arc::new(StubHttpClient::new());

@@ -1528,6 +1528,52 @@ pub struct ProxyDispatchInput<'a> {
 /// # Errors
 ///
 /// Naming the module or the entry at fault.
+/// Refuses a registration that supplies a middleware its builder describes
+/// in a phase the middleware does not run in, or for a media type it does
+/// not work on, so a configuration written from the description runs. A
+/// described middleware the registration leaves out is allowed, because a
+/// module may supply one only where its settings call for it.
+fn check_described_middleware(
+    builder: &crate::integrations::IntegrationBuilder,
+    registration: &IntegrationRegistration,
+) -> Result<(), Report<TrustedServerError>> {
+    let refuse = |message: String| Report::new(TrustedServerError::Configuration { message });
+    for described in builder.middleware() {
+        let Some(middleware) = registration
+            .middleware
+            .iter()
+            .find(|middleware| middleware.middleware_id() == described.name)
+        else {
+            continue;
+        };
+        if !middleware.phases().contains(&described.phase) {
+            let phases: Vec<String> = middleware
+                .phases()
+                .iter()
+                .map(|phase| format!("[[{phase}]]"))
+                .collect();
+            return Err(refuse(format!(
+                "module `{}` describes its middleware `{}` as named in a [[{}]] entry, and the \
+                 middleware it supplies runs in {}",
+                builder.id(),
+                described.name,
+                described.phase,
+                phases.join(" and ")
+            )));
+        }
+        if !middleware.handles_media_type(described.media_type) {
+            return Err(refuse(format!(
+                "module `{}` describes its middleware `{}` as working on `{}`, and the \
+                 middleware it supplies does not",
+                builder.id(),
+                described.name,
+                described.media_type
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn check_middleware(
     settings: &Settings,
     inner: &IntegrationRegistryInner,
@@ -2068,6 +2114,7 @@ impl IntegrationRegistry {
                     builder.id(),
                     "integration builder ID should match registration ID"
                 );
+                check_described_middleware(&builder, &registration)?;
                 plan_registrations.push(registration);
             }
 
@@ -2110,6 +2157,7 @@ impl IntegrationRegistry {
                     builder.id(),
                     "integration builder ID should match registration ID"
                 );
+                check_described_middleware(&builder, &registration)?;
                 registrations.push(registration);
             }
         }
@@ -7925,6 +7973,77 @@ mod tests {
                 "should name the entry, the media type and the middleware: {message}"
             );
         }
+    }
+
+    /// A builder's description of its middleware is checked against what it
+    /// registers, so a configuration written from the description runs.
+    #[test]
+    fn a_description_the_registration_contradicts_is_refused() {
+        use crate::integrations::{IntegrationBuilder, SuppliedMiddleware};
+
+        const NAME: &str = "testing.described";
+        struct FetchOnly;
+        impl Middleware for FetchOnly {
+            fn middleware_id(&self) -> &'static str {
+                NAME
+            }
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Fetch]
+            }
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                MiddlewareAction::pass()
+            }
+        }
+        fn register(
+            _settings: &Settings,
+        ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+            Ok(Some(
+                IntegrationRegistration::builder("described")
+                    .with_middleware(Arc::new(FetchOnly))
+                    .build(),
+            ))
+        }
+        const WRONG_PHASE: &[SuppliedMiddleware] =
+            &[SuppliedMiddleware::on_html(NAME, MiddlewarePhase::Serve)];
+        const WRONG_MEDIA_TYPE: &[SuppliedMiddleware] = &[SuppliedMiddleware::on(
+            NAME,
+            MiddlewarePhase::Fetch,
+            "text/plain",
+        )];
+        const RIGHT: &[SuppliedMiddleware] =
+            &[SuppliedMiddleware::on_html(NAME, MiddlewarePhase::Fetch)];
+        let builder = |described| {
+            IntegrationBuilder::new("described", "described-crate", register, validate_nothing)
+                .with_module_name(NAME)
+                .with_middleware(described)
+        };
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.select_module("testing", NAME);
+
+        for (described, expected) in [
+            (
+                WRONG_PHASE,
+                "module `described` describes its middleware `testing.described` as named in a \
+                 [[serve]] entry, and the middleware it supplies runs in [[fetch]]",
+            ),
+            (
+                WRONG_MEDIA_TYPE,
+                "module `described` describes its middleware `testing.described` as working on \
+                 `text/plain`, and the middleware it supplies does not",
+            ),
+        ] {
+            let error = IntegrationRegistry::with_registrations(&settings, &[builder(described)])
+                .err()
+                .expect("should refuse a description the registration contradicts");
+
+            let message = error.to_string();
+            assert!(
+                message.contains(expected),
+                "should name the module, the middleware and the difference: {message}"
+            );
+        }
+        IntegrationRegistry::with_registrations(&settings, &[builder(RIGHT)])
+            .expect("should accept a description the registration bears out");
     }
 
     #[test]

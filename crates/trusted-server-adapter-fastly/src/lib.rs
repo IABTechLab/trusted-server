@@ -60,6 +60,9 @@ use crate::app::{
     AppState, EcFinalizeState, RuntimeStoreConfig, TrustedServerApp, build_entry_point_services,
     load_settings_from_config_store,
 };
+/// The module builders this adapter links, and the same followed by a
+/// deployment's own, for a deployment composing a build of its own.
+pub use crate::app::{module_builders_with, shipped_module_builders};
 use crate::ec_kv::FastlyEcKvStore;
 use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers};
 use crate::platform::client_info_from_request;

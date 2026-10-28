@@ -44,7 +44,7 @@ use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::evidence::RequestInfo;
 use trusted_server_core::integrations::{
     AttributeRewriteAction, CarriedJsModule, IntegrationBuilder, IntegrationEndpoint,
-    IntegrationProxy, IntegrationRegistration, ScriptRewriteAction,
+    IntegrationProxy, IntegrationRegistration, ScriptRewriteAction, SuppliedMiddleware,
 };
 use trusted_server_core::middleware::{
     AttributeRewrite, Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase, TextHandler,
@@ -63,9 +63,9 @@ use validator::Validate;
 pub const SEAM_PROBE_ID: &str = "seam_probe";
 
 /// The name this module is selected by, its crate folder below `crates/`, so
-/// `[testing] modules = ["seam-probe"]` selects it. Its geo, Edge Cookie and
+/// `[testing] modules = ["iabtl"]` selects it. Its geo, Edge Cookie and
 /// device modules carry the same name, so `[geo] module`, `[ec] module` and
-/// `[device] module` select each of them as `testing.seam-probe`, and so does
+/// `[device] module` select each of them as `testing.iabtl`, and so does
 /// `[robots-txt] modules` its robots.txt contributor.
 #[must_use]
 pub fn module_name() -> &'static str {
@@ -76,7 +76,7 @@ pub fn module_name() -> &'static str {
 pub const SEAM_PROBE_ROBOTS_AGENT: &str = "SeamProbeBot";
 
 /// Source label the registry uses in duplicate-id errors.
-pub const SEAM_PROBE_SOURCE: &str = "trusted-server-integration-seam-probe";
+pub const SEAM_PROBE_SOURCE: &str = "trusted-server-testing-iabtl";
 
 /// Path of the proxy route that reports what the seam delivered.
 ///
@@ -111,7 +111,7 @@ pub const PROBE_JS_SHA256: &str =
 /// can prove deploy validation reached a vendor's rules rather than stopping
 /// at the core ones.
 pub const SEAM_PROBE_COUNTRY_MESSAGE: &str =
-    "`[testing.seam-probe] country` must be exactly two letters";
+    "`[testing.iabtl] country` must be exactly two letters";
 
 /// Request header a caller sets to have the preparer, and the handler of
 /// [`SEAM_PROBE_OWN_PATH`], count that request.
@@ -326,7 +326,7 @@ pub struct SeamProbePrepared {
     pub runs: usize,
 }
 
-/// The probe's own configuration block, `[testing.seam-probe]`.
+/// The probe's own configuration block, `[testing.iabtl]`.
 #[derive(Debug, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct SeamProbeConfig {
@@ -339,7 +339,7 @@ pub struct SeamProbeConfig {
     /// Whether the registration declares the probe's geo module.
     ///
     /// Set this to `false` to build a selected module that supplies no geo
-    /// module, which is what `[geo] module = "testing.seam-probe"` must
+    /// module, which is what `[geo] module = "testing.iabtl"` must
     /// reject at startup.
     #[serde(default = "default_declares_geo")]
     pub declares_geo: bool,
@@ -552,7 +552,7 @@ impl PlatformGeo for SeamProbeGeo {
 ///
 /// A static cannot call [`module_name`], so the literal is written out and
 /// `auction_implementations_are_named_as_the_module` keeps it honest.
-pub const SEAM_PROBE_ADSERVER_NAME: &str = "testing.seam-probe";
+pub const SEAM_PROBE_ADSERVER_NAME: &str = "testing.iabtl";
 
 /// The probe's demand implementation, registered on its builder.
 pub static SEAM_PROBE_DEMAND: DemandImplementation = DemandImplementation {
@@ -891,10 +891,19 @@ pub fn prepare_request(
 /// # Examples
 ///
 /// ```
-/// use trusted_server_integration_seam_probe::{builder, SEAM_PROBE_ID};
+/// use trusted_server_testing_iabtl::{builder, SEAM_PROBE_ID};
 ///
 /// assert_eq!(builder().id(), SEAM_PROBE_ID);
 /// ```
+/// The page changes the probe supplies, as an entry names them. Made once,
+/// because the names come from the crate's folder at run time.
+static SUPPLIED_MIDDLEWARE: LazyLock<[SuppliedMiddleware; 2]> = LazyLock::new(|| {
+    [
+        SuppliedMiddleware::on_html(module_name(), MiddlewarePhase::Fetch),
+        SuppliedMiddleware::on_html(reader_middleware_name(), MiddlewarePhase::Serve),
+    ]
+});
+
 #[must_use]
 pub fn builder() -> IntegrationBuilder {
     IntegrationBuilder::new(SEAM_PROBE_ID, SEAM_PROBE_SOURCE, register, validate)
@@ -903,16 +912,17 @@ pub fn builder() -> IntegrationBuilder {
         .with_demand(&SEAM_PROBE_DEMAND)
         .with_adserver(&SEAM_PROBE_ADSERVER)
         .with_cache_features(&[SEAM_PROBE_ANSWERS_CACHE])
+        .with_middleware(SUPPLIED_MIDDLEWARE.as_slice())
 }
 
 /// The cache the probe declares and loads its answers through, selected in
-/// `[cache.seam-probe-answers]`. The report route says whether the cache
+/// `[cache.iabtl-answers]`. The report route says whether the cache
 /// that table selected keeps values.
-pub const SEAM_PROBE_ANSWERS_CACHE: &str = "seam-probe-answers";
+pub const SEAM_PROBE_ANSWERS_CACHE: &str = "iabtl-answers";
 
 /// The id of the loading cache module the probe offers, selected in a
-/// `[cache.<name>]` table as `module = "seam-probe"`.
-pub const SEAM_PROBE_LOADING_CACHE_ID: &str = "loading-cache.seam-probe";
+/// `[cache.<name>]` table as `module = "iabtl"`.
+pub const SEAM_PROBE_LOADING_CACHE_ID: &str = "loading-cache.iabtl";
 
 /// A loading cache that keeps every value in this process's memory for as
 /// long as the process runs, enough to prove from outside core that a table
@@ -964,9 +974,9 @@ pub fn loading_cache_builder() -> IntegrationBuilder {
         .with_loading_cache(memory_loading_cache)
 }
 
-/// The vendor's name, which names the table `[shared.seam-probe]` that runs
+/// The vendor's name, which names the table `[shared.iabtl]` that runs
 /// [`shared_builder`].
-pub const SEAM_PROBE_SHARED_VENDOR: &str = "seam-probe";
+pub const SEAM_PROBE_SHARED_VENDOR: &str = "iabtl";
 
 /// The id of the builder the shared table runs.
 pub const SEAM_PROBE_SHARED_ID: &str = "seam_probe_shared";
@@ -977,7 +987,7 @@ pub const SEAM_PROBE_SHARED_PATH: &str = "/integrations/seam_probe_shared/marker
 /// The shared route's suffix under the builder's proxy prefix.
 const SHARED_ROUTE_SUFFIX: &str = "/marker";
 
-/// What `[shared.seam-probe]` carries.
+/// What `[shared.iabtl]` carries.
 #[derive(Debug, Clone, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct SeamProbeShared {
@@ -1033,7 +1043,7 @@ impl IntegrationProxy for SharedMarkerRoute {
     }
 }
 
-/// Registers the shared route when `[shared.seam-probe]` is present.
+/// Registers the shared route when `[shared.iabtl]` is present.
 ///
 /// # Errors
 ///
@@ -1065,7 +1075,7 @@ pub fn validate_shared(settings: &Settings) -> Result<bool, Report<TrustedServer
         .is_some())
 }
 
-/// The builder `[shared.seam-probe]` runs, which proves a vendor's shared
+/// The builder `[shared.iabtl]` runs, which proves a vendor's shared
 /// table from outside core.
 #[must_use]
 pub fn shared_builder() -> IntegrationBuilder {
@@ -1184,7 +1194,7 @@ mod tests {
             .build()
     }
 
-    /// Settings carrying a `[testing.seam-probe]` block with `body`
+    /// Settings carrying a `[testing.iabtl]` block with `body`
     /// appended to it.
     fn settings_with_probe(body: &str) -> Settings {
         Settings::from_toml(&format!(
@@ -1207,9 +1217,9 @@ mod tests {
                 assume_single_jurisdiction = true
 
                 [testing]
-                modules = ["seam-probe"]
+                modules = ["iabtl"]
 
-                [testing.seam-probe]
+                [testing.iabtl]
                 {body}
             "#
         ))
@@ -1248,7 +1258,7 @@ mod tests {
 
                 [[fetch]]
                 media_type = "text/html"
-                middleware = ["testing.seam-probe"]
+                middleware = ["testing.iabtl"]
             "#,
         );
 
@@ -1303,11 +1313,11 @@ mod tests {
 
                 [[fetch]]
                 media_type = "text/html"
-                middleware = ["testing.seam-probe"]
+                middleware = ["testing.iabtl"]
 
                 [[serve]]
                 media_type = "text/html"
-                middleware = ["testing.seam-probe.reader"]
+                middleware = ["testing.iabtl.reader"]
             "#,
         );
 
@@ -1329,7 +1339,7 @@ mod tests {
         );
         assert_eq!(
             reader_middleware_name(),
-            "testing.seam-probe.reader",
+            "testing.iabtl.reader",
             "should name the serve middleware after the module"
         );
     }
@@ -1538,6 +1548,18 @@ mod tests {
             request.extensions().get::<SeamProbePrepared>(),
             Some(&SeamProbePrepared { runs: 2 }),
             "should count both runs"
+        );
+    }
+
+    /// The builder describes the two middleware the registration supplies,
+    /// so a tool that writes a configuration places what the probe registers.
+    #[test]
+    fn the_builder_describes_the_middleware_the_probe_registers() {
+        let settings = settings_with_probe("country = \"NZ\"");
+        trusted_server_core::test_support::middleware::assert_described_middleware_is_registered(
+            &settings,
+            &[builder()],
+            SEAM_PROBE_ID,
         );
     }
 }

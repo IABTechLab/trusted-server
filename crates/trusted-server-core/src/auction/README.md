@@ -149,17 +149,17 @@ account_id = "example-account"
 module = "pbs_main"
 
 [ad-server]
-module = "mock"
+module = "iabtl"
 
-[ad-server.mock]
+[ad-server.iabtl]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 ```
 
 Every demand table carries an `implementation` line naming the
 implementation by its module path, which is how two Prebid Servers run side
-by side under names of their own, and `[ad-server]` writes `ad-server.mock`
-as `mock`. Endpoints must be HTTPS, or HTTP to `127.0.0.1`, `::1` or
+by side under names of their own, and `[ad-server]` writes `ad-server.iabtl`
+as `iabtl`. Endpoints must be HTTPS, or HTTP to `127.0.0.1`, `::1` or
 `localhost`. Replace all example values before enabling an auction.
 
 ## Code map

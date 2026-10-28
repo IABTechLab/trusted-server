@@ -32,6 +32,14 @@ const INMOBI_INTEGRATION_ID: &str = "inmobi";
 /// by, from this crate's folder. Its settings are the table `[cmp.inmobi]`.
 pub const MODULE: &str = "cmp.inmobi";
 
+/// The page change the module supplies, as an entry names it. It runs in either phase and is described in the one a generated configuration places it in.
+const SUPPLIED_MIDDLEWARE: &[trusted_server_core::integrations::SuppliedMiddleware] = &[
+    trusted_server_core::integrations::SuppliedMiddleware::on_html(
+        MODULE,
+        trusted_server_core::middleware::MiddlewarePhase::Fetch,
+    ),
+];
+
 /// Hosts a Choice tag may be served from.
 const ALLOWED_HOSTS: [&str; 2] = ["cmp.inmobi.com", "cdn.inmobi.com"];
 
@@ -369,6 +377,7 @@ pub fn builder() -> IntegrationBuilder {
         validate,
     )
     .with_module_name(MODULE)
+    .with_middleware(SUPPLIED_MIDDLEWARE)
 }
 
 /// The Choice consent prompt's tag, being the TCF stub, the GPP stub and the
@@ -1323,6 +1332,20 @@ mod tests {
                 env!("CARGO_MANIFEST_DIR"),
                 "/src/fixtures/page-change.recorded.html"
             ),
+        );
+    }
+
+    /// The builder describes the middleware the registration supplies, so a
+    /// tool that writes a configuration places what the module registers.
+    #[test]
+    fn the_builder_describes_the_middleware_the_module_registers() {
+        let settings = trusted_server_core::html_processor::test_support::page_settings(
+            include_str!("fixtures/page-change.settings.toml"),
+        );
+        trusted_server_core::test_support::middleware::assert_described_middleware_is_registered(
+            &settings,
+            &[super::builder()],
+            super::builder().id(),
         );
     }
 

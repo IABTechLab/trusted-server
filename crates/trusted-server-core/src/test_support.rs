@@ -478,6 +478,62 @@ pub mod template {
     }
 }
 
+/// Checks a module's description of its middleware against what it
+/// registers.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod middleware {
+    use crate::integrations::{IntegrationBuilder, IntegrationRegistry, supplied_middleware};
+    use crate::settings::Settings;
+
+    /// Asserts that the builder with the integration id `id`, among the
+    /// built-in builders and `builders`, describes exactly the middleware its
+    /// registration supplies under `settings`, in the order the registration
+    /// supplies them, and that each runs in the phase it is described in.
+    ///
+    /// # Panics
+    ///
+    /// When the registry cannot be built, which includes a description the
+    /// registration contradicts, when `id` does not run under `settings`, or
+    /// when the description and the registration differ.
+    pub fn assert_described_middleware_is_registered(
+        settings: &Settings,
+        builders: &[IntegrationBuilder],
+        id: &str,
+    ) {
+        let registry = IntegrationRegistry::with_registrations(settings, builders)
+            .expect("should build a registry whose descriptions match what it registers");
+        let registered = registry
+            .registered_integrations()
+            .into_iter()
+            .find(|integration| integration.id == id)
+            .map(|integration| integration.middleware)
+            .expect("the described module should run under the settings");
+        let described: Vec<&str> = supplied_middleware(builders)
+            .into_iter()
+            .filter(|(integration, _)| *integration == id)
+            .map(|(_, middleware)| middleware.name)
+            .collect();
+
+        assert_eq!(
+            described, registered,
+            "`{id}` should describe the middleware it registers, in registration order"
+        );
+        for (_, middleware) in supplied_middleware(builders)
+            .into_iter()
+            .filter(|(integration, _)| *integration == id)
+        {
+            assert!(
+                registry
+                    .middleware_in(middleware.phase)
+                    .contains(&middleware.name),
+                "`{}` should run in [[{}]] as described",
+                middleware.name,
+                middleware.phase
+            );
+        }
+    }
+}
+
 /// Shared Next.js + auction origin fixture.
 ///
 /// Adapters exercise the buffered publisher path against this fixture in their

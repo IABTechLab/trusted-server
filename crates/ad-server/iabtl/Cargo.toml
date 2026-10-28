@@ -1,5 +1,5 @@
 [package]
-name = "trusted-server-ad-server-mock"
+name = "trusted-server-ad-server-iabtl"
 description = "The demonstration ad server, which asks mocktioneer's decision endpoint to pick the winning bid, as an ad server module."
 authors = { workspace = true }
 edition = { workspace = true }

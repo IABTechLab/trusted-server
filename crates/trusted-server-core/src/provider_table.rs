@@ -17,7 +17,7 @@
 //! its module path, which lets several providers share one implementation
 //! under names of their own. Without the line the table's name stands for
 //! the implementation, which only a section named by the implementation's
-//! type can match, as `mock` in `[ad-server]` is `ad-server.mock`. A provider
+//! type can match, as `iabtl` in `[ad-server]` is `ad-server.iabtl`. A provider
 //! with nothing to set needs no table. [`ProviderTable::validate`] checks the
 //! rules that hold for every type, and the code that reads a type checks what
 //! only that type knows, such as which implementations exist.

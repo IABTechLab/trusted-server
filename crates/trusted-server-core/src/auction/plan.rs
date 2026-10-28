@@ -633,8 +633,8 @@ fn configuration_error(message: impl Into<String>) -> Report<TrustedServerError>
 /// The registered implementation `written` names in `[section]`.
 ///
 /// An implementation is named by its module path, which a section named by
-/// the implementation's type folder may shorten, so `mock` in `[ad-server]`
-/// is `ad-server.mock`. The refusal lists what the build has, as the section
+/// the implementation's type folder may shorten, so `iabtl` in `[ad-server]`
+/// is `ad-server.iabtl`. The refusal lists what the build has, as the section
 /// would write it.
 fn resolve_implementation<T>(
     section: &str,

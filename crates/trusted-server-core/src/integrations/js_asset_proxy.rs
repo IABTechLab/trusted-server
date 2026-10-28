@@ -47,7 +47,15 @@ pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
         validate,
     )
     .with_module_name(MODULE)
-    .selected_in("proxy");
+    .selected_in("proxy")
+    .with_middleware(SUPPLIED_MIDDLEWARE);
+
+/// The page change the module supplies, as an entry names it.
+const SUPPLIED_MIDDLEWARE: &[crate::integrations::SuppliedMiddleware] =
+    &[crate::integrations::SuppliedMiddleware::on_html(
+        MODULE,
+        MiddlewarePhase::Fetch,
+    )];
 const JS_ASSET_CONTENT_TYPE: &str = "application/javascript; charset=utf-8";
 const X_CONTENT_TYPE_OPTIONS_NOSNIFF: &str = "nosniff";
 const ERROR_ORIGIN_UNREACHABLE: &str = "js-asset-origin-unreachable";
@@ -1702,6 +1710,20 @@ mod tests {
                 env!("CARGO_MANIFEST_DIR"),
                 "/src/integrations/fixtures/js-asset-proxy.recorded.html"
             ),
+        );
+    }
+
+    /// The builder describes the middleware the registration supplies, so a
+    /// tool that writes a configuration places what the module registers.
+    #[test]
+    fn the_builder_describes_the_middleware_the_module_registers() {
+        let settings = crate::html_processor::test_support::page_settings(include_str!(
+            "fixtures/js-asset-proxy.settings.toml"
+        ));
+        crate::test_support::middleware::assert_described_middleware_is_registered(
+            &settings,
+            &[],
+            MODULE,
         );
     }
 }

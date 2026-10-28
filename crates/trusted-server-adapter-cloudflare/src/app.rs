@@ -158,7 +158,7 @@ async fn load_startup_settings(env: &worker::Env) -> Result<Settings, Report<Tru
         &secret_store,
         &StoreName::from(DEFAULT_SECRET_STORE_ID),
         trusted_server_core::platform::PolicyOrigin::Blob,
-        &trusted_server_modules::builders(),
+        &shipped_module_builders(),
     )
 }
 
@@ -189,7 +189,7 @@ fn build_state_with_settings(
 }
 
 /// Build the application state from explicit settings, composing the modules
-/// a stock build ships with the externally supplied builders in
+/// this adapter links with the externally supplied builders in
 /// `integrations`.
 ///
 /// A deployment that ships a vendor crate calls this to add that crate's
@@ -225,9 +225,9 @@ fn build_state_with_registrations_and_services(
     integrations: &[IntegrationBuilder],
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    // The modules a stock build ships come first and the deployment's own
+    // The modules this adapter links come first and the deployment's own
     // follow, which is the order their hooks run in.
-    let integrations = trusted_server_modules::builders_with(integrations);
+    let integrations = module_builders_with(integrations);
     let integrations = integrations.as_slice();
 
     // The plan is compiled with the integrations this adapter was given, so an
@@ -310,6 +310,53 @@ fn shipped_signal_modules()
         Arc::new(trusted_server_permission_signal_tcf::TcfModule::new()),
         Arc::new(trusted_server_permission_signal_mtm::MtmModule::new()),
     ]
+}
+
+/// The module builders this adapter links, in the order their request hooks
+/// run. Offering a module does not run it, because the registry builds a
+/// module only when a section of the settings selects it.
+///
+/// A deployment that wants a different set links a different set, and one
+/// that adds a module of its own hands its builder to [`build_state_with_registrations`], which
+/// runs it after these. None of these offers a loading cache, so a
+/// deployment that wants copies kept hands one the same way.
+#[must_use]
+pub fn shipped_module_builders() -> Vec<IntegrationBuilder> {
+    vec![
+        // Prebid registers from the auction plan, and what it registers runs
+        // ahead of the modules below.
+        trusted_server_auction_prebid::builder(),
+        trusted_server_testing_testlight::builder(),
+        trusted_server_framework_nextjs::builder(),
+        trusted_server_audience_permutive::builder(),
+        trusted_server_identity_lockr::builder(),
+        trusted_server_cmp_didomi::builder(),
+        trusted_server_cmp_inmobi::builder(),
+        trusted_server_cmp_sourcepoint::builder(),
+        trusted_server_cmp_osano::builder(),
+        trusted_server_tag_google_tag::builder(),
+        trusted_server_tag_google_tag_manager::builder(),
+        trusted_server_bot_protection_datadome::builder(),
+        trusted_server_ad_tag_google::builder(),
+        trusted_server_ad_tag_google::diagnostics::builder(),
+        trusted_server_ads_txt_iabtl::builder(),
+        trusted_server_headers_geo::builder(),
+        // Implementations `[demand]` and `[ad-server]` can name, which no
+        // section selects.
+        trusted_server_auction_protocol_openrtb::builder(),
+        trusted_server_auction_prebid_server::builder(),
+        trusted_server_auction_aps::builder(),
+        trusted_server_ad_server_iabtl::builder(),
+    ]
+}
+
+/// The builders this adapter links followed by `extra`, a deployment's own,
+/// which is the order their hooks run in.
+#[must_use]
+pub fn module_builders_with(extra: &[IntegrationBuilder]) -> Vec<IntegrationBuilder> {
+    let mut all = shipped_module_builders();
+    all.extend_from_slice(extra);
+    all
 }
 
 impl AppState {
@@ -1283,6 +1330,90 @@ mod tests {
         assert!(
             UNSENT_ANALYTICS_LOGGED.load(std::sync::atomic::Ordering::Relaxed),
             "startup should log that this adapter sends no auction telemetry"
+        );
+    }
+
+    /// The modules this adapter links are offered in the order their hooks
+    /// run. A module is named by what its section selects, and an
+    /// implementation by what `[demand]` or `[ad-server]` names.
+    #[test]
+    fn the_linked_modules_are_offered_in_hook_order() {
+        let names: Vec<&str> = shipped_module_builders()
+            .iter()
+            .map(|builder| {
+                builder
+                    .module_name()
+                    .or_else(|| builder.demand().map(|demand| demand.id))
+                    .or_else(|| builder.adserver().map(|adserver| adserver.id))
+                    .unwrap_or_else(|| builder.id())
+            })
+            .collect();
+
+        assert_eq!(
+            names,
+            [
+                "auction.prebid",
+                "testing.testlight",
+                "framework.nextjs",
+                "audience.permutive",
+                "identity.lockr",
+                "cmp.didomi",
+                "cmp.inmobi",
+                "cmp.sourcepoint",
+                "cmp.osano",
+                "tag.google-tag",
+                "tag.google-tag-manager",
+                "bot-protection.datadome",
+                "ad-tag.google",
+                "ad-tag.google.diagnostics",
+                "ads-txt.iabtl",
+                "headers.geo",
+                "auction-protocol.openrtb",
+                "auction.prebid-server",
+                "auction.aps",
+                "ad-server.iabtl",
+            ],
+            "should offer the linked modules in the order their hooks run"
+        );
+    }
+
+    /// This adapter links no loading cache module, so every feature loads
+    /// through `NoLoadingCache`, which keeps no copy, and a deployment that
+    /// wants copies kept hands a loading cache module's builder to it.
+    #[test]
+    fn the_stock_build_links_no_loading_cache() {
+        let offering: Vec<&str> = shipped_module_builders()
+            .iter()
+            .filter(|builder| builder.loading_cache().is_some())
+            .map(IntegrationBuilder::id)
+            .collect();
+
+        assert!(
+            offering.is_empty(),
+            "a stock build should link no loading cache, and links {offering:?}"
+        );
+    }
+
+    /// A deployment's builders follow the ones this adapter links.
+    #[test]
+    fn a_deployment_s_builders_follow_the_linked_ones() {
+        let linked = shipped_module_builders().len();
+        let extra = [IntegrationBuilder::implementations(
+            "deployment_fixture",
+            "deployment-crate",
+        )];
+
+        let all = module_builders_with(&extra);
+
+        assert_eq!(
+            all.len(),
+            linked + 1,
+            "should keep every linked builder and add the deployment's"
+        );
+        assert_eq!(
+            all.last().map(IntegrationBuilder::source),
+            Some("deployment-crate"),
+            "should put the deployment's builder last"
         );
     }
 }

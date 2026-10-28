@@ -12,6 +12,7 @@ use url::Url;
 use crate::auction::AuctionPlan;
 use crate::auction::demand::{AdServerImplementation, DemandImplementation};
 use crate::error::TrustedServerError;
+use crate::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
 use crate::platform::{DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, RuntimeServices};
 use crate::settings::Settings;
 
@@ -364,6 +365,46 @@ pub struct ModuleSecretSetting {
     pub in_use: fn(&serde_json::Map<String, serde_json::Value>) -> bool,
 }
 
+/// A page change a module supplies, as its builder describes it, so a tool
+/// that writes a configuration places the module's page changes without
+/// reading the module.
+///
+/// A middleware that runs in either phase is described in the one a
+/// generated configuration places it in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SuppliedMiddleware {
+    /// The name an entry writes, which is the middleware's
+    /// [`middleware_id`](crate::middleware::Middleware::middleware_id).
+    pub name: &'static str,
+    /// The phase an entry names it in.
+    pub phase: MiddlewarePhase,
+    /// The media type an entry naming it covers.
+    pub media_type: &'static str,
+}
+
+impl SuppliedMiddleware {
+    /// A page change on every HTML page, named `name` in a `[[phase]]` entry.
+    #[must_use]
+    pub const fn on_html(name: &'static str, phase: MiddlewarePhase) -> Self {
+        Self {
+            name,
+            phase,
+            media_type: HTML_MEDIA_TYPE,
+        }
+    }
+
+    /// A change to a file of `media_type`, named `name` in a `[[phase]]`
+    /// entry on the file's path.
+    #[must_use]
+    pub const fn on(name: &'static str, phase: MiddlewarePhase, media_type: &'static str) -> Self {
+        Self {
+            name,
+            phase,
+            media_type,
+        }
+    }
+}
+
 /// Source label for the built-in integrations.
 pub const CORE_SOURCE: &str = "trusted-server-core";
 
@@ -418,6 +459,7 @@ pub struct IntegrationBuilder {
     plan_validator: Option<IntegrationPlanValidateFn>,
     reads_auction_token: bool,
     secret_settings: &'static [ModuleSecretSetting],
+    middleware: &'static [SuppliedMiddleware],
     supplies_integration: bool,
     demand: Option<&'static DemandImplementation>,
     adserver: Option<&'static AdServerImplementation>,
@@ -465,6 +507,7 @@ impl IntegrationBuilder {
             plan_validator: None,
             reads_auction_token: false,
             secret_settings: &[],
+            middleware: &[],
             supplies_integration: true,
             demand: None,
             adserver: None,
@@ -495,6 +538,7 @@ impl IntegrationBuilder {
             plan_validator: None,
             reads_auction_token: false,
             secret_settings: &[],
+            middleware: &[],
             supplies_integration: false,
             demand: None,
             adserver: None,
@@ -614,6 +658,23 @@ impl IntegrationBuilder {
     #[must_use]
     pub const fn secret_settings(&self) -> &'static [ModuleSecretSetting] {
         self.secret_settings
+    }
+
+    /// Describes the page changes the module's registration supplies, each
+    /// with the phase and the media type an entry names it for, so a tool
+    /// that writes a configuration places them without reading the module.
+    /// The registry refuses a registration whose middleware contradicts the
+    /// description.
+    #[must_use]
+    pub const fn with_middleware(mut self, middleware: &'static [SuppliedMiddleware]) -> Self {
+        self.middleware = middleware;
+        self
+    }
+
+    /// The page changes the module's registration supplies, as described.
+    #[must_use]
+    pub const fn middleware(&self) -> &'static [SuppliedMiddleware] {
+        self.middleware
     }
 
     /// Runs this builder when a section selects the module `name`, which is a
@@ -763,7 +824,8 @@ impl IntegrationBuilder {
     }
 }
 
-/// The built-in integrations, in the order `trusted-server-modules` lists them.
+/// The built-in integrations, which the registry runs ahead of the builders
+/// a build links.
 const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     // This stays the first module a section selects, so its middleware is
     // the first of theirs in the order the registry lists them.
@@ -813,8 +875,7 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     .with_adserver(&crate::auction::test_support::adserver_fixture::ADSERVER),
 ];
 
-/// The built-in integration builders, in the order `trusted-server-modules`
-/// lists them.
+/// The built-in integration builders, in the order the registry runs them.
 pub(crate) fn builders() -> &'static [IntegrationBuilder] {
     BUILT_IN_BUILDERS
 }
@@ -825,6 +886,50 @@ pub(crate) fn all_builders(
     extra: &[IntegrationBuilder],
 ) -> impl Iterator<Item = IntegrationBuilder> + '_ {
     builders().iter().copied().chain(extra.iter().copied())
+}
+
+/// The middleware a build of the built-in modules and `builders` supplies,
+/// each with the id of the integration that supplies it, in the order the
+/// registry registers them, which is the order a configuration that runs
+/// them all names them in.
+///
+/// A module registered from the auction plan comes before every module a
+/// section selects, the built-in modules come before `builders`, and core's
+/// robots.txt and service version middleware, which no builder supplies,
+/// come last.
+#[must_use]
+pub fn supplied_middleware(
+    builders: &[IntegrationBuilder],
+) -> Vec<(&'static str, SuppliedMiddleware)> {
+    let described = |builder: IntegrationBuilder| {
+        builder
+            .middleware()
+            .iter()
+            .map(move |middleware| (builder.id(), *middleware))
+    };
+    all_builders(builders)
+        .filter(|builder| builder.plan_registration().is_some())
+        .flat_map(described)
+        .chain(
+            all_builders(builders)
+                .filter(|builder| builder.plan_registration().is_none())
+                .flat_map(described),
+        )
+        .chain([
+            (
+                crate::robots_txt::middleware::MODULE,
+                SuppliedMiddleware::on(
+                    crate::robots_txt::middleware::MODULE,
+                    MiddlewarePhase::Fetch,
+                    crate::robots_txt::middleware::MEDIA_TYPE,
+                ),
+            ),
+            (
+                crate::service_version::MODULE,
+                SuppliedMiddleware::on_html(crate::service_version::MODULE, MiddlewarePhase::Serve),
+            ),
+        ])
+        .collect()
 }
 
 /// The caches a deployment may hold answers in, by name: core's own first,
@@ -1351,5 +1456,158 @@ mod loading_caches_from_tests {
             message.contains("The loading cache modules this build has are: none"),
             "{message}"
         );
+    }
+}
+
+#[cfg(test)]
+mod supplied_middleware_tests {
+    use super::*;
+
+    fn no_build(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(None)
+    }
+
+    fn no_validate(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+        Ok(true)
+    }
+
+    fn no_plan_registration(
+        _settings: &Settings,
+        _plan: &AuctionPlan,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(None)
+    }
+
+    const FIRST: &[SuppliedMiddleware] = &[SuppliedMiddleware::on_html(
+        "testing.first",
+        MiddlewarePhase::Fetch,
+    )];
+    const PLANNED: &[SuppliedMiddleware] = &[
+        SuppliedMiddleware::on_html("testing.planned", MiddlewarePhase::Fetch),
+        SuppliedMiddleware::on_html("testing.planned.reader", MiddlewarePhase::Serve),
+    ];
+    const FILE: &[SuppliedMiddleware] = &[SuppliedMiddleware::on(
+        "testing.file",
+        MiddlewarePhase::Fetch,
+        "text/plain",
+    )];
+
+    #[test]
+    fn a_builder_describes_no_middleware_until_told() {
+        let builder = IntegrationBuilder::new("quiet", CORE_SOURCE, no_build, no_validate);
+
+        assert!(builder.middleware().is_empty());
+        assert_eq!(builder.with_middleware(FIRST).middleware(), FIRST);
+    }
+
+    /// The list follows the registry: what registers from the auction plan
+    /// first, then the built-in modules, then the linked builders in their
+    /// order, then core's robots.txt and service version middleware.
+    #[test]
+    fn the_middleware_are_listed_in_the_order_the_registry_registers_them() {
+        let first = IntegrationBuilder::new("first", CORE_SOURCE, no_build, no_validate)
+            .with_module_name("testing.first")
+            .with_middleware(FIRST);
+        let planned = IntegrationBuilder::new("planned", CORE_SOURCE, no_build, no_validate)
+            .with_module_name("testing.planned")
+            .with_plan_registration(no_plan_registration)
+            .with_middleware(PLANNED);
+        let file = IntegrationBuilder::new("file", CORE_SOURCE, no_build, no_validate)
+            .with_module_name("testing.file")
+            .with_middleware(FILE);
+        let silent = IntegrationBuilder::implementations("silent", CORE_SOURCE);
+
+        let listed = supplied_middleware(&[first, silent, planned, file]);
+
+        let rows: Vec<(&str, &str, MiddlewarePhase, &str)> = listed
+            .iter()
+            .map(|(integration, middleware)| {
+                (
+                    *integration,
+                    middleware.name,
+                    middleware.phase,
+                    middleware.media_type,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (
+                    "planned",
+                    "testing.planned",
+                    MiddlewarePhase::Fetch,
+                    HTML_MEDIA_TYPE
+                ),
+                (
+                    "planned",
+                    "testing.planned.reader",
+                    MiddlewarePhase::Serve,
+                    HTML_MEDIA_TYPE
+                ),
+                (
+                    js_asset_proxy::MODULE,
+                    js_asset_proxy::MODULE,
+                    MiddlewarePhase::Fetch,
+                    HTML_MEDIA_TYPE
+                ),
+                (
+                    "first",
+                    "testing.first",
+                    MiddlewarePhase::Fetch,
+                    HTML_MEDIA_TYPE
+                ),
+                ("file", "testing.file", MiddlewarePhase::Fetch, "text/plain"),
+                (
+                    crate::robots_txt::middleware::MODULE,
+                    crate::robots_txt::middleware::MODULE,
+                    MiddlewarePhase::Fetch,
+                    crate::robots_txt::middleware::MEDIA_TYPE
+                ),
+                (
+                    crate::service_version::MODULE,
+                    crate::service_version::MODULE,
+                    MiddlewarePhase::Serve,
+                    HTML_MEDIA_TYPE
+                ),
+            ],
+            "should list what the plan registers first, then core's own, then the linked \
+             builders in order, then core's file and version middleware"
+        );
+    }
+
+    /// Core's robots.txt row names the middleware the registry makes for a
+    /// `[robots-txt]` section, in the phase and for the media type the row
+    /// gives.
+    #[test]
+    fn core_s_robots_txt_row_is_what_the_registry_registers_for_the_section() {
+        use crate::robots_txt::middleware as robots_txt;
+
+        let settings = crate::html_processor::test_support::page_settings(
+            "[robots-txt]
+modules = \"refuse_all\"
+
+[[fetch]]
+media_type = \"text/plain\"
+path = \"/robots.txt\"
+middleware = [\"robots_txt\"]
+",
+        );
+        let registry = IntegrationRegistry::with_registrations(&settings, &[])
+            .expect("should build a registry with the section");
+        let (_, row) = supplied_middleware(&[])
+            .into_iter()
+            .find(|(integration, _)| *integration == robots_txt::MODULE)
+            .expect("the list should carry core's robots.txt row");
+
+        assert!(
+            registry
+                .middleware_in(row.phase)
+                .contains(&robots_txt::MODULE),
+            "the section should register the middleware for the listed phase"
+        );
+        assert_eq!(row.media_type, robots_txt::MEDIA_TYPE);
     }
 }

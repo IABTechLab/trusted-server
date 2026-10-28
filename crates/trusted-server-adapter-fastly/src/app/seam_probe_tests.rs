@@ -1,7 +1,7 @@
 //! Round-trip tests for the integration seam on the Fastly adapter, driven by
 //! a crate `trusted-server-core` knows nothing about.
 //!
-//! `trusted-server-integration-seam-probe` registers every capability the seam
+//! `trusted-server-testing-iabtl` registers every capability the seam
 //! exposes, and each test asserts an observable outcome through this adapter's
 //! own router: the bytes served, the JSON a route returns, or the error a
 //! startup check produces. The Axum adapter's seam tests assert the same
@@ -23,7 +23,7 @@ use trusted_server_core::platform::{GeoInfo, GeoModule, PlatformError};
 use trusted_server_core::settings::Settings;
 use trusted_server_core::tsjs::tsjs_script_src;
 use trusted_server_core::tsjs_bundle::{JsModulePart, compile_time_parts};
-use trusted_server_integration_seam_probe as seam_probe;
+use trusted_server_testing_iabtl as seam_probe;
 
 use super::{
     AppState, TrustedServerApp, build_entry_point_services, build_state_from_settings,
@@ -37,9 +37,9 @@ const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// assertions expect.
 const PROBE_BLOCK: &str = r#"
         [testing]
-        modules = ["seam-probe"]
+        modules = ["iabtl"]
 
-        [testing.seam-probe]
+        [testing.iabtl]
         country = "ZZ"
 "#;
 
@@ -183,7 +183,7 @@ fn proxy_route_reports_the_modules_geo_and_that_the_preparer_ran() {
     let settings = settings_with(&format!(
         r#"
         [geo]
-        module = "testing.seam-probe"
+        module = "testing.iabtl"
         {HMAC_BLOCK}
         {PROBE_BLOCK}
         "#
@@ -561,7 +561,7 @@ fn fetch_entry_builds_state_only_when_its_middleware_is_running() {
     const ENTRY: &str = r#"
         [[fetch]]
         media_type = "text/html"
-        middleware = ["testing.seam-probe"]
+        middleware = ["testing.iabtl"]
 "#;
 
     let selected = settings_with(&format!("{HMAC_BLOCK}{PROBE_BLOCK}{ENTRY}"));
@@ -577,8 +577,8 @@ fn fetch_entry_builds_state_only_when_its_middleware_is_running() {
 
     let message = error.to_string();
     assert!(
-        message.contains("[[fetch]] entry 1 names `testing.seam-probe`")
-            && message.contains("`testing.seam-probe` is a module no section selects"),
+        message.contains("[[fetch]] entry 1 names `testing.iabtl`")
+            && message.contains("`testing.iabtl` is a module no section selects"),
         "should name the entry and say why the middleware is not running: {message}"
     );
 }
@@ -616,7 +616,7 @@ fn serve_entry_builds_state_only_with_a_middleware_of_that_phase() {
 
     let message = error.to_string();
     assert!(
-        message.contains("[[serve]] entry 1 names `testing.seam-probe`")
+        message.contains("[[serve]] entry 1 names `testing.iabtl`")
             && message.contains("does not run in that phase. It runs in [[fetch]]"),
         "should say which phase the middleware runs in: {message}"
     );
@@ -629,13 +629,13 @@ fn geo_selector_naming_a_module_without_a_geo_module_fails_at_startup() {
     let settings = settings_with(&format!(
         r#"
         [geo]
-        module = "testing.seam-probe"
+        module = "testing.iabtl"
         {HMAC_BLOCK}
 
         [testing]
-        modules = ["seam-probe"]
+        modules = ["iabtl"]
 
-        [testing.seam-probe]
+        [testing.iabtl]
         country = "ZZ"
         declares_geo = false
         "#
@@ -647,7 +647,7 @@ fn geo_selector_naming_a_module_without_a_geo_module_fails_at_startup() {
 
     let message = error.to_string();
     assert!(
-        message.contains("`[geo] module` names `testing.seam-probe`")
+        message.contains("`[geo] module` names `testing.iabtl`")
             && message.contains("is selected and supplies no geo module"),
         "should name the module and the missing capability: {message}"
     );
@@ -903,9 +903,9 @@ mod module_endpoints {
         let settings = settings_with(&format!(
             r#"{HMAC_BLOCK}
         [testing]
-        modules = ["seam-probe", "own-module"]
+        modules = ["iabtl", "own-module"]
 
-        [testing.seam-probe]
+        [testing.iabtl]
         country = "ZZ"
         "#
         ));
@@ -985,7 +985,7 @@ fn demand_source_a_module_supplies_builds_state_only_with_its_builder() {
         modules = ["probe"]
 
         [demand.probe]
-        implementation = "testing.seam-probe"
+        implementation = "testing.iabtl"
         endpoint = "https://demand.example/openrtb2/auction"
         {HMAC_BLOCK}
         "#
@@ -1004,7 +1004,7 @@ fn demand_source_a_module_supplies_builds_state_only_with_its_builder() {
         .expect("should refuse a demand source no builder in the deployment supplies");
     let message = error.to_string();
     assert!(
-        message.contains("[demand] `probe` uses implementation `testing.seam-probe`"),
+        message.contains("[demand] `probe` uses implementation `testing.iabtl`"),
         "should name the demand source and the implementation nothing supplies: {message}"
     );
 }
@@ -1021,7 +1021,7 @@ fn ad_server_a_module_supplies_builds_state_only_with_its_builder() {
         module = "probe"
 
         [ad-server.probe]
-        implementation = "testing.seam-probe"
+        implementation = "testing.iabtl"
         {HMAC_BLOCK}
         "#
         ))
@@ -1039,7 +1039,7 @@ fn ad_server_a_module_supplies_builds_state_only_with_its_builder() {
         .expect("should refuse an ad server no builder in the deployment supplies");
     let message = error.to_string();
     assert!(
-        message.contains("[ad-server] `probe` uses implementation `testing.seam-probe`"),
+        message.contains("[ad-server] `probe` uses implementation `testing.iabtl`"),
         "should name the ad server and the implementation nothing supplies: {message}"
     );
 }
@@ -1053,28 +1053,30 @@ fn ec_and_device_selectors_naming_a_module_resolve_the_modules_it_declares() {
     let settings = settings_with(&format!(
         r#"
         [ec]
-        module = "testing.seam-probe"
+        module = "testing.iabtl"
 
         [device]
-        module = "testing.seam-probe"
+        module = "testing.iabtl"
         {PROBE_BLOCK}
         "#
     ));
 
     let state = state_with(settings, &[seam_probe::builder()]);
 
-    let device = state.registry.device_module().expect(
-        "`[device] module = \"testing.seam-probe\"` should resolve the module's device module",
-    );
+    let device = state
+        .registry
+        .device_module()
+        .expect("`[device] module = \"testing.iabtl\"` should resolve the module's device module");
     assert_eq!(
         device.id(),
         seam_probe::module_name(),
         "the device module should be the one the module declared"
     );
 
-    let module = state.registry.ec_module().expect(
-        "`[ec] module = \"testing.seam-probe\"` should resolve the module's Edge Cookie module",
-    );
+    let module = state
+        .registry
+        .ec_module()
+        .expect("`[ec] module = \"testing.iabtl\"` should resolve the module's Edge Cookie module");
     assert_eq!(
         module.id(),
         seam_probe::module_name(),
@@ -1122,7 +1124,7 @@ fn device_selector_naming_a_module_classifies_a_request_with_it() {
         settings_with(&format!(
             r#"
         [device]
-        module = "testing.seam-probe"
+        module = "testing.iabtl"
         {HMAC_BLOCK}
         {PROBE_BLOCK}
         "#

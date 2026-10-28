@@ -1412,11 +1412,11 @@ it passes through untouched.
 
 ### `[ads-txt]`
 
-| Field     | Type          | Required | Description                                                                       |
-| --------- | ------------- | -------- | --------------------------------------------------------------------------------- |
-| `modules` | Array[String] | Yes      | What adds lines to the file. `sellers` writes the lines `[ads-txt.sellers]` gives |
+| Field     | Type          | Required | Description                                                                   |
+| --------- | ------------- | -------- | ----------------------------------------------------------------------------- |
+| `modules` | Array[String] | Yes      | What adds lines to the file. `iabtl` writes the lines `[ads-txt.iabtl]` gives |
 
-### `[ads-txt.sellers]`
+### `[ads-txt.iabtl]`
 
 | Field   | Type          | Required | Description                                                                                                                                                         |
 | ------- | ------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1439,15 +1439,15 @@ written into the file or make it.
 
 ```toml
 [ads-txt]
-modules = ["sellers"]
+modules = ["iabtl"]
 
-[ads-txt.sellers]
+[ads-txt.iabtl]
 lines = ["ssp.example, 12345, DIRECT, f08c47fec0942fa0", "CONTACT=ads@publisher.example"]
 
 [[fetch]]
 media_type = "text/plain"
 path = "/ads.txt"
-middleware = ["ads-txt.sellers"]
+middleware = ["ads-txt.iabtl"]
 ```
 
 ## Shared Settings
@@ -2268,7 +2268,7 @@ refuses startup too, as does a section that selects nothing, so a table left
 behind after a module is switched off is caught rather than sitting unread.
 
 `auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps` and
-`ad-server.mock` supply demand and ad server implementations only. They are
+`ad-server.iabtl` supply demand and ad server implementations only. They are
 not page integrations, so a section that names one refuses startup like any
 name no module supplies. Their settings live in `[demand.<name>]` and
 `[ad-server.<name>]`. `loading-cache.51degrees` supplies a loading cache
@@ -2421,7 +2421,7 @@ generated configuration places it in.
 | `ad-tag.google`               | `[[fetch]]` | Writes the `tsjs.adInit` bootstrap into the head and, when `rewrite_script` is set, points a `src` or `href` that is the GPT script's address at `/integrations/gpt/script`                                                                                                                                                                                       |
 | `ad-tag.google.loader`        | `[[serve]]` | Writes the loader tag into the head, after the bootstrap, when `write_loader` is set, for a reader whose permissions allow storage on the device                                                                                                                                                                                                                  |
 | `ad-tag.google.diagnostics`   | `[[serve]]` | For a request that activated diagnostics, writes the bootstrap ahead of the script bundle and the tag that loads the diagnostics module straight after it                                                                                                                                                                                                         |
-| `ads-txt.sellers`             | `[[fetch]]` | Writes the lines `[ads-txt.sellers]` gives at the end of the publisher's `ads.txt`, on `text/plain` alone                                                                                                                                                                                                                                                         |
+| `ads-txt.iabtl`               | `[[fetch]]` | Writes the lines `[ads-txt.iabtl]` gives at the end of the publisher's `ads.txt`, on `text/plain` alone                                                                                                                                                                                                                                                           |
 | `headers.geo`                 | `[[serve]]` | Writes the location the request resolved as the `x-geo-*` response headers, or `x-geo-info-available: false` where none is known. `[headers] modules = ["geo"]` selects it                                                                                                                                                                                        |
 | `robots_txt`                  | `[[fetch]]` | Makes the `robots.txt` that `[robots-txt]` describes, in place of whatever the origin answers, on `text/plain` and at `/robots.txt` alone                                                                                                                                                                                                                         |
 | `service_version`             | `[[serve]]` | Writes `X-TS-Version`, the git version the build compiled in, and `X-TS-Service-Version`, the platform's version number of the service, when each is known. Core supplies it, so no section selects it                                                                                                                                                            |
@@ -3039,9 +3039,9 @@ allow_script_creatives = false
 module = "pbs_main"
 
 [ad-server]
-module = "mock"
+module = "iabtl"
 
-[ad-server.mock]
+[ad-server.iabtl]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 ```
@@ -3090,8 +3090,8 @@ applies floors locally. With one configured, normalized demand responses are
 sent to it, and Trusted Server falls back to local ranking when the ad server
 cannot run.
 
-The one implementation this repository ships is `ad-server.mock`, written
-`mock` in `[ad-server]`, for
+The one implementation this repository ships is `ad-server.iabtl`, written
+`iabtl` in `[ad-server]`, for
 development and testing.
 
 | Setting                | Required | Default | Description                                                         |
@@ -3103,13 +3103,13 @@ development and testing.
 
 ```toml
 [ad-server]
-module = "mock"
+module = "iabtl"
 
-[ad-server.mock]
+[ad-server.iabtl]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 
-[ad-server.mock.context_query_params]
+[ad-server.iabtl.context_query_params]
 example_segments = "segments"
 ```
 

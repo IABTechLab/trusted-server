@@ -12,11 +12,11 @@ use std::time::Duration;
 
 use trusted_server_core::config::TrustedServerAppConfig;
 
-/// Registers the modules a stock build ships with deploy validation, as the
-/// `ts` tool does before it validates, so a configuration validated here is
+/// Registers the modules the `ts` tool links with deploy validation, as the
+/// tool does before it validates, so a configuration validated here is
 /// judged against the modules the tool has.
-fn register_stock_modules() {
-    trusted_server_core::config::register_deploy_integrations(trusted_server_modules::builders());
+fn register_linked_modules() {
+    trusted_server_core::config::register_deploy_integrations(trusted_server_cli::linked_builders());
 }
 
 #[test]
@@ -225,7 +225,7 @@ fn generate_deploy_validation_warning_does_not_echo_baseline_values() {
     );
     let parsed: TrustedServerAppConfig =
         toml::from_str(&source).expect("should pass syntax and schema");
-    register_stock_modules();
+    register_linked_modules();
     assert!(
         TrustedServerAppConfig::new(parsed.into_settings()).is_err(),
         "should fail deploy validation"
@@ -282,7 +282,7 @@ fn generate_deploy_validation_refusal_preserves_config_and_safe_output() {
     let source = format!("{}\n# FICTIONAL_SECRET_SENTINEL\n", baseline());
     let parsed: TrustedServerAppConfig =
         toml::from_str(&source).expect("should parse valid baseline");
-    register_stock_modules();
+    register_linked_modules();
     TrustedServerAppConfig::new(parsed.into_settings()).expect("should pass deploy validation");
     for dry_run in [false, true] {
         let directory = tempfile::tempdir().expect("should create temporary config directory");

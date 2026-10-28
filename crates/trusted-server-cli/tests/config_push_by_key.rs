@@ -267,7 +267,7 @@ fn read_back(
         key,
         &StoreName::from("trusted_server_secrets"),
         origin,
-        &trusted_server_modules::builders(),
+        &trusted_server_cli::linked_builders(),
     )
 }
 

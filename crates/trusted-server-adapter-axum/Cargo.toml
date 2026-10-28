@@ -28,13 +28,31 @@ log = { workspace = true }
 reqwest = { workspace = true }
 simple_logger = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+trusted-server-ad-server-iabtl = { workspace = true }
+trusted-server-ad-tag-google = { workspace = true }
+trusted-server-ads-txt-iabtl = { workspace = true }
+trusted-server-auction-aps = { workspace = true }
+trusted-server-auction-prebid = { workspace = true }
+trusted-server-auction-prebid-server = { workspace = true }
+trusted-server-auction-protocol-openrtb = { workspace = true }
+trusted-server-audience-permutive = { workspace = true }
+trusted-server-bot-protection-datadome = { workspace = true }
+trusted-server-cmp-didomi = { workspace = true }
+trusted-server-cmp-inmobi = { workspace = true }
+trusted-server-cmp-osano = { workspace = true }
+trusted-server-cmp-sourcepoint = { workspace = true }
 trusted-server-core = { workspace = true }
-trusted-server-modules = { workspace = true }
+trusted-server-framework-nextjs = { workspace = true }
+trusted-server-headers-geo = { workspace = true }
+trusted-server-identity-lockr = { workspace = true }
 trusted-server-permission-signal-gpc = { workspace = true }
 trusted-server-permission-signal-gpp = { workspace = true }
 trusted-server-permission-signal-mtm = { workspace = true }
 trusted-server-permission-signal-tcf = { workspace = true }
 trusted-server-permission-signal-us-privacy = { workspace = true }
+trusted-server-tag-google-tag = { workspace = true }
+trusted-server-tag-google-tag-manager = { workspace = true }
+trusted-server-testing-testlight = { workspace = true }
 
 [dev-dependencies]
 trusted-server-core = { workspace = true, features = ["test-utils"] }
@@ -47,4 +65,4 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tower = { workspace = true, features = ["util"] }
 # Test fixture only. It proves the integration seam from outside core and must
 # never reach a production build, so it stays a dev-dependency.
-trusted-server-integration-seam-probe = { path = "../testing/seam-probe" }
+trusted-server-testing-iabtl = { path = "../testing/iabtl" }

@@ -250,15 +250,15 @@ pull_sync_concurrency = 3
 # for text/plain on the file's path names the middleware. Each line is a data
 # record or a variable of the ads.txt grammar, checked as the settings load.
 # [ads-txt]
-# modules = ["sellers"]
+# modules = ["iabtl"]
 
-# [ads-txt.sellers]
+# [ads-txt.iabtl]
 # lines = ["ssp.example, 12345, DIRECT, f08c47fec0942fa0"]
 
 # [[fetch]]
 # media_type = "text/plain"
 # path = "/ads.txt"
-# middleware = ["ads-txt.sellers"]
+# middleware = ["ads-txt.iabtl"]
 
 # The robots.txt the [robots-txt] section describes, made by core's own
 # middleware where this entry names it. The file replaces the origin's own
@@ -629,16 +629,16 @@ module = "pbs_main"
 
 # The ad server that picks the auction winner. With no [ad-server] selection the
 # highest bid wins. The only implementation this repository ships is
-# ad-server.mock, for development and testing, written here as mock because
+# ad-server.iabtl, for development and testing, written here as iabtl because
 # its type is this section's.
 # [ad-server]
-# module = "mock"
+# module = "iabtl"
 #
-# [ad-server.mock]
+# [ad-server.iabtl]
 # endpoint = "https://adserver.example.com/decide"
 # timeout_ms = 1000
 # Map auction context keys to decision-URL query params:
-# [ad-server.mock.context_query_params]
+# [ad-server.iabtl.context_query_params]
 # example_segments = "segments"
 
 # Server-side ad slot templates + creative-opportunity auction. Kept active.

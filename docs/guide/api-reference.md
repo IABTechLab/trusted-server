@@ -1101,7 +1101,7 @@ predicates below, `named` means a section selects the integration's module.
 
 | Integration          | Registration predicate                                              | HTTP routes                                       |
 | -------------------- | ------------------------------------------------------------------- | ------------------------------------------------- |
-| `adserver_mock`      | `[ad-server] module = "mock"`                                       | None                                              |
+| `adserver_mock`      | `[ad-server] module = "iabtl"`                                      | None                                              |
 | `aps`                | `demand implementation=auction.aps;rendering_mode=publisher_native` | None                                              |
 | `aps`                | `demand implementation=auction.aps;rendering_mode=trusted_server`   | `GET /integrations/aps/renderer`                  |
 | `creative`           | `always`                                                            | None                                              |

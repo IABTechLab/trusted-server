@@ -61,6 +61,14 @@ pub(crate) const PREBID_INTEGRATION_ID: &str = "prebid";
 /// The name this module is selected by, in `[auction]`.
 pub const MODULE: &str = "auction.prebid";
 
+/// The page change the module supplies, as an entry names it.
+const SUPPLIED_MIDDLEWARE: &[trusted_server_core::integrations::SuppliedMiddleware] = &[
+    trusted_server_core::integrations::SuppliedMiddleware::on_html(
+        MODULE,
+        trusted_server_core::middleware::MiddlewarePhase::Fetch,
+    ),
+];
+
 /// The builder a deployment hands to an adapter. Prebid is selected in
 /// `[auction]`, registered from the auction plan and checked against it.
 #[must_use]
@@ -74,6 +82,7 @@ pub fn builder() -> trusted_server_core::integrations::IntegrationBuilder {
     .with_module_name(MODULE)
     .with_plan_registration(register_for_plan)
     .with_plan_validator(validate_against_plan)
+    .with_middleware(SUPPLIED_MIDDLEWARE)
 }
 
 /// Prebid's registration needs the auction plan, so [`register_for_plan`]
@@ -3468,6 +3477,20 @@ server_url = "https://prebid.example"
                 env!("CARGO_MANIFEST_DIR"),
                 "/src/fixtures/page-change.recorded.html"
             ),
+        );
+    }
+
+    /// The builder describes the middleware the registration supplies, so a
+    /// tool that writes a configuration places what the module registers.
+    #[test]
+    fn the_builder_describes_the_middleware_the_module_registers() {
+        let settings = trusted_server_core::html_processor::test_support::page_settings(
+            include_str!("fixtures/page-change.settings.toml"),
+        );
+        trusted_server_core::test_support::middleware::assert_described_middleware_is_registered(
+            &settings,
+            &[super::builder()],
+            super::builder().id(),
         );
     }
 }
