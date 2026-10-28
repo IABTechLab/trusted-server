@@ -26,7 +26,7 @@
 //! under that country keyed by ISO 3166-2 subdivision code. The tree is
 //! the publisher's policy file, which a domain's settings name in
 //! `[permissions] policy` and [`load_policy`] checks and parses when the
-//! domain loads. No build carries a policy.
+//! domain loads. No adapter build carries a policy.
 //!
 //! Resolution takes the most specific match and falls back to the node above:
 //! the request's region when it is listed, otherwise its country, otherwise
