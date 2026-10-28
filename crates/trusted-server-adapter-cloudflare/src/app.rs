@@ -1780,18 +1780,21 @@ mod tests {
         // settings it awaits, so the synchronous hook has none to serve.
         let router = TrustedServerApp::routes();
 
-        let req = edgezero_core::http::request_builder()
-            .method("GET")
-            .uri("https://publisher.example/article")
-            .body(edgezero_core::body::Body::empty())
-            .expect("should build request");
-        let resp = router.oneshot(req).await.expect("should route the request");
-
-        assert_eq!(
-            resp.status().as_u16(),
-            500,
-            "a configuration error should answer 500"
-        );
+        for method in publisher_fallback_methods() {
+            for path in ["/", "/article"] {
+                let req = edgezero_core::http::request_builder()
+                    .method(method.clone())
+                    .uri(format!("https://publisher.example{path}"))
+                    .body(edgezero_core::body::Body::empty())
+                    .expect("should build request");
+                let resp = router.oneshot(req).await.expect("should route the request");
+                assert_eq!(
+                    resp.status().as_u16(),
+                    500,
+                    "{method} {path} should answer the configuration error's 500"
+                );
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
