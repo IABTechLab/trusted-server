@@ -19,17 +19,18 @@ use worker::{Context, Env, Request, Response, Result, event};
 #[event(fetch)]
 /// Dispatches an incoming Cloudflare Worker fetch event.
 ///
+/// The application is built for the request from the settings in the
+/// Worker's config store, then served by `EdgeZero`.
+///
 /// # Errors
 ///
 /// Returns a Workers runtime error when the fallback error response cannot be
 /// constructed.
 pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
-    if let Ok(config) = env.var("TRUSTED_SERVER_CONFIG") {
-        app::set_cloudflare_config_json(config.to_string());
-    }
-    app::set_cloudflare_env(env.clone());
-
-    match edgezero_adapter_cloudflare::run_app::<app::TrustedServerApp>(req, env, ctx).await {
+    let app = app::build_app(&env).await;
+    match edgezero_adapter_cloudflare::dispatch_app::<app::TrustedServerApp>(&app, req, env, ctx)
+        .await
+    {
         Ok(resp) => Ok(resp),
         Err(e) => {
             log::error!("worker dispatch error: {e:?}");

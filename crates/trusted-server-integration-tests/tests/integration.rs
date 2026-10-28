@@ -221,10 +221,10 @@ fn test_cloudflare_dynamic_publisher_response_does_not_cross_cookie_boundaries()
 #[ignore = "requires the `wrangler` CLI in $PATH and a prebuilt Cloudflare Workers bundle (run build.sh first); the test starts wrangler dev automatically"]
 fn test_cloudflare_without_its_kv_binding_fails_every_request() {
     init_logger();
-    let config_json = common::config::cloudflare_config_json(origin_port())
-        .expect("should build the Cloudflare config");
+    let envelope = common::config::integration_app_config_envelope(origin_port())
+        .expect("should build the settings blob");
     let process = environments::cloudflare::CloudflareWorkers
-        .spawn_without_kv_binding(&config_json)
+        .spawn_without_kv_binding(&envelope)
         .expect("should start Cloudflare Worker");
     let client = reqwest::blocking::Client::new();
 
@@ -260,10 +260,10 @@ fn test_cloudflare_enabled_auction_reaches_telemetry() {
     init_logger();
     // The readiness probe falls back to the proxied root page.
     let _origin = common::ec::MinimalOrigin::start(origin_port());
-    let config_json = common::config::cloudflare_auction_config_json(origin_port())
+    let envelope = common::config::auction_app_config_envelope(origin_port())
         .expect("should build auction-enabled Cloudflare config");
     let process = environments::cloudflare::CloudflareWorkers
-        .spawn_with_config_json(&config_json)
+        .spawn_with_config_envelope(&envelope)
         .expect("should start Cloudflare Worker");
     let request_body = serde_json::json!({
         "adUnits": [{

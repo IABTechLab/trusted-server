@@ -4,7 +4,7 @@
 //! the strings from the cookies and header the page fills in, and
 //! `assemble_permissions` resolves the policy.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use http::{HeaderMap, HeaderName, HeaderValue, header};
 use serde::Deserialize;
@@ -43,6 +43,19 @@ struct EvalInput {
     gpc: bool,
 }
 
+/// The repository's sample policy, which the page's repository samples tab
+/// evaluates.
+const SAMPLE_POLICY: &str = include_str!("../../../../config/permissions/sample.yaml");
+
+/// The sample's rules, parsed once.
+fn sample_maps() -> &'static PermissionMaps {
+    static MAPS: OnceLock<PermissionMaps> = OnceLock::new();
+    MAPS.get_or_init(|| {
+        PermissionMaps::from_yaml(SAMPLE_POLICY)
+            .expect("should parse the repository's sample policy")
+    })
+}
+
 fn eval_json(input: &str) -> String {
     let input: EvalInput = match serde_json::from_str(input) {
         Ok(input) => input,
@@ -50,7 +63,8 @@ fn eval_json(input: &str) -> String {
     };
     let evidence = evidence_for(&input);
     let modules = modules();
-    let maps = PermissionMaps::standard();
+    // The page's repository mode evaluates the repository's sample.
+    let maps = sample_maps();
     // The jurisdiction the modules read the signals under, as the server
     // detects it from the location the page enters.
     let detected = match input.geo.as_str() {
@@ -70,11 +84,11 @@ fn eval_json(input: &str) -> String {
         .with_evidence(&evidence);
     let (state, jurisdiction) = match input.geo.as_str() {
         "failed" => {
-            let state = assemble_permissions(&context, GeoStatus::Failed, &modules);
+            let state = assemble_permissions(maps, &context, GeoStatus::Failed, &modules);
             (state, "unknown".to_string())
         }
         "none" => {
-            let state = assemble_permissions(&context, GeoStatus::NoLocation, &modules);
+            let state = assemble_permissions(maps, &context, GeoStatus::NoLocation, &modules);
             (state, jurisdiction_name(maps.default_jurisdiction()))
         }
         _ => {
@@ -88,7 +102,7 @@ fn eval_json(input: &str) -> String {
                 region: input.region.clone().filter(|r| !r.is_empty()),
                 asn: None,
             };
-            let state = assemble_permissions(&context, GeoStatus::Located(&info), &modules);
+            let state = assemble_permissions(maps, &context, GeoStatus::Located(&info), &modules);
             let jurisdiction = jurisdiction_name(
                 maps.jurisdiction_for(input.country.as_deref(), input.region.as_deref()),
             );
