@@ -9,6 +9,7 @@ use super::{
     GeoModule, PlatformBackend, PlatformConfigStore, PlatformHttpClient, PlatformKvStore,
     PlatformSecretStore,
 };
+use crate::asset_cache::AssetCacheModule;
 use crate::ec::device::DeviceModule;
 use crate::ec::module::EdgeCookieModule;
 use crate::evidence::HostSignals;
@@ -217,6 +218,10 @@ pub struct RuntimeServices {
     /// selects no module, the Axum adapter, and the core tests all do.
     pub(crate) resolved_ec_module: Option<Arc<dyn EdgeCookieModule>>,
     pub(crate) device_module: Option<Arc<dyn DeviceModule>>,
+    /// The asset cache module `[asset-cache]` selected, which may answer for
+    /// a file before core asks its origin. `None` has every file asked of
+    /// its origin.
+    pub(crate) asset_cache_module: Option<Arc<dyn AssetCacheModule>>,
     /// The permission signal modules this deployment runs, in the order
     /// they are asked, selected at the composition root from the scheme
     /// crates the adapter links. Empty when the adapter offers none, in which
@@ -394,6 +399,13 @@ impl RuntimeServices {
         self.device_module.clone()
     }
 
+    /// The asset cache module `[asset-cache]` selected, when it selected
+    /// one. `None` has core ask the origin for every file.
+    #[must_use]
+    pub fn asset_cache_module(&self) -> Option<Arc<dyn AssetCacheModule>> {
+        self.asset_cache_module.clone()
+    }
+
     /// The prefixes of the publisher this request was resolved to, being the
     /// start of every name the browser holds and of every key in a shared
     /// store. See [`crate::prefix`].
@@ -534,6 +546,18 @@ impl RuntimeServices {
     pub fn with_device_module(self, device_module: Arc<dyn DeviceModule>) -> Self {
         Self {
             device_module: Some(device_module),
+            ..self
+        }
+    }
+
+    /// Returns a clone of this instance with the asset cache module
+    /// replaced.
+    ///
+    /// Adapters use this to apply the module `[asset-cache]` selected.
+    #[must_use]
+    pub fn with_asset_cache_module(self, module: Arc<dyn AssetCacheModule>) -> Self {
+        Self {
+            asset_cache_module: Some(module),
             ..self
         }
     }
@@ -858,6 +882,9 @@ impl RuntimeServicesBuilder {
             host_signals: self.host_signals,
             resolved_ec_module: self.resolved_ec_module,
             device_module: self.device_module,
+            // An adapter hands each request the module the registry
+            // selected, so services built for no request have none.
+            asset_cache_module: None,
             prefixes: self.prefixes.unwrap_or_default(),
             permission_signal_modules: self.permission_signal_modules,
             permission_policy: self

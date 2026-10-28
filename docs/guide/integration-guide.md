@@ -479,6 +479,7 @@ builder every integration uses.
 | `.with_device_module(name, ...)`                      | Offers a device module that `[device] module` may select by that name                                           |
 | `.with_prefix_module(name, ...)`                      | Offers a prefix module that `[prefix] module` may select by that name                                           |
 | `.with_robots_txt_contributor(name, ...)`             | Offers rules for `/robots.txt` that `[robots-txt] modules` may select by that name                              |
+| `.with_asset_cache_module(name, ...)`                 | Offers an asset cache module, asked for a file before its origin, when `[asset-cache]` selects the builder      |
 
 The three script delivery choices are exclusive and the last call wins.
 
@@ -976,6 +977,32 @@ that links none answers with false, and `remove` drops a copy that turned out
 to be unusable. The lifetimes come from the settings, as `[cache.robots-txt]`
 does through `LoadingCacheConfig::lifetimes`, so an operator tunes them
 without a code change.
+
+### Answering for a file before its origin
+
+A crate may answer for a file that is not a page, whether the publisher's
+origin sends it or an asset route fetches it, by declaring an
+`AssetCacheModule`, in `trusted_server_core::asset_cache`, with
+`.with_asset_cache_module(name, ...)`. Core offers each `GET` for such a file
+to the module `[asset-cache]` selects, at the point it is about to ask the
+file's origin, as an `AssetFile` that carries what core knows of the reader's
+request and the `OriginRequest` core would send. A `GET` that describes a
+body, by `Content-Length` or `Transfer-Encoding`, is not offered, because the
+module sends the request with no body. The module answers `Serve` with a
+response, which core processes as it would the origin's, and whose body is
+whole where the adapter does not stream responses, or `OriginFailed` when its
+own request to the origin failed, which core answers as a failed origin
+request, or `AskOrigin`, after which core asks the origin itself.
+
+The registry takes the module only from the registration of the builder
+`[asset-cache]` selects. It refuses one from any other builder, and one in
+what any builder registers for the auction plan, which runs whether or not a
+section selects the builder. It refuses an `[asset-cache]` that selects more
+than one module, and one that selects a builder that supplies no asset cache
+module, naming that builder. A deployment that selects none has every file
+asked of its origin. A module's tests make an `AssetFile` with
+`AssetFile::for_test` and an `OriginRequest` with `OriginRequest::for_test`,
+both behind core's `test-utils` feature.
 
 ### Two traps a vendor will hit
 

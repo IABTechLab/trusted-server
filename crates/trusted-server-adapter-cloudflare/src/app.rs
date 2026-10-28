@@ -315,8 +315,9 @@ impl AppState {
     /// Build per-request [`RuntimeServices`], carrying the Edge Cookie module
     /// the composition root already resolved and applying the module-supplied
     /// geo, Edge Cookie and device modules selected by `[geo]`, `[ec]` and
-    /// `[device] module`. The services also carry the permission policy the
-    /// domain's settings loaded, whichever services the request is given.
+    /// `[device] module`, and the asset cache module `[asset-cache]` selects.
+    /// The services also carry the permission policy the domain's settings
+    /// loaded, whichever services the request is given.
     ///
     /// No Edge Cookie module is carried when the composition root found
     /// nothing safe to keep, so the request path resolves the selection for
@@ -350,6 +351,9 @@ impl AppState {
         }
         if let Some(module) = self.registry.device_module() {
             services = services.with_device_module(module);
+        }
+        if let Some(module) = self.registry.asset_cache_module() {
+            services = services.with_asset_cache_module(module);
         }
         // The publisher this request resolved to names every key in a shared
         // store and every name the browser holds.

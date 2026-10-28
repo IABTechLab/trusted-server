@@ -832,17 +832,14 @@ pub(crate) fn all_builders(
 ///
 /// # Errors
 ///
-/// When a builder declares one of core's own caches, or two builders declare
+/// When a builder declares core's own `robots-txt`, or two builders declare
 /// one name, naming the builders, since the two would otherwise share one
 /// cache and its keys without a word.
 pub(crate) fn declared_caches(
     builders: &[IntegrationBuilder],
 ) -> Result<Vec<&'static str>, Report<TrustedServerError>> {
-    let mut declared: Vec<(&'static str, &'static str)> = vec![
-        (crate::settings::ROBOTS_TXT_CACHE, "core"),
-        (crate::settings::ASSETS_CACHE, "core"),
-        (crate::settings::ASSETS_VARY_CACHE, "core"),
-    ];
+    let mut declared: Vec<(&'static str, &'static str)> =
+        vec![(crate::settings::ROBOTS_TXT_CACHE, "core")];
     for builder in builders {
         for name in builder.cache_features() {
             if let Some((_, by)) = declared.iter().find(|(declared, _)| declared == name) {
@@ -902,8 +899,7 @@ pub(crate) fn check_cache_tables(
 /// builders a deployment links offer. A table that names no module takes the
 /// one loading cache module the build links, and keeps no copy when the build
 /// links none or several. A module's cache is made once however many tables
-/// select it. `[cache.assets]` naming `none` selects nothing for either asset
-/// cache.
+/// select it.
 ///
 /// # Errors
 ///
@@ -921,20 +917,7 @@ pub fn loading_caches_from(
     let declared = declared_caches(builders)?;
     let mut made: Vec<(&'static str, Arc<dyn crate::platform::PlatformLoadingCache>)> = Vec::new();
     let mut caches = crate::platform::LoadingCaches::default();
-    let assets_off =
-        settings.cache.assets.module.as_deref() == Some(crate::settings::ASSETS_CACHE_OFF);
     for (table, config) in settings.cache.loading_caches() {
-        // `[cache.assets]` turned off leaves both asset caches unselected, so
-        // they keep nothing and each asset is fetched from its origin.
-        if assets_off
-            && [
-                crate::settings::ASSETS_CACHE,
-                crate::settings::ASSETS_VARY_CACHE,
-            ]
-            .contains(&table)
-        {
-            continue;
-        }
         // A table naming no module takes the one loading cache module the
         // build links, so answers are held without a line in the document.
         // With none linked, or several, it holds nothing.
@@ -1194,10 +1177,31 @@ mod loading_caches_from_tests {
 
         let message = format!("{refused:?}");
         assert!(message.contains("[cache.answres]"), "{message}");
-        assert!(
-            message.contains("robots-txt, assets, assets-vary, answers"),
-            "{message}"
+        assert!(message.contains("robots-txt, answers"), "{message}");
+    }
+
+    #[test]
+    fn core_declares_only_the_robots_txt_cache() {
+        assert_eq!(
+            declared_caches(&[]).expect("core's own declaration is not refused"),
+            [ROBOTS_TXT_CACHE],
+            "a cache of the files the origin sends is a module's to declare"
         );
+    }
+
+    #[test]
+    fn a_cache_assets_table_is_refused() {
+        let toml_str = format!(
+            "{}\n[cache.assets]\nstore_seconds = 3600\n",
+            crate::test_support::tests::crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse the settings");
+
+        let refused = loading_caches_from(&settings, &[offering("loading-cache.one")])
+            .expect_err("no linked module declares a cache named `assets`");
+
+        let message = format!("{refused:?}");
+        assert!(message.contains("[cache.assets]"), "{message}");
     }
 
     #[test]
@@ -1258,36 +1262,6 @@ mod loading_caches_from_tests {
             "{message}"
         );
         assert!(message.contains("core's own"), "{message}");
-    }
-
-    #[test]
-    fn assets_naming_none_turns_both_asset_caches_off_and_nothing_else() {
-        let builders = [offering("loading-cache.one")];
-        let on = loading_caches_from(&settings_selecting(None), &builders)
-            .expect("no selection is not an error");
-        let mut settings = settings_selecting(None);
-        settings.cache.assets.module = Some(crate::settings::ASSETS_CACHE_OFF.to_owned());
-
-        let off = loading_caches_from(&settings, &builders)
-            .expect("turning the asset caches off is not an error");
-
-        for name in [
-            crate::settings::ASSETS_CACHE,
-            crate::settings::ASSETS_VARY_CACHE,
-        ] {
-            assert!(
-                on.for_feature(name).keeps_values(),
-                "{name} takes the one module offered"
-            );
-            assert!(
-                !off.for_feature(name).keeps_values(),
-                "{name} keeps nothing once turned off"
-            );
-        }
-        assert!(
-            off.for_feature(ROBOTS_TXT_CACHE).keeps_values(),
-            "turning the asset caches off leaves the other caches as they were"
-        );
     }
 
     fn settings_selecting(module: Option<&str>) -> Settings {
