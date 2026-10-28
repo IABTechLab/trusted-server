@@ -49,7 +49,14 @@ module = "hmac"
 
 [ec.hmac]
 passphrase = "ec_passphrase"
+
+[permissions]
+policy = "standard"
 ```
+
+`[permissions] policy` names your permission policy file, here
+`standard.yaml`, which you supply when you push. See
+[Permission Policy Configuration](#permission-policy-configuration).
 
 ### Environment Variable Overrides
 
@@ -67,8 +74,8 @@ export TRUSTED_SERVER__EC__MODULE=hmac
 export TRUSTED_SERVER__EC__HMAC__PASSPHRASE=ec_passphrase
 
 # Replace the rejected placeholder values in trusted-server.toml, then validate.
-ts config validate
-ts config push --adapter fastly
+ts config validate --permissions standard.yaml
+ts config push --adapter fastly --permissions standard.yaml
 ```
 
 ### Static secret references
@@ -143,7 +150,8 @@ Prepare an initial reference-based deployment in this order:
 2. Choose a stable key name for each active credential field in the app config.
 3. Write each credential value under its referenced key without exposing it in
    command arguments, shell history, logs, or CI output.
-4. Run `ts config validate`, then `ts config push --adapter fastly`.
+4. Run `ts config validate`, then
+   `ts config push --adapter fastly --permissions <file>`.
 5. Start or deploy instances after the store and pushed config are both ready.
 
 Migrate an existing deployment in this order:
@@ -153,7 +161,8 @@ Migrate an existing deployment in this order:
    CI output.
 2. Replace each active credential value with a stable key name and remove the
    legacy Tinybird, DataDome, and S3 `secret_store` selectors.
-3. Run `ts config validate`, then `ts config push --adapter fastly --no-diff`.
+3. Run `ts config validate`, then
+   `ts config push --adapter fastly --no-diff --permissions <file>`.
 4. Restart/redeploy instances as needed to load the new values. Rotation is
    startup-scoped; changing a store value does not alter already-built state.
 
@@ -166,7 +175,7 @@ matches the runtime lookup:
 
 ```bash
 export EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=default
-ts config push --adapter spin
+ts config push --adapter spin --permissions standard.yaml
 ```
 
 For local Spin development, add `--local` to the push command. Also declare a
@@ -244,6 +253,7 @@ fail and the service will return its startup-error response.
 | `[image_optimizer]`                                                                                               | nothing               | Reusable Fastly Image Optimizer profiles                                                      |
 | `[inspect]`                                                                                                       | nothing               | What the configuration page at `/_ts/config` shows                                            |
 | `[permission-signal]`                                                                                             | several modules       | Which permission signals are acted on, in order                                               |
+| `[permissions]`                                                                                                   | nothing               | The publisher's permission policy file, by name                                               |
 | `[prefix]`                                                                                                        | one module            | Which module names the browser's cookies and the shared store keys                            |
 | `[proxy]`                                                                                                         | several modules       | Proxy allowlist, TLS policy, asset routes, and the first-party script proxy module            |
 | `[publisher]`                                                                                                     | nothing               | Publisher domain, cookie domain, and proxy signing key                                        |
@@ -280,6 +290,9 @@ module = "hmac"
 
 [ec.hmac]
 passphrase = "ec_passphrase"
+
+[permissions]
+policy = "standard"
 
 [request_signing]
 enabled = true
@@ -865,8 +878,13 @@ A pattern that would not be honored as written refuses the configuration,
 both when a deployment is validated and when the settings load. That is a
 pattern that matches no value, a `show` that names a secret, a pattern another
 pattern of the same list already covers, a `show` that a `hide` covers, a
-pattern that changes nothing the page shows, and any pattern at all beside
-`config = false`.
+pattern that changes nothing the page shows, a pattern under
+`permissions.text`, the policy file the page never shows, and any pattern at
+all beside `config = false`.
+
+`ts config push` always writes `permissions.sha256`, so every check counts it
+as present, and a pattern that names it is judged alike before the push and
+when the pushed settings load.
 
 **Example**:
 
@@ -874,37 +892,6 @@ pattern that changes nothing the page shows, and any pattern at all beside
 [inspect]
 show = ["source.origin.url"]
 hide = ["response_headers"]
-```
-
-## Attestation Configuration
-
-A deployment can serve evidence of who operates it and which build it runs,
-signed with a key that only the operator's build carries. Without this section
-the deployment serves no evidence and the address belongs to the publisher's
-origin. [Attestation](/guide/attestation) describes the evidence, the signing
-keys and how a relying party checks it.
-
-### `[attestation]`
-
-| Field        | Type   | Required | Description                                                                                                                                                                                                                                                                                                                                                                                          |
-| ------------ | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `endpoint`   | String | No       | Where the page answers, with the JSON form at the same path plus `.json`. Default `/_ts/attestation`. An absolute path of two or more segments, 64 characters at most, of lower case letters, digits, `_` and `-`, the first segment starting with `_`, not ending `.json`, not an address the deployment already answers and not under a prefix a framework serves its assets from, such as `_next` |
-| `operator`   | String | Yes      | Who the evidence says operates the deployment, 1 to 64 characters                                                                                                                                                                                                                                                                                                                                    |
-| `context`    | String | Yes      | The text signed ahead of the evidence, 1 to 64 characters with no control characters. A verifier must use exactly the same text                                                                                                                                                                                                                                                                      |
-| `verify_url` | String | Yes      | An `https` address with a host, where the page sends a reader to check the claim                                                                                                                                                                                                                                                                                                                     |
-
-The section refuses any other field, so a configuration naming a signing key
-is refused. Keys are compiled into the build from the file the build input
-`TRUSTED_SERVER_ATTESTATION_KEYS` names, and a build given none answers `503`
-at the endpoint and nothing else changes.
-
-**Example**:
-
-```toml
-[attestation]
-operator = "Example Operator"
-context = "example-attestation:v1"
-verify_url = "https://verifier.example/verify?host=publisher.example"
 ```
 
 ## EC Configuration
@@ -1165,7 +1152,7 @@ A module advertises the technical permissions its data use requires, and Trusted
 
 ### Country and region rules (`permissions.yaml`)
 
-The country and region permission rules are defined in a human-editable permissions YAML document, compiled into the build (not loaded at runtime). The repository sample is `config/permissions/sample.yaml`, which is for testing and evaluation only and is neither a production policy nor legal advice. Edit or replace the compiled-in file and rebuild to change the policy. There is no `[permissions]` block in `trusted-server.toml`. It defines named **groups** (baselines such as `gdpr-eu`, `gdpr-uk`, `us-opt-out`) and **rules** that map a country or country/state to a group, with an optional `permissions` map that overrides single Data Uses (`granted`, `requires_signal`, or `denied`). A request that matches no rule resolves at the top of the rules tree. See the [Permission Model](/guide/permission-model) for the schema and the repository sample.
+The country and region permission rules are defined in the publisher's permission policy file, a human-editable YAML document that the settings name in `[permissions] policy` and that `ts config push --permissions <file>` supplies when the service is deployed, as [Permission Policy Configuration](#permission-policy-configuration) describes. No build carries a policy. The repository sample is `config/permissions/sample.yaml`, which is for testing and evaluation only and is neither a production policy nor legal advice. To change the policy, push the settings again with the changed file. The file defines named **groups** (baselines such as `gdpr-eu`, `gdpr-uk`, `us-opt-out`) and **rules** that map a country or country/state to a group, with an optional `permissions` map that overrides single Data Uses (`granted`, `requires_signal`, or `denied`). A request that matches no rule resolves at the top of the rules tree. See the [Permission Model](/guide/permission-model) for the schema and the repository sample.
 
 ## Consent Configuration
 
@@ -1203,6 +1190,43 @@ max_consent_age_days = 395
 mode = "restrictive"
 freshness_threshold_days = 30
 ```
+
+## Permission Policy Configuration
+
+`[permissions]` names the publisher's permission policy file, which decides
+which permissions each request has. The
+[permission model](/guide/permission-model) describes what the file says. No
+adapter build carries a policy, so every deployment names its own file and supplies it
+with `ts config push --permissions <file>`.
+
+### `[permissions]`
+
+| Field    | Type   | Default | Contract                                                            |
+| -------- | ------ | ------- | ------------------------------------------------------------------- |
+| `policy` | String | None    | Required. The policy file's stem, so `standard.yaml` is `standard`  |
+| `sha256` | String | None    | Written by `ts config push`, never by the settings or an overlay    |
+| `text`   | String | None    | The file itself, written by the push on Fastly, Cloudflare and Spin |
+
+```toml
+[permissions]
+policy = "standard"
+```
+
+```bash
+ts config validate --permissions standard.yaml
+ts config push --adapter fastly --permissions standard.yaml
+```
+
+The push writes the SHA-256 of the file's exact bytes into `sha256`, and on
+every adapter but Axum the file into `text`. Axum reads `<policy>.yaml` from the
+folder `TRUSTED_SERVER_PERMISSIONS_DIR` names when it starts. The
+[CLI guide](/guide/cli#configuration-commands) lists what the push refuses.
+
+A domain whose settings name no policy, or whose file is missing, is not the
+file that was pushed or does not parse, does not start. Every route answers
+`500`, except `/health` on the adapters whose startup router keeps it (see
+[adapter support](/guide/integrations-overview#adapter-support)). Fastly and
+Axum log the reason, which names the policy when the settings name one.
 
 ## Response Headers
 
@@ -1334,7 +1358,7 @@ allows those too. Set `proxy.allowed_domains` to bound what the proxy serves.
 
 Every adapter removes the three from a response before it finalizes it, unless this server answered a request for a path beneath `/_ts`, which is where a deployment is asked about itself. What the publisher's origin sends loses them beneath `/_ts` too. The removal comes before `[response_headers]` is applied, so a header of one of those names set there is still sent.
 
-No adapter writes a version on a response. What the build was made from is in the [attestation document](./attestation), under `build`, and the platform's version number of the service under `platform.serviceVersion`, which is where a deployment is asked about itself.
+No adapter writes a version on a response unless the deployment names the middleware that writes one.
 
 A deployment that wants the versions on its pages names core's `service_version` middleware in the `[[serve]]` entry that covers them, after the module middleware the entry already names. The middleware runs on every page the entry covers, and on nothing else. It writes `X-TS-Version`, the git version the build compiled in from `TRUSTED_SERVER__GIT_VERSION` or local git, when the build knows one, and `X-TS-Service-Version`, the version the adapter reports for the service, when it reports one. No section selects the middleware, and a deployment that does not name it sends nothing about its versions on a page.
 
@@ -2115,38 +2139,12 @@ which `module = "51degrees"` selects in a build that links it. A name that no
 linked crate offers a cache from is refused by `ts config validate` and when
 the service starts, with the names that could be written.
 
-Every response the publisher's origin sends that is not a page, and every
-answer of an asset route under `[[proxy.asset_routes]]`, is held the same way,
-selected by `[cache.assets]`, for the lifetime the origin's cache policy gives
-it and under what the origin says it varies on, so readers who share a memory
-copy, or on Fastly a location, share one fetch of an asset. On Cloudflare and
-Spin, where a memory copy lasts one request and the key-value store makes no
-request wait, each request that misses at the same moment fetches it, and later
-requests read the stored copy. A copy is
-served with the headers that describe it and an `Age` that counts from the
-origin's. Nothing is kept that may not be shared: anything but a `GET`,
-anything but a `200`, HTML, a response carrying `Set-Cookie`, one whose policy
-says `private`, `no-store` or `no-cache` or gives no lifetime, one that varies
-on `*` or on `Cookie`, one larger than a megabyte, an answer the platform's
-image optimizer makes, and the answer to a request carrying `Authorization`, a
-conditional header, a range, or a `Cache-Control` of `no-cache`, `no-store`,
-`min-fresh` or a nonzero `max-age`. A response that may not be shared is served
-to the request whose load fetched it from that one fetch. A request that sends
-the publisher's origin a cookie always goes to the origin, and its answer is not
-kept, because the cache cannot see whether the cookie shaped it. An asset route
-sends its origin no cookie. `[cache.assets] module = "none"` keeps no asset, so
-every asset is fetched from its origin for each request.
-
 | Table                | Field                | Default                 | Range         | Description                                                                     |
 | -------------------- | -------------------- | ----------------------- | ------------- | ------------------------------------------------------------------------------- |
 | `[cache.robots-txt]` | `module`             | the one the build links |               | The module whose loading cache holds each robots.txt module's answer.           |
 | `[cache.robots-txt]` | `memory_seconds`     | `60`                    | 0 to 31536000 | How long the copy in memory is used. Zero keeps none.                           |
 | `[cache.robots-txt]` | `store_seconds`      | `604800`, a week        | 1 to 31536000 | The longest a module's answer is used. The module's own refresh ends it sooner. |
 | `[cache.robots-txt]` | `store_idle_seconds` | `2592000`, 30 days      | 1 to 31536000 | How long an answer in the shared store lasts unused.                            |
-| `[cache.assets]`     | `module`             | the linked module       |               | The loading cache module for assets and route answers. `none` keeps none.       |
-| `[cache.assets]`     | `memory_seconds`     | `5`                     | 0 to 31536000 | How long the copy in memory is used. Zero keeps none.                           |
-| `[cache.assets]`     | `store_seconds`      | `3600`, an hour         | 1 to 31536000 | The longest a copy is used. The origin's own lifetime ends it sooner.           |
-| `[cache.assets]`     | `store_idle_seconds` | `86400`, a day          | 1 to 31536000 | How long a copy in the shared store lasts unused.                               |
 
 The 51Degrees modules declare `51degrees-answers`, the cache that holds the
 service's answers, sized in `[cache.51degrees-answers]`.
@@ -2189,6 +2187,68 @@ memory_seconds = 60
 store_seconds = 604800
 store_idle_seconds = 2592000
 ```
+
+### Holding the files the origins send
+
+A deployment may hold the files the publisher's origin sends that are not
+pages, and the answers of the asset routes under `[[proxy.asset_routes]]`, by
+linking an asset cache module and selecting it in `[asset-cache]`. Core offers
+each `GET` for such a file to that module before it asks the file's origin, so
+a deployment that selects none has every file asked of its origin. No stock
+build links an asset cache module.
+
+`asset-cache.51degrees`, from `crates/asset-cache/51degrees`, holds each file as
+its origin sent it, for the lifetime the origin's cache policy gives it and
+under what the origin says it varies on. It declares two caches,
+`51degrees-assets` for the copies and `51degrees-assets-vary` for what each
+address varies on, and each takes a loading cache module as every declared cache
+does, so the module holds nothing in a build that links no loading cache module.
+A copy is served with the headers that describe it and an `Age` that counts from
+the origin's. Nothing is kept that may not be shared, being anything but a
+`200`, HTML, a response carrying `Set-Cookie`, one whose policy says `private`,
+`no-store` or `no-cache` or gives no lifetime, one that varies on `*` or on
+`Cookie`, one larger than a megabyte, an answer the platform's image optimizer
+makes, and the answer to a request carrying `Authorization`, a conditional
+header, a range, a `Cache-Control` of `no-cache`, `no-store`, `min-fresh` or a
+nonzero `max-age`, or a `Pragma` of `no-cache`. A response that may not be
+shared is served to the request whose load fetched it, from that one fetch. On
+the publisher path a request that carries a cookie always goes to the origin,
+and its answer is not kept, because the module cannot see whether the cookie
+shaped it, and a document always goes to the origin too. An asset route sends
+its origin no cookie, so a route's answer is held whatever cookies the reader
+carries. `[[cache.asset_rules]]` change what a reader is told about a file, and
+never how long a copy is kept.
+
+```toml
+[asset-cache]
+module = "51degrees"
+
+[cache.51degrees-assets]
+memory_seconds = 5
+store_seconds = 3600
+store_idle_seconds = 86400
+```
+
+| Table                           | Field                | Default                  | Range         | Description                                                                                           |
+| ------------------------------- | -------------------- | ------------------------ | ------------- | ----------------------------------------------------------------------------------------------------- |
+| `[asset-cache]`                 | `module`             | none, so no file is held |               | The asset cache module, `51degrees` or `asset-cache.51degrees`.                                       |
+| `[cache.51degrees-assets]`      | `module`             | the one the build links  |               | The loading cache module that holds the copies.                                                       |
+| `[cache.51degrees-assets]`      | `memory_seconds`     | `5`                      | 0 to 31536000 | How long a copy or a record in memory is used. Zero keeps none.                                       |
+| `[cache.51degrees-assets]`      | `store_seconds`      | `3600`, an hour          | 1 to 31536000 | The longest a copy or a record in the shared store is used. The origin's own lifetime ends it sooner. |
+| `[cache.51degrees-assets]`      | `store_idle_seconds` | `86400`, a day           | 1 to 31536000 | How long a copy or a record in the shared store lasts unused.                                         |
+| `[cache.51degrees-assets-vary]` | `module`             | the one the build links  |               | The loading cache module that holds the records.                                                      |
+
+Both caches take the lifetimes of `[cache.51degrees-assets]`, so the lifetimes
+in `[cache.51degrees-assets-vary]` are checked and not used. A build that links
+two or more loading cache modules names one in each table. The module reads
+no table of its own, so an `[asset-cache.51degrees]` table is refused, an
+empty one included, and a table that names `none` as its loading cache module
+is refused, as one naming any module no linked crate offers is. A build
+without the module refuses `[cache.51degrees-assets]` and
+`[cache.51degrees-assets-vary]`, and its registry refuses
+`[asset-cache] module = "51degrees"`. So deploy the build that links the module
+before pushing a document that selects it, and push a document with neither
+the selection nor the two tables before rolling back.
 
 ## Integration Configurations
 
@@ -3882,8 +3942,10 @@ Push each key in lower case. The runtime lowercases the request's host and
 answered `421`.
 
 ```bash
-ts config push --adapter fastly --key www.publisher-a.example --app-config publisher-a.toml
-ts config push --adapter fastly --key www.publisher-b.example --app-config publisher-b.toml
+ts config push --adapter fastly --key www.publisher-a.example \
+  --app-config publisher-a.toml --permissions standard.yaml
+ts config push --adapter fastly --key www.publisher-b.example \
+  --app-config publisher-b.toml --permissions standard.yaml
 
 fastly config-store-entry update --upsert \
   --store-id <id of the store linked as trusted_server_config> \
@@ -3895,9 +3957,22 @@ fastly config-store-entry update --upsert \
 because EdgeZero writes no other key on Fastly. It writes the live store that
 `EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` selects through the
 `fastly` CLI, with the token in `FASTLY_API_TOKEN`, and with `--local` it
-writes the local store in `fastly.toml` instead. A long blob's chunks are
-written before its pointer. The selector is read on every request, so the
-blobs come first.
+writes the local store in `fastly.toml` instead. The policy entries are
+written first, and a long value's chunks before its pointer. The selector is
+read on every request, so the blobs come first.
+
+Each host's blob names its permission policy file in `[permissions] policy`
+and pins the file's SHA-256, and carries no copy of the file. The push keeps
+each file `--permissions` supplies once, in an entry of its own under
+`permissions_<sha256>`, written before the host's blob, and keeps an entry that
+already holds the file, so a hundred hosts that name three files store three
+entries. A live push that writes a policy entry waits 60 seconds before it
+writes the host's blob, because the store is consistent key by key, and a
+location that reads a blob before the entry it names answers that host
+`500`. A changed file is a new entry, so a host still running an earlier
+blob still finds the file that blob pins. The blob at `trusted_server_config`
+carries its file, as on a service with one blob. `ts config diff` compares only
+that blob, so the policy a host runs is checked on that host's `/_ts/config`.
 
 | A request for                                               | Reads the blob at         | Is answered                      |
 | ----------------------------------------------------------- | ------------------------- | -------------------------------- |
@@ -3910,6 +3985,7 @@ blobs come first.
 | `/health`, for any host                                     | None                      | `200`, before any config is read |
 | Any host, under a malformed selector                        | None                      | `500`                            |
 | Any host, where the store cannot be read                    | None                      | `500`                            |
+| A host whose policy entry is missing or is another file     | The host's blob           | `500`, with the reason logged    |
 
 A selector is malformed when it is empty, carries whitespace, a control
 character or `{host}` more than once, carries a brace outside its `{host}`
@@ -3997,7 +4073,7 @@ key. Clear any production key override for the local push:
 
 ```bash
 env -u EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY \
-  ts config push --adapter fastly --local
+  ts config push --adapter fastly --local --permissions standard.yaml
 ```
 
 `--local` writes under `[local_server.config_stores.trusted_server_config]` in
