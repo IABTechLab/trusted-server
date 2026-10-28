@@ -2,7 +2,7 @@
 
 **Phase 2 spec:** [ordinary Fastly release equality](../specs/2026-10-28-1235-binary-attestations-phase2-design.md), with its own source-checked review rounds. Tracking issue: #1235.
 
-**Status:** Phase 2 port and approved ordinary Fastly integration are implemented in draft #1449. Current baseline `5fa3843364f247fdc261c438ab9257323637a42c` adds structured failure diagnostics and its own spec/reviews; exact-head CI and a fresh rehearsal are pending. Historical `.13` remains exclusively at `770a425df4b28caaaef68dfd930bceabd9928046`. Phase 3 contains only [Gate 2 complete-SPDX](binary-attestations-phase3-complete-spdx.md) and [Gate 3 seven-artifact index](binary-attestations-phase3-seven-artifact-index.md) design proposals. Phase 3 implementation, qualification and remaining design gates stay closed.
+**Status:** Phase 2 at `5fa3843364f247fdc261c438ab9257323637a42c` has green CI and fresh fork rehearsal `.16` is running; historical `.13` remains exclusively at `770a425df4b28caaaef68dfd930bceabd9928046`. Phase 3 is design-only draft #1463. Gate 2 strict-composition and Gate 3 seven-artifact v2 designs are approved, subject to the [coverage/rollout decision](binary-attestations-phase3-complete-spdx-implementation.md) and [index implementation plan](binary-attestations-phase3-seven-artifact-index-implementation.md). Their plans still need approval; implementation, qualification and later gates remain closed.
 
 **Tracking issue:** #1235. The earlier separate tracking-issue draft is retained as planning history, not an additional issue prerequisite.
 
@@ -88,6 +88,8 @@ Assignment approval authorizes the mapped port and dependency/test staging, not 
 4. **Signed index and live publisher.** The frozen signed-companion types are closed; publication has an abstract API and fake tests but no live adapter. Approval precedes implementation. Preserve Phase 1 identities, names, predicates, release-ID mutation and recovery behavior.
 5. **Public offline verification.** Frozen offline verification is internal, build-only and expects caller-enforced network denial. A public offline interface/trust boundary needs approval; manual commands or the private helper do not substitute for the requested capability. Offline build evidence does not prove current publication.
 6. **Fork verifier trust.** Frozen consumer policy pins official repository IDs and signer URLs; online transport constructs official URLs. A trusted rehearsal policy/transport mechanism needs approval. Never infer authority from downloaded index contents or weaken production policy to accept the fork.
+
+**2026-10-28 gate status:** Gates 2/3 designs are approved for planning only. Gate 2 requires the seven-by-six coverage assessment and a target-specific rollout decision for costly cells. Gate 3 selects `trusted-server-binaries` only for v2; its plan must define repeatability explicitly. No schema/policy/source/workflow implementation is approved by these decisions.
 
 No new trigger, production/qualified selection or maintainer authority is authorized. All `Qualified*` enums stay uninhabited. Ordinary-CI/rehearsal evidence retains `release_qualification:false`. Existing Phase 1 workflows/helpers remain until compatible replacements are rehearsed. No IAB tags, releases or settings changes.
 

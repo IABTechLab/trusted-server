@@ -1,6 +1,6 @@
 # Gate 2 proposal: complete SPDX from owning build evidence
 
-**Status:** Design proposal awaiting approval. No implementation, production selection or qualification is authorized by this document.
+**Status:** Gate 2 design approved on 2026-10-28 for strict admission from retained, artifact-bound owning evidence. Plan only: production generation stays closed until all seven binaries pass. The [coverage matrix and rollout decision](binary-attestations-phase3-complete-spdx-implementation.md) stops at costly evidence gaps before implementation; no code, qualification or rehearsal tag is authorized.
 
 **Historical reviewed baseline:** Phase 2 `8a797dbcb0467b867dfbcc571597110b9254d672`, tree-equivalent to `08e1c33b8` after application integration `7d551777daeaee09e24bce9bf4f96edac6e5e0df`. Rehearsal `.13` remains evidence only for `770a425df4b28caaaef68dfd930bceabd9928046`.
 
@@ -10,9 +10,9 @@
 
 **Tracking:** Part of #1235.
 
-## Decision requested
+## Approved design scope
 
-Approve strict admission of complete composition from retained, artifact-bound evidence, reusing the reviewed projections and renderer from [frozen source `122b78664`](https://github.com/IABTechLab/trusted-server/tree/122b78664b1235c717e9208fd200f9a9b0c335df). Approve an ordinary-build capture approach that supplies equivalent ownership without pretending to be a controlled recipe. A concrete implementation plan and provider-coverage review must follow approval; current receipts cannot yet satisfy this contract.
+The user approved strict admission of complete composition from retained, artifact-bound evidence, reusing the reviewed projections and renderer from [frozen source `122b78664`](https://github.com/IABTechLab/trusted-server/tree/122b78664b1235c717e9208fd200f9a9b0c335df). The approved direction is an ordinary-build capture approach that supplies equivalent ownership without pretending to be a controlled recipe. A concrete implementation plan and provider-coverage review must follow approval; current receipts cannot yet satisfy this contract.
 
 The goal is a complete SPDX 2.3 build-composition document for each of the seven selected binaries. Completeness is relative to an explicitly approved input scope. It does not establish hermetic execution, independent reproduction, vulnerability absence or the contents of an operator's eventual runtime environment.
 

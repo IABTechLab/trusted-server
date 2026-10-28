@@ -1,6 +1,6 @@
 # Gate 3 proposal: seven-artifact release-index amendment
 
-**Status:** Design proposal awaiting approval. No schema, policy, consumer, producer or workflow implementation is changed here.
+**Status:** Gate 3 design approved on 2026-10-28 with new neutral v2 cohort ID `trusted-server-binaries`. Frozen v1 keeps `phase1-fastly-cli`. The [concrete index plan](binary-attestations-phase3-seven-artifact-index-implementation.md), including the explicit repeatability definition and additive policy path, awaits approval. No schema, policy, consumer, producer or workflow implementation is authorized yet.
 
 **Historical reviewed baseline:** Phase 2 `8a797dbcb0467b867dfbcc571597110b9254d672`, tree-equivalent to `08e1c33b8` after application integration `7d551777daeaee09e24bce9bf4f96edac6e5e0df`. `.13` remains attributed exclusively to `770a425df4b28caaaef68dfd930bceabd9928046`.
 
@@ -10,9 +10,9 @@
 
 **Tracking:** Part of #1235.
 
-## Decision requested
+## Approved design scope
 
-Approve a **schema-version 2** index contract for exactly the existing seven binaries, preserving public filenames and frozen v1 bytes. Approve explicit informational handling of the existing ordinary Fastly comparison profile, with no controlled-qualification inference. Complete evidence, live signing/publication and the public consumer remain separately gated.
+The user approved a **schema-version 2** index contract for exactly the existing seven binaries, preserving public filenames and frozen v1 bytes. Approval includes explicit informational handling of the existing ordinary Fastly comparison profile, with no controlled-qualification inference. Complete evidence, live signing/publication and the public consumer remain separately gated.
 
 The approved [phase assignment](binary-attestations-phases-2-4.md#separate-design-approval-gates) calls for a reviewed v1.1/v2 amendment. The retained v1 schema fixes integer `schema_version: 1` and exactly four entries; it has no minor-version mechanism. Today’s ordinary cohort has seven entries. Neither contract can silently stand in for the other.
 
@@ -36,7 +36,7 @@ All rows retain `variant: default`, `default_features: true`, `features: []`. Th
 | `trusted-server-axum-x86_64-unknown-linux-musl` | `trusted-server-adapter-axum` / `trusted-server-axum` | `server` / `native-executable`       | `x86_64-unknown-linux-musl` | `linux-musl` / `static` / `x86_64`     | `axum-production`   | `provenance-sbom`            |
 | `trusted-server-axum-aarch64-unknown-linux-gnu` | `trusted-server-adapter-axum` / `trusted-server-axum` | `server` / `native-executable`       | `aarch64-unknown-linux-gnu` | `linux-gnu` / `glibc-2.34` / `aarch64` | `axum-production`   | `provenance-sbom`            |
 
-Recommend retaining the opaque legacy cohort ID `phase1-fastly-cli`, distinguished by the explicitly new schema/policy identity. A coordinated rename is an alternative approval choice, not an implicit part of this amendment. Loader floors remain distinct from actually tested operating systems. Native reproduction remains a bounded measurement, with no equality gate. No Fastly staging/reuse variant or additional Axum hardening is enabled.
+The approved v2 cohort ID is `trusted-server-binaries`, carried only by the new v2 policy identity. Frozen v1 keeps `phase1-fastly-cli` and unchanged bytes, fixtures and policy. There are no other renames. Loader floors remain distinct from actually tested operating systems. Native reproduction remains a bounded measurement, with no equality gate. No Fastly staging/reuse variant or additional Axum hardening is enabled.
 
 ## Amendment and ownership
 
@@ -45,7 +45,7 @@ Recommend retaining the opaque legacy cohort ID `phase1-fastly-cli`, distinguish
 | Governing schema           | Add a separately approved `docs/superpowers/specs/schemas/release-index-v2.schema.json`; require version 2 and each of the seven identities exactly once | Existing v1 raw bytes remain unchanged; no open-ended artifact list                                                   |
 | Producer index descriptors | Represent the seven rows and strict source/digest joins in `distribution/**` and its policy checks                                                       | Extending index identities must not inhabit `Qualified*`, extend controlled recipe selection or enable Axum execution |
 | Types/compatibility        | Add only required Axum, musl/static and GNU aarch64 descriptor values                                                                                    | Existing binary names, default variant and other closed values remain                                                 |
-| Consumer policy identity   | Explicitly review the new `policy_version`, raw-byte hash and seven entries in the existing policy                                                       | Downloaded metadata never selects authority; existing signer/repository/tool pins are not silently changed            |
+| Consumer policy identity   | Explicitly review the new `policy_version`, raw-byte hash and seven entries in a separately approved v2 policy                                           | Downloaded metadata never selects authority; existing signer/repository/tool pins are not silently changed            |
 | Consumer implementation    | Phase 4 updates `src/release/{policy,bounds,evidence}.rs` and `evidence/joins.rs` in the CLI                                                             | Phase 3 does not double-port the public consumer or change its `readonly-verify` action                               |
 | Bounds                     | Explicit seven-executable count for version 2                                                                                                            | Preserve byte/depth/process/deadline limits unless separately reviewed; measure larger-cohort cost                    |
 
@@ -85,7 +85,7 @@ Future live rehearsal follows Gate 4 and sandbox-trust approval: independently v
 ## Approval choices
 
 - Approve version 2 with frozen v1 retained, the seven exact rows and the 53-file destination layout.
-- Retain the legacy cohort ID with explicit new schema/policy identity, or explicitly choose a coordinated rename.
+- The user selected the new neutral v2 cohort ID `trusted-server-binaries`; frozen v1 retains its legacy ID.
 - Approve the narrow informational ordinary-profile handling, with controlled requirements and candidate restrictions preserved.
 - Keep public consumer code in Phase 4 and live publication/sandbox trust behind Gates 4/6. No new schema/policy file is created before this design and its concrete implementation plan are approved.
 
