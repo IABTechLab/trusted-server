@@ -1673,7 +1673,8 @@ changes no code and decides none of them.
    policy's `text` out, because `sha256` already names the file.
 5. **Round 5.** A review in a fresh session, against
    `split/5-response-hook-docs`, with row 4 read on `split/3-permissions`.
-   No issues found. The round found section 1a right at that commit, where
-   `DEFAULT_PERMISSION_RULES` still compiles the repository's sample in, and
-   found that row 4's template fingerprint hashes the policy's `sha256` and
-   leaves its text out, as open question 2 says.
+   No issues found. The round found section 1a right at `61b1399c6`, the
+   commit it states, where `DEFAULT_PERMISSION_RULES` still compiles the
+   repository's sample in, and found that row 4's template fingerprint
+   hashes the policy's `sha256` and leaves its text out, as open question 2
+   says.
