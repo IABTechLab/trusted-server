@@ -144,7 +144,15 @@ fn read_config_entry(
         .change_context(TrustedServerError::Configuration { message })
 }
 
-fn resolve_fastly_chunk_pointer(
+/// The value a Fastly config store entry holds, put back together from its
+/// chunks when the entry is a pointer to them, as a long value is written,
+/// and the value itself otherwise.
+///
+/// # Errors
+///
+/// [`TrustedServerError::Configuration`] when a pointer is malformed, or a
+/// chunk cannot be read or has the wrong length or SHA-256.
+pub fn resolve_fastly_chunk_pointer(
     config_store: &dyn PlatformConfigStore,
     store_name: &StoreName,
     value: &str,

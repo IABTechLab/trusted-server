@@ -72,7 +72,10 @@ pub use image_optimizer::{
     PlatformImageOptimizerParams, PlatformImageOptimizerRegion,
 };
 pub use kv::UnavailableKvStore;
-pub use policy_source::{PlatformPolicySource, PolicyOrigin};
+pub use policy_source::{
+    POLICY_KEY_PREFIX, PlatformPolicySource, PolicyEntry, PolicyOrigin, policy_entry_text,
+    policy_key,
+};
 pub use template_assembly::{
     PlatformTemplateAssembler, TemplateAssemblyError, UnavailableTemplateAssembler,
     contains_publisher_esi_directive,
