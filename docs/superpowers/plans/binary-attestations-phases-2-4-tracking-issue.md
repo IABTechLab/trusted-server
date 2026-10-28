@@ -1,6 +1,6 @@
 # Binary attestations: phases 2–4
 
-Draft for the user to review and post. No issue has been created.
+Historical separate-issue draft. On 2026-10-28, the existing parent issue #1235 was selected to track this work; publication of another tracking issue is not required.
 
 ## Summary
 
