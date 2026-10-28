@@ -12328,9 +12328,9 @@ mod tests {
             ));
             let registry = IntegrationRegistry::new(settings)
                 .expect("should create integration registry")
-                .with_platform(crate::attestation::PlatformIdentity {
+                .with_platform(crate::platform::PlatformIdentity {
                     service_version: version.to_owned(),
-                    ..crate::attestation::PlatformIdentity::named("example-platform")
+                    ..crate::platform::PlatformIdentity::named("example-platform")
                 });
             let consent = crate::consent::ConsentContext {
                 jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
@@ -18552,9 +18552,9 @@ mod tests {
         ) -> IntegrationRegistry {
             IntegrationRegistry::new(settings)
                 .expect("should create integration registry")
-                .with_platform(crate::attestation::PlatformIdentity {
+                .with_platform(crate::platform::PlatformIdentity {
                     service_version: version.to_owned(),
-                    ..crate::attestation::PlatformIdentity::named("example-platform")
+                    ..crate::platform::PlatformIdentity::named("example-platform")
                 })
         }
 

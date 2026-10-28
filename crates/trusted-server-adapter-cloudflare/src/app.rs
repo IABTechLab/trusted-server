@@ -8,7 +8,7 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Method, Request, Response, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
-use trusted_server_core::attestation::{PlatformIdentity, handle_prefix, prefix_routes};
+use trusted_server_core::attestation::{handle_prefix, prefix_routes};
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan_with,
@@ -30,9 +30,9 @@ use trusted_server_core::inspect::permissions::{PERMISSIONS_PATHS, handle_permis
 use trusted_server_core::integrations::{
     IntegrationBuilder, IntegrationRegistry, ProxyDispatchInput,
 };
-use trusted_server_core::platform::RuntimeServices;
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::platform::StoreName;
+use trusted_server_core::platform::{PlatformIdentity, RuntimeServices};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,

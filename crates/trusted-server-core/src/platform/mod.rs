@@ -38,6 +38,7 @@ mod backend_naming;
 mod error;
 mod geo;
 mod http;
+mod identity;
 mod image_optimizer;
 mod kv;
 mod template_assembly;
@@ -65,6 +66,7 @@ pub use http::{
     PlatformCacheIntent, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
     PlatformResponse, PlatformSelectResult, UnavailableHttpClient,
 };
+pub use identity::{PlatformIdentity, UNKNOWN};
 pub use image_optimizer::{
     PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions,
     PlatformImageOptimizerParams, PlatformImageOptimizerRegion,

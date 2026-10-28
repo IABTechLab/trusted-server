@@ -93,7 +93,7 @@ use edgezero_core::http::{
 };
 use edgezero_core::router::RouterService;
 use error_stack::Report;
-use trusted_server_core::attestation::{PlatformIdentity, handle_prefix, prefix_routes};
+use trusted_server_core::attestation::{handle_prefix, prefix_routes};
 use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{
@@ -125,7 +125,8 @@ use trusted_server_core::integrations::{
 };
 use trusted_server_core::permissions::PermissionState;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, StoreName, build_geo_module,
+    ClientInfo, GeoInfo, PlatformIdentity, PlatformKvStore, RuntimeServices, StoreName, UNKNOWN,
+    build_geo_module,
 };
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
@@ -354,6 +355,24 @@ pub(crate) fn build_state_with_registrations(
         ec_module,
         permission_signal_modules,
     }))
+}
+
+/// What Fastly reports about the service answering, from the environment
+/// variables Fastly gives every Compute service.
+fn fastly_platform_identity() -> PlatformIdentity {
+    let read = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| UNKNOWN.to_owned())
+    };
+    PlatformIdentity {
+        name: "fastly".to_owned(),
+        service_id: read("FASTLY_SERVICE_ID"),
+        service_version: read("FASTLY_SERVICE_VERSION"),
+        staging: std::env::var("FASTLY_IS_STAGING").is_ok_and(|value| value == "1"),
+        pop: read("FASTLY_POP"),
+    }
 }
 
 /// The permission signal modules this adapter links, in the order they run
@@ -1471,24 +1490,6 @@ fn attestation_route_handler(
                 &ctx.into_request(),
             ))
         })
-    }
-}
-
-/// What the evidence says about the Fastly service answering, from the
-/// environment variables Fastly gives every Compute service.
-fn fastly_platform_identity() -> PlatformIdentity {
-    let read = |name: &str| {
-        std::env::var(name)
-            .ok()
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "unknown".to_owned())
-    };
-    PlatformIdentity {
-        name: "fastly".to_owned(),
-        service_id: read("FASTLY_SERVICE_ID"),
-        service_version: read("FASTLY_SERVICE_VERSION"),
-        staging: std::env::var("FASTLY_IS_STAGING").is_ok_and(|value| value == "1"),
-        pop: read("FASTLY_POP"),
     }
 }
 

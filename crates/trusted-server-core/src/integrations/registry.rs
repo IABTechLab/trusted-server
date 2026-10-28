@@ -9,7 +9,6 @@ use http::{Method, Request, Response};
 use matchit::Router;
 use sha2::{Digest as _, Sha256};
 
-use crate::attestation::PlatformIdentity;
 use crate::auction::AuctionPlan;
 use crate::constants::HEADER_X_TS_EC;
 use crate::ec::EcContext;
@@ -21,7 +20,7 @@ use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
 use crate::middleware::{Middleware, MiddlewareChain, MiddlewarePhase, PhaseEntries};
 use crate::module_context::{ModuleCall, ModuleContext, ResolvedRequest};
-use crate::platform::{DisabledGeo, PlatformGeo, RuntimeServices};
+use crate::platform::{DisabledGeo, PlatformGeo, PlatformIdentity, RuntimeServices};
 use crate::robots_txt::{ALLOW_ALL, REFUSE_ALL, RobotsTxtContributor};
 use crate::settings::Settings;
 

@@ -27,6 +27,7 @@ use crate::inspect::config::{CONFIG_JSON_PATH, CONFIG_PAGE_PATH};
 use crate::inspect::data::DATA_PAGE_PATH;
 use crate::inspect::html_escape;
 use crate::inspect::permissions::{PERMISSIONS_JSON_PATH, PERMISSIONS_PAGE_PATH};
+use crate::platform::PlatformIdentity;
 use crate::publisher::{PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH};
 use crate::settings::Settings;
 
@@ -125,46 +126,6 @@ pub struct AttestationConfig {
 
 fn default_endpoint() -> String {
     DEFAULT_ENDPOINT.to_owned()
-}
-
-/// What the evidence says about the platform, supplied by the adapter.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PlatformIdentity {
-    /// The platform's name.
-    pub name: String,
-    /// The platform's identifier for the service running this build.
-    pub service_id: String,
-    /// The platform's version number of that service.
-    pub service_version: String,
-    /// Whether the platform's staging environment answered.
-    pub staging: bool,
-    /// The location that answered.
-    pub pop: String,
-}
-
-/// What a fact the platform did not report reads as.
-pub const UNKNOWN: &str = "unknown";
-
-impl PlatformIdentity {
-    /// A platform that reports its name and nothing else.
-    #[must_use]
-    pub fn named(name: &str) -> Self {
-        Self {
-            name: name.to_owned(),
-            service_id: UNKNOWN.to_owned(),
-            service_version: UNKNOWN.to_owned(),
-            staging: false,
-            pop: UNKNOWN.to_owned(),
-        }
-    }
-}
-
-impl Default for PlatformIdentity {
-    /// A platform nothing has been reported about.
-    fn default() -> Self {
-        Self::named(UNKNOWN)
-    }
 }
 
 #[derive(Debug, Serialize)]
