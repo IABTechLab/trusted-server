@@ -5,7 +5,7 @@
 **Related specs:** `2026-10-14-source-modules-design.md`, in IABTechLab/trusted-server#1342, which replaced IABTechLab/trusted-server#1084 as the one place for every design document of the stack of pull requests listed in IABTechLab/trusted-server#777
 **Related PRs:** IABTechLab/trusted-server#1384, jwrosewell/trusted-server#38
 **Issues:** IABTechLab/trusted-server#1334
-**Last updated:** 2026-10-26
+**Last updated:** 2026-10-27
 
 > **Why this spec exists.** One crate held the list of the modules a stock build ships on every adapter's behalf, with a table saying which middleware each supplies, so a deployment that wanted a different set edited a crate that was not its own, and a module's description of itself lived in a crate that was not the module's. The same change renames the three modules the project owns itself, and those renames are the only part that changes what an operator writes in settings.
 
@@ -93,7 +93,7 @@ Three things have no test. The first is the five lists agreeing. Each adapter's 
 | 2026-10-14 | First draft.                                                                                                                                                                                                                                                                                                                                                                                                          |
 | 2026-10-15 | Fixes from review round 1. The other users of the old crate, the test that kept its table in step, the renamed packages and the seam probe's names, the adapters and the list functions, what does not change, the startup refusal, the rollout of the renamed selectors, what `ts audit` reads and writes, the missing tests, `iabtl` and the stack defined, the renames in the title, and the pull requests raised. |
 | 2026-10-15 | Fixes from review round 2. The claimed test for the media types `ts audit` writes, the three changes left for a later change, and the changelog entries that still named the removed crate.                                                                                                                                                                                                                           |
-| 2026-10-26 | The Axum adapter's tests in section 4 say that its linked builders include no loading cache module, so every feature loads through `NoLoadingCache` unless a deployment links one (`2026-10-12-loading-cache-design.md`), where they said a feature selects the stock loading cache by name.                                                                                                                          |
+| 2026-10-27 | The Axum adapter's tests in section 4 say that its linked builders include no loading cache module, so every feature loads through `NoLoadingCache` unless a deployment links one (`2026-10-12-loading-cache-design.md`), where they said a feature selects the stock loading cache by name.                                                                                                                          |
 
 ## Review log
 
