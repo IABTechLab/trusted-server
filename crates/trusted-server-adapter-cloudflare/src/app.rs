@@ -8,15 +8,12 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Method, Request, Response, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
-use trusted_server_core::attestation::{PlatformIdentity, handle_prefix, prefix_routes};
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan_with,
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::closed_paths::closed_path_response;
-#[cfg(any(test, target_arch = "wasm32"))]
-use trusted_server_core::config_payload::CONFIG_BLOB_KEY;
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::config_payload::{
     DEFAULT_SECRET_STORE_ID, settings_from_config_blob_with,
@@ -55,31 +52,11 @@ use crate::platform::build_runtime_services;
 // AppState
 // ---------------------------------------------------------------------------
 
-#[cfg(target_arch = "wasm32")]
-thread_local! {
-    static CLOUDFLARE_CONFIG_JSON: std::cell::OnceCell<String> = const { std::cell::OnceCell::new() };
-    static CLOUDFLARE_ENV: std::cell::OnceCell<worker::Env> = const { std::cell::OnceCell::new() };
-}
-
-#[cfg(target_arch = "wasm32")]
-pub fn set_cloudflare_config_json(value: String) {
-    CLOUDFLARE_CONFIG_JSON.with(|slot| {
-        let _ = slot.set(value);
-    });
-}
-
-#[cfg(target_arch = "wasm32")]
-pub fn set_cloudflare_env(env: worker::Env) {
-    CLOUDFLARE_ENV.with(|slot| {
-        let _ = slot.set(env);
-    });
-}
-
 /// Application state shared by everything that serves one request.
 ///
-/// Not built once per Worker isolate, because
-/// `edgezero_adapter_cloudflare::run_app` calls `build_app` inside the
-/// per-request entry point, so this is rebuilt on every request.
+/// Not built once per Worker isolate, because the Worker's fetch entry point
+/// builds the application for every request with `build_app`, so this is
+/// rebuilt on every request.
 pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
@@ -99,126 +76,97 @@ pub struct AppState {
     /// than the first request, and handed to every request's services.
     permission_signal_modules:
         Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>]>,
+    /// The permission policy the domain's settings loaded, which every
+    /// request is given.
+    permission_policy: Arc<trusted_server_core::permissions::PermissionPolicy>,
     /// Services a caller supplied for every request, rather than services built
     /// from the request context. `None` in a deployment.
     services: Option<RuntimeServices>,
 }
 
-/// Build the application state, loading settings and constructing all per-application components.
+/// Builds the application a Worker serves a request with.
+///
+/// The settings are read from the config store with an awaited Workers KV
+/// read, which `Hooks::build_app` cannot make, so the Worker's fetch entry
+/// point calls this and serves the result with `EdgeZero`'s `dispatch_app`.
+/// Settings that cannot be read or do not load give the startup error
+/// router.
+#[cfg(target_arch = "wasm32")]
+pub async fn build_app(env: &worker::Env) -> edgezero_core::app::App {
+    let router = match load_startup_settings(env)
+        .await
+        .and_then(build_state_with_settings)
+    {
+        Ok(state) => build_router(&state),
+        Err(error) => {
+            log::error!("failed to build application state: {:?}", error);
+            startup_error_router(&error)
+        }
+    };
+    edgezero_core::app::App::with_name(router, TrustedServerApp::name())
+}
+
+/// Reads the Worker's settings from its config store, the Workers KV
+/// namespace that `ts config push --adapter cloudflare` writes.
+///
+/// The binding and the key are resolved as the push resolves them. The
+/// binding is the config store's platform name, which is
+/// `trusted_server_config` unless
+/// `EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` names another, and
+/// the key is the store's logical ID unless the matching `__KEY` variable
+/// names another.
 ///
 /// # Errors
 ///
-/// Returns an error when settings, the auction orchestrator, or the integration
-/// registry fail to initialise.
-fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let settings = load_startup_settings()?;
-    build_state_with_settings(settings)
-}
-
+/// [`TrustedServerError::Configuration`] when the namespace cannot be opened
+/// or read, holds nothing at the key, or the settings do not load.
 #[cfg(target_arch = "wasm32")]
-fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
-    settings_from_cloudflare_config_json()
-}
+async fn load_startup_settings(env: &worker::Env) -> Result<Settings, Report<TrustedServerError>> {
+    use edgezero_core::config_store::ConfigStore as _;
 
-#[cfg(not(target_arch = "wasm32"))]
-fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
-    Err(Report::new(TrustedServerError::Configuration {
-        message: "Cloudflare startup settings require a Worker config binding".to_string(),
-    })
-    .attach("use TrustedServerApp::routes_with_settings for host tests"))
-}
-
-/// Older Cloudflare bindings used this JSON property before config stores adopted
-/// the manifest-derived default.
-///
-/// Remove this fallback only when support for those bindings is deliberately retired.
-#[cfg(any(test, target_arch = "wasm32"))]
-const LEGACY_CONFIG_BLOB_KEY: &str = "app_config";
-
-#[cfg(any(test, target_arch = "wasm32"))]
-#[derive(Debug, Eq, PartialEq, derive_more::Display)]
-enum CloudflareConfigEnvelopeError {
-    #[display(
-        "Cloudflare TRUSTED_SERVER_CONFIG has no `{primary_key}` or legacy `{legacy_key}` property"
-    )]
-    Missing {
-        primary_key: &'static str,
-        legacy_key: &'static str,
-    },
-    #[display("Cloudflare TRUSTED_SERVER_CONFIG value at `{key}` must be a string")]
-    NonString { key: &'static str },
-}
-
-#[cfg(any(test, target_arch = "wasm32"))]
-impl core::error::Error for CloudflareConfigEnvelopeError {}
-
-#[cfg(target_arch = "wasm32")]
-fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServerError>> {
-    let raw_config = CLOUDFLARE_CONFIG_JSON.with(|slot| slot.get().cloned());
-    let raw_config = raw_config.ok_or_else(|| {
-        Report::new(TrustedServerError::Configuration {
-            message: "Cloudflare TRUSTED_SERVER_CONFIG is required".to_string(),
-        })
-        .attach(format!(
-            "set TRUSTED_SERVER_CONFIG to JSON containing the `{CONFIG_BLOB_KEY}` blob envelope"
-        ))
-    })?;
-    let value: serde_json::Value = serde_json::from_str(&raw_config).map_err(|error| {
-        Report::new(TrustedServerError::Configuration {
-            message: "invalid Cloudflare TRUSTED_SERVER_CONFIG JSON".to_string(),
-        })
-        .attach(format!("failed to parse TRUSTED_SERVER_CONFIG: {error}"))
-    })?;
-    let envelope = cloudflare_config_envelope(&value).map_err(|error| {
-        Report::new(TrustedServerError::Configuration {
-            message: error.to_string(),
-        })
-    })?;
-    let env = CLOUDFLARE_ENV
-        .with(|slot| slot.get().cloned())
+    let selectors = config_store_selectors(env);
+    let store_name = trusted_server_core::settings_data::config_store_name(&selectors);
+    let key = trusted_server_core::settings_data::config_key(&selectors);
+    let unreadable = || TrustedServerError::Configuration {
+        message: format!(
+            "failed to read Trusted Server app config key `{key}` from config store `{store_name}`"
+        ),
+    };
+    let store = edgezero_adapter_cloudflare::config_store::CloudflareConfigStore::from_env(
+        env,
+        store_name.as_ref(),
+    )
+    .map_err(|error| Report::new(unreadable()).attach(error.to_string()))?;
+    let envelope = store
+        .get(&key)
+        .await
+        .map_err(|error| Report::new(unreadable()).attach(error.to_string()))?
         .ok_or_else(|| {
-            Report::new(TrustedServerError::Configuration {
-                message: "Cloudflare Worker environment is unavailable during startup".to_string(),
-            })
+            Report::new(unreadable()).attach("the namespace holds nothing at that key")
         })?;
-    let secret_store = crate::platform::CloudflareSecretStoreAdapter { env };
-    let default_secret_store = StoreName::from(DEFAULT_SECRET_STORE_ID);
+    let secret_store = crate::platform::CloudflareSecretStoreAdapter { env: env.clone() };
     // The settings are validated as they load, against the same builders the
     // state is built with.
     settings_from_config_blob_with(
-        envelope,
+        &envelope,
         &secret_store,
-        &default_secret_store,
+        &StoreName::from(DEFAULT_SECRET_STORE_ID),
+        trusted_server_core::platform::PolicyOrigin::Blob,
         &trusted_server_modules::builders(),
     )
 }
 
-#[cfg(any(test, target_arch = "wasm32"))]
-fn cloudflare_config_envelope(
-    value: &serde_json::Value,
-) -> Result<&str, CloudflareConfigEnvelopeError> {
-    match value.get(CONFIG_BLOB_KEY).filter(|envelope| {
-        // Treat a blank placeholder as absent so a populated legacy property
-        // remains usable during migration.
-        envelope.as_str() != Some("")
-    }) {
-        Some(envelope) => envelope
-            .as_str()
-            .ok_or(CloudflareConfigEnvelopeError::NonString {
-                key: CONFIG_BLOB_KEY,
-            }),
-        None => match value.get(LEGACY_CONFIG_BLOB_KEY) {
-            Some(envelope) => envelope
-                .as_str()
-                .ok_or(CloudflareConfigEnvelopeError::NonString {
-                    key: LEGACY_CONFIG_BLOB_KEY,
-                }),
-            None => Err(CloudflareConfigEnvelopeError::Missing {
-                primary_key: CONFIG_BLOB_KEY,
-                legacy_key: LEGACY_CONFIG_BLOB_KEY,
-            }),
-        },
-    }
+/// The config store selectors the Worker's variables set. They are read one
+/// by one, because a Worker's environment cannot be listed.
+#[cfg(target_arch = "wasm32")]
+fn config_store_selectors(env: &worker::Env) -> edgezero_core::env_config::EnvConfig {
+    let id = trusted_server_core::config_payload::DEFAULT_CONFIG_STORE_ID.to_ascii_uppercase();
+    let names = ["NAME", "KEY"].map(|setting| format!("EDGEZERO__STORES__CONFIG__{id}__{setting}"));
+    edgezero_core::env_config::EnvConfig::from_vars(
+        names
+            .into_iter()
+            .filter_map(|name| env.var(&name).ok().map(|value| (name, value.to_string()))),
+    )
 }
 
 /// Build the application state from explicit settings.
@@ -308,6 +256,7 @@ fn build_state_with_registrations_and_services(
             &settings,
             &shipped_signal_modules(),
         )?;
+    let permission_policy = settings.required_permission_policy()?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -315,6 +264,7 @@ fn build_state_with_registrations_and_services(
         registry: Arc::new(registry),
         ec_module,
         permission_signal_modules,
+        permission_policy,
         services,
     }))
 }
@@ -343,7 +293,8 @@ impl AppState {
     /// Build per-request [`RuntimeServices`], carrying the Edge Cookie module
     /// the composition root already resolved and applying the module-supplied
     /// geo, Edge Cookie and device modules selected by `[geo]`, `[ec]` and
-    /// `[device] module`.
+    /// `[device] module`. The services also carry the permission policy the
+    /// domain's settings loaded, whichever services the request is given.
     ///
     /// No Edge Cookie module is carried when the composition root found
     /// nothing safe to keep, so the request path resolves the selection for
@@ -359,9 +310,15 @@ impl AppState {
             .services
             .clone()
             .unwrap_or_else(|| {
-                build_runtime_services(ctx, &self.settings, &self.permission_signal_modules)
+                build_runtime_services(
+                    ctx,
+                    &self.settings,
+                    &self.permission_signal_modules,
+                    &self.permission_policy,
+                )
             })
-            .with_resolved_ec_module(self.ec_module.clone());
+            .with_resolved_ec_module(self.ec_module.clone())
+            .with_permission_policy(Arc::clone(&self.permission_policy));
         if let Some(module) = self.registry.geo_module() {
             services = services.with_geo(module);
         }
@@ -438,23 +395,6 @@ where
                 return Ok(http_error(&error));
             }
             Ok(f(s, services, req).await.unwrap_or_else(|e| http_error(&e)))
-        })
-    }
-}
-
-/// Answers the attestation pages without the request preparers, so no
-/// preparer can change or refuse the request whose host and nonce are signed.
-fn attestation_route_handler(
-    state: Arc<AppState>,
-) -> impl Fn(RequestContext) -> BoxedHandlerFuture + Clone + 'static {
-    move |ctx: RequestContext| {
-        let state = Arc::clone(&state);
-        Box::pin(async move {
-            Ok(handle_prefix(
-                &state.settings,
-                &PlatformIdentity::named("cloudflare"),
-                &ctx.into_request(),
-            ))
         })
     }
 }
@@ -568,16 +508,17 @@ impl Hooks for TrustedServerApp {
         "TrustedServer"
     }
 
+    /// The startup error router, because this hook cannot read the settings.
+    ///
+    /// A Worker reads its settings from the config store with an awaited
+    /// read, so its fetch entry point builds the application with
+    /// `build_app` and never calls this hook.
     fn routes() -> RouterService {
-        let state = match build_state() {
-            Ok(s) => s,
-            Err(ref e) => {
-                log::error!("failed to build application state: {:?}", e);
-                return startup_error_router(e);
-            }
-        };
-
-        build_router(&state)
+        startup_error_router(&Report::new(TrustedServerError::Configuration {
+            message: "the Cloudflare adapter reads its settings from the config store \
+                      when the Worker builds its application"
+                .to_string(),
+        }))
     }
 }
 
@@ -585,8 +526,8 @@ impl TrustedServerApp {
     /// Build the full application router from explicit settings.
     ///
     /// Testing seam: cross-adapter parity tests use this to drive the router
-    /// with known-good settings instead of the baked `get_settings()` result,
-    /// whose embedded placeholder secrets fail validation by design.
+    /// with settings they build, where a Worker reads its settings from its
+    /// config store.
     ///
     /// # Errors
     ///
@@ -885,21 +826,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         });
         router = router.route(DATA_PAGE_PATH, Method::GET, data);
 
-        // Routes chosen by the settings, so not in the fixed table.
-        let routes = prefix_routes(&state.settings);
-        if !routes.is_empty() {
-            let attestation = attestation_route_handler(Arc::clone(&state));
-            for route in &routes {
-                for method in publisher_fallback_methods() {
-                    if matches!(method, Method::GET | Method::HEAD) || route.every_method {
-                        router = router.route(&route.path, method, attestation.clone());
-                    } else {
-                        router = router.route(&route.path, method, fallback.clone());
-                    }
-                }
-            }
-        }
-
         // Only when the settings carry `[robots-txt]`.
         if state.settings.robots_txt.is_some() {
             let robots_txt = make_handler(Arc::clone(&state), |s, services, req| async move {
@@ -974,7 +900,12 @@ mod tests {
         // No resolved module is threaded here, so the request path resolves
         // the selection itself, which is what an embedder driving core
         // directly does and where the loud failure has to stay.
-        let services = build_runtime_services(&ctx, &settings, &Arc::default());
+        let services = build_runtime_services(
+            &ctx,
+            &settings,
+            &Arc::default(),
+            &trusted_server_core::permissions::PermissionPolicy::sample(),
+        );
         let req = ctx.into_request();
 
         let error = build_ec_context(&settings, &services, &req)
@@ -1003,7 +934,8 @@ mod tests {
                 assume_single_jurisdiction = true
             "#,
         )
-        .expect("should parse startup test settings");
+        .expect("should parse startup test settings")
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
         settings.demand = trusted_server_core::provider_table::ProviderList::new(
             vec!["aps_main".to_string()],
             std::collections::BTreeMap::from([(
@@ -1057,6 +989,27 @@ mod tests {
     }
 
     #[test]
+    fn each_request_is_given_the_policy_its_domain_loaded() {
+        let policy = trusted_server_core::test_support::policies::open();
+        let state = build_state_with_settings(
+            aps_profile_settings().with_permission_policy(Arc::clone(&policy)),
+        )
+        .expect("should build the state");
+        let req = request_builder()
+            .method("GET")
+            .uri("https://publisher.example/article")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build test request");
+
+        let services = state.services_for_request(&RequestContext::new(req, PathParams::default()));
+
+        assert!(
+            Arc::ptr_eq(services.permission_policy(), &policy),
+            "the request should decide under its domain's policy, not the sample"
+        );
+    }
+
+    #[test]
     fn startup_registers_aps_renderer_route() {
         let state = build_state_with_settings(aps_profile_settings())
             .expect("Cloudflare startup should register APS renderer");
@@ -1066,20 +1019,6 @@ mod tests {
                 "/integrations/aps/renderer"
             ),
             "Cloudflare startup registry should expose the APS renderer"
-        );
-    }
-
-    #[test]
-    fn cloudflare_config_prefers_manifest_default_key() {
-        let value = serde_json::json!({
-            LEGACY_CONFIG_BLOB_KEY: "legacy-envelope",
-            CONFIG_BLOB_KEY: "manifest-envelope",
-        });
-
-        assert_eq!(
-            cloudflare_config_envelope(&value),
-            Ok("manifest-envelope"),
-            "manifest-derived key should take precedence"
         );
     }
 
@@ -1100,7 +1039,8 @@ mod tests {
                 assume_single_jurisdiction = true
             "#,
         )
-        .expect("should parse startup test settings");
+        .expect("should parse startup test settings")
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
         settings.auction.enabled = false;
         settings.demand = two_source_demand();
 
@@ -1125,7 +1065,8 @@ mod tests {
                 assume_single_jurisdiction = true
             "#,
         )
-        .expect("should parse startup test settings");
+        .expect("should parse startup test settings")
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
         settings.auction.enabled = true;
         settings.demand = two_source_demand();
 
@@ -1139,88 +1080,51 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cloudflare_config_accepts_legacy_app_config_key() {
-        let value = serde_json::json!({ LEGACY_CONFIG_BLOB_KEY: "legacy-envelope" });
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_hook_router_answers_every_route_with_the_startup_error() {
+        // A Worker builds its application with `build_app`, which reads the
+        // settings it awaits, so the synchronous hook has none to serve.
+        let router = TrustedServerApp::routes();
+
+        let req = edgezero_core::http::request_builder()
+            .method("GET")
+            .uri("https://publisher.example/article")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request");
+        let resp = router.oneshot(req).await.expect("should route the request");
 
         assert_eq!(
-            cloudflare_config_envelope(&value),
-            Ok("legacy-envelope"),
-            "legacy app_config key should remain compatible"
+            resp.status().as_u16(),
+            500,
+            "a configuration error should answer 500"
         );
     }
 
-    #[test]
-    fn cloudflare_config_treats_blank_primary_as_absent() {
-        let value = serde_json::json!({
-            CONFIG_BLOB_KEY: "",
-            LEGACY_CONFIG_BLOB_KEY: "legacy-envelope",
-        });
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_startup_router_answers_500_to_a_policy_load_error() {
+        use trusted_server_core::test_support::policy_failure;
 
-        assert_eq!(
-            cloudflare_config_envelope(&value),
-            Ok("legacy-envelope"),
-            "blank primary should not shadow a populated legacy property"
+        let error = policy_failure::load_error();
+        assert!(
+            format!("{error:?}").contains(&format!("`{}`", policy_failure::POLICY_NAME)),
+            "the startup error should name the policy: {error:?}"
         );
-    }
 
-    #[test]
-    fn cloudflare_config_reports_missing_keys() {
-        let value = serde_json::json!({});
-
-        let error = cloudflare_config_envelope(&value)
-            .expect_err("should reject config without either accepted property");
-
-        assert_eq!(
-            error,
-            CloudflareConfigEnvelopeError::Missing {
-                primary_key: CONFIG_BLOB_KEY,
-                legacy_key: LEGACY_CONFIG_BLOB_KEY,
-            },
-            "missing config should name both accepted keys"
-        );
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "Cloudflare TRUSTED_SERVER_CONFIG has no `{CONFIG_BLOB_KEY}` or legacy `{LEGACY_CONFIG_BLOB_KEY}` property"
-            ),
-            "missing config should report absent properties, not invalid types"
-        );
-    }
-
-    #[test]
-    fn cloudflare_config_does_not_mask_malformed_manifest_value() {
-        let value = serde_json::json!({
-            LEGACY_CONFIG_BLOB_KEY: "legacy-envelope",
-            CONFIG_BLOB_KEY: true,
-        });
-
-        assert_eq!(
-            cloudflare_config_envelope(&value),
-            Err(CloudflareConfigEnvelopeError::NonString {
-                key: CONFIG_BLOB_KEY,
-            }),
-            "malformed manifest-derived value should not fall back"
-        );
-    }
-
-    #[test]
-    fn cloudflare_config_reports_malformed_legacy_value() {
-        let value = serde_json::json!({ LEGACY_CONFIG_BLOB_KEY: false });
-        let error = cloudflare_config_envelope(&value)
-            .expect_err("should reject a malformed legacy config value");
-
-        assert_eq!(
-            error,
-            CloudflareConfigEnvelopeError::NonString {
-                key: LEGACY_CONFIG_BLOB_KEY,
-            },
-            "malformed legacy value should name the legacy key"
-        );
-        assert_eq!(
-            error.to_string(),
-            "Cloudflare TRUSTED_SERVER_CONFIG value at `app_config` must be a string",
-            "configuration error should name the malformed legacy key"
-        );
+        let router = startup_error_router(&error);
+        for method in publisher_fallback_methods() {
+            for path in ["/", "/article"] {
+                let req = edgezero_core::http::request_builder()
+                    .method(method.clone())
+                    .uri(path)
+                    .body(edgezero_core::body::Body::empty())
+                    .expect("should build request");
+                let resp = router.oneshot(req).await.expect("should route the request");
+                assert_eq!(
+                    resp.status().as_u16(),
+                    500,
+                    "{method} {path} should answer 500"
+                );
+            }
+        }
     }
 }
