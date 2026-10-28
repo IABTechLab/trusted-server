@@ -1924,6 +1924,68 @@ store_seconds = 604800
 store_idle_seconds = 2592000
 ```
 
+### Holding the files the origins send
+
+A deployment may hold the files the publisher's origin sends that are not
+pages, and the answers of the asset routes under `[[proxy.asset_routes]]`, by
+linking an asset cache module and selecting it in `[asset-cache]`. Core offers
+each `GET` for such a file to that module before it asks the file's origin, so
+a deployment that selects none has every file asked of its origin. No stock
+build links an asset cache module.
+
+`asset-cache.51degrees`, from `crates/asset-cache/51degrees`, holds each file as
+its origin sent it, for the lifetime the origin's cache policy gives it and
+under what the origin says it varies on. It declares two caches,
+`51degrees-assets` for the copies and `51degrees-assets-vary` for what each
+address varies on, and each takes a loading cache module as every declared cache
+does, so the module holds nothing in a build that links no loading cache module.
+A copy is served with the headers that describe it and an `Age` that counts from
+the origin's. Nothing is kept that may not be shared, being anything but a
+`200`, HTML, a response carrying `Set-Cookie`, one whose policy says `private`,
+`no-store` or `no-cache` or gives no lifetime, one that varies on `*` or on
+`Cookie`, one larger than a megabyte, an answer the platform's image optimizer
+makes, and the answer to a request carrying `Authorization`, a conditional
+header, a range, a `Cache-Control` of `no-cache`, `no-store`, `min-fresh` or a
+nonzero `max-age`, or a `Pragma` of `no-cache`. A response that may not be
+shared is served to the request whose load fetched it, from that one fetch. On
+the publisher path a request that carries a cookie always goes to the origin,
+and its answer is not kept, because the module cannot see whether the cookie
+shaped it, and a document always goes to the origin too. An asset route sends
+its origin no cookie, so a route's answer is held whatever cookies the reader
+carries. `[[cache.asset_rules]]` change what a reader is told about a file, and
+never how long a copy is kept.
+
+```toml
+[asset-cache]
+module = "51degrees"
+
+[cache.51degrees-assets]
+memory_seconds = 5
+store_seconds = 3600
+store_idle_seconds = 86400
+```
+
+| Table                           | Field                | Default                  | Range         | Description                                                                                           |
+| ------------------------------- | -------------------- | ------------------------ | ------------- | ----------------------------------------------------------------------------------------------------- |
+| `[asset-cache]`                 | `module`             | none, so no file is held |               | The asset cache module, `51degrees` or `asset-cache.51degrees`.                                       |
+| `[cache.51degrees-assets]`      | `module`             | the one the build links  |               | The loading cache module that holds the copies.                                                       |
+| `[cache.51degrees-assets]`      | `memory_seconds`     | `5`                      | 0 to 31536000 | How long a copy or a record in memory is used. Zero keeps none.                                       |
+| `[cache.51degrees-assets]`      | `store_seconds`      | `3600`, an hour          | 1 to 31536000 | The longest a copy or a record in the shared store is used. The origin's own lifetime ends it sooner. |
+| `[cache.51degrees-assets]`      | `store_idle_seconds` | `86400`, a day           | 1 to 31536000 | How long a copy or a record in the shared store lasts unused.                                         |
+| `[cache.51degrees-assets-vary]` | `module`             | the one the build links  |               | The loading cache module that holds the records.                                                      |
+
+Both caches take the lifetimes of `[cache.51degrees-assets]`, so a lifetime set
+in `[cache.51degrees-assets-vary]` is refused. A build that links
+two or more loading cache modules names one in each table. The module reads
+no table of its own, so an `[asset-cache.51degrees]` table is refused, an
+empty one included, and a table that names `none` as its loading cache module
+is refused, as one naming any module no linked crate offers is. A build
+without the module refuses `[cache.51degrees-assets]` and
+`[cache.51degrees-assets-vary]`, and its registry refuses
+`[asset-cache] module = "51degrees"`. So deploy the build that links the module
+before pushing a document that selects it, and push a document with neither
+the selection nor the two tables before rolling back.
+
 ## Integration Configurations
 
 A page integration is a module, selected in the section of its type, and

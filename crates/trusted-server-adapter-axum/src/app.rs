@@ -275,8 +275,9 @@ fn refuse_platform_geo(settings: &Settings) -> Result<(), Report<TrustedServerEr
 impl AppState {
     /// Build per-request [`RuntimeServices`], applying the module-supplied geo,
     /// Edge Cookie and device modules selected by `[geo]`, `[ec]` and
-    /// `[device] module`, and carrying the permission policy the domain's
-    /// settings loaded whichever services the request is given.
+    /// `[device] module` and the asset cache module `[asset-cache]` selects,
+    /// and carrying the permission policy the domain's settings loaded
+    /// whichever services the request is given.
     ///
     /// Unset and `"none"` both resolve nothing for geo, so no client IP reaches
     /// a host geo service. `"platform"` opts in to this adapter's own lookup,
@@ -305,6 +306,9 @@ impl AppState {
         }
         if let Some(module) = self.registry.device_module() {
             services = services.with_device_module(module);
+        }
+        if let Some(module) = self.registry.asset_cache_module() {
+            services = services.with_asset_cache_module(module);
         }
         // The publisher this request resolved to names every key in a shared
         // store and every name the browser holds.

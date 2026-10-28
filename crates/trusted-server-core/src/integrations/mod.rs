@@ -1181,6 +1181,30 @@ mod loading_caches_from_tests {
     }
 
     #[test]
+    fn core_declares_only_the_robots_txt_cache() {
+        assert_eq!(
+            declared_caches(&[]).expect("core's own declaration is not refused"),
+            [ROBOTS_TXT_CACHE],
+            "a cache of the files the origin sends is a module's to declare"
+        );
+    }
+
+    #[test]
+    fn a_cache_assets_table_is_refused() {
+        let toml_str = format!(
+            "{}\n[cache.assets]\nstore_seconds = 3600\n",
+            crate::test_support::tests::crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse the settings");
+
+        let refused = loading_caches_from(&settings, &[offering("loading-cache.one")])
+            .expect_err("no linked module declares a cache named `assets`");
+
+        let message = format!("{refused:?}");
+        assert!(message.contains("[cache.assets]"), "{message}");
+    }
+
+    #[test]
     fn the_deploy_check_refuses_the_table_the_cache_build_refuses() {
         let settings = settings_declaring("answres", Some("one"));
         let builders = [declaring("a_vendor"), offering("loading-cache.one")];

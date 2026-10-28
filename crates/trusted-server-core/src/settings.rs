@@ -7146,6 +7146,24 @@ module = \"none\"",
     }
 
     #[test]
+    fn a_cache_assets_table_is_read_as_a_cache_a_module_declares() {
+        let toml_str = format!(
+            "{}\n[cache.assets]\nstore_seconds = 3600\n",
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse the table");
+
+        assert_eq!(
+            settings.cache.loading_caches(),
+            vec![
+                (super::ROBOTS_TXT_CACHE, &settings.cache.robots_txt),
+                ("assets", &settings.cache.declared["assets"]),
+            ],
+            "core has no `[cache.assets]` of its own, so a module would declare it"
+        );
+    }
+
+    #[test]
     fn a_loading_cache_module_is_read_and_written_back() {
         let toml_str = format!(
             r#"{}

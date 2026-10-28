@@ -1453,6 +1453,19 @@ impl MemoryLoadingCache {
         keys.sort();
         keys
     }
+
+    /// The value held under `key`, with the time it has left, or `None` for
+    /// its time when its load gave it no lifetime.
+    pub fn held(&self, key: &str) -> Option<(bytes::Bytes, Option<Duration>)> {
+        self.entries
+            .lock()
+            .expect("should lock the entries")
+            .get(key)
+            .map(|(bytes, end)| {
+                let left = end.map(|end| end.saturating_duration_since(web_time::Instant::now()));
+                (bytes.clone(), left)
+            })
+    }
 }
 
 #[async_trait::async_trait(?Send)]

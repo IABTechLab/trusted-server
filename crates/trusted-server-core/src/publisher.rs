@@ -37,6 +37,7 @@ use http::{HeaderValue, Method, Request, Response, StatusCode, Uri, header};
 use sha2::Digest as _;
 use web_time::Instant;
 
+use crate::asset_cache::{AssetAnswer, AssetFile, AssetVia, OriginRequest};
 use crate::auction::endpoints::{
     merge_auction_eids, resolve_auction_eids, resolve_client_auction_eids,
 };
@@ -3415,7 +3416,7 @@ pub async fn publisher_response_into_streaming_response(
 }
 
 /// Returns whether a request can render an HTML document context.
-fn is_html_document_request(req: &Request<EdgeBody>) -> bool {
+pub(crate) fn is_html_document_request(req: &Request<EdgeBody>) -> bool {
     if let Some(destination) = req
         .headers()
         .get("sec-fetch-dest")
@@ -5546,6 +5547,12 @@ pub async fn handle_publisher_request(
         });
     let mut template_cache_response_state = matches!(assembly_mode, AssemblyMode::Esi)
         .then_some(TemplateCacheResponseState::BypassRequest);
+    // What a selected asset cache module is told of the reader's request,
+    // read before the request is prepared for the origin. Only a `GET` is
+    // offered, being the one method a copy can answer.
+    let asset_file_url = (method_is_cacheable && services.asset_cache_module().is_some())
+        .then(|| target_uri.to_string());
+    let reader_carries_cookie = req.headers().contains_key(header::COOKIE);
     rewrite_origin_request(&mut req, target_uri, &origin_host_header)?;
 
     let request_method = req.method().clone();
@@ -5973,7 +5980,36 @@ pub async fn handle_publisher_request(
             request_is_document,
             &readthrough_reader_url,
         );
-        services.http_client().send(platform_request).await
+        // The asset cache module the deployment selects may answer for the
+        // file first. An origin request starts early only for a navigation,
+        // which is a document, so no file a module could answer is lost to it.
+        let answer = if let Some(module) = services.asset_cache_module()
+            && let Some(origin_url) = asset_file_url.as_deref()
+            && let Some(origin) = OriginRequest::of(&platform_request)
+        {
+            let origin_identity =
+                format!("{}\0{}", settings.publisher.origin_url, origin_host_header);
+            let file = AssetFile {
+                via: AssetVia::Publisher,
+                carries_authorization: authorization_disqualifies,
+                carries_cookie: reader_carries_cookie,
+                host: request_host,
+                scheme: request_scheme,
+                is_document: request_is_document,
+                asks_for_origin: request_requires_origin,
+                origin_url,
+                origin_identity: &origin_identity,
+                origin,
+            };
+            module.answer(services, file).await
+        } else {
+            AssetAnswer::AskOrigin
+        };
+        match answer {
+            AssetAnswer::Serve(response) => Ok(crate::platform::PlatformResponse::new(response)),
+            AssetAnswer::OriginFailed(report) => Err(report),
+            AssetAnswer::AskOrigin => services.http_client().send(platform_request).await,
+        }
     };
     let mut response = match origin_result {
         // The origin answered, so nothing in it describes this deployment,
@@ -7145,7 +7181,7 @@ pub(crate) enum TemplateCacheBypassReason {
     MalformedPolicyHeader,
 }
 
-fn request_bypasses_template_cache(headers: &edgezero_core::http::HeaderMap) -> bool {
+pub(crate) fn request_bypasses_template_cache(headers: &edgezero_core::http::HeaderMap) -> bool {
     const CONDITIONAL_OR_PARTIAL: &[&str] = &[
         "range",
         "if-range",
@@ -7280,18 +7316,18 @@ pub(crate) fn template_cache_bypass_reason(
 fn single_header_value(
     headers: &edgezero_core::http::HeaderMap,
     name: header::HeaderName,
-) -> Result<Option<&str>, TemplateCacheBypassReason> {
+) -> Result<Option<&str>, KeepRefusal> {
     let mut values = headers.get_all(name).iter();
     let Some(first) = values.next() else {
         return Ok(None);
     };
     if values.next().is_some() {
-        return Err(TemplateCacheBypassReason::MalformedCachePolicy);
+        return Err(KeepRefusal::MalformedPolicy);
     }
     first
         .to_str()
         .map(Some)
-        .map_err(|_| TemplateCacheBypassReason::MalformedCachePolicy)
+        .map_err(|_| KeepRefusal::MalformedPolicy)
 }
 
 fn single_representation_header_value(
@@ -7311,21 +7347,21 @@ fn single_representation_header_value(
         .map_err(|_| TemplateCacheBypassReason::MalformedRepresentationHeaders)
 }
 
-fn parse_delta_seconds(value: &str) -> Result<u64, TemplateCacheBypassReason> {
+fn parse_delta_seconds(value: &str) -> Result<u64, KeepRefusal> {
     let value = value.trim();
     let quoted_at_start = value.starts_with('"');
     let quoted_at_end = value.ends_with('"');
     let digits = match (quoted_at_start, quoted_at_end) {
         (true, true) if value.len() >= 2 => &value[1..value.len() - 1],
         (false, false) => value,
-        _ => return Err(TemplateCacheBypassReason::MalformedCachePolicy),
+        _ => return Err(KeepRefusal::MalformedPolicy),
     };
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(TemplateCacheBypassReason::MalformedCachePolicy);
+        return Err(KeepRefusal::MalformedPolicy);
     }
     digits
         .parse::<u64>()
-        .map_err(|_| TemplateCacheBypassReason::MalformedCachePolicy)
+        .map_err(|_| KeepRefusal::MalformedPolicy)
 }
 
 /// Parse the Fastly-specific freshness policy used by template cache's hosting platform.
@@ -7338,7 +7374,7 @@ fn parse_delta_seconds(value: &str) -> Result<u64, TemplateCacheBypassReason> {
 /// Unknown directives fail closed rather than inheriting semantics from another CDN.
 fn surrogate_control_freshness(
     headers: &edgezero_core::http::HeaderMap,
-) -> Result<Option<Duration>, TemplateCacheBypassReason> {
+) -> Result<Option<Duration>, KeepRefusal> {
     let mut saw_header = false;
     let mut max_age = None;
     let mut stale_while_revalidate = None;
@@ -7346,16 +7382,14 @@ fn surrogate_control_freshness(
 
     for value in headers.get_all("surrogate-control") {
         saw_header = true;
-        let value = value
-            .to_str()
-            .map_err(|_| TemplateCacheBypassReason::MalformedCachePolicy)?;
+        let value = value.to_str().map_err(|_| KeepRefusal::MalformedPolicy)?;
         if value.trim().is_empty() {
-            return Err(TemplateCacheBypassReason::MalformedCachePolicy);
+            return Err(KeepRefusal::MalformedPolicy);
         }
         for directive in value.split(',') {
             let directive = directive.trim();
             if directive.is_empty() {
-                return Err(TemplateCacheBypassReason::MalformedCachePolicy);
+                return Err(KeepRefusal::MalformedPolicy);
             }
             let (name, value) = directive
                 .split_once('=')
@@ -7367,33 +7401,27 @@ fn surrogate_control_freshness(
                 // before reuse" is correct for an HTTP cache and too permissive for a TS-owned
                 // one. Consolidating the two would loosen this gate rather than tidy it.
                 "private" | "no-store" | "no-cache" => {
-                    return Err(TemplateCacheBypassReason::OriginNotShareable);
+                    return Err(KeepRefusal::NotShareable);
                 }
                 "max-age" => {
-                    let parsed = parse_delta_seconds(
-                        value.ok_or(TemplateCacheBypassReason::MalformedCachePolicy)?,
-                    )?;
+                    let parsed = parse_delta_seconds(value.ok_or(KeepRefusal::MalformedPolicy)?)?;
                     if max_age.replace(parsed).is_some() {
-                        return Err(TemplateCacheBypassReason::MalformedCachePolicy);
+                        return Err(KeepRefusal::MalformedPolicy);
                     }
                 }
                 "stale-while-revalidate" => {
-                    let parsed = parse_delta_seconds(
-                        value.ok_or(TemplateCacheBypassReason::MalformedCachePolicy)?,
-                    )?;
+                    let parsed = parse_delta_seconds(value.ok_or(KeepRefusal::MalformedPolicy)?)?;
                     if stale_while_revalidate.replace(parsed).is_some() {
-                        return Err(TemplateCacheBypassReason::MalformedCachePolicy);
+                        return Err(KeepRefusal::MalformedPolicy);
                     }
                 }
                 "stale-if-error" => {
-                    let parsed = parse_delta_seconds(
-                        value.ok_or(TemplateCacheBypassReason::MalformedCachePolicy)?,
-                    )?;
+                    let parsed = parse_delta_seconds(value.ok_or(KeepRefusal::MalformedPolicy)?)?;
                     if stale_if_error.replace(parsed).is_some() {
-                        return Err(TemplateCacheBypassReason::MalformedCachePolicy);
+                        return Err(KeepRefusal::MalformedPolicy);
                     }
                 }
-                _ => return Err(TemplateCacheBypassReason::MalformedCachePolicy),
+                _ => return Err(KeepRefusal::MalformedPolicy),
             }
         }
     }
@@ -7401,56 +7429,63 @@ fn surrogate_control_freshness(
     if !saw_header {
         return Ok(None);
     }
-    let max_age = max_age.ok_or(TemplateCacheBypassReason::NoPositiveFreshness)?;
+    let max_age = max_age.ok_or(KeepRefusal::NoLifetime)?;
     if max_age == 0 {
-        return Err(TemplateCacheBypassReason::NoPositiveFreshness);
+        return Err(KeepRefusal::NoLifetime);
     }
     Ok(Some(Duration::from_secs(max_age)))
 }
 
-fn origin_shared_ttl(
+/// How long the origin lets a shared cache keep a response, at most
+/// `max_lifetime`.
+///
+/// The lifetime comes from `Surrogate-Control`, else `s-maxage`, else
+/// `max-age`, else `Expires` measured from `Date`, less the response's
+/// current age, being the larger of its `Age` and the age its `Date` implies.
+///
+/// # Errors
+///
+/// [`KeepRefusal::NotShareable`] for `private`, `no-store` or `no-cache`,
+/// [`KeepRefusal::MalformedPolicy`] for a policy that cannot be read, and
+/// [`KeepRefusal::NoLifetime`] for a response that gives no lifetime, or has
+/// none left.
+pub fn origin_shared_ttl(
     headers: &edgezero_core::http::HeaderMap,
-    max_age: Duration,
-) -> Result<Duration, TemplateCacheBypassReason> {
+    max_lifetime: Duration,
+) -> Result<Duration, KeepRefusal> {
     // `httpdate` parses `Date`/`Expires` into `std::time::SystemTime`, so take
     // the wasm-safe std value rather than calling `SystemTime::now()`.
-    origin_shared_ttl_at(headers, crate::ec::std_system_time_now(), max_age)
+    origin_shared_ttl_at(headers, crate::ec::std_system_time_now(), max_lifetime)
 }
 
 fn origin_shared_ttl_at(
     headers: &edgezero_core::http::HeaderMap,
     now: SystemTime,
-    template_cache_max_age: Duration,
-) -> Result<Duration, TemplateCacheBypassReason> {
+    max_lifetime: Duration,
+) -> Result<Duration, KeepRefusal> {
     let mut max_age = None;
     let mut shared_max_age = None;
 
     for value in headers.get_all(header::CACHE_CONTROL) {
-        let value = value
-            .to_str()
-            .map_err(|_| TemplateCacheBypassReason::MalformedCachePolicy)?;
+        let value = value.to_str().map_err(|_| KeepRefusal::MalformedPolicy)?;
         for directive in value.split(',').map(str::trim).filter(|v| !v.is_empty()) {
             let (name, value) = directive
                 .split_once('=')
                 .map_or((directive, None), |(name, value)| (name, Some(value)));
             match name.trim().to_ascii_lowercase().as_str() {
                 "private" | "no-store" | "no-cache" => {
-                    return Err(TemplateCacheBypassReason::OriginNotShareable);
+                    return Err(KeepRefusal::NotShareable);
                 }
                 "max-age" => {
-                    let parsed = parse_delta_seconds(
-                        value.ok_or(TemplateCacheBypassReason::MalformedCachePolicy)?,
-                    )?;
+                    let parsed = parse_delta_seconds(value.ok_or(KeepRefusal::MalformedPolicy)?)?;
                     if max_age.replace(parsed).is_some() {
-                        return Err(TemplateCacheBypassReason::MalformedCachePolicy);
+                        return Err(KeepRefusal::MalformedPolicy);
                     }
                 }
                 "s-maxage" => {
-                    let parsed = parse_delta_seconds(
-                        value.ok_or(TemplateCacheBypassReason::MalformedCachePolicy)?,
-                    )?;
+                    let parsed = parse_delta_seconds(value.ok_or(KeepRefusal::MalformedPolicy)?)?;
                     if shared_max_age.replace(parsed).is_some() {
-                        return Err(TemplateCacheBypassReason::MalformedCachePolicy);
+                        return Err(KeepRefusal::MalformedPolicy);
                     }
                 }
                 _ => {}
@@ -7461,16 +7496,16 @@ fn origin_shared_ttl_at(
     let date = single_header_value(headers, header::DATE)?
         .map(httpdate::parse_http_date)
         .transpose()
-        .map_err(|_| TemplateCacheBypassReason::MalformedCachePolicy)?;
+        .map_err(|_| KeepRefusal::MalformedPolicy)?;
     let standard_freshness = match shared_max_age.or(max_age) {
         Some(seconds) => Some(Duration::from_secs(seconds)),
         None => single_header_value(headers, header::EXPIRES)?
             .map(|value| {
-                let expires = httpdate::parse_http_date(value)
-                    .map_err(|_| TemplateCacheBypassReason::MalformedCachePolicy)?;
+                let expires =
+                    httpdate::parse_http_date(value).map_err(|_| KeepRefusal::MalformedPolicy)?;
                 expires
                     .duration_since(date.unwrap_or(now))
-                    .map_err(|_| TemplateCacheBypassReason::NoPositiveFreshness)
+                    .map_err(|_| KeepRefusal::NoLifetime)
             })
             .transpose()?,
     };
@@ -7478,7 +7513,7 @@ fn origin_shared_ttl_at(
     // restrictive directives were still parsed above and remain hard refusals.
     let freshness = surrogate_control_freshness(headers)?
         .or(standard_freshness)
-        .ok_or(TemplateCacheBypassReason::NoPositiveFreshness)?;
+        .ok_or(KeepRefusal::NoLifetime)?;
 
     let age = single_header_value(headers, header::AGE)?
         .map(parse_delta_seconds)
@@ -7494,10 +7529,10 @@ fn origin_shared_ttl_at(
     let remaining = freshness
         .checked_sub(current_age)
         .filter(|duration| !duration.is_zero())
-        .ok_or(TemplateCacheBypassReason::NoPositiveFreshness)?;
-    let capped = remaining.min(template_cache_max_age);
+        .ok_or(KeepRefusal::NoLifetime)?;
+    let capped = remaining.min(max_lifetime);
     if capped.is_zero() {
-        return Err(TemplateCacheBypassReason::NoPositiveFreshness);
+        return Err(KeepRefusal::NoLifetime);
     }
     Ok(capped)
 }
@@ -7523,6 +7558,73 @@ fn replayable_policy_headers(
     Ok(captured)
 }
 
+/// Why an origin's response may not be kept for other readers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepRefusal {
+    /// The status is not `200`.
+    NotOk,
+    /// The response sets a cookie.
+    SetsCookie,
+    /// The response's cache policy keeps it from a shared copy, by `private`,
+    /// `no-store` or `no-cache`, or by a shared cache header core does not
+    /// read.
+    NotShareable,
+    /// The response's cache policy cannot be read.
+    MalformedPolicy,
+    /// The response gives no lifetime, or has none left.
+    NoLifetime,
+}
+
+impl From<KeepRefusal> for TemplateCacheBypassReason {
+    fn from(refusal: KeepRefusal) -> Self {
+        match refusal {
+            KeepRefusal::NotOk => Self::NonOkStatus,
+            KeepRefusal::SetsCookie => Self::OriginSetCookie,
+            KeepRefusal::NotShareable => Self::OriginNotShareable,
+            KeepRefusal::MalformedPolicy => Self::MalformedCachePolicy,
+            KeepRefusal::NoLifetime => Self::NoPositiveFreshness,
+        }
+    }
+}
+
+/// As the template cache's matching reason, so its log lines read the same.
+impl core::fmt::Display for KeepRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(&TemplateCacheBypassReason::from(*self), f)
+    }
+}
+
+/// Whether an origin's response may be kept for other readers at all.
+///
+/// # Errors
+///
+/// [`KeepRefusal::NotOk`] for a status other than `200`,
+/// [`KeepRefusal::SetsCookie`] for a response that sets a cookie, and
+/// [`KeepRefusal::NotShareable`] for a shared cache header core does not
+/// read, checked in that order.
+pub fn origin_response_may_be_kept(
+    status: StatusCode,
+    headers: &edgezero_core::http::HeaderMap,
+) -> Result<(), KeepRefusal> {
+    if status != StatusCode::OK {
+        return Err(KeepRefusal::NotOk);
+    }
+    if headers.contains_key(header::SET_COOKIE) {
+        return Err(KeepRefusal::SetsCookie);
+    }
+    // Core Cache has no HTTP semantics. Fastly's documented Surrogate-Control subset
+    // is parsed by `origin_shared_ttl`; every other vendor-specific policy remains a
+    // bypass rather than guessing that unrelated CDNs share its grammar or precedence.
+    if crate::cache_policy::EDGE_CACHE_HEADER_NAMES
+        .iter()
+        .filter(|name| **name != "surrogate-control")
+        .any(|name| headers.contains_key(*name))
+    {
+        return Err(KeepRefusal::NotShareable);
+    }
+    Ok(())
+}
+
 fn template_cache_ttl(
     mode: AssemblyMode,
     authorization_disqualifies: bool,
@@ -7541,19 +7643,7 @@ fn template_cache_ttl(
     if cookie_disqualifies {
         return Err(TemplateCacheBypassReason::CookiePolicy);
     }
-    if response_headers.contains_key(header::SET_COOKIE) {
-        return Err(TemplateCacheBypassReason::OriginSetCookie);
-    }
-    // Core Cache has no HTTP semantics. Fastly's documented Surrogate-Control subset
-    // is parsed by `origin_shared_ttl`; every other vendor-specific policy remains a
-    // bypass rather than guessing that unrelated CDNs share its grammar or precedence.
-    if crate::cache_policy::EDGE_CACHE_HEADER_NAMES
-        .iter()
-        .filter(|name| **name != "surrogate-control")
-        .any(|name| response_headers.contains_key(*name))
-    {
-        return Err(TemplateCacheBypassReason::OriginNotShareable);
-    }
+    origin_response_may_be_kept(status, response_headers)?;
     // Checked here, among the leak vectors, because storing under a key that does not
     // cover the origin's Vary is cross-serving rather than mere ineligibility: a request
     // differing only in the uncovered header would read this template.
@@ -7584,9 +7674,6 @@ fn template_cache_ttl(
             uncovered,
         )));
     }
-    if status != StatusCode::OK {
-        return Err(TemplateCacheBypassReason::NonOkStatus);
-    }
     let declared_content_type =
         single_representation_header_value(response_headers, header::CONTENT_TYPE)?;
     if declared_content_type.is_some_and(|declared| declared != content_type)
@@ -7607,7 +7694,7 @@ fn template_cache_ttl(
         return Err(TemplateCacheBypassReason::UnsupportedContentEncoding);
     }
     replayable_policy_headers(response_headers)?;
-    origin_shared_ttl(response_headers, policy.max_age)
+    Ok(origin_shared_ttl(response_headers, policy.max_age)?)
 }
 
 /// What the `<head>` seam injects, given the assembly mode.
@@ -8273,6 +8360,485 @@ fn mark_deprecated_alias(response: &mut Response<EdgeBody>, is_legacy_alias: boo
 
 #[cfg(test)]
 mod tests {
+    /// The files the publisher's origin sends that are not pages.
+    mod origin_file_tests {
+        use super::*;
+        use crate::asset_cache::AssetVia;
+        use crate::asset_cache::test_support::{Offered, TestAssetCache};
+        use crate::platform::test_support::{
+            MemoryLoadingCache, StubHttpClient, build_services_with_http_client,
+        };
+
+        /// The lifetime the origin gives every file these tests queue.
+        const FILE_CACHE_CONTROL: &str = "public, max-age=300";
+
+        /// The most bytes a test reads of a response body.
+        const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+        fn settings() -> Arc<Settings> {
+            Arc::new(crate::test_support::tests::create_test_settings())
+        }
+
+        /// The services of a deployment that links a loading cache module,
+        /// so that a value a load makes is kept.
+        fn services(stub: &Arc<StubHttpClient>) -> RuntimeServices {
+            build_services_with_http_client(Arc::clone(stub) as _)
+                .with_loading_cache(Arc::new(MemoryLoadingCache::default()))
+        }
+
+        fn file_request(path_and_query: &str, destination: &str) -> Request<EdgeBody> {
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("https://ts.example.com{path_and_query}"))
+                .header(header::HOST, "ts.example.com")
+                .header("sec-fetch-dest", destination)
+                .body(EdgeBody::empty())
+                .expect("should build the file request")
+        }
+
+        fn queue(stub: &StubHttpClient, content_type: &str, body: &[u8]) {
+            stub.push_response_with_headers(
+                200,
+                body.to_vec(),
+                vec![
+                    ("content-type", content_type),
+                    ("cache-control", FILE_CACHE_CONTROL),
+                ],
+            );
+        }
+
+        async fn run(
+            settings: &Arc<Settings>,
+            services: &RuntimeServices,
+            request: Request<EdgeBody>,
+        ) -> Response<EdgeBody> {
+            try_run(settings, services, request)
+                .await
+                .expect("should proxy the file request")
+        }
+
+        /// The publisher path's finished response to `request`, or the error
+        /// it answers with.
+        async fn try_run(
+            settings: &Arc<Settings>,
+            services: &RuntimeServices,
+            request: Request<EdgeBody>,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+            let registry =
+                IntegrationRegistry::new(settings).expect("should create integration registry");
+            let orchestrator = AuctionOrchestrator::new(
+                crate::auction::test_support::legacy_auction_config(settings),
+            );
+            let consent = crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            };
+            let mut ec_context = EcContext::new_for_test(None, consent);
+            let publisher_response = handle_publisher_request(
+                AppContext {
+                    settings,
+                    integration_registry: &registry,
+                },
+                services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &[],
+                    registry: None,
+                },
+                request,
+                EdgeCacheHeader::SMaxageFallback,
+            )
+            .await?;
+            buffer_publisher_response_async(
+                publisher_response,
+                &Method::GET,
+                settings,
+                &registry,
+                &orchestrator,
+                services,
+            )
+            .await
+        }
+
+        async fn body_of(response: Response<EdgeBody>) -> Vec<u8> {
+            response
+                .into_body()
+                .into_bytes_bounded(MAX_BODY_BYTES)
+                .await
+                .expect("should read the body")
+                .to_vec()
+        }
+
+        #[tokio::test]
+        async fn every_file_is_asked_of_the_publishers_origin() {
+            let stub = Arc::new(StubHttpClient::new());
+            let services = services(&stub);
+            let settings = settings();
+
+            for _ in 0..2 {
+                queue(&stub, "text/css", b"body{}");
+                let response = run(&settings, &services, file_request("/site.css", "style")).await;
+                assert_eq!(body_of(response).await, b"body{}");
+            }
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "two requests for a file the origin lets be kept are two origin requests"
+            );
+        }
+
+        fn services_with(
+            stub: &Arc<StubHttpClient>,
+            module: &Arc<TestAssetCache>,
+        ) -> RuntimeServices {
+            services(stub).with_asset_cache_module(Arc::clone(module) as _)
+        }
+
+        /// A stylesheet that names the publisher's origin, which the page
+        /// path rewrites to the host the reader asked.
+        fn stylesheet_naming_the_origin() -> Response<EdgeBody> {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/css")
+                .body(EdgeBody::from(
+                    "a{background:url(https://origin.test-publisher.com/a.png)}",
+                ))
+                .expect("should build the stylesheet")
+        }
+
+        #[tokio::test]
+        async fn a_module_serving_a_file_stops_the_origin_being_asked() {
+            let stub = Arc::new(StubHttpClient::new());
+            let module = TestAssetCache::serving(stylesheet_naming_the_origin);
+            let services = services_with(&stub, &module);
+
+            let response = run(&settings(), &services, file_request("/site.css", "style")).await;
+            let body = String::from_utf8(body_of(response).await).expect("should be text");
+
+            assert!(
+                stub.recorded_request_uris().is_empty(),
+                "the module's answer takes the place of the origin's"
+            );
+            assert_eq!(module.offered().len(), 1, "the file is offered once");
+            assert!(
+                body.contains("ts.example.com/a.png")
+                    && !body.contains("origin.test-publisher.com"),
+                "the answer is processed as an origin response is: {body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_module_passing_a_file_back_leaves_one_origin_request() {
+            let stub = Arc::new(StubHttpClient::new());
+            let module = TestAssetCache::asking_the_origin();
+            let services = services_with(&stub, &module);
+            queue(&stub, "text/css", b"body{}");
+
+            let response = run(&settings(), &services, file_request("/site.css", "style")).await;
+
+            assert_eq!(body_of(response).await, b"body{}");
+            assert_eq!(module.offered().len(), 1, "the file is offered once");
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "core asks the origin once, as with no module"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_module_that_cannot_reach_the_origin_is_answered_as_a_failed_origin_request() {
+            use crate::error::IntoHttpResponse as _;
+
+            let stub = Arc::new(StubHttpClient::new());
+            let module = TestAssetCache::failing_to_reach_the_origin();
+            let services = services_with(&stub, &module);
+
+            let Err(error) =
+                try_run(&settings(), &services, file_request("/site.css", "style")).await
+            else {
+                panic!("should fail as a failed origin request does");
+            };
+
+            assert_eq!(
+                error.current_context().status_code(),
+                StatusCode::BAD_GATEWAY
+            );
+            assert!(
+                format!("{error:?}").contains("Failed to proxy request to origin"),
+                "{error:?}"
+            );
+            assert!(
+                stub.recorded_request_uris().is_empty(),
+                "the origin is not asked a second time"
+            );
+        }
+
+        /// What the module was offered for `request`, which core then sends
+        /// to the origin.
+        async fn offered_for(request: Request<EdgeBody>) -> Offered {
+            let stub = Arc::new(StubHttpClient::new());
+            let module = TestAssetCache::asking_the_origin();
+            queue(&stub, "text/css", b"body{}");
+            let response = run(&settings(), &services_with(&stub, &module), request).await;
+            let _ = body_of(response).await;
+            let mut offered = module.offered();
+            assert_eq!(offered.len(), 1, "the file is offered once");
+            offered.remove(0)
+        }
+
+        #[tokio::test]
+        async fn the_module_is_told_what_core_knows_of_the_readers_request() {
+            let plain = offered_for(file_request("/site.css?v=2", "style")).await;
+            assert_eq!(plain.via, AssetVia::Publisher);
+            assert!(!plain.carries_authorization && !plain.carries_cookie);
+            assert!(!plain.is_document && !plain.asks_for_origin);
+            assert_eq!(plain.host, "ts.example.com");
+            assert_eq!(
+                plain.origin_url,
+                "https://origin.test-publisher.com/site.css?v=2"
+            );
+            assert_eq!(
+                plain.origin_identity,
+                "https://origin.test-publisher.com\0origin.test-publisher.com"
+            );
+            assert_eq!(
+                plain.origin.uri().to_string(),
+                plain.origin_url,
+                "the origin request asks for the file's URL"
+            );
+
+            let with = |name: header::HeaderName, value: &'static str| {
+                let mut request = file_request("/site.css", "style");
+                request
+                    .headers_mut()
+                    .insert(name, HeaderValue::from_static(value));
+                request
+            };
+            assert!(
+                offered_for(with(header::COOKIE, "session=1"))
+                    .await
+                    .carries_cookie
+            );
+            assert!(
+                offered_for(with(header::AUTHORIZATION, "Bearer reader"))
+                    .await
+                    .carries_authorization
+            );
+            assert!(
+                offered_for(with(header::RANGE, "bytes=0-3"))
+                    .await
+                    .asks_for_origin
+            );
+
+            let mut navigation = file_request("/page", "document");
+            navigation
+                .headers_mut()
+                .insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
+            assert!(offered_for(navigation).await.is_document);
+
+            let mut with_state = file_request("/site.css", "style");
+            IntegrationRequestState::insert(&mut with_state, "a_module", ());
+            assert!(
+                offered_for(with_state).await.asks_for_origin,
+                "state a module left keeps the file to the origin"
+            );
+
+            let mut personalized = file_request("/site.css", "style");
+            personalized
+                .extensions_mut()
+                .insert(crate::response_privacy::PersonalizedResponse);
+            assert!(
+                offered_for(personalized).await.asks_for_origin,
+                "a response an integration marked personalized is the origin's"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_head_request_is_not_offered() {
+            let stub = Arc::new(StubHttpClient::new());
+            let module = TestAssetCache::asking_the_origin();
+            queue(&stub, "text/css", b"body{}");
+            let mut request = file_request("/site.css", "style");
+            *request.method_mut() = Method::HEAD;
+
+            let _ = try_run(&settings(), &services_with(&stub, &module), request).await;
+
+            assert!(module.offered().is_empty(), "only a `GET` is offered");
+            assert_eq!(stub.recorded_request_uris().len(), 1);
+        }
+
+        /// Settings that let a shareable page be held by the platform's
+        /// readthrough cache, so the origin request carries a cache intent of
+        /// its own.
+        fn readthrough_settings() -> Arc<Settings> {
+            let toml = format!(
+                "{}\n[creative_opportunities]\ngam_network_id = \"99999\"\n\
+                 origin_readthrough_enabled = true\n",
+                crate::test_support::tests::crate_test_settings_str()
+            );
+            let mut settings =
+                Settings::from_toml(&toml).expect("should parse the readthrough settings");
+            // Mirrors `create_test_settings`, without which the registry is
+            // not built.
+            settings.proxy.allowed_domains =
+                vec!["*.example".to_string(), "*.example.com".to_string()];
+            Arc::new(settings)
+        }
+
+        #[tokio::test]
+        async fn the_origin_request_a_module_is_handed_is_the_one_core_sends_with_no_module() {
+            let settings = readthrough_settings();
+            let navigation = || {
+                let mut request = file_request("/page?edition=2", "document");
+                request
+                    .headers_mut()
+                    .insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
+                request
+                    .headers_mut()
+                    .insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-GB"));
+                request
+            };
+            let page = b"<html><head></head><body>page</body></html>";
+            for streaming in [false, true] {
+                let stub = Arc::new(StubHttpClient::new());
+                stub.set_streaming_responses_supported(streaming);
+                let module = TestAssetCache::asking_the_origin();
+                for _ in 0..2 {
+                    queue(&stub, "text/html", page);
+                }
+
+                let _ = body_of(run(&settings, &services(&stub), navigation()).await).await;
+                let services = services_with(&stub, &module);
+                let _ = body_of(run(&settings, &services, navigation()).await).await;
+
+                let handed = module.offered().remove(0).origin.platform_request();
+                let headers = |request: &PlatformHttpRequest| -> Vec<(String, String)> {
+                    request
+                        .request
+                        .headers()
+                        .iter()
+                        .map(|(name, value)| {
+                            let value = value.to_str().expect("should be text").to_owned();
+                            (name.as_str().to_owned(), value)
+                        })
+                        .collect()
+                };
+                assert_eq!(handed.request.method(), Method::GET);
+                assert_eq!(
+                    handed.request.uri().to_string(),
+                    stub.recorded_request_uris()[0]
+                );
+                assert_eq!(headers(&handed), stub.recorded_request_headers()[0]);
+                assert_eq!(handed.backend_name, stub.recorded_backend_names()[0]);
+                assert_eq!(handed.cache_intent, stub.recorded_cache_intents()[0]);
+                assert!(
+                    matches!(handed.cache_intent, PlatformCacheIntent::Shared { .. }),
+                    "a shareable page is asked for through the readthrough cache"
+                );
+                assert_eq!(
+                    handed.stream_response,
+                    stub.recorded_stream_response_flags()[0]
+                );
+                assert_eq!(handed.stream_response, streaming);
+                assert_eq!(
+                    stub.recorded_request_uris()[1],
+                    stub.recorded_request_uris()[0],
+                    "core sends the same request once the module passes the file back"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_get_that_describes_a_body_is_not_offered() {
+            for (name, value) in [
+                (header::CONTENT_LENGTH, "4"),
+                (header::TRANSFER_ENCODING, "chunked"),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                let module = TestAssetCache::asking_the_origin();
+                queue(&stub, "text/css", b"body{}");
+                let mut request = file_request("/site.css", "style");
+                request
+                    .headers_mut()
+                    .insert(name.clone(), HeaderValue::from_static(value));
+
+                let _ = try_run(&settings(), &services_with(&stub, &module), request).await;
+
+                assert!(
+                    module.offered().is_empty(),
+                    "a request carrying {name} is not offered, because a module's load \
+                     sends it with no body"
+                );
+                assert_eq!(stub.recorded_request_uris().len(), 1, "{name}");
+            }
+        }
+
+        /// A `GET` of `path` carrying the reader's validators and range.
+        fn request_with_validators_and_range(path: &str) -> Request<EdgeBody> {
+            let mut request = file_request(path, "empty");
+            for (name, value) in VALIDATORS_AND_RANGE {
+                request.headers_mut().insert(
+                    header::HeaderName::from_static(name),
+                    HeaderValue::from_static(value),
+                );
+            }
+            request
+        }
+
+        /// What the module was offered for `request` under `settings`.
+        async fn offered_under(settings: Settings, request: Request<EdgeBody>) -> Offered {
+            let stub = Arc::new(StubHttpClient::new());
+            let module = TestAssetCache::asking_the_origin();
+            queue(&stub, "text/plain", b"User-agent: *\nAllow: /\n");
+            let settings = Arc::new(settings);
+            let _ = try_run(&settings, &services_with(&stub, &module), request).await;
+            let mut offered = module.offered();
+            assert_eq!(offered.len(), 1, "the file is offered once");
+            offered.remove(0)
+        }
+
+        #[tokio::test]
+        async fn asks_for_origin_describes_the_request_after_its_range_is_removed() {
+            // The robots.txt middleware needs the whole file, so core removes
+            // the reader's validators and range before it asks the origin.
+            let whole = offered_under(
+                settings_refusing_every_crawler(),
+                request_with_validators_and_range(crate::robots_txt::ROBOTS_TXT_PATH),
+            )
+            .await;
+            let ranged = offered_under(
+                settings_refusing_every_crawler(),
+                request_with_validators_and_range("/humans.txt"),
+            )
+            .await;
+
+            assert!(
+                !whole.asks_for_origin && !whole.origin.headers().contains_key(header::RANGE),
+                "the origin will be asked for the whole file"
+            );
+            assert!(
+                ranged.asks_for_origin && ranged.origin.headers().contains_key(header::RANGE),
+                "a range no middleware removes asks for the origin"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_module_is_told_the_scheme_the_reader_asked_over() {
+            let plain = offered_for(file_request("/site.css", "style")).await;
+            let mut forwarded = file_request("/site.css", "style");
+            forwarded
+                .headers_mut()
+                .insert("x-forwarded-proto", HeaderValue::from_static("https"));
+            let forwarded = offered_for(forwarded).await;
+
+            assert_eq!(plain.scheme, "http", "no TLS and no forwarded scheme");
+            assert_eq!(forwarded.scheme, "https");
+        }
+    }
+
     use std::future::Future as _;
     use std::io::{self, Read as _};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17810,7 +18376,7 @@ mod tests {
                     one_minute_later,
                     Duration::from_secs(60),
                 ),
-                Err(TemplateCacheBypassReason::NoPositiveFreshness),
+                Err(KeepRefusal::NoLifetime),
                 "an old Date is apparent age even when an upstream omitted Age"
             );
         }
@@ -17877,8 +18443,76 @@ mod tests {
             ]);
             assert_eq!(
                 origin_shared_ttl_at(&expired, now, Duration::from_secs(60)),
-                Err(TemplateCacheBypassReason::NoPositiveFreshness)
+                Err(KeepRefusal::NoLifetime)
             );
+        }
+
+        #[test]
+        fn the_keep_checks_refuse_as_the_template_cache_reports() {
+            let cdn = || HeaderName::from_static("cdn-cache-control");
+            let surrogate = HeaderName::from_static("surrogate-control");
+            for (status, response, expected) in [
+                (StatusCode::NOT_FOUND, headers(&[]), Err(KeepRefusal::NotOk)),
+                (
+                    StatusCode::OK,
+                    headers(&[(header::SET_COOKIE, "a=b")]),
+                    Err(KeepRefusal::SetsCookie),
+                ),
+                (
+                    StatusCode::OK,
+                    headers(&[(cdn(), "max-age=60")]),
+                    Err(KeepRefusal::NotShareable),
+                ),
+                (
+                    StatusCode::OK,
+                    headers(&[(surrogate, "max-age=60")]),
+                    Ok(()),
+                ),
+                // The status is checked first, then the cookie, then the
+                // shared cache headers.
+                (
+                    StatusCode::NOT_FOUND,
+                    headers(&[(header::SET_COOKIE, "a=b")]),
+                    Err(KeepRefusal::NotOk),
+                ),
+                (
+                    StatusCode::OK,
+                    headers(&[(header::SET_COOKIE, "a=b"), (cdn(), "max-age=60")]),
+                    Err(KeepRefusal::SetsCookie),
+                ),
+            ] {
+                assert_eq!(
+                    origin_response_may_be_kept(status, &response),
+                    expected,
+                    "{status} {response:?}"
+                );
+            }
+            for (refusal, reason) in [
+                (KeepRefusal::NotOk, TemplateCacheBypassReason::NonOkStatus),
+                (
+                    KeepRefusal::SetsCookie,
+                    TemplateCacheBypassReason::OriginSetCookie,
+                ),
+                (
+                    KeepRefusal::NotShareable,
+                    TemplateCacheBypassReason::OriginNotShareable,
+                ),
+                (
+                    KeepRefusal::MalformedPolicy,
+                    TemplateCacheBypassReason::MalformedCachePolicy,
+                ),
+                (
+                    KeepRefusal::NoLifetime,
+                    TemplateCacheBypassReason::NoPositiveFreshness,
+                ),
+            ] {
+                assert_eq!(TemplateCacheBypassReason::from(refusal), reason);
+                assert_eq!(
+                    refusal.to_string(),
+                    reason.to_string(),
+                    "a refusal is logged as the template cache's matching reason"
+                );
+            }
         }
 
         #[test]

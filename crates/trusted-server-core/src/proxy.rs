@@ -11,6 +11,7 @@ use std::io::{Cursor, Write};
 use std::time::Duration;
 use web_time::{SystemTime, UNIX_EPOCH};
 
+use crate::asset_cache::{AssetAnswer, AssetCacheModule, AssetFile, AssetVia, OriginRequest};
 use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, NO_STORE_PRIVATE_CACHE_CONTROL,
     apply_no_store_private_to_headers, cache_control_headers_are_private_or_no_store,
@@ -1181,13 +1182,25 @@ pub async fn handle_asset_proxy_request(
         platform_req = platform_req.with_stream_response();
     }
 
-    let platform_resp = services
-        .http_client()
-        .send(platform_req)
-        .await
-        .change_context(TrustedServerError::Proxy {
-            message: "Failed to proxy asset request".to_string(),
-        })?;
+    // The asset cache module the deployment selects may answer for the file
+    // first, offered as a `GET` the platform's image optimizer does not
+    // answer, because the platform holds what its optimizer makes.
+    let answer = if let Some(module) = services.asset_cache_module()
+        && platform_req.image_optimizer.is_none()
+        && let Some(origin) = OriginRequest::of(&platform_req)
+    {
+        route_file_answer(&*module, services, &req, route, &target_url, origin).await
+    } else {
+        AssetAnswer::AskOrigin
+    };
+    let platform_resp = match answer {
+        AssetAnswer::Serve(response) => Ok(PlatformResponse::new(response)),
+        AssetAnswer::OriginFailed(report) => Err(report),
+        AssetAnswer::AskOrigin => services.http_client().send(platform_req).await,
+    }
+    .change_context(TrustedServerError::Proxy {
+        message: "Failed to proxy asset request".to_string(),
+    })?;
 
     let mut response = if stream_response {
         platform_response_to_fastly_asset(platform_resp)
@@ -1204,6 +1217,48 @@ pub async fn handle_asset_proxy_request(
     }
 
     Ok(response)
+}
+
+/// The scheme a route's reader is taken to ask over when the request URI
+/// names none.
+const ROUTE_DEFAULT_SCHEME: &str = "https";
+
+/// What `module` answers for the file a route is about to ask its origin
+/// for with `origin`, told what core knows of the reader's request `req`.
+///
+/// The file's origin is named by the route's origin URL and its prefix, so
+/// two routes to one origin are never taken for each other.
+async fn route_file_answer(
+    module: &dyn AssetCacheModule,
+    services: &RuntimeServices,
+    req: &Request<EdgeBody>,
+    route: &ProxyAssetRoute,
+    target_url: &url::Url,
+    origin: OriginRequest,
+) -> AssetAnswer {
+    let host = req
+        .uri()
+        .host()
+        .or_else(|| {
+            req.headers()
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok())
+        })
+        .unwrap_or_default();
+    let origin_identity = format!("{}\0{}", route.origin_url, route.prefix);
+    let file = AssetFile {
+        via: AssetVia::Route,
+        carries_authorization: req.headers().contains_key(header::AUTHORIZATION),
+        carries_cookie: req.headers().contains_key(header::COOKIE),
+        host,
+        scheme: req.uri().scheme_str().unwrap_or(ROUTE_DEFAULT_SCHEME),
+        is_document: crate::publisher::is_html_document_request(req),
+        asks_for_origin: crate::publisher::request_bypasses_template_cache(req.headers()),
+        origin_url: target_url.as_str(),
+        origin_identity: &origin_identity,
+        origin,
+    };
+    module.answer(services, file).await
 }
 
 /// Upserts the `ts-ec` query parameter on a URL, replacing any existing value.
@@ -5018,6 +5073,441 @@ mod tests {
             "assets.example.com:8443",
             "should include non-standard port in Host header"
         );
+    }
+
+    /// A stylesheet the route's origin lets be kept for five minutes.
+    fn queue_shareable_stylesheet(stub: &StubHttpClient) {
+        stub.push_response_with_headers(
+            200,
+            b"body { color: red }".to_vec(),
+            vec![
+                ("content-type", "text/css"),
+                ("cache-control", "public, max-age=300"),
+            ],
+        );
+    }
+
+    /// A route's answer to `request`, through `/.images/` to its origin.
+    async fn route_answer(
+        services: &RuntimeServices,
+        request: HttpRequest<EdgeBody>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        let settings = create_test_settings();
+        let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+        handle_asset_proxy_request(&settings, services, request, &route)
+            .await?
+            .into_response()
+    }
+
+    #[test]
+    fn every_file_is_asked_of_a_routes_origin() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(false);
+            let services = build_services_with_http_client(Arc::clone(&stub) as _)
+                .with_loading_cache(Arc::new(
+                    crate::platform::test_support::MemoryLoadingCache::default(),
+                ));
+            let uri = "https://www.example.com/.images/site.css";
+
+            for _ in 0..2 {
+                queue_shareable_stylesheet(&stub);
+                let answer = route_answer(&services, build_http_request(Method::GET, uri))
+                    .await
+                    .expect("should answer the file request");
+                assert_eq!(answer.status(), StatusCode::OK);
+            }
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "two requests for a file the origin lets be kept are two origin requests"
+            );
+        });
+    }
+
+    /// The services of a deployment that selects `module` as its asset cache
+    /// module, over a stub that answers with whole bodies.
+    fn services_with_module(
+        stub: &Arc<StubHttpClient>,
+        module: &Arc<crate::asset_cache::test_support::TestAssetCache>,
+    ) -> RuntimeServices {
+        build_services_with_http_client(Arc::clone(stub) as _)
+            .with_asset_cache_module(Arc::clone(module) as _)
+    }
+
+    fn whole_body_stub() -> Arc<StubHttpClient> {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.set_streaming_responses_supported(false);
+        stub
+    }
+
+    /// A stylesheet that sets a cookie, which a route never passes on.
+    fn stylesheet_setting_a_cookie() -> Response<EdgeBody> {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/css")
+            .header(header::SET_COOKIE, "a=b")
+            .body(EdgeBody::from("body { color: blue }"))
+            .expect("should build the stylesheet")
+    }
+
+    const ROUTE_FILE_URI: &str = "https://www.example.com/.images/site.css";
+
+    #[test]
+    fn a_module_serving_a_routes_file_stops_the_origin_being_asked() {
+        use crate::asset_cache::test_support::TestAssetCache;
+        futures::executor::block_on(async {
+            let stub = whole_body_stub();
+            let module = TestAssetCache::serving(stylesheet_setting_a_cookie);
+
+            let answer = route_answer(
+                &services_with_module(&stub, &module),
+                build_http_request(Method::GET, ROUTE_FILE_URI),
+            )
+            .await
+            .expect("should answer the file request");
+
+            assert!(
+                stub.recorded_request_uris().is_empty(),
+                "the module's answer takes the place of the origin's"
+            );
+            assert_eq!(module.offered().len(), 1, "the file is offered once");
+            assert!(
+                !answer.headers().contains_key(header::SET_COOKIE),
+                "the answer is handled as the origin's would be"
+            );
+            assert_eq!(
+                answer.into_body().as_bytes(),
+                Some(&b"body { color: blue }"[..]),
+                "the module's body is served"
+            );
+        });
+    }
+
+    #[test]
+    fn a_module_passing_a_routes_file_back_leaves_one_origin_request() {
+        use crate::asset_cache::test_support::TestAssetCache;
+        futures::executor::block_on(async {
+            let stub = whole_body_stub();
+            queue_shareable_stylesheet(&stub);
+            let module = TestAssetCache::asking_the_origin();
+
+            let answer = route_answer(
+                &services_with_module(&stub, &module),
+                build_http_request(Method::GET, ROUTE_FILE_URI),
+            )
+            .await
+            .expect("should answer the file request");
+
+            assert_eq!(answer.status(), StatusCode::OK);
+            assert_eq!(module.offered().len(), 1, "the file is offered once");
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "core asks the origin once, as with no module"
+            );
+        });
+    }
+
+    #[test]
+    fn a_module_that_cannot_reach_a_routes_origin_is_answered_as_a_failed_origin_request() {
+        use crate::asset_cache::test_support::TestAssetCache;
+        futures::executor::block_on(async {
+            let stub = whole_body_stub();
+            let module = TestAssetCache::failing_to_reach_the_origin();
+
+            let Err(error) = route_answer(
+                &services_with_module(&stub, &module),
+                build_http_request(Method::GET, ROUTE_FILE_URI),
+            )
+            .await
+            else {
+                panic!("should fail as a failed origin request does");
+            };
+
+            assert_eq!(
+                error.current_context().status_code(),
+                StatusCode::BAD_GATEWAY
+            );
+            assert!(
+                format!("{error:?}").contains("Failed to proxy asset request"),
+                "{error:?}"
+            );
+            assert!(
+                stub.recorded_request_uris().is_empty(),
+                "the origin is not asked a second time"
+            );
+        });
+    }
+
+    #[test]
+    fn a_routes_head_request_is_not_offered() {
+        use crate::asset_cache::test_support::TestAssetCache;
+        futures::executor::block_on(async {
+            let stub = whole_body_stub();
+            queue_shareable_stylesheet(&stub);
+            let module = TestAssetCache::asking_the_origin();
+
+            route_answer(
+                &services_with_module(&stub, &module),
+                build_http_request(Method::HEAD, ROUTE_FILE_URI),
+            )
+            .await
+            .expect("should answer the file request");
+
+            assert!(module.offered().is_empty(), "only a `GET` is offered");
+            assert_eq!(stub.recorded_request_uris().len(), 1);
+        });
+    }
+
+    #[test]
+    fn a_route_takes_the_host_header_and_https_when_the_uri_names_neither() {
+        use crate::asset_cache::test_support::TestAssetCache;
+        futures::executor::block_on(async {
+            let stub = whole_body_stub();
+            queue_shareable_stylesheet(&stub);
+            let module = TestAssetCache::asking_the_origin();
+            let mut request = build_http_request(Method::GET, "/.images/site.css");
+            request
+                .headers_mut()
+                .insert(header::HOST, HeaderValue::from_static("www.example.com"));
+
+            route_answer(&services_with_module(&stub, &module), request)
+                .await
+                .expect("should answer the file request");
+
+            let offered = module.offered().remove(0);
+            assert_eq!(
+                offered.host, "www.example.com",
+                "the Host header names the host"
+            );
+            assert_eq!(
+                offered.scheme, "https",
+                "a URI that names no scheme is taken as https"
+            );
+        });
+    }
+
+    #[test]
+    fn a_route_tells_the_module_what_core_knows_of_the_readers_request() {
+        use crate::asset_cache::test_support::TestAssetCache;
+        futures::executor::block_on(async {
+            let offered = |request: HttpRequest<EdgeBody>| async move {
+                let stub = whole_body_stub();
+                queue_shareable_stylesheet(&stub);
+                let module = TestAssetCache::asking_the_origin();
+                route_answer(&services_with_module(&stub, &module), request)
+                    .await
+                    .expect("should answer the file request");
+                module.offered().remove(0)
+            };
+            let with = |name: header::HeaderName, value: &'static str| {
+                let mut request = build_http_request(Method::GET, ROUTE_FILE_URI);
+                request
+                    .headers_mut()
+                    .insert(name, HeaderValue::from_static(value));
+                request
+            };
+
+            let plain = offered(build_http_request(Method::GET, ROUTE_FILE_URI)).await;
+            assert_eq!(plain.via, crate::asset_cache::AssetVia::Route);
+            assert!(!plain.carries_authorization && !plain.carries_cookie);
+            assert!(!plain.is_document && !plain.asks_for_origin);
+            assert_eq!(plain.host, "www.example.com");
+            assert_eq!(plain.scheme, "https");
+            assert_eq!(
+                plain.origin_url,
+                "https://assets.example.com/.images/site.css"
+            );
+            assert_eq!(
+                plain.origin_identity,
+                "https://assets.example.com\0/.images/"
+            );
+
+            assert!(
+                offered(with(header::COOKIE, "session=1"))
+                    .await
+                    .carries_cookie
+            );
+            assert!(
+                offered(with(header::RANGE, "bytes=0-3"))
+                    .await
+                    .asks_for_origin
+            );
+            assert!(
+                offered(with(header::CACHE_CONTROL, "no-cache"))
+                    .await
+                    .asks_for_origin
+            );
+            let frame = with(header::HeaderName::from_static("sec-fetch-dest"), "iframe");
+            assert!(offered(frame).await.is_document);
+        });
+    }
+
+    #[test]
+    fn a_reader_s_authorization_is_reported_and_never_sent_to_a_routes_origin() {
+        use crate::asset_cache::test_support::TestAssetCache;
+        futures::executor::block_on(async {
+            let stub = whole_body_stub();
+            stub.push_response(200, b"ok".to_vec());
+            let module = TestAssetCache::asking_the_origin();
+            let settings = create_test_settings();
+            let mut route = test_s3_image_optimizer_route();
+            route.image_optimizer = None;
+            let mut request =
+                build_http_request(Method::GET, "https://www.example.com/.images/a.css");
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer reader"),
+            );
+
+            let services = build_services_with_secret_and_http_client(
+                HashMapSecretStore::new(test_s3_secrets()),
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+            )
+            .with_asset_cache_module(Arc::clone(&module) as _);
+
+            handle_asset_proxy_request(&settings, &services, request, &route)
+                .await
+                .expect("should proxy the signed file request");
+
+            let offered = module.offered().remove(0);
+            assert!(
+                offered.carries_authorization,
+                "the reader's Authorization is reported"
+            );
+            let sent = offered
+                .origin
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            assert!(
+                sent.starts_with("AWS4-HMAC-SHA256"),
+                "the origin request carries the route's own credentials, not the reader's: {sent}"
+            );
+            let forwarded_headers = super::ASSET_PROXY_FORWARD_HEADERS;
+            let forwarded: Vec<&str> = forwarded_headers
+                .iter()
+                .map(header::HeaderName::as_str)
+                .collect();
+            for name in offered.origin.headers().keys() {
+                assert!(
+                    forwarded.contains(&name.as_str())
+                        || name == header::HOST
+                        || name == header::AUTHORIZATION
+                        || name.as_str().starts_with("x-amz-"),
+                    "the origin request carries only what the route forwards and signs: {name}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_file_the_image_optimizer_answers_is_not_offered() {
+        use crate::asset_cache::test_support::TestAssetCache;
+        futures::executor::block_on(async {
+            let stub = whole_body_stub();
+            stub.push_response(200, b"ok".to_vec());
+            let module = TestAssetCache::asking_the_origin();
+            let mut settings = create_test_settings();
+            settings.image_optimizer = ImageOptimizerSettings {
+                profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
+            };
+            let mut route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+            route.image_optimizer = Some(AssetImageOptimizerConfig {
+                enabled: true,
+                region: "us_east".to_string(),
+                profile_set: "default_images".to_string(),
+                origin_query: None,
+            });
+            let request = build_http_request(
+                Method::GET,
+                "https://www.example.com/.images/foo.jpg?profile=medium",
+            );
+
+            handle_asset_proxy_request(
+                &settings,
+                &services_with_module(&stub, &module),
+                request,
+                &route,
+            )
+            .await
+            .expect("should proxy the optimized file request");
+
+            assert!(
+                module.offered().is_empty(),
+                "the platform holds what its optimizer makes"
+            );
+            assert!(
+                stub.recorded_image_optimizer_options()[0].is_some(),
+                "the request goes to the origin through the optimizer"
+            );
+        });
+    }
+
+    #[test]
+    fn the_origin_request_a_route_hands_the_module_is_the_one_core_sends_with_no_module() {
+        use crate::asset_cache::test_support::TestAssetCache;
+        futures::executor::block_on(async {
+            for streaming in [false, true] {
+                let stub = Arc::new(StubHttpClient::new());
+                stub.set_streaming_responses_supported(streaming);
+                queue_shareable_stylesheet(&stub);
+                queue_shareable_stylesheet(&stub);
+                let module = TestAssetCache::asking_the_origin();
+                let request = || {
+                    let mut request = build_http_request(Method::GET, ROUTE_FILE_URI);
+                    request
+                        .headers_mut()
+                        .insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-GB"));
+                    request
+                };
+                let settings = create_test_settings();
+                let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+
+                let no_module = build_services_with_http_client(Arc::clone(&stub) as _);
+                handle_asset_proxy_request(&settings, &no_module, request(), &route)
+                    .await
+                    .expect("should answer with no module");
+                handle_asset_proxy_request(
+                    &settings,
+                    &services_with_module(&stub, &module),
+                    request(),
+                    &route,
+                )
+                .await
+                .expect("should answer with a module");
+
+                let handed = module.offered().remove(0).origin.platform_request();
+                let headers: Vec<(String, String)> = handed
+                    .request
+                    .headers()
+                    .iter()
+                    .map(|(name, value)| {
+                        let value = value.to_str().expect("should be text").to_owned();
+                        (name.as_str().to_owned(), value)
+                    })
+                    .collect();
+                for sent in [0, 1] {
+                    assert_eq!(
+                        handed.request.uri().to_string(),
+                        stub.recorded_request_uris()[sent]
+                    );
+                    assert_eq!(headers, stub.recorded_request_headers()[sent]);
+                    assert_eq!(handed.backend_name, stub.recorded_backend_names()[sent]);
+                    assert_eq!(handed.cache_intent, stub.recorded_cache_intents()[sent]);
+                    assert_eq!(
+                        handed.stream_response,
+                        stub.recorded_stream_response_flags()[sent]
+                    );
+                }
+                assert_eq!(handed.request.method(), Method::GET);
+                assert_eq!(handed.stream_response, streaming);
+            }
+        });
     }
 
     #[test]

@@ -22,6 +22,7 @@ members = [
     "crates/ads-txt/sellers",
     "crates/headers/geo",
     "crates/loading-cache/51degrees",
+    "crates/asset-cache/51degrees",
     "crates/tag/google-tag",
     "crates/tag/google-tag-manager",
     "crates/testing/testlight",
@@ -172,6 +173,7 @@ trusted-server-cmp-inmobi = { path = "crates/cmp/inmobi" }
 trusted-server-ads-txt-sellers = { path = "crates/ads-txt/sellers" }
 trusted-server-headers-geo = { path = "crates/headers/geo" }
 trusted-server-loading-cache-51degrees = { path = "crates/loading-cache/51degrees" }
+trusted-server-asset-cache-51degrees = { path = "crates/asset-cache/51degrees" }
 trusted-server-tag-google-tag = { path = "crates/tag/google-tag" }
 trusted-server-tag-google-tag-manager = { path = "crates/tag/google-tag-manager" }
 trusted-server-testing-testlight = { path = "crates/testing/testlight" }

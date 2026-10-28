@@ -444,11 +444,12 @@ fn warn_if_certificate_check_disabled(settings: &Settings) {
 /// continues to rely on the trusted `fastly-ssl` header injected by
 /// `edgezero_main` after sanitization.
 ///
-/// Applies the module-supplied modules selected by `[geo]`, `[ec]` and
-/// `[device] module` on top of the base services. Unset and `none` resolve
-/// the disabled geo module, `platform` leaves the Fastly lookup standing,
-/// and any other key names a module's module. Identity and device are
-/// applied the same way when a module supplies them.
+/// Applies the module-supplied modules selected by `[geo]`, `[ec]`,
+/// `[device] module` and `[asset-cache]` on top of the base services. Unset
+/// and `none` resolve the disabled geo module, `platform` leaves the Fastly
+/// lookup standing, and any other key names a module's module. Identity,
+/// device and the asset cache are applied the same way when a module
+/// supplies them.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
     let client_info = ctx
         .request()
@@ -527,6 +528,9 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
     }
     if let Some(module) = state.registry.device_module() {
         services = services.with_device_module(module);
+    }
+    if let Some(module) = state.registry.asset_cache_module() {
+        services = services.with_asset_cache_module(module);
     }
     // The publisher this request resolved to, its tenant included, names
     // every key in a shared store and every name the browser holds.
