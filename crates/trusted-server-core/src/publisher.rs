@@ -10979,15 +10979,20 @@ mod tests {
             };
 
             let registry = test_registry(&create_test_settings());
+            let public = crate::prefix::PublicPrefix::default();
 
             assert_eq!(
-                template_fingerprint(&with_policy("digest-a", "groups: {}\n"), &registry),
-                template_fingerprint(&with_policy("digest-a", "a different text\n"), &registry),
+                template_fingerprint(&with_policy("digest-a", "groups: {}\n"), &registry, &public),
+                template_fingerprint(
+                    &with_policy("digest-a", "a different text\n"),
+                    &registry,
+                    &public
+                ),
                 "the text should not reach the fingerprint"
             );
             assert_ne!(
-                template_fingerprint(&with_policy("digest-a", "groups: {}\n"), &registry),
-                template_fingerprint(&with_policy("digest-b", "groups: {}\n"), &registry),
+                template_fingerprint(&with_policy("digest-a", "groups: {}\n"), &registry, &public),
+                template_fingerprint(&with_policy("digest-b", "groups: {}\n"), &registry, &public),
                 "a different policy file should select a different template"
             );
         }
