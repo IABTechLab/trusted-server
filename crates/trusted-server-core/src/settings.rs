@@ -1490,6 +1490,24 @@ impl<'de> Deserialize<'de> for PermissionSignalConfig {
     }
 }
 
+/// Which prefix module gives the start of every name the browser holds and
+/// every key in a shared store.
+///
+/// Mapped from the `[prefix]` TOML section. See [`crate::prefix`].
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct PrefixConfig {
+    /// The prefix module to run, named as any module is, by its crate folder.
+    ///
+    /// Core's own module runs when this is absent or names `ts`, giving `ts`
+    /// for the names the browser holds and `ts.<publisher.domain>` for shared
+    /// store keys. A name no module supplies is refused when the registry is
+    /// built, in
+    /// [`IntegrationRegistry::with_plan_and_registrations`](crate::integrations::IntegrationRegistry::with_plan_and_registrations).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
+}
+
 /// The permission policy file a domain runs, mapped from the `[permissions]`
 /// table.
 ///
@@ -3795,6 +3813,10 @@ fn is_default_geo_config(value: &GeoConfig) -> bool {
     *value == GeoConfig::default()
 }
 
+fn is_default_prefix_config(value: &PrefixConfig) -> bool {
+    *value == PrefixConfig::default()
+}
+
 fn is_default_permission_signal_config(value: &PermissionSignalConfig) -> bool {
     *value == PermissionSignalConfig::default()
 }
@@ -4310,6 +4332,10 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "is_default_geo_config")]
     #[validate(nested)]
     pub geo: GeoConfig,
+    /// The prefix module, `[prefix] module`, see [`crate::prefix`].
+    #[serde(default, skip_serializing_if = "is_default_prefix_config")]
+    #[validate(nested)]
+    pub prefix: PrefixConfig,
     #[serde(
         rename = "permission-signal",
         default,

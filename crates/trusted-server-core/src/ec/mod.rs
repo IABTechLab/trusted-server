@@ -80,7 +80,7 @@ use http::Request;
 
 use crate::consent::jurisdiction::Jurisdiction;
 use crate::consent::{self as consent_mod, ConsentContext, ConsentPipelineInput};
-use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE};
+use crate::constants::{COOKIE_EC, COOKIE_EC_PULL_COMPLETE};
 use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
@@ -90,6 +90,7 @@ use crate::module_context::{ModuleContext, ModuleRequest, ResolvedRequest};
 use crate::openrtb::Eid;
 use crate::permissions::{Permission, PermissionState};
 use crate::platform::RuntimeServices;
+use crate::prefix::PublicPrefix;
 use crate::settings::Settings;
 use device::DeviceSignals;
 use module::{EdgeCookieModule, GeneratedEdgeCookie};
@@ -191,7 +192,7 @@ pub use generation::{
 
 /// Parsed EC identity from an incoming request.
 struct RequestEc {
-    /// EC ID from the `ts-ec` cookie, if present.
+    /// EC ID from the Edge Cookie, `<public prefix>-ec`, if present.
     cookie_ec: Option<String>,
     /// Pull-sync completeness marker, if present.
     pull_sync_marker: Option<String>,
@@ -204,16 +205,19 @@ struct RequestEc {
 /// # Errors
 ///
 /// - [`TrustedServerError::InvalidHeaderValue`] if cookie parsing fails
-fn parse_ec_from_request(req: &Request<EdgeBody>) -> Result<RequestEc, Report<TrustedServerError>> {
+fn parse_ec_from_request(
+    req: &Request<EdgeBody>,
+    public: &PublicPrefix,
+) -> Result<RequestEc, Report<TrustedServerError>> {
     let jar = handle_request_cookies(req)?;
     let cookie_ec = jar
         .as_ref()
-        .and_then(|j| j.get(COOKIE_TS_EC))
+        .and_then(|j| j.get(&public.cookie_name(COOKIE_EC)))
         .map(cookie::Cookie::value)
-        .and_then(|value| request_ec_id_if_allowed(value, "ts-ec cookie"));
+        .and_then(|value| request_ec_id_if_allowed(value, "Edge Cookie"));
     let pull_sync_marker = jar
         .as_ref()
-        .and_then(|j| j.get(COOKIE_TS_EC_PULL_COMPLETE))
+        .and_then(|j| j.get(&public.cookie_name(COOKIE_EC_PULL_COMPLETE)))
         .map(cookie::Cookie::value)
         .map(str::to_owned);
 
@@ -233,7 +237,8 @@ fn request_ec_id_if_allowed(value: &str, source: &str) -> Option<String> {
     None
 }
 
-/// The Edge Cookie identifier `req` carries in its `ts-ec` cookie, or `None`
+/// The Edge Cookie identifier `req` carries in its Edge Cookie under
+/// `public`, the request's public prefix, or `None`
 /// when it carries none, or one holding a character no identifier has.
 ///
 /// # Errors
@@ -241,8 +246,9 @@ fn request_ec_id_if_allowed(value: &str, source: &str) -> Option<String> {
 /// - [`TrustedServerError::InvalidHeaderValue`] if cookie parsing fails
 pub(crate) fn request_cookie_ec(
     req: &Request<EdgeBody>,
+    public: &PublicPrefix,
 ) -> Result<Option<String>, Report<TrustedServerError>> {
-    Ok(parse_ec_from_request(req)?.cookie_ec)
+    Ok(parse_ec_from_request(req, public)?.cookie_ec)
 }
 
 /// Captures the EC state for a single request lifecycle.
@@ -254,7 +260,7 @@ pub(crate) fn request_cookie_ec(
 pub struct EcContext {
     /// The EC ID value, if one exists (from request) or was generated.
     ec_value: Option<String>,
-    /// The EC ID from the `ts-ec` cookie, if present on the incoming
+    /// The EC ID from the Edge Cookie, if present on the incoming
     /// request. Stored separately from `ec_value` because the header may
     /// take precedence, but revocation still needs the cookie value.
     cookie_ec_value: Option<String>,
@@ -308,6 +314,9 @@ pub struct EcContext {
     kv_snapshot: EcKvSnapshot,
     /// Whether this request may rotate an orphaned EC identity.
     recovery_eligible: bool,
+    /// The start of every cookie name the request's Edge Cookie state reads
+    /// and writes, from the request's services.
+    public_prefix: PublicPrefix,
     /// EIDs the route resolved from the current request: the `/auction` JSON
     /// body, or the `ts-eids` cookie when the body carried none. Carried to
     /// response finalization so KV ingestion can use the full set the client
@@ -324,7 +333,7 @@ impl EcContext {
     /// Reads EC state from an incoming request without generating a new ID.
     ///
     /// This is the first phase of the EC lifecycle. It:
-    /// - Checks the `ts-ec` cookie for an existing EC ID
+    /// - Checks the Edge Cookie, `<public prefix>-ec`, for an existing EC ID
     /// - Captures the client IP (normalized) for later generation
     /// - Builds the full [`ConsentContext`] from cookies, headers, and geo
     ///
@@ -411,7 +420,7 @@ impl EcContext {
         geo_status: consent::GeoStatus<'_>,
     ) -> Result<Self, Report<TrustedServerError>> {
         let geo_info = geo_status.info();
-        let parsed = parse_ec_from_request(req)?;
+        let parsed = parse_ec_from_request(req, services.public_prefix())?;
 
         // Take the selected module once. It is used here to decide whether
         // the incoming cookie value is a usable identifier, to read the
@@ -544,6 +553,7 @@ impl EcContext {
             response_headers: Vec::new(),
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
+            public_prefix: services.public_prefix().clone(),
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::from_cookie(parsed.pull_sync_marker),
             eid_sync_source: None,
@@ -660,7 +670,7 @@ impl EcContext {
         // reserved surface before any of them are kept. A module may set its
         // own cookies and headers, but not a managed `ts-` cookie, a header in
         // the `x-ts-` namespace, or a framing or hop-by-hop header. Without the
-        // check a module could write `ts-ec` itself and bypass the identifier
+        // check a module could write the Edge Cookie itself and bypass the identifier
         // validation and identity-graph row generation enforces. A rejection
         // returns an error, as the identifier-bounds rejection below does.
         // Because the check runs before the headers are captured, nothing from
@@ -668,7 +678,8 @@ impl EcContext {
         // without a new Edge Cookie. Checked before the identifier is read,
         // because a module can return headers with no identifier at all.
         for (name, value) in &generated.response_headers {
-            if let Some(effect) = module::reserved_response_effect(name, value) {
+            if let Some(effect) = module::reserved_response_effect(name, value, &self.public_prefix)
+            {
                 return Err(Report::new(TrustedServerError::EdgeCookie {
                     message: format!(
                         "Module `{}` returned a response header `{name}` that {effect}",
@@ -870,7 +881,7 @@ impl EcContext {
         self.ec_value().and_then(|value| self.kv_key_for(value))
     }
 
-    /// The identity-graph key for the `ts-ec` cookie the request carried.
+    /// The identity-graph key for the Edge Cookie the request carried.
     ///
     /// Withdrawal tombstones the cookie's row as well as the active one,
     /// because a stateless deployment leaves [`ec_kv_key`](Self::ec_kv_key)
@@ -892,13 +903,13 @@ impl EcContext {
             .and_then(|value| self.kv_key_for(value))
     }
 
-    /// Returns whether the `ts-ec` cookie was present on the incoming request.
+    /// Returns whether the Edge Cookie was present on the incoming request.
     #[must_use]
     pub fn cookie_was_present(&self) -> bool {
         self.cookie_ec_value.is_some()
     }
 
-    /// Returns whether an EC ID was found in the `ts-ec` cookie on the
+    /// Returns whether an EC ID was found in the Edge Cookie on the
     /// incoming request.
     #[must_use]
     pub fn ec_was_present(&self) -> bool {
@@ -915,6 +926,13 @@ impl EcContext {
     #[must_use]
     pub fn consent(&self) -> &ConsentContext {
         &self.consent
+    }
+
+    /// The start of every cookie name this request's Edge Cookie state reads
+    /// and writes, such as `ts` for `ts-ec`.
+    #[must_use]
+    pub fn public_prefix(&self) -> &PublicPrefix {
+        &self.public_prefix
     }
 
     /// Returns a mutable reference to the consent context.
@@ -1190,6 +1208,7 @@ impl EcContext {
             response_headers: Vec::new(),
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
+            public_prefix: PublicPrefix::default(),
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
@@ -1236,6 +1255,7 @@ impl EcContext {
             response_headers: Vec::new(),
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
+            public_prefix: PublicPrefix::default(),
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
@@ -1271,6 +1291,7 @@ impl EcContext {
             response_headers: Vec::new(),
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
+            public_prefix: PublicPrefix::default(),
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
@@ -2944,6 +2965,58 @@ pub(crate) mod tests {
             "should use cookie instead of header"
         );
         assert!(ec.cookie_was_present(), "should still detect cookie");
+    }
+
+    /// The Edge Cookie is read under the request's public prefix alone, so a
+    /// cookie written under another prefix, core's own `ts` included, is
+    /// ignored, and the one written back takes the request's prefix. A prefix
+    /// carrying a publisher's name, as one host serving several writes, reads
+    /// and writes the same way, and another publisher's cookie is ignored.
+    #[test]
+    fn the_edge_cookie_is_read_and_written_under_the_requests_prefix() {
+        let settings = create_test_settings();
+        let ec_id = valid_ec_id("d", "Pfx001");
+        for (parts, cookie, others) in [
+            (vec!["_ex"], "_ex-ec", vec!["ts-ec"]),
+            (
+                vec!["_ex", "www.example.com"],
+                "_ex.www.example.com-ec",
+                vec!["ts-ec", "_ex-ec", "_ex.other.example-ec"],
+            ),
+        ] {
+            let prefixes = crate::prefix::Prefixes::new(
+                crate::prefix::PublicPrefix::new(parts).expect("should accept the prefix"),
+                crate::platform::ServerKeyPrefix::new("ex", "test-publisher.com"),
+            );
+            let services = noop_services().with_prefixes(prefixes);
+
+            for other in others {
+                let old = create_test_request(&[("cookie", &format!("{other}={ec_id}"))]);
+                let ignored =
+                    EcContext::read_from_request(&settings, &old, &services).expect("should read");
+                assert!(
+                    ignored.ec_value().is_none() && !ignored.cookie_was_present(),
+                    "`{other}` is under another prefix than `{cookie}` and should be ignored"
+                );
+            }
+
+            let new = create_test_request(&[("cookie", &format!("{cookie}={ec_id}"))]);
+            let read =
+                EcContext::read_from_request(&settings, &new, &services).expect("should read");
+            assert_eq!(read.ec_value(), Some(ec_id.as_str()), "{cookie}");
+
+            let mut response = http::Response::new(edgezero_core::body::Body::empty());
+            crate::ec::finalize::set_ec_cookie_on_response(&settings, &read, &mut response);
+            let written = response
+                .headers()
+                .get(http::header::SET_COOKIE)
+                .and_then(|value| value.to_str().ok())
+                .expect("should write the cookie");
+            assert!(
+                written.starts_with(&format!("{cookie}={ec_id};")),
+                "{written}"
+            );
+        }
     }
 
     #[test]

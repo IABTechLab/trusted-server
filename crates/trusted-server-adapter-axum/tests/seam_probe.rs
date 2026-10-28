@@ -976,6 +976,57 @@ fn device_selector_naming_a_module_resolves_the_device_module_it_declares() {
     );
 }
 
+/// `[prefix] module` naming a module resolves that module's prefix module
+/// the same way, so the prefixes travel the route the other capabilities do.
+#[test]
+fn prefix_selector_naming_a_module_resolves_the_prefix_module_it_declares() {
+    let settings = settings_selecting_module(
+        r#"
+            [prefix]
+            module = "testing.seam-probe"
+        "#,
+    );
+
+    let registry = registry_with_probe(&settings);
+
+    assert_eq!(
+        registry.prefix_module().name(),
+        seam_probe::module_name(),
+        "the resolved module should be the one the module declared"
+    );
+}
+
+/// A request's services carry what the selected prefix module gives, which
+/// the probe's route answers, so the names the browser holds and the keys a
+/// shared store holds are the module's and not core's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_requests_services_carry_the_selected_modules_prefixes() {
+    let settings = settings_with(&format!(
+        r#"
+            [prefix]
+            module = "testing.seam-probe"
+            {PROBE_BLOCK}
+        "#
+    ));
+    let mut service = service_with(settings, &[seam_probe::builder()]);
+
+    let response = get(&mut service, seam_probe::SEAM_PROBE_REPORT_PATH).await;
+
+    assert_eq!(response.status().as_u16(), 200);
+    let body = body_text(response).await;
+    let report: serde_json::Value =
+        serde_json::from_str(&body).expect("the route should return JSON");
+    assert_eq!(
+        report["public_prefix"],
+        seam_probe::SEAM_PROBE_PREFIX_HEAD,
+        "the names the browser holds start with the module's head: {body}"
+    );
+    assert_eq!(
+        report["server_key_prefix"], "probe.test-publisher.example.com",
+        "the keys a shared store holds start with the module's head and the publisher's domain: {body}"
+    );
+}
+
 /// `[ec] module` naming a module resolves a module that, when driven
 /// through `generate`, produces an identifier the built-in HMAC module can
 /// never make.

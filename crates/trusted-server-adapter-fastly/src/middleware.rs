@@ -18,7 +18,10 @@ use trusted_server_core::constants::{
 };
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::http_util::{ROUTE_NAMESPACE, strip_deployment_headers};
+use trusted_server_core::integrations::IntegrationRegistry;
+use trusted_server_core::module_context::ModuleRequest;
 use trusted_server_core::platform::{ClientInfo, PlatformGeo, RuntimeServices};
+use trusted_server_core::prefix::Prefixes;
 use trusted_server_core::settings::Settings;
 
 pub(crate) const HEADER_X_TS_FINALIZED: &str = "x-ts-finalized";
@@ -50,6 +53,9 @@ pub struct FinalizeResponseMiddleware {
     /// Built once with the application and cloned per request with that
     /// request's client metadata applied.
     services: RuntimeServices,
+    /// The registry whose selected prefix module names the publisher's
+    /// prefixes, or `None` where no application state was built.
+    registry: Option<Arc<IntegrationRegistry>>,
 }
 
 impl FinalizeResponseMiddleware {
@@ -64,7 +70,16 @@ impl FinalizeResponseMiddleware {
             settings,
             geo,
             services,
+            registry: None,
         }
+    }
+
+    /// The registry whose selected prefix module names each request's
+    /// publisher prefixes.
+    #[must_use]
+    pub fn with_registry(mut self, registry: Arc<IntegrationRegistry>) -> Self {
+        self.registry = Some(registry);
+        self
     }
 }
 
@@ -76,6 +91,24 @@ impl Middleware for FinalizeResponseMiddleware {
             |info| info.client_ip,
         );
         let path = ctx.request().uri().path().to_owned();
+        // The publisher this request resolved to names the keys the geo
+        // module's answers are held under, so the services carry its prefixes,
+        // which are core's own where no registry names a prefix module.
+        let client = ctx
+            .request()
+            .extensions()
+            .get::<ClientInfo>()
+            .cloned()
+            .unwrap_or_default();
+        let services = match &self.registry {
+            Some(registry) => self.services.clone().with_prefixes(
+                registry.prefixes(&self.settings, ModuleRequest::of(ctx.request(), &client)),
+            ),
+            None => self
+                .services
+                .clone()
+                .with_prefixes(Prefixes::trusted_server(&self.settings)),
+        };
 
         let mut response = match next.run(ctx).await {
             Ok(r) => r,
@@ -86,7 +119,7 @@ impl Middleware for FinalizeResponseMiddleware {
         };
 
         let geo_info = if geo_allowed_for_response(&response) {
-            let services = self.services.clone().with_client_info(ClientInfo {
+            let services = services.clone().with_client_info(ClientInfo {
                 client_ip,
                 ..ClientInfo::default()
             });
@@ -367,8 +400,13 @@ mod tests {
             .uri("https://publisher.example/_ts/data")
             .body(Body::empty())
             .expect("should build request");
-        let mut response = trusted_server_core::inspect::data::handle_data(None, None, &request)
-            .expect("should answer");
+        let mut response = trusted_server_core::inspect::data::handle_data(
+            None,
+            None,
+            &trusted_server_core::prefix::PublicPrefix::default(),
+            &request,
+        )
+        .expect("should answer");
 
         apply_finalize_headers(&settings, None, &mut response);
 

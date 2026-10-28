@@ -22,6 +22,7 @@ use crate::middleware::{
     ResponseHeader, TextHandler,
 };
 use crate::platform::PlatformIdentity;
+use crate::prefix::{PUBLIC_PREFIX_ATTRIBUTE, PublicPrefix};
 use crate::publisher::build_empty_bids_script;
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
@@ -117,6 +118,10 @@ pub struct HtmlProcessorConfig {
     /// `None` on every path that cannot store a shared template, so an ordinary inline
     /// request does not pay for handlers whose only consumer is the template-cache gate.
     pub csp_nonce_observed: Option<Arc<AtomicBool>>,
+    /// The deployment's public prefix for this document, written on the
+    /// bundle tag so the client script names its cookies and storage entries
+    /// after it, see [`crate::prefix`]. `None` writes no attribute.
+    pub public_prefix: Option<PublicPrefix>,
     /// What the middleware prepared for this document, see
     /// [`Middleware::prepare`](crate::middleware::Middleware::prepare).
     pub prepared: Arc<Prepared>,
@@ -144,6 +149,7 @@ impl HtmlProcessorConfig {
             request_state: IntegrationRequestState::default(),
             body_close: BodyCloseInjection::None,
             csp_nonce_observed: None,
+            public_prefix: None,
             prepared: Arc::new(Prepared::default()),
         }
     }
@@ -202,6 +208,13 @@ impl HtmlProcessorConfig {
     #[must_use]
     pub fn with_csp_nonce_observer(mut self, observed: Option<Arc<AtomicBool>>) -> Self {
         self.csp_nonce_observed = observed;
+        self
+    }
+
+    /// Sets the public prefix the bundle tag tells the client script.
+    #[must_use]
+    pub fn with_public_prefix(mut self, public_prefix: PublicPrefix) -> Self {
+        self.public_prefix = Some(public_prefix);
         self
     }
 
@@ -633,6 +646,7 @@ fn build_html_processor(
     let permissions_script = config.permissions_script.clone();
     let body_close = config.body_close.clone();
     let ad_bids_state = config.ad_bids_state.clone();
+    let public_prefix = config.public_prefix.clone();
 
     // No source-comment neutralization here: rewriting a publisher comment that happens
     // to match the reserved marker would change publisher content bytes. Collisions are
@@ -661,6 +675,7 @@ fn build_html_processor(
             let integrations = integration_registry.clone();
             let ad_slots_script = ad_slots_script.clone();
             let permissions_script = permissions_script.clone();
+            let public_prefix = public_prefix.clone();
             move |el| {
                 if !injected_tsjs.get() {
                     let mut snippet = String::new();
@@ -682,7 +697,16 @@ fn build_html_processor(
                     }
                     // Main bundle: core + non-deferred integrations (synchronous).
                     let immediate_parts = integrations.js_parts_immediate();
-                    let script_attributes = integrations.tsjs_script_tag_attributes();
+                    let mut script_attributes: Vec<(&str, &str)> =
+                        integrations.tsjs_script_tag_attributes();
+                    // The names the client script writes in the browser start
+                    // with the deployment's public prefix, which it is told
+                    // here rather than holding a copy of its own. Every part
+                    // is letters, digits, `_`, `-` and `.`, so the value
+                    // cannot leave the attribute.
+                    if let Some(prefix) = public_prefix.as_ref() {
+                        script_attributes.push((PUBLIC_PREFIX_ATTRIBUTE, prefix.as_str()));
+                    }
                     snippet.push_str(&tsjs::tsjs_script_tag_with_attributes(
                         &immediate_parts,
                         &script_attributes,
@@ -1181,6 +1205,7 @@ mod tests {
     fn create_test_config() -> HtmlProcessorConfig {
         HtmlProcessorConfig {
             csp_nonce_observed: None,
+            public_prefix: None,
             prepared: Arc::new(Prepared::default()),
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_owned(),
@@ -1193,6 +1218,36 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             request_state: IntegrationRequestState::default(),
         }
+    }
+
+    /// The client script names its cookies and storage entries after the
+    /// public prefix, which its tag tells it. A document given no prefix gets
+    /// no attribute.
+    #[test]
+    fn the_bundle_tag_tells_the_client_script_the_public_prefix() {
+        fn process(public: Option<PublicPrefix>) -> String {
+            let settings = create_test_settings();
+            let registry = IntegrationRegistry::new(&settings).expect("should build the registry");
+            let mut config = create_test_config();
+            config.integrations = registry.clone();
+            config.public_prefix = public;
+            let mut processor = test_support::create_page_processor(&settings, &registry, config);
+            let output = processor
+                .process_chunk(b"<html><head></head><body></body></html>", true)
+                .expect("should process HTML");
+
+            String::from_utf8(output).expect("should produce valid UTF-8")
+        }
+
+        let told = process(Some(
+            PublicPrefix::new(["_ex"]).expect("should accept the prefix"),
+        ));
+        assert!(
+            told.contains(r#"data-ts-public-prefix="_ex""#),
+            "the bundle tag should carry the public prefix: {told}"
+        );
+        let untold = process(None);
+        assert!(!untold.contains(PUBLIC_PREFIX_ATTRIBUTE), "{untold}");
     }
 
     #[test]
@@ -1872,6 +1927,7 @@ mod tests {
     fn injects_ad_slots_at_head_open() {
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            public_prefix: None,
             prepared: Arc::new(Prepared::default()),
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
@@ -1951,6 +2007,7 @@ mod tests {
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            public_prefix: None,
             prepared: Arc::new(Prepared::default()),
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
@@ -1991,6 +2048,7 @@ mod tests {
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            public_prefix: None,
             prepared: Arc::new(Prepared::default()),
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
@@ -2032,6 +2090,7 @@ mod tests {
         let request_host = "proxy.test-publisher.example.com";
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            public_prefix: None,
             prepared: Arc::new(Prepared::default()),
             body_close: BodyCloseInjection::None,
             origin_host: "origin.test-publisher.example.com".to_string(),
@@ -2087,6 +2146,7 @@ mod tests {
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            public_prefix: None,
             prepared: Arc::new(Prepared::default()),
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
@@ -2120,6 +2180,7 @@ mod tests {
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            public_prefix: None,
             prepared: Arc::new(Prepared::default()),
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
@@ -2146,6 +2207,7 @@ mod tests {
     fn marker_mode_config(marker: &str, observer: Option<Arc<AtomicBool>>) -> HtmlProcessorConfig {
         HtmlProcessorConfig {
             csp_nonce_observed: observer,
+            public_prefix: None,
             body_close: BodyCloseInjection::Marker(marker.to_string()),
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2364,6 +2426,7 @@ mod tests {
         const MARKER: &str = "<!--reserved-template-cache-seam-->";
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            public_prefix: None,
             prepared: Arc::new(Prepared::default()),
             body_close: BodyCloseInjection::Marker(MARKER.to_string()),
             origin_host: "origin.example.com".to_string(),

@@ -35,7 +35,9 @@
 #
 # [shared.<vendor>] holds what one vendor's modules share, such as an endpoint
 # and a license key. That vendor's crates alone read it, its presence runs the
-# builder they share, and a table no module reads is refused.
+# builder they share, and a table no module reads is refused. [prefix] selects
+# the module that names the browser's cookies and the shared store keys, and
+# core's own `ts` runs when it selects nothing.
 #
 # `TRUSTED_SERVER__` env vars can override values when the `ts` CLI builds and
 # validates this config for push (e.g. TRUSTED_SERVER__PUBLISHER__DOMAIN=...;

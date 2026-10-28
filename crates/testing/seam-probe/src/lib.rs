@@ -1,12 +1,12 @@
 //! An integration that lives outside `trusted-server-core` and exercises every
 //! part of the integration seam from a vendor crate's position.
 //!
-//! One registration carries a browser module, a proxy route, a geo module,
-//! an Edge Cookie identity module, a device module, a robots.txt contributor
-//! and a middleware for each phase of a page, alongside its own configuration
-//! block, and the builder adds a request preparer, a demand implementation
-//! `[demand]` can name and an ad server implementation `[ad-server]` can
-//! name. The round-trip tests in
+//! One registration carries a browser module, a proxy route, a geo module, an
+//! Edge Cookie identity module, a device module, a prefix module, a robots.txt
+//! contributor and a middleware for each phase of a page, alongside its own
+//! configuration block, and the builder adds a request preparer, a demand
+//! implementation `[demand]` can name and an ad server implementation
+//! `[ad-server]` can name. The round-trip tests in
 //! `crates/trusted-server-adapter-axum/tests/seam_probe.rs` and
 //! `crates/trusted-server-adapter-fastly/src/app/seam_probe_tests.rs` drive
 //! each of those through a real adapter, so the seam is proven by a caller that
@@ -47,10 +47,11 @@ use trusted_server_core::integrations::{
 use trusted_server_core::middleware::{
     AttributeRewrite, Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase, TextHandler,
 };
-use trusted_server_core::module_context::{ModuleCall, ModuleRequest};
+use trusted_server_core::module_context::{ModuleCall, ModuleRequest, Withheld};
 use trusted_server_core::platform::{
-    GeoInfo, PlatformError, PlatformGeo, PlatformResponse, RuntimeServices,
+    GeoInfo, PlatformError, PlatformGeo, PlatformResponse, RuntimeServices, ServerKeyPrefix,
 };
+use trusted_server_core::prefix::{PrefixModule, PublicPrefix};
 use trusted_server_core::robots_txt::{Contribution, RobotsTxtContributor};
 use trusted_server_core::settings::{IntegrationConfig, Settings};
 use validator::Validate;
@@ -428,6 +429,32 @@ impl DeviceModule for SeamProbeDevice {
     }
 }
 
+/// The head the probe's prefix module gives, so a test can tell its names
+/// from core's own `ts`.
+pub const SEAM_PROBE_PREFIX_HEAD: &str = "_probe";
+
+/// The probe's prefix module, declared on the same registration, which gives
+/// `_probe` for the names the browser holds and `probe.<publisher.domain>`
+/// for the keys in a shared store.
+#[derive(Debug)]
+pub struct SeamProbePrefix;
+
+impl SeamProbePrefix {
+    fn server_key(&self, settings: &Settings) -> ServerKeyPrefix {
+        ServerKeyPrefix::new("probe", &settings.publisher.domain)
+    }
+}
+
+impl PrefixModule for SeamProbePrefix {
+    fn public_prefix(&self, _call: ModuleCall<'_>) -> Result<PublicPrefix, Withheld> {
+        Ok(PublicPrefix::new([SEAM_PROBE_PREFIX_HEAD]).expect("the head is a valid prefix"))
+    }
+
+    fn server_key_prefix(&self, call: ModuleCall<'_>) -> Result<ServerKeyPrefix, Withheld> {
+        call.inject(self, Self::server_key)
+    }
+}
+
 /// The probe's robots.txt contributor, declared on the same registration.
 ///
 /// Its one rule names the request it was asked for, so a test can read back
@@ -639,6 +666,8 @@ impl SeamProbeProxy {
             "module": module_name(),
             "geo_country": country,
             "request_preparer_runs": prepared.map_or(0, |marker| marker.runs),
+            "public_prefix": services.public_prefix().as_str(),
+            "server_key_prefix": services.server_key_prefix().as_str(),
         })
         .to_string();
 
@@ -752,12 +781,13 @@ pub fn register(
             .with_geo_module(module_name(), Arc::new(SeamProbeGeo::new(config.country)));
     }
     {
-        // Identity, device and robots.txt rules are declared the same way
-        // location is, so one module supplies all four and there is no second
-        // mechanism.
+        // Identity, device, the prefixes and robots.txt rules are declared
+        // the same way location is, so one module supplies all five and there
+        // is no second mechanism.
         registration = registration
             .with_ec_module(module_name(), Arc::new(SeamProbeEc))
             .with_device_module(module_name(), Arc::new(SeamProbeDevice))
+            .with_prefix_module(module_name(), Arc::new(SeamProbePrefix))
             .with_robots_txt_contributor(module_name(), Arc::new(SeamProbeRobotsTxt));
     }
 

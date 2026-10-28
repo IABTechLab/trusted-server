@@ -7,7 +7,8 @@ use hmac::{Hmac, KeyInit as _, Mac as _};
 use http::{HeaderValue, Response, header};
 use sha2::{Digest as _, Sha256};
 
-use crate::constants::COOKIE_TS_EC_PULL_COMPLETE;
+use crate::constants::COOKIE_EC_PULL_COMPLETE;
+use crate::prefix::PublicPrefix;
 use crate::redacted::Redacted;
 use crate::settings::{EcModuleBlock, Settings};
 
@@ -107,6 +108,7 @@ pub(crate) fn validate_marker_state(
 /// Reconciles browser marker state against finalized authoritative KV state.
 pub(crate) fn reconcile_marker(
     settings: &Settings,
+    public: &PublicPrefix,
     registry: &PartnerRegistry,
     ec_id: Option<&str>,
     snapshot: &EcKvSnapshot,
@@ -115,17 +117,17 @@ pub(crate) fn reconcile_marker(
 ) {
     let pull_partners = sorted_pull_partner_domains(registry);
     if pull_partners.is_empty() {
-        expire_if_present(state, response);
+        expire_if_present(public, state, response);
         return;
     }
 
     let Some(ec_id) = ec_id else {
-        expire_if_present(state, response);
+        expire_if_present(public, state, response);
         return;
     };
 
     if !matches!(snapshot, EcKvSnapshot::NotRead) && !snapshot.belongs_to(ec_id) {
-        expire_if_present(state, response);
+        expire_if_present(public, state, response);
         return;
     }
 
@@ -135,34 +137,39 @@ pub(crate) fn reconcile_marker(
                 .entry_for(ec_id)
                 .expect("snapshot binding should be checked before marker reconciliation");
             if !entry.consent.ok {
-                expire_if_present(state, response);
+                expire_if_present(public, state, response);
             } else if entry_is_pull_complete(entry, registry) {
                 if !state.is_valid() {
-                    set_marker(settings, registry, ec_id, state, response);
+                    set_marker(settings, public, registry, ec_id, state, response);
                 }
             } else {
-                expire_if_present(state, response);
+                expire_if_present(public, state, response);
             }
         }
         EcKvSnapshot::Missing { .. } => {
-            expire_if_present(state, response);
+            expire_if_present(public, state, response);
         }
         EcKvSnapshot::Failed { .. } | EcKvSnapshot::NotRead => {
             if matches!(state, PullSyncMarkerState::Invalid) {
-                expire_if_present(state, response);
+                expire_if_present(public, state, response);
             }
         }
     }
 }
 
 /// Expires the completeness marker regardless of KV state.
-pub(crate) fn expire_marker(state: &mut PullSyncMarkerState, response: &mut Response<EdgeBody>) {
-    append_cookie(response, &format_marker_cookie("", 0));
+pub(crate) fn expire_marker(
+    public: &PublicPrefix,
+    state: &mut PullSyncMarkerState,
+    response: &mut Response<EdgeBody>,
+) {
+    append_cookie(response, &format_marker_cookie(public, "", 0));
     *state = PullSyncMarkerState::Absent;
 }
 
 fn set_marker(
     settings: &Settings,
+    public: &PublicPrefix,
     registry: &PartnerRegistry,
     ec_id: &str,
     state: &mut PullSyncMarkerState,
@@ -173,13 +180,20 @@ fn set_marker(
     let Some(value) = create_marker(settings, registry, ec_id, expires_at) else {
         return;
     };
-    append_cookie(response, &format_marker_cookie(&value, MARKER_MAX_AGE_SECS));
+    append_cookie(
+        response,
+        &format_marker_cookie(public, &value, MARKER_MAX_AGE_SECS),
+    );
     *state = PullSyncMarkerState::Valid { expires_at };
 }
 
-fn expire_if_present(state: &mut PullSyncMarkerState, response: &mut Response<EdgeBody>) {
+fn expire_if_present(
+    public: &PublicPrefix,
+    state: &mut PullSyncMarkerState,
+    response: &mut Response<EdgeBody>,
+) {
     if state.was_present() {
-        expire_marker(state, response);
+        expire_marker(public, state, response);
     }
 }
 
@@ -194,13 +208,12 @@ fn append_cookie(response: &mut Response<EdgeBody>, value: &str) {
     }
 }
 
-fn format_marker_cookie(value: &str, max_age: u64) -> String {
+fn format_marker_cookie(public: &PublicPrefix, value: &str, max_age: u64) -> String {
     // Keep this cookie host-only. The signed payload does not include the
     // request host, so a Domain attribute would allow replay across sibling
     // hosts that share the domain-wide EC cookie and passphrase.
-    format!(
-        "{COOKIE_TS_EC_PULL_COMPLETE}={value}; Path=/; Secure; SameSite=Lax; Max-Age={max_age}; HttpOnly"
-    )
+    let name = public.cookie_name(COOKIE_EC_PULL_COMPLETE);
+    format!("{name}={value}; Path=/; Secure; SameSite=Lax; Max-Age={max_age}; HttpOnly")
 }
 
 #[cfg(test)]
@@ -502,6 +515,7 @@ mod tests {
 
         reconcile_marker(
             &settings,
+            &PublicPrefix::default(),
             &registry,
             Some(EC_ID),
             &snapshot,
@@ -514,6 +528,7 @@ mod tests {
         let mut absent_response = empty_response();
         reconcile_marker(
             &settings,
+            &PublicPrefix::default(),
             &registry,
             Some(EC_ID),
             &snapshot,
@@ -551,6 +566,7 @@ mod tests {
             let mut response = empty_response();
             reconcile_marker(
                 &settings,
+                &PublicPrefix::default(),
                 &registry,
                 Some(EC_ID),
                 &snapshot,
@@ -576,6 +592,7 @@ mod tests {
             let mut response = empty_response();
             reconcile_marker(
                 &settings,
+                &PublicPrefix::default(),
                 &registry,
                 Some(EC_ID),
                 &snapshot,
@@ -604,6 +621,7 @@ mod tests {
             let mut response = empty_response();
             reconcile_marker(
                 &settings,
+                &PublicPrefix::default(),
                 &registry,
                 Some(EC_ID),
                 snapshot,
@@ -625,6 +643,7 @@ mod tests {
 
         reconcile_marker(
             &settings,
+            &PublicPrefix::default(),
             &registry,
             Some(EC_ID),
             &EcKvSnapshot::NotRead,
@@ -706,7 +725,7 @@ mod tests {
 
     #[test]
     fn marker_cookie_is_host_only_and_secure() {
-        let cookie = format_marker_cookie("value", MARKER_MAX_AGE_SECS);
+        let cookie = format_marker_cookie(&PublicPrefix::default(), "value", MARKER_MAX_AGE_SECS);
         assert_eq!(
             cookie,
             "ts-ec-pull-complete=value; Path=/; Secure; SameSite=Lax; Max-Age=3600; HttpOnly"

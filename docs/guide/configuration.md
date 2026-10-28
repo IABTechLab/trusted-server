@@ -245,6 +245,7 @@ fail and the service will return its startup-error response.
 | `[inspect]`                                                                                                       | nothing               | What the configuration page at `/_ts/config` shows                                            |
 | `[permission-signal]`                                                                                             | several modules       | Which permission signals are acted on, in order                                               |
 | `[permissions]`                                                                                                   | nothing               | The publisher's permission policy file, by name                                               |
+| `[prefix]`                                                                                                        | one module            | Which module names the browser's cookies and the shared store keys                            |
 | `[proxy]`                                                                                                         | several modules       | Proxy allowlist, TLS policy, asset routes, and the first-party script proxy module            |
 | `[publisher]`                                                                                                     | nothing               | Publisher domain, origin, and proxy signing key                                               |
 | `[request_signing]`                                                                                               | nothing               | Outbound Ed25519 request signing                                                              |
@@ -929,6 +930,35 @@ modules = ["gpc", "gpp", "us-privacy", "tcf"]
 
 See [Permission Signals](/guide/permission-signals) for what each module
 reads and how to add a scheme.
+
+## Prefix Configuration
+
+Selects the module that gives the start of every name the browser holds for a publisher, being cookies and first-party storage keys, and of every key the publisher's entries take in a store publishers share.
+
+### `[prefix]`
+
+| Field    | Type           | Required | Description                                                                                                                                                            |
+| -------- | -------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `module` | String or null | No       | Name of the prefix module, or omit it or write `ts` for core's own, which gives `ts` for the names the browser holds and `ts.<publisher.domain>` for shared store keys |
+
+Core's own module runs when nothing is selected, so a default deployment writes `ts-ec`, `ts-eids` and `ts-tester`. A module from a crate at `crates/prefix/<name>` is written `<name>` or `prefix.<name>`, and the crate's own module has to be selected in the section of its type as well. Naming a module this deployment does not run fails at startup, with the prefix modules it does run, and a module that names a value its call never carries is refused at startup rather than on a request.
+
+A prefix is chosen when a deployment starts. Selecting a module other than the one a deployment ran before orphans every name the browser holds under the old prefix, being each reader's Edge Cookie, resolved marker, EIDs and tester cookie, and every entry in a shared store under the old key prefix, being the identity-graph rows behind them, because nothing reads an old prefix. A change is a cutover the publisher plans, with every reader starting again, not a setting to move between builds.
+
+A public prefix carries no domain, because a browser keeps each site's names apart from every other site's. A server key prefix carries the publisher's domain with a single leading `www.` folded, so `www.example.com` and `example.com` share keys and `clients.example.com` and `public.example.com` do not, and the domain is the loaded settings' `publisher.domain`, never the request's `Host` header. The page's bundle tag tells the client script the public prefix, as `data-ts-public-prefix`, so the script names its own cookies after it and holds no copy.
+
+**Example**:
+
+```toml
+[prefix]
+module = "example" # omit it for `ts`
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__PREFIX__MODULE=example
+```
 
 ## Module Permissions
 

@@ -100,7 +100,7 @@ use trusted_server_core::auction::{
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::closed_paths::closed_path_response;
 use trusted_server_core::config_payload::DEFAULT_SECRET_STORE_ID;
-use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
+use trusted_server_core::constants::{COOKIE_EIDS, COOKIE_SHAREDID};
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
@@ -121,6 +121,7 @@ use trusted_server_core::integrations::{
     IntegrationBuilder, IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects,
     RequestFilterRegistryInput, RequestFilterRegistryOutcome,
 };
+use trusted_server_core::module_context::ModuleRequest;
 use trusted_server_core::permissions::PermissionState;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, LoadingCaches, PlatformIdentity, PlatformKvStore, PolicyOrigin,
@@ -527,7 +528,13 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
     if let Some(module) = state.registry.device_module() {
         services = services.with_device_module(module);
     }
-    services
+    // The publisher this request resolved to, its tenant included, names
+    // every key in a shared store and every name the browser holds.
+    let prefixes = state.registry.prefixes(
+        &state.settings,
+        ModuleRequest::of(ctx.request(), services.client_info()),
+    );
+    services.with_prefixes(prefixes)
 }
 
 /// Builds the services graph handed to a module on a response-side finalize
@@ -701,7 +708,8 @@ async fn build_ec_request_state(
         );
     }
 
-    let eids_cookie = crate::extract_cookie_value(req, COOKIE_TS_EIDS);
+    let eids_cookie =
+        crate::extract_cookie_value(req, &services.public_prefix().cookie_name(COOKIE_EIDS));
     let sharedid_cookie = crate::extract_cookie_value(req, COOKIE_SHAREDID);
 
     let (ec_context, setup_error) =
@@ -856,7 +864,14 @@ async fn execute_named(
     if matches!(handler, NamedRouteHandler::Data) {
         let kv = crate::maybe_identity_graph(&state.settings);
         let response = request_module(&state.settings.ec, &services)
-            .and_then(|module| handle_data(kv.as_ref(), module.as_deref(), &req))
+            .and_then(|module| {
+                handle_data(
+                    kv.as_ref(),
+                    module.as_deref(),
+                    services.public_prefix(),
+                    &req,
+                )
+            })
             .unwrap_or_else(|error| http_error(&error));
         return Ok(response);
     }
@@ -931,8 +946,12 @@ async fn run_named_route(
                 )
             }
         }
-        NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
-        NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
+        NamedRouteHandler::SetTester => {
+            handle_set_tester(&state.settings, services.public_prefix())
+        }
+        NamedRouteHandler::ClearTester => {
+            handle_clear_tester(&state.settings, services.public_prefix())
+        }
         NamedRouteHandler::Permissions | NamedRouteHandler::Config | NamedRouteHandler::Data => {
             unreachable!("the inspection endpoints are answered before EC setup")
         }
@@ -1017,7 +1036,8 @@ async fn run_named_route(
 fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
     let device_signals = device_signals_for(&req);
     let is_real_browser = device_signals.looks_like_browser;
-    let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
+    let eids_cookie =
+        crate::extract_cookie_value(&req, &services.public_prefix().cookie_name(COOKIE_EIDS));
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
     let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
@@ -1590,15 +1610,18 @@ impl TrustedServerApp {
     }
 
     fn routes_for_state(state: &Arc<AppState>) -> RouterService {
-        let mut router = RouterService::builder().middleware(FinalizeResponseMiddleware::new(
-            Arc::clone(&state.settings),
-            build_geo_module(&state.settings, Arc::new(FastlyPlatformGeo)),
-            build_finalize_services(
-                &state.settings,
-                Arc::clone(&state.default_kv_store),
-                Arc::clone(&state.loading_caches),
-            ),
-        ));
+        let mut router = RouterService::builder().middleware(
+            FinalizeResponseMiddleware::new(
+                Arc::clone(&state.settings),
+                build_geo_module(&state.settings, Arc::new(FastlyPlatformGeo)),
+                build_finalize_services(
+                    &state.settings,
+                    Arc::clone(&state.default_kv_store),
+                    Arc::clone(&state.loading_caches),
+                ),
+            )
+            .with_registry(Arc::clone(&state.registry)),
+        );
 
         let fallback_handler = fallback_route_handler(Arc::clone(state));
 
@@ -1823,6 +1846,26 @@ mod tests {
     fn test_router() -> RouterService {
         let state = build_state_from_settings(test_settings()).expect("should build test state");
         TrustedServerApp::routes_for_state(&state)
+    }
+
+    /// Every request's services carry the prefixes of the publisher it
+    /// resolved to, which start every shared store key and every name the
+    /// browser holds.
+    #[test]
+    fn per_request_services_carry_the_publishers_prefixes() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let context = RequestContext::new(
+            empty_request(Method::GET, "/article"),
+            PathParams::default(),
+        );
+
+        let services = build_per_request_services(&state, &context);
+
+        assert_eq!(
+            services.server_key_prefix().as_str(),
+            "ts.test-publisher.com"
+        );
+        assert_eq!(services.public_prefix().as_str(), "ts");
     }
 
     #[test]

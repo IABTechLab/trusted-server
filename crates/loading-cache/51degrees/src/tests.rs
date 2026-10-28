@@ -200,11 +200,7 @@ fn spec() -> CacheSpec {
 }
 
 fn key(name: &str) -> StoreKey {
-    StoreKey::new(
-        &ServerKeyPrefix::for_domain("www.example.com"),
-        "test",
-        name,
-    )
+    StoreKey::new(&ServerKeyPrefix::new("ts", "www.example.com"), "test", name)
 }
 
 /// A loader that counts its runs, waits long enough for every other caller to
@@ -468,7 +464,7 @@ async fn two_publishers_never_share_an_entry() {
     let services = services(Arc::clone(&kv));
     let caches = LoadingCaches::new();
     let runs = Arc::new(AtomicUsize::new(0));
-    let of = |domain: &str| StoreKey::new(&ServerKeyPrefix::for_domain(domain), "test", "k");
+    let of = |domain: &str| StoreKey::new(&ServerKeyPrefix::new("ts", domain), "test", "k");
 
     let one = caches
         .get_or_load(

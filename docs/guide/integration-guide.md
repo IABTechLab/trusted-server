@@ -476,6 +476,7 @@ builder every integration uses.
 | `.with_ec_module(name, ...)`                          | Offers an Edge Cookie module that `[ec] module` may select by that name                         |
 | `.with_geo_module(name, ...)`                         | Offers a geo module that `[geo] module` may select by that name                                 |
 | `.with_device_module(name, ...)`                      | Offers a device module that `[device] module` may select by that name                           |
+| `.with_prefix_module(name, ...)`                      | Offers a prefix module that `[prefix] module` may select by that name                           |
 | `.with_robots_txt_contributor(name, ...)`             | Offers rules for `/robots.txt` that `[robots-txt] modules` may select by that name              |
 
 The three script delivery choices are exclusive and the last call wins.
@@ -849,6 +850,26 @@ the list does not order page changes, which run in the order an entry names
 them. Offering a module does not run it, because the registry builds a module
 only when a section of the settings selects it.
 
+### Giving the deployment its prefixes
+
+A crate may give the start of every name the browser holds for a publisher,
+being cookies and first-party storage keys, and of every key the publisher's
+entries take in a store publishers share, by declaring a `PrefixModule` with
+`.with_prefix_module(name, ...)`. `[prefix] module` selects it by that name,
+and core's own module, which gives `ts` and `ts.<publisher.domain>`, runs when
+nothing is selected. The module is handed a module call carrying the request
+and the settings, and nothing else, and the registry asks it once when it is
+built, so a module naming a value its call never carries is refused at startup.
+
+Every request's services carry what the module gives, as
+`services.public_prefix()` and `services.server_key_prefix()`. A crate names a
+cookie with `public_prefix().cookie_name(COOKIE_EC)` rather than writing
+`ts-ec`, keys a shared store with the server key prefix, and reads the prefix
+in the browser from the bundle tag's `data-ts-public-prefix` attribute rather
+than holding a copy. A public prefix's parts are letters, digits, `_`, `-` and
+`.`, and the first starts with a letter or a single `_`, so every form is a
+valid cookie name and no cookie name starts with `__`.
+
 ### A vendor's shared table
 
 What every module of one vendor needs, such as an endpoint and a license key,
@@ -910,16 +931,16 @@ caller made, so a copy is shared by every instance that reads the same store.
 Code in core, or in a module, loads through the cache with
 `RuntimeServices::load_cached`. It names its cache with a `CacheSpec`, being
 the cache's name, the lifetimes of the memory and store copies and how many
-values the memory copy holds. Its key is a `StoreKey`, which starts with the publisher's `ServerKeyPrefix` from the
-loaded settings, so two publishers sharing a store never share a copy. The
-`Loader` it hands over owns everything it uses, and answers a `LoadedValue`,
-with a lifetime of its own where the source gives one. Its value serves every
-reader, so any services it needs come from
-`services.clone().without_connection()`, never
+values the memory copy holds. Its key is a `StoreKey`, which starts with the
+publisher's `ServerKeyPrefix` from `services.server_key_prefix()`, so two
+publishers sharing a store never share a copy. The `Loader` it hands over
+owns everything it uses, and answers a `LoadedValue`, with a lifetime of its
+own where the source gives one. Its value serves every reader, so any
+services it needs come from `services.clone().without_connection()`, never
 the request's own, and `load_cached` hands the cache the same.
 
 ```rust
-let key = StoreKey::new(&ServerKeyPrefix::for_settings(settings), CACHE, digest);
+let key = StoreKey::new(services.server_key_prefix(), CACHE, digest);
 let bytes = services
     .load_cached(
         &cache_spec(settings),

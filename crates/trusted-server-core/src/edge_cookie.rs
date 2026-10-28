@@ -10,7 +10,7 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
 use http::Request;
 
-use crate::constants::{COOKIE_TS_EC, HEADER_X_TS_EC};
+use crate::constants::{COOKIE_EC, HEADER_X_TS_EC};
 use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 #[cfg(test)]
@@ -22,6 +22,7 @@ use crate::evidence::BorrowedRequestInfo;
 #[cfg(test)]
 use crate::module_context::{ModuleContext, test_support};
 use crate::platform::RuntimeServices;
+use crate::prefix::PublicPrefix;
 use crate::settings::Settings;
 
 /// Test helper that generates a fresh EC ID with the configured Edge Cookie
@@ -85,7 +86,8 @@ pub async fn generate_ec_id(
 /// Reads whatever the request offers as an Edge Cookie identifier, before any
 /// check that this deployment could have issued it.
 ///
-/// Reads the `x-ts-ec` header first and then the `ts-ec` cookie. Both are
+/// Reads the `x-ts-ec` header first and then the Edge Cookie under `public`,
+/// the request's public prefix. Both are
 /// client-controlled. `x-ts-ec` is stripped from responses but is not stripped
 /// from inbound requests, so a caller must treat the result as an attacker's
 /// choice of string.
@@ -106,6 +108,7 @@ pub async fn generate_ec_id(
 /// - [`TrustedServerError::InvalidHeaderValue`] if cookie parsing fails
 pub(crate) fn unvalidated_ec_id_from_request(
     req: &Request<EdgeBody>,
+    public: &PublicPrefix,
 ) -> Result<Option<String>, Report<TrustedServerError>> {
     if let Some(ec_id) = req
         .headers()
@@ -121,7 +124,7 @@ pub(crate) fn unvalidated_ec_id_from_request(
 
     match handle_request_cookies(req)? {
         Some(jar) => {
-            if let Some(cookie) = jar.get(COOKIE_TS_EC) {
+            if let Some(cookie) = jar.get(&public.cookie_name(COOKIE_EC)) {
                 let value = cookie.value();
                 if ec_id_has_only_allowed_chars(value) {
                     log::trace!("Using existing EC ID from cookie");
@@ -177,7 +180,7 @@ pub fn recognized_ec_id(
     services: &RuntimeServices,
     req: &Request<EdgeBody>,
 ) -> Result<Option<String>, Report<TrustedServerError>> {
-    let Some(ec_id) = unvalidated_ec_id_from_request(req)? else {
+    let Some(ec_id) = unvalidated_ec_id_from_request(req, services.public_prefix())? else {
         return Ok(None);
     };
 
@@ -203,7 +206,7 @@ pub fn recognized_ec_id(
 ///
 /// Attempts to retrieve an existing EC ID from:
 /// 1. The `x-ts-ec` header
-/// 2. The `ts-ec` cookie
+/// 2. The Edge Cookie, `<public prefix>-ec`
 ///
 /// If neither exists, generates a new EC ID via the configured module.
 ///
@@ -219,7 +222,7 @@ pub(crate) async fn get_or_generate_ec_id_from_http_request(
     services: &RuntimeServices,
     req: &Request<EdgeBody>,
 ) -> Result<Option<String>, Report<TrustedServerError>> {
-    if let Some(id) = unvalidated_ec_id_from_request(req)? {
+    if let Some(id) = unvalidated_ec_id_from_request(req, services.public_prefix())? {
         return Ok(Some(id));
     }
 
@@ -420,7 +423,7 @@ mod tests {
             // The raw reader hands it straight back, which is exactly why it is
             // not the check anything may rely on.
             assert_eq!(
-                unvalidated_ec_id_from_request(&req)
+                unvalidated_ec_id_from_request(&req, &PublicPrefix::default())
                     .expect("should read the header")
                     .as_deref(),
                 Some(forged),
@@ -453,7 +456,8 @@ mod tests {
         let settings = create_test_settings();
         let req = create_test_request(&[(HEADER_X_TS_EC, "existing_ec_id")]);
 
-        let ec_id = unvalidated_ec_id_from_request(&req).expect("should get EC ID");
+        let ec_id = unvalidated_ec_id_from_request(&req, &PublicPrefix::default())
+            .expect("should get EC ID");
         assert_eq!(ec_id, Some("existing_ec_id".to_string()));
 
         let ec_id = get_or_generate_ec_id(&settings, &noop_services(), &req)
@@ -468,10 +472,11 @@ mod tests {
         let settings = create_test_settings();
         let req = create_test_request(&[(
             header::COOKIE,
-            &format!("{}=existing_cookie_id", COOKIE_TS_EC),
+            &format!("ts-{COOKIE_EC}=existing_cookie_id"),
         )]);
 
-        let ec_id = unvalidated_ec_id_from_request(&req).expect("should get EC ID");
+        let ec_id = unvalidated_ec_id_from_request(&req, &PublicPrefix::default())
+            .expect("should get EC ID");
         assert_eq!(ec_id, Some("existing_cookie_id".to_string()));
 
         let ec_id = get_or_generate_ec_id(&settings, &noop_services(), &req)
@@ -490,8 +495,8 @@ mod tests {
             .body(edgezero_core::body::Body::empty())
             .expect("should build test request");
 
-        let ec_id =
-            unvalidated_ec_id_from_request(&req).expect("should get EC ID from http request");
+        let ec_id = unvalidated_ec_id_from_request(&req, &PublicPrefix::default())
+            .expect("should get EC ID from http request");
 
         assert_eq!(ec_id, Some("existing_http_ec_id".to_string()));
     }
@@ -504,7 +509,7 @@ mod tests {
             .uri("http://example.com")
             .header(
                 header::COOKIE,
-                format!("{}=existing_http_cookie_id", COOKIE_TS_EC),
+                format!("ts-{COOKIE_EC}=existing_http_cookie_id"),
             )
             .body(edgezero_core::body::Body::empty())
             .expect("should build test request");
@@ -520,7 +525,8 @@ mod tests {
     #[test]
     fn test_get_ec_id_none() {
         let req = create_test_request(&[]);
-        let ec_id = unvalidated_ec_id_from_request(&req).expect("should handle missing ID");
+        let ec_id = unvalidated_ec_id_from_request(&req, &PublicPrefix::default())
+            .expect("should handle missing ID");
         assert!(ec_id.is_none());
     }
 
@@ -540,11 +546,11 @@ mod tests {
     fn test_get_ec_id_rejects_invalid_header_and_falls_back_to_cookie() {
         let req = create_test_request(&[
             (HEADER_X_TS_EC, "evil;injected"),
-            (header::COOKIE, &format!("{}=valid_cookie_id", COOKIE_TS_EC)),
+            (header::COOKIE, &format!("ts-{COOKIE_EC}=valid_cookie_id")),
         ]);
 
-        let ec_id =
-            unvalidated_ec_id_from_request(&req).expect("should handle invalid header gracefully");
+        let ec_id = unvalidated_ec_id_from_request(&req, &PublicPrefix::default())
+            .expect("should handle invalid header gracefully");
         assert_eq!(
             ec_id,
             Some("valid_cookie_id".to_string()),
@@ -573,13 +579,11 @@ mod tests {
 
     #[test]
     fn test_get_ec_id_rejects_invalid_cookie() {
-        let req = create_test_request(&[(
-            header::COOKIE,
-            &format!("{}=bad<script>value", COOKIE_TS_EC),
-        )]);
+        let req =
+            create_test_request(&[(header::COOKIE, &format!("ts-{COOKIE_EC}=bad<script>value"))]);
 
-        let ec_id =
-            unvalidated_ec_id_from_request(&req).expect("should handle invalid cookie gracefully");
+        let ec_id = unvalidated_ec_id_from_request(&req, &PublicPrefix::default())
+            .expect("should handle invalid cookie gracefully");
         assert!(
             ec_id.is_none(),
             "should reject cookie with disallowed characters"
