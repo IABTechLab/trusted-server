@@ -2297,6 +2297,22 @@ impl IntegrationRegistry {
         MiddlewareChain::new(phase, media_type, middleware)
     }
 
+    /// The middleware the serve phase's headers step asks for `path`: every
+    /// one an entry whose path covers it names, see
+    /// [`PhaseEntries::for_path`].
+    #[must_use]
+    pub fn middleware_for_path(
+        &self,
+        entries: &PhaseEntries,
+        path: &str,
+    ) -> Vec<Arc<dyn Middleware>> {
+        entries
+            .for_path(path)
+            .into_iter()
+            .filter_map(|name| self.inner.middleware_named(name).map(Arc::clone))
+            .collect()
+    }
+
     /// Whether a middleware that an entry of either phase names for a request
     /// for `path`, under any media type, needs the origin's whole body, see
     /// [`Middleware::needs_whole_body`]. Asked before the origin answers, so
@@ -3307,7 +3323,7 @@ pub(crate) mod test_support {
         use crate::integrations::{CORE_SOURCE, IntegrationBuilder};
         use crate::middleware::{
             AttributeRewrite, Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase,
-            Preparation, Refusal,
+            Preparation, Refusal, ResponseHeader, ResponseView,
         };
         use crate::module_context::ModuleCall;
         use crate::settings::Settings;
@@ -3497,6 +3513,62 @@ pub(crate) mod test_support {
                 MiddlewareAction::pass()
             }
         }
+        /// The name of the serve middleware that sets headers through the
+        /// headers step alone.
+        pub(crate) const LOCATING: &str = "testing.middleware-fixture.locating";
+        pub(crate) const LOCATION_PREFIX: &str = "/fixture";
+        /// The header the locating middleware sets on every response it is
+        /// shown, carrying that response's status.
+        pub(crate) const SHOWN_STATUS_NAME: &str = "x-fixture-shown-status";
+
+        /// Puts a prefix on a redirect's root-relative `Location`, which is
+        /// what a deployment that names the publisher in the first part of the
+        /// address needs, and names the status of every response it is shown.
+        struct Locating;
+
+        impl Middleware for Locating {
+            fn middleware_id(&self) -> &'static str {
+                LOCATING
+            }
+
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Serve]
+            }
+
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                MiddlewareAction::pass()
+            }
+
+            fn response_headers(
+                &self,
+                _context: &MiddlewareContext<'_>,
+                response: &ResponseView<'_>,
+            ) -> Vec<ResponseHeader> {
+                let mut headers = vec![(
+                    http::HeaderName::from_static(SHOWN_STATUS_NAME),
+                    http::HeaderValue::from(response.status.as_u16()),
+                )];
+                if !response.status.is_redirection() {
+                    return headers;
+                }
+                let Some(location) = response
+                    .headers
+                    .get(http::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                else {
+                    return headers;
+                };
+                if location.starts_with('/')
+                    && !location.starts_with("//")
+                    && let Ok(value) =
+                        http::HeaderValue::from_str(&format!("{LOCATION_PREFIX}{location}"))
+                {
+                    headers.push((http::header::LOCATION, value));
+                }
+                headers
+            }
+        }
+
         /// The name of the serve middleware that writes a header on a text
         /// response.
         pub(crate) const TEXT_HEADER: &str = "testing.middleware-fixture.text-header";
@@ -3733,6 +3805,7 @@ pub(crate) mod test_support {
                     .with_middleware(Arc::new(Preparing))
                     .with_middleware(Arc::new(Refusing))
                     .with_middleware(Arc::new(TextHeader))
+                    .with_middleware(Arc::new(Locating))
                     .build(),
             ))
         }
@@ -7106,6 +7179,7 @@ mod tests {
                 fixture::PREPARING,
                 fixture::REFUSING,
                 fixture::TEXT_HEADER,
+                fixture::LOCATING,
                 crate::service_version::MODULE,
             ],
             "should list the middleware the selected module supplies, and core's own after them"
@@ -7129,6 +7203,7 @@ mod tests {
                 fixture::BROKEN_READER,
                 fixture::PREPARING,
                 fixture::TEXT_HEADER,
+                fixture::LOCATING,
                 crate::service_version::MODULE
             ],
             "should list the middleware that run in the serve phase, core's own last"
@@ -7147,6 +7222,37 @@ mod tests {
         assert!(
             chain_for("text/css", "/news/site.css").is_empty(),
             "should run nothing on a media type no entry covers"
+        );
+    }
+
+    #[test]
+    fn middleware_for_path_gives_every_covering_entry_s_middleware_once_in_entry_order() {
+        let registry = IntegrationRegistry::new(&fixture_settings_with_entries(Vec::new()))
+            .expect("should build a registry");
+        let entries = PhaseEntries::new(vec![
+            html_entry(Some("/news/"), &[fixture::LOCATING, fixture::READER]),
+            text_entry(&[fixture::TEXT_HEADER, fixture::LOCATING]),
+            html_entry(Some("/sport/"), &[fixture::BROKEN_READER]),
+            html_entry(None, &["testing.nothing", fixture::READER]),
+        ]);
+
+        let ids = |path: &str| -> Vec<&'static str> {
+            registry
+                .middleware_for_path(&entries, path)
+                .iter()
+                .map(|middleware| middleware.middleware_id())
+                .collect()
+        };
+        assert_eq!(
+            ids("/news/today"),
+            [fixture::LOCATING, fixture::READER, fixture::TEXT_HEADER],
+            "should give each middleware once, in entry order, whatever the entry's media type"
+        );
+        assert_eq!(
+            ids("/weather/"),
+            [fixture::TEXT_HEADER, fixture::LOCATING, fixture::READER],
+            "should leave out an entry whose path does not cover the request, and a name \
+             nothing supplies"
         );
     }
 
@@ -7245,7 +7351,7 @@ mod tests {
             message.contains(
                 "[[fetch]] entry 2 names `testing.nothing`, which no module that runs supplies"
             ) && message.contains(&format!(
-                "[{}, {}, {}, {}, {}, {}, {}, {}, {}, {}]",
+                "[{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}]",
                 fixture::HEAD,
                 fixture::LINKS,
                 fixture::BROKEN,
@@ -7255,6 +7361,7 @@ mod tests {
                 fixture::PREPARING,
                 fixture::REFUSING,
                 fixture::TEXT_HEADER,
+                fixture::LOCATING,
                 crate::service_version::MODULE
             )),
             "should name the entry and list what could be named: {message}"
@@ -7311,6 +7418,7 @@ mod tests {
                 fixture::PREPARING,
                 fixture::REFUSING,
                 fixture::TEXT_HEADER,
+                fixture::LOCATING,
             ],
             "should list every middleware when there are no entries"
         );
@@ -7326,7 +7434,8 @@ mod tests {
                 fixture::TEXT,
                 fixture::PREPARING,
                 fixture::REFUSING,
-                fixture::TEXT_HEADER
+                fixture::TEXT_HEADER,
+                fixture::LOCATING
             ],
             "should leave out a middleware any entry names"
         );
@@ -7397,7 +7506,8 @@ mod tests {
                 fixture::TEXT,
                 fixture::PREPARING,
                 fixture::REFUSING,
-                fixture::TEXT_HEADER
+                fixture::TEXT_HEADER,
+                fixture::LOCATING
             ],
             "should count a middleware as named only by an entry of a phase it runs in"
         );

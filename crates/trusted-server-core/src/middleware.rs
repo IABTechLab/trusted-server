@@ -276,6 +276,15 @@ pub trait TextHandler {
 /// A header a middleware writes on the reader's response.
 pub type ResponseHeader = (HeaderName, HeaderValue);
 
+/// What a serve middleware is told about the response it may set a header
+/// on, read only: the status and the headers as they stand after core's own
+/// rewrites, before the adapter finalizes the response.
+#[derive(Debug, Clone, Copy)]
+pub struct ResponseView<'a> {
+    pub status: StatusCode,
+    pub headers: &'a http::HeaderMap,
+}
+
 /// Writes `headers` on `response`, each replacing a header of the same name.
 pub fn write_response_headers<T>(response: &mut http::Response<T>, headers: Vec<ResponseHeader>) {
     for (name, value) in headers {
@@ -572,6 +581,22 @@ pub trait Middleware: Send + Sync {
     /// Decides what to do with one document.
     fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction;
 
+    /// The headers a serve middleware sets on the response the publisher path
+    /// sends, a redirect with no body included, for a request path its entry
+    /// covers. Each replaces a
+    /// header of the same name, and one the action from
+    /// [`create`](Self::create) sets in
+    /// [`MiddlewareAction::response_headers`] replaces it in turn. None by
+    /// default.
+    fn response_headers(
+        &self,
+        context: &MiddlewareContext<'_>,
+        response: &ResponseView<'_>,
+    ) -> Vec<ResponseHeader> {
+        let _ = (context, response);
+        Vec::new()
+    }
+
     /// Text a stored page is keyed by, being what this middleware writes
     /// that no setting decides, such as markup compiled into its crate. A
     /// change to it stores pages again, where otherwise a page stored before
@@ -659,6 +684,23 @@ impl PhaseEntries {
             .iter()
             .find(|entry| entry.covers(media_type, path))
             .map_or(&[][..], |entry| entry.middleware.as_slice())
+    }
+
+    /// The middleware every entry whose path covers `path` names, in entry
+    /// order and each once, whatever the entries' media types. A header is
+    /// not about a body, so this is what the headers step of the serve phase
+    /// asks.
+    #[must_use]
+    pub fn for_path(&self, path: &str) -> Vec<&str> {
+        let mut names: Vec<&str> = Vec::new();
+        for entry in self.0.iter().filter(|entry| entry.covers_path(path)) {
+            for name in &entry.middleware {
+                if !names.contains(&name.as_str()) {
+                    names.push(name);
+                }
+            }
+        }
+        names
     }
 
     /// Every name the entries select, each once, in the order first written.

@@ -461,6 +461,17 @@ is sent as it arrived, as before. When `origin_url` has a path, a request path
 with a `.` or `..` segment, in any percent-encoded spelling, is refused with
 `400` so no request reaches outside the folder.
 
+**Response headers**: When `origin_url` has a path, a URL in a response
+header that names the origin is mapped to the serving host only when it is in
+that folder, and it loses the folder. With the folder above, `Location:
+https://storage.publisher.com/bucket/site/news/` reaches a reader of
+`www.publisher.com` as `https://www.publisher.com/news/`, and a URL outside
+the folder is left as the origin wrote it (see Origin URLs in proxied response
+headers). Where a request addressing hook removes a path prefix, the reader is
+sent to an address without the prefix, which a Fastly service whose `__KEY`
+selector carries `{host}` answers `421` if every selector value misses (see
+One blob for each path).
+
 #### `origin_host_header_override`
 
 **Purpose**: Optional Host header to send to the publisher origin while still
@@ -1221,6 +1232,15 @@ is delivered as:
 Location: https://www.example.com/landing.html
 Content-Security-Policy: img-src https://origin.example.com https://www.example.com data:
 ```
+
+When `publisher.origin_url` has a path, such as a folder of object storage,
+only a URL in that folder is mapped, and it loses the folder. With
+`origin_url = "https://storage.example.com/bucket/site"`,
+`https://storage.example.com/bucket/site/news/` becomes
+`https://www.example.com/news/`, and `https://storage.example.com/bucket/other/`
+is unchanged, because no address on the serving host leads there. A CSP source
+with no path still gains the serving host beside it, and the two exceptions
+below compare the path without the folder.
 
 Two exceptions prevent a redirect loop. Rewriting either target would send the
 browser back to the same URL, and the origin would redirect again:
@@ -2159,6 +2179,16 @@ A page takes the first entry that covers it and runs that entry's middleware
 alone. Entries are therefore written from the longest path to the entry with
 no path, and a folder is written with its closing slash, because `/news` also
 begins `/newsletter`.
+
+A serve middleware may set response headers as well as change the page. For
+that it is asked about a response the publisher path sends for a request path
+its entry covers, whatever the response's media type and whether or not it
+has a body, with the response's status and headers in hand, so a redirect
+reaches a middleware that rewrites its `Location`. A header it sets replaces
+one of the same name. A serve middleware is not asked about a refusal made
+before the origin is asked, such as the `405` for a method a signed origin
+does not take, about a page served from the template cache or the refusal of
+such a page, or about an answer made from an error.
 
 ```toml
 [[fetch]]

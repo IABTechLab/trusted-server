@@ -3885,6 +3885,44 @@ fn publisher_origin_path_and_query<'a>(
     Cow::Owned(built)
 }
 
+/// Writes on `response` the headers each serve middleware an entry names for
+/// `request_path` sets, see
+/// [`Middleware::response_headers`](crate::middleware::Middleware::response_headers).
+fn write_serve_middleware_headers(
+    response: &mut Response<EdgeBody>,
+    reader: &crate::html_processor::ReaderDocument<'_>,
+    request_path: &str,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) {
+    let middleware = integration_registry
+        .middleware_for_path(settings.phase_entries(MiddlewarePhase::Serve), request_path);
+    if middleware.is_empty() {
+        return;
+    }
+    let document_state = IntegrationDocumentState::default();
+    reader.request_state.seed(&document_state);
+    let context = crate::middleware::MiddlewareContext {
+        phase: MiddlewarePhase::Serve,
+        request_host: reader.request_host,
+        request_scheme: reader.request_scheme,
+        origin_host: reader.origin_host,
+        platform: reader.platform,
+        document_state: &document_state,
+        max_buffered_script_bytes: reader.max_buffered_script_bytes,
+        prepared: reader.prepared,
+    };
+    let view = crate::middleware::ResponseView {
+        status: response.status(),
+        headers: response.headers(),
+    };
+    let headers = middleware
+        .iter()
+        .flat_map(|middleware| middleware.response_headers(&context, &view))
+        .collect();
+    write_response_headers(response, headers);
+}
+
 /// Returns the status a publisher origin request is refused with before it is
 /// sent, or `None` when it may be sent.
 ///
@@ -6217,6 +6255,20 @@ pub async fn handle_publisher_request(
         response = empty_document(&entry.media_type)?;
     }
 
+    // Every serve middleware an entry names for this path is asked for the
+    // headers it sets on the response that is sent, whatever it is, so a
+    // redirect with no body reaches a middleware that rewrites its Location.
+    let header_prepared = Prepared::default();
+    let header_reader = crate::html_processor::ReaderDocument {
+        request_host,
+        request_scheme,
+        origin_host: &origin_host,
+        platform: integration_registry.platform(),
+        request_state: &request_state,
+        max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
+        prepared: &header_prepared,
+    };
+
     if should_run_ad_stack && response.status() == StatusCode::NOT_MODIFIED {
         if let Some(dispatched) = dispatched_auction.take() {
             emit_abandoned_auction(
@@ -6237,10 +6289,16 @@ pub async fn handle_publisher_request(
             .change_context(TrustedServerError::Proxy {
                 message: "failed to build unexpected origin 304 response".to_string(),
             })?;
+        write_serve_middleware_headers(
+            &mut response,
+            &header_reader,
+            &request_path,
+            settings,
+            integration_registry,
+        );
         enforce_terminal_private_cache_privacy(&mut response);
         return Ok(PublisherResponse::Buffered(response));
     }
-
     // Map origin URLs in navigation, preload, and CSP headers to the serving host,
     // matching the body rewrite, on every route. Runs before the template-cache gate
     // so a stored template replays the rewritten policy headers; the cache key is
@@ -6250,12 +6308,22 @@ pub async fn handle_publisher_request(
         &OriginHeaderRewrite {
             origin_host: &origin_host,
             origin_host_header: &origin_host_header,
+            origin_path: parsed_origin.path(),
             request_host,
             request_scheme,
             origin_scheme: &origin_scheme,
             request_path_and_query: &request_path_and_query,
             request_is_get_or_head: is_get_or_head,
         },
+    );
+    // Asked after the rewrite, so a serve middleware sees the headers the
+    // reader receives and a header it sets is the one sent.
+    write_serve_middleware_headers(
+        &mut response,
+        &header_reader,
+        &request_path,
+        settings,
+        integration_registry,
     );
 
     let template_cache_policy = TemplateCachePolicy::from_settings(settings);
@@ -6474,6 +6542,13 @@ pub async fn handle_publisher_request(
                 .await;
             }
             let mut response = refusal_response(&refusal)?;
+            write_serve_middleware_headers(
+                &mut response,
+                &header_reader,
+                &request_path,
+                settings,
+                integration_registry,
+            );
             enforce_terminal_private_cache_privacy(&mut response);
             return Ok(PublisherResponse::Buffered(response));
         }
@@ -20989,6 +21064,53 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn the_502_for_an_unexpected_origin_304_carries_a_serve_middlewares_headers() {
+            use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+            let mut settings = settings_with_dispatching_provider();
+            settings.select_module("testing", fixture::MODULE);
+            settings.serve =
+                crate::middleware::PhaseEntries::new(vec![crate::middleware::PhaseEntry {
+                    media_type: crate::middleware::HTML_MEDIA_TYPE.to_owned(),
+                    path: None,
+                    middleware: vec![fixture::LOCATING.to_owned()],
+                }]);
+            let mut orchestrator = AuctionOrchestrator::new(
+                crate::auction::test_support::legacy_auction_config(&settings),
+            );
+            orchestrator.register_provider(Arc::new(DispatchingTestProvider));
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"unused provider response".to_vec());
+            stub.push_response_with_headers(304, Vec::new(), vec![("etag", ORIGIN_ETAG)]);
+            let services = services_with_telemetry(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                Arc::new(RecordingTelemetrySink::default()),
+            );
+
+            let response = run_with_orchestrator(
+                &settings,
+                &services,
+                &orchestrator,
+                &[article_slot()],
+                conditional_navigation_request(),
+            )
+            .await;
+
+            let PublisherResponse::Buffered(response) = response else {
+                panic!("unexpected origin 304 should return a buffered response")
+            };
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(fixture::SHOWN_STATUS_NAME)
+                    .and_then(|value| value.to_str().ok()),
+                Some("502"),
+                "should set the middleware's headers on the 502, which is what is sent"
+            );
+        }
+
+        #[tokio::test]
         async fn inactive_ad_stack_304_uses_short_browser_cache_policy() {
             // Arrange
             let settings = settings_with_enabled_auction_and_creative_opportunities();
@@ -24133,6 +24255,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_made_file_carries_the_headers_a_serve_middleware_sets() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let mut settings =
+            settings_running_the_middleware_fixture(text_entry_for(Some("/ads.txt")));
+        settings.serve = PhaseEntries::new(vec![PhaseEntry {
+            media_type: crate::middleware::HTML_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::LOCATING.to_owned()],
+        }]);
+
+        let proxied = proxy_with(settings, Method::GET, "/ads.txt", 404).await;
+        let response = response_of(proxied.response);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(fixture::SHOWN_STATUS_NAME)
+                .and_then(|value| value.to_str().ok()),
+            Some("200"),
+            "should set the middleware's headers on the made file, which is what is sent"
+        );
+    }
+
+    #[tokio::test]
     async fn an_html_entry_with_a_path_makes_no_missing_page() {
         use crate::integrations::registry_test_support::middleware_fixture as fixture;
         use crate::middleware::HTML_MEDIA_TYPE;
@@ -24979,7 +25127,7 @@ mod tests {
                 .to_owned()
         }
 
-        fn response_status(response: &PublisherResponse) -> StatusCode {
+        pub(super) fn response_status(response: &PublisherResponse) -> StatusCode {
             match response {
                 PublisherResponse::Buffered(response)
                 | PublisherResponse::PassThrough { response, .. }
@@ -25455,6 +25603,451 @@ mod tests {
                     "should find no dot segment in `{path}`"
                 );
             }
+        }
+    }
+
+    /// A redirect the origin sends to itself, named for the reader on every
+    /// route the publisher proxy returns an origin response through.
+    mod origin_redirect_tests {
+        use super::object_storage_origin_tests::response_status;
+        use super::*;
+        use crate::platform::PlatformHttpClient;
+
+        const ORIGIN_URL: &str = "https://origin.example";
+        const STORAGE_URL: &str = "https://storage.example.com/bucket/site";
+        const READER_HOST: &str = "publisher.example";
+
+        fn settings_with_origin(origin_url: &str) -> Settings {
+            let mut settings = create_test_settings();
+            settings.publisher.origin_url = origin_url.to_owned();
+            settings
+        }
+
+        /// A reader request for `uri` on [`READER_HOST`], made over `scheme`.
+        fn reader_request(method: Method, uri: &str, scheme: &str) -> HttpRequest<EdgeBody> {
+            HttpRequest::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::HOST, READER_HOST)
+                .header("x-forwarded-proto", scheme)
+                .body(EdgeBody::empty())
+                .expect("should build reader request")
+        }
+
+        /// What the publisher proxy returns for `request` when the origin
+        /// answers with `status` and `headers`, and the addresses the origin
+        /// was sent.
+        async fn proxied(
+            settings: &Settings,
+            request: HttpRequest<EdgeBody>,
+            status: u16,
+            headers: Vec<(&str, &str)>,
+        ) -> (PublisherResponse, Vec<String>) {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(status, b"origin response".to_vec(), headers);
+            let services =
+                build_services_with_http_client(Arc::clone(&stub) as Arc<dyn PlatformHttpClient>);
+            let response = run_publisher_proxy(settings, &services, request).await;
+            (response, stub.recorded_request_uris())
+        }
+
+        /// The `Location` the reader receives.
+        fn location(response: &PublisherResponse) -> Option<&str> {
+            let response = match response {
+                PublisherResponse::Buffered(response)
+                | PublisherResponse::PassThrough { response, .. }
+                | PublisherResponse::Stream { response, .. }
+                | PublisherResponse::AssembleTemplate { response, .. } => response,
+            };
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+        }
+
+        fn route(response: &PublisherResponse) -> &'static str {
+            match response {
+                PublisherResponse::Buffered(_) => "buffered",
+                PublisherResponse::PassThrough { .. } => "pass-through",
+                PublisherResponse::Stream { .. } => "stream",
+                PublisherResponse::AssembleTemplate { .. } => "template",
+            }
+        }
+
+        #[tokio::test]
+        async fn the_reader_receives_the_rewritten_location_on_every_route() {
+            let settings = settings_with_origin(ORIGIN_URL);
+            // (what is asked for, method, the origin's status, the origin's
+            // media type, the route the answer takes)
+            let cases = [
+                ("a page, buffered", Method::GET, 301, None, "buffered"),
+                (
+                    "a page, streamed",
+                    Method::GET,
+                    301,
+                    Some("text/html; charset=utf-8"),
+                    "stream",
+                ),
+                ("a found page", Method::GET, 302, None, "buffered"),
+                ("a see other", Method::POST, 303, None, "buffered"),
+                ("a HEAD", Method::HEAD, 301, None, "buffered"),
+                (
+                    "a HEAD of a page",
+                    Method::HEAD,
+                    302,
+                    Some("text/html"),
+                    "stream",
+                ),
+                ("a POST", Method::POST, 307, None, "buffered"),
+                ("a PUT", Method::PUT, 308, None, "buffered"),
+                ("a DELETE", Method::DELETE, 307, None, "buffered"),
+            ];
+            for (what, method, status, media_type, expected_route) in cases {
+                let mut headers = vec![("location", "https://origin.example/news/?page=2#latest")];
+                if let Some(media_type) = media_type {
+                    headers.push(("content-type", media_type));
+                }
+
+                let (response, sent) = proxied(
+                    &settings,
+                    reader_request(method, "https://publisher.example/news?page=2", "https"),
+                    status,
+                    headers,
+                )
+                .await;
+
+                assert_eq!(
+                    sent,
+                    vec!["https://origin.example/news?page=2"],
+                    "should ask the origin for {what}"
+                );
+                assert_eq!(
+                    route(&response),
+                    expected_route,
+                    "should return {what} through the expected route"
+                );
+                assert_eq!(
+                    location(&response),
+                    Some("https://publisher.example/news/?page=2#latest"),
+                    "should name the redirect for the reader on {what}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn the_reader_s_own_scheme_is_used() {
+            let settings = settings_with_origin(ORIGIN_URL);
+
+            let (response, _) = proxied(
+                &settings,
+                reader_request(Method::GET, "http://publisher.example/news", "http"),
+                301,
+                vec![("location", "https://origin.example/news/")],
+            )
+            .await;
+
+            assert_eq!(
+                location(&response),
+                Some("http://publisher.example/news/"),
+                "should send a reader on plain HTTP to plain HTTP"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_origin_on_plain_http_or_on_a_port_is_named_for_the_reader() {
+            // (origin URL, the origin's `Location`, what the reader receives)
+            let cases = [
+                (
+                    "http://origin.example",
+                    "http://origin.example/news/",
+                    "https://publisher.example/news/",
+                ),
+                (
+                    "http://origin.example",
+                    "https://origin.example/news/",
+                    "https://publisher.example/news/",
+                ),
+                (
+                    "http://origin.example:8080",
+                    "http://origin.example:8080/news/",
+                    "https://publisher.example/news/",
+                ),
+                (
+                    "http://origin.example:8080",
+                    "http://origin.example/news/",
+                    "http://origin.example/news/",
+                ),
+                (
+                    "https://origin.example:8443",
+                    "https://origin.example:8443/news/",
+                    "https://publisher.example/news/",
+                ),
+                (
+                    "https://origin.example:8443",
+                    "https://origin.example/news/",
+                    "https://origin.example/news/",
+                ),
+                (
+                    "https://origin.example",
+                    "https://origin.example:8443/news/",
+                    "https://origin.example:8443/news/",
+                ),
+            ];
+            for (origin_url, sent, expected) in cases {
+                let settings = settings_with_origin(origin_url);
+
+                let (response, _) = proxied(
+                    &settings,
+                    reader_request(Method::GET, "https://publisher.example/news", "https"),
+                    301,
+                    vec![("location", sent)],
+                )
+                .await;
+
+                assert_eq!(
+                    location(&response),
+                    Some(expected),
+                    "should give the reader `{expected}` for `{sent}` from `{origin_url}`"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn under_a_host_override_the_host_of_origin_url_is_the_origin_s_name() {
+            let mut settings = settings_with_origin(ORIGIN_URL);
+            settings.publisher.origin_host_header_override = Some("www.example.com".to_owned());
+            // (the origin's `Location`, what the reader receives)
+            let cases = [
+                (
+                    "https://origin.example/news/",
+                    "https://publisher.example/news/",
+                ),
+                (
+                    "https://www.example.com/news/",
+                    "https://www.example.com/news/",
+                ),
+            ];
+            for (sent, expected) in cases {
+                let (response, _) = proxied(
+                    &settings,
+                    reader_request(Method::GET, "https://publisher.example/news", "https"),
+                    301,
+                    vec![("location", sent)],
+                )
+                .await;
+
+                assert_eq!(
+                    location(&response),
+                    Some(expected),
+                    "should treat the host of `origin_url` as the origin's name for `{sent}`"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_redirect_under_the_origin_path_reaches_the_reader_without_it() {
+            let settings = settings_with_origin(STORAGE_URL);
+
+            let (response, sent) = proxied(
+                &settings,
+                reader_request(
+                    Method::GET,
+                    "https://publisher.example/news?page=2",
+                    "https",
+                ),
+                301,
+                vec![(
+                    "location",
+                    "https://storage.example.com/bucket/site/news/?page=2",
+                )],
+            )
+            .await;
+
+            assert_eq!(
+                sent,
+                vec!["https://storage.example.com/bucket/site/news?page=2"],
+                "should ask the origin under the origin path"
+            );
+            assert_eq!(
+                location(&response),
+                Some("https://publisher.example/news/?page=2"),
+                "should send the reader to their own path, without the origin path"
+            );
+
+            let (response, _) = proxied(
+                &settings,
+                reader_request(Method::GET, "https://publisher.example/news", "https"),
+                301,
+                vec![("location", "https://storage.example.com/bucket/other/news/")],
+            )
+            .await;
+
+            assert_eq!(
+                location(&response),
+                Some("https://storage.example.com/bucket/other/news/"),
+                "should leave a redirect outside the origin path as the origin wrote it"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_redirect_that_is_not_the_origin_s_own_reaches_the_reader_unchanged() {
+            let settings = settings_with_origin(ORIGIN_URL);
+            // (why, the origin's `Location`)
+            let cases = [
+                ("another host", "https://somewhere.else/news/"),
+                ("a path from the root", "/news/"),
+                ("a path beside the one asked for", "news/"),
+                ("a query alone", "?page=2"),
+            ];
+            for (why, sent) in cases {
+                let (response, _) = proxied(
+                    &settings,
+                    reader_request(Method::GET, "https://publisher.example/news", "https"),
+                    302,
+                    vec![("location", sent)],
+                )
+                .await;
+
+                assert_eq!(
+                    response_status(&response),
+                    StatusCode::FOUND,
+                    "should relay the redirect for {why}"
+                );
+                assert_eq!(
+                    location(&response),
+                    Some(sent),
+                    "should leave {why} as the origin wrote it"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_location_on_an_answer_that_is_no_redirect_is_named_for_the_reader() {
+            let settings = settings_with_origin(ORIGIN_URL);
+            // (the origin's status, the origin's media type, the route the
+            // answer takes)
+            let cases = [
+                (200, None, "pass-through"),
+                (200, Some("text/html; charset=utf-8"), "stream"),
+                (201, None, "pass-through"),
+                (404, None, "buffered"),
+                (503, Some("text/html"), "stream"),
+            ];
+            for (status, media_type, expected_route) in cases {
+                let mut headers = vec![("location", "https://origin.example/news/")];
+                if let Some(media_type) = media_type {
+                    headers.push(("content-type", media_type));
+                }
+
+                let (response, _) = proxied(
+                    &settings,
+                    reader_request(Method::GET, "https://publisher.example/news", "https"),
+                    status,
+                    headers,
+                )
+                .await;
+
+                assert_eq!(
+                    route(&response),
+                    expected_route,
+                    "should return a {status} through the expected route"
+                );
+                assert_eq!(
+                    location(&response),
+                    Some("https://publisher.example/news/"),
+                    "should name the `Location` of a {status} for the reader"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_serve_middleware_named_for_the_path_sets_a_redirects_location() {
+            use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+            let mut settings = settings_with_origin(ORIGIN_URL);
+            settings
+                .insert_module_config(
+                    "testing",
+                    fixture::MODULE,
+                    &serde_json::json!({ "label": "locating" }),
+                )
+                .expect("should select the middleware stand-in");
+            settings.serve =
+                crate::middleware::PhaseEntries::new(vec![crate::middleware::PhaseEntry {
+                    media_type: crate::middleware::HTML_MEDIA_TYPE.to_owned(),
+                    path: None,
+                    middleware: vec![fixture::LOCATING.to_owned()],
+                }]);
+
+            let (response, _) = proxied(
+                &settings,
+                reader_request(Method::GET, "https://publisher.example/news", "https"),
+                302,
+                vec![("location", "/uk")],
+            )
+            .await;
+            assert_eq!(
+                location(&response),
+                Some("/fixture/uk"),
+                "should hand a bodiless redirect to the middleware and keep the header it set"
+            );
+
+            let (response, _) = proxied(
+                &settings,
+                reader_request(Method::GET, "https://publisher.example/news", "https"),
+                301,
+                vec![("location", "https://somewhere.else/news/")],
+            )
+            .await;
+            assert_eq!(
+                location(&response),
+                Some("https://somewhere.else/news/"),
+                "should leave a Location the middleware does not set"
+            );
+
+            let mut elsewhere = settings.clone();
+            elsewhere.serve =
+                crate::middleware::PhaseEntries::new(vec![crate::middleware::PhaseEntry {
+                    media_type: crate::middleware::HTML_MEDIA_TYPE.to_owned(),
+                    path: Some("/other/".to_owned()),
+                    middleware: vec![fixture::LOCATING.to_owned()],
+                }]);
+            let (response, _) = proxied(
+                &elsewhere,
+                reader_request(Method::GET, "https://publisher.example/news", "https"),
+                302,
+                vec![("location", "/uk")],
+            )
+            .await;
+            assert_eq!(
+                location(&response),
+                Some("/uk"),
+                "should not ask a middleware whose entry covers another path"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_redirect_with_no_location_gains_none() {
+            let settings = settings_with_origin(ORIGIN_URL);
+
+            let (response, _) = proxied(
+                &settings,
+                reader_request(Method::GET, "https://publisher.example/news", "https"),
+                302,
+                Vec::new(),
+            )
+            .await;
+
+            assert_eq!(
+                response_status(&response),
+                StatusCode::FOUND,
+                "should relay the redirect"
+            );
+            assert_eq!(
+                location(&response),
+                None,
+                "should add no `Location` the origin did not send"
+            );
         }
     }
 
