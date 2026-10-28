@@ -90,6 +90,16 @@ pub mod tests {
         }
     }
 
+    /// A small valid policy whose digest no other test uses, given a `group`
+    /// no other test passes, so no earlier load in the process holds its
+    /// rules.
+    #[must_use]
+    pub fn policy_only_this_test_loads(group: &str) -> String {
+        format!(
+            "groups:\n  {group}:\n    default: requires_signal\nrules:\n  group: {group}\n  jurisdiction: unknown\n"
+        )
+    }
+
     #[must_use]
     /// Creates test settings from embedded TOML configuration.
     ///
