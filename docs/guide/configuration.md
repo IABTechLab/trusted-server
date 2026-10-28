@@ -2488,10 +2488,11 @@ The client hints middleware's own table has one field.
 | ------------------------------------- | ---------- | ------- | ------- | -------------------------------------------------------------------------------------------- |
 | `[middleware.51degrees.client_hints]` | `critical` | Boolean | `true`  | Whether `Critical-CH` is written with `Accept-CH`, so a browser retries its first navigation |
 
-The service's answers are held in the cache `51degrees-answers`, selected and
+The service's answers load through the cache `51degrees-answers`, selected and
 sized in `[cache.51degrees-answers]` with the four settings every declared
-cache takes, see [Loading caches](#loading-caches). An answer ends after an
-hour whatever `store_seconds` says. Each table refuses a field it does not
+cache takes, see [Loading caches](#loading-caches), and are held only where
+the build links a loading cache module. An answer ends after an hour whatever
+`store_seconds` says. Each table refuses a field it does not
 read, and a table with no `license_key` is refused, because every 51Degrees
 module presents one. See [51Degrees](/guide/integrations/51degrees) for what
 the middleware writes and where to place it.

@@ -517,7 +517,9 @@ pull_sync_concurrency = 3
 # The loading cache that holds the 51Degrees service's answers, which the
 # 51Degrees modules under [shared.51degrees] ask for once for each request's
 # evidence, and how long the copies last, with the same four settings. An
-# answer ends after an hour whatever the store lifetime says.
+# answer ends after an hour whatever the store lifetime says. A stock build
+# links no loading cache module and refuses `module`, as for
+# [cache.robots-txt].
 # [cache.51degrees-answers]
 # module = "51degrees"
 # memory_seconds = 60
