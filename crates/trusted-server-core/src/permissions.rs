@@ -868,27 +868,52 @@ pub fn load_policy(
     Ok(Arc::new(PermissionPolicy { reference, maps }))
 }
 
+/// The policy `reference` pins when this instance already holds the rules
+/// of its digest, so a load need not read the file.
+///
+/// Held rules were checked against their digest when they were first
+/// loaded.
+#[must_use]
+pub(crate) fn held_policy(reference: &PolicyReference) -> Option<Arc<PermissionPolicy>> {
+    held_maps(&reference.sha256).map(|maps| {
+        Arc::new(PermissionPolicy {
+            reference: reference.clone(),
+            maps,
+        })
+    })
+}
+
 /// The rules of the policy file whose SHA-256 is `sha256`, parsed from
 /// `text` the first time this instance meets the digest.
 fn parsed_policy(sha256: &str, text: &str) -> Result<Arc<PermissionMaps>, PermissionsError> {
-    static PARSED: OnceLock<Mutex<BTreeMap<String, Arc<PermissionMaps>>>> = OnceLock::new();
-    let parsed = PARSED.get_or_init(Mutex::default);
-    if let Some(maps) = parsed
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(sha256)
-    {
-        return Ok(Arc::clone(maps));
+    if let Some(maps) = held_maps(sha256) {
+        return Ok(maps);
     }
     // Parsed outside the lock, so a long parse holds up no other load.
     let maps = Arc::new(PermissionMaps::from_yaml(text)?);
     Ok(Arc::clone(
-        parsed
+        parsed_policies()
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .entry(sha256.to_owned())
             .or_insert(maps),
     ))
+}
+
+/// The rules this instance holds for the digest `sha256`.
+fn held_maps(sha256: &str) -> Option<Arc<PermissionMaps>> {
+    parsed_policies()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(sha256)
+        .cloned()
+}
+
+/// The rules this instance has parsed, by the SHA-256 of their file, kept
+/// for as long as the instance runs.
+fn parsed_policies() -> &'static Mutex<BTreeMap<String, Arc<PermissionMaps>>> {
+    static PARSED: OnceLock<Mutex<BTreeMap<String, Arc<PermissionMaps>>>> = OnceLock::new();
+    PARSED.get_or_init(Mutex::default)
 }
 
 /// The repository's sample policy, for tests. No build a deployment runs
@@ -1636,6 +1661,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::test_support::tests::policy_only_this_test_loads;
 
     #[test]
     fn permission_set_membership_and_subset() {
@@ -2675,13 +2701,6 @@ signals:
             !signals.opt_out_revokes(Permission::StoreOnDevice),
             "an unlisted Data Use is not revoked by the opt-out"
         );
-    }
-
-    /// A small valid policy whose digest no other test uses.
-    fn policy_only_this_test_loads(group: &str) -> String {
-        format!(
-            "groups:\n  {group}:\n    default: requires_signal\nrules:\n  group: {group}\n  jurisdiction: unknown\n"
-        )
     }
 
     #[test]
