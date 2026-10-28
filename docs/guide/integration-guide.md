@@ -218,6 +218,15 @@ itself, on an empty document of the entry's media type, and what it writes
 is the file. A middleware that adds to a file therefore writes the same on an
 empty one, with nothing before its first line.
 
+An entry's `path` is a prefix, so a middleware made for one file says which
+path is the file with `handles_path`, and is left out everywhere else the
+entry covers. One that writes the whole file, whatever the origin sent, says
+so with `writes_whole_document`, and the file is then made in place of any
+answer it would not be handed as a `200` of the entry's media type. One that
+needs the origin's whole body says so with `needs_whole_body`, and the origin
+is then asked without the reader's conditional and range headers. Core's
+`robots_txt` middleware says all three.
+
 ```rust
 struct Sellers;
 

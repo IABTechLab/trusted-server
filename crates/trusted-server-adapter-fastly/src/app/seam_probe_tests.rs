@@ -16,20 +16,16 @@ use error_stack::Report;
 use futures::executor::block_on;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::evidence::OwnedRequestInfo;
-use trusted_server_core::integrations::{
-    IntegrationBuilder, IntegrationRegistration, IntegrationRequestFilter, RequestFilterDecision,
-    RequestFilterEffects, RequestFilterInput,
-};
-use trusted_server_core::module_context::{ModuleCall, ModuleContext, ModuleRequest};
-use trusted_server_core::robots_txt::{Contribution, RobotsTxtContributor};
+use trusted_server_core::integrations::{IntegrationBuilder, IntegrationRegistration};
+use trusted_server_core::module_context::{ModuleContext, ModuleRequest};
 use trusted_server_core::settings::Settings;
 use trusted_server_core::tsjs::tsjs_script_src;
 use trusted_server_core::tsjs_bundle::{JsModulePart, compile_time_parts};
 use trusted_server_integration_seam_probe as seam_probe;
 
 use super::{
-    AppState, EcFinalizeState, TrustedServerApp, build_finalize_services,
-    build_state_from_settings, build_state_with_registrations, register_integrations,
+    AppState, TrustedServerApp, build_finalize_services, build_state_from_settings,
+    build_state_with_registrations, register_integrations,
 };
 
 /// Largest response body these tests read, ample for the served script.
@@ -214,55 +210,10 @@ fn proxy_route_reports_the_modules_geo_and_that_the_preparer_ran() {
     );
 }
 
-/// `[robots-txt] modules` naming the probe serves the rules the probe gives,
-/// asked for the request's host and path and never its query, because the
-/// answer is held and served to every crawler.
-#[test]
-fn robots_txt_selection_naming_a_module_serves_the_rules_it_gives() {
-    let settings = settings_with(&format!(
-        r#"
-        [robots-txt]
-        modules = ["testing.seam-probe", "allow_all"]
-        {HMAC_BLOCK}
-        {PROBE_BLOCK}
-        "#
-    ));
-    let router = router_with(settings, &[seam_probe::builder()]);
-
-    let response = get(&router, "/robots.txt?crawler=one", None);
-
-    assert_eq!(
-        response.status().as_u16(),
-        200,
-        "the file should be served here and not by the origin"
-    );
-    assert!(
-        response.headers().get("x-robots-tag").is_none(),
-        "a file made from contributors puts no blanket rule on responses"
-    );
-    let file = body_text(response);
-    let agent = seam_probe::SEAM_PROBE_ROBOTS_AGENT;
-    assert!(
-        file.starts_with(&format!("User-Agent: {agent}\nDisallow: /")),
-        "the probe's rules should come first, as `modules` orders them: {file}"
-    );
-    assert!(
-        file.contains("/robots.txt?\n"),
-        "the probe should be asked for the path with no query: {file}"
-    );
-    assert!(
-        !file.contains("crawler=one"),
-        "nothing one crawler put in the address should reach a held answer: {file}"
-    );
-    assert!(
-        file.ends_with("User-Agent: *\nAllow: /\n"),
-        "core's own rules should follow: {file}"
-    );
-}
-
-/// With `refuse_all` selected the file is the refusal, and every response
-/// this adapter finalizes says not to index, the response of another route
-/// included.
+/// With `refuse_all` selected every response this adapter finalizes says
+/// not to index, the response of another route included. The file itself is
+/// the publisher path's, made by the `robots_txt` middleware the entry
+/// names, so no route of this server names the path.
 #[test]
 fn refusing_every_crawler_tags_every_response() {
     let settings = settings_with(&format!(
@@ -270,6 +221,11 @@ fn refusing_every_crawler_tags_every_response() {
         [robots-txt]
         modules = "refuse_all"
         always_allow = ["/ads.txt"]
+
+        [[fetch]]
+        media_type = "text/plain"
+        path = "/robots.txt"
+        middleware = ["robots_txt"]
         {HMAC_BLOCK}
         {PROBE_BLOCK}
         "#
@@ -283,13 +239,12 @@ fn refusing_every_crawler_tags_every_response() {
             .map(str::to_owned)
     };
 
-    let file = get(&router, "/robots.txt", None);
-
-    assert_eq!(file.status().as_u16(), 200, "the refusal should be served");
-    assert_eq!(tag(&file).as_deref(), Some("noindex, nofollow"));
-    assert_eq!(
-        body_text(file),
-        "User-agent: *\nAllow: /ads.txt\nDisallow: /\n"
+    assert!(
+        !router
+            .routes()
+            .into_iter()
+            .any(|route| route.path() == "/robots.txt"),
+        "the file is the publisher path's"
     );
 
     let other = get(&router, seam_probe::SEAM_PROBE_REPORT_PATH, None);
@@ -301,352 +256,160 @@ fn refusing_every_crawler_tags_every_response() {
     );
 }
 
-/// The methods this adapter registers for `/robots.txt`.
-fn robots_txt_methods(router: &RouterService) -> Vec<String> {
-    router
-        .routes()
-        .into_iter()
-        .filter(|route| route.path() == "/robots.txt")
-        .map(|route| route.method().to_string())
-        .collect()
-}
-
-/// With no `[robots-txt]` section the path is the publisher's, and the probe
-/// being on offer changes nothing. With the section the path is this
-/// server's for `GET` and `HEAD`.
+/// Without the section no blanket rule is placed on responses.
 #[test]
-fn robots_txt_is_this_servers_only_when_the_settings_carry_the_section() {
+fn no_blanket_rule_is_placed_on_responses_without_the_section() {
     let without = router_with(
         settings_with(&format!("{HMAC_BLOCK}{PROBE_BLOCK}")),
         &[seam_probe::builder()],
     );
 
-    assert_eq!(
-        robots_txt_methods(&without),
-        Vec::<String>::new(),
-        "without the section no route of this server names the path"
-    );
     let other = get(&without, seam_probe::SEAM_PROBE_REPORT_PATH, None);
+
     assert!(
         other.headers().get("x-robots-tag").is_none(),
         "no blanket rule is placed on responses without the section"
     );
+}
 
-    let with = router_with(
+/// A module whose request filter answers every request with a challenge, as
+/// bot protection does.
+mod challenge {
+    use std::sync::Arc;
+
+    use edgezero_core::body::Body;
+    use edgezero_core::http::{Response, StatusCode};
+    use error_stack::Report;
+    use trusted_server_core::error::TrustedServerError;
+    use trusted_server_core::integrations::{
+        IntegrationBuilder, IntegrationRegistration, IntegrationRequestFilter,
+        RequestFilterDecision, RequestFilterEffects, RequestFilterInput,
+    };
+    use trusted_server_core::settings::Settings;
+
+    /// The module's id.
+    const ID: &str = "robots-txt-challenge";
+
+    /// Answers every request with a `403` challenge.
+    struct Challenging;
+
+    #[async_trait::async_trait(?Send)]
+    impl IntegrationRequestFilter for Challenging {
+        fn integration_id(&self) -> &'static str {
+            ID
+        }
+
+        async fn filter_request(
+            &self,
+            _input: RequestFilterInput<'_>,
+        ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
+            let mut response = Response::new(Body::from("a challenge"));
+            *response.status_mut() = StatusCode::FORBIDDEN;
+            Ok(RequestFilterDecision::Respond {
+                response: Box::new(response),
+                effects: RequestFilterEffects::default(),
+            })
+        }
+    }
+
+    fn register(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder(ID)
+                .with_request_filter(Arc::new(Challenging))
+                .build(),
+        ))
+    }
+
+    fn accept(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+        Ok(true)
+    }
+
+    /// The module, selected by `[testing] modules = ["robots-txt-challenge"]`.
+    pub(super) fn builder() -> IntegrationBuilder {
+        IntegrationBuilder::new(ID, ID, register, accept)
+            .with_module_name("testing.robots-txt-challenge")
+    }
+}
+
+/// A crawler asking for robots.txt is answered before the Edge Cookie steps
+/// and the request filters, so a filter that answers every other request
+/// with a challenge never stands in for the file, and no Edge Cookie state
+/// rides on the answer. Another method on the path is no crawler's request
+/// for the file, so the filter answers it.
+#[test]
+fn robots_txt_is_answered_before_the_edge_cookie_steps_and_the_filters() {
+    use trusted_server_core::platform::PlatformHttpClient;
+    use trusted_server_core::platform::test_support::{
+        StubHttpClient, build_services_with_http_client,
+    };
+
+    let state = state_with(
         settings_with(&format!(
             r#"
             [robots-txt]
             modules = "refuse_all"
+
+            [[fetch]]
+            media_type = "text/plain"
+            path = "/robots.txt"
+            middleware = ["robots_txt"]
             {HMAC_BLOCK}
-            {PROBE_BLOCK}
+
+            [testing]
+            modules = ["robots-txt-challenge"]
             "#
         )),
-        &[seam_probe::builder()],
+        &[challenge::builder()],
     );
+    let origin = Arc::new(StubHttpClient::new());
+    origin.push_response_with_headers(
+        200,
+        b"User-agent: *\nAllow: /\n".to_vec(),
+        vec![("content-type", "text/plain")],
+    );
+    let services =
+        build_services_with_http_client(Arc::clone(&origin) as Arc<dyn PlatformHttpClient>);
+    let dispatch = |method: Method, path: &str| {
+        let request = request_builder()
+            .method(method)
+            .uri(format!("https://test-publisher.com{path}"))
+            .header("host", "test-publisher.com")
+            .body(Body::empty())
+            .expect("should build request");
+        block_on(super::dispatch_fallback(&state, &services, request))
+    };
 
-    let methods = robots_txt_methods(&with);
-    for method in ["GET", "HEAD"] {
-        assert!(
-            methods.iter().any(|registered| registered == method),
-            "{method} /robots.txt should be answered here: {methods:?}"
-        );
-    }
-}
-
-/// The id of a module whose request filter answers every request with a
-/// challenge, as bot protection does.
-const CHALLENGE_ID: &str = "robots-txt-challenge";
-
-/// The module name that module is selected by.
-const CHALLENGE_MODULE: &str = "testing.robots-txt-challenge";
-
-/// Answers every request with a `403` challenge.
-struct Challenging;
-
-#[async_trait::async_trait(?Send)]
-impl IntegrationRequestFilter for Challenging {
-    fn integration_id(&self) -> &'static str {
-        CHALLENGE_ID
-    }
-
-    async fn filter_request(
-        &self,
-        _input: RequestFilterInput<'_>,
-    ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
-        let response = edgezero_core::http::response_builder()
-            .status(403)
-            .body(Body::from("a challenge"))
-            .expect("should build the challenge");
-        Ok(RequestFilterDecision::Respond {
-            response: Box::new(response),
-            effects: RequestFilterEffects::default(),
-        })
-    }
-}
-
-fn register_challenge(
-    _settings: &Settings,
-) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
-    Ok(Some(
-        IntegrationRegistration::builder(CHALLENGE_ID)
-            .with_request_filter(Arc::new(Challenging))
-            .build(),
-    ))
-}
-
-fn accept_challenge(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
-    Ok(true)
-}
-
-/// A crawler asking for robots.txt is answered before the Edge Cookie steps
-/// and the request filters, so a filter that answers every other request with
-/// a challenge never stands in for the file, and no Edge Cookie state rides
-/// on the answer.
-#[test]
-fn robots_txt_is_answered_before_the_edge_cookie_steps_and_the_filters() {
-    let settings = settings_with(&format!(
-        r#"
-        [robots-txt]
-        modules = "refuse_all"
-        {HMAC_BLOCK}
-
-        [testing]
-        modules = ["robots-txt-challenge"]
-        "#
-    ));
-    let challenge = IntegrationBuilder::new(
-        CHALLENGE_ID,
-        CHALLENGE_ID,
-        register_challenge,
-        accept_challenge,
-    )
-    .with_module_name(CHALLENGE_MODULE);
-    let router = router_with(settings, &[challenge]);
-
-    let other = get(&router, "/.well-known/trusted-server.json", None);
+    let page = dispatch(Method::GET, "/page");
     assert_eq!(
-        other.status().as_u16(),
+        page.status().as_u16(),
         403,
-        "the filter should answer another named route"
+        "the filter should answer another request"
+    );
+    let post = dispatch(Method::POST, "/robots.txt");
+    assert_eq!(
+        post.status().as_u16(),
+        403,
+        "the filter should answer a method other than GET and HEAD"
     );
 
-    let file = get(&router, "/robots.txt", None);
+    let file = dispatch(Method::GET, "/robots.txt");
     assert_eq!(
         file.status().as_u16(),
         200,
         "the file should be served, not the filter's challenge"
     );
     assert!(
-        file.extensions().get::<EcFinalizeState>().is_none(),
+        file.extensions().get::<super::EcFinalizeState>().is_none(),
         "no Edge Cookie state should ride on the file"
     );
     assert_eq!(body_text(file), "User-agent: *\nDisallow: /\n");
-}
-
-/// Sends one request with `method` and returns the response.
-fn send(router: &RouterService, method: Method, path: &str) -> Response {
-    let request = request_builder()
-        .method(method)
-        .uri(format!("https://test-publisher.com{path}"))
-        .body(Body::empty())
-        .expect("should build request");
-    block_on(router.oneshot(request)).expect("should route request")
-}
-
-/// The value of the header `name`, as text.
-fn header_text<'r>(response: &'r Response, name: &str) -> Option<&'r str> {
-    response
-        .headers()
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-}
-
-/// A `HEAD` for the file is answered here with the headers a `GET` is given
-/// and no body.
-#[test]
-fn a_head_of_robots_txt_is_answered_with_the_headers_and_no_body() {
-    let router = router_with(
-        settings_with(&format!(
-            r#"
-            [robots-txt]
-            modules = "refuse_all"
-            {HMAC_BLOCK}
-            {PROBE_BLOCK}
-            "#
-        )),
-        &[seam_probe::builder()],
-    );
-
-    let response = send(&router, Method::HEAD, "/robots.txt");
-
-    assert_eq!(response.status().as_u16(), 200);
     assert_eq!(
-        header_text(&response, "content-type"),
-        Some("text/plain; charset=utf-8")
+        origin.recorded_request_methods(),
+        ["GET"],
+        "only the crawler's request for the file should reach the origin"
     );
-    assert_eq!(
-        header_text(&response, "cache-control"),
-        Some("public, max-age=3600")
-    );
-    assert!(body_text(response).is_empty(), "a HEAD carries no body");
-}
-
-/// The id of the module that answers once.
-const ANSWERS_ONCE_ID: &str = "robots-txt-answers-once";
-
-/// A robots.txt contributor that answers the first time it is asked and fails
-/// every time after, whose answer is due for a refresh at once.
-#[derive(Debug, Default)]
-struct AnswersOnce {
-    asked: std::sync::atomic::AtomicUsize,
-}
-
-#[async_trait::async_trait(?Send)]
-impl RobotsTxtContributor for AnswersOnce {
-    fn refresh(&self) -> std::time::Duration {
-        std::time::Duration::ZERO
-    }
-
-    fn fingerprint(&self) -> String {
-        "answers-once".to_owned()
-    }
-
-    async fn contribute(
-        &self,
-        _call: ModuleCall<'_>,
-    ) -> Result<Contribution, Report<TrustedServerError>> {
-        if self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-            Ok(Contribution::parse("User-Agent: OnceBot\nDisallow: /"))
-        } else {
-            Err(Report::new(TrustedServerError::Proxy {
-                message: "the rules service is down".to_owned(),
-            }))
-        }
-    }
-}
-
-fn register_answers_once(
-    _settings: &Settings,
-) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
-    Ok(Some(
-        IntegrationRegistration::builder(ANSWERS_ONCE_ID)
-            .with_robots_txt_contributor(
-                "robots-txt.answers-once",
-                Arc::new(AnswersOnce::default()),
-            )
-            .build(),
-    ))
-}
-
-fn accept_answers_once(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
-    Ok(true)
-}
-
-/// The id of the module that never answers.
-const NEVER_ANSWERS_ID: &str = "robots-txt-never-answers";
-
-/// A robots.txt contributor that fails every time it is asked.
-#[derive(Debug)]
-struct NeverAnswers;
-
-#[async_trait::async_trait(?Send)]
-impl RobotsTxtContributor for NeverAnswers {
-    fn refresh(&self) -> std::time::Duration {
-        std::time::Duration::ZERO
-    }
-
-    fn fingerprint(&self) -> String {
-        "never-answers".to_owned()
-    }
-
-    async fn contribute(
-        &self,
-        _call: ModuleCall<'_>,
-    ) -> Result<Contribution, Report<TrustedServerError>> {
-        Err(Report::new(TrustedServerError::Proxy {
-            message: "the rules service is down".to_owned(),
-        }))
-    }
-}
-
-fn register_never_answers(
-    _settings: &Settings,
-) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
-    Ok(Some(
-        IntegrationRegistration::builder(NEVER_ANSWERS_ID)
-            .with_robots_txt_contributor("robots-txt.never-answers", Arc::new(NeverAnswers))
-            .build(),
-    ))
-}
-
-fn accept_never_answers(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
-    Ok(true)
-}
-
-/// A module whose answer is due for a refresh at once is asked again on the
-/// next request, and when it fails the last answer it gave is served past its
-/// age, because yesterday's rules are a better answer than none.
-#[test]
-fn a_module_that_fails_after_answering_has_its_last_answer_served() {
-    let settings = settings_with(&format!(
-        r#"
-        [robots-txt]
-        modules = ["answers-once"]
-        {HMAC_BLOCK}
-
-        [testing]
-        modules = ["robots-txt-answers-once"]
-        "#
-    ));
-    let builder = IntegrationBuilder::new(
-        ANSWERS_ONCE_ID,
-        ANSWERS_ONCE_ID,
-        register_answers_once,
-        accept_answers_once,
-    )
-    .with_module_name("testing.robots-txt-answers-once");
-    let router = router_with(settings, &[builder]);
-
-    let first = get(&router, "/robots.txt", None);
-    assert_eq!(first.status().as_u16(), 200);
-    assert_eq!(body_text(first), "User-Agent: OnceBot\nDisallow: /\n");
-
-    let second = get(&router, "/robots.txt", None);
-    assert_eq!(
-        second.status().as_u16(),
-        200,
-        "the module fails, so the answer it gave last is served"
-    );
-    assert_eq!(body_text(second), "User-Agent: OnceBot\nDisallow: /\n");
-}
-
-/// A module that fails with no answer kept makes the file a `503` that tells
-/// a crawler to come back in ten minutes and is not stored.
-#[test]
-fn with_nothing_kept_a_module_that_fails_makes_the_file_unavailable() {
-    let settings = settings_with(&format!(
-        r#"
-        [robots-txt]
-        modules = ["never-answers"]
-        {HMAC_BLOCK}
-
-        [testing]
-        modules = ["robots-txt-never-answers"]
-        "#
-    ));
-    let builder = IntegrationBuilder::new(
-        NEVER_ANSWERS_ID,
-        NEVER_ANSWERS_ID,
-        register_never_answers,
-        accept_never_answers,
-    )
-    .with_module_name("testing.robots-txt-never-answers");
-    let router = router_with(settings, &[builder]);
-
-    let response = get(&router, "/robots.txt", None);
-    assert_eq!(response.status().as_u16(), 503);
-    assert_eq!(header_text(&response, "retry-after"), Some("600"));
-    assert_eq!(header_text(&response, "cache-control"), Some("no-store"));
 }
 
 /// A request prepares exactly once whether a named route or the fallback

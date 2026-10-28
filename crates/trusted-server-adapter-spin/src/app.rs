@@ -49,7 +49,6 @@ use trusted_server_core::publisher::{
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
-use trusted_server_core::robots_txt::{ROBOTS_TXT_PATH, handle_robots_txt};
 use trusted_server_core::settings::Settings;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use trusted_server_core::settings_data::{default_config_key, default_secret_store_name};
@@ -1148,29 +1147,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 }
             }
         }
-        // Only when the settings carry `[robots-txt]`.
-        if state.settings.robots_txt.is_some() {
-            let s = Arc::clone(&state);
-            let robots_txt_handler = move |ctx: RequestContext| {
-                let s = Arc::clone(&s);
-                async move {
-                    let services = s.services_for_request(&ctx);
-                    Ok::<Response, EdgeError>(
-                        handle_robots_txt(&s.settings, &services, &s.registry, ctx.into_request())
-                            .await
-                            .unwrap_or_else(|e| http_error(&e)),
-                    )
-                }
-            };
-            for method in publisher_fallback_methods() {
-                if matches!(method, Method::GET | Method::HEAD) {
-                    builder = builder.route(ROBOTS_TXT_PATH, method, robots_txt_handler.clone());
-                } else {
-                    builder = builder.route(ROBOTS_TXT_PATH, method, fallback.clone());
-                }
-            }
-        }
-
         for method in publisher_fallback_methods() {
             builder = builder.route("/", method.clone(), fallback.clone());
             builder = builder.route("/{*rest}", method, fallback.clone());

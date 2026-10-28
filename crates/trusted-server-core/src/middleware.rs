@@ -512,6 +512,34 @@ pub trait Middleware: Send + Sync {
         media_type == HTML_MEDIA_TYPE
     }
 
+    /// Whether this middleware works on a response to a request for `path`,
+    /// every path by default. An entry's `path` is a prefix, so a middleware
+    /// made for one file says which path is that file, and is left out of
+    /// the chain for any other path the entry covers.
+    fn handles_path(&self, path: &str) -> bool {
+        let _ = path;
+        true
+    }
+
+    /// Whether this middleware writes the whole document, whatever the origin
+    /// sent. Where a `[[fetch]]` entry with a `path` names it, core makes the
+    /// document on an empty one in place of any answer it would not hand the
+    /// middleware as a `200` of the entry's media type, as it does where the
+    /// origin answers `404`. `false` by default, for a middleware that changes
+    /// what the origin sent.
+    fn writes_whole_document(&self) -> bool {
+        false
+    }
+
+    /// Whether this middleware needs the origin's whole body. Where an entry
+    /// names it for a request's path, core asks the origin without the
+    /// reader's conditional and range headers, as it does for a page the ad
+    /// stack answers, because a `304` carries no body and a `206` only part of
+    /// one. `false` by default.
+    fn needs_whole_body(&self) -> bool {
+        false
+    }
+
     /// The phases an entry may name this middleware in.
     fn phases(&self) -> &[MiddlewarePhase];
 
@@ -569,11 +597,16 @@ impl PhaseEntry {
     /// `path`.
     #[must_use]
     pub fn covers(&self, media_type: &str, path: &str) -> bool {
-        self.media_type == media_type
-            && self
-                .path
-                .as_deref()
-                .is_none_or(|prefix| path.starts_with(prefix))
+        self.media_type == media_type && self.covers_path(path)
+    }
+
+    /// Whether the entry covers a request for `path`, whatever the media type
+    /// of the response.
+    #[must_use]
+    pub fn covers_path(&self, path: &str) -> bool {
+        self.path
+            .as_deref()
+            .is_none_or(|prefix| path.starts_with(prefix))
     }
 
     /// The prefix the paths the entry covers begin with. The path of a
@@ -823,6 +856,15 @@ impl MiddlewareChain {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.middleware.is_empty()
+    }
+
+    /// Whether a middleware in the chain writes the whole document, see
+    /// [`Middleware::writes_whole_document`].
+    #[must_use]
+    pub fn writes_whole_document(&self) -> bool {
+        self.middleware
+            .iter()
+            .any(|middleware| middleware.writes_whole_document())
     }
 
     /// Runs the preparation of every middleware that has one, in the order

@@ -14,7 +14,9 @@
 //! contributor says.
 //!
 //! 1. A refusal cannot be loosened. With `refuse_all` selected the file is the
-//!    refusal and nothing else.
+//!    refusal and nothing else, and the origin cannot loosen it either,
+//!    because the file takes the place of whatever the origin answers to a
+//!    `GET` or `HEAD` that names its host.
 //! 2. A path in `always_allow` stays open to every crawler a contribution
 //!    refuses the whole site to, `*` included. A narrower rule is kept as
 //!    given, so `Disallow: /ads` still closes off `/ads.txt`.
@@ -39,14 +41,15 @@
 mod contributor;
 pub mod document;
 mod holding;
+pub mod middleware;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
+use http::Response;
 use http::header::{self, HeaderValue};
-use http::{Method, Request, Response, StatusCode};
 use serde::{Deserialize, Deserializer, Serialize};
 use validator::{Validate, ValidationError};
 
@@ -54,16 +57,12 @@ pub use contributor::{ALLOW_ALL, REFUSE_ALL, RobotsTxtContributor};
 pub use document::{Contribution, Group, Record};
 
 use crate::error::TrustedServerError;
-use crate::integrations::IntegrationRegistry;
 use crate::module_context::ResolvedRequest;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
 /// The path this module answers.
 pub const ROBOTS_TXT_PATH: &str = "/robots.txt";
-
-/// How long a browser or an edge cache may hold the answer.
-const CLIENT_CACHE_SECONDS: u32 = 3600;
 
 /// How long a crawler is asked to wait when there is no file to give it.
 const RETRY_AFTER_SECONDS: u32 = 600;
@@ -163,7 +162,8 @@ impl RobotsTxtConfig {
     /// The configuration that refuses every crawler with no exception.
     ///
     /// The starting point for a publisher who wants the refusal with
-    /// allowances of their own. Needs no contributor, no key and no network.
+    /// allowances of their own. Needs no contributor and no key. The origin is
+    /// still asked, and the file takes the place of whatever it answers.
     #[must_use]
     pub fn refuse_all() -> Self {
         Self {
@@ -281,77 +281,46 @@ pub fn apply_response_robots_tag(settings: &Settings, response: &mut Response<Ed
     );
 }
 
-/// Answers `GET` and `HEAD /robots.txt` for a publisher whose settings carry
-/// a `[robots-txt]` section. A `HEAD` is answered with the headers of the
-/// `GET` and no body.
+/// One entry of `modules` as the registry resolved it: the name a
+/// contributor was declared under and the contributor, or `allow_all` and
+/// none.
+pub(crate) type Selected = (&'static str, Option<Arc<dyn RobotsTxtContributor>>);
+
+/// The entries of `config.modules` resolved against `contributors`, the
+/// contributors a deployment runs by the names they were declared under.
 ///
 /// # Errors
 ///
-/// When the settings carry no `[robots-txt]` section. An adapter registers
-/// this route only when the section is present, so that is a wiring fault and
-/// not something a request can cause.
-pub async fn handle_robots_txt(
-    settings: &Settings,
-    services: &RuntimeServices,
-    registry: &IntegrationRegistry,
-    req: Request<EdgeBody>,
-) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    let response = answer(settings, services, registry, &req).await?;
-    Ok(if req.method() == Method::HEAD {
-        response.map(|_| EdgeBody::empty())
-    } else {
-        response
-    })
-}
-
-async fn answer(
-    settings: &Settings,
-    services: &RuntimeServices,
-    registry: &IntegrationRegistry,
-    req: &Request<EdgeBody>,
-) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    let config = settings.robots_txt.as_ref().ok_or_else(|| {
-        Report::new(configuration(
-            "the robots.txt route is registered but there is no [robots-txt] section".to_owned(),
-        ))
-    })?;
-    // A refusal answers without asking anything, before any contributor,
-    // held answer or network is involved. That is the point of it, because a
-    // site that is not ready to be crawled can then say so with nothing
-    // provisioned at all.
-    if config.refuses_all() {
-        return Ok(respond(Ok(document::refusal(&config.always_allow))));
-    }
-    let mut selected: Vec<Selected> = Vec::new();
-    for id in &config.modules {
-        if id == ALLOW_ALL {
+/// When an entry names a contributor `contributors` does not carry, which
+/// the registry refuses before it asks, so this is a wiring fault.
+pub(crate) fn select(
+    config: &RobotsTxtConfig,
+    contributors: &[(&'static str, Arc<dyn RobotsTxtContributor>)],
+) -> Result<Vec<Selected>, Report<TrustedServerError>> {
+    let mut selected = Vec::with_capacity(config.modules.len());
+    for written in &config.modules {
+        if written == REFUSE_ALL {
+            // The refusal needs no contributor, and the middleware answers it
+            // before asking any.
+            continue;
+        }
+        if written == ALLOW_ALL {
             selected.push((ALLOW_ALL, None));
             continue;
         }
-        let Some((declared, contributor)) = registry.robots_txt_contributor(id) else {
-            // Unreachable, the registry refuses this name when it is built.
-            return Ok(respond(Err(Report::new(configuration(format!(
-                "[robots-txt] modules names `{id}`, which no module in this deployment supplies"
-            ))))));
+        let names: Vec<&str> = contributors.iter().map(|(name, _)| *name).collect();
+        let Some((declared, contributor)) =
+            crate::module_name::resolve(MODULE_TYPE, written, &names)
+                .and_then(|declared| contributors.iter().find(|(name, _)| *name == declared))
+        else {
+            return Err(Report::new(configuration(format!(
+                "[robots-txt] modules names `{written}`, which no module in this deployment supplies"
+            ))));
         };
-        selected.push((declared, Some(contributor)));
+        selected.push((declared, Some(Arc::clone(contributor))));
     }
-    // The answers are held and served to every crawler of the host, so the
-    // contributors are handed the request with nothing one crawler put in
-    // the address, for the host it was addressed to and never one a
-    // forwarded header names. That host is part of the key an answer is
-    // held under.
-    let request = ResolvedRequest::of(req, services.client_info())
-        .without_query()
-        .with_host(crate::http_util::addressed_host(req));
-    Ok(respond(
-        file_for(config, &selected, &request, services, settings).await,
-    ))
+    Ok(selected)
 }
-
-/// One entry of `modules` as the handler resolved it: the name a contributor
-/// was declared under and the contributor, or `allow_all` and none.
-type Selected = (&'static str, Option<Arc<dyn RobotsTxtContributor>>);
 
 /// The file for `config`, from the contributions of `selected` in order,
 /// each asked for `request` and held for the publisher `settings` describe and
@@ -359,7 +328,7 @@ type Selected = (&'static str, Option<Arc<dyn RobotsTxtContributor>>);
 ///
 /// Fails, and the file is answered `503`, when a contributor fails with no
 /// answer of its kept, and when the file would hold no rule.
-async fn file_for(
+pub(crate) async fn file_for(
     config: &RobotsTxtConfig,
     selected: &[Selected],
     request: &ResolvedRequest,
@@ -388,38 +357,6 @@ async fn file_for(
     Ok(file)
 }
 
-fn respond(file: Result<String, Report<TrustedServerError>>) -> Response<EdgeBody> {
-    match file {
-        Ok(file) => Response::builder()
-            .status(StatusCode::OK)
-            .header(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/plain; charset=utf-8"),
-            )
-            .header(
-                header::CACHE_CONTROL,
-                format!("public, max-age={CLIENT_CACHE_SECONDS}"),
-            )
-            .body(EdgeBody::from(file.into_bytes()))
-            .expect("should build the robots.txt response"),
-        Err(report) => {
-            log::error!("Could not assemble robots.txt: {report:?}");
-            Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .header(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("text/plain; charset=utf-8"),
-                )
-                .header(header::RETRY_AFTER, RETRY_AFTER_SECONDS.to_string())
-                .header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))
-                .body(EdgeBody::from(
-                    b"robots.txt is temporarily unavailable\n".to_vec(),
-                ))
-                .expect("should build the robots.txt failure response")
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -429,7 +366,10 @@ mod tests {
         services_with, settings,
     };
     use super::*;
-    use crate::integrations::{IntegrationBuilder, IntegrationRegistration};
+    use crate::integrations::{IntegrationBuilder, IntegrationRegistration, IntegrationRegistry};
+    use crate::middleware::Middleware;
+    use crate::module_context::{ModuleContext, ModuleRequest};
+    use http::StatusCode;
 
     fn parsed(document: serde_json::Value) -> RobotsTxtConfig {
         serde_json::from_value(document).expect("should read the robots.txt settings")
@@ -620,73 +560,126 @@ mod tests {
         );
     }
 
+    /// What the middleware prepares for `settings`, with the services given,
+    /// through the registry that made it from `[robots-txt]`, as the handler
+    /// runs it for `/robots.txt` in the fetch phase.
+    async fn prepared_by(
+        settings: &Settings,
+        extra: &[IntegrationBuilder],
+        services: &RuntimeServices,
+    ) -> Result<Option<String>, crate::middleware::Refusal> {
+        use crate::middleware::{MiddlewarePhase, Prepared};
+
+        let registry = IntegrationRegistry::with_registrations(settings, extra)
+            .expect("should build the registry");
+        let chain = registry.middleware_chain(
+            &settings.fetch,
+            MiddlewarePhase::Fetch,
+            middleware::MEDIA_TYPE,
+            ROBOTS_TXT_PATH,
+        );
+        assert_eq!(
+            chain.ids(),
+            [middleware::MODULE],
+            "the entry names the middleware"
+        );
+        let request = robots_request();
+        let addressed_host = crate::http_util::addressed_host(&request);
+        let module_context =
+            ModuleContext::new(ModuleRequest::of(&request, services.client_info()))
+                .with_settings(settings)
+                .with_services(services)
+                .with_addressed_host(&addressed_host);
+        let state = crate::integrations::IntegrationDocumentState::default();
+        let prepared = Prepared::default();
+        let context = crate::middleware::MiddlewareContext {
+            prepared: &prepared,
+            ..crate::middleware::test_support::context(MiddlewarePhase::Fetch, &state)
+        };
+        chain.prepare(&module_context, &context).await?;
+        Ok(prepared.take::<String>(MiddlewarePhase::Fetch, middleware::MODULE))
+    }
+
+    /// `settings` with `config` as its `[robots-txt]` section and the entry
+    /// that places the middleware on the file.
+    fn settings_placing(config: RobotsTxtConfig) -> Settings {
+        let mut settings = settings();
+        settings.robots_txt = Some(config);
+        settings.fetch =
+            crate::middleware::PhaseEntries::new(vec![crate::middleware::PhaseEntry {
+                media_type: middleware::MEDIA_TYPE.to_owned(),
+                path: Some(ROBOTS_TXT_PATH.to_owned()),
+                middleware: vec![middleware::MODULE.to_owned()],
+            }]);
+        settings
+    }
+
+    /// Leaving out the rules of a contributor that failed would allow by
+    /// omission what those rules refused, so the whole file fails closed.
     #[tokio::test]
-    async fn with_nothing_held_a_failure_is_service_unavailable() {
+    async fn with_nothing_held_a_failure_refuses_the_request() {
         let failing: Arc<dyn RobotsTxtContributor> =
             Arc::new(Scripted::new(vec![Err("cannot answer".to_owned())]));
         let config = parsed(serde_json::json!({ "modules": ["failing", "allow_all"] }));
+        let middleware =
+            middleware::RobotsTxt::new(config, vec![("failing", Some(failing)), (ALLOW_ALL, None)]);
+        let settings = settings();
+        let services = services_with(Arc::default(), Arc::default());
+        let request = robots_request();
+        let addressed_host = crate::http_util::addressed_host(&request);
+        let module_context =
+            ModuleContext::new(ModuleRequest::of(&request, services.client_info()))
+                .with_settings(&settings)
+                .with_services(&services)
+                .with_addressed_host(&addressed_host);
+        let state = crate::integrations::IntegrationDocumentState::default();
+        let context = crate::middleware::test_support::context(
+            crate::middleware::MiddlewarePhase::Fetch,
+            &state,
+        );
 
-        let response = respond(
-            file_for(
-                &config,
-                &[("failing", Some(failing)), (ALLOW_ALL, None)],
-                &request(),
-                &services_with(Arc::default(), Arc::default()),
-                &settings(),
+        let refusal = middleware
+            .prepare(
+                module_context.call(
+                    middleware::MODULE,
+                    crate::permissions::PermissionSet::none(),
+                ),
+                &context,
             )
-            .await,
-        );
+            .expect("the middleware prepares")
+            .await
+            .expect_err("a crawler reads an empty or allow everything file as permission");
 
+        assert_eq!(refusal.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
-            response.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "a crawler reads an empty or allow everything file as permission"
+            refusal.retry_after,
+            Some(std::time::Duration::from_secs(u64::from(
+                RETRY_AFTER_SECONDS
+            )))
         );
-        assert_eq!(
-            response.headers().get(header::RETRY_AFTER),
-            Some(&HeaderValue::from_static("600")),
-            "a crawler should be told to come back in ten minutes"
-        );
-        assert_eq!(
-            response.headers().get(header::CACHE_CONTROL),
-            Some(&HeaderValue::from_static("no-store")),
-            "a failure must not be held in place of the file"
-        );
+        assert_eq!(refusal.message, "robots.txt is temporarily unavailable\n");
     }
 
     /// The refusal asks nothing of anything, and dominates whatever else is
     /// selected, because a refusal cannot be loosened.
     #[tokio::test]
     async fn refusing_every_crawler_asks_no_contributor_and_reads_no_store() {
-        let mut settings = settings();
         let mut refusing = parsed(serde_json::json!({ "modules": ["allow_all", "refuse_all"] }));
         refusing.always_allow = vec!["/ads.txt".to_owned()];
-        settings.robots_txt = Some(refusing);
+        let settings = settings_placing(refusing);
         let store = Arc::new(MemoryKvStore::default());
-        let registry = IntegrationRegistry::new(&settings).expect("should build the registry");
 
-        let response = handle_robots_txt(
+        let file = prepared_by(
             &settings,
+            &[],
             &services_with(Arc::default(), Arc::clone(&store)),
-            &registry,
-            robots_request(),
         )
         .await
-        .expect("the refusal answers without asking");
+        .expect("the refusal answers without asking")
+        .expect("the refusal is prepared");
 
-        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response.headers().get(header::CACHE_CONTROL),
-            Some(&HeaderValue::from_static("public, max-age=3600"))
-        );
-        let body = response
-            .into_body()
-            .into_bytes_bounded(1024)
-            .await
-            .expect("should read the body");
-        assert_eq!(
-            body.as_ref(),
-            b"User-agent: *\nAllow: /ads.txt\nDisallow: /\n",
+            file, "User-agent: *\nAllow: /ads.txt\nDisallow: /\n",
             "the refusal, whatever else is selected"
         );
         assert!(
@@ -699,36 +692,24 @@ mod tests {
         );
     }
 
-    /// A crawler that asks with `HEAD` is told what a `GET` would be told and
-    /// is sent no file.
-    #[tokio::test]
-    async fn a_head_is_answered_with_the_headers_and_no_body() {
-        let mut settings = settings();
-        settings.robots_txt = Some(RobotsTxtConfig::refuse_all());
-        let registry = IntegrationRegistry::new(&settings).expect("should build the registry");
-        let mut request = robots_request();
-        *request.method_mut() = Method::HEAD;
-
-        let response = handle_robots_txt(
-            &settings,
-            &services_with(Arc::default(), Arc::default()),
-            &registry,
-            request,
-        )
-        .await
-        .expect("should answer");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(header::CONTENT_TYPE),
-            Some(&HeaderValue::from_static("text/plain; charset=utf-8"))
+    /// The registry makes the middleware only for settings that carry the
+    /// section, so a publisher keeping their own file is left alone.
+    #[test]
+    fn the_middleware_exists_only_with_the_section() {
+        let without = IntegrationRegistry::new(&settings()).expect("should build the registry");
+        assert!(
+            !without.middleware_ids().contains(&middleware::MODULE),
+            "{:?}",
+            without.middleware_ids()
         );
-        let body = response
-            .into_body()
-            .into_bytes_bounded(16)
-            .await
-            .expect("should read the body");
-        assert!(body.is_empty(), "a HEAD carries no body");
+
+        let with = IntegrationRegistry::new(&settings_placing(RobotsTxtConfig::refuse_all()))
+            .expect("should build the registry");
+        assert!(
+            with.middleware_ids().contains(&middleware::MODULE),
+            "{:?}",
+            with.middleware_ids()
+        );
     }
 
     /// The id of the builder that registers the echoing contributor.
@@ -765,31 +746,23 @@ mod tests {
             .with_module_name(ECHO_BUILDER_MODULE)
     }
 
-    /// The handler asks a contributor for the request it is answering, being
-    /// its host and path, without the query and without the reader's
+    /// The middleware asks a contributor for the request it is answering,
+    /// being its host and path, without the query and without the reader's
     /// evidence.
     #[tokio::test]
-    async fn the_handler_asks_the_contributors_for_the_request_it_answers() {
-        let settings = settings_selecting_echo();
-        let registry = IntegrationRegistry::with_registrations(&settings, &[echo_builder()])
-            .expect("should build the registry");
+    async fn the_middleware_asks_the_contributors_for_the_request_it_answers() {
+        let mut settings = settings_selecting_echo();
+        settings.fetch = settings_placing(RobotsTxtConfig::refuse_all()).fetch;
 
-        let response = handle_robots_txt(
+        let file = prepared_by(
             &settings,
+            &[echo_builder()],
             &services_with(Arc::default(), Arc::default()),
-            &registry,
-            robots_request(),
         )
         .await
-        .expect("should answer");
+        .expect("should answer")
+        .expect("the file is prepared");
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response
-            .into_body()
-            .into_bytes_bounded(4096)
-            .await
-            .expect("should read the body");
-        let file = String::from_utf8(body.to_vec()).expect("the file is text");
         let config = settings
             .robots_txt
             .as_ref()
@@ -814,21 +787,11 @@ mod tests {
         assert!(message.contains("allow_all"), "{message}");
     }
 
-    /// The body of a response, as text.
-    async fn text_of(response: Response<EdgeBody>) -> String {
-        let body = response
-            .into_body()
-            .into_bytes_bounded(4096)
-            .await
-            .expect("should read the body");
-        String::from_utf8(body.to_vec()).expect("the file is text")
-    }
-
     /// A crawler's request for the file, addressed to `host`, carrying
     /// `headers` as well.
-    fn robots_request_to(host: &str, headers: &[(&str, &str)]) -> Request<EdgeBody> {
-        let mut builder = Request::builder()
-            .uri(ROBOTS_TXT_PATH)
+    fn robots_request_to(host: &str, headers: &[(&str, &str)]) -> http::Request<EdgeBody> {
+        let mut builder = http::Request::builder()
+            .uri(format!("https://{host}{ROBOTS_TXT_PATH}"))
             .header(header::HOST, host);
         for &(name, value) in headers {
             builder = builder.header(name, value);
@@ -838,26 +801,97 @@ mod tests {
             .expect("should build the request")
     }
 
+    /// The file the publisher path answers `request` with, under `settings`
+    /// with the echoing contributor registered, while `origin` answers `404`
+    /// so the middleware makes the file.
+    async fn file_through_the_publisher_path(
+        settings: &Settings,
+        services: &RuntimeServices,
+        origin: &crate::platform::test_support::StubHttpClient,
+        request: http::Request<EdgeBody>,
+    ) -> String {
+        let registry = IntegrationRegistry::with_registrations(settings, &[echo_builder()])
+            .expect("should build the registry");
+        let orchestrator = crate::auction::AuctionOrchestrator::new(
+            crate::auction::test_support::legacy_auction_config(settings),
+        );
+        origin.push_response_with_headers(
+            404,
+            b"not found".to_vec(),
+            vec![("content-type", "text/html")],
+        );
+        let method = request.method().clone();
+        let answer = crate::publisher::handle_publisher_request(
+            crate::publisher::AppContext {
+                settings,
+                integration_registry: &registry,
+            },
+            services,
+            None,
+            &mut crate::ec::EcContext::default(),
+            crate::publisher::AuctionDispatch {
+                orchestrator: &orchestrator,
+                slots: &[],
+                registry: None,
+            },
+            request,
+            crate::cache_policy::EdgeCacheHeader::SMaxageFallback,
+        )
+        .await
+        .expect("should answer the request");
+        let response = crate::publisher::buffer_publisher_response_async(
+            answer,
+            &method,
+            settings,
+            &registry,
+            &orchestrator,
+            services,
+        )
+        .await
+        .expect("should make the file");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .into_bytes_bounded(4096)
+            .await
+            .expect("should read the file");
+        String::from_utf8(body.to_vec()).expect("the file is text")
+    }
+
+    /// Services asking `origin`, holding answers in memory, as one instance
+    /// of a host does.
+    fn services_asking(
+        origin: &Arc<crate::platform::test_support::StubHttpClient>,
+    ) -> RuntimeServices {
+        crate::platform::test_support::build_services_with_http_client(
+            Arc::clone(origin) as Arc<dyn crate::platform::PlatformHttpClient>
+        )
+        .with_kv_store(Arc::new(MemoryKvStore::default()))
+        .with_loading_cache(Arc::new(
+            crate::platform::test_support::MemoryLoadingCache::default(),
+        ))
+    }
+
     /// One deployment may serve several hosts, and each is answered with
     /// what its contributors gave for that host, never with an answer held
     /// for another.
     #[tokio::test]
     async fn each_host_is_answered_for_itself() {
-        let settings = settings_selecting_echo();
-        let registry = IntegrationRegistry::with_registrations(&settings, &[echo_builder()])
-            .expect("should build the registry");
-        let services = services_with(Arc::default(), Arc::default());
+        let settings = settings_selecting(
+            serde_json::json!({ "modules": ["echo"] }),
+            ECHO_BUILDER_MODULE,
+        );
+        let origin = Arc::new(crate::platform::test_support::StubHttpClient::new());
+        let services = services_asking(&origin);
 
         for host in [PUBLISHER, "other.publisher.example"] {
-            let response = handle_robots_txt(
+            let file = file_through_the_publisher_path(
                 &settings,
                 &services,
-                &registry,
+                &origin,
                 robots_request_to(host, &[]),
             )
-            .await
-            .expect("should answer");
-            let file = text_of(response).await;
+            .await;
 
             assert!(
                 file.contains(&format!("Disallow: /{host}/robots.txt?")),
@@ -867,14 +901,17 @@ mod tests {
     }
 
     /// `Forwarded` and `X-Forwarded-Host` name whatever host a client likes,
-    /// so a contributor is asked for the host the request was addressed to,
-    /// and an answer made for a claimed host is never held for the real one.
+    /// and the publisher path's own host follows them, so a contributor is
+    /// asked for the host the request was addressed to, and an answer made
+    /// for a claimed host is never held for the real one.
     #[tokio::test]
     async fn a_forwarded_host_is_never_the_host_a_contributor_is_asked_for() {
-        let settings = settings_selecting_echo();
-        let registry = IntegrationRegistry::with_registrations(&settings, &[echo_builder()])
-            .expect("should build the registry");
-        let services = services_with(Arc::default(), Arc::default());
+        let settings = settings_selecting(
+            serde_json::json!({ "modules": ["echo"] }),
+            ECHO_BUILDER_MODULE,
+        );
+        let origin = Arc::new(crate::platform::test_support::StubHttpClient::new());
+        let services = services_asking(&origin);
         let claiming = robots_request_to(
             PUBLISHER,
             &[
@@ -883,19 +920,17 @@ mod tests {
             ],
         );
 
-        let claimed = handle_robots_txt(&settings, &services, &registry, claiming)
-            .await
-            .expect("should answer");
-        let after = handle_robots_txt(
+        let claimed =
+            file_through_the_publisher_path(&settings, &services, &origin, claiming).await;
+        let after = file_through_the_publisher_path(
             &settings,
             &services,
-            &registry,
+            &origin,
             robots_request_to(PUBLISHER, &[]),
         )
-        .await
-        .expect("should answer");
+        .await;
 
-        for file in [text_of(claimed).await, text_of(after).await] {
+        for file in [claimed, after] {
             assert!(
                 !file.contains("elsewhere.example"),
                 "a claimed host should never reach the file: {file}"
@@ -905,6 +940,56 @@ mod tests {
                 "the file should be made for the host addressed: {file}"
             );
         }
+    }
+
+    /// An answer is held for the host the request was addressed to, so a
+    /// call that does not carry that host asks no contributor and refuses
+    /// the request. The refusal asks nothing, so it is still made.
+    #[tokio::test]
+    async fn without_the_addressed_host_only_the_refusal_is_made() {
+        let scripted = Arc::new(Scripted::new(vec![Ok(rules("User-Agent: *\nAllow: /"))]));
+        let asking = middleware::RobotsTxt::new(
+            parsed(serde_json::json!({ "modules": ["scripted"] })),
+            vec![(
+                "scripted",
+                Some(Arc::clone(&scripted) as Arc<dyn RobotsTxtContributor>),
+            )],
+        );
+        let refusing = middleware::RobotsTxt::new(RobotsTxtConfig::refuse_all(), Vec::new());
+        let settings = settings();
+        let services = services_with(Arc::default(), Arc::default());
+        let request = robots_request();
+        let module_context =
+            ModuleContext::new(ModuleRequest::of(&request, services.client_info()))
+                .with_settings(&settings)
+                .with_services(&services);
+        let state = crate::integrations::IntegrationDocumentState::default();
+        let context = crate::middleware::test_support::context(
+            crate::middleware::MiddlewarePhase::Fetch,
+            &state,
+        );
+        let call = module_context.call(
+            middleware::MODULE,
+            crate::permissions::PermissionSet::none(),
+        );
+
+        let refusal = asking
+            .prepare(call, &context)
+            .expect("the middleware prepares")
+            .await
+            .expect_err("no contributor is asked without the host");
+        let file = refusing
+            .prepare(call, &context)
+            .expect("the middleware prepares")
+            .await
+            .expect("the refusal is made without the host");
+
+        assert_eq!(refusal.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(scripted.times_asked(), 0, "no contributor should be asked");
+        assert_eq!(
+            *file.downcast::<String>().expect("the file is text"),
+            "User-agent: *\nDisallow: /\n"
+        );
     }
 
     /// A contributor with nothing to add, which answers a comment and no
@@ -954,11 +1039,11 @@ mod tests {
             .with_module_name(SILENT_BUILDER_MODULE)
     }
 
-    /// The test settings with `robots_txt` as the section and the test
-    /// builder named `module` selected.
+    /// The test settings with `robots_txt` as the section, the entry that
+    /// places the middleware on the file, and the test builder named
+    /// `module` selected.
     fn settings_selecting(robots_txt: serde_json::Value, module: &str) -> Settings {
-        let mut settings = settings();
-        settings.robots_txt = Some(parsed(robots_txt));
+        let mut settings = settings_placing(parsed(robots_txt));
         settings
             .insert_module_config("testing", module, &serde_json::json!({}))
             .expect("should select the test builder");
@@ -977,30 +1062,21 @@ mod tests {
             }),
             SILENT_BUILDER_MODULE,
         );
-        let registry = IntegrationRegistry::with_registrations(&settings, &[silent_builder()])
-            .expect("should build the registry");
 
-        let response = handle_robots_txt(
+        let refusal = prepared_by(
             &settings,
+            &[silent_builder()],
             &services_with(Arc::default(), Arc::default()),
-            &registry,
-            robots_request(),
         )
         .await
-        .expect("should answer");
+        .expect_err("a file with no rule should never be served");
 
+        assert_eq!(refusal.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
-            response.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "a file with no rule should never be served"
-        );
-        assert_eq!(
-            response.headers().get(header::RETRY_AFTER),
-            Some(&HeaderValue::from_static("600"))
-        );
-        assert_eq!(
-            response.headers().get(header::CACHE_CONTROL),
-            Some(&HeaderValue::from_static("no-store"))
+            refusal.retry_after,
+            Some(std::time::Duration::from_secs(u64::from(
+                RETRY_AFTER_SECONDS
+            )))
         );
     }
 
@@ -1015,21 +1091,18 @@ mod tests {
             }),
             SILENT_BUILDER_MODULE,
         );
-        let registry = IntegrationRegistry::with_registrations(&settings, &[silent_builder()])
-            .expect("should build the registry");
 
-        let response = handle_robots_txt(
+        let file = prepared_by(
             &settings,
+            &[silent_builder()],
             &services_with(Arc::default(), Arc::default()),
-            &registry,
-            robots_request(),
         )
         .await
-        .expect("should answer");
+        .expect("should answer")
+        .expect("the file is prepared");
 
-        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            text_of(response).await,
+            file,
             "User-agent: *\nDisallow: /private/\n\n# nothing to add\n"
         );
     }
@@ -1118,8 +1191,6 @@ mod tests {
             accept,
         )
         .with_module_name(CONNECTION_BUILDER_MODULE);
-        let registry = IntegrationRegistry::with_registrations(&settings, &[builder])
-            .expect("should build the registry");
         let connection = crate::platform::ClientInfo {
             client_ip: Some("203.0.113.7".parse().expect("should parse the address")),
             tls_protocol: Some("TLSv1.3".to_owned()),
@@ -1132,10 +1203,10 @@ mod tests {
             ..services_with(Arc::default(), Arc::default()).with_client_info(connection)
         };
 
-        let response = handle_robots_txt(&settings, &services, &registry, robots_request())
+        let file = prepared_by(&settings, &[builder], &services)
             .await
-            .expect("should answer");
-        let file = text_of(response).await;
+            .expect("should answer")
+            .expect("the file is prepared");
 
         assert!(
             file.contains("Disallow: /ip-false/tls-false/ja4-false/edge-false/signals-false"),

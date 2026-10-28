@@ -4481,6 +4481,7 @@ impl Settings {
         self.validate_asset_image_optimizer_profile_sets()?;
         if let Some(robots_txt) = &self.robots_txt {
             robots_txt.prepare_runtime()?;
+            self.require_robots_txt_placed()?;
         }
 
         if let Some(co) = &mut self.creative_opportunities {
@@ -4516,6 +4517,59 @@ impl Settings {
         }
 
         Ok(())
+    }
+
+    /// Refuses a `[robots-txt]` section unless a `[[fetch]]` entry for
+    /// `text/plain` with `path = "/robots.txt"` names the `robots_txt`
+    /// middleware, and refuses any entry naming it on another path or media
+    /// type. Only a `[[fetch]]` entry makes the file where the origin has
+    /// none, and an entry on another path would replace that file with the
+    /// robots.txt rules.
+    fn require_robots_txt_placed(&self) -> Result<(), Report<TrustedServerError>> {
+        use crate::robots_txt::ROBOTS_TXT_PATH;
+        use crate::robots_txt::middleware::{MEDIA_TYPE, MODULE};
+
+        let names = |entry: &crate::middleware::PhaseEntry| {
+            entry.middleware.iter().any(|name| name == MODULE)
+        };
+        let on_the_file = |entry: &crate::middleware::PhaseEntry| {
+            entry.media_type == MEDIA_TYPE && entry.path.as_deref() == Some(ROBOTS_TXT_PATH)
+        };
+        for (phase, entries) in [("fetch", &self.fetch), ("serve", &self.serve)] {
+            for (index, entry) in entries.entries().iter().enumerate() {
+                if names(entry) && !on_the_file(entry) {
+                    return Err(Report::new(TrustedServerError::Settings {
+                        message: format!(
+                            "[[{phase}]] entry {} names `{MODULE}` for `{}` on {}, where it \
+                             would replace each file it covers with robots.txt. Name it only \
+                             in an entry with media_type = `{MEDIA_TYPE}` and path = \
+                             `{ROBOTS_TXT_PATH}`",
+                            index + 1,
+                            entry.media_type,
+                            entry.path.as_deref().map_or_else(
+                                || "every path".to_owned(),
+                                |path| format!("`{path}`")
+                            ),
+                        ),
+                    }));
+                }
+            }
+        }
+        if self
+            .fetch
+            .entries()
+            .iter()
+            .any(|entry| names(entry) && on_the_file(entry))
+        {
+            return Ok(());
+        }
+        Err(Report::new(TrustedServerError::Settings {
+            message: format!(
+                "[robots-txt] is set, but no [[fetch]] entry with media_type = `{MEDIA_TYPE}` and \
+                 path = `{ROBOTS_TXT_PATH}` names `{MODULE}`, so the file would never be made \
+                 where the origin has none. Add that entry"
+            ),
+        }))
     }
 
     /// Returns compiled creative opportunity slots when template delivery is enabled.
@@ -5266,7 +5320,83 @@ mod tests {
     }
 
     fn settings_str_with_robots_txt(section: &str) -> String {
-        format!("{}\n[robots-txt]\n{section}\n", crate_test_settings_str())
+        format!(
+            "{}\n[robots-txt]\n{section}\n\n[[fetch]]\nmedia_type = \"text/plain\"\npath = \"/robots.txt\"\nmiddleware = [\"robots_txt\"]\n",
+            crate_test_settings_str()
+        )
+    }
+
+    #[test]
+    fn a_robots_txt_section_with_no_entry_placing_the_middleware_is_refused() {
+        let toml = format!(
+            "{}\n[robots-txt]\nmodules = \"refuse_all\"\n",
+            crate_test_settings_str()
+        );
+
+        let error = Settings::from_toml(&toml).expect_err("the file would never be made");
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains(
+                "no [[fetch]] entry with media_type = `text/plain` and path = `/robots.txt` names \
+                 `robots_txt`"
+            ),
+            "{message}"
+        );
+    }
+
+    /// The `[[fetch]]` or `[[serve]]` entry placing the middleware on
+    /// `/robots.txt`.
+    const ROBOTS_TXT_ENTRY: &str =
+        "media_type = \"text/plain\"\npath = \"/robots.txt\"\nmiddleware = [\"robots_txt\"]\n";
+
+    /// Settings with `[robots-txt]` refusing every crawler and `entries`.
+    fn settings_str_placing_robots_txt(entries: &str) -> String {
+        format!(
+            "{}\n[robots-txt]\nmodules = \"refuse_all\"\n\n{entries}\n",
+            crate_test_settings_str()
+        )
+    }
+
+    #[test]
+    fn a_fetch_entry_on_the_files_path_places_robots_txt() {
+        let toml = settings_str_placing_robots_txt(&format!(
+            "[[fetch]]\n{ROBOTS_TXT_ENTRY}\n[[serve]]\n{ROBOTS_TXT_ENTRY}"
+        ));
+
+        Settings::from_toml(&toml).expect("an entry on the file's path places the middleware");
+    }
+
+    /// An entry with no path would replace every text file, `ads.txt`
+    /// included, with the robots.txt rules.
+    #[test]
+    fn an_entry_naming_robots_txt_on_another_path_is_refused() {
+        let toml = settings_str_placing_robots_txt(&format!(
+            "[[fetch]]\n{ROBOTS_TXT_ENTRY}\n[[fetch]]\nmedia_type = \"text/plain\"\nmiddleware = [\"robots_txt\"]\n"
+        ));
+
+        let error = Settings::from_toml(&toml).expect_err("every text file would be robots.txt");
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("[[fetch]] entry 2 names `robots_txt` for `text/plain` on every path"),
+            "{message}"
+        );
+    }
+
+    /// Only a `[[fetch]]` entry makes the file where the origin has none, so
+    /// a `[[serve]]` placement alone would leave an origin's `404` standing,
+    /// which a crawler reads as permission to crawl everything.
+    #[test]
+    fn robots_txt_placed_only_in_serve_is_refused() {
+        let toml = settings_str_placing_robots_txt(&format!("[[serve]]\n{ROBOTS_TXT_ENTRY}"));
+
+        let error = Settings::from_toml(&toml).expect_err("the file would never be made");
+
+        assert!(
+            format!("{error:?}").contains("no [[fetch]] entry with media_type = `text/plain`"),
+            "{error:?}"
+        );
     }
 
     #[test]

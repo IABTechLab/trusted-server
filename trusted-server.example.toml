@@ -197,6 +197,10 @@ pull_sync_concurrency = 3
 # an empty file, which a crawler would read as permission.
 #
 # A module's own settings go in its own block, [robots-txt.<name>].
+# A publisher who sells advertising wants /ads.txt in always_allow, because
+# a crawler may ignore an ads.txt that robots.txt disallows. The file is made
+# by core's robots_txt middleware where a [[fetch]] entry for text/plain on
+# the file's path names it, see the entry below the ads.txt one.
 # [robots-txt]
 # modules = ["refuse_all"]
 # always_allow = ["/ads.txt"]
@@ -216,6 +220,14 @@ pull_sync_concurrency = 3
 # media_type = "text/plain"
 # path = "/ads.txt"
 # middleware = ["ads-txt.sellers"]
+
+# The robots.txt the [robots-txt] section describes, made by core's own
+# middleware where this entry names it. The file replaces the origin's own
+# and is made where the origin has none.
+# [[fetch]]
+# media_type = "text/plain"
+# path = "/robots.txt"
+# middleware = ["robots_txt"]
 
 # Sign outbound OpenRTB/API requests. The runtime reads its keys from fixed
 # store names (`jwks_store` / `signing_keys`), and `ts keys` writes them. To keep

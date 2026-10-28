@@ -1149,7 +1149,7 @@ middleware = ["service_version"]
 
 ## robots.txt Configuration
 
-What `/robots.txt` answers. With no `[robots-txt]` section the publisher keeps their own file and `/robots.txt` reaches the origin like any other path.
+What `/robots.txt` answers. With a `[robots-txt]` section, and a `[[fetch]]` entry for `text/plain` on the file's path naming `robots_txt`, core's own middleware makes the file, replacing the origin's own where it has one and making it in place of any other answer. With no section the publisher keeps their own file and `/robots.txt` reaches the origin like any other path.
 
 ### `[robots-txt]`
 
@@ -1171,11 +1171,12 @@ A module with settings of its own reads them from its own block, `[robots-txt.<n
 4. A module is asked for the host the request was addressed to, never one that `Forwarded` or `X-Forwarded-Host` names, and is given nothing of the crawler's connection. A stock build links no loading cache module, so there every request for the file asks each module. In a build that links one, a module's answer is held for that host in the loading cache of the one loading cache module the build links, or of the module `[cache.robots-txt]` names, briefly in memory and in the shared store outside it, so a module is asked again only when no copy young enough is held, rather than by every request, and `[cache.robots-txt]` sets how long the copies last, as described under [Loading caches](#loading-caches). The last answer is also kept apart for 30 days, in the value cache on Fastly and in the key-value store on Cloudflare and Spin, and Axum, which has no key-value store, keeps none. A value cache can drop an entry early, so on Fastly an answer past its age is likely, rather than certain, to be there when a module cannot answer.
 5. A module that cannot answer has its last answer served past its age. With no answer kept at all, or with no rule anywhere in the file, the file is `503` with `Retry-After: 600`, never an empty file, which a crawler would read as permission to crawl everything. Select `allow_all` to allow every crawler.
 6. Spin's key-value store gives an entry no lifetime, so there a kept answer stays until it is replaced, and one kept for settings that have since changed stays until it is deleted from the store. With no loading cache module linked, or several linked and none named in `[cache.robots-txt]`, no copy is held, so every request for the file asks each module, and a deployment whose key-value store cannot be opened keeps no last answer either.
-7. On Fastly the file is answered once the modules have prepared the request, before the Edge Cookie steps and the request filters, so a filter's answer never stands in for it.
+7. The file is made by the `robots_txt` middleware, which runs on `text/plain` at `/robots.txt` alone, in the phase the entry places it in, prepares the file before the document is processed, and replaces the origin's `text/plain` file with it. The origin is asked for its whole file, without a crawler's conditional or range headers. Any other answer to a `GET` or `HEAD`, such as a `404`, a page from a single-page application's catch-all, a redirect or a `401` from a staging site behind a login, has the file made in its place with status `200`. An origin that cannot be reached gives `502`, which a crawler reads as refusing everything. The response takes the deployment's cache policy for the path, as every file does, so where the response is stored a module is asked only when the stored copy has ended, however soon its refresh is due. A refusal, as in point 5, is answered before any document is processed, and nothing is stored.
+8. On Fastly the file is answered once the modules have prepared the request, before the Edge Cookie steps and the request filters, so a filter's answer never stands in for it.
 
 **Which responses carry the header.** An adapter writes `X-Robots-Tag` last when it finalizes a response, replacing any tag already there, so neither an origin page nor `[response_headers]` can loosen it. That covers every route, the publisher fallback and the error path. A response sent before that step does not carry it. On every adapter but Fastly that is the `404` or `405` the router gives a request it does not route. On Fastly it is the two debug endpoints under `/_ts/debug` and a failure before the settings are read.
 
-**Refused when the settings load**: `modules` absent, empty or naming one thing twice, a key that is not a setting, and a block for a module `modules` does not name. A name that nothing the deployment runs supplies is refused at startup.
+**Refused when the settings load**: `modules` absent, empty or naming one thing twice, a key that is not a setting, a block for a module `modules` does not name, a section with no `[[fetch]]` entry for `text/plain` with `path = "/robots.txt"` naming `robots_txt`, because the file would never be made where the origin has none, and an entry naming `robots_txt` on any other path or media type, because it would replace that file with robots.txt. A name that nothing the deployment runs supplies is refused at startup.
 
 **A publisher who sells advertising almost certainly wants `/ads.txt` in `always_allow`.** Google's help for publishers says "The ads.txt file for a domain may be ignored by crawlers if the robots.txt file on a domain disallows one of the following", and lists first "The crawling of the URL path on which an ads.txt file is posted" ([AdSense Help](https://support.google.com/adsense/answer/7679060)). A file that refuses everything disallows that path, so a refusal without the allowance can leave the publisher's `ads.txt` unread.
 
@@ -1185,6 +1186,11 @@ A module with settings of its own reads them from its own block, `[robots-txt.<n
 [robots-txt]
 modules = ["refuse_all"]
 always_allow = ["/ads.txt"]
+
+[[fetch]]
+media_type = "text/plain"
+path = "/robots.txt"
+middleware = ["robots_txt"]
 ```
 
 ## ads.txt Configuration
@@ -2019,6 +2025,7 @@ generated configuration places it in.
 | `ad-tag.google`               | `[[fetch]]` | Writes the `tsjs.adInit` bootstrap into the head and, when `rewrite_script` is set, points a `src` or `href` that is the GPT script's address at `/integrations/gpt/script`                                       |
 | `ad-tag.google.diagnostics`   | `[[serve]]` | For a request that activated diagnostics, writes the bootstrap ahead of the script bundle and the tag that loads the diagnostics module straight after it                                                         |
 | `ads-txt.sellers`             | `[[fetch]]` | Writes the lines `[ads-txt.sellers]` gives at the end of the publisher's `ads.txt`, on `text/plain` alone                                                                                                         |
+| `robots_txt`                  | `[[fetch]]` | Makes the `robots.txt` that `[robots-txt]` describes, in place of whatever the origin answers, on `text/plain` and at `/robots.txt` alone                                                                         |
 | `service_version`             | `[[serve]]` | Writes `X-TS-Version`, the git version the build compiled in, and `X-TS-Service-Version`, the platform's version number of the service, when each is known. Core supplies it, so no section selects it            |
 
 An entry that could not do what it says refuses the configuration, both when

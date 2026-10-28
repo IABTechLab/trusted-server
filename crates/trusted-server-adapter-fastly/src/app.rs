@@ -138,7 +138,6 @@ use trusted_server_core::publisher::{
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
-use trusted_server_core::robots_txt::{ROBOTS_TXT_PATH, handle_robots_txt};
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::{
     DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store_with,
@@ -866,17 +865,6 @@ async fn execute_named(
         return Ok(http_error(&report));
     }
 
-    // A crawler asking for robots.txt is answered once the modules have
-    // prepared the request, before the Edge Cookie steps and the request
-    // filters, so nothing is read from its cookies or written back, and no
-    // filter's answer stands in for the file.
-    if matches!(handler, NamedRouteHandler::RobotsTxt) {
-        let response = handle_robots_txt(&state.settings, &services, &state.registry, req)
-            .await
-            .unwrap_or_else(|error| http_error(&error));
-        return Ok(response);
-    }
-
     let mut ec = build_ec_request_state(&state.settings, &services, &req).await;
     // EcContext creation errors short-circuit before filters, mirroring legacy:
     // the legacy path returns its error response before running filter_request.
@@ -1020,9 +1008,6 @@ async fn run_named_route(
         NamedRouteHandler::FirstPartyProxyRebuild => {
             handle_first_party_proxy_rebuild(&state.settings, services, req).await
         }
-        NamedRouteHandler::RobotsTxt => {
-            unreachable!("robots.txt is answered before EC setup")
-        }
     }
 }
 
@@ -1082,6 +1067,14 @@ async fn dispatch_fallback(
 
     if let Err(report) = state.registry.prepare_request(&state.settings, &mut req) {
         return http_error(&report);
+    }
+
+    // A crawler asking for robots.txt is answered once the modules have
+    // prepared the request, before the Edge Cookie steps and the request
+    // filters, so nothing is read from its cookies or written back, and no
+    // filter's answer stands in for the file.
+    if asks_for_robots_txt(&state.settings, &method, &path) {
+        return answer_robots_txt(state, services, req, &method).await;
     }
 
     let mut ec = build_ec_request_state(&state.settings, services, &req).await;
@@ -1214,6 +1207,58 @@ async fn dispatch_fallback(
 
     let response = result.unwrap_or_else(|e| http_error(&e));
     attach_dispatch_extensions(response, ec, effects)
+}
+
+/// Whether the request is a crawler's `GET` or `HEAD` of the robots.txt that
+/// `[robots-txt]` makes.
+fn asks_for_robots_txt(settings: &Settings, method: &Method, path: &str) -> bool {
+    settings.robots_txt.is_some()
+        && path == trusted_server_core::robots_txt::ROBOTS_TXT_PATH
+        && matches!(*method, Method::GET | Method::HEAD)
+}
+
+/// Answers robots.txt through the publisher path with an empty Edge Cookie
+/// context and no auction, so none of the crawler's cookies or consent
+/// signals are read, and attaches no Edge Cookie state, so the finalize step
+/// writes nothing back.
+async fn answer_robots_txt(
+    state: &AppState,
+    services: &RuntimeServices,
+    req: Request,
+    method: &Method,
+) -> Response {
+    let answer = handle_publisher_request(
+        AppContext {
+            settings: &state.settings,
+            integration_registry: state.registry.as_ref(),
+        },
+        services,
+        None,
+        &mut EcContext::default(),
+        AuctionDispatch {
+            orchestrator: &state.orchestrator,
+            slots: &[],
+            registry: None,
+        },
+        req,
+        EdgeCacheHeader::SurrogateControl,
+    )
+    .await;
+    let response = match answer {
+        Ok(answer) => {
+            publisher_response_into_streaming_response(
+                answer,
+                method,
+                Arc::clone(&state.settings),
+                state.registry.as_ref(),
+                Arc::clone(&state.orchestrator),
+                services.clone(),
+            )
+            .await
+        }
+        Err(report) => Err(report),
+    };
+    response.unwrap_or_else(|report| http_error(&report))
 }
 
 /// Returns `true` when an asset response should carry a (streamed) body.
@@ -1376,7 +1421,6 @@ enum NamedRouteHandler {
     FirstPartyClick,
     FirstPartySign,
     FirstPartyProxyRebuild,
-    RobotsTxt,
 }
 
 struct NamedRoute {
@@ -1495,21 +1539,7 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         primary_methods: &[Method::GET, Method::POST],
         handler: NamedRouteHandler::FirstPartyProxyRebuild,
     },
-    // Only when the settings carry `[robots-txt]`.
-    NamedRoute {
-        path: ROBOTS_TXT_PATH,
-        primary_methods: &[Method::GET, Method::HEAD],
-        handler: NamedRouteHandler::RobotsTxt,
-    },
 ];
-
-/// Whether a named route is served for these settings.
-fn named_route_is_served(settings: &Settings, handler: NamedRouteHandler) -> bool {
-    match handler {
-        NamedRouteHandler::RobotsTxt => settings.robots_txt.is_some(),
-        _ => true,
-    }
-}
 
 fn named_route_handler(
     state: Arc<AppState>,
@@ -1577,9 +1607,6 @@ impl TrustedServerApp {
         // non-primary publisher fallback method is registered from the same
         // row. Adding a named route now requires editing only this table.
         for route in NAMED_ROUTES {
-            if !named_route_is_served(&state.settings, route.handler) {
-                continue;
-            }
             for method in route.primary_methods {
                 router = router.route(
                     route.path,
@@ -3092,6 +3119,120 @@ mod tests {
         assert!(
             !response.headers().contains_key(header::CONTENT_LENGTH),
             "processed streaming publisher responses must not carry a stale Content-Length"
+        );
+    }
+
+    /// `/robots.txt` is the publisher path's, streamed against an origin that
+    /// answers each request in turn. A `GET` has the origin's file replaced
+    /// by the refusal, a `HEAD` has the file made where the origin has none
+    /// and gets no body, and a `POST` keeps the origin's `404`, because a
+    /// file is made only for a `GET` or a `HEAD`. Finalizing gives each the
+    /// refusal's `X-Robots-Tag`, the file's own answer included.
+    #[test]
+    fn robots_txt_is_served_through_the_publisher_path_with_its_tag() {
+        use trusted_server_core::platform::test_support::{
+            StubHttpClient, build_services_with_http_client,
+        };
+
+        let settings = Settings::from_toml(
+            r#"
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            module = "hmac"
+
+            [ec.hmac]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            assume_single_jurisdiction = true
+
+            [request_signing]
+            enabled = false
+
+            [robots-txt]
+            modules = "refuse_all"
+            always_allow = ["/ads.txt"]
+
+            [[fetch]]
+            media_type = "text/plain"
+            path = "/robots.txt"
+            middleware = ["robots_txt"]
+            "#,
+        )
+        .expect("should parse robots.txt test settings")
+        // A loaded domain carries its policy.
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
+        let state = build_state_from_settings(settings).expect("should build state");
+        let origin = Arc::new(StubHttpClient::new());
+        origin.push_response_with_headers(
+            200,
+            b"User-agent: *\nAllow: /\n".to_vec(),
+            vec![("content-type", "text/plain")],
+        );
+        for _ in 0..2 {
+            origin.push_response_with_headers(
+                404,
+                b"<html><body>not found</body></html>".to_vec(),
+                vec![("content-type", "text/html")],
+            );
+        }
+        let services =
+            build_services_with_http_client(Arc::clone(&origin) as Arc<dyn PlatformHttpClient>);
+        let served = |method: Method| {
+            let request = request_builder()
+                .method(method)
+                .uri("https://test-publisher.com/robots.txt")
+                .header(header::HOST, "test-publisher.com")
+                .body(Body::empty())
+                .expect("should build request");
+            let mut response = block_on(super::dispatch_fallback(&state, &services, request));
+            crate::middleware::apply_finalize_headers(&state.settings, None, &mut response);
+            response
+        };
+        let tag = |response: &Response| {
+            response
+                .headers()
+                .get("x-robots-tag")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        let body = |response: Response| {
+            let bytes = block_on(response.into_body().into_bytes_bounded(1024 * 1024))
+                .expect("should read the body");
+            String::from_utf8(bytes.to_vec()).expect("the body is text")
+        };
+
+        let get = served(Method::GET);
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_eq!(tag(&get).as_deref(), Some("noindex, nofollow"));
+        assert_eq!(body(get), "User-agent: *\nAllow: /ads.txt\nDisallow: /\n");
+
+        let head = served(Method::HEAD);
+        assert_eq!(
+            head.status(),
+            StatusCode::OK,
+            "the file is made where the origin has none"
+        );
+        assert_eq!(tag(&head).as_deref(), Some("noindex, nofollow"));
+        assert_eq!(body(head), "", "a HEAD gets no body");
+
+        let post = served(Method::POST);
+        assert_eq!(
+            post.status(),
+            StatusCode::NOT_FOUND,
+            "a file is made only for a GET or a HEAD"
+        );
+        assert_eq!(tag(&post).as_deref(), Some("noindex, nofollow"));
+
+        assert_eq!(
+            origin.recorded_request_methods(),
+            ["GET", "HEAD", "POST"],
+            "each request reaches the origin"
         );
     }
 

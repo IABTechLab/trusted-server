@@ -1840,6 +1840,18 @@ impl IntegrationRegistry {
         inner.ec_module = resolve_ec_module(settings, &inner);
         inner.device_module = resolve_device_module(settings, &inner)?;
         inner.geo_module = geo_module;
+        check_robots_txt_selection(settings, &inner)?;
+        if let Some(config) = settings.robots_txt.as_ref() {
+            // Core's own middleware for the file, made once every registration is in.
+            let selected = crate::robots_txt::select(config, &inner.robots_txt_contributors)?;
+            inner.middleware.push((
+                crate::robots_txt::middleware::MODULE,
+                Arc::new(crate::robots_txt::middleware::RobotsTxt::new(
+                    config.clone(),
+                    selected,
+                )) as Arc<dyn Middleware>,
+            ));
+        }
         // Core's own middleware, which an entry may name whatever the
         // sections select.
         inner.middleware.push((
@@ -1847,7 +1859,6 @@ impl IntegrationRegistry {
             Arc::new(crate::service_version::ServiceVersion::default()),
         ));
         check_middleware(settings, &inner)?;
-        check_robots_txt_selection(settings, &inner)?;
 
         Ok(Self {
             inner: Arc::new(inner),
@@ -1886,23 +1897,6 @@ impl IntegrationRegistry {
         self.inner.device_module.clone()
     }
 
-    /// The robots.txt contributor `[robots-txt] modules` means by `written`,
-    /// with the name it was declared under, or `None` when nothing this
-    /// deployment runs supplies one under that name.
-    #[must_use]
-    pub fn robots_txt_contributor(
-        &self,
-        written: &str,
-    ) -> Option<(&'static str, Arc<dyn RobotsTxtContributor>)> {
-        let offered = &self.inner.robots_txt_contributors;
-        let names: Vec<&str> = offered.iter().map(|(name, _)| *name).collect();
-        let name = crate::module_name::resolve(ROBOTS_TXT_TYPE, written, &names)?;
-        offered
-            .iter()
-            .find(|(offered_name, _)| *offered_name == name)
-            .map(|(offered_name, contributor)| (*offered_name, Arc::clone(contributor)))
-    }
-
     /// The name of every middleware a running module supplies, in
     /// registration order.
     #[must_use]
@@ -1938,8 +1932,9 @@ impl IntegrationRegistry {
     }
 
     /// The middleware the first entry covering a response selects, in the
-    /// order they run, for a response of `media_type` to a request for `path`.
-    /// A response no entry covers gives an empty chain.
+    /// order they run, for a response of `media_type` to a request for `path`,
+    /// leaving out any that does not work on `path`. A response no entry
+    /// covers gives an empty chain.
     #[must_use]
     pub fn middleware_chain(
         &self,
@@ -1952,8 +1947,27 @@ impl IntegrationRegistry {
             .for_response(media_type, path)
             .iter()
             .filter_map(|name| self.inner.middleware_named(name).map(Arc::clone))
+            .filter(|middleware| middleware.handles_path(path))
             .collect();
         MiddlewareChain::new(phase, media_type, middleware)
+    }
+
+    /// Whether a middleware that an entry of either phase names for a request
+    /// for `path`, under any media type, needs the origin's whole body, see
+    /// [`Middleware::needs_whole_body`]. Asked before the origin answers, so
+    /// before the media type of the response is known.
+    #[must_use]
+    pub fn middleware_needs_whole_body(&self, settings: &Settings, path: &str) -> bool {
+        MiddlewarePhase::ALL.iter().any(|phase| {
+            settings
+                .phase_entries(*phase)
+                .entries()
+                .iter()
+                .filter(|entry| entry.covers_path(path))
+                .flat_map(|entry| &entry.middleware)
+                .filter_map(|name| self.inner.middleware_named(name))
+                .any(|middleware| middleware.handles_path(path) && middleware.needs_whole_body())
+        })
     }
 
     /// Every integration id the registry was built from, named or not, in

@@ -918,3 +918,139 @@ async fn the_sellers_module_makes_an_ads_txt_the_origin_does_not_have() {
         "should be the sellers lines alone"
     );
 }
+
+// ---------------------------------------------------------------------------
+// robots.txt
+// ---------------------------------------------------------------------------
+
+/// The route test settings with a `[robots-txt]` section that refuses every
+/// crawler and keeps one path open, and the entry that places the file.
+fn settings_refusing_every_crawler() -> trusted_server_core::settings::Settings {
+    trusted_server_core::settings::Settings::from_toml(
+        r#"
+            [publisher]
+            domain = "test-publisher.example.com"
+            cookie_domain = ".test-publisher.example.com"
+            origin_url = "https://origin.test-publisher.example.com"
+            proxy_secret = "integration-test-proxy-secret"
+
+            [ec]
+            module = "hmac"
+
+            [ec.hmac]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            assume_single_jurisdiction = true
+
+            [robots-txt]
+            modules = "refuse_all"
+            always_allow = ["/ads.txt"]
+
+            [[fetch]]
+            media_type = "text/plain"
+            path = "/robots.txt"
+            middleware = ["robots_txt"]
+        "#,
+    )
+    .expect("should parse robots.txt test settings")
+    .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
+}
+
+/// `/robots.txt` is the publisher path's, answered against an origin that
+/// answers each request in turn. A `GET` has the origin's file replaced by
+/// the refusal, a `HEAD` has the file made where the origin has none and
+/// gets no body, and a `POST` keeps the origin's `404`, because a file is
+/// made only for a `GET` or a `HEAD`. Each carries the refusal's
+/// `X-Robots-Tag`, the file's own answer included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn robots_txt_is_served_through_the_publisher_path_with_its_tag() {
+    use std::sync::Arc;
+
+    use edgezero_core::http::Response;
+    use trusted_server_core::platform::PlatformHttpClient;
+    use trusted_server_core::platform::test_support::{
+        StubHttpClient, build_services_with_http_client,
+    };
+
+    let origin = Arc::new(StubHttpClient::new());
+    origin.push_response_with_headers(
+        200,
+        b"User-agent: *\nAllow: /\n".to_vec(),
+        vec![("content-type", "text/plain")],
+    );
+    for _ in 0..2 {
+        origin.push_response_with_headers(
+            404,
+            b"<html><body>not found</body></html>".to_vec(),
+            vec![("content-type", "text/html")],
+        );
+    }
+    let router = TrustedServerApp::routes_with_settings_and_services(
+        settings_refusing_every_crawler(),
+        build_services_with_http_client(Arc::clone(&origin) as Arc<dyn PlatformHttpClient>),
+    )
+    .expect("should build router with a stub origin");
+    let robots_txt = |method: &str| {
+        edgezero_core::http::request_builder()
+            .method(method)
+            .uri("https://test-publisher.example.com/robots.txt")
+            .header("host", "test-publisher.example.com")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request")
+    };
+    let tag = |response: &Response| {
+        response
+            .headers()
+            .get("x-robots-tag")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    let body = |response: Response| {
+        let bytes = response
+            .into_body()
+            .into_bytes()
+            .expect("should hold the answer in memory");
+        String::from_utf8(bytes.to_vec()).expect("the body is text")
+    };
+
+    let get = router
+        .clone()
+        .oneshot(robots_txt("GET"))
+        .await
+        .expect("should serve the GET");
+    assert_eq!(get.status(), 200);
+    assert_eq!(tag(&get).as_deref(), Some("noindex, nofollow"));
+    assert_eq!(body(get), "User-agent: *\nAllow: /ads.txt\nDisallow: /\n");
+
+    let head = router
+        .clone()
+        .oneshot(robots_txt("HEAD"))
+        .await
+        .expect("should serve the HEAD");
+    assert_eq!(
+        head.status(),
+        200,
+        "the file is made where the origin has none"
+    );
+    assert_eq!(tag(&head).as_deref(), Some("noindex, nofollow"));
+    assert_eq!(body(head), "", "a HEAD gets no body");
+
+    let post = router
+        .clone()
+        .oneshot(robots_txt("POST"))
+        .await
+        .expect("should serve the POST");
+    assert_eq!(
+        post.status(),
+        404,
+        "a file is made only for a GET or a HEAD"
+    );
+    assert_eq!(tag(&post).as_deref(), Some("noindex, nofollow"));
+
+    assert_eq!(
+        origin.recorded_request_methods(),
+        ["GET", "HEAD", "POST"],
+        "each request reaches the origin"
+    );
+}
