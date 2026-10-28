@@ -88,6 +88,8 @@ run_case() {
 
     "${spin_args[@]}" >"$log_path" 2>&1 &
     APP_PID=$!
+    # The component installs no logger, so a negative case is checked by
+    # its status alone, which smoke_wait_http waits for.
     smoke_wait_http "http://127.0.0.1:$port/" "$expected_status" \
         "$body_path" "$headers_path"
     smoke_assert_process_alive "$APP_PID" "Spin" "$log_path"
@@ -105,10 +107,6 @@ run_case() {
             [ "$CONFIG_PUSHED" = true ] ||
                 smoke_die "missing-secret case ran before the config push"
         fi
-        # The component installs no logger, so a negative case is checked by
-        # its status alone.
-        [ "$SMOKE_HTTP_STATUS" = "$expected_status" ] ||
-            smoke_die "negative case returned HTTP $SMOKE_HTTP_STATUS, expected $expected_status"
     else
         smoke_assert_success "$body_path" "$ORIGIN_PORT" "$port"
     fi

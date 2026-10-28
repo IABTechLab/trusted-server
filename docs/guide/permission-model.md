@@ -189,7 +189,7 @@ The policy lives in a human-editable permissions YAML document, the
 publisher's own file, which policy owners keep under version control. A
 domain's settings name it in `[permissions] policy`, by its stem, and
 `ts config push --permissions <file>` supplies it when the service is
-deployed. No build carries a policy, and a domain whose settings name no
+deployed. No adapter build carries a policy, and a domain whose settings name no
 policy, or whose file is missing or is not the file that was pushed, does
 not start and answers 500. The repository sample is
 `config/permissions/sample.yaml`. That sample is for testing and evaluation
