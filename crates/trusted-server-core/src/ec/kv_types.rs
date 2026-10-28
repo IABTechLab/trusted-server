@@ -98,6 +98,10 @@ pub struct KvEntry {
     /// identity provider ID. Never sent to bidders.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ps: BTreeMap<String, KvProviderState>,
+    /// The newest pending-key generation merged into this row (spec 5.3,
+    /// Pending key). Items at or below it are never merged again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pg: Option<u64>,
 }
 
 /// Consent state within a KV entry.
@@ -544,6 +548,7 @@ impl KvEntry {
             network: None,
             ids: BTreeMap::new(),
             ps: BTreeMap::new(),
+            pg: None,
         }
     }
 
@@ -575,6 +580,7 @@ impl KvEntry {
             network: None,
             ids,
             ps: BTreeMap::new(),
+            pg: None,
         }
     }
 
@@ -608,6 +614,7 @@ impl KvEntry {
             network: None,
             ids: BTreeMap::new(),
             ps: BTreeMap::new(),
+            pg: None,
         }
     }
 

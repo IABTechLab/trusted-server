@@ -572,6 +572,7 @@ impl EcContext {
                 .saturating_add(self.identity.capture_kv_writes()),
             flush: input.flush.copied(),
             removal_lost: self.identity.removal_lost(),
+            removal_deferred: self.identity.removal_deferred(),
             withdrawal_after_send: input.withdrawal_after_send,
             withdrawal_after_send_failed: input.withdrawal_after_send_failed,
             capture_unpersisted: self.identity.capture_unpersisted().clone(),
@@ -755,6 +756,13 @@ impl EcContext {
     #[must_use]
     pub fn has_pending_removals(&self) -> bool {
         self.identity.pending_removals().is_some()
+    }
+
+    /// Whether a capture kept positive writes for the pending key, which
+    /// [`identity::flush::defer_capture_writes`] appends after send.
+    #[must_use]
+    pub fn has_capture_writes(&self) -> bool {
+        !self.identity.capture_writes().is_empty()
     }
 
     /// Forgets a withdrawn EC ID whose retried tombstone was written.

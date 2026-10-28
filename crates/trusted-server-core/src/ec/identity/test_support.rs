@@ -666,8 +666,10 @@ pub struct WriteCounts {
     pub if_generation_match: usize,
     /// Writes in [`EcKvWriteMode::Overwrite`] mode.
     pub overwrite: usize,
-    /// Point reads.
+    /// Point reads of identity rows.
     pub lookups: usize,
+    /// Point reads of pending keys (spec 5.3, Pending key).
+    pub pending_lookups: usize,
 }
 
 impl WriteCounts {
@@ -689,8 +691,10 @@ pub struct WriteCountingEcKv {
     if_generation_match: AtomicUsize,
     overwrite: AtomicUsize,
     lookups: AtomicUsize,
+    pending_lookups: AtomicUsize,
     refusals: Mutex<BTreeMap<String, usize>>,
     failing: Mutex<BTreeSet<String>>,
+    failing_all: Mutex<BTreeSet<String>>,
     pauses: Mutex<Vec<Duration>>,
 }
 
@@ -704,8 +708,10 @@ impl WriteCountingEcKv {
             if_generation_match: AtomicUsize::new(0),
             overwrite: AtomicUsize::new(0),
             lookups: AtomicUsize::new(0),
+            pending_lookups: AtomicUsize::new(0),
             refusals: Mutex::new(BTreeMap::new()),
             failing: Mutex::new(BTreeSet::new()),
+            failing_all: Mutex::new(BTreeSet::new()),
             pauses: Mutex::new(Vec::new()),
         }
     }
@@ -718,6 +724,19 @@ impl WriteCountingEcKv {
     /// Panics when the failure table is poisoned.
     pub fn fail_conditional_writes(&self, key: &str) {
         self.failing
+            .lock()
+            .expect("should lock the failures")
+            .insert(key.to_owned());
+    }
+
+    /// Fails every write to `key`, whatever its mode, with a store error.
+    /// A failed write is still counted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the failure table is poisoned.
+    pub fn fail_all_writes(&self, key: &str) {
+        self.failing_all
             .lock()
             .expect("should lock the failures")
             .insert(key.to_owned());
@@ -755,6 +774,7 @@ impl WriteCountingEcKv {
             if_generation_match: self.if_generation_match.load(Ordering::SeqCst),
             overwrite: self.overwrite.load(Ordering::SeqCst),
             lookups: self.lookups.load(Ordering::SeqCst),
+            pending_lookups: self.pending_lookups.load(Ordering::SeqCst),
         }
     }
 
@@ -765,6 +785,7 @@ impl WriteCountingEcKv {
             &self.if_generation_match,
             &self.overwrite,
             &self.lookups,
+            &self.pending_lookups,
         ] {
             count.store(0, Ordering::SeqCst);
         }
@@ -777,7 +798,12 @@ impl EcKvStore for WriteCountingEcKv {
     }
 
     fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
-        self.lookups.fetch_add(1, Ordering::SeqCst);
+        let count = if key.starts_with("pending:") {
+            &self.pending_lookups
+        } else {
+            &self.lookups
+        };
+        count.fetch_add(1, Ordering::SeqCst);
         self.inner.lookup(key)
     }
 
@@ -796,6 +822,17 @@ impl EcKvStore for WriteCountingEcKv {
             EcKvWriteMode::Overwrite => &self.overwrite,
         };
         count.fetch_add(1, Ordering::SeqCst);
+        if self
+            .failing_all
+            .lock()
+            .expect("should lock the failures")
+            .contains(key)
+        {
+            return Err(Report::new(TrustedServerError::KvStore {
+                store_name: self.inner.store_name().to_owned(),
+                message: "store unavailable".to_owned(),
+            }));
+        }
         if matches!(write.mode, EcKvWriteMode::IfGenerationMatch(_)) {
             if self
                 .failing

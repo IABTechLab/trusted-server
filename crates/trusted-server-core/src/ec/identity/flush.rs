@@ -20,6 +20,7 @@ use super::descriptor::{Input, Resolves};
 use super::ids::{IdentityProviderId, SourceDomain, UnixTime};
 use super::input::{ProviderConsent, Region, ResolveSignals, StoredId, ThreadRandom};
 use super::mutation::{ApplyContext, IdentityMutation, ProviderStateChange, apply};
+use super::pending::{append_pending, load_pending};
 use super::policy::{PolicySignals, fingerprint_bits};
 use super::provider::IdentityProvider;
 use super::removal::{RemovalTiming, log_removal_lost, write_removals};
@@ -126,6 +127,10 @@ pub fn run_after_send(input: AfterSendInput<'_>) -> FlushOutcome {
         Vec::new()
     };
     let needs_cluster_size = phase_one_entry.is_some_and(lacks_cluster_size);
+    // Every returning writer reads the pending key: what earlier requests
+    // could not write waits there for it (spec 5.3, Pending key).
+    let phase_one_applied = phase_one_entry.and_then(|entry| entry.pg).unwrap_or(0);
+    let mut pending = load_pending(graph, &ec_id, phase_one_applied);
     // A re-grant clears a sticky opt-out on the writer's one flush (spec 8).
     let regranted = opt_out_clears(
         &phase_one_view,
@@ -134,7 +139,12 @@ pub fn run_after_send(input: AfterSendInput<'_>) -> FlushOutcome {
         facts.policy_signals,
     );
 
-    if mutation.is_empty() && due.is_empty() && !needs_cluster_size && regranted.is_empty() {
+    if mutation.is_empty()
+        && due.is_empty()
+        && !needs_cluster_size
+        && regranted.is_empty()
+        && pending.is_none()
+    {
         return FlushOutcome::Skipped;
     }
 
@@ -170,6 +180,10 @@ pub fn run_after_send(input: AfterSendInput<'_>) -> FlushOutcome {
     };
     if !live.consent.ok {
         return drop_mutation(&ec_id, "tombstone");
+    }
+    let live_applied = live.pg.unwrap_or(0);
+    if pending.is_some() && live_applied != phase_one_applied {
+        pending = load_pending(graph, &ec_id, live_applied);
     }
 
     // The row is live and consenting: only now may the EC ID leave TS.
@@ -222,15 +236,29 @@ pub fn run_after_send(input: AfterSendInput<'_>) -> FlushOutcome {
         }
     }
 
+    // Only this request's own removals go back to the pending key if the
+    // write fails: the merged items are still there.
+    let own_removals = mutation.removals();
+    let pending_generation = pending.map(|merge| {
+        let mut merged = merge.mutation;
+        merged.absorb(core::mem::take(&mut mutation));
+        mutation = merged;
+        merge.generation
+    });
+
     let random = ThreadRandom;
     let apply_context = ApplyContext {
         now,
         random: &random,
         catalog: runtime.catalog(),
     };
-    let Some(applied) = apply(&mutation, &live, &apply_context) else {
+    let Some(mut applied) = apply(&mutation, &live, &apply_context) else {
         return drop_mutation(&ec_id, "invalid");
     };
+    if let Some(generation) = pending_generation {
+        applied.entry.pg = Some(generation);
+        applied.changed = true;
+    }
     if !applied.changed {
         return FlushOutcome::NoChange;
     }
@@ -242,7 +270,14 @@ pub fn run_after_send(input: AfterSendInput<'_>) -> FlushOutcome {
                 "Identity flush for '{}' lost its generation check; not retried",
                 log_id(&ec_id)
             );
-            write_failed(graph, context, &ec_id, &mutation, &apply_context)
+            write_failed(
+                graph,
+                context,
+                &ec_id,
+                &mutation,
+                &own_removals,
+                &apply_context,
+            )
         }
         Err(error) => {
             log::warn!(
@@ -250,7 +285,14 @@ pub fn run_after_send(input: AfterSendInput<'_>) -> FlushOutcome {
                 log_id(&ec_id),
                 error.current_context()
             );
-            write_failed(graph, context, &ec_id, &mutation, &apply_context)
+            write_failed(
+                graph,
+                context,
+                &ec_id,
+                &mutation,
+                &own_removals,
+                &apply_context,
+            )
         }
     }
 }
@@ -272,13 +314,14 @@ fn lacks_cluster_size(entry: &KvEntry) -> bool {
             .is_none()
 }
 
-/// Writes the failed flush's removals alone, and counts each one every
-/// attempt failed to write (spec 5.2 phase 4 step 5).
+/// Writes the failed flush's removals alone. When that fails too, the
+/// request's own removals go to the pending key (spec 5.2 phase 4 step 5).
 fn write_failed(
     graph: &KvIdentityGraph,
     context: &mut EcContext,
     ec_id: &str,
     mutation: &IdentityMutation,
+    own_removals: &IdentityMutation,
     apply_context: &ApplyContext<'_>,
 ) -> FlushOutcome {
     let removals = mutation.removals();
@@ -296,20 +339,61 @@ fn write_failed(
         RemovalTiming::AfterSend,
     );
     if outcome == RemovalWriteOutcome::Failed {
-        log_removal_lost(ec_id, &removals);
-        for _ in removals.removal_labels() {
+        defer_or_lose(graph, context, ec_id, own_removals);
+    }
+    FlushOutcome::WriteFailed { removals: outcome }
+}
+
+/// Appends removals the row write missed to the pending key and counts each
+/// as deferred, or, when that fails too, logs and counts each as lost.
+fn defer_or_lose(
+    graph: &KvIdentityGraph,
+    context: &mut EcContext,
+    ec_id: &str,
+    removals: &IdentityMutation,
+) {
+    if !removals.has_removals() {
+        return;
+    }
+    let deferred = append_pending(graph, ec_id, removals, current_timestamp());
+    if !deferred {
+        log_removal_lost(ec_id, removals);
+    }
+    for _ in removals.removal_labels() {
+        if deferred {
+            context.identity_mut().record_removal_deferred();
+        } else {
             context.identity_mut().record_removal_lost();
         }
     }
-    FlushOutcome::WriteFailed { removals: outcome }
+}
+
+/// Appends the positive writes a capture kept, on a request that is not the
+/// writer, to the pending key for the next writer (spec 5.3, Pending key).
+/// Without an EC ID, or after a global revoke, it drops them.
+pub fn defer_capture_writes(context: &mut EcContext, graph: &KvIdentityGraph) {
+    let writes = core::mem::take(context.identity_mut().capture_writes_mut());
+    if writes.is_empty() || context.global_revoke_requested() {
+        return;
+    }
+    let Some(ec_id) = context.ec_value().map(str::to_owned) else {
+        return;
+    };
+    if !append_pending(graph, &ec_id, &writes, current_timestamp()) {
+        log::warn!(
+            "Capture writes for '{}' could not reach the pending key",
+            log_id(&ec_id)
+        );
+    }
 }
 
 /// Tries once more, after send, the capture removal write that failed before
 /// send (spec 5.3).
 ///
-/// This is the last attempt: the pending removals are taken, and each one
-/// that still cannot be written is logged and counted as lost. Without a
-/// pending removal it does nothing.
+/// This is the last row attempt: the pending removals are taken, and when
+/// they still cannot be written they go to the pending key, or are logged
+/// and counted as lost if that fails too. Without a pending removal it does
+/// nothing.
 pub fn retry_pending_removals(context: &mut EcContext, graph: &KvIdentityGraph) {
     let Some(removals) = context.identity().pending_removals().cloned() else {
         return;
@@ -333,10 +417,9 @@ pub fn retry_pending_removals(context: &mut EcContext, graph: &KvIdentityGraph) 
         },
         RemovalTiming::AfterSend,
     );
+    context.identity_mut().set_pending_removals(None);
     if outcome == RemovalWriteOutcome::Failed {
-        lose_pending_removals(context);
-    } else {
-        context.identity_mut().set_pending_removals(None);
+        defer_or_lose(graph, context, &ec_id, &removals);
     }
 }
 
@@ -586,6 +669,7 @@ mod tests {
     use crate::consent::types::GppConsent;
     use crate::ec::identity::denials::{denials, filter_browser_candidates};
     use crate::ec::identity::mutation::PartnerIdChange;
+    use crate::ec::identity::pending::pending_key;
     use crate::ec::identity::removal::PER_KEY_WRITE_WINDOW;
     use crate::ec::identity::request::WriterDecision;
     use crate::ec::identity::revision::{record_revision, uid_hash, visitor_key};
@@ -1124,11 +1208,101 @@ mod tests {
     }
 
     #[test]
+    fn a_removal_the_row_write_missed_goes_to_the_pending_key() {
+        let (mut fixture, _) = removal_fixture();
+        fixture
+            .store
+            .refuse_conditional_writes(TEST_EC_ID, usize::MAX);
+
+        let outcome = fixture.run(&ScriptedLimiter::allowing());
+
+        assert_eq!(
+            outcome,
+            FlushOutcome::WriteFailed {
+                removals: RemovalWriteOutcome::Failed
+            },
+            "should miss the row write"
+        );
+        assert_eq!(
+            fixture.context.identity().removal_lost(),
+            0,
+            "should lose nothing"
+        );
+        assert_eq!(
+            fixture.context.identity().removal_deferred(),
+            2,
+            "should defer the removal and the opt-out"
+        );
+        let merge = load_pending(&fixture.graph, TEST_EC_ID, 0).expect("should hold the item");
+        assert_eq!(
+            merge.mutation.removal_labels(),
+            vec![
+                (pid(PULL_ID), None),
+                (pid(PULL_ID), Some(source(PULL_SOURCE)))
+            ],
+            "should hold the request's removals only"
+        );
+    }
+
+    #[test]
+    fn the_next_writer_merges_the_pending_key_once() {
+        let mut row = live_row(true);
+        let record = record_for_test("old-uid", Some(PULL_ID), 900);
+        let expected = record_revision(&record);
+        row.ids.insert(PULL_SOURCE.to_owned(), record);
+        let mut fixture = Fixture::new(Some(&row), false);
+        let mut removal = IdentityMutation::default();
+        removal.add_change(PartnerIdChange::OwnerRemove {
+            source: source(PULL_SOURCE),
+            provider: pid(PULL_ID),
+            expected,
+        });
+        assert!(
+            append_pending(&fixture.graph, TEST_EC_ID, &removal, current_timestamp()),
+            "should seed the pending key"
+        );
+
+        fixture.store.reset_counts();
+
+        let outcome = fixture.run(&ScriptedLimiter::allowing());
+
+        assert_eq!(outcome, FlushOutcome::Written, "should write the merge");
+        assert_eq!(
+            fixture.store.writes().pending_lookups,
+            1,
+            "should read the pending key once"
+        );
+        let merged = fixture.row();
+        assert!(
+            !merged.ids.contains_key(PULL_SOURCE),
+            "should apply the pending removal"
+        );
+        let watermark = merged.pg.expect("should store the watermark");
+        assert!(
+            load_pending(&fixture.graph, TEST_EC_ID, watermark).is_none(),
+            "should cover every pending item"
+        );
+
+        fixture
+            .context
+            .set_kv_snapshot(fixture.graph.load_snapshot(TEST_EC_ID));
+        fixture.store.reset_counts();
+        let again = fixture.run(&ScriptedLimiter::allowing());
+        assert_eq!(again, FlushOutcome::Skipped, "should merge nothing twice");
+        assert_eq!(
+            fixture.store.writes().if_generation_match,
+            0,
+            "should write nothing twice"
+        );
+    }
+
+    #[test]
     fn failed_removal_retry_counts_removal_lost() {
         let (mut fixture, _) = removal_fixture();
         fixture
             .store
             .refuse_conditional_writes(TEST_EC_ID, usize::MAX);
+        fixture.store.fail_all_writes(&pending_key(TEST_EC_ID));
 
         let outcome = fixture.run(&ScriptedLimiter::allowing());
 

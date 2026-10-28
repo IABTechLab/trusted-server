@@ -20,6 +20,7 @@ pub mod input;
 pub mod measurement;
 pub(crate) mod mirror;
 pub(crate) mod mutation;
+pub(crate) mod pending;
 pub(crate) mod policy;
 pub mod provider;
 pub(crate) mod removal;

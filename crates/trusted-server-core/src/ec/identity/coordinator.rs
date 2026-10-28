@@ -1998,6 +1998,18 @@ fn passes_consent_steps(descriptor: &ProviderDescriptor, context: &EcContext, no
 struct CaptureAsk {
     removals: Vec<PartnerIdChange>,
     state: ProviderStateChange,
+    /// Positive changes that pass the consent steps and differ from what KV
+    /// holds, for the writer's flush or the pending key (spec 5.3).
+    positives: Vec<PartnerIdChange>,
+}
+
+/// The source and record of a positive change.
+fn positive_record(change: &PartnerIdChange) -> Option<(&SourceDomain, &KvPartnerId)> {
+    match change {
+        PartnerIdChange::FillMissing { source, record }
+        | PartnerIdChange::OwnerWrite { source, record, .. } => Some((source, record)),
+        PartnerIdChange::OwnerRemove { .. } | PartnerIdChange::WriterRemove { .. } => None,
+    }
 }
 
 /// The sources the provider claims that a result carries IDs for, once each.
@@ -2015,7 +2027,8 @@ fn positive_sources(
         .collect()
 }
 
-/// Reads one result for its removals, opt-out and clear, and nothing else.
+/// Reads one result for its removals, opt-out and clear, and for the
+/// positive changes worth keeping.
 fn capture_ask(
     deps: &IdentityDeps<'_>,
     context: &EcContext,
@@ -2056,13 +2069,34 @@ fn capture_ask(
         result,
         state,
     } = changes;
-    let resulting = result.map_or(state, |result| result.state);
+    let (resulting, result_ids) = match result {
+        Some(result) => (result.state, result.ids),
+        None => (state, Vec::new()),
+    };
+    let (removals, positives): (Vec<_>, Vec<_>) = changes
+        .into_iter()
+        .chain(result_ids)
+        .partition(PartnerIdChange::is_removal);
+    let keeps_positives = positive
+        && !opted_out
+        && !view.is_opted_out(id)
+        && passes_consent_steps(descriptor, context, now.as_secs());
     let mut ask = CaptureAsk {
-        removals: changes
-            .into_iter()
-            .filter(PartnerIdChange::is_removal)
-            .collect(),
+        removals,
         state: ProviderStateChange::default(),
+        positives: if keeps_positives {
+            positives
+                .into_iter()
+                .filter(|change| {
+                    positive_record(change).is_some_and(|(source, record)| {
+                        view.record(source)
+                            .is_none_or(|stored| stored.eids != record.eids)
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
     };
     if let Some(opt_out) = resulting.opt_out.filter(|_| opted_out) {
         ask.state.opt_out = Some(opt_out);
@@ -2194,6 +2228,20 @@ pub(crate) fn run_capture(
             mutation.add_change(removal);
         }
         mutation.merge_state(id.clone(), ask.state);
+        // The writer's own flush stores them; any other request leaves them
+        // to the pending key after send (spec 5.3, Pending key).
+        if !unreadable {
+            for change in ask.positives {
+                if context.identity().writer() {
+                    context.identity_mut().mutation_mut().add_change(change);
+                } else {
+                    context
+                        .identity_mut()
+                        .capture_writes_mut()
+                        .add_change(change);
+                }
+            }
+        }
     }
 
     // The tombstone the finalize step writes supersedes every other removal.
@@ -2243,8 +2291,11 @@ mod tests {
     use crate::ec::identity::descriptor::{
         ConsentPolicy, Input, ProviderDescriptor, ResolveKind, Resolves, UsOptOut,
     };
+    use crate::ec::identity::flush::defer_capture_writes;
     use crate::ec::identity::input::{ProviderConsent, SeededRandom, ThreadRandom};
+    use crate::ec::identity::pending::{load_pending, pending_key};
     use crate::ec::identity::policy::fingerprint_bits;
+    use crate::ec::identity::request::WriterDecision;
     use crate::ec::identity::resolution::{ResolvedEid, ResolvedUid};
     use crate::ec::identity::revision::{record_revision, uid_hash};
     use crate::ec::identity::test_support::FakeRateLimiter;
@@ -6029,6 +6080,114 @@ mod tests {
             }
         }
 
+        fn kept_sources(mutation: &IdentityMutation) -> Vec<&str> {
+            mutation
+                .stand_alone_changes()
+                .iter()
+                .filter_map(|change| {
+                    crate::ec::identity::coordinator::positive_record(change)
+                        .map(|(source, _)| source.as_str())
+                })
+                .collect()
+        }
+
+        #[test]
+        fn capture_positive_from_another_request_waits_in_the_pending_key() {
+            let mut fixture = CaptureFixture::new(vec![lockr()], Some(&live_row()));
+
+            fixture.capture(
+                &lockr_path(),
+                &json!({"tokens": [{"source": FIRST, "value": "secret-uid-1"}]}),
+            );
+
+            assert_eq!(
+                kept_sources(fixture.context.identity().capture_writes()),
+                vec![FIRST],
+                "should keep the positive for after send"
+            );
+            assert_eq!(
+                fixture.store.writes().total(),
+                0,
+                "should write nothing before send"
+            );
+
+            defer_capture_writes(&mut fixture.context, &fixture.graph);
+
+            let merge = load_pending(&fixture.graph, TEST_EC_ID, 0).expect("should hold the write");
+            assert_eq!(
+                kept_sources(&merge.mutation),
+                vec![FIRST],
+                "should append the positive to the pending key"
+            );
+            assert_eq!(
+                fixture.row(),
+                live_row(),
+                "should leave the row to the next writer"
+            );
+        }
+
+        #[test]
+        fn capture_positive_from_the_writer_joins_its_flush() {
+            let mut fixture = CaptureFixture::new(vec![lockr()], Some(&live_row()));
+            fixture
+                .context
+                .identity_mut()
+                .set_writer_decision(WriterDecision {
+                    writer: true,
+                    is_real_browser: true,
+                    user_agent: Some("ExampleBrowser/1.0".to_owned()),
+                    dnt: false,
+                    page_url: None,
+                });
+
+            fixture.capture(
+                &lockr_path(),
+                &json!({"tokens": [{"source": FIRST, "value": "secret-uid-1"}]}),
+            );
+
+            assert_eq!(
+                kept_sources(fixture.context.identity().mutation()),
+                vec![FIRST],
+                "should stage the positive in the writer's mutation"
+            );
+            assert!(
+                fixture.context.identity().capture_writes().is_empty(),
+                "should keep nothing for the pending key"
+            );
+        }
+
+        #[test]
+        fn capture_positive_is_kept_only_from_a_browser_and_when_it_changes_kv() {
+            let body = json!({"tokens": [{"source": FIRST, "value": "secret-uid-1"}]});
+            let mut bot = CaptureFixture::new(vec![lockr()], Some(&live_row())).not_a_browser();
+            bot.capture(&lockr_path(), &body);
+            assert!(
+                bot.context.identity().capture_writes().is_empty(),
+                "should keep nothing from a client that is not a browser"
+            );
+
+            let mut first = CaptureFixture::new(vec![lockr()], Some(&live_row()));
+            first.capture(&lockr_path(), &body);
+            let (_, record) = first
+                .context
+                .identity()
+                .capture_writes()
+                .stand_alone_changes()
+                .iter()
+                .find_map(crate::ec::identity::coordinator::positive_record)
+                .expect("control: a first capture keeps the positive");
+            let mut stored = live_row();
+            stored.ids.insert(FIRST.to_owned(), record.clone());
+
+            let mut again = CaptureFixture::new(vec![lockr()], Some(&stored));
+            again.capture(&lockr_path(), &body);
+
+            assert!(
+                again.context.identity().capture_writes().is_empty(),
+                "should keep nothing KV already holds"
+            );
+        }
+
         #[test]
         fn capture_stores_no_positive_id_and_counts_it() {
             let mut fixture = CaptureFixture::new(vec![lockr()], Some(&live_row()));
@@ -6187,12 +6346,41 @@ mod tests {
         }
 
         #[test]
+        fn capture_removal_after_both_attempts_goes_to_the_pending_key() {
+            let seeded = row_with(&[(FIRST, "secret-uid-a", None)]);
+            let mut fixture = CaptureFixture::new(vec![lockr()], Some(&seeded));
+            fixture.store.fail_conditional_writes(TEST_EC_ID);
+
+            fixture.capture(&lockr_path(), &json!({"invalidate": [FIRST]}));
+            fixture.retry_after_send();
+
+            assert_eq!(
+                fixture.context.identity().removal_lost(),
+                0,
+                "should lose nothing"
+            );
+            assert_eq!(
+                fixture.context.identity().removal_deferred(),
+                1,
+                "should defer the removal"
+            );
+            let merge =
+                load_pending(&fixture.graph, TEST_EC_ID, 0).expect("should hold the removal");
+            assert_eq!(
+                merge.mutation.removal_labels(),
+                vec![(pid("lockr"), Some(source(FIRST)))],
+                "should hold the capture's removal"
+            );
+        }
+
+        #[test]
         fn capture_removal_lost_after_both_attempts_is_counted_and_logged_without_a_value() {
             install_capturing_logger();
             let provider = answering_capture_provider("lostcap", &[FIRST], None);
             let seeded = row_with(&[(FIRST, "secret-uid-lost-9137", None)]);
             let mut fixture = CaptureFixture::new(vec![provider], Some(&seeded));
             fixture.store.fail_conditional_writes(TEST_EC_ID);
+            fixture.store.fail_all_writes(&pending_key(TEST_EC_ID));
 
             fixture.capture(&capture_path("lostcap"), &json!({"invalidate": [FIRST]}));
             fixture.retry_after_send();
@@ -6539,10 +6727,12 @@ mod tests {
                 "should remove the provider's source record"
             );
 
-            // A failed opt-out write gets the after-send retry, then is lost.
+            // A failed opt-out write gets the after-send retry, then is lost
+            // when the pending key cannot take it either.
             let mut failing = CaptureFixture::new(vec![provider.clone()], Some(&seeded));
             unreadable(&mut failing);
             failing.store.fail_conditional_writes(TEST_EC_ID);
+            failing.store.fail_all_writes(&pending_key(TEST_EC_ID));
             failing.capture(&capture_path("unreadcap"), &json!({"opted_out": true}));
             assert!(
                 failing.context.identity().pending_removals().is_some(),

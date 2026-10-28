@@ -283,18 +283,20 @@ these costs for it:
   (section 2.2). Full-fidelity sets from capture wait for open question 4
   (sections 4.7,
   12.2, 15).
-- **A failed removal write can be lost.** A capture removal write is tried
-  before send with the withdrawal path's CAS attempts and once more after
-  send (section 5.3). A writer whose flush fails retries its removals alone
-  with the same CAS attempts (section 5.2, phase 4). When every attempt
-  fails, the removal is logged at error and counted in `removal_lost`, and
-  nothing keeps it. Removals are rare, and a vendor's own SDK holds a
-  revocation too.
+- **A failed removal write waits in the pending key.** A capture removal
+  write is tried before send with the withdrawal path's CAS attempts and
+  once more after send (section 5.3). A writer whose flush fails retries its
+  removals alone with the same CAS attempts (section 5.2, phase 4). When
+  every attempt fails, the removal is appended to the EC ID's pending key
+  and counted in `removal_deferred`, and the next writer merges it (section
+  5.3, The pending key). Only when that append fails too is it logged at
+  error and counted in `removal_lost`.
 - **A failed flush has no backup.** Browser ingest is re-derived from
   `ts-eids`, and provider results are resolved again by a later writer
   (section 5.2, phase 4).
-- **Every returning writer navigation reads KV once.** No navigation is
-  answered from a cookie with zero reads (section 5.2).
+- **Every returning writer navigation reads KV twice.** It reads the row
+  and the pending key. No navigation is answered from a cookie with zero
+  reads (section 5.2).
 - **Server-only IDs are readable by page scripts.** UID2 advertising tokens
   and LiveRamp envelopes are in `ts-eids-s`, which is not `HttpOnly`.
   `x-ts-eids` already exposes them (section 9.3).
@@ -1920,8 +1922,10 @@ tombstone drops its mutation (section 5.4, step 1).
    window (1 second), because the usual cause of the failed flush is
    another tab's write within the last second. A per-key limit on one of its
    attempts waits another window and counts as an attempt, like a
-   generation mismatch. When those fail too, they are lost and counted in
-   `removal_lost`. Nothing else backs the flush, so:
+   generation mismatch. When those fail too, the request's own removals go
+   to the pending key (section 5.3), and only when that append fails are
+   they lost and counted in `removal_lost`. Nothing else backs the flush,
+   so:
    - browser ingest is re-derived from `ts-eids` by the next navigation
    - every positive provider result is lost: hold-mode answers and
      after-send results, with their state changes and `ps.n`/`ps.f`. Each
@@ -1934,8 +1938,10 @@ tombstone drops its mutation (section 5.4, step 1).
      later initial call re-seeds it
 
 **Cost per page load.** Writes are at most one, plus the removal-only retry
-when a flush that holds removals fails. Reads,
-compared with today:
+when a flush that holds removals fails, and a pending-key append when that
+fails too. Reads, compared with today, for a writer navigation; each also
+reads the pending key once in phase 4 (section 5.3, The pending key), which
+the table leaves out:
 
 | Navigation                        | Today                  | This design                                                         |
 | --------------------------------- | ---------------------- | ------------------------------------------------------------------- |
@@ -1943,7 +1949,8 @@ compared with today:
 | No auction, no provider due       | 0 or 1                 | 1 (phase 1). Phase 4 reuses it                                      |
 | An after-send provider dispatches | 2 (preload, pull sync) | 2: phase 1 and the phase 4 re-read                                  |
 
-Every returning writer navigation reads KV once in phase 1. That read finds
+Every returning writer navigation reads the row once in phase 1, and the
+pending key once in phase 4. The row read finds
 orphans, answers eligibility and filters browser candidates, so no cookie
 copy of the row is needed. Each `/auction` and `/_ts/page-bids` keeps its
 one existing read. Orphan recovery adds the reads it adds today, in the rare
@@ -1982,15 +1989,47 @@ the whole of an SPA session. Revision 15 removes that.
   `TooManyRequests`), and any other error still ends the attempt
 - writes nothing when the read shows a tombstone, a missing row or the
   removal already applied
-- when both attempts fail, logs at error with the provider ID and source
-  only, and increments `removal_lost`. Nothing keeps the removal
-  (section 2.3)
+- when both attempts fail, appends the removal to the pending key below and
+  increments `removal_deferred`. Only when that append fails too does it log
+  at error with the provider ID and source only, and increment
+  `removal_lost` (section 2.3)
 
 It runs whatever the request's consent, including when consent is unusable
 but not withdrawn, because a revocation can arrive then. A writer
 navigation of the same page load that flushes with its phase 1 generation
 after this write fails its CAS and is not retried (section 5.2, phase 4);
 its browser ingest is re-derived at the next navigation.
+
+**The pending key.** Decided after the round 14 review (section 15,
+questions 2 and 4). `pending:<ec_id>` holds what a request could not write
+to the row, for the next writer to merge:
+
+- **What goes in.** A removal, opt-out or clear whose row write and
+  after-send retry both failed, from a capture or from a writer's flush.
+  And a capture's positive change from a request that is not the writer,
+  when it passes the consent steps (`passes_consent_steps`), the provider
+  is not opted out, and its entry set differs from what the capture's view
+  read. A positive change keeps the revision the capture read as its
+  `expected`, so a merge never overwrites a record that changed since. When
+  the capturing request is itself the writer, its positive changes join its
+  own mutation and skip the pending key.
+- **The append.** Read the key, drop items older than its one-day TTL,
+  append one item `{g, at, ch, ps}` and write with a CAS (`Add` when the key
+  is absent), up to five attempts. `g` is the item's generation:
+  `max(last g + 1, now * 1000)`, so a key that expired and comes back never
+  reuses a generation. A key holds at most 16 items; an append to a full
+  key fails. Positive capture changes are appended after send; a failed
+  append drops them with a warning, as before this decision.
+- **The merge.** Every returning writer reads the pending key in phase 4,
+  before deciding it has nothing to do. Items with `g` above the row's `pg`
+  merge before the request's own mutation, under the rules of section 5.4:
+  a removal applies as in the removal write, and a positive change is
+  skipped when its UIDs hash into `ps.iv` or `ps.ov` or its owner is opted
+  out. The write stores the newest merged `g` as `pg`. When the write
+  fails, the items stay, and only the request's own removals are appended.
+- **What it never does.** The key is never deleted; its TTL ends it.
+  Auctions and `/identify` never read it, so a deferred positive ID is not
+  served until a writer has merged it.
 
 `/auction` and `/_ts/page-bids` return the mirror payload of section 6.2 in
 their JSON response, from the KV row they read. The shim writes
@@ -2343,6 +2382,7 @@ literals move to them. `PartnerIdUpdate` (`ec/kv.rs:75-90`) gains
 | `ps.iv` | Hashes of UIDs the owner invalidated, oldest first, at most 128, so they are not re-seeded (section 7.2)                                    |
 | `ps.ov` | Hashes of UIDs the provider's opt-out removed, oldest first, at most 128. Emptied when the opt-out clears (section 8)                       |
 | `ps.st` | The provider's private state, as embedded JSON (a raw value, not an escaped string) of at most 1,024 bytes. KV only                         |
+| `pg`    | The newest pending-key generation merged into the row (section 5.3, The pending key). Items at or below it are never merged again           |
 
 `KvEntry` validation (`ec/kv_types.rs:375`) adds: the entry-set limits of
 section 4.5 (UID-level and EID-level `ext` at most 2,048 bytes, 8 entries
@@ -4169,12 +4209,17 @@ token.
 - Passive capture runs from `handle_proxy` only for providers with a capture
   rule matching the request, decodes gzip and brotli bodies under the caps,
   never reads the request body, and never touches `n`, `f` or the breaker.
-- A capture stores no positive ID and increments `capture_unpersisted`
-  without logging a value. Its removals, opt-out and any clear are written
-  by the capture removal write on that request, before send.
+- A capture writes no positive ID itself and increments
+  `capture_unpersisted` without logging a value. A positive change that
+  passes the consent steps and differs from KV joins the writer's mutation,
+  or, on any other request, the pending key after send. Its removals,
+  opt-out and any clear are written by the capture removal write on that
+  request, before send.
 - The capture removal write retries only a CAS conflict, up to five
   attempts, tries once more after send when those fail, and on a second
-  failure increments `removal_lost` without logging a value. It
+  failure appends to the pending key and increments `removal_deferred`. It
+  increments `removal_lost`, without logging a value, only when that append
+  fails too. It
   writes nothing for a tombstone, a missing row or an already applied
   removal, and it runs on the unusable-consent path.
 - A writer navigation whose phase 1 snapshot predates a capture removal
@@ -4267,10 +4312,11 @@ so adapter tests can use it. `KvIdentityGraph::counting` counts reads only
   or `/auction`, whatever `ts-eids-s` holds.
 - No response sets a server identity cookie other than `ts-ec`.
 
-**Failed flush.** After a refused write, the mutation's removals, opt-outs and clears are written alone with up to five CAS attempts, and a mutation without them makes no second write. When those attempts fail too, `removal_lost` is incremented without logging a value. The next writer navigation re-derives browser ingest from `ts-eids` and calls the still-due providers again within the burst cap.
+**Failed flush.** After a refused write, the mutation's removals, opt-outs and clears are written alone with up to five CAS attempts, and a mutation without them makes no second write. When those attempts fail too, the request's own removals go to the pending key, and `removal_lost` is incremented, without logging a value, only when that append fails. The next writer navigation merges the pending key, re-derives browser ingest from `ts-eids` and calls the still-due providers again within the burst cap.
 
-**Reads.** Every returning writer navigation pays exactly one KV read in
-phase 1, plus the phase 4 re-read when an after-send provider dispatches.
+**Reads.** Every returning writer navigation pays one KV read of the row in
+phase 1 and one of the pending key in phase 4, plus the phase 4 re-read
+when an after-send provider dispatches.
 `/auction` and `/_ts/page-bids` pay their existing one read and no more. No
 request opens or parses `ts-eids-s`.
 
@@ -4495,7 +4541,7 @@ one before:
 
    It changes behaviour on its own: fewer KV writes, `/auction`,
    `/_ts/page-bids` and `/identify` stop writing, every returning writer
-   navigation reads KV once, and new visitors reach pull partners from
+   navigation reads the row and the pending key, and new visitors reach pull partners from
    their second page load. Write and read counters per page load show the
    effect. Operators move `pull_sync_ttl_sec`, `pull_sync_rate_limit` and
    `ec.pull_sync_concurrency` to their replacements before deploying it,
@@ -4572,19 +4618,24 @@ a KV migration to version 1, which this spec does not provide.
 2. **Lost removals.** A removal write that fails all its attempts is lost
    (sections 5.2, 5.3). After launch, watch
    `removal_lost`. If it is not close to zero, should a durable
-   fallback come back, and in what form?
+   fallback come back, and in what form? **Decided (round 14):** the
+   pending key (section 5.3) holds it for the next writer;
+   `removal_lost` now counts only a removal whose append failed too.
 3. **Global revoke and a granting CMP.** A global revoke clears the EC
    cookie, as a withdrawal does, but the CMP's consent may still grant. The
    next navigation then mints a new EC. Should a global revoke also stop
-   minting until consent changes? **Decided (round 14):** yes. `revoke_scope
-= "global"` stays, and the `ts-ec-revoked` marker stops minting until the
+   minting until consent changes? **Decided (round 14):** yes. The global
+   scope stays, and the `ts-ec-revoked` marker stops minting until the
    consent fingerprint changes (section 8, Revoke scope).
 4. **Durable stager results.** Stagers persist no positive ID (section
    5.3), so a positive Lockr capture, with its full entry set, reaches KV
    only as the one UID browser ingest picks. Should a durable path
    come back for it, for example a capture-driven write within G4, if
    `capture_unpersisted` shows that captures carry IDs or fields the
-   browser path does not?
+   browser path does not? **Decided (round 14):** yes, through the pending
+   key (section 5.3). A positive capture that differs from KV is merged by
+   the next writer within its one write, so G4 holds; auctions do not read
+   the key.
 5. **Who reads `ts-eids-s`, and does it meet the product rule?** The
    product rule is that provider IDs go to a first-party cookie and to KV,
    with the cookie read first. Since revision 14 the server never reads the
@@ -4641,23 +4692,24 @@ Decisions made while writing this spec, with the user:
 Revision 15 applies these decisions, made by the user after the round 14
 review, which allowed breaking changes:
 
-| Decision              | Choice                                                                                                                                                                                                                                                              |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Stager providers      | None. Resolving providers run only on writer navigations, so every outcome, backoff included, is stored. Stagers serve KV                                                                                                                                           |
-| Removals              | Written to KV on the request that carries them. `ts-eids-r`, its keyring and secrets, the overflow write and the strips-only rollout step are removed                                                                                                               |
-| Non-browser removals  | Applied, as consent withdrawals are; only clears need a real browser. Changed after the round 14 review from dropping them                                                                                                                                          |
-| Expiry scope          | G7 covers owned expiring sources. A stateless owner keeps its expired record as a refresh anchor until `exp` plus its declared refresh grace. Unowned IDs keep no lifetime (section 2.3). Changed after the round 14 review                                         |
-| Opt-out clears        | A TCF re-grant clears only a denial `fp` recorded (new TCF bit 16), with no `LastUpdated` comparison. A clear stores a watermark, the `at` of the opt-out it read, as `ps.oc`, and clears apply before opt-outs. Changed after the round 14 review                  |
-| Backend budget        | `max_backend_requests` (default 32) bounds origin, auction and provider calls in one execution; a provider call past it is skipped, not a failure, and a hold call reserves the origin and the auction. Added after the round 14 review                             |
-| Per-IP ceiling        | `max_calls_per_ip_per_minute` (default 10) caps one provider's calls per client address across visitors, keyed on an HMAC of the IP, next to the per-visitor cap. Breaker failures are not required to come from distinct visitors. Added after the round 14 review |
-| Reader-first rollout  | Rollout step 0, from `main`, reads version 2 rows, never rewrites them except to tombstone, and serves no stored ID from a row with a provider opt-out, so step 1 can roll back and deploy alongside old instances. Added after the round 14 review                 |
-| Global revoke minting | A global revoke also sets `ts-ec-revoked` with the consent fingerprint, and no EC is minted until the request's fingerprint differs. Decided after the round 14 review                                                                                              |
-| Capture               | Revoke-only: removals, opt-out and clear. Positive IDs are counted, never stored. `capture_enabled` and request-body consent are removed                                                                                                                            |
-| Capture-only opt-out  | Also removes the records of its sources that no provider wrote, and blocks the browser's values for them. A capture-only provider cannot own a source and must list its `sources`                                                                                   |
-| Provider denials      | A provider's `ps.iv` and `ps.ov` filter browser candidates for unowned sources too. An opt-out's removals go to `ps.ov`, which its clear empties                                                                                                                    |
-| Mirror feedback       | The shim never copies `ts-eids-s` into `ts-eids` or the `/auction` body                                                                                                                                                                                             |
-| Dry run               | Removed, with `is_dry_run`                                                                                                                                                                                                                                          |
-| KV schema             | Version 2 with one record shape. Version 1 rows are read and upgraded on write. Rollout step 0 reads version 2 and never rewrites it, so step 1 can roll back to it                                                                                                 |
-| Stored hashes         | `ps.iv` hashes are unkeyed and the consent fingerprint is a plain bitmask, because the row already holds the raw values. No legacy revision hash                                                                                                                    |
-| Pull sync             | The pull-complete marker and the legacy pull sync config keys are removed                                                                                                                                                                                           |
-| Withdrawal retry      | A tombstone that fails before send gets one more attempt after send                                                                                                                                                                                                 |
+| Decision              | Choice                                                                                                                                                                                                                                                                             |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Stager providers      | None. Resolving providers run only on writer navigations, so every outcome, backoff included, is stored. Stagers serve KV                                                                                                                                                          |
+| Removals              | Written to KV on the request that carries them. `ts-eids-r`, its keyring and secrets, the overflow write and the strips-only rollout step are removed                                                                                                                              |
+| Non-browser removals  | Applied, as consent withdrawals are; only clears need a real browser. Changed after the round 14 review from dropping them                                                                                                                                                         |
+| Expiry scope          | G7 covers owned expiring sources. A stateless owner keeps its expired record as a refresh anchor until `exp` plus its declared refresh grace. Unowned IDs keep no lifetime (section 2.3). Changed after the round 14 review                                                        |
+| Opt-out clears        | A TCF re-grant clears only a denial `fp` recorded (new TCF bit 16), with no `LastUpdated` comparison. A clear stores a watermark, the `at` of the opt-out it read, as `ps.oc`, and clears apply before opt-outs. Changed after the round 14 review                                 |
+| Backend budget        | `max_backend_requests` (default 32) bounds origin, auction and provider calls in one execution; a provider call past it is skipped, not a failure, and a hold call reserves the origin and the auction. Added after the round 14 review                                            |
+| Per-IP ceiling        | `max_calls_per_ip_per_minute` (default 10) caps one provider's calls per client address across visitors, keyed on an HMAC of the IP, next to the per-visitor cap. Breaker failures are not required to come from distinct visitors. Added after the round 14 review                |
+| Reader-first rollout  | Rollout step 0, from `main`, reads version 2 rows, never rewrites them except to tombstone, and serves no stored ID from a row with a provider opt-out, so step 1 can roll back and deploy alongside old instances. Added after the round 14 review                                |
+| Global revoke minting | A global revoke also sets `ts-ec-revoked` with the consent fingerprint, and no EC is minted until the request's fingerprint differs. Decided after the round 14 review                                                                                                             |
+| Pending key           | Removals whose writes all failed, and positive captures from a request that is not the writer, go to `pending:<ec_id>` (one-day TTL, CAS append, 16 items). Every writer reads it and merges items above the row's `pg`. Auctions never read it. Decided after the round 14 review |
+| Capture               | Revoke-only: removals, opt-out and clear. Positive IDs are counted, never stored. `capture_enabled` and request-body consent are removed                                                                                                                                           |
+| Capture-only opt-out  | Also removes the records of its sources that no provider wrote, and blocks the browser's values for them. A capture-only provider cannot own a source and must list its `sources`                                                                                                  |
+| Provider denials      | A provider's `ps.iv` and `ps.ov` filter browser candidates for unowned sources too. An opt-out's removals go to `ps.ov`, which its clear empties                                                                                                                                   |
+| Mirror feedback       | The shim never copies `ts-eids-s` into `ts-eids` or the `/auction` body                                                                                                                                                                                                            |
+| Dry run               | Removed, with `is_dry_run`                                                                                                                                                                                                                                                         |
+| KV schema             | Version 2 with one record shape. Version 1 rows are read and upgraded on write. Rollout step 0 reads version 2 and never rewrites it, so step 1 can roll back to it                                                                                                                |
+| Stored hashes         | `ps.iv` hashes are unkeyed and the consent fingerprint is a plain bitmask, because the row already holds the raw values. No legacy revision hash                                                                                                                                   |
+| Pull sync             | The pull-complete marker and the legacy pull sync config keys are removed                                                                                                                                                                                                          |
+| Withdrawal retry      | A tombstone that fails before send gets one more attempt after send                                                                                                                                                                                                                |

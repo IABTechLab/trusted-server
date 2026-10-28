@@ -199,6 +199,34 @@ impl KvIdentityGraph {
         self.store.store_name()
     }
 
+    /// Reads any key of the store, such as a pending key, raw.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::KvStore`] on store open or read failure.
+    pub(crate) fn lookup_key(
+        &self,
+        key: &str,
+    ) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+        self.store.lookup(key)
+    }
+
+    /// Writes any key of the store, such as a pending key, raw, with no
+    /// metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::KvStore`] on store open or write failure.
+    pub(crate) fn write_key(
+        &self,
+        key: &str,
+        body: &str,
+        ttl: Duration,
+        mode: EcKvWriteMode,
+    ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+        self.write_entry(key, body, "", ttl, mode)
+    }
+
     fn kv_error(&self, message: String) -> Report<TrustedServerError> {
         Report::new(TrustedServerError::KvStore {
             store_name: self.store_name().to_owned(),

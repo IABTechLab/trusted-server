@@ -50,6 +50,7 @@ pub struct IdentityMeasurement {
     pub(crate) kv_writes: u32,
     pub(crate) flush: Option<FlushOutcome>,
     pub(crate) removal_lost: u32,
+    pub(crate) removal_deferred: u32,
     pub(crate) withdrawal_after_send: bool,
     pub(crate) withdrawal_after_send_failed: bool,
     pub(crate) capture_unpersisted: BTreeMap<(IdentityProviderId, SourceDomain), u32>,
@@ -92,6 +93,12 @@ impl IdentityMeasurement {
         self.removal_lost
     }
 
+    /// Removals the row write missed that went to the pending key.
+    #[must_use]
+    pub fn removal_deferred(&self) -> u32 {
+        self.removal_deferred
+    }
+
     /// Whether a withdrawal tombstone needed its after-send run.
     #[must_use]
     pub fn withdrawal_after_send(&self) -> bool {
@@ -122,13 +129,14 @@ impl core::fmt::Display for IdentityMeasurement {
         write!(
             formatter,
             "cookie_header_bytes={} route={} kv_reads={} kv_writes={} flush={} removal_lost={} \
-             withdrawal_after_send={} withdrawal_after_send_failed={} capture_unpersisted={}",
+             removal_deferred={} withdrawal_after_send={} withdrawal_after_send_failed={} capture_unpersisted={}",
             self.cookie_header_bytes,
             self.route,
             self.kv_reads,
             self.kv_writes,
             FlushLabel(self.flush),
             self.removal_lost,
+            self.removal_deferred,
             u8::from(self.withdrawal_after_send),
             u8::from(self.withdrawal_after_send_failed),
             CaptureUnpersisted(&self.capture_unpersisted),
@@ -219,6 +227,7 @@ mod tests {
             kv_writes: 0,
             flush: None,
             removal_lost: 0,
+            removal_deferred: 0,
             withdrawal_after_send: false,
             withdrawal_after_send_failed: false,
             capture_unpersisted,

@@ -43,7 +43,9 @@ pub(crate) struct RequestIdentity {
     hold_dispatched: bool,
     mutation: IdentityMutation,
     pending_removals: Option<IdentityMutation>,
+    capture_writes: IdentityMutation,
     removal_lost: u32,
+    removal_deferred: u32,
     cookie_header_bytes: usize,
     create_attempts: u32,
     capture_unpersisted: BTreeMap<(IdentityProviderId, SourceDomain), u32>,
@@ -60,7 +62,9 @@ impl core::fmt::Debug for RequestIdentity {
             .field("is_real_browser", &self.is_real_browser)
             .field("mutation_changes", &self.mutation.change_count())
             .field("has_pending_removals", &self.pending_removals.is_some())
+            .field("capture_writes", &self.capture_writes.change_count())
             .field("removal_lost", &self.removal_lost)
+            .field("removal_deferred", &self.removal_deferred)
             .field("has_runtime", &self.runtime.is_some())
             .finish_non_exhaustive()
     }
@@ -161,6 +165,29 @@ impl RequestIdentity {
     /// Keeps a removal write for one retry after send.
     pub(crate) fn set_pending_removals(&mut self, removals: Option<IdentityMutation>) {
         self.pending_removals = removals;
+    }
+
+    /// Positive capture writes a request that is not the writer keeps for
+    /// the pending key (spec 5.3, Pending key).
+    #[must_use]
+    pub(crate) fn capture_writes(&self) -> &IdentityMutation {
+        &self.capture_writes
+    }
+
+    /// The capture writes, to fill or take.
+    pub(crate) fn capture_writes_mut(&mut self) -> &mut IdentityMutation {
+        &mut self.capture_writes
+    }
+
+    /// Removals the row write missed that went to the pending key.
+    #[must_use]
+    pub(crate) fn removal_deferred(&self) -> u32 {
+        self.removal_deferred
+    }
+
+    /// Counts one removal that went to the pending key.
+    pub(crate) fn record_removal_deferred(&mut self) {
+        self.removal_deferred = self.removal_deferred.saturating_add(1);
     }
 
     /// Removals every attempt failed to write (spec 5.2 phase 4, 5.3).

@@ -236,10 +236,23 @@ impl IdentityMutation {
         &self.partner_ids
     }
 
+    /// The stand-alone changes, removals and positives alike, for the
+    /// pending key.
+    #[must_use]
+    pub(crate) fn stand_alone_changes(&self) -> &[PartnerIdChange] {
+        &self.partner_ids
+    }
+
+    /// Each provider state change that holds an opt-out or clear, for the
+    /// pending key.
+    pub(crate) fn removal_states(
+        &self,
+    ) -> impl Iterator<Item = (&IdentityProviderId, &ProviderStateChange)> {
+        self.all_states().filter(|(_, state)| state.has_removal())
+    }
+
     /// Whether nothing would change.
     #[must_use]
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.partner_ids.is_empty()
             && self.results.is_empty()

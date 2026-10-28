@@ -283,7 +283,7 @@ Pull partners run in the same after-send step, from a visitor's second page load
 
 The `ts-ec-pull-complete` completeness cookie no longer exists. Trusted Server neither sets nor reads it. A copy that a browser still holds is ignored and expires on its own within its one-hour `Max-Age`.
 
-Each request also logs one `identity request measurement: ...` line after the response is sent. It carries the inbound `Cookie` header size in bytes, KV reads and writes labelled by route kind (`writer`, `stager` or `new_ec`), the flush outcome, the number of lost removals, and whether a withdrawal tombstone needed its after-send run and failed. It holds no EC ID, UID or cookie value. It replaces the `EID sync measurement: ...` line for returning visitors; that line is now logged only for a new EC.
+Each request also logs one `identity request measurement: ...` line after the response is sent. It carries the inbound `Cookie` header size in bytes, KV reads and writes labelled by route kind (`writer`, `stager` or `new_ec`), the flush outcome, the number of removals deferred to the pending key and of lost removals, and whether a withdrawal tombstone needed its after-send run and failed. It holds no EC ID, UID or cookie value. It replaces the `EID sync measurement: ...` line for returning visitors; that line is now logged only for a new EC.
 
 ### The `ts-eids-s` Mirror Cookie
 
@@ -300,7 +300,7 @@ Identity providers fetch or capture IDs on the server. Engineers who write one s
 
 ### Capture Provider Checklist
 
-A capture provider reads responses that Trusted Server proxies for a vendor. It is revoke-only: a captured revocation, opt-out or clear is written to KV, and captured positive IDs are only counted in `capture_unpersisted`, never stored. Work through these steps before enabling one on a live service:
+A capture provider reads responses that Trusted Server proxies for a vendor. A captured revocation, opt-out or clear is written to KV at once. A captured positive ID is counted in `capture_unpersisted`; when it comes from a browser whose consent allows the provider and differs from what KV holds, it is stored by the next writer navigation, through the `pending:<ec_id>` KV key. A removal whose KV writes all fail waits in the same key (`removal_deferred` on the measurement line) and is counted in `removal_lost` only when that key cannot take it either. Work through these steps before enabling one on a live service:
 
 1. **Register every captured source.** Each source the provider declares has an `[[ec.partners]]` entry with `bidstream_enabled = true` and the right `openrtb_atype`.
 2. **Move a source off pull sync first.** A source that is going to have an `owner` must not also have `pull_sync_enabled = true`. A pull-sync entry registers a generic pull provider that claims the source, and two providers cannot claim an owned source.

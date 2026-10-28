@@ -18,8 +18,8 @@ use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::{ec_finalize_response, retry_failed_withdrawals};
 use trusted_server_core::ec::identity::IdentityRuntime;
 use trusted_server_core::ec::identity::flush::{
-    AfterSendInput, FlushOutcome, lose_pending_removals, may_flush, retry_pending_removals,
-    run_after_send,
+    AfterSendInput, FlushOutcome, defer_capture_writes, lose_pending_removals, may_flush,
+    retry_pending_removals, run_after_send,
 };
 use trusted_server_core::ec::identity::measurement::{IdentityMeasurement, MeasurementInput};
 use trusted_server_core::ec::kv::KvIdentityGraph;
@@ -724,6 +724,15 @@ fn finalize_send_and_flush_measured(
         }
     }
 
+    // Positive capture IDs from a request that is not the writer wait in the
+    // pending key for the next writer.
+    if ec_state.ec_context.has_capture_writes() {
+        match graph_once() {
+            Some(graph) => defer_capture_writes(&mut ec_state.ec_context, &graph),
+            None => log::warn!("capture writes dropped: identity graph unavailable"),
+        }
+    }
+
     let outcome = flush_after_send(
         runtime,
         settings,
@@ -1161,7 +1170,11 @@ mod tests {
             cookie.len(),
             "should hold the inbound Cookie header size"
         );
-        assert_eq!(measurement.kv_reads(), 1, "should count the phase 1 read");
+        assert_eq!(
+            measurement.kv_reads(),
+            2,
+            "should count the phase 1 read and the pending-key read"
+        );
         assert_eq!(measurement.kv_writes(), 1, "should count the one write");
         assert_eq!(
             measurement.route(),
@@ -3857,17 +3870,30 @@ mod tests {
                 Some(FlushOutcome::WriteFailed {
                     removals: trusted_server_core::ec::identity::flush::RemovalWriteOutcome::Failed
                 }),
-                "should report the removals lost when every attempt is refused"
+                "should report the removal write failed when every attempt is refused"
             );
             assert_writes(
                 &refused_always.store,
-                (0, 6, 0),
-                "the flush once, then the removals up to five times",
+                (1, 6, 0),
+                "the flush once, the removals up to five times, then the pending key",
             );
             assert_eq!(
                 stored_uid(&refused_always.row(), "ssp.example.com").as_deref(),
                 Some("probe-uid"),
                 "should leave the row as it was"
+            );
+
+            let (_, next) = refused_always.drive(navigation(Some(&format!("ts-ec={EC_ID}"))));
+
+            assert_eq!(
+                next,
+                Some(FlushOutcome::Written),
+                "should merge the pending key on the next writer"
+            );
+            assert_eq!(
+                stored_uid(&refused_always.row(), "ssp.example.com"),
+                None,
+                "should apply the removal the earlier flush missed"
             );
         }
 
@@ -4030,9 +4056,37 @@ mod tests {
         }
 
         #[test]
+        fn capture_removal_after_both_attempts_reaches_the_row_through_the_pending_key() {
+            let scenario = capture_scenario(CAPTURE_INVALIDATION);
+            scenario.store.refuse_conditional_writes(EC_ID, 10);
+
+            let (outcome, measurement) = drive_measured_for_test(
+                &scenario.state,
+                didomi_navigation(Some(&returning_with_shared_id())),
+            );
+
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::Written),
+                "should flush the merge"
+            );
+            assert_eq!(measurement.removal_lost(), 0, "should lose no removal");
+            assert!(
+                measurement.to_string().contains("removal_deferred=1"),
+                "should print the deferral on the measurement line"
+            );
+            assert_eq!(
+                stored_uid(&scenario.row(), "ssp.example.com"),
+                None,
+                "should apply the removal in the writer's flush"
+            );
+        }
+
+        #[test]
         fn capture_removal_lost_after_both_attempts_is_counted() {
             let scenario = capture_scenario(CAPTURE_INVALIDATION);
             scenario.store.refuse_conditional_writes(EC_ID, 10);
+            scenario.store.fail_all_writes(&format!("pending:{EC_ID}"));
 
             let (_, measurement) = drive_measured_for_test(
                 &scenario.state,
