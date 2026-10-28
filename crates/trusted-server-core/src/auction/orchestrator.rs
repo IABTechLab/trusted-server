@@ -335,7 +335,7 @@ fn snapshot_context_request(request: &Request<EdgeBody>) -> Request<EdgeBody> {
     }
     if let Some(ingress) = request
         .extensions()
-        .get::<edgezero_core::request::RequestIngress>()
+        .get::<edgezero_core::ingress::RequestIngress>()
     {
         snapshot.extensions_mut().insert(ingress.clone());
     }
@@ -5127,10 +5127,10 @@ mod tests {
         request
             .extensions_mut()
             .insert(crate::http_util::RuntimeRequestOrigin::new(
-                edgezero_core::request::InboundOrigin::parse(
+                edgezero_core::ingress::InboundOrigin::parse(
                     "https",
                     "publisher.example.com:8443",
-                    edgezero_core::request::OriginSource::RuntimeUri,
+                    edgezero_core::ingress::OriginSource::RuntimeUri,
                 )
                 .expect("should validate runtime origin"),
             ));
@@ -5179,19 +5179,19 @@ mod tests {
                     .headers_mut()
                     .remove(crate::forwarder::FORWARDER_AUTH_HEADER);
             }
-            let ingress = edgezero_core::request::RequestIngress::new(
-                edgezero_core::request::CapturedTarget::Unavailable(
-                    edgezero_core::request::TargetUnavailable::NotExposed,
+            let ingress = edgezero_core::ingress::RequestIngress::new(
+                edgezero_core::ingress::CapturedTarget::Unavailable(
+                    edgezero_core::ingress::TargetUnavailable::NotExposed,
                 ),
                 Some(
-                    edgezero_core::request::InboundOrigin::parse(
+                    edgezero_core::ingress::InboundOrigin::parse(
                         "http",
                         "internal.example.com",
-                        edgezero_core::request::OriginSource::RuntimeUri,
+                        edgezero_core::ingress::OriginSource::RuntimeUri,
                     )
                     .expect("should construct transport origin"),
                 ),
-                edgezero_core::request::HeaderFidelity::default(),
+                edgezero_core::ingress::HeaderFidelity::default(),
             );
             request.extensions_mut().insert(ingress);
             crate::forwarder::prepare_trusted_forwarder(&mut request, &settings);
@@ -5205,11 +5205,11 @@ mod tests {
             );
             let retained = snapshot
                 .extensions()
-                .get::<edgezero_core::request::RequestIngress>()
+                .get::<edgezero_core::ingress::RequestIngress>()
                 .expect("should preserve immutable ingress");
             let original = request
                 .extensions()
-                .get::<edgezero_core::request::RequestIngress>()
+                .get::<edgezero_core::ingress::RequestIngress>()
                 .expect("should retain ingress on source request");
             assert_eq!(
                 retained.origin().map(|origin| (
@@ -5227,8 +5227,8 @@ mod tests {
             assert!(
                 matches!(
                     retained.target(),
-                    edgezero_core::request::CapturedTarget::Unavailable(
-                        edgezero_core::request::TargetUnavailable::NotExposed
+                    edgezero_core::ingress::CapturedTarget::Unavailable(
+                        edgezero_core::ingress::TargetUnavailable::NotExposed
                     )
                 ),
                 "should preserve unavailable target evidence"

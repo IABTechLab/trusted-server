@@ -1,7 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::Aead as _, aead::KeyInit as _};
 use edgezero_core::body::Body as EdgeBody;
-use edgezero_core::request::{InboundOrigin, RequestIngress};
+use edgezero_core::ingress::{InboundOrigin, RequestIngress};
 use error_stack::Report;
 use http::{Request, Response, StatusCode, header};
 use sha2::{Digest as _, Sha256};
@@ -134,7 +134,7 @@ impl RuntimeRequestOrigin {
     /// # Examples
     ///
     /// ```
-    /// use edgezero_core::request::{InboundOrigin, OriginSource};
+    /// use edgezero_core::ingress::{InboundOrigin, OriginSource};
     /// use trusted_server_core::http_util::RuntimeRequestOrigin;
     /// let origin = InboundOrigin::parse(
     ///     "https", "publisher.example.com:8443", OriginSource::RuntimeUri,
@@ -630,23 +630,23 @@ mod tests {
                 InboundOrigin::parse(
                     "https",
                     "runtime.example.com:9443",
-                    edgezero_core::request::OriginSource::RuntimeUri,
+                    edgezero_core::ingress::OriginSource::RuntimeUri,
                 )
                 .expect("should validate runtime origin"),
             ));
             request.extensions_mut().insert(RequestIngress::new(
-                edgezero_core::request::CapturedTarget::Unavailable(
-                    edgezero_core::request::TargetUnavailable::NotExposed,
+                edgezero_core::ingress::CapturedTarget::Unavailable(
+                    edgezero_core::ingress::TargetUnavailable::NotExposed,
                 ),
                 ingress_available.then(|| {
                     InboundOrigin::parse(
                         "http",
                         "internal.example.com:8080",
-                        edgezero_core::request::OriginSource::RuntimeUri,
+                        edgezero_core::ingress::OriginSource::RuntimeUri,
                     )
                     .expect("should validate ingress origin")
                 }),
-                edgezero_core::request::HeaderFidelity::default(),
+                edgezero_core::ingress::HeaderFidelity::default(),
             ));
             crate::forwarder::prepare_trusted_forwarder(&mut request, &settings);
 
@@ -924,7 +924,7 @@ mod tests {
             if let Ok(origin) = InboundOrigin::parse(
                 "https",
                 host,
-                edgezero_core::request::OriginSource::RuntimeUri,
+                edgezero_core::ingress::OriginSource::RuntimeUri,
             ) {
                 let mut req = build_request(Method::GET, "/page");
                 req.extensions_mut()

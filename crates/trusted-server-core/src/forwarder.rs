@@ -170,7 +170,7 @@ pub(crate) fn public_origin<B>(request: &Request<B>) -> Option<&PublicOrigin> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use edgezero_core::request::{
+    use edgezero_core::ingress::{
         CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, RequestIngress,
         TargetUnavailable,
     };

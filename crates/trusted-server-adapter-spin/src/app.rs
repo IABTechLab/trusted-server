@@ -10,7 +10,7 @@ use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
-use edgezero_core::request::{InboundOrigin, OriginSource};
+use edgezero_core::ingress::{InboundOrigin, OriginSource};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -1237,12 +1237,12 @@ mod tests {
             ("x-forwarded-proto", "http"),
         ]);
         req.extensions_mut()
-            .insert(edgezero_core::request::RequestIngress::new(
-                edgezero_core::request::CapturedTarget::Unavailable(
-                    edgezero_core::request::TargetUnavailable::NotExposed,
+            .insert(edgezero_core::ingress::RequestIngress::new(
+                edgezero_core::ingress::CapturedTarget::Unavailable(
+                    edgezero_core::ingress::TargetUnavailable::NotExposed,
                 ),
                 None,
-                edgezero_core::request::HeaderFidelity::default(),
+                edgezero_core::ingress::HeaderFidelity::default(),
             ));
 
         normalize_spin_request(&mut req);
@@ -1266,7 +1266,7 @@ mod tests {
         );
         assert!(
             req.extensions()
-                .get::<edgezero_core::request::RequestIngress>()
+                .get::<edgezero_core::ingress::RequestIngress>()
                 .expect("should retain original ingress")
                 .origin()
                 .is_none(),

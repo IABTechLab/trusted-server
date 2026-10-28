@@ -1,7 +1,7 @@
 //! Deliberate, authenticated trace cookie mutations.
 
 use edgezero_core::body::Body as EdgeBody;
-use edgezero_core::request::RequestIngress;
+use edgezero_core::ingress::RequestIngress;
 use futures::StreamExt as _;
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, header};
 use url::Url;
@@ -210,7 +210,7 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use bytes::Bytes;
     use edgezero_core::body::Body as EdgeBody;
-    use edgezero_core::request::{
+    use edgezero_core::ingress::{
         CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, RequestIngress,
         TargetUnavailable,
     };

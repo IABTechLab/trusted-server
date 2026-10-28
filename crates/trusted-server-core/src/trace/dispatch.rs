@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
-use edgezero_core::request::RequestIngress;
+use edgezero_core::ingress::RequestIngress;
 use edgezero_core::router::PreDispatchHook;
 use http::{HeaderMap, Method, Request, Response, StatusCode};
 use trusted_server_js::trace_assets::trace_asset;

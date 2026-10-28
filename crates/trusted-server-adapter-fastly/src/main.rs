@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
-use edgezero_adapter_fastly::request::{capture_request_ingress, into_core_request_with_ingress};
+use edgezero_adapter_fastly::request::{capture_request_ingress, into_core_request};
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
@@ -326,13 +326,23 @@ fn heap_mib() -> String {
     )
 }
 
+/// Convert with the released adapter API while retaining the original ingress snapshot.
+fn into_core_request_preserving_ingress(
+    req: FastlyRequest,
+    ingress: edgezero_core::ingress::RequestIngress,
+) -> Result<HttpRequest, EdgeError> {
+    let mut request = into_core_request(req)?;
+    request.extensions_mut().insert(ingress);
+    Ok(request)
+}
+
 /// Handles a request through the `EdgeZero` router path.
 fn edgezero_main(
     mut req: FastlyRequest,
     sandbox: &mut Sandbox,
     ordinal: u64,
     request_id: &str,
-    ingress: edgezero_core::request::RequestIngress,
+    ingress: edgezero_core::ingress::RequestIngress,
     trace_path: bool,
 ) {
     let runtime_stores = RuntimeStoreConfig::logical();
@@ -483,7 +493,7 @@ fn edgezero_main(
     // Dispatch directly through the EdgeZero router without an intermediate
     // fastly::Response conversion. That preserves duplicate header values such
     // as multiple Set-Cookie headers.
-    let mut response = match into_core_request_with_ingress(req, ingress) {
+    let mut response = match into_core_request_preserving_ingress(req, ingress) {
         Ok(mut core_req) => {
             if let Some(forwarder) = forwarder {
                 core_req.extensions_mut().insert(forwarder);
@@ -907,7 +917,7 @@ mod tests {
     use edgezero_core::body::Body as EdgeBody;
     use edgezero_core::http::response_builder;
     use edgezero_core::http::{HeaderValue, Method, StatusCode};
-    use edgezero_core::request::{
+    use edgezero_core::ingress::{
         CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, RequestIngress,
         TargetUnavailable,
     };
@@ -1190,7 +1200,7 @@ mod tests {
             let req = FastlyRequest::get(url);
             let native = is_trace_path(req.get_path());
             let ingress = capture_request_ingress(&req);
-            let core = into_core_request_with_ingress(req, ingress)
+            let core = into_core_request_preserving_ingress(req, ingress)
                 .expect("should convert the native request");
 
             assert_eq!(
@@ -1199,6 +1209,43 @@ mod tests {
                 "should classify {url} identically before and after conversion"
             );
         }
+    }
+
+    #[test]
+    fn conversion_retains_ingress_captured_before_native_mutation() {
+        let mut req = FastlyRequest::get("https://internal.example.com/article");
+        let origin =
+            InboundOrigin::parse("https", "publisher.example.com", OriginSource::RuntimeUri)
+                .expect("should validate the original transport origin");
+        let ingress = RequestIngress::new(
+            CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+            Some(origin),
+            HeaderFidelity::default(),
+        );
+        req.set_header("host", "internal.example.com");
+
+        let core = into_core_request_preserving_ingress(req, ingress)
+            .expect("should convert with the original ingress snapshot");
+
+        let retained = core
+            .extensions()
+            .get::<RequestIngress>()
+            .expect("should retain ingress metadata");
+        let origin = retained
+            .origin()
+            .expect("should retain origin captured before native mutation");
+        assert_eq!(
+            origin.authority(),
+            "publisher.example.com",
+            "should preserve the captured authority instead of recapturing from modified headers"
+        );
+        assert_eq!(
+            core.headers()
+                .get("host")
+                .expect("should retain current host"),
+            "internal.example.com",
+            "should keep current request headers separate from the original ingress snapshot"
+        );
     }
 
     #[test]

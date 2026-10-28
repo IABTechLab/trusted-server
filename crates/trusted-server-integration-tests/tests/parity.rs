@@ -1340,11 +1340,11 @@ mod trace_parity {
 
     use async_trait::async_trait;
     use bytes::Bytes;
-    use edgezero_core::key_value_store::{KvError, KvPage};
-    use edgezero_core::request::{
+    use edgezero_core::ingress::{
         CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, Preservation, RequestIngress,
         TargetUnavailable,
     };
+    use edgezero_core::key_value_store::{KvError, KvPage};
     use error_stack::Report;
     use http::{Method, StatusCode, header};
     use trusted_server_core::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
