@@ -5500,7 +5500,7 @@ mod tests {
             stub.push_response(200, b"ok".to_vec());
             let module = TestAssetCache::asking_the_origin();
             let settings = create_test_settings();
-            let mut route = test_s3_image_optimizer_route();
+            let mut route = test_signed_image_optimizer_route();
             route.image_optimizer = None;
             let mut request =
                 build_http_request(Method::GET, "https://www.example.com/.images/a.css");
@@ -5510,7 +5510,7 @@ mod tests {
             );
 
             let services = build_services_with_secret_and_http_client(
-                HashMapSecretStore::new(test_s3_secrets()),
+                HashMapSecretStore::new(test_signed_route_secrets()),
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
             )
             .with_asset_cache_module(Arc::clone(&module) as _);
@@ -5537,9 +5537,13 @@ mod tests {
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default()
                 .to_owned();
-            assert!(
-                sent.starts_with("AWS4-HMAC-SHA256"),
-                "the origin request carries the route's own credentials, not the reader's: {sent}"
+            assert_eq!(
+                sent,
+                signed_route_authorization(
+                    &Method::GET,
+                    "https://bucket.storage.example.com/.images/a.css"
+                ),
+                "the origin request carries the route's own credentials, not the reader's"
             );
             let forwarded_headers = super::ASSET_PROXY_FORWARD_HEADERS;
             let forwarded: Vec<&str> = forwarded_headers
@@ -5551,7 +5555,7 @@ mod tests {
                     forwarded.contains(&name.as_str())
                         || name == header::HOST
                         || name == header::AUTHORIZATION
-                        || name.as_str().starts_with("x-amz-"),
+                        || name.as_str().starts_with("x-fixture-"),
                     "the origin request carries only what the route forwards and signs: {name}"
                 );
             }
