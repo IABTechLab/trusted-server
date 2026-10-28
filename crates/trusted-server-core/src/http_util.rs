@@ -527,7 +527,7 @@ pub fn enforce_max_body_size(
     Ok(())
 }
 
-/// The namespace the inspection and attestation endpoints answer under.
+/// The namespace the inspection endpoints answer under.
 pub const ROUTE_NAMESPACE: &str = "/_ts";
 
 /// Response headers that describe the deployment and not the page.

@@ -26,6 +26,7 @@ members = [
     "crates/shared/aws",
     "crates/shared/51degrees",
     "crates/middleware/51degrees",
+    "crates/asset-cache/51degrees",
     "crates/tag/google-tag",
     "crates/tag/google-tag-manager",
     "crates/testing/testlight",
@@ -129,7 +130,6 @@ log-fastly = "0.13"
 lol_html = "2.7.2"
 matchit = "0.9"
 mime = "0.3"
-p256 = { version = "0.13", default-features = false, features = ["alloc", "ecdsa", "pkcs8"] }
 predicates = "3"
 prost-build = "0.13"
 rand = "0.8"
@@ -180,6 +180,7 @@ trusted-server-loading-cache-51degrees = { path = "crates/loading-cache/51degree
 trusted-server-shared-aws = { path = "crates/shared/aws" }
 trusted-server-shared-51degrees = { path = "crates/shared/51degrees" }
 trusted-server-middleware-51degrees = { path = "crates/middleware/51degrees" }
+trusted-server-asset-cache-51degrees = { path = "crates/asset-cache/51degrees" }
 trusted-server-tag-google-tag = { path = "crates/tag/google-tag" }
 trusted-server-tag-google-tag-manager = { path = "crates/tag/google-tag-manager" }
 trusted-server-testing-testlight = { path = "crates/testing/testlight" }
