@@ -957,6 +957,12 @@ mod tests {
             .expect("should parse the startup settings")
         }
 
+        /// The sample with a comment naming `test`, so its digest is one no
+        /// earlier load in the process holds and the folder is read.
+        fn file_only_this_test_pins(test: &str) -> String {
+            format!("{SAMPLE_POLICY_TEXT}# pinned only by {test}\n")
+        }
+
         /// The blob the Axum push writes for settings naming `standard`,
         /// pinned to `policy_text` and carrying no text of its own.
         fn blob_naming_standard(policy_text: &str) -> String {
@@ -1024,32 +1030,31 @@ mod tests {
 
         #[test]
         fn startup_reads_the_named_policy_file_from_the_policy_folder() {
+            let pushed = file_only_this_test_pins("the folder read test");
             let folder = tempfile::tempdir().expect("should create a policy folder");
-            std::fs::write(folder.path().join("standard.yaml"), SAMPLE_POLICY_TEXT)
+            std::fs::write(folder.path().join("standard.yaml"), &pushed)
                 .expect("should write the policy file");
 
-            let state = start(
-                &blob_naming_standard(SAMPLE_POLICY_TEXT),
-                Some(folder.path()),
-            )
-            .expect("should load the policy file the settings name");
+            let state = start(&blob_naming_standard(&pushed), Some(folder.path()))
+                .expect("should load the policy file the settings name");
 
             let policy = state
                 .settings
                 .permission_policy()
                 .expect("should keep the policy with the settings");
             assert_eq!(policy.name(), "standard");
-            assert_eq!(policy.sha256(), policy_sha256(SAMPLE_POLICY_TEXT));
+            assert_eq!(policy.sha256(), policy_sha256(&pushed));
         }
 
         #[test]
         fn startup_without_the_pushed_policy_file_answers_500_on_every_route() {
-            let blob = blob_naming_standard(SAMPLE_POLICY_TEXT);
+            let pushed = file_only_this_test_pins("the startup refusal test");
+            let blob = blob_naming_standard(&pushed);
             let empty = tempfile::tempdir().expect("should create an empty folder");
             let edited = tempfile::tempdir().expect("should create a policy folder");
             std::fs::write(
                 edited.path().join("standard.yaml"),
-                format!("{SAMPLE_POLICY_TEXT}# edited after the push\n"),
+                format!("{pushed}# edited after the push\n"),
             )
             .expect("should write an edited policy file");
 
