@@ -6113,6 +6113,9 @@ mod tests {
         assert!(!check(&catalog, &none, "a.example.com", &record(Some("gone"), None)), "should not serve an unknown writer");
         let opted: BTreeSet<_> = ["p".parse().expect("should parse the provider ID")].into_iter().collect();
         assert!(!check(&catalog, &opted, "a.example.com", &record(Some("p"), None)), "should not serve an opted-out writer");
+        // `an_opted_out_owner_stops_every_record_of_its_source`: with `owner`
+        // owning a.example.com and opted out, a browser-seeded record of
+        // a.example.com is not served; with no opt-out it is.
         assert!(check(&catalog, &none, "b.example.com", &record(None, None)), "should serve an unowned browser record");
     }
 
@@ -6596,6 +6599,7 @@ Apply order (spec 5.4). Copy it into the doc comment of `apply`:
    - Hashes always come from the record KV held. A removal that no longer applies adds none.
 3. Positive changes:
    - A provider is opted out when its live `o` is set and its `oc` is not strictly later than `o.at`. Every change whose `record.w` is opted out is skipped, `OwnerWrite` and `FillMissing` alike.
+   - `owner_denies`: for an owned source, every positive change is skipped while the owner is opted out, whoever wrote it, and an `OwnerWrite` or `FillMissing` any of whose UIDs hashes into the owner's `ps.iv` is skipped. Both read the entry after step 2. Tests: an invalidation and a browser refill of the same UID in one mutation leave it removed; an opted-out owner blocks a browser fill and another writer's fill of its source (control: an unowned source still fills); an owner opt-out in the same mutation blocks a browser refill; an owner write of an invalidated UID is skipped (control: another UID is stored).
    - A `FillMissing` applies when the source is absent, or its record is expired, or its record's writer is not configured. It is skipped when the hash of any UID of its set is in the `ps.iv` or `ps.ov` of any provider in `catalog.claimants(source)`. A browser `FillMissing` (`record.w` is `None`) is also skipped when the source belongs to an opted-out capture-only provider's `capture_only_sources`.
    - An `OwnerWrite` applies when the live revision equals `expected`, or when `expected` is `None` and the source has no valid record with `w == record.w`. A browser-seeded value never blocks the owner.
    - A written record replaces the live record whole, never merges into it, so no entry of the old set survives. It gets a fresh `rv` and `at = record.at.or(now)`, and keeps the change's `w`.

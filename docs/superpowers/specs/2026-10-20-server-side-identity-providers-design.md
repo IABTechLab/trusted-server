@@ -2059,7 +2059,13 @@ Applying the mutation to a live entry, in order:
    `ps.iv` or `ps.ov` of a provider that claims the source is skipped, owned
    or
    unowned. A browser-ingest `FillMissing` for a source of an opted-out
-   capture-only provider is skipped too.
+   capture-only provider is skipped too. For an owned source, every
+   positive change is skipped while the owner is opted out, whoever wrote
+   it, and an `OwnerWrite` or `FillMissing` any of whose UIDs matches the
+   owner's `ps.iv` is skipped, the owner's own write included. These read
+   the entry after step 2, so an invalidation or opt-out in the same
+   mutation already counts: a browser refill of a UID the same writer just
+   invalidated, or of a source whose owner just opted out, never lands.
    Changes that no longer apply are dropped silently: a newer write won.
    Each `ProviderResult` applies atomically. Its IDs, its state change and
    its `n` and `f` apply together, and only when every ID change in it
@@ -2576,7 +2582,11 @@ for validation and troubleshooting, and both exposures are accepted
 
 One shared servability check covers expiry, the rollback rule, the writer's
 and owner's consent policies, and opt-outs: a record whose writer has `ps.o`
-set is never served. `resolve_partner_ids` (`ec/eids.rs:36`), the admin view
+set is never served, and neither is any record of a source whose owner has
+`ps.o` set, whoever wrote it: an owner's opt-out removes only what the owner
+wrote, so a browser-seeded record can remain. No stored record matches an
+owner's `ps.iv`, because every invalidation removes its record and step 3
+of section 5.4 blocks a refill. `resolve_partner_ids` (`ec/eids.rs:36`), the admin view
 (`ec/admin.rs:485`) and `/_ts/api/v1/identify` all use it. `/identify` reads
 `entry.ids` directly today (`ec/identify.rs:99-103`), so it switches to the
 check. Its response shape does not change: `uid` is the first UID of the

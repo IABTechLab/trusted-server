@@ -411,6 +411,10 @@ pub(crate) struct Applied {
 ///    - A provider is opted out when its live `o` is set and its `oc` is not
 ///      strictly later than `o.at`. Every change whose `record.w` is opted out
 ///      is skipped, `OwnerWrite` and `FillMissing` alike.
+///    - For an owned source, every positive change is skipped while the owner
+///      is opted out, whoever wrote it, and an `OwnerWrite` or `FillMissing`
+///      any of whose UIDs hashes into the owner's `ps.iv` is skipped too. Both
+///      read the entry after step 2.
 ///    - A `FillMissing` applies when the source is absent, or its record is
 ///      expired, or its record's writer is not configured. It is skipped when
 ///      the hash of any UID of its set is in the `ps.iv` or `ps.ov` of any
@@ -660,6 +664,12 @@ fn is_expired(record: &KvPartnerId, now: u64) -> bool {
 // Temporary: first used by a later identity task.
 #[allow(dead_code)]
 fn change_applies(entry: &KvEntry, change: &PartnerIdChange, context: &ApplyContext<'_>) -> bool {
+    if let PartnerIdChange::FillMissing { source, record }
+    | PartnerIdChange::OwnerWrite { source, record, .. } = change
+        && owner_denies(entry, source, record, context)
+    {
+        return false;
+    }
     match change {
         PartnerIdChange::FillMissing { source, record } => {
             fill_applies(entry, source, record, context)
@@ -686,6 +696,29 @@ fn change_applies(entry: &KvEntry, change: &PartnerIdChange, context: &ApplyCont
         }
         PartnerIdChange::OwnerRemove { .. } | PartnerIdChange::WriterRemove { .. } => false,
     }
+}
+
+/// Whether the source's owner denies a positive change: while the owner is
+/// opted out, nothing fills its source, and no writer, the owner included,
+/// stores a UID the owner invalidated. Both are read after step 2, so an
+/// opt-out or invalidation in the same mutation counts.
+fn owner_denies(
+    entry: &KvEntry,
+    source: &SourceDomain,
+    record: &KvPartnerId,
+    context: &ApplyContext<'_>,
+) -> bool {
+    let Some(owner) = context.catalog.owner_of(source) else {
+        return false;
+    };
+    if is_opted_out(entry, owner.as_str()) {
+        return true;
+    }
+    entry.ps.get(owner.as_str()).is_some_and(|state| {
+        set_hashes(&record.eids)
+            .iter()
+            .any(|hash| state.iv.contains(hash))
+    })
 }
 
 // Temporary: first used by a later identity task.
@@ -1323,6 +1356,132 @@ mod tests {
                 .get("owner")
                 .is_none_or(|state| state.iv.is_empty()),
             "should add no hash"
+        );
+    }
+
+    /// A live row where `owner` wrote `uid` on a.example.com at rv `1111…`.
+    fn owned_row(uid: &str) -> KvEntry {
+        let mut live = KvEntry::minimal("b.example.com", "x", 1);
+        live.ids.insert(
+            "a.example.com".to_owned(),
+            written("owner", uid, "1111111111111111"),
+        );
+        live
+    }
+
+    #[test]
+    fn an_invalidation_and_a_browser_refill_of_the_same_uid_leave_it_removed() {
+        let mut mutation = IdentityMutation::default();
+        mutation.add_change(PartnerIdChange::OwnerRemove {
+            source: src("a.example.com"),
+            provider: pid("owner"),
+            expected: rev("1111111111111111"),
+        });
+        mutation.add_change(fill(
+            "a.example.com",
+            KvPartnerId::browser("uid-a", Some(950)),
+        ));
+
+        let applied = run(&mutation, &owned_row("uid-a")).expect("should apply");
+
+        assert!(
+            !applied.entry.ids.contains_key("a.example.com"),
+            "should not refill the UID the same mutation invalidated"
+        );
+        assert!(
+            !applied.entry.ps["owner"].iv.is_empty(),
+            "should record the invalidation"
+        );
+    }
+
+    #[test]
+    fn an_opted_out_owner_blocks_every_positive_change_to_its_sources() {
+        let mut live = KvEntry::minimal("b.example.com", "x", 1);
+        live.ps.insert(
+            "owner".to_owned(),
+            KvProviderState {
+                o: Some(KvOptOut {
+                    at: 500,
+                    fp: "1".to_owned(),
+                }),
+                ..KvProviderState::default()
+            },
+        );
+        let browser = fill("a.example.com", KvPartnerId::browser("new-uid", Some(950)));
+        let other_writer = fill(
+            "a.example.com",
+            written("other", "new-uid", "2222222222222222"),
+        );
+
+        for change in [browser, other_writer] {
+            let mut mutation = IdentityMutation::default();
+            mutation.add_change(change.clone());
+
+            let applied = run(&mutation, &live).expect("should apply");
+
+            assert!(
+                !applied.entry.ids.contains_key("a.example.com"),
+                "should skip {change:?} while the owner is opted out"
+            );
+        }
+
+        let mut control = IdentityMutation::default();
+        control.add_change(fill(
+            "b.example.com",
+            KvPartnerId::browser("new-uid", Some(950)),
+        ));
+        let applied =
+            run(&control, &KvEntry::minimal("c.example.com", "x", 1)).expect("should apply");
+        assert!(
+            applied.entry.ids.contains_key("b.example.com"),
+            "control: should fill a source the opted-out owner does not own"
+        );
+    }
+
+    #[test]
+    fn an_owner_opt_out_in_the_same_mutation_blocks_a_browser_refill() {
+        let mut mutation = IdentityMutation::default();
+        mutation.merge_state(pid("owner"), opt_out(1_000));
+        mutation.add_change(fill(
+            "a.example.com",
+            KvPartnerId::browser("new-uid", Some(950)),
+        ));
+
+        let applied = run(&mutation, &owned_row("uid-a")).expect("should apply");
+
+        assert!(
+            !applied.entry.ids.contains_key("a.example.com"),
+            "should neither keep the owner's record nor take the browser's"
+        );
+    }
+
+    #[test]
+    fn an_owner_write_of_an_invalidated_uid_is_skipped() {
+        let mut live = KvEntry::minimal("b.example.com", "x", 1);
+        live.ps.insert(
+            "owner".to_owned(),
+            KvProviderState {
+                iv: vec![uid_hash("uid-a")],
+                ..KvProviderState::default()
+            },
+        );
+        let owner_write = |uid: &str| {
+            let mut mutation = IdentityMutation::default();
+            mutation.add_change(PartnerIdChange::OwnerWrite {
+                source: src("a.example.com"),
+                record: written("owner", uid, "3333333333333333"),
+                expected: None,
+            });
+            run(&mutation, &live).expect("should apply")
+        };
+
+        assert!(
+            !owner_write("uid-a").entry.ids.contains_key("a.example.com"),
+            "should not store a UID the owner invalidated"
+        );
+        assert!(
+            owner_write("uid-b").entry.ids.contains_key("a.example.com"),
+            "control: should store another UID"
         );
     }
 

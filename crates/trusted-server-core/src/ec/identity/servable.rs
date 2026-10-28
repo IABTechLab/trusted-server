@@ -55,6 +55,13 @@ pub(crate) fn is_servable(
         }
     }
     if let Some(owner) = context.catalog.owner_of(source) {
+        // An opted-out owner stops its source whoever wrote the record, so a
+        // browser-seeded record its opt-out did not remove is not served.
+        // No stored record matches the owner's `ps.iv`: every invalidation
+        // removes its record, and nothing refills one (spec 5.4).
+        if context.opted_out.contains(owner) {
+            return false;
+        }
         let Some(owner_provider) = context.catalog.get(owner) else {
             return false;
         };
@@ -191,6 +198,41 @@ mod tests {
         assert!(
             check(&catalog, &none, "b.example.com", &record(None, None)),
             "should serve an unowned browser record"
+        );
+    }
+
+    #[test]
+    fn an_opted_out_owner_stops_every_record_of_its_source() {
+        let catalog = ProviderCatalog::new(
+            vec![provider(
+                "owner",
+                "a.example.com",
+                ConsentPolicy::eid_persistence_only(),
+                false,
+            )],
+            [(
+                "a.example.com".parse().expect("should parse the source"),
+                "owner".parse().expect("should parse the provider ID"),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let opted: BTreeSet<_> = ["owner".parse().expect("should parse the provider ID")]
+            .into_iter()
+            .collect();
+
+        assert!(
+            !check(&catalog, &opted, "a.example.com", &record(None, None)),
+            "should not serve a browser-seeded record of the owned source"
+        );
+        assert!(
+            check(
+                &catalog,
+                &BTreeSet::new(),
+                "a.example.com",
+                &record(None, None)
+            ),
+            "control: should serve it while the owner is not opted out"
         );
     }
 
