@@ -708,8 +708,13 @@ A pattern that would not be honored as written refuses the configuration,
 both when a deployment is validated and when the settings load. That is a
 pattern that matches no value, a `show` that names a secret, a pattern another
 pattern of the same list already covers, a `show` that a `hide` covers, a
-pattern that changes nothing the page shows, and any pattern at all beside
-`config = false`.
+pattern that changes nothing the page shows, a pattern under
+`permissions.text`, the policy file the page never shows, and any pattern at
+all beside `config = false`.
+
+`ts config push` always writes `permissions.sha256`, so every check counts it
+as present, and a pattern that names it is judged alike before the push and
+when the pushed settings load.
 
 **Example**:
 

@@ -152,6 +152,11 @@ A secret is masked twice over. The settings loader records each value it fills
 from the secret store, and those paths are masked. Then any string that still
 contains one of those values is masked wherever it sits, a key included.
 
+`permissions` shows the policy file's name as `policy` and its SHA-256 as
+`sha256`, neither masked by default, so a publisher can check which exact file
+a domain runs. The file itself is never shown, because the settings loader
+takes it out of the settings when it loads the policy.
+
 **Example:**
 
 ```bash
@@ -269,6 +274,7 @@ that page reads the resolution of a request with no stored signal.
 {
   "awaiting": [],
   "modules": { "configured": ["gpc", "tcf"], "contributed": ["tcf"] },
+  "policy": "standard",
   "set": ["necessary.operations.storage"],
   "signals": [{ "module": "tcf", "scheme": "tcf", "value": "CP..." }],
   "storageWithdrawn": false,
@@ -286,10 +292,15 @@ that page reads the resolution of a request with no stored signal.
 | `storageWithdrawn`    | Whether the request explicitly withdrew device storage, as distinct from not setting it                   |
 | `modules.contributed` | The signal modules that produced a signal used in this resolution                                         |
 | `modules.configured`  | The signal modules the publisher configured, or `null` when it named none and the adapter's own list runs |
+| `policy`              | The permission policy file whose rules the answer resolved, by the name `[permissions] policy` gives it   |
 | `version`             | The version of the core crate that answered                                                               |
 
 A module in `configured` and not in `contributed` ran and found nothing to
 work with, which is a different fact from a module that was never configured.
+
+A policy's name is its file's stem, which two versions of one file share, so
+the SHA-256 that `/_ts/config` shows is what matches the answer to one exact
+copy of the file.
 
 Nothing is created or written for the reader. The Edge Cookie lifecycle does
 not run for this request, so no cookie is set and no identity row is written.
