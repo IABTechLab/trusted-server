@@ -95,7 +95,9 @@ Preserve single-shot listing/refusal, draft creation, uploads and publication by
 - [x] User accepts the ordinary-release adapter's narrower equality claim for this Phase 2 slice.
 - [x] User approves the concrete informational writer/measurement/transfer contract and additive Fastly provenance subject.
 - [x] User approves implementation after a concrete plan is written and independently reviewed within this design; qualification types/selectors and new triggers remain closed.
-- [x] Rehearse the exact reviewed head and report time/cost and unchanged Phase 1 verification before merge. Merging Phase 2 activates the gate on the next real tag; no separate switch.
+- [ ] Rehearse the exact reviewed head and report time/cost and unchanged Phase 1 verification before merge. Merging Phase 2 activates the gate on the next real tag; no separate switch.
+
+**Current verification:** The supervision correction at `36454c526f70f145eb42a7994a8b6e74dc1df135` passed independent review and exact-head CI: 29 successful checks and four expected skips. [Rehearsal .17](https://github.com/prk-Jr/trusted-server/actions/runs/40710926728) and [rehearsal .18](https://github.com/prk-Jr/trusted-server/actions/runs/40714430928) could not acquire a macOS ARM64 runner; no successful current-source release rehearsal is claimed. A fresh successful cohort rehearsal remains required before readiness. This record changes documentation only after that implementation. Keep #1449 draft, without reviewers. Historical `.16` at `5fa384336` now has its [separate runtime supplement](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6471330921); that proof is not reassigned to the later correction. The approved design requirements above are unchanged.
 
 ## Approved forward-compatibility and mismatch conditions
 

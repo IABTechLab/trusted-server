@@ -2,7 +2,7 @@
 
 **Phase 2 spec:** [ordinary Fastly release equality](../specs/2026-10-28-1235-binary-attestations-phase2-design.md), with its own source-checked review rounds. Tracking issue: #1235.
 
-**Status:** Phase 2 passed final review, exact-source CI and rehearsal `.16` at `5fa3843364f247fdc261c438ab9257323637a42c`. This completion record is docs-only since that implementation. [Full transcript](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6467368408). Historical `.13` stays attributed only to `770a425df4b28caaaef68dfd930bceabd9928046`. Qualification and Phase 3/4 production gates remain closed; Phase 3 planning is draft #1463.
+**Current verification:** The supervision correction at `36454c526f70f145eb42a7994a8b6e74dc1df135` passed independent review and exact-head CI: 29 successful checks and four expected skips. [Rehearsal .17](https://github.com/prk-Jr/trusted-server/actions/runs/40710926728) and [rehearsal .18](https://github.com/prk-Jr/trusted-server/actions/runs/40714430928) could not acquire a macOS ARM64 runner; no successful current-source release rehearsal is claimed. A fresh successful cohort rehearsal remains required before readiness. This record changes documentation only after that implementation. Keep #1449 draft, without reviewers. Historical `.16` remains at `5fa384336`, and `.13` at `770a425df`. Qualification and Phase 3/4 production gates remain closed; Phase 3 is draft #1463.
 
 **Tracking issue:** #1235. The earlier separate tracking-issue draft is retained as planning history, not an additional issue prerequisite.
 
@@ -103,7 +103,7 @@ Gate 1's [ordinary-release design](binary-attestations-phase2-fastly-integration
 - [x] Port source by module, preserving Phase 1 hunks and recording each current-main adaptation; update per-path landing metadata in the slice map.
 - [x] Adapt closed producer tables to the seven Phase 1 assets and current pins without opening qualifications or changing the index schema.
 - [x] Run explicitly selected pure tests with a nonzero-selection guard; compile platform-specific branches in CI; keep process/ignored tests CI-only.
-- [x] Obtain independent and security reviews; pass touched CI gates before pushing and rehearse only an exact green reviewed head. Current-input completion is `.16` at `5fa384336`; review coverage limits are recorded in the integration plan.
+- [ ] Complete current-source rehearsal after the supervision correction. Independent/security reviews and exact-head CI passed at `36454c526`; `.17`/`.18` encountered ARM64 hosted-runner capacity failures. Historical `.16` stays at `5fa384336`; review limits and runtime evidence are recorded in the integration plan.
 - [x] Obtain separate Fastly integration design approval and independently review the [concrete implementation plan](binary-attestations-phase2-fastly-integration-implementation.md) before implementing its missing gate/writer. Do not claim the intended Phase 2 capability is shipped by porting closed code.
 
 The following progress notes and per-path staged labels are historical snapshots of successive chunks. Current completion is recorded by the checkpoints above and the approved integration plan; an old snapshot is not an outstanding port task.
