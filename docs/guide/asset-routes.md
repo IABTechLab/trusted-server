@@ -12,7 +12,7 @@ For a matching `GET` or `HEAD` request, Trusted Server runs this sequence:
 2. Optionally rewrite the request path with `path_pattern` and `target_path`.
 3. Build Image Optimizer metadata from the request query when the route enables it.
 4. Apply the origin query policy.
-5. Add origin authentication headers when the route configures auth.
+5. Add origin authentication headers when the route's source configures auth.
 6. Send the request to the resolved backend origin.
 7. Return the origin status, body, and safe headers.
 
@@ -20,12 +20,19 @@ The origin query policy runs before S3 signing, so the signature covers the exac
 
 ## Basic route
 
+Each route names where its content comes from in a `source` table, in the same shape as the publisher's [`[source]`](/guide/configuration#source). `module = "origin"` selects core's HTTP origin, and `[proxy.asset_routes.source.origin]` holds its settings. Write the route's own keys, `prefix`, `path_pattern` and `target_path`, before the source tables, because a table header ends the route's own keys.
+
 ```toml
 [proxy]
 
 [[proxy.asset_routes]]
 prefix = "/assets/"
-origin_url = "https://assets.example.com"
+
+[proxy.asset_routes.source]
+module = "origin"
+
+[proxy.asset_routes.source.origin]
+url = "https://assets.example.com"
 ```
 
 A request for `/assets/logo.png?v=1` is sent to:
@@ -35,7 +42,9 @@ https://assets.example.com/assets/logo.png?v=1
 ```
 
 Plain asset routes preserve the incoming query string by default.
-`origin_url` must be only an absolute `http` or `https` origin (scheme, host, and optional port), without userinfo, path, query, or fragment components.
+`url` must be an absolute `http` or `https` address with a host, without a user name or password, a query, a fragment, or a trailing `/`. A path in `url` names a folder, and the route's target path is added under it. With `url = "https://storage.example.com/bucket/site"`, a request for `/assets/logo.png` is sent to `https://storage.example.com/bucket/site/assets/logo.png`.
+
+`host_header` sets the outbound `Host` header where it is not the host of `url`. Trusted Server still connects, uses SNI, and checks certificates against the host in `url`.
 
 ## Path rewrite
 
@@ -44,23 +53,33 @@ Use `path_pattern` and `target_path` when the public path shape differs from the
 ```toml
 [[proxy.asset_routes]]
 prefix = "/.image/"
-origin_url = "https://assets-cdn.example.com"
 path_pattern = "^/\\.image/(.*)/[^/]+\\.([^/.]+)$"
 target_path = "/image/upload/$1.$2"
+
+[proxy.asset_routes.source]
+module = "origin"
+
+[proxy.asset_routes.source.origin]
+url = "https://assets-cdn.example.com"
 ```
 
-Both fields must be configured together. The rewritten path must start with `/`.
+Both fields must be configured together. The rewritten path must start with `/`. When `url` has a path, the rewritten path is added under that folder.
 
 ## Private S3 origins
 
-Add an auth block when the asset origin is a private S3 bucket.
+Add an auth block to the route's source when the asset origin is a private S3 bucket.
 
 ```toml
 [[proxy.asset_routes]]
 prefix = "/.image/"
-origin_url = "https://bucket.s3.us-east-1.amazonaws.com"
 
-[proxy.asset_routes.auth]
+[proxy.asset_routes.source]
+module = "origin"
+
+[proxy.asset_routes.source.origin]
+url = "https://bucket.s3.us-east-1.amazonaws.com"
+
+[proxy.asset_routes.source.origin.auth]
 type = "s3_sigv4"
 region = "us-east-1"
 origin_query = "strip"
@@ -71,8 +90,8 @@ secret_access_key = "s3_secret_access_key"
 
 ### S3 requirements
 
-- `origin_url` must be the real S3 host that AWS validates in the SigV4 canonical request.
-- Use `https` origins for authenticated routes. `http` origins are accepted by the generic asset route validator, but they would send SigV4 headers in clear text.
+- `url` must be the real S3 host that AWS validates in the SigV4 canonical request.
+- `url` must use `https` when the route signs. A signing table the signer cannot use, such as an empty or malformed `region`, is refused at startup naming the route, as in `proxy.asset_routes /.image/ source.origin.auth`.
 - S3 support is for `GET` and `HEAD` asset reads.
 - Signing uses header-based AWS SigV4, not presigned URLs.
 - The signer uses `x-amz-content-sha256: UNSIGNED-PAYLOAD`.
@@ -103,7 +122,7 @@ Place those values in the logical `trusted_server_secrets` store. Adapter config
 
 Precedence:
 
-1. `proxy.asset_routes.auth.origin_query`, when auth is configured.
+1. `proxy.asset_routes.source.origin.auth.origin_query`, when auth is configured.
 2. `proxy.asset_routes.image_optimizer.origin_query`, when Image Optimizer is enabled.
 3. The route default.
 
@@ -148,9 +167,14 @@ when_missing = "smart"
 
 [[proxy.asset_routes]]
 prefix = "/.image/"
-origin_url = "https://bucket.s3.us-east-1.amazonaws.com"
 
-[proxy.asset_routes.auth]
+[proxy.asset_routes.source]
+module = "origin"
+
+[proxy.asset_routes.source.origin]
+url = "https://bucket.s3.us-east-1.amazonaws.com"
+
+[proxy.asset_routes.source.origin.auth]
 type = "s3_sigv4"
 region = "us-east-1"
 origin_query = "strip"

@@ -109,7 +109,7 @@ fn served(settings: &Settings) -> (String, String) {
     )
 }
 
-/// The value at a concrete path, such as `proxy.asset_routes[0].origin_url`.
+/// The value at a concrete path, such as `proxy.asset_routes[0].prefix`.
 fn at<'v>(value: &'v Value, path: &str) -> Option<&'v Value> {
     let pattern = PathPattern::parse(path).expect("a concrete path");
     let mut node = value;
@@ -145,14 +145,14 @@ fn unmarked(value: &Value) -> Value {
 
 #[test]
 fn a_pattern_names_keys_every_element_or_one_element() {
-    let every = PathPattern::parse("proxy.asset_routes[].origin_url").expect("well formed");
-    let one = PathPattern::parse("proxy.asset_routes[1].origin_url").expect("well formed");
+    let every = PathPattern::parse("proxy.asset_routes[].prefix").expect("well formed");
+    let one = PathPattern::parse("proxy.asset_routes[1].prefix").expect("well formed");
     let route = |index| {
         vec![
             PathStep::Key("proxy".to_owned()),
             PathStep::Key("asset_routes".to_owned()),
             PathStep::Index(index),
-            PathStep::Key("origin_url".to_owned()),
+            PathStep::Key("prefix".to_owned()),
         ]
     };
 
@@ -163,7 +163,7 @@ fn a_pattern_names_keys_every_element_or_one_element() {
         !every.matches(&route(0)[..3]),
         "should name only values at its own depth"
     );
-    assert_eq!(render_path(&route(1)), "proxy.asset_routes[1].origin_url");
+    assert_eq!(render_path(&route(1)), "proxy.asset_routes[1].prefix");
 }
 
 #[test]
@@ -212,7 +212,7 @@ fn a_key_the_inspect_section_does_not_have_is_refused_naming_it() {
 fn documents_holding_every_declared_secret() -> Vec<(&'static str, Value)> {
     let mut main = document("");
     main["publisher"]["proxy_secret"] = json!("proxy");
-    main["publisher"]["origin_auth"] = json!({
+    main["source"]["origin"]["auth"] = json!({
         "type": "s3_sigv4",
         "region": "test-region-1",
         "access_key_id": "origin-access",
@@ -236,13 +236,18 @@ fn documents_holding_every_declared_secret() -> Vec<(&'static str, Value)> {
     });
     main["proxy"]["asset_routes"] = json!([{
         "prefix": "/assets/",
-        "origin_url": "https://assets.example.com",
-        "auth": {
-            "type": "s3_sigv4",
-            "region": "us-east-1",
-            "access_key_id": "route-access",
-            "secret_access_key": "route-secret",
-            "session_token": "route-session",
+        "source": {
+            "module": "origin",
+            "origin": {
+                "url": "https://assets.example.com",
+                "auth": {
+                    "type": "s3_sigv4",
+                    "region": "us-east-1",
+                    "access_key_id": "route-access",
+                    "secret_access_key": "route-secret",
+                    "session_token": "route-session",
+                },
+            },
         },
     }]);
     main["analytics"] = json!({
@@ -368,13 +373,10 @@ fn every_declared_core_secret_is_masked_and_never_served() {
 /// sensitive, with those paths and values.
 fn settings_with_every_sensitive_field() -> (Settings, Vec<(&'static str, &'static str)>) {
     let expected = vec![
-        ("publisher.origin_url", "https://origin-canary.example.com"),
+        ("source.origin.url", "https://origin-canary.example.com"),
+        ("source.origin.host_header", "host-canary.example.com"),
         (
-            "publisher.origin_host_header_override",
-            "host-canary.example.com",
-        ),
-        (
-            "proxy.asset_routes[0].origin_url",
+            "proxy.asset_routes[0].source.origin.url",
             "https://bucket-canary.example.com",
         ),
         ("ec.ec_store", "identity-store-canary"),
@@ -388,12 +390,13 @@ fn settings_with_every_sensitive_field() -> (Settings, Vec<(&'static str, &'stat
             .expect("an expected path")
     };
     let mut settings = settings();
-    settings.publisher.origin_url = value("publisher.origin_url");
-    settings.publisher.origin_host_header_override =
-        Some(value("publisher.origin_host_header_override"));
+    settings.set_origin_source(&crate::source::OriginSettings {
+        host_header: Some(value("source.origin.host_header")),
+        ..crate::source::OriginSettings::new(value("source.origin.url"))
+    });
     settings.proxy.asset_routes = vec![ProxyAssetRoute::new(
         "/assets/",
-        value("proxy.asset_routes[0].origin_url"),
+        value("proxy.asset_routes[0].source.origin.url"),
     )];
     settings.ec.ec_store = Some(value("ec.ec_store"));
     settings.auction.creative_store = value("auction.creative_store");
@@ -606,9 +609,10 @@ fn a_path_masked_beneath_a_key_holding_a_secret_lists_the_renamed_key() {
 const ASSET_ROUTES: &str = r#"
     [[proxy.asset_routes]]
     prefix = "/assets/"
-    origin_url = "https://assets.example.com"
+    source.module = "origin"
+    source.origin.url = "https://assets.example.com"
 
-    [proxy.asset_routes.auth]
+    [proxy.asset_routes.source.origin.auth]
     type = "s3_sigv4"
     region = "us-east-1"
     access_key_id = "route-access"
@@ -616,29 +620,30 @@ const ASSET_ROUTES: &str = r#"
 
     [[proxy.asset_routes]]
     prefix = "/media/"
-    origin_url = "https://media.example.com"
+    source.module = "origin"
+    source.origin.url = "https://media.example.com"
 "#;
 
 #[test]
 fn show_reveals_a_value_masked_by_default() {
     let settings = load(document(&format!(
-        "{ASSET_ROUTES}\n[inspect]\nshow = [\"publisher.origin_url\", \
-         \"proxy.asset_routes[].origin_url\"]"
+        "{ASSET_ROUTES}\n[inspect]\nshow = [\"source.origin.url\", \
+         \"proxy.asset_routes[].source.origin.url\"]"
     )))
     .expect("should load");
 
     let view = view(&settings);
 
     assert_eq!(
-        at(&view.settings, "publisher.origin_url"),
+        at(&view.settings, "source.origin.url"),
         Some(&json!("https://origin.test-publisher.com"))
     );
     assert_eq!(
-        at(&view.settings, "proxy.asset_routes[1].origin_url"),
+        at(&view.settings, "proxy.asset_routes[1].source.origin.url"),
         Some(&json!("https://media.example.com"))
     );
-    assert!(!view.masked.iter().any(|path| path.ends_with(".origin_url")));
-    assert!(!is_masked(&view, "publisher.origin_url"));
+    assert!(!view.masked.iter().any(|path| path.ends_with(".origin.url")));
+    assert!(!is_masked(&view, "source.origin.url"));
 }
 
 #[test]
@@ -662,16 +667,16 @@ fn a_pattern_not_honored_as_written_is_refused_saying_why() {
             "show names `publisher.proxy_secret`, which is a secret",
         ),
         (
-            r#"show = ["proxy.asset_routes[].auth.secret_access_key"]"#,
-            "show names `proxy.asset_routes[].auth.secret_access_key`, which is a secret",
+            r#"show = ["proxy.asset_routes[].source.origin.auth.secret_access_key"]"#,
+            "show names `proxy.asset_routes[].source.origin.auth.secret_access_key`, which is a secret",
         ),
         (
             r#"hide = ["publisher.no_such_setting"]"#,
             "hide names `publisher.no_such_setting`, which matches no value",
         ),
         (
-            r#"show = ["proxy.asset_routes[9].origin_url"]"#,
-            "show names `proxy.asset_routes[9].origin_url`, which matches no value",
+            r#"show = ["proxy.asset_routes[9].source.origin.url"]"#,
+            "show names `proxy.asset_routes[9].source.origin.url`, which matches no value",
         ),
         (
             r#"show = ["publisher.domain"]"#,
@@ -679,8 +684,8 @@ fn a_pattern_not_honored_as_written_is_refused_saying_why() {
              it names is masked by default",
         ),
         (
-            r#"hide = ["publisher.origin_url"]"#,
-            "hide names `publisher.origin_url`, which changes nothing, because \
+            r#"hide = ["source.origin.url"]"#,
+            "hide names `source.origin.url`, which changes nothing, because \
              everything it names is masked or empty already",
         ),
         (
@@ -689,20 +694,20 @@ fn a_pattern_not_honored_as_written_is_refused_saying_why() {
              everything it names is masked or empty already",
         ),
         (
-            r#"show = ["publisher.origin_url", "publisher.origin_url"]"#,
-            "show names `publisher.origin_url`, which changes nothing, because \
-             `publisher.origin_url` in the same list already names everything it does",
+            r#"show = ["source.origin.url", "source.origin.url"]"#,
+            "show names `source.origin.url`, which changes nothing, because \
+             `source.origin.url` in the same list already names everything it does",
         ),
         (
-            r#"show = ["proxy.asset_routes[].origin_url", "proxy.asset_routes[0].origin_url"]"#,
-            "show names `proxy.asset_routes[0].origin_url`, which changes nothing, because \
-             `proxy.asset_routes[].origin_url` in the same list already names everything \
+            r#"show = ["proxy.asset_routes[].source.origin.url", "proxy.asset_routes[0].source.origin.url"]"#,
+            "show names `proxy.asset_routes[0].source.origin.url`, which changes nothing, because \
+             `proxy.asset_routes[].source.origin.url` in the same list already names everything \
              it does",
         ),
         (
-            "show = [\"publisher.origin_url\"]\nhide = [\"publisher.origin_url\"]",
-            "show names `publisher.origin_url`, which changes nothing, because hide \
-             names it as `publisher.origin_url` and hide wins over show",
+            "show = [\"source.origin.url\"]\nhide = [\"source.origin.url\"]",
+            "show names `source.origin.url`, which changes nothing, because hide \
+             names it as `source.origin.url` and hide wins over show",
         ),
         (
             "config = false\nhide = [\"publisher.domain\"]",

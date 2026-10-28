@@ -51,13 +51,21 @@ pub struct Publisher {
     /// (see [`ec_cookie_domain`](Self::ec_cookie_domain)).
     #[validate(custom(function = validate_cookie_domain))]
     pub cookie_domain: String,
-    #[serde(serialize_with = "crate::redacted::sensitive")]
-    #[validate(custom(function = validate_no_trailing_slash))]
-    pub origin_url: String,
-    /// Optional outbound Host header to send while connecting to `origin_url`.
-    #[serde(default, serialize_with = "crate::redacted::sensitive")]
-    #[validate(custom(function = validate_host_header_override))]
-    pub origin_host_header_override: Option<String>,
+    /// Moved to the publisher's source, kept so a document carrying it is
+    /// refused with directions.
+    #[serde(default, skip_serializing)]
+    #[allow(
+        dead_code,
+        reason = "the field exists so that reading the moved setting fails with directions"
+    )]
+    origin_url: MovedOriginUrl,
+    /// Moved to the publisher's source, as for `origin_url`.
+    #[serde(default, skip_serializing)]
+    #[allow(
+        dead_code,
+        reason = "the field exists so that reading the moved setting fails with directions"
+    )]
+    origin_host_header_override: MovedOriginHostHeader,
     /// Secret used to encrypt/decrypt proxied URLs in `/first-party/proxy`.
     /// Keep this secret stable to allow existing links to decode.
     #[validate(custom(function = validate_redacted_not_empty))]
@@ -91,15 +99,20 @@ pub struct Publisher {
     #[serde(default = "default_max_buffered_body_bytes")]
     #[validate(range(min = 1, message = "must be at least 1 byte"))]
     pub max_buffered_body_bytes: usize,
-    /// Optional signing of publisher origin reads, taking an asset route's `auth` table.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin_auth: Option<AssetOriginAuth>,
-    /// Optional file name added to a request path that ends in `/` on the way
-    /// to the origin, for an origin such as object storage that does not answer
-    /// a folder with its index file. The reader's address is unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[validate(custom(function = validate_directory_index))]
-    pub directory_index: Option<String>,
+    /// Moved to the publisher's source, as for `origin_url`.
+    #[serde(default, skip_serializing)]
+    #[allow(
+        dead_code,
+        reason = "the field exists so that reading the moved setting fails with directions"
+    )]
+    origin_auth: MovedOriginAuth,
+    /// Moved to the publisher's source, as for `origin_url`.
+    #[serde(default, skip_serializing)]
+    #[allow(
+        dead_code,
+        reason = "the field exists so that reading the moved setting fails with directions"
+    )]
+    directory_index: MovedDirectoryIndex,
 }
 
 fn default_max_buffered_body_bytes() -> usize {
@@ -116,12 +129,12 @@ impl Default for Publisher {
         Self {
             domain: String::default(),
             cookie_domain: String::default(),
-            origin_url: String::default(),
-            origin_host_header_override: None,
+            origin_url: MovedOriginUrl,
+            origin_host_header_override: MovedOriginHostHeader,
             proxy_secret: Redacted::default(),
             max_buffered_body_bytes: default_max_buffered_body_bytes(),
-            origin_auth: None,
-            directory_index: None,
+            origin_auth: MovedOriginAuth,
+            directory_index: MovedDirectoryIndex,
         }
     }
 }
@@ -198,88 +211,24 @@ impl Publisher {
                     .any(|p| p.eq_ignore_ascii_case(&host))
             })
     }
-
-    /// Extracts the host (including port if present) from the `origin_url`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use trusted_server_core::settings::Publisher;
-    /// # use trusted_server_core::redacted::Redacted;
-    /// let publisher = Publisher {
-    ///     domain: "example.com".to_string(),
-    ///     cookie_domain: ".example.com".to_string(),
-    ///     origin_url: "https://origin.example.com:8080".to_string(),
-    ///     origin_host_header_override: None,
-    ///     proxy_secret: Redacted::new("proxy-secret".to_string()),
-    ///     max_buffered_body_bytes: 16 * 1024 * 1024,
-    ///     origin_auth: None,
-    ///     directory_index: None,
-    /// };
-    /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
-    /// ```
-    #[allow(dead_code)]
-    #[must_use]
-    pub fn origin_host(&self) -> String {
-        Url::parse(&self.origin_url)
-            .ok()
-            .and_then(|url| {
-                url.host_str().map(|host| match url.port() {
-                    Some(port) => format!("{}:{}", host, port),
-                    None => host.to_string(),
-                })
-            })
-            .unwrap_or_else(|| self.origin_url.clone())
-    }
-
-    /// Returns the outbound Host header for proxied publisher-origin requests.
-    #[must_use]
-    pub fn origin_host_header(&self) -> String {
-        self.origin_host_header_override
-            .clone()
-            .unwrap_or_else(|| self.origin_host())
-    }
-
-    /// Returns `true` when [`Self::origin_auth`] says the reader's query is
-    /// left off origin requests, as an asset route's `origin_query` does.
-    #[must_use]
-    pub fn origin_query_is_stripped(&self) -> bool {
-        self.origin_auth
-            .as_ref()
-            .and_then(AssetOriginAuth::origin_query_policy)
-            == Some(OriginQueryPolicy::Strip)
-    }
-
-    fn normalize(&mut self) {
-        if let Some(auth) = &mut self.origin_auth {
-            auth.normalize();
-        }
-    }
-
-    /// Refuses an `origin_auth` the signer cannot use, naming the setting.
-    ///
-    /// As for an asset route, a signed origin must use `https`.
-    fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
-        let Some(auth) = &self.origin_auth else {
-            return Ok(());
-        };
-        let uses_https = Url::parse(&self.origin_url).is_ok_and(|url| url.scheme() == "https");
-        if !uses_https {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "{PUBLISHER_ORIGIN_AUTH_SETTING} requires publisher.origin_url to use https"
-                ),
-            }));
-        }
-        auth.prepare_runtime(PUBLISHER_ORIGIN_AUTH_SETTING)
-    }
 }
 
-/// The setting named in every refusal of `[publisher]`'s `origin_auth`.
-const PUBLISHER_ORIGIN_AUTH_SETTING: &str = "publisher.origin_auth";
+/// `value` as a `Host` header a source may send, or why it cannot be one.
+pub(crate) fn check_host_header(value: &str) -> Result<(), String> {
+    validate_host_header_override_value(value)
+        .map_err(|reason| format!("must be a host or host:port alone, but {reason}"))
+}
 
-/// The setting named in every refusal of an asset route's `auth`.
-const ASSET_ROUTE_AUTH_SETTING: &str = "proxy.asset_routes auth";
+/// `value` as one file name a source may add to a folder's path, or why it
+/// cannot be one.
+pub(crate) fn check_directory_index(value: &str) -> Result<(), String> {
+    validate_directory_index(value).map_err(|error| {
+        error.message.map_or_else(
+            || "is not one file name".to_owned(),
+            |message| message.to_string(),
+        )
+    })
+}
 
 /// Which integrations run, and the settings each one is given.
 ///
@@ -1965,14 +1914,14 @@ pub enum AssetOriginAuth {
 }
 
 impl AssetOriginAuth {
-    fn normalize(&mut self) {
+    pub(crate) fn normalize(&mut self) {
         match self {
             Self::S3SigV4(config) => config.normalize(),
         }
     }
 
     /// Refuses a table the signer cannot use, naming `setting` in the message.
-    fn prepare_runtime(&self, setting: &str) -> Result<(), Report<TrustedServerError>> {
+    pub(crate) fn prepare_runtime(&self, setting: &str) -> Result<(), Report<TrustedServerError>> {
         match self {
             Self::S3SigV4(config) => config.prepare_runtime(setting),
         }
@@ -2645,13 +2594,22 @@ pub struct ProxyAssetRoute {
     /// a trailing `/` unless you intentionally want `/static` to match paths such
     /// as `/staticfile.js`.
     pub prefix: String,
-    /// Absolute `http` or `https` origin used for upstream requests.
-    ///
-    /// Only the scheme, host, and port are used. Any path or query configured on
-    /// this URL is rejected because the incoming request path/query, or the
-    /// configured rewrite result, replaces them at runtime.
-    #[serde(serialize_with = "crate::redacted::sensitive")]
-    pub origin_url: String,
+    /// The source the route's content comes from, in the shape `[source]`
+    /// has: `module` naming it and its settings in the table beneath.
+    #[serde(
+        default,
+        skip_serializing_if = "SectionModules::is_unset",
+        serialize_with = "crate::source::serialize_selection"
+    )]
+    pub source: SectionModules,
+    /// Moved to the route's source, kept so a document carrying it is refused
+    /// with directions.
+    #[serde(default, skip_serializing)]
+    #[allow(
+        dead_code,
+        reason = "the field exists so that reading the moved setting fails with directions"
+    )]
+    origin_url: MovedRouteOriginUrl,
     /// Optional regex matched against the incoming request path before proxying.
     pub path_pattern: Option<String>,
     /// Optional regex replacement used with [`Self::path_pattern`] to build the upstream path.
@@ -2659,9 +2617,13 @@ pub struct ProxyAssetRoute {
     /// Must be configured together with [`Self::path_pattern`] and must produce a
     /// path that starts with `/`.
     pub target_path: Option<String>,
-    /// Optional origin authentication configuration.
-    #[serde(default)]
-    pub auth: Option<AssetOriginAuth>,
+    /// Moved to the route's source, as for `origin_url`.
+    #[serde(default, skip_serializing)]
+    #[allow(
+        dead_code,
+        reason = "the field exists so that reading the moved setting fails with directions"
+    )]
+    auth: MovedRouteAuth,
     /// Optional Image Optimizer configuration.
     #[serde(default)]
     pub image_optimizer: Option<AssetImageOptimizerConfig>,
@@ -2670,19 +2632,40 @@ pub struct ProxyAssetRoute {
 }
 
 impl ProxyAssetRoute {
-    /// Create an asset route with the required prefix and origin URL.
+    /// An asset route at `prefix` whose source is core's `origin` at
+    /// `origin_url`.
     #[must_use]
     pub fn new(prefix: impl Into<String>, origin_url: impl Into<String>) -> Self {
         Self {
             prefix: prefix.into(),
-            origin_url: origin_url.into(),
+            source: crate::source::OriginSettings::new(origin_url).selection(),
             ..Self::default()
         }
     }
 
+    /// Sets the route's source to core's `origin` with `origin`.
+    pub fn set_origin_source(&mut self, origin: &crate::source::OriginSettings) {
+        self.source = origin.selection();
+    }
+
+    /// The route's `origin` source settings as written, when its source is
+    /// `origin`. [`Self::prepare_runtime`] checks them.
+    #[must_use]
+    pub fn origin_source(&self) -> Option<crate::source::OriginSettings> {
+        let (name, table) = crate::source::selected(&self.source, "source").ok()?;
+        (name == crate::source::ORIGIN)
+            .then(|| crate::source::OriginSettings::parse(&table, "source.origin").ok())
+            .flatten()
+    }
+
+    /// The setting named in a refusal of this route's source.
+    #[must_use]
+    pub fn source_setting(&self) -> String {
+        format!("proxy.asset_routes {} source", self.prefix)
+    }
+
     fn normalize(&mut self) {
         self.prefix = self.prefix.trim().to_string();
-        self.origin_url = self.origin_url.trim().to_string();
         self.path_pattern = self
             .path_pattern
             .take()
@@ -2693,9 +2676,6 @@ impl ProxyAssetRoute {
             .take()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        if let Some(auth) = &mut self.auth {
-            auth.normalize();
-        }
         if let Some(image_optimizer) = &mut self.image_optimizer {
             image_optimizer.normalize();
         }
@@ -2784,33 +2764,7 @@ impl ProxyAssetRoute {
             })
         })?;
 
-        validate_proxy_origin_url(&self.origin_url).map_err(|err| {
-            Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "proxy.asset_routes origin_url `{}` is invalid: {err}",
-                    self.origin_url
-                ),
-            })
-        })?;
-
-        if matches!(&self.auth, Some(AssetOriginAuth::S3SigV4(_))) {
-            let parsed_origin = Url::parse(&self.origin_url).map_err(|err| {
-                Report::new(TrustedServerError::Configuration {
-                    message: format!(
-                        "proxy.asset_routes origin_url `{}` is invalid: {err}",
-                        self.origin_url
-                    ),
-                })
-            })?;
-            if parsed_origin.scheme() != "https" {
-                return Err(Report::new(TrustedServerError::Configuration {
-                    message: format!(
-                        "proxy.asset_routes origin_url `{}` must use https when auth type is s3_sigv4",
-                        self.origin_url
-                    ),
-                }));
-            }
-        }
+        crate::source::check_selection(&self.source, &self.source_setting())?;
 
         match (&self.path_pattern, &self.target_path) {
             (None, None) | (Some(_), Some(_)) => {}
@@ -2824,9 +2778,6 @@ impl ProxyAssetRoute {
             }
         }
 
-        if let Some(auth) = &self.auth {
-            auth.prepare_runtime(ASSET_ROUTE_AUTH_SETTING)?;
-        }
         if let Some(image_optimizer) = &self.image_optimizer {
             image_optimizer.prepare_runtime()?;
         }
@@ -2859,11 +2810,22 @@ impl ProxyAssetRoute {
     /// enabled Image Optimizer routes and `preserve` otherwise.
     #[must_use]
     pub fn origin_query_policy(&self) -> OriginQueryPolicy {
-        if let Some(policy) = self
-            .auth
-            .as_ref()
-            .and_then(AssetOriginAuth::origin_query_policy)
-        {
+        self.query_policy_with(self.origin_source().and_then(|origin| origin.auth).as_ref())
+    }
+
+    /// The effective origin query policy for a request to `location`, as
+    /// [`Self::origin_query_policy`] gives it, with the signing the location
+    /// carries.
+    #[must_use]
+    pub fn origin_query_policy_at(
+        &self,
+        location: &crate::source::SourceLocation,
+    ) -> OriginQueryPolicy {
+        self.query_policy_with(location.auth())
+    }
+
+    fn query_policy_with(&self, auth: Option<&AssetOriginAuth>) -> OriginQueryPolicy {
+        if let Some(policy) = auth.and_then(AssetOriginAuth::origin_query_policy) {
             return policy;
         }
         if let Some(policy) = self
@@ -2999,20 +2961,29 @@ impl Proxy {
     /// Resolve the longest matching asset route for the given request path.
     #[must_use]
     pub fn asset_route_for_path(&self, path: &str) -> Option<&ProxyAssetRoute> {
-        let mut best_match: Option<&ProxyAssetRoute> = None;
+        self.asset_route_index_for_path(path)
+            .map(|index| &self.asset_routes[index])
+    }
 
-        for route in &self.asset_routes {
+    /// The position in `asset_routes` of the route
+    /// [`Self::asset_route_for_path`] gives, which names the route's source
+    /// to [`IntegrationRegistry::route_source`](crate::integrations::IntegrationRegistry::route_source).
+    #[must_use]
+    pub fn asset_route_index_for_path(&self, path: &str) -> Option<usize> {
+        let mut best_match: Option<(usize, usize)> = None;
+
+        for (index, route) in self.asset_routes.iter().enumerate() {
             if !path.starts_with(&route.prefix) {
                 continue;
             }
 
             match best_match {
-                Some(current) if current.prefix.len() >= route.prefix.len() => {}
-                _ => best_match = Some(route),
+                Some((_, length)) if length >= route.prefix.len() => {}
+                _ => best_match = Some((index, route.prefix.len())),
             }
         }
 
-        best_match
+        best_match.map(|(index, _)| index)
     }
 }
 
@@ -4078,6 +4049,43 @@ macro_rules! refused_table {
 }
 
 refused_table! {
+    /// `[publisher] origin_url`, moved to the publisher's source.
+    MovedOriginUrl => "`[publisher] origin_url` has moved to the publisher's source. Write \
+        `[source] module = \"origin\"` and the address as `[source.origin] url`"
+}
+
+refused_table! {
+    /// `[publisher] origin_host_header_override`, moved to the publisher's source.
+    MovedOriginHostHeader => "`[publisher] origin_host_header_override` has moved to the \
+        publisher's source, as `[source.origin] host_header`"
+}
+
+refused_table! {
+    /// `[publisher] origin_auth`, moved to the publisher's source.
+    MovedOriginAuth => "`[publisher] origin_auth` has moved to the publisher's source, as \
+        `[source.origin] auth`"
+}
+
+refused_table! {
+    /// `[publisher] directory_index`, moved to the publisher's source.
+    MovedDirectoryIndex => "`[publisher] directory_index` has moved to the publisher's \
+        source, as `[source.origin] directory_index`"
+}
+
+refused_table! {
+    /// An asset route's `origin_url`, moved to the route's source.
+    MovedRouteOriginUrl => "`origin_url` of a `[[proxy.asset_routes]]` entry has moved to \
+        the route's source. Write `[proxy.asset_routes.source] module = \"origin\"` and the \
+        address as `[proxy.asset_routes.source.origin] url`"
+}
+
+refused_table! {
+    /// An asset route's `auth`, moved to the route's source.
+    MovedRouteAuth => "`auth` of a `[[proxy.asset_routes]]` entry has moved to the route's \
+        source, as `[proxy.asset_routes.source.origin] auth`"
+}
+
+refused_table! {
     /// The `[adserver]` table, renamed `[ad-server]`.
     RenamedAdServerTable => "Configuration table `[adserver]` is now `[ad-server]`. Select the \
         ad server with `[ad-server] module` and move its settings to `[ad-server.<name>]` \
@@ -4411,6 +4419,14 @@ fn validate_trusted_client_ip_shared_secret(
 pub struct Settings {
     #[validate(nested)]
     pub publisher: Publisher,
+    /// The source the publisher's pages come from: `module` naming it and its
+    /// settings in the table beneath, `[source.origin]` for core's `origin`.
+    #[serde(
+        default,
+        skip_serializing_if = "SectionModules::is_unset",
+        serialize_with = "crate::source::serialize_selection"
+    )]
+    pub source: SectionModules,
     #[serde(default)]
     #[validate(nested)]
     pub tester_cookie: TesterCookieConfig,
@@ -4741,7 +4757,6 @@ impl Settings {
     /// Returns a configuration error if image optimizer keys collide after trimming.
     pub(crate) fn normalize_deserialized(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.cache.normalize();
-        self.publisher.normalize();
         self.proxy.normalize();
         self.image_optimizer.normalize()?;
         self.debug.auction_html_comment_options.normalize();
@@ -4782,19 +4797,35 @@ impl Settings {
         Ok(settings)
     }
 
+    /// The publisher's `origin` source settings as written, when `[source]`
+    /// selects core's `origin`. [`Self::prepare_runtime`] checks them.
+    #[must_use]
+    pub fn origin_source(&self) -> Option<crate::source::OriginSettings> {
+        let (name, table) =
+            crate::source::selected(&self.source, crate::source::SOURCE_SECTION).ok()?;
+        (name == crate::source::ORIGIN)
+            .then(|| crate::source::OriginSettings::parse(&table, "source.origin").ok())
+            .flatten()
+    }
+
+    /// Sets the publisher's source to core's `origin` with `origin`.
+    pub fn set_origin_source(&mut self, origin: &crate::source::OriginSettings) {
+        self.source = origin.selection();
+    }
+
     /// Eagerly prepare runtime-only settings artifacts.
     ///
     /// # Errors
     ///
     /// Returns a configuration error if any cached runtime artifact cannot be
     /// prepared, if any handler path regex does not compile, if a creative
-    /// opportunity slot is invalid, if `publisher.origin_auth` cannot sign, or
+    /// opportunity slot is invalid, if the publisher's source cannot be used, or
     /// if [`AuctionDebugCommentOptions::metadata_keys`] names an unsupported
     /// key.
     pub fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.image_optimizer.prepare_runtime()?;
         self.cache.prepare_runtime()?;
-        self.publisher.prepare_runtime()?;
+        crate::source::check_selection(&self.source, crate::source::SOURCE_SECTION)?;
         self.proxy.prepare_runtime()?;
         if let Some(analytics) = &mut self.analytics {
             analytics.prepare_runtime()?;
@@ -4964,8 +4995,11 @@ impl Settings {
         if Publisher::is_placeholder_cookie_domain(&self.publisher.cookie_domain) {
             insecure_fields.push("publisher.cookie_domain".to_owned());
         }
-        if Publisher::is_placeholder_origin_url(&self.publisher.origin_url) {
-            insecure_fields.push("publisher.origin_url".to_owned());
+        if self
+            .origin_source()
+            .is_some_and(|origin| origin.is_placeholder())
+        {
+            insecure_fields.push("source.origin.url".to_owned());
         }
 
         if insecure_fields.is_empty() {
@@ -5021,12 +5055,19 @@ impl Settings {
         self.proxy.asset_route_for_path(path)
     }
 
+    /// The position of the asset route [`Self::asset_route_for_path`] gives.
+    #[must_use]
+    pub fn asset_route_index_for_path(&self, path: &str) -> Option<usize> {
+        self.proxy.asset_route_index_for_path(path)
+    }
+
     /// Every section that selects modules, with its name: `[proxy]`,
     /// `[auction]` and each module type's own section.
     pub fn module_sections(&self) -> impl Iterator<Item = (&str, &SectionModules)> {
         [
             ("proxy", &self.proxy.modules),
             ("auction", &self.auction.modules),
+            (crate::source::SOURCE_SECTION, &self.source),
         ]
         .into_iter()
         .chain(self.sections.iter())
@@ -5285,31 +5326,6 @@ fn validate_cookie_domain(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-fn validate_no_trailing_slash(value: &str) -> Result<(), ValidationError> {
-    if value.ends_with('/') {
-        let mut err = ValidationError::new("trailing_slash");
-        err.add_param("value".into(), &value);
-        err.message = Some("origin_url must not include a trailing slash".into());
-        return Err(err);
-    }
-    Ok(())
-}
-
-fn validate_host_header_override(value: &str) -> Result<(), ValidationError> {
-    if let Err(reason) = validate_host_header_override_value(value) {
-        let mut err = ValidationError::new("invalid_host_header_override");
-        err.add_param("value".into(), &value);
-        err.add_param("reason".into(), &reason);
-        err.message = Some(
-            "origin_host_header_override must be a valid host or host:port without scheme, path, query, or fragment"
-                .into(),
-        );
-        return Err(err);
-    }
-
-    Ok(())
-}
-
 /// Longest `directory_index` accepted, the usual limit on one file name.
 const MAX_DIRECTORY_INDEX_BYTES: usize = 255;
 
@@ -5418,63 +5434,6 @@ fn validate_asset_route_prefix(value: &str) -> Result<(), ValidationError> {
         let mut err = ValidationError::new("invalid_prefix");
         err.add_param("value".into(), &value);
         err.message = Some("asset-route prefix must start with '/'".into());
-        return Err(err);
-    }
-
-    Ok(())
-}
-
-fn validate_proxy_origin_url(value: &str) -> Result<(), ValidationError> {
-    validate_no_trailing_slash(value)?;
-
-    let parsed = Url::parse(value).map_err(|parse_error| {
-        let mut err = ValidationError::new("invalid_origin_url");
-        err.add_param("value".into(), &value);
-        err.add_param("message".into(), &parse_error.to_string());
-        err.message = Some("origin_url must be an absolute http or https URL".into());
-        err
-    })?;
-
-    if !matches!(parsed.scheme(), "http" | "https") {
-        let mut err = ValidationError::new("invalid_origin_url_scheme");
-        err.add_param("value".into(), &value);
-        err.message = Some("origin_url must use http or https".into());
-        return Err(err);
-    }
-
-    if parsed.host_str().is_none() {
-        let mut err = ValidationError::new("missing_origin_host");
-        err.add_param("value".into(), &value);
-        err.message = Some("origin_url must include a host".into());
-        return Err(err);
-    }
-
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        let mut err = ValidationError::new("origin_url_has_userinfo");
-        err.add_param("value".into(), &value);
-        err.message = Some("origin_url must not include username or password".into());
-        return Err(err);
-    }
-
-    if parsed.fragment().is_some() {
-        let mut err = ValidationError::new("origin_url_has_fragment");
-        err.add_param("value".into(), &value);
-        err.message = Some("origin_url must not include a fragment".into());
-        return Err(err);
-    }
-
-    if !matches!(parsed.path(), "" | "/") {
-        let mut err = ValidationError::new("origin_url_has_path");
-        err.add_param("value".into(), &value);
-        err.message =
-            Some("origin_url must not include a path; only scheme/host/port are used".into());
-        return Err(err);
-    }
-
-    if parsed.query().is_some() {
-        let mut err = ValidationError::new("origin_url_has_query");
-        err.add_param("value".into(), &value);
-        err.message = Some("origin_url must not include a query string".into());
         return Err(err);
     }
 
@@ -5953,8 +5912,10 @@ mod tests {
         // like a configured `trusted_client_ip`, needs a compatible blob restored
         // before rolling back to a binary that predates it. The shared test
         // config sets `[geo]` because the permission model requires a default
-        // country, so both selector tables are reset to unset here.
+        // country and `[source]` because every deployment names one, so those
+        // tables are reset to unset here.
         settings.geo = GeoConfig::default();
+        settings.source = SectionModules::default();
         settings.device = DeviceConfig::default();
         settings.sections = TypeSections::default();
         settings.auction.modules.clear();
@@ -6100,14 +6061,17 @@ module = \"none\"",
         });
 
         let mut asset_route = ProxyAssetRoute::new("/s3-assets/", "https://s3.canary.example");
-        asset_route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-            region: "us-east-1".to_string(),
-            secret_store: None,
-            access_key_id: Redacted::new(CANARY_S3_ACCESS_KEY_ID.to_string()),
-            secret_access_key: Redacted::new(CANARY_S3_SECRET_ACCESS_KEY.to_string()),
-            session_token: Some(Redacted::new(CANARY_S3_SESSION_TOKEN.to_string())),
-            origin_query: None,
-        }));
+        asset_route.set_origin_source(&crate::source::OriginSettings {
+            auth: Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+                region: "us-east-1".to_string(),
+                secret_store: None,
+                access_key_id: Redacted::new(CANARY_S3_ACCESS_KEY_ID.to_string()),
+                secret_access_key: Redacted::new(CANARY_S3_SECRET_ACCESS_KEY.to_string()),
+                session_token: Some(Redacted::new(CANARY_S3_SESSION_TOKEN.to_string())),
+                origin_query: None,
+            })),
+            ..crate::source::OriginSettings::new("https://s3.canary.example")
+        });
         settings.proxy.asset_routes = vec![asset_route];
 
         settings.analytics = Some(AnalyticsConfig {
@@ -7228,11 +7192,11 @@ module = \"none\"",
             ".test-publisher.com",
             "EC cookie domain should be computed as .{{domain}}"
         );
-        assert_eq!(
-            settings.publisher.origin_url,
-            "https://origin.test-publisher.com"
-        );
-        assert_eq!(settings.publisher.origin_host_header_override, None);
+        let origin = settings
+            .origin_source()
+            .expect("the fixture should select the origin source");
+        assert_eq!(origin.url, "https://origin.test-publisher.com");
+        assert_eq!(origin.host_header, None);
         assert_eq!(
             settings.ec.module.as_ref(),
             Some(&EcModuleSelection::from(HMAC_MODULE_KEY)),
@@ -8590,16 +8554,16 @@ passphrase = "another-test-secret-key-32-bytes"
     }
 
     #[test]
-    fn validate_rejects_trailing_slash_in_origin_url() {
+    fn validate_rejects_trailing_slash_in_source_origin_url() {
         let toml_str = crate_test_settings_str().replace(
-            r#"origin_url = "https://origin.test-publisher.com""#,
-            r#"origin_url = "https://origin.test-publisher.com/""#,
+            r#"url = "https://origin.test-publisher.com""#,
+            r#"url = "https://origin.test-publisher.com/""#,
         );
 
-        let result = Settings::from_toml(&toml_str);
+        let err = Settings::from_toml(&toml_str).expect_err("a url ending in '/' should fail");
         assert!(
-            result.is_err(),
-            "origin_url ending with '/' should fail validation"
+            format!("{err:?}").contains("[source.origin] url"),
+            "the refusal should name the setting: {err:?}"
         );
     }
 
@@ -8703,16 +8667,21 @@ passphrase = "another-test-secret-key-32-bytes"
     }
 
     #[test]
-    fn validate_accepts_origin_host_header_override() {
+    fn validate_accepts_source_origin_host_header() {
         let toml_str = crate_test_settings_str().replace(
-            r#"origin_url = "https://origin.test-publisher.com""#,
-            r#"origin_url = "https://origin.test-publisher.com"
-origin_host_header_override = "www.example.com:8443""#,
+            r#"url = "https://origin.test-publisher.com""#,
+            r#"url = "https://origin.test-publisher.com"
+host_header = "www.example.com:8443""#,
         );
 
         let settings = Settings::from_toml(&toml_str).expect("should accept host header override");
         assert_eq!(
-            settings.publisher.origin_host_header(),
+            settings
+                .origin_source()
+                .expect("should select the origin source")
+                .location()
+                .expect("should give a location")
+                .host_header(),
             "www.example.com:8443",
             "should use configured host header override"
         );
@@ -8721,8 +8690,8 @@ origin_host_header_override = "www.example.com:8443""#,
     #[test]
     fn publisher_rejects_unknown_fields() {
         let toml_str = crate_test_settings_str().replace(
-            r#"origin_url = "https://origin.test-publisher.com""#,
-            r#"origin_url = "https://origin.test-publisher.com"
+            r#"proxy_secret = "unit-test-proxy-secret""#,
+            r#"proxy_secret = "unit-test-proxy-secret"
 origin_host_header_overide = "www.example.com""#,
         );
 
@@ -8735,7 +8704,23 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
-    fn validate_rejects_invalid_origin_host_header_overrides() {
+    fn source_origin_rejects_unknown_fields() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"url = "https://origin.test-publisher.com""#,
+            r#"url = "https://origin.test-publisher.com"
+host_headr = "www.example.com""#,
+        );
+
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("unknown origin fields should fail configuration loading");
+        assert!(
+            format!("{err:?}").contains("host_headr"),
+            "error should identify the misspelled origin field: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_source_origin_host_headers() {
         for override_value in [
             "",
             " www.example.com",
@@ -8755,23 +8740,23 @@ origin_host_header_overide = "www.example.com""#,
             "[::1",
         ] {
             let toml_str = crate_test_settings_str().replace(
-                r#"origin_url = "https://origin.test-publisher.com""#,
+                r#"url = "https://origin.test-publisher.com""#,
                 &format!(
-                    "origin_url = \"https://origin.test-publisher.com\"\norigin_host_header_override = {override_value:?}"
+                    "url = \"https://origin.test-publisher.com\"\nhost_header = {override_value:?}"
                 ),
             );
 
             let result = Settings::from_toml(&toml_str);
             assert!(
                 result.is_err(),
-                "origin_host_header_override {override_value:?} should fail validation"
+                "host_header {override_value:?} should fail validation"
             );
         }
     }
 
     #[test]
     fn test_settings_missing_required_fields() {
-        let re = Regex::new(r"origin_url = .*").expect("regex should compile");
+        let re = Regex::new(r"url = .*").expect("regex should compile");
 
         let toml_str = crate_test_settings_str();
         let toml_str = re.replace(&toml_str, "");
@@ -9086,8 +9071,9 @@ source_domain = "partner.example.com"
         let toml_str = crate_test_settings_str();
 
         let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
+            "{}{}SOURCE{}ORIGIN{}URL",
             ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR
         );
@@ -9232,8 +9218,9 @@ source_domain = "partner.example.com"
         let toml_str = crate_test_settings_str();
 
         let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
+            "{}{}SOURCE{}ORIGIN{}URL",
             ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR
         );
@@ -9304,8 +9291,9 @@ source_domain = "partner.example.com"
     fn test_set_env() {
         temp_env::with_var(
             format!(
-                "{}{}PUBLISHER{}ORIGIN_URL",
+                "{}{}SOURCE{}ORIGIN{}URL",
                 ENVIRONMENT_VARIABLE_PREFIX,
+                ENVIRONMENT_VARIABLE_SEPARATOR,
                 ENVIRONMENT_VARIABLE_SEPARATOR,
                 ENVIRONMENT_VARIABLE_SEPARATOR
             ),
@@ -9315,8 +9303,33 @@ source_domain = "partner.example.com"
 
                 assert!(settings.is_ok(), "Settings should load from embedded TOML");
                 assert_eq!(
-                    settings.expect("should load settings").publisher.origin_url,
+                    settings
+                        .expect("should load settings")
+                        .origin_source()
+                        .expect("should select the origin source")
+                        .url,
                     "https://change-publisher.com"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn the_old_environment_variable_for_the_address_is_refused_naming_the_source() {
+        temp_env::with_var(
+            format!(
+                "{}{}PUBLISHER{}ORIGIN_URL",
+                ENVIRONMENT_VARIABLE_PREFIX,
+                ENVIRONMENT_VARIABLE_SEPARATOR,
+                ENVIRONMENT_VARIABLE_SEPARATOR
+            ),
+            Some("https://change-publisher.com"),
+            || {
+                let error = Settings::from_toml_and_env(&crate_test_settings_str())
+                    .expect_err("should refuse the old variable");
+                assert!(
+                    format!("{error:?}").contains("[source.origin] url"),
+                    "should name where the address is set now: {error:?}"
                 );
             },
         );
@@ -9343,8 +9356,9 @@ source_domain = "partner.example.com"
 
         temp_env::with_var(
             format!(
-                "{}{}PUBLISHER{}ORIGIN_URL",
+                "{}{}SOURCE{}ORIGIN{}URL",
                 ENVIRONMENT_VARIABLE_PREFIX,
+                ENVIRONMENT_VARIABLE_SEPARATOR,
                 ENVIRONMENT_VARIABLE_SEPARATOR,
                 ENVIRONMENT_VARIABLE_SEPARATOR
             ),
@@ -9354,7 +9368,11 @@ source_domain = "partner.example.com"
 
                 assert!(settings.is_ok(), "Settings should load from embedded TOML");
                 assert_eq!(
-                    settings.expect("should load settings").publisher.origin_url,
+                    settings
+                        .expect("should load settings")
+                        .origin_source()
+                        .expect("should select the origin source")
+                        .url,
                     "https://change-publisher.com"
                 );
             },
@@ -9381,10 +9399,11 @@ source_domain = "partner.example.com"
     }
 
     #[test]
-    fn test_origin_host_header_override_env() {
+    fn test_source_origin_host_header_env() {
         let env_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_HOST_HEADER_OVERRIDE",
+            "{}{}SOURCE{}ORIGIN{}HOST_HEADER",
             ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR
         );
@@ -9393,19 +9412,26 @@ source_domain = "partner.example.com"
             let settings = Settings::from_toml_and_env(&crate_test_settings_str())
                 .expect("should load settings with host header override env");
 
+            let origin = settings
+                .origin_source()
+                .expect("should select the origin source");
+            assert_eq!(origin.host_header.as_deref(), Some("www.example.com"));
             assert_eq!(
-                settings.publisher.origin_host_header_override.as_deref(),
-                Some("www.example.com")
+                origin
+                    .location()
+                    .expect("should give a location")
+                    .host_header(),
+                "www.example.com"
             );
-            assert_eq!(settings.publisher.origin_host_header(), "www.example.com");
         });
     }
 
     #[test]
-    fn test_origin_host_header_override_env_typo_fails_closed() {
+    fn test_source_origin_host_header_env_typo_fails_closed() {
         let env_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_HOST_HEADER_OVERIDE",
+            "{}{}SOURCE{}ORIGIN{}HOST_HEADR",
             ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR
         );
@@ -9414,123 +9440,10 @@ source_domain = "partner.example.com"
             let err = Settings::from_toml_and_env(&crate_test_settings_str())
                 .expect_err("misspelled host override env var should fail configuration loading");
             assert!(
-                format!("{err:?}").contains("origin_host_header_overide"),
-                "error should identify the misspelled publisher env field: {err:?}"
+                format!("{err:?}").contains("host_headr"),
+                "error should identify the misspelled origin env field: {err:?}"
             );
         });
-    }
-
-    #[test]
-    fn test_publisher_origin_host() {
-        // Test with full URL including port
-        let publisher = Publisher {
-            domain: "example.com".to_string(),
-            cookie_domain: ".example.com".to_string(),
-            origin_url: "https://origin.example.com:8080".to_string(),
-            origin_host_header_override: None,
-            proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: 16 * 1024 * 1024,
-            origin_auth: None,
-            directory_index: None,
-        };
-        assert_eq!(publisher.origin_host(), "origin.example.com:8080");
-
-        // Test with URL without port (default HTTPS port)
-        let publisher = Publisher {
-            domain: "example.com".to_string(),
-            cookie_domain: ".example.com".to_string(),
-            origin_url: "https://origin.example.com".to_string(),
-            origin_host_header_override: None,
-            proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: 16 * 1024 * 1024,
-            origin_auth: None,
-            directory_index: None,
-        };
-        assert_eq!(publisher.origin_host(), "origin.example.com");
-
-        // Test with HTTP URL with explicit port
-        let publisher = Publisher {
-            domain: "example.com".to_string(),
-            cookie_domain: ".example.com".to_string(),
-            origin_url: "http://localhost:9090".to_string(),
-            origin_host_header_override: None,
-            proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: 16 * 1024 * 1024,
-            origin_auth: None,
-            directory_index: None,
-        };
-        assert_eq!(publisher.origin_host(), "localhost:9090");
-
-        // Test with URL without protocol (fallback to original)
-        let publisher = Publisher {
-            domain: "example.com".to_string(),
-            cookie_domain: ".example.com".to_string(),
-            origin_url: "localhost:9090".to_string(),
-            origin_host_header_override: None,
-            proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: 16 * 1024 * 1024,
-            origin_auth: None,
-            directory_index: None,
-        };
-        assert_eq!(publisher.origin_host(), "localhost:9090");
-
-        // Test with IPv4 address
-        let publisher = Publisher {
-            domain: "example.com".to_string(),
-            cookie_domain: ".example.com".to_string(),
-            origin_url: "http://192.168.1.1:8080".to_string(),
-            origin_host_header_override: None,
-            proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: 16 * 1024 * 1024,
-            origin_auth: None,
-            directory_index: None,
-        };
-        assert_eq!(publisher.origin_host(), "192.168.1.1:8080");
-
-        // Test with IPv6 address
-        let publisher = Publisher {
-            domain: "example.com".to_string(),
-            cookie_domain: ".example.com".to_string(),
-            origin_url: "http://[::1]:8080".to_string(),
-            origin_host_header_override: None,
-            proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: 16 * 1024 * 1024,
-            origin_auth: None,
-            directory_index: None,
-        };
-        assert_eq!(publisher.origin_host(), "[::1]:8080");
-    }
-
-    #[test]
-    fn test_publisher_origin_host_header_defaults_to_origin_host() {
-        let publisher = Publisher {
-            domain: "example.com".to_string(),
-            cookie_domain: ".example.com".to_string(),
-            origin_url: "https://origin.example.com:8443".to_string(),
-            origin_host_header_override: None,
-            proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: 16 * 1024 * 1024,
-            origin_auth: None,
-            directory_index: None,
-        };
-
-        assert_eq!(publisher.origin_host_header(), "origin.example.com:8443");
-    }
-
-    #[test]
-    fn test_publisher_origin_host_header_uses_override() {
-        let publisher = Publisher {
-            domain: "example.com".to_string(),
-            cookie_domain: ".example.com".to_string(),
-            origin_url: "https://origin.example.com".to_string(),
-            origin_host_header_override: Some("www.example.com".to_string()),
-            proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: 16 * 1024 * 1024,
-            origin_auth: None,
-            directory_index: None,
-        };
-
-        assert_eq!(publisher.origin_host_header(), "www.example.com");
     }
 
     #[test]
@@ -9546,10 +9459,15 @@ source_domain = "partner.example.com"
 
         let from_toml = Settings::from_toml(
             r#"
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.example.com"
+
             [publisher]
             domain = "example.com"
             cookie_domain = ".example.com"
-            origin_url = "https://origin.example.com"
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
@@ -9570,57 +9488,53 @@ source_domain = "partner.example.com"
         );
     }
 
-    /// The fixture settings with `lines` added to `[publisher]` and its
-    /// `origin_url` replaced by `origin_url`.
-    fn publisher_settings_with(origin_url: &str, lines: &str) -> String {
-        crate_test_settings_str()
-            .replacen(
-                "origin_url = \"https://origin.test-publisher.com\"",
-                &format!("origin_url = \"{origin_url}\""),
-                1,
-            )
-            .replacen(
-                "proxy_secret = \"unit-test-proxy-secret\"",
-                &format!("proxy_secret = \"unit-test-proxy-secret\"\n{lines}"),
-                1,
-            )
+    /// The fixture settings with `[source.origin]` at `url` and `lines` added
+    /// to it.
+    fn origin_settings_with(url: &str, lines: &str) -> String {
+        crate_test_settings_str().replacen(
+            "url = \"https://origin.test-publisher.com\"",
+            &format!("url = \"{url}\"\n{lines}"),
+            1,
+        )
     }
 
     const STORAGE_ORIGIN_URL: &str = "https://storage.example.com/bucket/site";
 
     #[test]
-    fn publisher_object_storage_settings_are_off_by_default() {
+    fn source_origin_object_storage_settings_are_off_by_default() {
         let settings =
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        let origin = settings
+            .origin_source()
+            .expect("the fixture should select the origin source");
 
+        assert!(origin.auth.is_none(), "auth should default to unset");
         assert!(
-            settings.publisher.origin_auth.is_none(),
-            "origin_auth should default to unset"
-        );
-        assert!(
-            settings.publisher.directory_index.is_none(),
+            origin.directory_index.is_none(),
             "directory_index should default to unset"
         );
-        let serialized =
-            serde_json::to_value(&settings.publisher).expect("should serialize publisher");
+        let serialized = serde_json::to_value(&settings.source).expect("should serialize source");
         assert!(
-            serialized.get("origin_auth").is_none() && serialized.get("directory_index").is_none(),
-            "unset settings should serialize as a document written before they existed: \
-             {serialized}"
+            serialized["origin"].get("auth").is_none()
+                && serialized["origin"].get("directory_index").is_none(),
+            "unset settings should not be written: {serialized}"
         );
     }
 
     #[test]
-    fn publisher_origin_auth_reads_the_asset_route_auth_table() {
-        let settings = Settings::from_toml(&publisher_settings_with(
+    fn source_origin_auth_reads_the_asset_route_auth_table() {
+        let settings = Settings::from_toml(&origin_settings_with(
             STORAGE_ORIGIN_URL,
-            r#"origin_auth = { type = "s3_sigv4", region = "test-region-1", access_key_id = "origin_access_key_id", secret_access_key = "origin_secret_access_key", session_token = "origin_session_token", origin_query = "strip" }
+            r#"auth = { type = "s3_sigv4", region = "test-region-1", access_key_id = "origin_access_key_id", secret_access_key = "origin_secret_access_key", session_token = "origin_session_token", origin_query = "strip" }
             directory_index = "index.html""#,
         ))
-        .expect("should parse a publisher with origin_auth and directory_index");
+        .expect("should parse an origin with auth and directory_index");
+        let origin = settings
+            .origin_source()
+            .expect("should select the origin source");
 
-        let Some(AssetOriginAuth::S3SigV4(auth)) = settings.publisher.origin_auth.as_ref() else {
-            panic!("should read origin_auth as the asset route auth table");
+        let Some(AssetOriginAuth::S3SigV4(auth)) = origin.auth.as_ref() else {
+            panic!("should read auth as the asset route auth table");
         };
         assert_eq!(auth.region, "test-region-1");
         assert_eq!(auth.access_key_id.expose(), "origin_access_key_id");
@@ -9633,21 +9547,24 @@ source_domain = "partner.example.com"
             Some("origin_session_token")
         );
         assert!(
-            settings.publisher.origin_query_is_stripped(),
+            origin
+                .location()
+                .expect("should give a location")
+                .query_is_stripped(),
             "origin_query = \"strip\" should leave the query off origin requests"
         );
-        assert_eq!(
-            settings.publisher.directory_index.as_deref(),
-            Some("index.html")
-        );
+        assert_eq!(origin.directory_index.as_deref(), Some("index.html"));
 
-        let defaulted = Settings::from_toml(&publisher_settings_with(
+        let defaulted = Settings::from_toml(&origin_settings_with(
             STORAGE_ORIGIN_URL,
-            r#"origin_auth = { type = "s3_sigv4", region = "test-region-1" }"#,
+            r#"auth = { type = "s3_sigv4", region = "test-region-1" }"#,
         ))
-        .expect("should parse origin_auth naming only its region");
-        let Some(AssetOriginAuth::S3SigV4(auth)) = defaulted.publisher.origin_auth.as_ref() else {
-            panic!("should read origin_auth with defaulted key references");
+        .expect("should parse auth naming only its region");
+        let defaulted = defaulted
+            .origin_source()
+            .expect("should select the origin source");
+        let Some(AssetOriginAuth::S3SigV4(auth)) = defaulted.auth.as_ref() else {
+            panic!("should read auth with defaulted key references");
         };
         assert_eq!(
             (
@@ -9658,13 +9575,16 @@ source_domain = "partner.example.com"
             "omitted key references should default as an asset route's do"
         );
         assert!(
-            !defaulted.publisher.origin_query_is_stripped(),
+            !defaulted
+                .location()
+                .expect("should give a location")
+                .query_is_stripped(),
             "the query should be kept unless origin_query strips it"
         );
     }
 
     #[test]
-    fn publisher_directory_index_accepts_a_file_name() {
+    fn source_origin_directory_index_accepts_a_file_name() {
         for name in [
             "index.html",
             "default.htm",
@@ -9673,17 +9593,24 @@ source_domain = "partner.example.com"
             "home~1.html",
         ] {
             let lines = format!("directory_index = {}", toml::Value::String(name.to_owned()));
-            let settings = Settings::from_toml(&publisher_settings_with(
+            let settings = Settings::from_toml(&origin_settings_with(
                 "https://origin.test-publisher.com",
                 &lines,
             ))
             .unwrap_or_else(|err| panic!("should accept directory_index `{name}`: {err:?}"));
-            assert_eq!(settings.publisher.directory_index.as_deref(), Some(name));
+            assert_eq!(
+                settings
+                    .origin_source()
+                    .expect("should select the origin source")
+                    .directory_index
+                    .as_deref(),
+                Some(name)
+            );
         }
     }
 
     #[test]
-    fn publisher_directory_index_refuses_anything_but_a_file_name() {
+    fn source_origin_directory_index_refuses_anything_but_a_file_name() {
         let too_long = "a".repeat(super::MAX_DIRECTORY_INDEX_BYTES + 1);
         for name in [
             "",
@@ -9703,63 +9630,63 @@ source_domain = "partner.example.com"
             too_long.as_str(),
         ] {
             let lines = format!("directory_index = {}", toml::Value::String(name.to_owned()));
-            let err = Settings::from_toml(&publisher_settings_with(
+            let err = Settings::from_toml(&origin_settings_with(
                 "https://origin.test-publisher.com",
                 &lines,
             ))
             .expect_err("should refuse a directory_index that is not one file name");
             assert!(
-                format!("{err:?}").contains("publisher.directory_index"),
+                format!("{err:?}").contains("[source.origin] directory_index"),
                 "the refusal of `{name}` should name the setting: {err:?}"
             );
         }
     }
 
     #[test]
-    fn publisher_origin_auth_refuses_a_table_it_cannot_sign_with() {
+    fn source_origin_auth_refuses_a_table_it_cannot_sign_with() {
         for (origin_url, table, expected) in [
             (
                 STORAGE_ORIGIN_URL,
                 r#"{ type = "s3_sigv4", region = "" }"#,
-                "publisher.origin_auth s3_sigv4 region must not be empty",
+                "source.origin.auth s3_sigv4 region must not be empty",
             ),
             (
                 STORAGE_ORIGIN_URL,
                 r#"{ type = "s3_sigv4", region = "Test_Region" }"#,
-                "publisher.origin_auth s3_sigv4 region must contain only lowercase letters",
+                "source.origin.auth s3_sigv4 region must contain only lowercase letters",
             ),
             (
                 STORAGE_ORIGIN_URL,
                 r#"{ type = "s3_sigv4", region = "test-region-1", access_key_id = " " }"#,
-                "publisher.origin_auth s3_sigv4 credentials must not be empty",
+                "source.origin.auth s3_sigv4 credentials must not be empty",
             ),
             (
                 STORAGE_ORIGIN_URL,
                 r#"{ type = "s3_sigv4", region = "test-region-1", secret_access_key = "" }"#,
-                "publisher.origin_auth s3_sigv4 credentials must not be empty",
+                "source.origin.auth s3_sigv4 credentials must not be empty",
             ),
             (
                 "http://storage.example.com/bucket/site",
                 r#"{ type = "s3_sigv4", region = "test-region-1" }"#,
-                "publisher.origin_auth requires publisher.origin_url to use https",
+                "[source.origin] signs with auth, so url must use https",
             ),
             (
                 STORAGE_ORIGIN_URL,
                 r#"{ type = "unknown_scheme", region = "test-region-1" }"#,
-                "origin_auth",
+                "source.origin",
             ),
             (
                 STORAGE_ORIGIN_URL,
                 r#"{ type = "s3_sigv4", region = "test-region-1", bucket = "site" }"#,
-                "origin_auth",
+                "bucket",
             ),
-            (STORAGE_ORIGIN_URL, r#""s3_sigv4""#, "origin_auth"),
+            (STORAGE_ORIGIN_URL, r#""s3_sigv4""#, "source.origin"),
         ] {
-            let err = Settings::from_toml(&publisher_settings_with(
+            let err = Settings::from_toml(&origin_settings_with(
                 origin_url,
-                &format!("origin_auth = {table}"),
+                &format!("auth = {table}"),
             ))
-            .expect_err("should refuse an origin_auth the signer cannot use");
+            .expect_err("should refuse an auth the signer cannot use");
             assert!(
                 format!("{err:?}").contains(expected),
                 "the refusal of `{table}` should say `{expected}`: {err:?}"
@@ -9768,36 +9695,40 @@ source_domain = "partner.example.com"
     }
 
     #[test]
-    fn asset_route_auth_refusals_still_name_the_asset_route() {
+    fn asset_route_auth_refusals_name_the_asset_route() {
         let mut route = ProxyAssetRoute::new("/assets/", "https://storage.example.com");
-        route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-            region: String::new(),
-            secret_store: None,
-            access_key_id: Redacted::new("access_key_id".to_owned()),
-            secret_access_key: Redacted::new("secret_access_key".to_owned()),
-            session_token: None,
-            origin_query: None,
-        }));
+        route.set_origin_source(&crate::source::OriginSettings {
+            auth: Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+                region: String::new(),
+                secret_store: None,
+                access_key_id: Redacted::new("access_key_id".to_owned()),
+                secret_access_key: Redacted::new("secret_access_key".to_owned()),
+                session_token: None,
+                origin_query: None,
+            })),
+            ..crate::source::OriginSettings::new("https://storage.example.com")
+        });
 
         let err = route
             .prepare_runtime()
             .expect_err("should refuse an asset route auth with no region");
         assert!(
-            format!("{err:?}")
-                .contains("proxy.asset_routes auth s3_sigv4 region must not be empty"),
-            "the asset route refusal should keep its wording: {err:?}"
+            format!("{err:?}").contains(
+                "proxy.asset_routes /assets/ source.origin.auth s3_sigv4 region must not be empty"
+            ),
+            "the asset route refusal should name the route: {err:?}"
         );
     }
 
     #[test]
-    fn publisher_origin_auth_credentials_stay_out_of_debug_output() {
+    fn source_origin_auth_credentials_stay_out_of_debug_output() {
         let canaries = [
             "canary-origin-access",
             "canary-origin-secret",
             "canary-origin-session",
         ];
-        let publisher = Publisher {
-            origin_auth: Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+        let origin = crate::source::OriginSettings {
+            auth: Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
                 region: "test-region-1".to_owned(),
                 secret_store: None,
                 access_key_id: Redacted::new(canaries[0].to_owned()),
@@ -9805,10 +9736,12 @@ source_domain = "partner.example.com"
                 session_token: Some(Redacted::new(canaries[2].to_owned())),
                 origin_query: None,
             })),
-            ..Publisher::default()
+            ..crate::source::OriginSettings::new("https://storage.example.com/bucket/site")
         };
+        let mut settings = Settings::default();
+        settings.set_origin_source(&origin);
 
-        let debug = format!("{publisher:?}");
+        let debug = format!("{origin:?} {settings:?}");
 
         assert!(
             debug.contains("test-region-1"),
@@ -9829,10 +9762,15 @@ source_domain = "partner.example.com"
         // silently breaking traffic.
         let result = Settings::from_toml(
             r#"
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.example.com"
+
             [publisher]
             domain = "example.com"
             cookie_domain = ".example.com"
-            origin_url = "https://origin.example.com"
             proxy_secret = "unit-test-proxy-secret"
             max_buffered_body_bytes = 0
 
@@ -10101,6 +10039,97 @@ source_domain = "partner.example.com"
         }
     }
 
+    /// The fields that said where the publisher's pages come from are refused
+    /// naming where they are written now.
+    #[test]
+    fn the_moved_publisher_origin_fields_are_refused_naming_the_source() {
+        for (line, expected) in [
+            (
+                r#"origin_url = "https://origin.example.com""#,
+                "[source.origin] url",
+            ),
+            (
+                r#"origin_host_header_override = "www.example.com""#,
+                "[source.origin] host_header",
+            ),
+            (
+                r#"directory_index = "index.html""#,
+                "[source.origin] directory_index",
+            ),
+            (
+                r#"origin_auth = { type = "s3_sigv4", region = "test-region-1" }"#,
+                "[source.origin] auth",
+            ),
+        ] {
+            let toml = crate_test_settings_str().replacen(
+                "proxy_secret = \"unit-test-proxy-secret\"",
+                &format!("proxy_secret = \"unit-test-proxy-secret\"\n{line}"),
+                1,
+            );
+
+            let error = Settings::from_toml(&toml).expect_err("should refuse the moved field");
+            assert!(
+                format!("{error:?}").contains(expected),
+                "`{line}` should be refused naming `{expected}`: {error:?}"
+            );
+        }
+    }
+
+    /// An asset route's origin fields are refused naming the route's source.
+    #[test]
+    fn the_moved_asset_route_origin_fields_are_refused_naming_the_source() {
+        for (lines, expected) in [
+            (
+                r#"origin_url = "https://assets.example.com""#,
+                "[proxy.asset_routes.source.origin] url",
+            ),
+            (
+                r#"source.module = "origin"
+            source.origin.url = "https://assets.example.com"
+            auth = { type = "s3_sigv4", region = "us-east-1" }"#,
+                "[proxy.asset_routes.source.origin] auth",
+            ),
+        ] {
+            let toml = format!(
+                "{}\n[proxy]\n\n[[proxy.asset_routes]]\nprefix = \"/assets/\"\n{lines}\n",
+                crate_test_settings_str()
+            );
+
+            let error = Settings::from_toml(&toml).expect_err("should refuse the moved field");
+            assert!(
+                format!("{error:?}").contains(expected),
+                "the route should be refused naming `{expected}`: {error:?}"
+            );
+        }
+    }
+
+    /// A configuration blob in the old shape is refused the same way.
+    #[test]
+    fn json_settings_refuse_the_moved_publisher_origin_url() {
+        let mut value = serde_json::to_value(create_test_settings())
+            .expect("should serialize the test settings fixture to JSON");
+        value["publisher"]["origin_url"] = json!("https://origin.example.com");
+
+        let error =
+            Settings::from_json_value(value).expect_err("should refuse the moved field in JSON");
+        assert!(
+            format!("{error:?}").contains("[source.origin] url"),
+            "should name where the address is written now: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_document_naming_no_source_is_refused() {
+        let toml =
+            crate_test_settings_str().replacen("[source]\n            module = \"origin\"", "", 1);
+
+        let error = Settings::from_toml(&toml).expect_err("should refuse a missing source");
+        assert!(
+            format!("{error:?}").contains("[source] names no source"),
+            "should say the document names no source: {error:?}"
+        );
+    }
+
     #[test]
     fn invalid_settings_for_a_selected_module_fail_registry_startup() {
         fn build(
@@ -10355,7 +10384,8 @@ source_domain = "partner.example.com"
             allowed_domains: vec![],
             asset_routes: vec![ProxyAssetRoute {
                 prefix: "  /.images/  ".to_string(),
-                origin_url: "  https://assets.example.com  ".to_string(),
+                source: crate::source::OriginSettings::new("  https://assets.example.com  ")
+                    .selection(),
                 ..Default::default()
             }],
             modules: SectionModules::default(),
@@ -10366,8 +10396,12 @@ source_domain = "partner.example.com"
             "should trim asset-route prefix"
         );
         assert_eq!(
-            proxy.asset_routes[0].origin_url, "https://assets.example.com",
-            "should trim asset-route origin_url"
+            proxy.asset_routes[0]
+                .origin_source()
+                .expect("should select the origin source")
+                .url,
+            "https://assets.example.com",
+            "reading the source should trim its url"
         );
     }
 
@@ -10378,7 +10412,8 @@ source_domain = "partner.example.com"
             allowed_domains: vec![],
             asset_routes: vec![ProxyAssetRoute {
                 prefix: "/.images/".to_string(),
-                origin_url: "https://assets.example.com".to_string(),
+                source: crate::source::OriginSettings::new("https://assets.example.com")
+                    .selection(),
                 path_pattern: Some("  ^/(.*)$  ".to_string()),
                 target_path: Some("  /rewritten/$1  ".to_string()),
                 ..Default::default()
@@ -10407,7 +10442,8 @@ source_domain = "partner.example.com"
 
             [[proxy.asset_routes]]
             prefix = "/.image/"
-            origin_url = "https://assets.example.com"
+            source.module = "origin"
+            source.origin.url = "https://assets.example.com"
             path_pattern = "^/\\.image/(.*)/[^/]+\\.([^/.]+)$"
             target_path = "/image/upload/$1.$2"
             "#;
@@ -10454,9 +10490,10 @@ source_domain = "partner.example.com"
 
             [[proxy.asset_routes]]
             prefix = "/.image/"
-            origin_url = "https://bucket.s3.us-east-1.amazonaws.com"
+            source.module = "origin"
+            source.origin.url = "https://bucket.s3.us-east-1.amazonaws.com"
 
-            [proxy.asset_routes.auth]
+            [proxy.asset_routes.source.origin.auth]
             type = "s3_sigv4"
             region = "us-east-1"
             origin_query = "strip"
@@ -10474,7 +10511,11 @@ source_domain = "partner.example.com"
             .expect("should match configured route");
         assert!(route.image_optimizer_enabled());
         assert_eq!(route.origin_query_policy(), OriginQueryPolicy::Strip);
-        match route.auth.as_ref().expect("should configure route auth") {
+        match route
+            .origin_source()
+            .and_then(|origin| origin.auth)
+            .expect("should configure route auth")
+        {
             AssetOriginAuth::S3SigV4(config) => {
                 assert_eq!(config.region, "us-east-1");
                 assert_eq!(config.secret_store, None);
@@ -10492,9 +10533,10 @@ source_domain = "partner.example.com"
 
             [[proxy.asset_routes]]
             prefix = "/.images/"
-            origin_url = "http://bucket.s3.us-east-1.amazonaws.com"
+            source.module = "origin"
+            source.origin.url = "http://bucket.s3.us-east-1.amazonaws.com"
 
-            [proxy.asset_routes.auth]
+            [proxy.asset_routes.source.origin.auth]
             type = "s3_sigv4"
             region = "us-east-1"
             "#;
@@ -10503,7 +10545,7 @@ source_domain = "partner.example.com"
             .expect_err("should reject cleartext S3 SigV4 origin URLs");
 
         assert!(
-            format!("{err:?}").contains("must use https when auth type is s3_sigv4"),
+            format!("{err:?}").contains("signs with auth, so url must use https"),
             "should mention the S3 SigV4 HTTPS requirement: {err:?}"
         );
     }
@@ -10518,9 +10560,10 @@ source_domain = "partner.example.com"
 
             [[proxy.asset_routes]]
             prefix = "/.images/"
-            origin_url = "https://bucket.s3.us-east-1.amazonaws.com"
+            source.module = "origin"
+            source.origin.url = "https://bucket.s3.us-east-1.amazonaws.com"
 
-            [proxy.asset_routes.auth]
+            [proxy.asset_routes.source.origin.auth]
             type = "s3_sigv4"
             region = "{region}"
             "#
@@ -10544,9 +10587,10 @@ source_domain = "partner.example.com"
 
             [[proxy.asset_routes]]
             prefix = "/.images/"
-            origin_url = "https://bucket.s3.us-east-1.amazonaws.com"
+            source.module = "origin"
+            source.origin.url = "https://bucket.s3.us-east-1.amazonaws.com"
 
-            [proxy.asset_routes.auth]
+            [proxy.asset_routes.source.origin.auth]
             type = "s3_sigv4"
             region = "us-east-1"
             secret_access_key_name = "secret_access_key"
@@ -10576,7 +10620,8 @@ source_domain = "partner.example.com"
 
             [[proxy.asset_routes]]
             prefix = "/.image/"
-            origin_url = "https://assets.example.com"
+            source.module = "origin"
+            source.origin.url = "https://assets.example.com"
 
             [proxy.asset_routes.image_optimizer]
             enabled = true
@@ -10736,7 +10781,8 @@ source_domain = "partner.example.com"
 
             [[proxy.asset_routes]]
             prefix = "/images/"
-            origin_url = "https://assets.example.com"
+            source.module = "origin"
+            source.origin.url = "https://assets.example.com"
 
             [proxy.asset_routes.image_optimizer]
             region = " us_east "
@@ -10874,25 +10920,31 @@ source_domain = "partner.example.com"
             ),
             (
                 format!(
-                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}ORIGIN_URL"
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}SOURCE{separator}MODULE"
+                ),
+                Some("origin"),
+            ),
+            (
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}SOURCE{separator}ORIGIN{separator}URL"
                 ),
                 Some("https://bucket.s3.us-west-2.amazonaws.com"),
             ),
             (
                 format!(
-                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}TYPE"
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}SOURCE{separator}ORIGIN{separator}AUTH{separator}TYPE"
                 ),
                 Some("s3_sigv4"),
             ),
             (
                 format!(
-                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}REGION"
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}SOURCE{separator}ORIGIN{separator}AUTH{separator}REGION"
                 ),
                 Some("us-west-2"),
             ),
             (
                 format!(
-                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}ORIGIN_QUERY"
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}SOURCE{separator}ORIGIN{separator}AUTH{separator}ORIGIN_QUERY"
                 ),
                 Some("strip"),
             ),
@@ -11015,7 +11067,8 @@ source_domain = "partner.example.com"
 
             [[proxy.asset_routes]]
             prefix = "/.image/"
-            origin_url = "https://bucket.s3.us-east-1.amazonaws.com"
+            source.module = "origin"
+            source.origin.url = "https://bucket.s3.us-east-1.amazonaws.com"
 
             [proxy.asset_routes.image_optimizer]
             enabled = true
@@ -11037,7 +11090,7 @@ source_domain = "partner.example.com"
     fn proxy_asset_route_disabled_image_optimizer_does_not_override_origin_query_policy() {
         let route = ProxyAssetRoute {
             prefix: "/.image/".to_string(),
-            origin_url: "https://assets.example.com".to_string(),
+            source: crate::source::OriginSettings::new("https://assets.example.com").selection(),
             image_optimizer: Some(AssetImageOptimizerConfig {
                 enabled: false,
                 region: "us_east".to_string(),
@@ -11058,7 +11111,8 @@ source_domain = "partner.example.com"
 
             [[proxy.asset_routes]]
             prefix = "/.image/"
-            origin_url = "https://assets.example.com"
+            source.module = "origin"
+            source.origin.url = "https://assets.example.com"
             path_pattern = "^/\\.image/(.*)$"
             "#;
         let err = Settings::from_toml(&toml_str)
@@ -11078,7 +11132,8 @@ source_domain = "partner.example.com"
 
             [[proxy.asset_routes]]
             prefix = "/.image/"
-            origin_url = "https://assets.example.com"
+            source.module = "origin"
+            source.origin.url = "https://assets.example.com"
             path_pattern = "["
             target_path = "/image/upload/$1"
             "#;
@@ -11099,12 +11154,12 @@ source_domain = "partner.example.com"
             asset_routes: vec![
                 ProxyAssetRoute {
                     prefix: "/.images/".to_string(),
-                    origin_url: "https://a.example.com".to_string(),
+                    source: crate::source::OriginSettings::new("https://a.example.com").selection(),
                     ..Default::default()
                 },
                 ProxyAssetRoute {
                     prefix: "/.images/special/".to_string(),
-                    origin_url: "https://b.example.com".to_string(),
+                    source: crate::source::OriginSettings::new("https://b.example.com").selection(),
                     ..Default::default()
                 },
             ],
@@ -11115,7 +11170,11 @@ source_domain = "partner.example.com"
             .asset_route_for_path("/.images/special/banner.png")
             .expect("should match a configured asset route");
         assert_eq!(
-            route.origin_url, "https://b.example.com",
+            route
+                .origin_source()
+                .expect("should select the origin source")
+                .url,
+            "https://b.example.com",
             "should prefer the most specific prefix"
         );
     }
@@ -11128,12 +11187,14 @@ source_domain = "partner.example.com"
             asset_routes: vec![
                 ProxyAssetRoute {
                     prefix: "/.images/".to_string(),
-                    origin_url: "https://first.example.com".to_string(),
+                    source: crate::source::OriginSettings::new("https://first.example.com")
+                        .selection(),
                     ..Default::default()
                 },
                 ProxyAssetRoute {
                     prefix: "/.images/".to_string(),
-                    origin_url: "https://second.example.com".to_string(),
+                    source: crate::source::OriginSettings::new("https://second.example.com")
+                        .selection(),
                     ..Default::default()
                 },
             ],
@@ -11144,7 +11205,11 @@ source_domain = "partner.example.com"
             .asset_route_for_path("/.images/banner.png")
             .expect("should match duplicate prefixes deterministically");
         assert_eq!(
-            route.origin_url, "https://first.example.com",
+            route
+                .origin_source()
+                .expect("should select the origin source")
+                .url,
+            "https://first.example.com",
             "should keep the first configured duplicate prefix"
         );
     }
@@ -11175,7 +11240,8 @@ source_domain = "partner.example.com"
 
             [[proxy.asset_routes]]
             prefix = ".images/"
-            origin_url = "https://assets.example.com"
+            source.module = "origin"
+            source.origin.url = "https://assets.example.com"
             "#;
         let err =
             Settings::from_toml(&toml_str).expect_err("should reject invalid asset-route prefix");
@@ -11193,31 +11259,36 @@ source_domain = "partner.example.com"
 
             [[proxy.asset_routes]]
             prefix = "/.images/"
-            origin_url = "ftp://assets.example.com"
+            source.module = "origin"
+            source.origin.url = "ftp://assets.example.com"
             "#;
         let err = Settings::from_toml(&toml_str)
             .expect_err("should reject non-http asset-route origin_url");
         assert!(
-            format!("{err:?}").contains("origin_url must use http or https"),
+            format!("{err:?}").contains("must use http or https"),
             "should mention the origin_url validation failure: {err:?}"
         );
     }
 
     #[test]
-    fn proxy_asset_route_validation_rejects_origin_url_path() {
+    fn proxy_asset_route_accepts_an_origin_folder() {
         let toml_str = crate_test_settings_str()
             + r#"
             [proxy]
 
             [[proxy.asset_routes]]
             prefix = "/.images/"
-            origin_url = "https://assets.example.com/api"
+            source.module = "origin"
+            source.origin.url = "https://assets.example.com/api"
             "#;
-        let err = Settings::from_toml(&toml_str)
-            .expect_err("should reject asset-route origin_url with path");
-        assert!(
-            format!("{err:?}").contains("origin_url must not include a path"),
-            "should mention the origin_url path validation failure: {err:?}"
+        let settings = Settings::from_toml(&toml_str)
+            .expect("a path in an asset route's origin url should name a folder");
+        assert_eq!(
+            settings.proxy.asset_routes[0]
+                .origin_source()
+                .expect("should select the origin source")
+                .url,
+            "https://assets.example.com/api"
         );
     }
 
@@ -11229,12 +11300,13 @@ source_domain = "partner.example.com"
 
             [[proxy.asset_routes]]
             prefix = "/.images/"
-            origin_url = "https://assets.example.com?token=abc"
+            source.module = "origin"
+            source.origin.url = "https://assets.example.com?token=abc"
             "#;
         let err = Settings::from_toml(&toml_str)
             .expect_err("should reject asset-route origin_url with query");
         assert!(
-            format!("{err:?}").contains("origin_url must not include a query string"),
+            format!("{err:?}").contains("must not carry a query or a fragment"),
             "should mention the origin_url query validation failure: {err:?}"
         );
     }
@@ -11247,12 +11319,13 @@ source_domain = "partner.example.com"
 
             [[proxy.asset_routes]]
             prefix = "/.images/"
-            origin_url = "https://user:pass@assets.example.com"
+            source.module = "origin"
+            source.origin.url = "https://user:pass@assets.example.com"
             "#;
         let err = Settings::from_toml(&toml_str)
             .expect_err("should reject asset-route origin_url with userinfo");
         assert!(
-            format!("{err:?}").contains("origin_url must not include username or password"),
+            format!("{err:?}").contains("must not carry a user name or password"),
             "should mention the origin_url userinfo validation failure: {err:?}"
         );
     }
@@ -11265,12 +11338,13 @@ source_domain = "partner.example.com"
 
             [[proxy.asset_routes]]
             prefix = "/.images/"
-            origin_url = "https://assets.example.com#fragment"
+            source.module = "origin"
+            source.origin.url = "https://assets.example.com#fragment"
             "#;
         let err = Settings::from_toml(&toml_str)
             .expect_err("should reject asset-route origin_url with fragment");
         assert!(
-            format!("{err:?}").contains("origin_url must not include a fragment"),
+            format!("{err:?}").contains("must not carry a query or a fragment"),
             "should mention the origin_url fragment validation failure: {err:?}"
         );
     }
@@ -11283,12 +11357,17 @@ source_domain = "partner.example.com"
 
             [[proxy.asset_routes]]
             prefix = "/.images/"
-            origin_url = "https://assets.example.com:8443"
+            source.module = "origin"
+            source.origin.url = "https://assets.example.com:8443"
             "#;
         let settings =
             Settings::from_toml(&toml_str).expect("should accept asset-route origin host and port");
         assert_eq!(
-            settings.proxy.asset_routes[0].origin_url, "https://assets.example.com:8443",
+            settings.proxy.asset_routes[0]
+                .origin_source()
+                .expect("should select the origin source")
+                .url,
+            "https://assets.example.com:8443",
             "should preserve valid origin URL with non-standard port"
         );
     }
@@ -11301,8 +11380,9 @@ source_domain = "partner.example.com"
             allowed_domains = ["  AD.EXAMPLE.COM  ", "  ", "*.CDN.Example.Com"]
             "#;
         let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
+            "{}{}SOURCE{}ORIGIN{}URL",
             ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR
         );
@@ -11353,10 +11433,15 @@ source_domain = "partner.example.com"
     #[test]
     fn settings_parses_creative_opportunities_section() {
         let toml = r#"
+[source]
+module = "origin"
+
+[source.origin]
+url = "https://origin.example.com"
+
 [publisher]
 domain = "example.com"
 cookie_domain = ".example.com"
-origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
 [geo]
@@ -11438,10 +11523,15 @@ formats = [{ width = 300, height = 250 }]
     #[test]
     fn settings_rejects_invalid_creative_opportunity_slot_id() {
         let toml = r#"
+[source]
+module = "origin"
+
+[source.origin]
+url = "https://origin.example.com"
+
 [publisher]
 domain = "example.com"
 cookie_domain = ".example.com"
-origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
 [geo]
@@ -11475,10 +11565,15 @@ formats = [{ width = 300, height = 250 }]
         // id injected via env is rejected by from_toml_and_env (the build-time
         // path uses the same validation against the merged config).
         let toml = r#"
+[source]
+module = "origin"
+
+[source.origin]
+url = "https://origin.example.com"
+
 [publisher]
 domain = "example.com"
 cookie_domain = ".example.com"
-origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
 [geo]
@@ -11518,10 +11613,15 @@ gam_network_id = "21765378893"
     fn creative_opportunity_settings_toml(slot_body: &str) -> String {
         format!(
             r#"
+[source]
+module = "origin"
+
+[source.origin]
+url = "https://origin.example.com"
+
 [publisher]
 domain = "example.com"
 cookie_domain = ".example.com"
-origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
 [geo]

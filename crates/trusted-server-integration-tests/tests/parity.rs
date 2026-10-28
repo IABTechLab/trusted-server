@@ -32,10 +32,15 @@ use trusted_server_core::test_support::nextjs_auction;
 fn test_settings() -> Settings {
     Settings::from_toml(
         r#"
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.test-publisher.example.com"
+
             [publisher]
             domain = "test-publisher.example.com"
             cookie_domain = ".test-publisher.example.com"
-            origin_url = "https://origin.test-publisher.example.com"
             proxy_secret = "parity-test-proxy-secret"
 
             [ec]

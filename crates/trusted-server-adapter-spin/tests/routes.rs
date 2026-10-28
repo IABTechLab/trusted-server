@@ -31,10 +31,15 @@ fn test_router() -> RouterService {
 fn test_settings() -> Settings {
     Settings::from_toml(
         r#"
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.test-publisher.example.com"
+
             [publisher]
             domain = "test-publisher.example.com"
             cookie_domain = ".test-publisher.example.com"
-            origin_url = "https://origin.test-publisher.example.com"
             proxy_secret = "route-test-proxy-secret"
 
             [ec]
@@ -691,10 +696,15 @@ mod module_endpoints {
     fn settings_with(extra: &str) -> Settings {
         Settings::from_toml(&format!(
             r#"
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.test-publisher.example.com"
+
             [publisher]
             domain = "test-publisher.example.com"
             cookie_domain = ".test-publisher.example.com"
-            origin_url = "https://origin.test-publisher.example.com"
             proxy_secret = "route-test-proxy-secret"
 
             [ec]
@@ -1106,10 +1116,15 @@ async fn data_endpoint_answers_a_browser_opening_the_page_and_nothing_else() {
 /// inject, with the `[ec.acme]` block that module's settings live in.
 /// `acme` is a fictional vendor key.
 const UNINJECTED_MODULE_TOML: &str = r#"
+    [source]
+    module = "origin"
+
+    [source.origin]
+    url = "https://origin.test-publisher.example.com"
+
     [publisher]
     domain = "test-publisher.example.com"
     cookie_domain = ".test-publisher.example.com"
-    origin_url = "https://origin.test-publisher.example.com"
     proxy_secret = "route-test-proxy-secret"
 
     [ec]
@@ -1248,10 +1263,15 @@ async fn nextjs_auction_output_holds_until_the_structural_body_close() {
 fn settings_refusing_every_crawler() -> Settings {
     Settings::from_toml(
         r#"
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.test-publisher.example.com"
+
             [publisher]
             domain = "test-publisher.example.com"
             cookie_domain = ".test-publisher.example.com"
-            origin_url = "https://origin.test-publisher.example.com"
             proxy_secret = "route-test-proxy-secret"
 
             [ec]

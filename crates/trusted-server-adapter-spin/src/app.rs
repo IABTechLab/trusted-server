@@ -1233,10 +1233,15 @@ mod tests {
     fn multi_provider_settings() -> Settings {
         let mut settings = Settings::from_toml(
             r#"
+                [source]
+                module = "origin"
+
+                [source.origin]
+                url = "https://origin.publisher.example"
+
                 [publisher]
                 domain = "publisher.example"
                 cookie_domain = ".publisher.example"
-                origin_url = "https://origin.publisher.example"
                 proxy_secret = "fictional-proxy-secret"
 
                 [ec]
@@ -1339,10 +1344,15 @@ mod tests {
     fn a_requests_services_carry_the_publishers_prefixes() {
         let settings = Settings::from_toml(
             r#"
+                [source]
+                module = "origin"
+
+                [source.origin]
+                url = "https://origin.publisher.example"
+
                 [publisher]
                 domain = "www.publisher.example"
                 cookie_domain = ".publisher.example"
-                origin_url = "https://origin.publisher.example"
                 proxy_secret = "fictional-proxy-secret-32-bytes-ok"
 
                 [geo]
@@ -1417,10 +1427,15 @@ mod tests {
     /// inject, with the `[ec.acme]` block that module's settings live in.
     /// `acme` is a fictional vendor key.
     const UNINJECTED_MODULE_TOML: &str = r#"
+        [source]
+        module = "origin"
+
+        [source.origin]
+        url = "https://origin.test-publisher.example.com"
+
         [publisher]
         domain = "test-publisher.example.com"
         cookie_domain = ".test-publisher.example.com"
-        origin_url = "https://origin.test-publisher.example.com"
         proxy_secret = "unit-test-proxy-secret"
 
         [ec]

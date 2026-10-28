@@ -442,8 +442,13 @@ Configure proxy behavior in `trusted-server.toml`:
 [publisher]
 domain = "publisher.com"
 cookie_domain = ".publisher.com"
-origin_url = "https://origin.publisher.com"
 proxy_secret = "publisher_proxy_secret"
+
+[source]
+module = "origin"
+
+[source.origin]
+url = "https://origin.publisher.com"
 ```
 
 `proxy_secret` is the key name in the Trusted Server secret store. Provision a
@@ -456,7 +461,12 @@ Use `[[proxy.asset_routes]]` when a first-party path prefix should proxy directl
 ```toml
 [[proxy.asset_routes]]
 prefix = "/assets/"
-origin_url = "https://assets.example.com"
+
+[proxy.asset_routes.source]
+module = "origin"
+
+[proxy.asset_routes.source.origin]
+url = "https://assets.example.com"
 ```
 
 Asset routes are intended for publisher-owned paths, not third-party creative URLs. They support optional path rewrites, private S3 origin signing, and Fastly Image Optimizer metadata. See [Asset Routes](/guide/asset-routes) for full configuration and operational guidance.

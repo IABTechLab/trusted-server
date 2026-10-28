@@ -280,8 +280,8 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
                 true,
             ),
         ];
-        // An asset route's `auth` and `[publisher]`'s `origin_auth` take the
-        // same table, so each holds the same three key references.
+        // An asset route's source and the publisher's take the same signing
+        // table, so each holds the same three key references.
         let origin_auth_keys = ["access_key_id", "secret_access_key", "session_token"];
         fields.extend(origin_auth_keys.map(|key| {
             field(
@@ -289,6 +289,8 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
                     optional_object("proxy"),
                     optional_object("asset_routes"),
                     SecretPathSegment::ArrayEach,
+                    optional_object("source"),
+                    optional_object("origin"),
                     optional_object("auth"),
                     object(key),
                 ],
@@ -298,8 +300,9 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
         fields.extend(origin_auth_keys.map(|key| {
             field(
                 vec![
-                    object("publisher"),
-                    optional_object("origin_auth"),
+                    optional_object("source"),
+                    optional_object("origin"),
+                    optional_object("auth"),
                     object(key),
                 ],
                 true,
@@ -452,8 +455,11 @@ fn validate_non_secret_deploy_placeholders(
     if crate::settings::Publisher::is_placeholder_cookie_domain(&settings.publisher.cookie_domain) {
         insecure_fields.push("publisher.cookie_domain");
     }
-    if crate::settings::Publisher::is_placeholder_origin_url(&settings.publisher.origin_url) {
-        insecure_fields.push("publisher.origin_url");
+    if settings
+        .origin_source()
+        .is_some_and(|origin| origin.is_placeholder())
+    {
+        insecure_fields.push("source.origin.url");
     }
 
     if insecure_fields.is_empty() {
@@ -546,15 +552,15 @@ fn validate_secret_key_references(
     }
 
     for (index, route) in settings.proxy.asset_routes.iter().enumerate() {
-        if let Some(auth) = route.auth.as_ref() {
+        if let Some(auth) = route.origin_source().and_then(|origin| origin.auth) {
             validate_origin_auth_key_references(
-                &format!("proxy.asset_routes[{index}].auth"),
-                auth,
+                &format!("proxy.asset_routes[{index}].source.origin.auth"),
+                &auth,
             )?;
         }
     }
-    if let Some(auth) = settings.publisher.origin_auth.as_ref() {
-        validate_origin_auth_key_references("publisher.origin_auth", auth)?;
+    if let Some(auth) = settings.origin_source().and_then(|origin| origin.auth) {
+        validate_origin_auth_key_references("source.origin.auth", &auth)?;
     }
 
     Ok(())
@@ -619,7 +625,8 @@ mod tests {
     };
     use crate::test_support::template::{template_with_resolved_required_secrets, uncomment_block};
     use crate::test_support::tests::{
-        crate_test_settings_str, crate_test_settings_str_with_ec_section, select_hmac_module,
+        crate_test_settings_str, crate_test_settings_str_with_ec_section, edit_origin,
+        select_hmac_module, set_route_auth,
     };
     use edgezero_core::app_config::AppConfigMeta;
     use edgezero_core::blob_envelope::BlobEnvelope;
@@ -1045,15 +1052,21 @@ formats = [{ width = 300, height = 250 }]
                 ("ec.partners[*].ts_pull_token".to_owned(), true),
                 ("trusted_client_ip.shared_secret".to_owned(), false),
                 ("analytics.tinybird.auction_token_secret".to_owned(), true),
-                ("proxy.asset_routes[*].auth.access_key_id".to_owned(), true),
                 (
-                    "proxy.asset_routes[*].auth.secret_access_key".to_owned(),
+                    "proxy.asset_routes[*].source.origin.auth.access_key_id".to_owned(),
+                    true
+                ),
+                (
+                    "proxy.asset_routes[*].source.origin.auth.secret_access_key".to_owned(),
                     true,
                 ),
-                ("proxy.asset_routes[*].auth.session_token".to_owned(), true),
-                ("publisher.origin_auth.access_key_id".to_owned(), true),
-                ("publisher.origin_auth.secret_access_key".to_owned(), true),
-                ("publisher.origin_auth.session_token".to_owned(), true),
+                (
+                    "proxy.asset_routes[*].source.origin.auth.session_token".to_owned(),
+                    true
+                ),
+                ("source.origin.auth.access_key_id".to_owned(), true),
+                ("source.origin.auth.secret_access_key".to_owned(), true),
+                ("source.origin.auth.session_token".to_owned(), true),
             ],
             "should expose the native EdgeZero secret metadata contract"
         );
@@ -1115,14 +1128,17 @@ formats = [{ width = 300, height = 250 }]
             "/assets/",
             "https://examplebucket.s3.us-east-1.amazonaws.com",
         );
-        route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-            region: "us-east-1".to_string(),
-            secret_store: Some("legacy-s3-store".to_string()),
-            access_key_id: Redacted::new("s3-access-key".to_string()),
-            secret_access_key: Redacted::new("s3-secret-key".to_string()),
-            session_token: None,
-            origin_query: None,
-        }));
+        set_route_auth(
+            &mut route,
+            Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+                region: "us-east-1".to_string(),
+                secret_store: Some("legacy-s3-store".to_string()),
+                access_key_id: Redacted::new("s3-access-key".to_string()),
+                secret_access_key: Redacted::new("s3-secret-key".to_string()),
+                session_token: None,
+                origin_query: None,
+            })),
+        );
         settings.proxy.asset_routes.push(route);
 
         settings
@@ -1361,10 +1377,15 @@ gam_network_id = "99999"
     fn runtime_validation_rejects_placeholders() {
         let settings = Settings::from_toml(
             r#"
+[source]
+module = "origin"
+
+[source.origin]
+url = "https://origin.example.com"
+
 [publisher]
 domain = "example.com"
 cookie_domain = ".example.com"
-origin_url = "https://origin.example.com"
 proxy_secret = "change-me-proxy-secret"
 
 [geo]
@@ -1394,7 +1415,9 @@ passphrase = "production-secret-key-32-bytes-min"
         let mut settings = valid_settings();
         settings.publisher.domain = "example.com".to_string();
         settings.publisher.cookie_domain = ".example.com".to_string();
-        settings.publisher.origin_url = "https://origin.example.com".to_string();
+        edit_origin(&mut settings, |origin| {
+            origin.url = "https://origin.example.com".to_string()
+        });
 
         let err = validate_settings_for_deploy(&settings)
             .expect_err("should reject unedited example publisher hosts");
@@ -1403,62 +1426,58 @@ passphrase = "production-secret-key-32-bytes-min"
         assert!(
             text.contains("publisher.domain")
                 && text.contains("publisher.cookie_domain")
-                && text.contains("publisher.origin_url"),
+                && text.contains("source.origin.url"),
             "should flag all three example publisher placeholders: {err:?}"
         );
     }
 
-    /// Valid settings whose `[publisher]` signs its origin requests.
+    /// Valid settings whose `[source.origin]` signs its requests.
     fn settings_signing_the_publisher_origin(
         access_key_id: &str,
         secret_access_key: &str,
         session_token: Option<&str>,
     ) -> Settings {
         let mut settings = valid_settings();
-        settings.publisher.origin_url = "https://storage.example.com/bucket/site".to_string();
-        settings.publisher.origin_auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-            region: "test-region-1".to_string(),
-            secret_store: None,
-            access_key_id: Redacted::new(access_key_id.to_string()),
-            secret_access_key: Redacted::new(secret_access_key.to_string()),
-            session_token: session_token.map(|token| Redacted::new(token.to_string())),
-            origin_query: None,
-        }));
+        edit_origin(&mut settings, |origin| {
+            origin.url = "https://storage.example.com/bucket/site".to_string()
+        });
+        edit_origin(&mut settings, |origin| {
+            origin.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+                region: "test-region-1".to_string(),
+                secret_store: None,
+                access_key_id: Redacted::new(access_key_id.to_string()),
+                secret_access_key: Redacted::new(secret_access_key.to_string()),
+                session_token: session_token.map(|token| Redacted::new(token.to_string())),
+                origin_query: None,
+            }))
+        });
         settings
     }
 
     #[test]
-    fn deploy_validation_accepts_a_publisher_origin_auth_naming_its_keys() {
+    fn deploy_validation_accepts_a_source_origin_auth_naming_its_keys() {
         validate_settings_for_deploy(&settings_signing_the_publisher_origin(
             "origin_access_key_id",
             "origin_secret_access_key",
             Some("origin_session_token"),
         ))
-        .expect("should accept an origin_auth whose key references are named");
+        .expect("should accept an auth whose key references are named");
     }
 
     #[test]
-    fn deploy_validation_refuses_an_empty_publisher_origin_auth_key_reference() {
+    fn deploy_validation_refuses_an_empty_source_origin_auth_key_reference() {
         for (settings, path) in [
             (
                 settings_signing_the_publisher_origin(" ", "origin_secret_access_key", None),
-                "publisher.origin_auth.access_key_id",
+                "source.origin.auth.access_key_id",
             ),
             (
                 settings_signing_the_publisher_origin("origin_access_key_id", "", None),
-                "publisher.origin_auth.secret_access_key",
-            ),
-            (
-                settings_signing_the_publisher_origin(
-                    "origin_access_key_id",
-                    "origin_secret_access_key",
-                    Some(" "),
-                ),
-                "publisher.origin_auth.session_token",
+                "source.origin.auth.secret_access_key",
             ),
         ] {
             let err = validate_settings_for_deploy(&settings)
-                .expect_err("should refuse an empty origin_auth key reference");
+                .expect_err("should refuse an empty auth key reference");
             assert!(
                 format!("{err:?}").contains(&format!(
                     "secret key reference at `{path}` must not be empty"
@@ -1469,10 +1488,27 @@ passphrase = "production-secret-key-32-bytes-min"
     }
 
     #[test]
-    fn documented_publisher_object_storage_settings_validate_when_uncommented() {
+    fn a_blank_source_origin_session_token_is_read_as_none() {
+        let settings = settings_signing_the_publisher_origin(
+            "origin_access_key_id",
+            "origin_secret_access_key",
+            Some(" "),
+        );
+        validate_settings_for_deploy(&settings)
+            .expect("a blank session token is no token, as a document's is");
+        let Some(AssetOriginAuth::S3SigV4(auth)) =
+            settings.origin_source().and_then(|origin| origin.auth)
+        else {
+            panic!("should keep the origin auth");
+        };
+        assert!(auth.session_token.is_none());
+    }
+
+    #[test]
+    fn documented_source_origin_object_storage_settings_validate_when_uncommented() {
         let toml = uncomment_block(
             &template_with_resolved_required_secrets(),
-            "[publisher.origin_auth]",
+            "[source.origin.auth]",
         )
         .replacen(
             "# directory_index = \"index.html\"",
@@ -1480,17 +1516,17 @@ passphrase = "production-secret-key-32-bytes-min"
             1,
         );
         let settings = Settings::from_toml(&toml)
-            .expect("the documented origin_auth and directory_index should parse and validate");
+            .expect("the documented auth and directory_index should parse and validate");
+        let origin = settings
+            .origin_source()
+            .expect("the template should select the origin source");
 
         assert!(
-            matches!(
-                settings.publisher.origin_auth,
-                Some(AssetOriginAuth::S3SigV4(_))
-            ),
-            "the documented origin_auth should be read"
+            matches!(origin.auth, Some(AssetOriginAuth::S3SigV4(_))),
+            "the documented auth should be read"
         );
         assert_eq!(
-            settings.publisher.directory_index.as_deref(),
+            origin.directory_index.as_deref(),
             Some("index.html"),
             "the documented directory_index should be read"
         );

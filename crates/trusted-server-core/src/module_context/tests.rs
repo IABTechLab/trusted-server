@@ -454,3 +454,30 @@ fn a_route_answers_forbidden_only_for_a_value_its_permissions_withhold() {
         http::StatusCode::INTERNAL_SERVER_ERROR
     );
 }
+
+#[test]
+fn a_module_request_carries_the_prefix_request_addressing_removed() {
+    let mut request = http::Request::builder()
+        .method(Method::GET)
+        .uri("https://yoursite.example/news/")
+        .body(EdgeBody::empty())
+        .expect("should build the request");
+    let client = ClientInfo::default();
+    assert_eq!(ModuleRequest::of(&request, &client).removed_prefix(), None);
+
+    request
+        .extensions_mut()
+        .insert(crate::addressing::RemovedPathPrefix::new(
+            "/www.example.com".to_owned(),
+        ));
+    let view = ModuleRequest::of(&request, &client);
+    assert_eq!(view.removed_prefix(), Some("/www.example.com"));
+    assert_eq!(view.path(), "/news/");
+
+    let held = ResolvedRequest::of(&request, &client);
+    assert_eq!(
+        held.view().removed_prefix(),
+        Some("/www.example.com"),
+        "a held request should keep the removed prefix"
+    );
+}

@@ -6,14 +6,67 @@ pub mod tests {
     use crate::redacted::Redacted;
     use crate::settings::{Ec, EcModuleBlock, HmacModuleConfig, HostSignalsModuleConfig, Settings};
 
+    /// Changes the publisher's `origin` source settings with `edit`.
+    ///
+    /// # Panics
+    ///
+    /// When `settings` do not select core's `origin` source.
+    pub fn edit_origin(
+        settings: &mut Settings,
+        edit: impl FnOnce(&mut crate::source::OriginSettings),
+    ) {
+        let mut origin = settings
+            .origin_source()
+            .expect("settings should select the origin source");
+        edit(&mut origin);
+        settings.set_origin_source(&origin);
+    }
+
+    /// Sets the signing of `route`'s `origin` source to `auth`.
+    ///
+    /// # Panics
+    ///
+    /// When `route` does not select core's `origin` source.
+    pub fn set_route_auth(
+        route: &mut crate::settings::ProxyAssetRoute,
+        auth: Option<crate::settings::AssetOriginAuth>,
+    ) {
+        let mut origin = route
+            .origin_source()
+            .expect("the route should select the origin source");
+        origin.auth = auth;
+        route.set_origin_source(&origin);
+    }
+
+    /// The host of the publisher's `origin` source, with its port where its
+    /// address names one.
+    ///
+    /// # Panics
+    ///
+    /// When `settings` do not select core's `origin` source.
+    #[must_use]
+    pub fn origin_host(settings: &Settings) -> String {
+        settings
+            .origin_source()
+            .expect("settings should select the origin source")
+            .location()
+            .expect("the origin source should give a location")
+            .host()
+    }
+
     #[must_use]
     pub fn crate_test_settings_str() -> String {
         r#"
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
-            origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
+
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.test-publisher.com"
 
             [geo]
             # A gdpr-eu country, where every permission requires a signal. This
@@ -461,8 +514,13 @@ pub mod nextjs_auction {
             [publisher]
             domain = "test-publisher.example.com"
             cookie_domain = ".test-publisher.example.com"
-            origin_url = "https://origin.test-publisher.example.com"
             proxy_secret = "fixture-test-proxy-secret"
+
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.test-publisher.example.com"
 
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
@@ -844,10 +902,15 @@ pub mod policy_failure {
     pub fn load_error() -> Report<TrustedServerError> {
         let mut settings = Settings::from_toml(
             r#"
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.publisher.example"
+
             [publisher]
             domain = "publisher.example"
             cookie_domain = ".publisher.example"
-            origin_url = "https://origin.publisher.example"
             proxy_secret = "publisher_proxy_secret"
             "#,
         )

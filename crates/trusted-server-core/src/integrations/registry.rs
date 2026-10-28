@@ -17,6 +17,7 @@ use crate::ec::device::DeviceModule;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::module::{EcModuleSelection, EdgeCookieModule};
 use crate::error::TrustedServerError;
+use crate::evidence::OwnedRequestInfo;
 use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
 use crate::middleware::{Middleware, MiddlewareChain, MiddlewarePhase, PhaseEntries};
@@ -27,6 +28,7 @@ use crate::platform::{
 use crate::prefix::{PrefixModule, Prefixes, SelectedPrefixModule};
 use crate::robots_txt::{ALLOW_ALL, REFUSE_ALL, RobotsTxtContributor};
 use crate::settings::Settings;
+use crate::source::{Source, SourceFactory};
 
 /// What a middleware's element handler decides about one attribute of an
 /// element.
@@ -685,6 +687,12 @@ pub struct IntegrationRegistration {
     /// Declaring them does not put them in the file, because the file is only
     /// built from the contributors `[robots-txt] modules` names.
     pub robots_txt_contributor: Option<(&'static str, Arc<dyn RobotsTxtContributor>)>,
+    /// Source module this registration supplies, with the name a source table
+    /// selects it by, see [`crate::source`].
+    ///
+    /// Declaring one does not make it serve anything, because a source is only
+    /// built where `[source]` or an asset route's `source` table names it.
+    pub source_module: Option<(&'static str, Arc<dyn SourceFactory>)>,
     /// Asset cache module this registration supplies, under its name.
     ///
     /// Taken only from the registration of the builder `[asset-cache]`
@@ -721,6 +729,7 @@ impl IntegrationRegistrationBuilder {
                 device_module: None,
                 prefix_module: None,
                 robots_txt_contributor: None,
+                source_module: None,
                 asset_cache_module: None,
             },
         }
@@ -812,6 +821,19 @@ impl IntegrationRegistrationBuilder {
     #[must_use]
     pub fn with_prefix_module(mut self, name: &'static str, module: Arc<dyn PrefixModule>) -> Self {
         self.registration.prefix_module = Some((name, module));
+        self
+    }
+
+    /// Declare a source module under `name`, which `[source]` or an asset
+    /// route's `source` table selects. The factory builds a source from the
+    /// selecting table's settings, see [`crate::source`].
+    #[must_use]
+    pub fn with_source_module(
+        mut self,
+        name: &'static str,
+        factory: Arc<dyn SourceFactory>,
+    ) -> Self {
+        self.registration.source_module = Some((name, factory));
         self
     }
 
@@ -967,9 +989,21 @@ struct IntegrationRegistryInner {
     // The prefix module `[prefix] module` resolved to, core's own when
     // nothing is selected.
     prefix_module: SelectedPrefixModule,
+    // The source modules the running registrations supply, each with its name.
+    source_modules: Vec<(&'static str, Arc<dyn SourceFactory>)>,
+    // The publisher's source and each asset route's, in route order, built
+    // from the settings. `None` for a registry built without settings.
+    sources: Option<BuiltSources>,
     // The asset cache module of the builder `[asset-cache]` selects, or
     // `None` when it selects none.
     asset_cache_module: Option<Arc<dyn AssetCacheModule>>,
+}
+
+/// The sources a deployment's settings name, built once.
+#[derive(Clone)]
+struct BuiltSources {
+    publisher: Arc<dyn Source>,
+    routes: Vec<Arc<dyn Source>>,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -1006,6 +1040,8 @@ impl Default for IntegrationRegistryInner {
             device_module: None,
             prefix_modules: Vec::new(),
             prefix_module: SelectedPrefixModule::default(),
+            source_modules: Vec::new(),
+            sources: None,
             asset_cache_module: None,
         }
     }
@@ -1620,6 +1656,12 @@ fn check_section_selections(
         .filter_map(|builder| builder.module_name())
         .collect();
     for (section, modules) in settings.module_sections() {
+        // A source is offered by a registration under a name of its own, as
+        // a prefix module is, so building the sources checks the selection
+        // against the sources on offer.
+        if section == crate::source::SOURCE_SECTION {
+            continue;
+        }
         for written in modules.selected() {
             if crate::module_name::resolve(section, written, &offered).is_some() {
                 continue;
@@ -1656,6 +1698,65 @@ fn check_section_selections(
         }
     }
     Ok(())
+}
+
+/// The source `selection` names, built from its table, where `setting` names
+/// the table in a refusal. Core's `origin` is always on offer, beside the
+/// sources the registrations supply.
+fn build_source(
+    selection: &crate::provider_table::SectionModules,
+    setting: &str,
+    offered: &[(&'static str, Arc<dyn SourceFactory>)],
+) -> Result<Arc<dyn Source>, Report<TrustedServerError>> {
+    let (written, table) = crate::source::selected(selection, setting)?;
+    let table_setting = format!("{setting}.{written}");
+    let names: Vec<&str> = offered
+        .iter()
+        .map(|(name, _)| *name)
+        .chain(std::iter::once(crate::source::ORIGIN_MODULE))
+        .collect();
+    let Some(found) = crate::module_name::resolve(crate::source::SOURCE_SECTION, written, &names)
+    else {
+        let short: Vec<&str> = names
+            .iter()
+            .map(|name| crate::module_name::short_form(crate::source::SOURCE_SECTION, name))
+            .collect();
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "[{setting}] selects `{written}`, which no module this deployment supplies. \
+                 The source modules it supplies are [{}]",
+                short.join(", ")
+            ),
+        }));
+    };
+    if found == crate::source::ORIGIN_MODULE {
+        return crate::source::OriginFactory.build(&table, &table_setting);
+    }
+    let factory = offered
+        .iter()
+        .find(|(name, _)| *name == found)
+        .map(|(_, factory)| Arc::clone(factory))
+        .ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("[{setting}] selects `{written}`, which nothing builds"),
+            })
+        })?;
+    factory.build(&table, &table_setting)
+}
+
+/// The publisher's source and each asset route's, built from `settings`.
+fn build_sources(
+    settings: &Settings,
+    offered: &[(&'static str, Arc<dyn SourceFactory>)],
+) -> Result<BuiltSources, Report<TrustedServerError>> {
+    let publisher = build_source(&settings.source, crate::source::SOURCE_SECTION, offered)?;
+    let routes = settings
+        .proxy
+        .asset_routes
+        .iter()
+        .map(|route| build_source(&route.source, &route.source_setting(), offered))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(BuiltSources { publisher, routes })
 }
 
 /// Refuses an `[asset-cache]` that selects more than one module, because
@@ -1727,6 +1828,51 @@ fn refuse_unselected_asset_cache(
 }
 
 impl IntegrationRegistry {
+    /// The publisher's source, built when the registry was built from the
+    /// settings, or built now from `settings` with core's sources alone for a
+    /// registry built without them.
+    ///
+    /// # Errors
+    ///
+    /// When the registry holds none and `settings` name a source core does
+    /// not supply, or one it cannot build.
+    pub fn publisher_source(
+        &self,
+        settings: &Settings,
+    ) -> Result<Arc<dyn Source>, Report<TrustedServerError>> {
+        match &self.inner.sources {
+            Some(sources) => Ok(Arc::clone(&sources.publisher)),
+            None => build_source(&settings.source, crate::source::SOURCE_SECTION, &[]),
+        }
+    }
+
+    /// The source of the asset route at `index` in `settings`, built as for
+    /// [`Self::publisher_source`].
+    ///
+    /// # Errors
+    ///
+    /// When there is no route at `index`, or as [`Self::publisher_source`].
+    pub fn route_source(
+        &self,
+        settings: &Settings,
+        index: usize,
+    ) -> Result<Arc<dyn Source>, Report<TrustedServerError>> {
+        if let Some(source) = self
+            .inner
+            .sources
+            .as_ref()
+            .and_then(|sources| sources.routes.get(index))
+        {
+            return Ok(Arc::clone(source));
+        }
+        let route = settings.proxy.asset_routes.get(index).ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("there is no asset route at {index}"),
+            })
+        })?;
+        build_source(&route.source, &route.source_setting(), &[])
+    }
+
     /// Tells the registry what the adapter reports about the platform, which
     /// a middleware is told about every document.
     #[must_use]
@@ -2090,6 +2236,10 @@ impl IntegrationRegistry {
                 claim_module_name(&mut claimed, "prefix", name, registration.integration_id)?;
                 inner.prefix_modules.push((name, module));
             }
+            if let Some((name, factory)) = registration.source_module {
+                claim_module_name(&mut claimed, "source", name, registration.integration_id)?;
+                inner.source_modules.push((name, factory));
+            }
             if let Some((name, contributor)) = registration.robots_txt_contributor {
                 claim_module_name(
                     &mut claimed,
@@ -2176,6 +2326,7 @@ impl IntegrationRegistry {
         inner.ec_module = resolve_ec_module(settings, &inner);
         inner.device_module = resolve_device_module(settings, &inner)?;
         inner.prefix_module = resolve_prefix_module(settings, &inner)?;
+        inner.sources = Some(build_sources(settings, &inner.source_modules)?);
         inner.geo_module = geo_module;
         check_robots_txt_selection(settings, &inner)?;
         if let Some(config) = settings.robots_txt.as_ref() {
@@ -2527,10 +2678,25 @@ impl IntegrationRegistry {
             req.headers_mut().remove(HEADER_X_TS_EC.clone());
 
             // The route takes the request, so the context holds a copy of
-            // what it resolved to, beside what was resolved for it.
+            // what it resolved to and of its evidence, beside what was
+            // resolved for it. The evidence is read as the permission path
+            // reads it, after the caller's EC header is gone.
             let resolved = ResolvedRequest::of(&req, services.client_info());
+            let evidence = OwnedRequestInfo::new(
+                services
+                    .client_info()
+                    .client_ip
+                    .map(crate::ec::generation::normalize_ip)
+                    .unwrap_or_default(),
+                req.headers().clone(),
+            )
+            .with_request_target(
+                req.uri().path().to_owned(),
+                req.uri().query().unwrap_or_default().to_owned(),
+            );
             let context = ModuleContext::new(resolved.view())
                 .with_settings(settings)
+                .with_evidence(&evidence)
                 .with_request_state(ec_context, services);
             Some(
                 proxy
@@ -2825,6 +2991,8 @@ impl IntegrationRegistry {
                 device_module: None,
                 prefix_modules: Vec::new(),
                 prefix_module: SelectedPrefixModule::default(),
+                source_modules: Vec::new(),
+                sources: None,
                 asset_cache_module: None,
             }),
             plan: None,
@@ -2908,6 +3076,8 @@ impl IntegrationRegistry {
                 device_module: None,
                 prefix_modules: Vec::new(),
                 prefix_module: SelectedPrefixModule::default(),
+                source_modules: Vec::new(),
+                sources: None,
                 asset_cache_module: None,
             }),
             plan: None,
@@ -4974,6 +5144,105 @@ mod tests {
             answer(PermissionSet::none()),
             "test-publisher.com storage=true id=none",
             "and one declaring nothing still sees the permissions but not the identifier"
+        );
+    }
+
+    /// A route that answers with the request evidence its module call
+    /// handed it.
+    struct EvidenceReadingRoute;
+
+    impl EvidenceReadingRoute {
+        fn report(
+            &self,
+            _req: Request<EdgeBody>,
+            evidence: &dyn crate::evidence::RequestInfo,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+            let body = format!(
+                "ip={} path={} query={} session={} ec={}",
+                evidence.client_ip(),
+                evidence.path(),
+                evidence.query(),
+                evidence.cookie("session").unwrap_or("none"),
+                evidence.header("x-ts-ec").unwrap_or("none"),
+            );
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(EdgeBody::from(body))
+                .expect("should build the response"))
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl IntegrationProxy for EvidenceReadingRoute {
+        fn integration_name(&self) -> &'static str {
+            "evidence"
+        }
+
+        fn routes(&self) -> Vec<IntegrationEndpoint> {
+            vec![IntegrationEndpoint::post("/integrations/test/evidence")]
+        }
+
+        async fn handle(
+            &self,
+            call: ModuleCall<'_>,
+            req: Request<EdgeBody>,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+            call.inject_with(self, req, Self::report)?
+        }
+    }
+
+    /// A route is handed its request's evidence, being the client address,
+    /// the headers and the address it was asked at, without the caller's EC
+    /// header, so a route that reads the request as evidence can answer.
+    #[test]
+    fn a_route_is_handed_its_requests_evidence() {
+        let settings = create_test_settings();
+        let registry = IntegrationRegistry::from_routes(vec![(
+            Method::POST,
+            "/integrations/test/evidence",
+            (
+                Arc::new(EvidenceReadingRoute) as Arc<dyn IntegrationProxy>,
+                "evidence",
+            ),
+        )]);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("https://test-publisher.com/integrations/test/evidence?from=page")
+            .header(header::HOST, "test-publisher.com")
+            .header(header::COOKIE, "session=abc")
+            .header(HEADER_X_TS_EC.clone(), "caller-supplied")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let mut ec_context =
+            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
+        let services =
+            crate::platform::test_support::noop_services_with_client_ip(std::net::IpAddr::from([
+                203, 0, 113, 7,
+            ]));
+
+        let response = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
+            method: &Method::POST,
+            path: "/integrations/test/evidence",
+            settings: &settings,
+            kv: None,
+            ec_context: &mut ec_context,
+            services: &services,
+            req,
+        }))
+        .expect("should find the route")
+        .expect("a route reading the evidence should answer");
+        let body = String::from_utf8(
+            response
+                .into_body()
+                .into_bytes()
+                .unwrap_or_default()
+                .to_vec(),
+        )
+        .expect("the answer is text");
+
+        assert_eq!(
+            body,
+            "ip=203.0.113.7 path=/integrations/test/evidence query=from=page session=abc ec=none"
         );
     }
 

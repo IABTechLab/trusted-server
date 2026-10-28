@@ -1060,10 +1060,15 @@ mod tests {
     #[test]
     fn rejects_unknown_proxy_mode() {
         let toml = r#"
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.test-publisher.com"
+
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
-            origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]

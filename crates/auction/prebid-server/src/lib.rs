@@ -3047,10 +3047,15 @@ mod tests {
 [auction]
 modules = ["prebid"]
 
+[source]
+module = "origin"
+
+[source.origin]
+url = "https://origin.test-publisher.com"
+
 [publisher]
 domain = "test-publisher.com"
 cookie_domain = ".test-publisher.com"
-origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
 [ec]

@@ -8,10 +8,10 @@ request, and why the file is built this way.
 ## One rule for every type
 
 Everything Trusted Server can switch on is a module, selected the same way:
-the Edge Cookie identity, the location and device lookups, the permission
-signals, the demand sources in an auction, the ad server that picks the
-winner, the rules in `robots.txt`, where auction telemetry is sent, and the
-page integrations.
+where the publisher's pages come from, the Edge Cookie identity, the location
+and device lookups, the permission signals, the demand sources in an auction,
+the ad server that picks the winner, the rules in `robots.txt`, where auction
+telemetry is sent, and the page integrations.
 
 ```toml
 [<type>]
@@ -22,10 +22,9 @@ setting = "value"
 ```
 
 1. **The type is the job.** Each type is one top-level table, named for what
-   its modules do: `ec`, `geo`, `device`, `permission-signal`, `demand`,
-   `ad-server`, `robots-txt`, `ads-txt` and `analytics`, and the section of each
-   module
-   type, such as `cmp` or `tag`.
+   its modules do: `source`, `ec`, `geo`, `device`, `permission-signal`,
+   `demand`, `ad-server`, `robots-txt`, `ads-txt` and `analytics`, and the
+   section of each module type, such as `cmp` or `tag`.
 2. **The selector chooses what runs.** A type that runs one module takes
    `module`, a string. A type that runs several takes `modules`, a list.
 3. **`[<type>.<name>]` holds the settings.** A name with nothing to set
@@ -48,6 +47,7 @@ setting = "value"
 
 | Type                | Runs              | Selector           | Implementations in this repository                                                                      |
 | ------------------- | ----------------- | ------------------ | ------------------------------------------------------------------------------------------------------- |
+| `source`            | one               | `module`, a string | `origin`, an HTTP origin, or a module that supplies a source                                            |
 | `ec`                | one               | `module`, a string | `hmac`, `host_signals`, `client_fixed` (demonstration builds), or an integration that supplies identity |
 | `geo`               | one               | `module`, a string | `platform`, `none`, or an integration that supplies location                                            |
 | `device`            | one               | `module`, a string | `builtin` (the default), `fastly`, or an integration that supplies device signals                       |
@@ -83,6 +83,7 @@ partner registry and the cluster thresholds, and `[geo]` holds
 
 | Type                                            | With no `module` or `modules` line                                                |
 | ----------------------------------------------- | --------------------------------------------------------------------------------- |
+| `source`                                        | the configuration is refused, because `[source]` is required                      |
 | `ec`                                            | no Edge Cookie is created                                                         |
 | `geo`                                           | no location is resolved and no host geo service is called                         |
 | `device`                                        | `builtin` runs, which reads the User-Agent only                                   |
@@ -166,7 +167,7 @@ They keep their own keys and have no selector.
 
 | Table                                      | Configures                                                            |
 | ------------------------------------------ | --------------------------------------------------------------------- |
-| `[publisher]`                              | the site, its origin and the proxy secret                             |
+| `[publisher]`                              | the site and the proxy secret                                         |
 | `[auction]`                                | whether auctions run, the whole-auction timeout and creative handling |
 | `[auction.bidders.<code>]`                 | which demand provider a browser bidder code is sent to                |
 | `[creative_opportunities]`                 | server-rendered ad slots                                              |
@@ -203,8 +204,13 @@ A site with every kind of component the rules cover.
 [publisher]
 domain = "example.com"
 cookie_domain = ".example.com"
-origin_url = "https://origin.example.com"
 proxy_secret = "publisher_proxy_secret"    # key name in trusted_server_secrets
+
+[source]
+module = "origin"
+
+[source.origin]
+url = "https://origin.example.com"
 
 [proxy]
 allowed_domains = ["assets.example.com"]

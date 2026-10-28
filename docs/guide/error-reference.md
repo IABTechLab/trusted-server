@@ -62,8 +62,13 @@ before validation.
 ```toml
 [publisher]
 domain = "your-publisher-domain.com"
-origin_url = "https://origin.your-publisher-domain.com"
 proxy_secret = "publisher_proxy_secret"
+
+[source]
+module = "origin"
+
+[source.origin]
+url = "https://origin.your-publisher-domain.com"
 ```
 
 `proxy_secret` names an entry in the Trusted Server secret store. Provision a
@@ -73,9 +78,29 @@ TOML file.
 **Required Fields:**
 
 - `publisher.domain`
-- `publisher.origin_url`
 - `publisher.proxy_secret`
+- `source.module`
+- `source.origin.url` (when `source.module = "origin"`)
 - `ec.hmac.passphrase` (when `ec.module = "hmac"`)
+
+---
+
+### No source named
+
+**Error Message:**
+
+```
+Configuration error: [source] names no source. Write `module = "origin"` and the origin's address under [source.origin] url
+```
+
+**Cause:** The configuration has no `[source]` section, or has one with no
+`module` line, such as a `[source.origin]` table written on its own. `[source]`
+is required, because it says where the publisher's pages come from.
+
+**Solution:** Add the section with its `module` line, as in the example above. A configuration that
+names the origin in `[publisher]` is refused with a message naming the
+`[source.origin]` setting to write instead. See
+[`[source]`](/guide/configuration#source).
 
 ---
 

@@ -163,7 +163,7 @@ impl OriginHeaderRewrite<'_> {
         if self.is_scheme_change_to_current_request(url) {
             log::warn!(
                 "Keeping origin scheme-change redirect to the current request URL; the \
-                 browser leaves the serving host. Check that `publisher.origin_url` uses \
+                 browser leaves the serving host. Check that `source.origin.url` uses \
                  the scheme the origin enforces"
             );
             return None;
@@ -178,7 +178,7 @@ impl OriginHeaderRewrite<'_> {
     /// sets no cookie. Nothing the browser sends on the retry would differ, so
     /// the origin is redirecting because of something Trusted Server sends
     /// unchanged. When the outbound `Host` differs from the origin host (from
-    /// `publisher.origin_host_header_override`), the redirect is a host change
+    /// `source.origin.host_header`), the redirect is a host change
     /// that a retry cannot satisfy, so it is left unchanged even if the
     /// response sets a cookie.
     fn rewrite_location(&self, url: &str, response_sets_cookie: bool) -> Option<String> {
@@ -194,7 +194,7 @@ impl OriginHeaderRewrite<'_> {
                 log::warn!(
                     "Keeping origin redirect to the current request URL under a `Host` \
                      override; the browser leaves the serving host. Check that the origin \
-                     accepts the `Host` from `publisher.origin_host_header_override`"
+                     accepts the `Host` from `source.origin.host_header`"
                 );
             } else {
                 log::warn!(

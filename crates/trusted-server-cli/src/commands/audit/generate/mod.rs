@@ -457,9 +457,9 @@ fn build_draft_config_with_generator(
     )?;
     draft = replace_key_in_section(
         &draft,
-        "publisher",
-        "origin_url",
-        &format!("origin_url = \"{origin}\""),
+        "source.origin",
+        "url",
+        &format!("url = \"{origin}\""),
     )?;
 
     let detected = artifact
@@ -2757,7 +2757,10 @@ mod tests {
 
         assert!(draft.contains("domain = \"www.publisher.example\""));
         assert!(draft.contains("cookie_domain = \".www.publisher.example\""));
-        assert!(draft.contains("origin_url = \"https://www.publisher.example:8443\""));
+        assert!(draft.contains(
+            "
+url = \"https://www.publisher.example:8443\""
+        ));
         assert!(draft.contains("Detected prebid"));
         let parsed = toml::from_str::<toml::Value>(&draft).expect("draft should parse as TOML");
         let selected = |section: &str| {

@@ -143,7 +143,7 @@ fn push(project: &TempDir, args: &[&str]) -> Output {
             format!(".{HOST}"),
         )
         .env(
-            "TRUSTED_SERVER__PUBLISHER__ORIGIN_URL",
+            "TRUSTED_SERVER__SOURCE__ORIGIN__URL",
             "https://origin.publisher.example",
         )
         .output()

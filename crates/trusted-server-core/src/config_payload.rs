@@ -239,8 +239,8 @@ mod tests {
         TinybirdSettings, TrustedClientIpConfig,
     };
     use crate::test_support::tests::{
-        crate_test_settings_str, hmac_passphrase, sample_permissions, select_hmac_module,
-        select_host_signals_module,
+        crate_test_settings_str, edit_origin, hmac_passphrase, sample_permissions,
+        select_hmac_module, select_host_signals_module, set_route_auth,
     };
 
     /// Test settings as `ts config push` writes them, naming the repository's
@@ -624,14 +624,17 @@ mod tests {
             "/assets/",
             "https://examplebucket.s3.us-east-1.amazonaws.com",
         );
-        route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-            region: "us-east-1".to_string(),
-            secret_store: Some("legacy-s3-store".to_string()),
-            access_key_id: Redacted::new("s3-access-key".to_string()),
-            secret_access_key: Redacted::new("s3-secret-key".to_string()),
-            session_token: Some(Redacted::new("s3-session-key".to_string())),
-            origin_query: None,
-        }));
+        set_route_auth(
+            &mut route,
+            Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+                region: "us-east-1".to_string(),
+                secret_store: Some("legacy-s3-store".to_string()),
+                access_key_id: Redacted::new("s3-access-key".to_string()),
+                secret_access_key: Redacted::new("s3-secret-key".to_string()),
+                session_token: Some(Redacted::new("s3-session-key".to_string())),
+                origin_query: None,
+            })),
+        );
         original.proxy.asset_routes.push(route);
         original
             .ec
@@ -655,8 +658,8 @@ mod tests {
             Some("resolved-tinybird-token")
         );
         let auth = reconstructed.proxy.asset_routes[0]
-            .auth
-            .as_ref()
+            .origin_source()
+            .and_then(|origin| origin.auth)
             .expect("should preserve S3 auth");
         let AssetOriginAuth::S3SigV4(auth) = auth;
         assert_eq!(auth.access_key_id.expose(), "AKIAIOSFODNN7EXAMPLE");
@@ -860,9 +863,12 @@ mod tests {
             "/default-s3/",
             "https://examplebucket.s3.us-east-1.amazonaws.com",
         );
-        route.auth = Some(AssetOriginAuth::S3SigV4(
-            toml::from_str("region = \"us-east-1\"").expect("should apply S3 secret defaults"),
-        ));
+        set_route_auth(
+            &mut route,
+            Some(AssetOriginAuth::S3SigV4(
+                toml::from_str("region = \"us-east-1\"").expect("should apply S3 secret defaults"),
+            )),
+        );
         original.proxy.asset_routes.push(route);
 
         let reconstructed = settings_from_config_blob(
@@ -874,8 +880,8 @@ mod tests {
         .expect("should resolve default S3 secret keys");
 
         let AssetOriginAuth::S3SigV4(auth) = reconstructed.proxy.asset_routes[0]
-            .auth
-            .as_ref()
+            .origin_source()
+            .and_then(|origin| origin.auth)
             .expect("should preserve S3 auth");
         assert_eq!(auth.access_key_id.expose(), "AKIAIOSFODNN7EXAMPLE");
         assert_eq!(
@@ -885,17 +891,21 @@ mod tests {
     }
 
     #[test]
-    fn publisher_origin_auth_resolves_its_credentials_from_the_store() {
+    fn source_origin_auth_resolves_its_credentials_from_the_store() {
         let mut original = test_settings();
-        original.publisher.origin_url = "https://storage.example.com/bucket/site".to_string();
-        original.publisher.origin_auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-            region: "test-region-1".to_string(),
-            secret_store: None,
-            access_key_id: Redacted::new("s3-access-key".to_string()),
-            secret_access_key: Redacted::new("s3-secret-key".to_string()),
-            session_token: Some(Redacted::new("s3-session-key".to_string())),
-            origin_query: None,
-        }));
+        edit_origin(&mut original, |origin| {
+            origin.url = "https://storage.example.com/bucket/site".to_string()
+        });
+        edit_origin(&mut original, |origin| {
+            origin.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+                region: "test-region-1".to_string(),
+                secret_store: None,
+                access_key_id: Redacted::new("s3-access-key".to_string()),
+                secret_access_key: Redacted::new("s3-secret-key".to_string()),
+                session_token: Some(Redacted::new("s3-session-key".to_string())),
+                origin_query: None,
+            }))
+        });
 
         let reconstructed = settings_from_config_blob(
             &envelope_json(&original),
@@ -905,9 +915,10 @@ mod tests {
         )
         .expect("should resolve the publisher origin credentials from the mapped store");
 
-        let Some(AssetOriginAuth::S3SigV4(auth)) = reconstructed.publisher.origin_auth.as_ref()
+        let Some(AssetOriginAuth::S3SigV4(auth)) =
+            reconstructed.origin_source().and_then(|origin| origin.auth)
         else {
-            panic!("should keep the publisher origin_auth");
+            panic!("should keep the origin auth");
         };
         assert_eq!(auth.access_key_id.expose(), "AKIAIOSFODNN7EXAMPLE");
         assert_eq!(

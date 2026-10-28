@@ -94,9 +94,9 @@ use crate::response_privacy::{
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::{
     AUCTION_DEBUG_METADATA_ALLOWLIST, AUCTION_DEBUG_UPSTREAM_METADATA_KEYS, AssetOriginAuth,
-    AuctionDebugCommentFormat, AuctionDebugCommentOptions, AuctionDebugCommentVerbosity, Publisher,
-    Settings,
+    AuctionDebugCommentFormat, AuctionDebugCommentOptions, AuctionDebugCommentVerbosity, Settings,
 };
+use crate::source::{SourceLocation, SourceRequest};
 use crate::streaming_processor::{
     BodyStreamDecoder, BodyStreamEncoder, Compression, GzipDecodeReader, PipelineConfig,
     STREAM_CHUNK_SIZE, StreamProcessor, StreamingPipeline,
@@ -1931,9 +1931,9 @@ fn create_html_stream_processor(
 /// that is assembled and not yet encoded, and to the response, which is
 /// nothing when no entry covers the request.
 ///
-/// The origin host is read from the settings. A page served from the store
-/// keeps no record of it, and a serve middleware is told the same about a
-/// page from the store as about one fetched for this request.
+/// The origin host is the one the publisher's source answered for this
+/// request, which the parameters of a page from the store carry as well as
+/// those of one fetched for it.
 fn reader_serve_processor(
     params: &OwnedProcessResponseParams,
     settings: &Settings,
@@ -1951,13 +1951,13 @@ fn reader_serve_processor(
         HTML_MEDIA_TYPE,
         &params.request_path,
     );
-    let origin_host = settings.publisher.origin_host();
+    let origin_host = &params.origin_host;
     create_serve_processor(
         &chain,
         &ReaderDocument {
             request_host: &params.request_host,
             request_scheme: &params.request_scheme,
-            origin_host: &origin_host,
+            origin_host,
             platform: integration_registry.platform(),
             request_state: &params.request_state,
             max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
@@ -2772,7 +2772,7 @@ fn seam_script_for(params: &OwnedProcessResponseParams) -> String {
 /// leave through the seam, never through the cached head.
 fn build_template_assembly_params(
     entry: &crate::platform::TemplateEntry,
-    settings: &Settings,
+    location: &SourceLocation,
     request_host: &str,
     request_scheme: &str,
     price_granularity: PriceGranularity,
@@ -2787,8 +2787,8 @@ fn build_template_assembly_params(
         seam_ad_slots: None,
         policy_headers: Vec::new(),
         content_encoding: entry.metadata.content_encoding.clone(),
-        origin_host: String::new(),
-        origin_url: settings.publisher.origin_url.clone(),
+        origin_host: location.host_header(),
+        origin_url: location.url().to_owned(),
         request_host: request_host.to_string(),
         request_scheme: request_scheme.to_string(),
         // Set by the caller, with the rest of what belongs to the request.
@@ -3841,12 +3841,13 @@ fn rewrite_origin_request(
 
 /// Builds the path and query of a publisher origin request.
 ///
-/// With none of `[publisher]`'s path settings in use this is the reader's path
-/// and query exactly as sent. A path in `origin_url` comes first, joined to
-/// the reader's path with one `/`. `directory_index` is added to a path that
-/// ends in `/`, and the query is left off when `origin_auth` strips it.
+/// With none of the location's path settings in use this is the reader's
+/// path and query exactly as sent. A path in the location's address comes
+/// first, joined to the reader's path with one `/`. The directory index is
+/// added to a path that ends in `/`, and the query is left off when the
+/// location's signing strips it.
 fn publisher_origin_path_and_query<'a>(
-    publisher: &Publisher,
+    location: &SourceLocation,
     origin_path: &str,
     uri: &'a Uri,
 ) -> Cow<'a, str> {
@@ -3857,11 +3858,8 @@ fn publisher_origin_path_and_query<'a>(
         .path_and_query()
         .map_or("/", http::uri::PathAndQuery::path);
     let folder = origin_path.trim_end_matches('/');
-    let index = publisher
-        .directory_index
-        .as_deref()
-        .filter(|_| path.ends_with('/'));
-    let strip_query = publisher.origin_query_is_stripped();
+    let index = location.directory_index().filter(|_| path.ends_with('/'));
+    let strip_query = location.query_is_stripped();
     if folder.is_empty() && index.is_none() && !strip_query {
         return Cow::Borrowed(path_and_query);
     }
@@ -3928,14 +3926,15 @@ fn write_serve_middleware_headers(
 ///
 /// A signed origin is only asked to read, so any method but `GET` or `HEAD` is
 /// refused with `405` rather than signed with the publisher's credentials.
-/// When `origin_url` names a folder, a reader path with a `.` or `..` segment
-/// in any spelling is refused with `400`, so no request climbs out of it.
+/// When the location's address names a folder, a reader path with a `.` or
+/// `..` segment in any spelling is refused with `400`, so no request climbs out
+/// of it.
 fn refused_origin_request(
-    publisher: &Publisher,
+    location: &SourceLocation,
     origin_path: &str,
     req: &Request<EdgeBody>,
 ) -> Option<StatusCode> {
-    if publisher.origin_auth.is_some() && !matches!(*req.method(), Method::GET | Method::HEAD) {
+    if location.auth().is_some() && !matches!(*req.method(), Method::GET | Method::HEAD) {
         return Some(StatusCode::METHOD_NOT_ALLOWED);
     }
     if !origin_path.trim_end_matches('/').is_empty() && path_has_dot_segment(req.uri().path()) {
@@ -3948,7 +3947,7 @@ fn refused_origin_request(
 /// any of a bounded number of percent-decoding rounds. A backslash counts as a
 /// separator, and a path still changing after the last round counts as having
 /// one.
-fn path_has_dot_segment(path: &str) -> bool {
+pub(crate) fn path_has_dot_segment(path: &str) -> bool {
     crate::closed_paths::matches_any_decoding(path, |current| {
         current
             .split(['/', '\\'])
@@ -5416,11 +5415,21 @@ pub async fn handle_publisher_request(
     // recomputed per delivery point.
     let permissions_json = ec_context.permissions().page_json();
 
-    let parsed_origin = url::Url::parse(&settings.publisher.origin_url).change_context(
-        TrustedServerError::Proxy {
-            message: format!("Invalid origin_url: {}", settings.publisher.origin_url),
-        },
-    )?;
+    // Where this request's content comes from, as the publisher's source
+    // answers. Everything below that names the origin reads this.
+    let source = integration_registry.publisher_source(settings)?;
+    let removed_prefix = req
+        .extensions()
+        .get::<crate::addressing::RemovedPathPrefix>()
+        .map(|prefix| prefix.as_str().to_owned());
+    let location = source.locate(&SourceRequest {
+        method: req.method(),
+        path: req.uri().path(),
+        query: req.uri().query().unwrap_or_default(),
+        headers: req.headers(),
+        removed_prefix: removed_prefix.as_deref(),
+    })?;
+    let parsed_origin = location.parsed().clone();
     let origin_scheme = parsed_origin.scheme().to_string();
     let origin_host_without_port = parsed_origin.host_str().ok_or_else(|| {
         Report::new(TrustedServerError::Proxy {
@@ -5433,7 +5442,7 @@ pub async fn handle_publisher_request(
             scheme: origin_scheme.clone(),
             host: origin_host_without_port.to_string(),
             port: parsed_origin.port(),
-            host_header_override: settings.publisher.origin_host_header_override.clone(),
+            host_header_override: location.host_header_override().map(str::to_owned),
             certificate_check: settings.proxy.certificate_check,
             first_byte_timeout: DEFAULT_PUBLISHER_FIRST_BYTE_TIMEOUT,
             between_bytes_timeout: DEFAULT_PUBLISHER_FIRST_BYTE_TIMEOUT,
@@ -5442,9 +5451,13 @@ pub async fn handle_publisher_request(
         .change_context(TrustedServerError::Proxy {
             message: "backend registration failed".to_string(),
         })?;
-    let origin_host = settings.publisher.origin_host();
-    let origin_host_header = settings.publisher.origin_host_header();
-    if let Some(status) = refused_origin_request(&settings.publisher, parsed_origin.path(), &req) {
+    let origin_host = location.host();
+    // The name the origin answers to, sent as its `Host`. A page names itself
+    // by it, so its own addresses are looked for under this name and not the
+    // address's host, which differ where the source fetches through another
+    // host.
+    let origin_host_header = location.host_header();
+    if let Some(status) = refused_origin_request(&location, parsed_origin.path(), &req) {
         log::debug!("Publisher origin request refused before sending: {status}");
         return Ok(PublisherResponse::Buffered(origin_refusal_response(
             status,
@@ -5457,7 +5470,7 @@ pub async fn handle_publisher_request(
         .unwrap_or("/")
         .to_string();
     let origin_path_and_query =
-        publisher_origin_path_and_query(&settings.publisher, parsed_origin.path(), req.uri());
+        publisher_origin_path_and_query(&location, parsed_origin.path(), req.uri());
     let target_uri = format!("{origin_scheme}://{origin_host}{origin_path_and_query}")
         .parse::<Uri>()
         .change_context(TrustedServerError::Proxy {
@@ -5719,7 +5732,7 @@ pub async fn handle_publisher_request(
             // origin target. Path *and* query: a different query is a different page, and
             // a purge caller types the whole address.
             request_path: request_path_and_query.clone(),
-            origin_identity: format!("{}\0{}", settings.publisher.origin_url, origin_host_header),
+            origin_identity: location.identity(),
             assembly_mode,
             vary_values: settings
                 .creative_opportunities
@@ -5745,7 +5758,7 @@ pub async fn handle_publisher_request(
     let reader_carries_cookie = req.headers().contains_key(header::COOKIE);
     rewrite_origin_request(&mut req, target_uri, &origin_host_header)?;
     // Signed last, once nothing else changes the request the origin is sent.
-    if let Some(auth) = settings.publisher.origin_auth.as_ref() {
+    if let Some(auth) = location.auth() {
         sign_publisher_origin_request(&mut req, auth)?;
     }
 
@@ -6062,7 +6075,7 @@ pub async fn handle_publisher_request(
                     let response = build_cached_template_response(&entry, reader_compression)?;
                     let mut params = build_template_assembly_params(
                         &entry,
-                        settings,
+                        &location,
                         request_host,
                         request_scheme,
                         price_granularity,
@@ -6086,7 +6099,7 @@ pub async fn handle_publisher_request(
                         .with_settings(settings)
                         .with_addressed_host(&addressed_host)
                         .with_request_state(ec_context, services);
-                    let stored_origin_host = settings.publisher.origin_host();
+                    let stored_origin_host = location.host_header();
                     let document = TextResponse {
                         content_type: crate::middleware::HTML_MEDIA_TYPE,
                         status: StatusCode::OK,
@@ -6181,8 +6194,7 @@ pub async fn handle_publisher_request(
             && let Some(origin_url) = asset_file_url.as_deref()
             && let Some(origin) = OriginRequest::of(&platform_request)
         {
-            let origin_identity =
-                format!("{}\0{}", settings.publisher.origin_url, origin_host_header);
+            let origin_identity = location.identity();
             let file = AssetFile {
                 via: AssetVia::Publisher,
                 carries_authorization: authorization_disqualifies,
@@ -6262,7 +6274,7 @@ pub async fn handle_publisher_request(
     let header_reader = crate::html_processor::ReaderDocument {
         request_host,
         request_scheme,
-        origin_host: &origin_host,
+        origin_host: &origin_host_header,
         platform: integration_registry.platform(),
         request_state: &request_state,
         max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
@@ -6516,7 +6528,7 @@ pub async fn handle_publisher_request(
             request_path: &request_path,
             request_host,
             request_scheme,
-            origin_host: &origin_host,
+            origin_host: &origin_host_header,
             request_state: &request_state,
             max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
             prepared: &prepared,
@@ -6645,8 +6657,8 @@ pub async fn handle_publisher_request(
                     seam_ad_slots,
                     policy_headers,
                     content_encoding,
-                    origin_host,
-                    origin_url: settings.publisher.origin_url.clone(),
+                    origin_host: origin_host_header,
+                    origin_url: location.url().to_owned(),
                     request_host: request_host.to_string(),
                     request_scheme: request_scheme.to_string(),
                     request_path: request_path.clone(),
@@ -9319,7 +9331,9 @@ mod tests {
         StubHttpClient, build_services_with_http_client, noop_services,
         noop_services_with_telemetry_sink,
     };
-    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+    use crate::test_support::tests::{
+        crate_test_settings_str, create_test_settings, edit_origin, origin_host,
+    };
     use edgezero_core::body::Body as EdgeBody;
     use http::{Method, Request as HttpRequest, StatusCode, header};
     use std::sync::Arc;
@@ -10851,8 +10865,11 @@ mod tests {
             seam_ad_slots: None,
             policy_headers: Vec::new(),
             content_encoding: content_encoding.to_owned(),
-            origin_host: settings.publisher.origin_host(),
-            origin_url: settings.publisher.origin_url.clone(),
+            origin_host: origin_host(settings),
+            origin_url: settings
+                .origin_source()
+                .expect("settings should select the origin source")
+                .url,
             request_host: settings.publisher.domain.clone(),
             request_scheme: "https".to_owned(),
             request_path: "/".to_owned(),
@@ -11054,16 +11071,24 @@ mod tests {
         services: &RuntimeServices,
         req: Request<EdgeBody>,
     ) -> PublisherResponse {
+        run_publisher_proxy_with(settings, &test_registry(settings), services, req).await
+    }
+
+    async fn run_publisher_proxy_with(
+        settings: &Settings,
+        registry: &IntegrationRegistry,
+        services: &RuntimeServices,
+        req: Request<EdgeBody>,
+    ) -> PublisherResponse {
         let orchestrator = AuctionOrchestrator::new(
             crate::auction::test_support::legacy_auction_config(settings),
         );
         let mut ec_context =
             EcContext::read_from_request(settings, &req, services).expect("should read EC context");
-        let registry = test_registry(settings);
         handle_publisher_request(
             AppContext {
                 settings,
-                integration_registry: &registry,
+                integration_registry: registry,
             },
             services,
             None,
@@ -11078,6 +11103,160 @@ mod tests {
         )
         .await
         .expect("should proxy publisher request")
+    }
+
+    mod source_tests {
+        //! The publisher path asks its source where each request's content
+        //! comes from.
+
+        use super::*;
+        use crate::integrations::{IntegrationBuilder, IntegrationRegistration};
+        use crate::source::{Source, SourceFactory, SourceLocation, SourceRequest};
+
+        /// The module whose registration offers the source, which a
+        /// section selects to run it.
+        const ADDRESSED_MODULE: &str = "testing.addressed";
+
+        /// The source's own name, which `[source]` selects.
+        const ADDRESSED_SOURCE: &str = "testing.addressed.source";
+
+        /// A source answering the origin named by the prefix request
+        /// addressing removed, as a source reading the address does.
+        #[derive(Debug)]
+        struct AddressedSource;
+
+        impl Source for AddressedSource {
+            fn locate(
+                &self,
+                request: &SourceRequest<'_>,
+            ) -> Result<SourceLocation, Report<TrustedServerError>> {
+                let name = request
+                    .removed_prefix
+                    .unwrap_or("/default.example")
+                    .trim_start_matches('/');
+                SourceLocation::new(format!("https://{name}"))
+            }
+        }
+
+        struct AddressedFactory;
+
+        impl SourceFactory for AddressedFactory {
+            fn build(
+                &self,
+                _settings: &serde_json::Map<String, serde_json::Value>,
+                _setting: &str,
+            ) -> Result<Arc<dyn Source>, Report<TrustedServerError>> {
+                Ok(Arc::new(AddressedSource))
+            }
+        }
+
+        fn addressed_registration(
+            _settings: &Settings,
+        ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+            Ok(Some(
+                IntegrationRegistration::builder("addressed")
+                    .with_source_module(ADDRESSED_SOURCE, Arc::new(AddressedFactory))
+                    .build(),
+            ))
+        }
+
+        fn addressed_builder() -> IntegrationBuilder {
+            IntegrationBuilder::new(
+                "addressed",
+                "seam-probe",
+                addressed_registration,
+                |_settings: &Settings| Ok(true),
+            )
+            .with_module_name(ADDRESSED_MODULE)
+        }
+
+        /// Settings whose `[source]` selects the addressed source.
+        fn addressed_settings() -> Settings {
+            let mut settings = create_test_settings();
+            settings
+                .insert_module_config("testing", ADDRESSED_MODULE, &serde_json::json!({}))
+                .expect("should run the test module");
+            settings.source = crate::provider_table::SectionModules::one(
+                ADDRESSED_SOURCE,
+                serde_json::Map::new(),
+            );
+            settings
+        }
+
+        fn addressed_request(prefix: &str) -> HttpRequest<EdgeBody> {
+            let mut request = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://publisher.example/page")
+                .header(header::HOST, "publisher.example")
+                .body(EdgeBody::empty())
+                .expect("should build reader request");
+            request
+                .extensions_mut()
+                .insert(crate::addressing::RemovedPathPrefix::new(prefix.to_owned()));
+            request
+        }
+
+        #[tokio::test]
+        async fn a_source_answering_per_request_sends_each_request_to_its_own_origin() {
+            let settings = addressed_settings();
+            let registry =
+                IntegrationRegistry::with_registrations(&settings, &[addressed_builder()])
+                    .expect("should build the registry offering the test source");
+            let stub = Arc::new(StubHttpClient::new());
+            for _ in 0..2 {
+                stub.push_response_with_headers(
+                    200,
+                    b"<html><body>page</body></html>".to_vec(),
+                    vec![(header::CONTENT_TYPE.as_str(), "text/html; charset=utf-8")],
+                );
+            }
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+
+            let mut origin_hosts = Vec::new();
+            for prefix in ["/a.example", "/b.example"] {
+                let response = run_publisher_proxy_with(
+                    &settings,
+                    &registry,
+                    &services,
+                    addressed_request(prefix),
+                )
+                .await;
+                let PublisherResponse::Stream { params, .. } = response else {
+                    panic!("should stream the origin page through the page pipeline");
+                };
+                origin_hosts.push(params.origin_host.clone());
+            }
+
+            assert_eq!(
+                stub.recorded_request_uris(),
+                vec!["https://a.example/page", "https://b.example/page"],
+                "each request should go to the origin its source answered"
+            );
+            assert_eq!(
+                origin_hosts,
+                vec!["a.example", "b.example"],
+                "the page pipeline should be told each request's own origin host"
+            );
+        }
+
+        #[test]
+        fn a_source_the_build_does_not_offer_is_refused_naming_those_it_does() {
+            let mut settings = create_test_settings();
+            settings.source =
+                crate::provider_table::SectionModules::one("nosuch", serde_json::Map::new());
+
+            let Err(error) = IntegrationRegistry::new(&settings) else {
+                panic!("should refuse a source no module supplies");
+            };
+
+            let message = format!("{error:?}");
+            assert!(
+                message.contains("nosuch") && message.contains("origin"),
+                "should name the selection and the sources on offer: {message}"
+            );
+        }
     }
 
     mod rendered_template_identity_tests {
@@ -11704,7 +11883,9 @@ mod tests {
             assert_ne!(fingerprint(&base), fingerprint(&creative));
 
             let mut origin = base.clone();
-            origin.publisher.origin_host_header_override = Some("tenant.example.com".to_string());
+            edit_origin(&mut origin, |settings| {
+                settings.host_header = Some("tenant.example.com".to_string())
+            });
             assert_ne!(fingerprint(&base), fingerprint(&origin));
         }
 
@@ -13234,7 +13415,7 @@ mod tests {
         /// running `settings`, for a request that left a mark or did not.
         fn reader_marker_for(settings: &Settings, marked: bool) -> String {
             crate::integrations::registry_test_support::middleware_fixture::reader_marker(
-                &settings.publisher.origin_host(),
+                &origin_host(settings),
                 marked,
             )
         }
@@ -15485,7 +15666,9 @@ mod tests {
         #[tokio::test]
         async fn two_pass_integration_templates_are_identical_across_request_shapes() {
             let mut settings = settings_with_mode("esi");
-            settings.publisher.origin_url = "https://origin.example.com".to_owned();
+            edit_origin(&mut settings, |origin| {
+                origin.url = "https://origin.example.com".to_owned()
+            });
             crate::integrations::registry_test_support::payload_fixture::select_and_place(
                 &mut settings,
             );
@@ -19402,7 +19585,7 @@ mod tests {
         location: &str,
     ) -> String {
         let mut settings = create_test_settings();
-        settings.publisher.origin_url = origin_url.to_string();
+        edit_origin(&mut settings, |origin| origin.url = origin_url.to_owned());
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
             303,
@@ -19456,7 +19639,7 @@ mod tests {
 
     #[tokio::test]
     async fn cookieless_get_redirect_to_current_url_is_not_rewritten_into_a_loop() {
-        // A canonical-host redirect triggered by `origin_host_header_override`
+        // A canonical-host redirect triggered by `source.origin.host_header`
         // answers the retry through Trusted Server the same way, so it must leave.
         for method in [Method::GET, Method::HEAD] {
             let location = redirect_location_for_current_url(
@@ -19476,7 +19659,9 @@ mod tests {
     #[tokio::test]
     async fn overridden_host_redirect_with_cookie_is_not_rewritten_into_a_loop() {
         let mut settings = create_test_settings();
-        settings.publisher.origin_host_header_override = Some("publisher.example".to_string());
+        edit_origin(&mut settings, |origin| {
+            origin.host_header = Some("publisher.example".to_owned());
+        });
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
             301,
@@ -22402,20 +22587,6 @@ mod tests {
     }
 
     #[test]
-    fn test_publisher_origin_host_extraction() {
-        let settings = create_test_settings();
-        let origin_host = settings.publisher.origin_host();
-        assert_eq!(origin_host, "origin.test-publisher.com");
-
-        let mut settings_with_port = create_test_settings();
-        settings_with_port.publisher.origin_url = "origin.test-publisher.com:8080".to_string();
-        assert_eq!(
-            settings_with_port.publisher.origin_host(),
-            "origin.test-publisher.com:8080"
-        );
-    }
-
-    #[test]
     fn test_invalid_utf8_handling() {
         let invalid_utf8_bytes = vec![0xFF, 0xFE, 0xFD];
         assert!(String::from_utf8(invalid_utf8_bytes.clone()).is_err());
@@ -24954,7 +25125,9 @@ mod tests {
     #[tokio::test]
     async fn publisher_request_sends_configured_host_header_override() {
         let mut settings = create_test_settings();
-        settings.publisher.origin_host_header_override = Some("www.example.com".to_string());
+        edit_origin(&mut settings, |origin| {
+            origin.host_header = Some("www.example.com".to_string())
+        });
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, b"origin response".to_vec());
         let services = build_services_with_http_client(
@@ -24983,6 +25156,61 @@ mod tests {
             Some("www.example.com"),
             "should send configured host override to outbound request"
         );
+    }
+
+    #[tokio::test]
+    async fn a_page_fetched_through_another_host_is_rewritten_under_its_own_name() {
+        let mut settings = create_test_settings();
+        edit_origin(&mut settings, |origin| {
+            origin.url = "https://fetch.example/through".to_string();
+            origin.host_header = Some("www.example.com".to_string());
+        });
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            br#"<html><body><a href="https://www.example.com/news">news</a></body></html>"#
+                .to_vec(),
+            vec![(header::CONTENT_TYPE.as_str(), "text/html; charset=utf-8")],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/page")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let PublisherResponse::Stream { body, params, .. } =
+            run_publisher_proxy(&settings, &services, req).await
+        else {
+            panic!("should stream the page through the page pipeline");
+        };
+        assert_eq!(
+            stub.recorded_request_uris(),
+            vec!["https://fetch.example/through/page"],
+            "should fetch the page from the source's address"
+        );
+        assert_eq!(
+            params.origin_host, "www.example.com",
+            "the page's own host is the Host its source sends"
+        );
+        let mut output = Vec::new();
+        stream_publisher_body(
+            body,
+            &mut output,
+            &params,
+            &settings,
+            &test_registry(&settings),
+        )
+        .expect("should rewrite the page");
+        let html = String::from_utf8(output).expect("should be UTF-8");
+        assert!(
+            html.contains("publisher.example/news"),
+            "should point the page's own address at the request host: {html}"
+        );
+        assert!(!html.contains("www.example.com"), "{html}");
     }
 
     /// The publisher origin request as `origin_url`'s path, `directory_index`
@@ -25167,9 +25395,14 @@ mod tests {
             );
         }
 
+        /// A location with none of the path settings in use.
+        fn plain_location() -> SourceLocation {
+            SourceLocation::new("https://origin.example.com").expect("should accept the address")
+        }
+
         #[test]
         fn origin_path_and_query_without_the_new_settings_is_the_reader_s_own() {
-            let publisher = Publisher::default();
+            let location = plain_location();
             for request in [
                 "/",
                 "/page",
@@ -25182,7 +25415,7 @@ mod tests {
             ] {
                 let uri: Uri = request.parse().expect("should parse reader path");
                 for origin_path in ["", "/"] {
-                    let built = publisher_origin_path_and_query(&publisher, origin_path, &uri);
+                    let built = publisher_origin_path_and_query(&location, origin_path, &uri);
                     assert!(
                         matches!(built, Cow::Borrowed(_)),
                         "should reuse the reader's own path for `{request}`"
@@ -25200,7 +25433,7 @@ mod tests {
         #[tokio::test]
         async fn origin_path_is_kept_and_joined_with_one_slash() {
             let mut settings = create_test_settings();
-            settings.publisher.origin_url = STORAGE_URL.to_owned();
+            edit_origin(&mut settings, |origin| origin.url = STORAGE_URL.to_owned());
 
             let sent = origin_uris(
                 &settings,
@@ -25227,7 +25460,7 @@ mod tests {
 
         #[test]
         fn origin_path_join_has_one_slash_whichever_side_carries_one() {
-            let publisher = Publisher::default();
+            let location = plain_location();
             for (origin_path, request, expected) in [
                 ("/bucket/site", "/page", "/bucket/site/page"),
                 ("/bucket/site/", "/page", "/bucket/site/page"),
@@ -25240,7 +25473,7 @@ mod tests {
             ] {
                 let uri: Uri = request.parse().expect("should parse reader path");
                 assert_eq!(
-                    publisher_origin_path_and_query(&publisher, origin_path, &uri),
+                    publisher_origin_path_and_query(&location, origin_path, &uri),
                     expected,
                     "should join `{origin_path}` and `{request}` with one slash"
                 );
@@ -25249,10 +25482,7 @@ mod tests {
 
         #[test]
         fn directory_index_is_added_only_to_a_path_ending_in_a_slash() {
-            let publisher = Publisher {
-                directory_index: Some("index.html".to_owned()),
-                ..Publisher::default()
-            };
+            let location = plain_location().with_directory_index(Some("index.html".to_owned()));
             for (origin_path, request, expected) in [
                 ("", "/", "/index.html"),
                 ("", "/news/", "/news/index.html"),
@@ -25266,7 +25496,7 @@ mod tests {
             ] {
                 let uri: Uri = request.parse().expect("should parse reader path");
                 assert_eq!(
-                    publisher_origin_path_and_query(&publisher, origin_path, &uri),
+                    publisher_origin_path_and_query(&location, origin_path, &uri),
                     expected,
                     "should give `{request}` under `{origin_path}` the expected origin path"
                 );
@@ -25276,7 +25506,9 @@ mod tests {
         #[tokio::test]
         async fn directory_index_changes_the_origin_address_and_not_the_reader_s() {
             let mut settings = create_test_settings();
-            settings.publisher.directory_index = Some("index.html".to_owned());
+            edit_origin(&mut settings, |origin| {
+                origin.directory_index = Some("index.html".to_owned())
+            });
 
             let sent = origin_uris(
                 &settings,
@@ -25324,9 +25556,13 @@ mod tests {
         #[tokio::test]
         async fn signed_origin_request_carries_none_of_the_reader_s_private_headers() {
             let mut settings = create_test_settings();
-            settings.publisher.origin_url = STORAGE_URL.to_owned();
-            settings.publisher.directory_index = Some("index.html".to_owned());
-            settings.publisher.origin_auth = Some(signing_auth(None));
+            edit_origin(&mut settings, |origin| origin.url = STORAGE_URL.to_owned());
+            edit_origin(&mut settings, |origin| {
+                origin.directory_index = Some("index.html".to_owned())
+            });
+            edit_origin(&mut settings, |origin| {
+                origin.auth = Some(signing_auth(None))
+            });
             let stub = stub_with_responses(1);
             let services = services_for(&stub);
 
@@ -25414,8 +25650,10 @@ mod tests {
         #[tokio::test]
         async fn signed_head_request_is_signed_as_a_head() {
             let mut settings = create_test_settings();
-            settings.publisher.origin_url = STORAGE_URL.to_owned();
-            settings.publisher.origin_auth = Some(signing_auth(None));
+            edit_origin(&mut settings, |origin| origin.url = STORAGE_URL.to_owned());
+            edit_origin(&mut settings, |origin| {
+                origin.auth = Some(signing_auth(None))
+            });
             let stub = stub_with_responses(1);
             let services = services_for(&stub);
 
@@ -25433,8 +25671,10 @@ mod tests {
         #[tokio::test]
         async fn signed_origin_strips_the_query_when_origin_auth_says_so() {
             let mut settings = create_test_settings();
-            settings.publisher.origin_url = STORAGE_URL.to_owned();
-            settings.publisher.origin_auth = Some(signing_auth(Some(OriginQueryPolicy::Strip)));
+            edit_origin(&mut settings, |origin| origin.url = STORAGE_URL.to_owned());
+            edit_origin(&mut settings, |origin| {
+                origin.auth = Some(signing_auth(Some(OriginQueryPolicy::Strip)))
+            });
             let stub = stub_with_responses(1);
             let services = services_for(&stub);
 
@@ -25457,7 +25697,9 @@ mod tests {
         #[tokio::test]
         async fn signed_origin_refuses_a_method_that_is_not_a_read() {
             let mut settings = create_test_settings();
-            settings.publisher.origin_auth = Some(signing_auth(None));
+            edit_origin(&mut settings, |origin| {
+                origin.auth = Some(signing_auth(None))
+            });
             for method in [Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS] {
                 let stub = stub_with_responses(1);
                 let services = services_for(&stub);
@@ -25538,7 +25780,7 @@ mod tests {
         #[tokio::test]
         async fn origin_path_refuses_a_reader_path_that_climbs_out_of_it() {
             let mut settings = create_test_settings();
-            settings.publisher.origin_url = STORAGE_URL.to_owned();
+            edit_origin(&mut settings, |origin| origin.url = STORAGE_URL.to_owned());
             for path in [
                 "/../other-site/page",
                 "/news/../../other-site/page",
@@ -25619,7 +25861,7 @@ mod tests {
 
         fn settings_with_origin(origin_url: &str) -> Settings {
             let mut settings = create_test_settings();
-            settings.publisher.origin_url = origin_url.to_owned();
+            edit_origin(&mut settings, |origin| origin.url = origin_url.to_owned());
             settings
         }
 
@@ -25815,7 +26057,9 @@ mod tests {
         #[tokio::test]
         async fn under_a_host_override_the_host_of_origin_url_is_the_origin_s_name() {
             let mut settings = settings_with_origin(ORIGIN_URL);
-            settings.publisher.origin_host_header_override = Some("www.example.com".to_owned());
+            edit_origin(&mut settings, |origin| {
+                origin.host_header = Some("www.example.com".to_owned())
+            });
             // (the origin's `Location`, what the reader receives)
             let cases = [
                 (

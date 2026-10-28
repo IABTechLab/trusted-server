@@ -58,10 +58,15 @@ assume_single_jurisdiction = true
     };
     Settings::from_toml(&format!(
         r#"
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.test-publisher.example.com"
+
             [publisher]
             domain = "test-publisher.example.com"
             cookie_domain = ".test-publisher.example.com"
-            origin_url = "https://origin.test-publisher.example.com"
             proxy_secret = "seam-probe-test-proxy-secret"
 
             [ec]
@@ -958,10 +963,15 @@ fn deploy_validation_accepts_a_modules_ad_server_only_with_its_builder() {
 fn settings_selecting_module(extra: &str) -> Settings {
     Settings::from_toml(&format!(
         r#"
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.test-publisher.example.com"
+
             [publisher]
             domain = "test-publisher.example.com"
             cookie_domain = ".test-publisher.example.com"
-            origin_url = "https://origin.test-publisher.example.com"
             proxy_secret = "seam-probe-test-proxy-secret"
 
             [geo]

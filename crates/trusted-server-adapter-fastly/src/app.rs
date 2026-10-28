@@ -139,7 +139,7 @@ use trusted_server_core::publisher::{
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
-use trusted_server_core::settings::{ProxyAssetRoute, Settings};
+use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::{
     DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store_with,
 };
@@ -1148,10 +1148,10 @@ async fn dispatch_fallback(
         // before the publisher fallback. Asset responses skip EC finalization
         // (no EcFinalizeState attached), matching legacy's `should_finalize_ec = false`.
         let matched_asset_route = matches!(method, Method::GET | Method::HEAD)
-            .then(|| state.settings.asset_route_for_path(&path))
+            .then(|| state.settings.asset_route_index_for_path(&path))
             .flatten();
-        if let Some(asset_route) = matched_asset_route {
-            return dispatch_asset_fallback(state, services, req, asset_route, &effects).await;
+        if let Some(index) = matched_asset_route {
+            return dispatch_asset_fallback(state, services, req, index, &effects).await;
         }
 
         // Generate an EC ID if needed — mirrors the legacy catch-all arm.
@@ -1312,14 +1312,22 @@ async fn dispatch_asset_fallback(
     state: &AppState,
     services: &RuntimeServices,
     req: Request,
-    asset_route: &ProxyAssetRoute,
+    index: usize,
     effects: &RequestFilterEffects,
 ) -> Response {
     log::info!("No explicit route matched; proxying via configured asset route");
 
     let method = req.method().clone();
+    let asset_route = &state.settings.proxy.asset_routes[index];
+    let answer = match state.registry.route_source(&state.settings, index) {
+        Ok(source) => {
+            handle_asset_proxy_request(&state.settings, services, req, asset_route, source.as_ref())
+                .await
+        }
+        Err(report) => Err(report),
+    };
 
-    match handle_asset_proxy_request(&state.settings, services, req, asset_route).await {
+    match answer {
         Ok(asset_response) => {
             let cache_policy = asset_response.cache_policy();
             let (mut response, stream_body) = asset_response.into_response_and_body();
@@ -1787,10 +1795,15 @@ mod tests {
     fn test_settings() -> Settings {
         Settings::from_toml(
             r#"
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.test-publisher.com"
+
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
-            origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
             [proxy]
@@ -2250,10 +2263,15 @@ mod tests {
         // answered here.
         let settings = Settings::from_toml(
             r#"
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.test-publisher.com"
+
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
-            origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
@@ -2936,10 +2954,15 @@ mod tests {
         // ran instead of the publisher fallback (which always attaches one).
         let settings = Settings::from_toml(
             r#"
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.test-publisher.com"
+
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
-            origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
@@ -2958,7 +2981,8 @@ mod tests {
 
             [[proxy.asset_routes]]
             prefix = "/.image/"
-            origin_url = "https://assets.example.com"
+            source.module = "origin"
+            source.origin.url = "https://assets.example.com"
             "#,
         )
         .expect("should parse asset-route settings")
@@ -3071,10 +3095,15 @@ mod tests {
         // pipe straight to the client via `stream_to_client`.
         let settings = Settings::from_toml(
             r#"
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.test-publisher.com"
+
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
-            origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
@@ -3093,7 +3122,8 @@ mod tests {
 
             [[proxy.asset_routes]]
             prefix = "/.images/"
-            origin_url = "https://assets.example.com"
+            source.module = "origin"
+            source.origin.url = "https://assets.example.com"
             "#,
         )
         .expect("should parse asset-route settings")
@@ -3102,18 +3132,14 @@ mod tests {
 
         let services = streaming_runtime_services();
         let req = empty_request(Method::GET, "/.images/logo.png");
-        let asset_route = state
+        let index = state
             .settings
-            .asset_route_for_path("/.images/logo.png")
+            .asset_route_index_for_path("/.images/logo.png")
             .expect("should match the configured asset route");
         let effects = RequestFilterEffects::default();
 
         let response = block_on(super::dispatch_asset_fallback(
-            &state,
-            &services,
-            req,
-            asset_route,
-            &effects,
+            &state, &services, req, index, &effects,
         ));
 
         assert_eq!(
@@ -3171,10 +3197,15 @@ mod tests {
 
         let settings = Settings::from_toml(
             r#"
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.test-publisher.com"
+
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
-            origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]

@@ -77,7 +77,7 @@ fn run_ts(project: &TempDir, args: &[&str], overrides: &[(&str, &str)]) -> Outpu
             ".publisher.example.com",
         )
         .env(
-            "TRUSTED_SERVER__PUBLISHER__ORIGIN_URL",
+            "TRUSTED_SERVER__SOURCE__ORIGIN__URL",
             "https://upstream.example.com",
         )
         .envs(overrides.iter().copied())

@@ -222,7 +222,7 @@ push_blob() { # push_blob <publisher domain> <origin port> [--key <key>]
     cd "$WORK"
     TRUSTED_SERVER__PUBLISHER__DOMAIN="$domain" \
       TRUSTED_SERVER__PUBLISHER__COOKIE_DOMAIN=".$domain" \
-      TRUSTED_SERVER__PUBLISHER__ORIGIN_URL="http://127.0.0.1:$port" \
+      TRUSTED_SERVER__SOURCE__ORIGIN__URL="http://127.0.0.1:$port" \
       "$TS" config push --adapter fastly --local \
       --manifest "$WORK/edgezero.toml" --app-config "$WORK/app.toml" \
       --permissions "$POLICY_FILE" --no-diff --yes "$@" >/dev/null

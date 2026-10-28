@@ -27,16 +27,22 @@ setting = "value"
 
 ### Minimal Configuration
 
-Create `trusted-server.toml` in your project root. Generate both secret values
-first with `openssl rand -base64 32`. The placeholders below are intentionally
-rejected until replaced.
+Create `trusted-server.toml` in your project root. Two sections are required,
+`[publisher]` for the site and [`[source]`](#source) for where its pages come
+from. Generate both secret values first with `openssl rand -base64 32`. The
+placeholders below are intentionally rejected until replaced.
 
 ```toml
 [publisher]
 domain = "publisher.com"
 cookie_domain = ".publisher.com"
-origin_url = "https://origin.publisher.com"
 proxy_secret = "publisher_proxy_secret"
+
+[source]
+module = "origin"
+
+[source.origin]
+url = "https://origin.publisher.com"
 
 [ec]
 module = "hmac"
@@ -61,7 +67,7 @@ read by the deployed application at request time.
 ```bash
 # Format: TRUSTED_SERVER__SECTION__FIELD
 export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
-export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
+export TRUSTED_SERVER__SOURCE__ORIGIN__URL=https://origin.publisher.com
 # Secret overrides, when needed, are key names, not secret values.
 export TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=publisher_proxy_secret
 export TRUSTED_SERVER__EC__MODULE=hmac
@@ -86,13 +92,14 @@ publisher, trusted-client-IP, EC, Tinybird, DataDome, and S3 fields:
 - `analytics.tinybird.auction_token_secret`, when `[analytics] module = "tinybird"`
 - `bot-protection.datadome.server_side_key_secret_name`, when protection is enabled
 - `bot-protection.datadome.protection_test_bypass.credential_secret_name`, when the bypass is enabled
-- `proxy.asset_routes[*].auth.access_key_id`, `secret_access_key`, and optional `session_token`
-- `publisher.origin_auth.access_key_id`, `secret_access_key`, and optional `session_token`, when `[publisher]` sets `origin_auth`
+- `proxy.asset_routes[*].source.origin.auth.access_key_id`, `secret_access_key`, and optional `session_token`, when a route's `[proxy.asset_routes.source.origin]` sets `auth`
+- `source.origin.auth.access_key_id`, `secret_access_key`, and optional `session_token`, when `[source.origin]` sets `auth`
 
 Their values belong in the logical `trusted_server_secrets` store and are
 resolved only while an instance builds runtime settings. An adapter can map the
 logical ID to a different physical name. For example, Fastly commonly maps
-`trusted_server_secrets` to physical store `ts_secrets`.
+`trusted_server_secrets` to physical store `ts_secrets`. A blank
+`session_token` in either signing table is read as no token.
 
 Two accepted secret-shaped fields are deliberately different:
 
@@ -222,7 +229,7 @@ fail and the service will return its startup-error response.
 
 ## Key Sections
 
-12 of these sections select what runs, with `module` where one runs and
+13 of these sections select what runs, with `module` where one runs and
 `modules` where several run, and each gives every selected name its own
 `[<type>.<name>]` settings table, as
 [Configuration Rules](/guide/configuration-rules) describes.
@@ -248,13 +255,14 @@ fail and the service will return its startup-error response.
 | `[permissions]`                                                                                                   | nothing               | The publisher's permission policy file, by name                                               |
 | `[prefix]`                                                                                                        | one module            | Which module names the browser's cookies and the shared store keys                            |
 | `[proxy]`                                                                                                         | several modules       | Proxy allowlist, TLS policy, asset routes, and the first-party script proxy module            |
-| `[publisher]`                                                                                                     | nothing               | Publisher domain, origin, and proxy signing key                                               |
+| `[publisher]`                                                                                                     | nothing               | Publisher domain, cookie domain, and proxy signing key                                        |
 | `[request_signing]`                                                                                               | nothing               | Outbound Ed25519 request signing                                                              |
 | `[response_headers]`                                                                                              | nothing               | Headers added to Trusted Server responses                                                     |
 | `[rewrite]`                                                                                                       | nothing               | First-party URL rewrite exclusions                                                            |
 | `[robots-txt]`                                                                                                    | several modules       | What `/robots.txt` answers, and `X-Robots-Tag` on its responses when every crawler is refused |
 | `[[serve]]`                                                                                                       | nothing               | Which page changes run on each reader's copy of a page, and in what order                     |
 | `[shared]`                                                                                                        | nothing               | What one vendor's modules share, a table per vendor, which runs that vendor's builder         |
+| `[source]`                                                                                                        | one module            | Where the publisher's pages come from                                                         |
 | `[tester_cookie]`                                                                                                 | nothing               | Optional tester-cookie endpoints                                                              |
 | `[trusted_client_ip]`                                                                                             | nothing               | Authenticated front-door client-IP forwarding                                                 |
 | `[<type>]`, such as `[cmp]`, `[tag]`, `[ad-tag]`, `[bot-protection]`, `[identity]`, `[audience]` or `[framework]` | one module or several | The section of a module type, selecting the modules of that type that run                     |
@@ -268,8 +276,13 @@ deployment.
 [publisher]
 domain = "publisher.com"
 cookie_domain = ".publisher.com"
-origin_url = "https://origin.publisher.com"
 proxy_secret = "publisher_proxy_secret"
+
+[source]
+module = "origin"
+
+[source.origin]
+url = "https://origin.publisher.com"
 
 [ec]
 module = "hmac"
@@ -357,20 +370,19 @@ this way.
 
 ## Publisher Configuration
 
-Core publisher settings for domain, origin, and proxy configuration.
+Core publisher settings for the domain, cookies, and proxy signing, and the
+source the publisher's pages come from.
 
 ### `[publisher]`
 
-| Field                         | Type    | Required | Description                                                                 |
-| ----------------------------- | ------- | -------- | --------------------------------------------------------------------------- |
-| `domain`                      | String  | Yes      | Publisher's apex domain name                                                |
-| `cookie_domain`               | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                      |
-| `origin_url`                  | String  | Yes      | Publisher origin URL, whose path (if any) comes before the request path     |
-| `origin_host_header_override` | String  | No       | Outbound Host header to send while connecting to `origin_url`               |
-| `proxy_secret`                | String  | Yes      | Secret-store key name for the proxy URL secret                              |
-| `max_buffered_body_bytes`     | Integer | No       | Buffered-body cap / Fastly stream raw+decoded byte ceiling (default 16 MiB) |
-| `origin_auth`                 | Table   | No       | Signs every origin request with the table an asset route's `auth` takes     |
-| `directory_index`             | String  | No       | File name added to an origin request path that ends in `/`                  |
+| Field                     | Type    | Required | Description                                                                 |
+| ------------------------- | ------- | -------- | --------------------------------------------------------------------------- |
+| `domain`                  | String  | Yes      | Publisher's apex domain name                                                |
+| `cookie_domain`           | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                      |
+| `proxy_secret`            | String  | Yes      | Secret-store key name for the proxy URL secret                              |
+| `max_buffered_body_bytes` | Integer | No       | Buffered-body cap / Fastly stream raw+decoded byte ceiling (default 16 MiB) |
+
+Where the publisher's pages come from is set in [`[source]`](#source).
 
 > **Note:** EC cookies (`ts-ec`) derive their domain automatically as `.{domain}` and
 > do not use `cookie_domain`. The `cookie_domain` field is used by other cookie helpers.
@@ -381,9 +393,6 @@ Core publisher settings for domain, origin, and proxy configuration.
 [publisher]
 domain = "publisher.com"
 cookie_domain = ".publisher.com"
-origin_url = "https://origin.publisher.com"
-# Optional: connect to origin_url but send this outbound Host header.
-# origin_host_header_override = "www.publisher.com"
 proxy_secret = "publisher_proxy_secret"
 ```
 
@@ -392,8 +401,6 @@ proxy_secret = "publisher_proxy_secret"
 ```bash
 TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
 TRUSTED_SERVER__PUBLISHER__COOKIE_DOMAIN=.publisher.com
-TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
-TRUSTED_SERVER__PUBLISHER__ORIGIN_HOST_HEADER_OVERRIDE=www.publisher.com
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=publisher_proxy_secret
 TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
 ```
@@ -431,66 +438,6 @@ TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
 - `publisher.com` - Exact domain only
 
 **Best Practice**: Use leading dot (`.publisher.com`) for subdomain sharing.
-
-#### `origin_url`
-
-**Purpose**: Backend origin server URL for publisher content.
-
-**Usage**:
-
-- Fallback proxy target for non-integration requests
-- HTML processing rewrites origin URLs to request host
-- Base for relative URL resolution
-
-**Format**: Full URL with protocol
-
-- ✅ `https://origin.publisher.com`
-- ✅ `https://origin.publisher.com:8080`
-- ✅ `http://192.168.1.1:9000`
-- ✅ `https://storage.publisher.com/bucket/site` (a folder of object storage)
-- ❌ `origin.publisher.com` (missing protocol)
-- ❌ `https://origin.publisher.com/` (trailing slash)
-
-**Port Handling**: Includes port if non-standard (not 80/443).
-
-**Path Handling**: A path in `origin_url` is kept, and the request path is
-added after it with exactly one `/` between them, so a request for `/news/page`
-with the folder above is sent to `/bucket/site/news/page`. The request query is
-kept. A query in `origin_url` itself is ignored. With no path, the request path
-is sent as it arrived, as before. When `origin_url` has a path, a request path
-with a `.` or `..` segment, in any percent-encoded spelling, is refused with
-`400` so no request reaches outside the folder.
-
-**Response headers**: When `origin_url` has a path, a URL in a response
-header that names the origin is mapped to the serving host only when it is in
-that folder, and it loses the folder. With the folder above, `Location:
-https://storage.publisher.com/bucket/site/news/` reaches a reader of
-`www.publisher.com` as `https://www.publisher.com/news/`, and a URL outside
-the folder is left as the origin wrote it (see Origin URLs in proxied response
-headers). Where a request addressing hook removes a path prefix, the reader is
-sent to an address without the prefix, which a Fastly service whose `__KEY`
-selector carries `{host}` answers `421` if every selector value misses (see
-One blob for each path).
-
-#### `origin_host_header_override`
-
-**Purpose**: Optional Host header to send to the publisher origin while still
-connecting to the host in `origin_url`.
-
-**Usage**:
-
-- Connects, uses SNI, and checks certificates against `origin_url`
-- Sends the configured value as the outbound HTTP `Host` header
-- Useful when the origin endpoint expects a canonical publisher hostname
-
-**Format**: Hostname with optional port, without protocol, path, query, or fragment
-
-- ✅ `www.publisher.com`
-- ✅ `www.publisher.com:8443`
-- ❌ `https://www.publisher.com`
-- ❌ `www.publisher.com/path`
-
-**Default**: When omitted, Trusted Server sends the host from `origin_url`.
 
 #### `proxy_secret`
 
@@ -556,25 +503,167 @@ a zero-byte cap fails every non-empty publisher response.
 TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
 ```
 
-#### `origin_auth`
+### `[source]`
+
+`[source]` is required. It says where the publisher's pages come from. A
+source answers, for each request, where that request's content comes from.
+`module` names the source, and the table beneath it holds the source's
+settings, as in every section that selects a module. Core supplies one source,
+`origin`, an HTTP origin. A module a build links can offer another source under
+its own name, selected the same way, with `module = "<name>"` and its settings
+in `[source.<name>]`. Each asset route names its own source in the same shape,
+in [`[proxy.asset_routes.source.origin]`](#proxy-asset-routes-source-origin).
+
+The `origin` source takes these settings in `[source.origin]`:
+
+| Field             | Type   | Required | Description                                                               |
+| ----------------- | ------ | -------- | ------------------------------------------------------------------------- |
+| `url`             | String | Yes      | Origin address, whose path (if any) names the folder requests are sent to |
+| `host_header`     | String | No       | Outbound Host header, where it is not the host of `url`                   |
+| `directory_index` | String | No       | File name added to an origin request path that ends in `/`                |
+| `auth`            | Table  | No       | Signs every origin request, in the same table an asset route's source has |
+
+A configuration with no `[source]` is refused with `[source] names no source`.
+A configuration that writes one of the fields below is refused, and the message
+names the setting to write instead.
+
+| Refused field                             | Write instead                             |
+| ----------------------------------------- | ----------------------------------------- |
+| `[publisher] origin_url`                  | `[source.origin] url`                     |
+| `[publisher] origin_host_header_override` | `[source.origin] host_header`             |
+| `[publisher] origin_auth`                 | `[source.origin] auth`                    |
+| `[publisher] directory_index`             | `[source.origin] directory_index`         |
+| `[[proxy.asset_routes]] origin_url`       | `[proxy.asset_routes.source.origin] url`  |
+| `[[proxy.asset_routes]] auth`             | `[proxy.asset_routes.source.origin] auth` |
+
+**Example**:
+
+```toml
+[source]
+module = "origin"
+
+[source.origin]
+url = "https://origin.publisher.com"
+# Optional: connect to url but send this outbound Host header.
+# host_header = "www.publisher.com"
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__SOURCE__ORIGIN__URL=https://origin.publisher.com
+TRUSTED_SERVER__SOURCE__ORIGIN__HOST_HEADER=www.publisher.com
+```
+
+#### `url`
+
+**Purpose**: Address of the origin server for publisher content.
+
+**Usage**:
+
+- Fallback proxy target for non-integration requests
+- HTML processing rewrites origin URLs to request host
+- Base for relative URL resolution
+
+**Format**: An absolute `http` or `https` address with a host. It carries no
+user name or password, no query, no fragment, and no trailing `/`.
+
+- ✅ `https://origin.publisher.com`
+- ✅ `https://origin.publisher.com:8080`
+- ✅ `http://192.168.1.1:9000`
+- ✅ `https://storage.publisher.com/bucket/site` (a folder of object storage)
+- ❌ `origin.publisher.com` (missing protocol)
+- ❌ `https://origin.publisher.com/` (trailing slash)
+- ❌ `https://origin.publisher.com?site=1` (query)
+- ❌ `https://user:pass@origin.publisher.com` (user name and password)
+
+**Port Handling**: Includes port if non-standard (not 80/443).
+
+**Path Handling**: A path in `url` names a folder, and the request path is
+added after it with exactly one `/` between them, so a request for `/news/page`
+with the folder above is sent to `/bucket/site/news/page`. The request query is
+kept. With no path, the request path is sent as it arrived. When `url` has a
+path, a request path with a `.` or `..` segment, in any percent-encoded
+spelling, is refused with `400` so no request reaches outside the folder.
+
+**Response headers**: When `url` has a path, a URL in a response header that
+names the origin is mapped to the serving host only when it is in that folder,
+and it loses the folder. With the folder above, `Location:
+https://storage.publisher.com/bucket/site/news/` reaches a reader of
+`www.publisher.com` as `https://www.publisher.com/news/`, and a URL outside
+the folder is left as the origin wrote it (see Origin URLs in proxied response
+headers). Where a request addressing hook removes a path prefix, the reader is
+sent to an address without the prefix, which a Fastly service whose `__KEY`
+selector carries `{host}` answers `421` if every selector value misses (see
+One blob for each path).
+
+#### `host_header`
+
+**Purpose**: Optional outbound `Host` header, where it is not the host of
+`url`. Trusted Server still connects to the host in `url`.
+
+**Usage**:
+
+- Connects, uses SNI, and checks certificates against the host in `url`
+- Sends the configured value as the outbound HTTP `Host` header
+- Useful when the origin endpoint expects a canonical publisher hostname
+
+**Format**: Hostname with optional port, without protocol, path, query, or fragment
+
+- ✅ `www.publisher.com`
+- ✅ `www.publisher.com:8443`
+- ❌ `https://www.publisher.com`
+- ❌ `www.publisher.com/path`
+
+**Default**: When omitted, Trusted Server sends the host from `url`.
+
+#### `directory_index`
+
+**Purpose**: A file name added to the origin request path when the request
+path ends in `/`, for an origin such as object storage that does not answer a
+folder with its index file.
+
+**Usage**:
+
+- `/` is sent to the origin as `/index.html`, and `/news/` as
+  `/news/index.html`.
+- `/news` and `/style.css` are sent as they are.
+- Only the origin request changes. The reader's address, and the path the page
+  pipeline and its middleware see, are unchanged.
+
+**Format**: One file name, made of letters, digits and `-._~!$&'()*+,;=:@`,
+with no `/`, `%`, space, query or fragment, and neither `.` nor `..`. Anything
+else is refused at startup naming `[source.origin] directory_index`.
+
+**Default**: Unset, and every path is sent as it arrived.
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__SOURCE__ORIGIN__DIRECTORY_INDEX=index.html
+```
+
+#### `auth`
 
 **Purpose**: Sign every publisher origin request, for an origin such as
 private object storage that answers only signed reads. Pages still pass through
 the page pipeline, which an [asset route](#proxy-asset-routes) skips.
 
 **Format**: The same table as
-[`[proxy.asset_routes.auth]`](#proxy-asset-routes-auth), with the same fields,
-defaults and secret-store key references, signed by the same signer.
+[`[proxy.asset_routes.source.origin.auth]`](#proxy-asset-routes-source-origin-auth),
+with the same fields, defaults and secret-store key references, signed by the
+same signer. Write `[source.origin.auth]` after the other `[source.origin]`
+keys, because a table header ends the keys of the table before it.
 
 ```toml
-[publisher]
-domain = "publisher.com"
-cookie_domain = ".publisher.com"
-origin_url = "https://storage.publisher.com/bucket/site"
-proxy_secret = "publisher_proxy_secret"
+[source]
+module = "origin"
+
+[source.origin]
+url = "https://storage.publisher.com/bucket/site"
 directory_index = "index.html"
 
-[publisher.origin_auth]
+[source.origin.auth]
 type = "s3_sigv4"
 region = "example-region-1"
 access_key_id = "publisher_origin_access_key_id"
@@ -594,38 +683,11 @@ secret_access_key = "publisher_origin_secret_access_key"
   the signing scheme's own header namespace.
 - `origin_query = "strip"` leaves the reader's query off the origin request.
   By default the query is kept.
-- `origin_url` must use `https`. A table the signer cannot use, such as an
-  empty or malformed `region`, is refused at startup naming
-  `publisher.origin_auth`.
+- `url` must use `https`. A table the signer cannot use, such as an empty or
+  malformed `region`, is refused at startup naming `source.origin.auth`.
 
 **Default**: Unset, and origin requests are sent unsigned with the reader's
-headers, as before.
-
-#### `directory_index`
-
-**Purpose**: A file name added to the origin request path when the request
-path ends in `/`, for an origin such as object storage that does not answer a
-folder with its index file.
-
-**Usage**:
-
-- `/` is sent to the origin as `/index.html`, and `/news/` as
-  `/news/index.html`.
-- `/news` and `/style.css` are sent as they are.
-- Only the origin request changes. The reader's address, and the path the page
-  pipeline and its middleware see, are unchanged.
-
-**Format**: One file name, made of letters, digits and `-._~!$&'()*+,;=:@`,
-with no `/`, `%`, space, query or fragment, and neither `.` nor `..`. Anything
-else is refused at startup naming `publisher.directory_index`.
-
-**Default**: Unset, and every path is sent as it arrived.
-
-**Environment Override**:
-
-```bash
-TRUSTED_SERVER__PUBLISHER__DIRECTORY_INDEX=index.html
-```
+headers.
 
 ## Trusted Client IP Configuration
 
@@ -788,19 +850,19 @@ defaults.
 
 Each entry of `show` and `hide` is a path pattern, being keys joined by `.`,
 with `[]` for every element of a list and `[N]` for one, such as
-`publisher.origin_url`, `proxy.asset_routes[].origin_url` or
+`source.origin.url`, `proxy.asset_routes[].source.origin.url` or
 `proxy.asset_routes[0].prefix`. A pattern names the values at exactly its own
 depth.
 
 A masked value shows as `XXXX`, and the page lists every masked path.
 
-| What                                                                      | Masked     | Can `show` reveal it             |
-| ------------------------------------------------------------------------- | ---------- | -------------------------------- |
-| A secret, meaning a value the settings loader fills from the secret store | Always     | No                               |
-| `publisher.origin_url` and `publisher.origin_host_header_override`        | By default | Yes                              |
-| `proxy.asset_routes[].origin_url`                                         | By default | Yes                              |
-| `ec.ec_store` and `auction.creative_store`                                | By default | Yes                              |
-| Anything `hide` names                                                     | When named | It is the publisher's own choice |
+| What                                                                                          | Masked     | Can `show` reveal it             |
+| --------------------------------------------------------------------------------------------- | ---------- | -------------------------------- |
+| A secret, meaning a value the settings loader fills from the secret store                     | Always     | No                               |
+| `source.origin.url` and `source.origin.host_header`                                           | By default | Yes                              |
+| `proxy.asset_routes[].source.origin.url` and `proxy.asset_routes[].source.origin.host_header` | By default | Yes                              |
+| `ec.ec_store` and `auction.creative_store`                                                    | By default | Yes                              |
+| Anything `hide` names                                                                         | When named | It is the publisher's own choice |
 
 A pattern that would not be honored as written refuses the configuration,
 both when a deployment is validated and when the settings load. That is a
@@ -818,7 +880,7 @@ when the pushed settings load.
 
 ```toml
 [inspect]
-show = ["publisher.origin_url"]
+show = ["source.origin.url"]
 hide = ["response_headers"]
 ```
 
@@ -1233,9 +1295,9 @@ Location: https://www.example.com/landing.html
 Content-Security-Policy: img-src https://origin.example.com https://www.example.com data:
 ```
 
-When `publisher.origin_url` has a path, such as a folder of object storage,
+When `source.origin.url` has a path, such as a folder of object storage,
 only a URL in that folder is mapped, and it loses the folder. With
-`origin_url = "https://storage.example.com/bucket/site"`,
+`url = "https://storage.example.com/bucket/site"`,
 `https://storage.example.com/bucket/site/news/` becomes
 `https://www.example.com/news/`, and `https://storage.example.com/bucket/other/`
 is unchanged, because no address on the serving host leads there. A CSP source
@@ -1246,11 +1308,11 @@ Two exceptions prevent a redirect loop. Rewriting either target would send the
 browser back to the same URL, and the origin would redirect again:
 
 - When the origin redirects to the URL being requested but under a different
-  scheme from `publisher.origin_url` (for example, an `http://` origin forcing
+  scheme from `source.origin.url` (for example, an `http://` origin forcing
   HTTPS), the `Location` or `Refresh` target is left unchanged.
 - When the origin answers a `GET` or `HEAD` with a `Location` to the URL being
   requested, the target is left unchanged if the response sets no cookie, or
-  whatever cookies it sets when `publisher.origin_host_header_override` sends a
+  whatever cookies it sets when `source.origin.host_header` sends a
   different `Host`. The origin is redirecting because of something Trusted
   Server sends unchanged on every retry, such as that `Host`.
 
@@ -1654,21 +1716,28 @@ Set this to `false` only for local development with self-signed certificates.
 
 Asset routes proxy selected first-party paths to an alternate asset origin without requiring signed `/first-party/proxy` URLs.
 
-| Field             | Type   | Required | Description                                     |
-| ----------------- | ------ | -------- | ----------------------------------------------- |
-| `prefix`          | String | Yes      | Request path prefix to match                    |
-| `origin_url`      | String | Yes      | Absolute `http` or `https` origin URL           |
-| `path_pattern`    | String | No       | Regex matched against the incoming request path |
-| `target_path`     | String | No       | Replacement path used with `path_pattern`       |
-| `auth`            | Table  | No       | Optional origin authentication                  |
-| `image_optimizer` | Table  | No       | Optional route-level Image Optimizer settings   |
+| Field             | Type   | Required | Description                                                       |
+| ----------------- | ------ | -------- | ----------------------------------------------------------------- |
+| `prefix`          | String | Yes      | Request path prefix to match                                      |
+| `source`          | Table  | Yes      | Where the route's content comes from, in the shape `[source]` has |
+| `path_pattern`    | String | No       | Regex matched against the incoming request path                   |
+| `target_path`     | String | No       | Replacement path used with `path_pattern`                         |
+| `image_optimizer` | Table  | No       | Optional route-level Image Optimizer settings                     |
+
+Write `prefix`, `path_pattern` and `target_path` before the route's source
+tables, because a table header ends the route's own keys.
 
 **Example**:
 
 ```toml
 [[proxy.asset_routes]]
 prefix = "/assets/"
-origin_url = "https://assets.example.com"
+
+[proxy.asset_routes.source]
+module = "origin"
+
+[proxy.asset_routes.source.origin]
+url = "https://assets.example.com"
 ```
 
 **Path rewrite example**:
@@ -1676,9 +1745,14 @@ origin_url = "https://assets.example.com"
 ```toml
 [[proxy.asset_routes]]
 prefix = "/.image/"
-origin_url = "https://assets-cdn.example.com"
 path_pattern = "^/\\.image/(.*)/[^/]+\\.([^/.]+)$"
 target_path = "/image/upload/$1.$2"
+
+[proxy.asset_routes.source]
+module = "origin"
+
+[proxy.asset_routes.source.origin]
+url = "https://assets-cdn.example.com"
 ```
 
 **Behavior**:
@@ -1687,10 +1761,36 @@ target_path = "/image/upload/$1.$2"
 - Built-in and integration routes take precedence.
 - The longest matching asset-route prefix wins.
 - `path_pattern` and `target_path` must be configured together.
-- `origin_url` must not include userinfo, a path, a query string, or a fragment.
 - Unsafe origin response headers such as `Set-Cookie` are stripped before the response reaches the browser.
 
-### `[proxy.asset_routes.auth]`
+### `[proxy.asset_routes.source.origin]`
+
+A route selects its source the way [`[source]`](#source) does, with `module`
+in `[proxy.asset_routes.source]` and the source's settings in the table
+beneath. Core's `origin` source takes these settings:
+
+| Field             | Type   | Required | Description                                             |
+| ----------------- | ------ | -------- | ------------------------------------------------------- |
+| `url`             | String | Yes      | Absolute `http` or `https` origin address               |
+| `host_header`     | String | No       | Outbound Host header, where it is not the host of `url` |
+| `directory_index` | String | No       | File name added to a target path that ends in `/`       |
+| `auth`            | Table  | No       | Signs every request to the origin, see the table below  |
+
+- `url` must name a host, and must not carry a user name or password, a query,
+  a fragment, or a trailing `/`.
+- A path in `url` names a folder. The route's target path, after any
+  `path_pattern` and `target_path` rewrite, is added under that folder, so with
+  `url = "https://storage.example.com/bucket/site"` a request for
+  `/assets/app.js` is sent to
+  `https://storage.example.com/bucket/site/assets/app.js`.
+- When `url` names a folder, a target path with a `.` or `..` segment in any
+  spelling is answered `400`, so no request reaches outside the folder.
+- `directory_index` follows the same rules as the publisher's
+  [`directory_index`](#directory-index).
+- With `host_header`, Trusted Server still connects, uses SNI, and checks
+  certificates against the host in `url`.
+
+### `[proxy.asset_routes.source.origin.auth]`
 
 The first supported origin auth type is `s3_sigv4`.
 
@@ -1708,9 +1808,14 @@ The first supported origin auth type is `s3_sigv4`.
 ```toml
 [[proxy.asset_routes]]
 prefix = "/.image/"
-origin_url = "https://bucket.s3.us-east-1.amazonaws.com"
 
-[proxy.asset_routes.auth]
+[proxy.asset_routes.source]
+module = "origin"
+
+[proxy.asset_routes.source.origin]
+url = "https://bucket.s3.us-east-1.amazonaws.com"
+
+[proxy.asset_routes.source.origin.auth]
 type = "s3_sigv4"
 region = "us-east-1"
 origin_query = "strip"
@@ -1719,7 +1824,9 @@ secret_access_key = "s3_secret_access_key"
 # session_token = "s3_session_token"
 ```
 
-S3 auth uses header-based AWS SigV4 with `UNSIGNED-PAYLOAD`. It is scoped to read-only asset requests and expects `origin_url` to use the S3 host that AWS validates. Credential references resolve from `trusted_server_secrets` at startup, and request signing performs no secret-store reads.
+S3 auth uses header-based AWS SigV4 with `UNSIGNED-PAYLOAD`. It is scoped to read-only asset requests and expects `url` to use the S3 host that AWS validates. Credential references resolve from `trusted_server_secrets` at startup, and request signing performs no secret-store reads.
+
+Signing requires `url` to use `https`. A table the signer cannot use, such as an empty or malformed `region`, is refused at startup naming the route, as in `proxy.asset_routes /.image/ source.origin.auth`.
 
 Effective `origin_query` precedence is auth-level `origin_query`, then enabled Image Optimizer `origin_query`, then the route default.
 
@@ -3930,10 +4037,12 @@ from the file, and startup checks the rest and runs the first set again.
 
 ### Checked when the configuration is validated or pushed
 
-**Publisher**:
+**Publisher and source**:
 
-- All fields non-empty
-- `origin_url` is a valid URL
+- All `[publisher]` fields non-empty
+- `[source]` names exactly one source
+- `[source.origin] url` is an absolute `http` or `https` address with a host,
+  and carries no user name or password, query, fragment, or trailing `/`
 
 **EC Validation**:
 
@@ -4002,8 +4111,13 @@ Configuration error: [demand.pbs_main] endpoint must be HTTPS, or HTTP to 127.0.
 # trusted-server.dev.toml
 [publisher]
 domain = "localhost"
-origin_url = "http://localhost:3000"
 proxy_secret = "publisher_proxy_secret"
+
+[source]
+module = "origin"
+
+[source.origin]
+url = "http://localhost:3000"
 ```
 
 **Staging and production**:

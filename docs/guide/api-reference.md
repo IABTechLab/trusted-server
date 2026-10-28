@@ -114,13 +114,18 @@ Endpoint-specific CORS: `Access-Control-Allow-Origin: *`.
 
 ```json
 {
-  "masked": ["publisher.origin_url", "publisher.proxy_secret"],
+  "masked": ["publisher.proxy_secret", "source.origin.url"],
   "settings": {
     "publisher": {
       "cookie_domain": ".example.com",
       "domain": "example.com",
-      "origin_url": "XXXX",
       "proxy_secret": "XXXX"
+    },
+    "source": {
+      "module": "origin",
+      "origin": {
+        "url": "XXXX"
+      }
     }
   },
   "version": "0.1.0"

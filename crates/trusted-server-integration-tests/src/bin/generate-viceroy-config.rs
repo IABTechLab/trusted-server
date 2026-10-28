@@ -171,7 +171,11 @@ fn build_app_config_envelope(
     settings.permissions.sha256 = Some(policy_sha256(&policy.text));
     settings.permissions.text = Some(policy.text.clone());
     if let Some(origin_url) = origin_url {
-        settings.publisher.origin_url = origin_url.to_string();
+        let mut origin = settings.origin_source().ok_or_else(|| {
+            error_box("the app config should select the origin source".to_string())
+        })?;
+        origin.url = origin_url.to_string();
+        settings.set_origin_source(&origin);
     }
     // The fixture selects modules a stock build ships, so validation needs
     // the stock list as the adapters and the `ts` tool have it.
@@ -550,7 +554,11 @@ mod tests {
         );
 
         assert_eq!(
-            settings.publisher.origin_url, "http://127.0.0.1:9999",
+            settings
+                .origin_source()
+                .expect("should select the origin source")
+                .url,
+            "http://127.0.0.1:9999",
             "should apply origin override before envelope creation"
         );
     }

@@ -6,8 +6,8 @@
 # `trusted-server.toml`. Copy it (`ts config init`), fill in the required
 # values, and push it (`ts config push`) as an EdgeZero app-config blob.
 #
-# Only one section is REQUIRED for the server to start and pass validation,
-# which is [publisher] (domain + origin).
+# Two sections are REQUIRED for the server to start and pass validation,
+# being [publisher] (the domain) and [source] (where its pages come from).
 #
 # Edge Cookie identity is optional and stays off until an [ec] module is
 # selected, so no identity secret is needed to start. See the Edge Cookie
@@ -50,35 +50,46 @@
 
 
 # -----------------------------------------------------------------------------
-# REQUIRED - Publisher / origin
+# REQUIRED - Publisher
 # -----------------------------------------------------------------------------
 [publisher]
 # Public domain Trusted Server is fronting.
 domain = "example.com"
 # Cookie scope for first-party identity cookies (leading dot = include subdomains).
 cookie_domain = ".example.com"
-# Upstream origin to proxy publisher content from. No trailing slash. A path is
-# kept and the request path is added after it, so a site held in a folder of
-# object storage is "https://storage.example.com/bucket/site".
-origin_url = "https://origin.example.com"
 # Secret Store key for the HMAC secret used to sign first-party proxy URLs.
 proxy_secret = "publisher_proxy_secret"
-# Optional: override the outbound Host header sent to origin_url.
-# origin_host_header_override = "www.example.com"
 # Optional: max bytes buffered when a response is post-processed in full (HTML
 # rewriting/injection) instead of streamed. Default 16 MiB; larger responses
 # return 502. Raise for deployments serving very large publisher pages.
 # max_buffered_body_bytes = 16777216  # 16 MiB
+
+
+# -----------------------------------------------------------------------------
+# REQUIRED - Source of the publisher's pages
+# -----------------------------------------------------------------------------
+# `module` names the source and the table beneath it holds the source's
+# settings. Core supplies `origin`, an HTTP origin. A module can offer another.
+[source]
+module = "origin"
+
+[source.origin]
+# Upstream origin to proxy publisher content from. No trailing slash. A path is
+# kept and the request path is added after it, so a site held in a folder of
+# object storage is "https://storage.example.com/bucket/site".
+url = "https://origin.example.com"
+# Optional: the outbound Host header, where it is not the host of url.
+# host_header = "www.example.com"
 # Optional: file name added to a request path ending in "/" on the way to the
 # origin, for an origin such as object storage that does not answer a folder
 # with its index file. The reader's address is unchanged.
 # directory_index = "index.html"
 # Optional: sign every origin request, for an origin such as private object
-# storage. The same table as [proxy.asset_routes.auth]. Only GET and HEAD are
-# signed, other methods are refused, and the reader's cookies, Authorization,
-# Referer, conditional validators and Range are not sent. origin_url must use
-# https. Keep this table last in [publisher].
-# [publisher.origin_auth]
+# storage. The same table as an asset route's. Only GET and HEAD are signed,
+# other methods are refused, and the reader's cookies, Authorization, Referer,
+# conditional validators and Range are not sent. url must use https. Keep this
+# table last in [source.origin].
+# [source.origin.auth]
 # type = "s3_sigv4"
 # region = "example-region-1"
 # access_key_id = "publisher_origin_access_key_id"
@@ -449,14 +460,21 @@ pull_sync_concurrency = 3
 # prefix wins; only GET/HEAD participate; query string is preserved.
 # [[proxy.asset_routes]]
 # prefix = "/.image/"
-# origin_url = "https://assets.example.com"
 # Optional path rewrite before sending upstream (the prefix must match what the
 # pattern expects, and here both use `/.image/`):
 # path_pattern = "^/\\.image/(.*)/[^/]+\\.([^/.]+)$"
 # target_path = "/image/upload/$1.$2"
 #
+# The route's source, in the shape [source] has. A path in url names a folder
+# the target path is added under.
+# [proxy.asset_routes.source]
+# module = "origin"
+#
+# [proxy.asset_routes.source.origin]
+# url = "https://assets.example.com"
+#
 # Optional S3 SigV4 auth for a private origin:
-# [proxy.asset_routes.auth]
+# [proxy.asset_routes.source.origin.auth]
 # type = "s3_sigv4"
 # region = "us-east-1"
 # origin_query = "strip"

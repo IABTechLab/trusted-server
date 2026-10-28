@@ -173,10 +173,15 @@ mod tests {
         // test builds its own.
         let mut s = Settings::from_toml(
             r#"
+                [source]
+                module = "origin"
+
+                [source.origin]
+                url = "https://origin.test-publisher.example.com"
+
                 [publisher]
                 domain = "test-publisher.example.com"
                 cookie_domain = ".test-publisher.example.com"
-                origin_url = "https://origin.test-publisher.example.com"
                 proxy_secret = "unit-test-proxy-secret"
 
                 [ec]
