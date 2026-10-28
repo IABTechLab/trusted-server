@@ -343,6 +343,7 @@ pull_sync_concurrency = 3
 #   "audience.permutive",
 #   "identity.lockr",
 #   "cmp.didomi",
+#   "cmp.inmobi",
 #   "cmp.sourcepoint",
 #   "tag.google-tag-manager",
 #   "bot-protection.datadome",
@@ -782,6 +783,14 @@ auction_timeout_ms = 500
 
 # Osano consent management. It has nothing to set, so [cmp] module = "osano"
 # is the whole configuration and it needs no table of its own.
+
+# InMobi Choice consent prompt. `script_url` is required, https on cmp.inmobi.com
+# or cdn.inmobi.com with no user name or password, and `cmp_id` is 1 to 4095.
+# Name `cmp.inmobi` in every [[fetch]] entry, before any middleware that writes
+# a vendor's tag. Selected with [cmp] module = "inmobi".
+# [cmp.inmobi]
+# script_url = "https://cmp.inmobi.com/choice/<account>/<site>/choice.js?tag_version=V3"
+# cmp_id = 10
 
 # Permutive DMP. `organization_id` and `workspace_id` are required.
 # [audience]

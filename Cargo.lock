@@ -6878,6 +6878,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-server-cmp-inmobi"
+version = "0.1.0"
+dependencies = [
+ "error-stack",
+ "serde",
+ "serde_json",
+ "trusted-server-core",
+ "url",
+ "validator",
+]
+
+[[package]]
 name = "trusted-server-cmp-osano"
 version = "0.1.0"
 dependencies = [
@@ -7085,6 +7097,7 @@ dependencies = [
  "trusted-server-audience-permutive",
  "trusted-server-bot-protection-datadome",
  "trusted-server-cmp-didomi",
+ "trusted-server-cmp-inmobi",
  "trusted-server-cmp-osano",
  "trusted-server-cmp-sourcepoint",
  "trusted-server-core",

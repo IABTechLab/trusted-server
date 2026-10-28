@@ -200,6 +200,18 @@ pub const SEAM_PROBE_SCRIPT_WORD: &str = "SEAM_PROBE_COUNTRY";
 /// that carries `data-seam-probe`.
 pub struct SeamProbeMiddleware {
     country: String,
+    /// The head marker as written, then [`SEAM_PROBE_REPORT_PATH`].
+    template_key: String,
+}
+
+impl SeamProbeMiddleware {
+    fn new(country: String) -> Self {
+        let template_key = seam_probe_head_marker(&country) + SEAM_PROBE_REPORT_PATH;
+        Self {
+            country,
+            template_key,
+        }
+    }
 }
 
 impl Middleware for SeamProbeMiddleware {
@@ -225,6 +237,12 @@ impl Middleware for SeamProbeMiddleware {
             })],
             ..MiddlewareAction::pass()
         }
+    }
+
+    /// The head marker and the report path, because their text is compiled
+    /// into this crate and no setting changes when it does.
+    fn template_key(&self) -> &str {
+        &self.template_key
     }
 }
 
@@ -727,9 +745,7 @@ pub fn register(
             source: PROBE_JS,
             sha256: PROBE_JS_SHA256,
         })
-        .with_middleware(Arc::new(SeamProbeMiddleware {
-            country: config.country.clone(),
-        }))
+        .with_middleware(Arc::new(SeamProbeMiddleware::new(config.country.clone())))
         .with_middleware(Arc::new(SeamProbeReaderMiddleware));
     if config.declares_geo {
         registration = registration
@@ -1198,6 +1214,26 @@ mod tests {
             registration.geo_module.is_none(),
             "should declare no geo module when declares_geo is false"
         );
+    }
+
+    /// The head marker's markup and the report path are compiled into this
+    /// crate and no setting changes when they do, so they have to be in the
+    /// text the registered fetch middleware keys a stored page by.
+    #[test]
+    fn the_marker_and_the_report_path_are_in_what_keys_a_stored_page() {
+        use trusted_server_core::integrations::IntegrationRegistry;
+
+        let settings = settings_with_probe("country = \"NZ\"");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should build a registry with the probe registered");
+
+        let keys = registry.middleware_template_keys();
+        let (_, key) = keys
+            .iter()
+            .find(|(name, _)| *name == module_name())
+            .expect("the probe's fetch middleware should be registered");
+        assert!(key.contains(&seam_probe_head_marker("NZ")), "{key}");
+        assert!(key.contains(SEAM_PROBE_REPORT_PATH), "{key}");
     }
 
     #[tokio::test]

@@ -439,7 +439,7 @@ pub fn register(
     Ok(Some(
         IntegrationRegistration::builder(DIDOMI_INTEGRATION_ID)
             .with_proxy(integration.clone())
-            .with_middleware(Arc::new(ClientConfig(integration)))
+            .with_middleware(Arc::new(ClientConfig::new(&integration)))
             .build(),
     ))
 }
@@ -595,7 +595,18 @@ impl DidomiIntegration {
 
 /// Writes the browser module's settings into the head, on the pages a
 /// `[[fetch]]` entry names [`MODULE`] for.
-struct ClientConfig(Arc<DidomiIntegration>);
+struct ClientConfig {
+    /// The script, made once when the module registers.
+    script: String,
+}
+
+impl ClientConfig {
+    fn new(integration: &DidomiIntegration) -> Self {
+        Self {
+            script: integration.client_config_script(),
+        }
+    }
+}
 
 impl Middleware for ClientConfig {
     fn middleware_id(&self) -> &'static str {
@@ -608,9 +619,15 @@ impl Middleware for ClientConfig {
 
     fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
         MiddlewareAction {
-            head_inserts: vec![self.0.client_config_script()],
+            head_inserts: vec![self.script.clone()],
             ..MiddlewareAction::pass()
         }
+    }
+
+    /// The script, because its text and the default path in it are compiled
+    /// into this crate and no setting changes when they do.
+    fn template_key(&self) -> &str {
+        &self.script
     }
 }
 
@@ -1386,7 +1403,7 @@ mod tests {
             &document_state,
         );
 
-        let action = ClientConfig(integration).create(&context);
+        let action = ClientConfig::new(&integration).create(&context);
 
         assert_eq!(
             action.head_inserts,
@@ -1477,6 +1494,49 @@ mod tests {
             trusted_server_core::module_name!(),
             "should be named by the folder this crate lives in"
         );
+    }
+
+    /// The settings script and its default path are compiled into this crate
+    /// and no setting changes when they do, so what the registered middleware
+    /// writes into the head has to be in the text it keys a stored page by,
+    /// or a page stored before a change keeps the old script until it
+    /// expires.
+    #[test]
+    fn the_settings_script_is_in_what_keys_a_stored_page() {
+        let settings = trusted_server_core::html_processor::test_support::page_settings(
+            include_str!("fixtures/page-change.settings.toml"),
+        );
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should build the registry");
+        let document_state = trusted_server_core::integrations::IntegrationDocumentState::default();
+        let written = registry
+            .middleware_chain(
+                &settings.fetch,
+                MiddlewarePhase::Fetch,
+                trusted_server_core::middleware::HTML_MEDIA_TYPE,
+                "/",
+            )
+            .plan(&trusted_server_core::middleware::test_support::context(
+                MiddlewarePhase::Fetch,
+                &document_state,
+            ))
+            .expect("should plan the page change")
+            .head_inserts;
+        assert!(
+            written
+                .iter()
+                .any(|script| script.contains(DIDOMI_DEFAULT_PREFIX)),
+            "should write the default path: {written:?}"
+        );
+
+        let keys = registry.middleware_template_keys();
+        let (_, key) = keys
+            .iter()
+            .find(|(name, _)| *name == MODULE)
+            .expect("the settings script's middleware should be registered");
+        for script in &written {
+            assert!(key.contains(script.as_str()), "{script} is not in {key}");
+        }
     }
 
     /// The page a reader receives with this module running, kept as a file

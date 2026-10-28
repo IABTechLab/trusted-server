@@ -2237,6 +2237,10 @@ fn assemble_if_shared(
 /// serve. That is safe because a module this deployment never serves appears in no bundle
 /// hash and no injected URL, so it cannot change what a template renders.
 ///
+/// Each registered middleware's [`template_key`](crate::middleware::Middleware::template_key)
+/// covers what it writes that no setting decides, such as markup compiled into a module's
+/// crate, which neither the build digest nor the settings see.
+///
 /// # Panics
 ///
 /// Does not panic: serializing the already-deserialized typed settings to a JSON value is
@@ -2254,6 +2258,11 @@ fn template_fingerprint_with_build_digest(
     hasher.update(build_digest.as_bytes());
     hasher
         .update(crate::tsjs_bundle::compose_hash(&integration_registry.js_parts_all()).as_bytes());
+    // Each part is hashed alone, so no text can move where the next begins.
+    for (name, key) in integration_registry.middleware_template_keys() {
+        hasher.update(sha2::Sha256::digest(name.as_bytes()));
+        hasher.update(sha2::Sha256::digest(key.as_bytes()));
+    }
     // EdgeZero's canonical form sorts object keys itself, so independently deserialized
     // HashMaps hash identically even when a dependency enables `serde_json/preserve_order`.
     // Array order is preserved: set-valued settings must serialize deterministically
@@ -10249,6 +10258,84 @@ mod tests {
                 fingerprint_with_carried(&settings, carrying_before),
                 fingerprint_with_carried(&settings, carrying_after),
                 "a rebuilt carried module must select a different template"
+            );
+        }
+
+        /// Head markup a module's crate compiles in, before a fix to it.
+        const WRITTEN_BEFORE: &str = "<script>window.__stub=1;</script>";
+
+        /// The same markup after the fix.
+        const WRITTEN_AFTER: &str = "<script>window.__stub=2;</script>";
+
+        /// A fetch middleware that writes markup compiled into its crate,
+        /// which no setting decides.
+        struct WritesCompiledMarkup(&'static str);
+
+        impl crate::middleware::Middleware for WritesCompiledMarkup {
+            fn middleware_id(&self) -> &'static str {
+                "testing.probe"
+            }
+
+            fn phases(&self) -> &[crate::middleware::MiddlewarePhase] {
+                &[crate::middleware::MiddlewarePhase::Fetch]
+            }
+
+            fn create(
+                &self,
+                _context: &crate::middleware::MiddlewareContext<'_>,
+            ) -> crate::middleware::MiddlewareAction {
+                crate::middleware::MiddlewareAction {
+                    head_inserts: vec![self.0.to_owned()],
+                    ..crate::middleware::MiddlewareAction::pass()
+                }
+            }
+
+            fn template_key(&self) -> &str {
+                self.0
+            }
+        }
+
+        /// Registration of a middleware writing [`WRITTEN_BEFORE`].
+        fn writing_before(
+            _settings: &Settings,
+        ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+            Ok(Some(
+                IntegrationRegistration::builder("probe")
+                    .without_js()
+                    .with_middleware(std::sync::Arc::new(WritesCompiledMarkup(WRITTEN_BEFORE)))
+                    .build(),
+            ))
+        }
+
+        /// Registration of a middleware writing [`WRITTEN_AFTER`].
+        fn writing_after(
+            _settings: &Settings,
+        ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+            Ok(Some(
+                IntegrationRegistration::builder("probe")
+                    .without_js()
+                    .with_middleware(std::sync::Arc::new(WritesCompiledMarkup(WRITTEN_AFTER)))
+                    .build(),
+            ))
+        }
+
+        #[test]
+        fn a_change_to_markup_a_middleware_compiles_in_changes_the_fingerprint() {
+            // A fetch middleware's markup is stored with the template, and no
+            // setting holds markup compiled into a module's crate, so a fix to
+            // it has to select a new template or stored pages keep the old one.
+            let mut settings = create_test_settings();
+            settings.select_module("testing", "testing.probe");
+
+            assert_eq!(
+                fingerprint_with_carried(&settings, writing_before),
+                fingerprint_with_carried(&settings, writing_before),
+                "the same markup must select the same template"
+            );
+            assert_ne!(
+                fingerprint_with_carried(&settings, writing_before),
+                fingerprint_with_carried(&settings, writing_after),
+                "a change to compiled-in markup must select a different template"
             );
         }
 

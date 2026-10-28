@@ -1,0 +1,9 @@
+[cmp]
+module = "inmobi"
+
+[cmp.inmobi]
+script_url = "https://cmp.inmobi.com/choice/EXAMPLEacct00/www.publisher.example/choice.js?tag_version=V3"
+
+[[fetch]]
+media_type = "text/html"
+middleware = ["cmp.inmobi"]

@@ -327,3 +327,9 @@ jobs:
 
       - name: Run unit tests
         run: npm test -- --run
+
+      # A module that writes a script into pages tests it in its own folder,
+      # with Node's test runner and no packages.
+      - name: Run module page script tests
+        working-directory: .
+        run: node --test "crates/*/*/tests/*.test.mjs"

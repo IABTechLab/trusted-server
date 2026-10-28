@@ -33,6 +33,7 @@ pub fn builders() -> Vec<IntegrationBuilder> {
         trusted_server_audience_permutive::builder(),
         trusted_server_identity_lockr::builder(),
         trusted_server_cmp_didomi::builder(),
+        trusted_server_cmp_inmobi::builder(),
         trusted_server_cmp_sourcepoint::builder(),
         trusted_server_cmp_osano::builder(),
         trusted_server_tag_google_tag_manager::builder(),
@@ -99,6 +100,7 @@ pub fn middleware() -> Vec<StockMiddleware> {
     use trusted_server_audience_permutive as permutive;
     use trusted_server_bot_protection_datadome as datadome;
     use trusted_server_cmp_didomi as didomi;
+    use trusted_server_cmp_inmobi as inmobi;
     use trusted_server_cmp_sourcepoint as sourcepoint;
     use trusted_server_core::integrations::js_asset_proxy;
     use trusted_server_core::service_version;
@@ -121,6 +123,7 @@ pub fn middleware() -> Vec<StockMiddleware> {
         row(permutive::builder().id(), Fetch, permutive::MODULE),
         row(lockr::builder().id(), Fetch, lockr::MODULE),
         row(didomi::builder().id(), Fetch, didomi::MODULE),
+        row(inmobi::builder().id(), Fetch, inmobi::MODULE),
         row(sourcepoint::builder().id(), Fetch, sourcepoint::MODULE),
         row(
             google_tag_manager::builder().id(),
@@ -175,6 +178,7 @@ mod tests {
         include_str!("../../audience/permutive/src/fixtures/page-change.settings.toml"),
         include_str!("../../identity/lockr/src/fixtures/page-change.settings.toml"),
         include_str!("../../cmp/didomi/src/fixtures/page-change.settings.toml"),
+        include_str!("../../cmp/inmobi/src/fixtures/page-change.settings.toml"),
         include_str!("../../cmp/sourcepoint/src/fixtures/page-change.settings.toml"),
         include_str!("../../tag/google-tag-manager/src/fixtures/page-change.settings.toml"),
         include_str!("../../bot-protection/datadome/src/fixtures/page-change.settings.toml"),
@@ -374,6 +378,7 @@ mod tests {
                 "audience.permutive",
                 "identity.lockr",
                 "cmp.didomi",
+                "cmp.inmobi",
                 "cmp.sourcepoint",
                 "cmp.osano",
                 "tag.google-tag-manager",

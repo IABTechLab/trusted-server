@@ -970,6 +970,9 @@ impl Middleware for ClientTag {
     }
 }
 
+/// The first-party path a page loads the SDK's scripts under.
+const SDK_PREFIX: &str = "/integrations/datadome";
+
 /// Loads the `DataDome` SDK from the first-party path, on the pages a
 /// `[[fetch]]` entry names [`MODULE`] for. It does nothing unless
 /// `rewrite_sdk` is set.
@@ -994,6 +997,12 @@ impl Middleware for SdkAddress {
             element_handlers: AttributeRewrite::each(&["src", "href"], &decide),
             ..MiddlewareAction::pass()
         }
+    }
+
+    /// The path the SDK's scripts are loaded under, because it is compiled
+    /// into this crate and no setting changes when it does.
+    fn template_key(&self) -> &str {
+        SDK_PREFIX
     }
 }
 
@@ -1049,7 +1058,7 @@ impl DataDomeIntegration {
         // on pages that set an external base URL these resolve against that base
         // rather than the address-bar origin — an accepted tradeoff, matching
         // GTM/Didomi/Testlight which are also relative.
-        let new_url = format!("/integrations/datadome{path}");
+        let new_url = format!("{SDK_PREFIX}{path}");
 
         log::info!(
             "[datadome] Rewriting script src from {} to {}",
@@ -2089,6 +2098,35 @@ mod tests {
         assert!(
             format!("{error:?}").contains("account_id"),
             "should identify the removed field: {error:?}"
+        );
+    }
+
+    /// The path the SDK's scripts are loaded under is compiled into this crate
+    /// and no setting changes when it does, so it has to be the text the
+    /// registered fetch middleware keys a stored page by, or a page stored
+    /// before a change keeps loading the SDK from the old path until it
+    /// expires.
+    #[test]
+    fn the_sdk_path_is_what_keys_a_stored_page() {
+        let settings = trusted_server_core::html_processor::test_support::page_settings(
+            include_str!("fixtures/page-change.settings.toml"),
+        );
+        let registry = trusted_server_core::integrations::IntegrationRegistry::with_registrations(
+            &settings,
+            &[builder()],
+        )
+        .expect("should build the registry");
+
+        let keys = registry.middleware_template_keys();
+        let (_, key) = keys
+            .iter()
+            .find(|(name, _)| *name == MODULE)
+            .expect("the SDK's middleware should be registered");
+        assert_eq!(*key, SDK_PREFIX);
+        assert!(
+            include_str!("fixtures/page-change.recorded.html")
+                .contains(&format!("src=\"{SDK_PREFIX}/tags.js\"")),
+            "the recorded page should load the SDK under the path the key holds"
         );
     }
 

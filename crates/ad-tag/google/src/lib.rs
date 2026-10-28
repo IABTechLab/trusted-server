@@ -99,6 +99,9 @@ const SECUREPUBADS_HOST: &str = "securepubads.g.doubleclick.net";
 /// Integration route prefix for all GPT proxy endpoints.
 const ROUTE_PREFIX: &str = "/integrations/gpt";
 
+/// The first-party path a page loads the GPT script from.
+const SCRIPT_PATH: &str = "/integrations/gpt/script";
+
 /// Configuration for the Google Publisher Tags integration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
@@ -436,7 +439,7 @@ pub fn register(
 
     let mut registration = IntegrationRegistration::builder(GPT_INTEGRATION_ID)
         .with_proxy(integration.clone())
-        .with_middleware(Arc::new(PageChange(integration.clone())));
+        .with_middleware(Arc::new(PageChange::new(integration.clone())));
     if let Some((name, value)) = integration.bundle_tag_attribute() {
         registration = registration.with_bundle_tag_attribute(name, value);
     }
@@ -494,7 +497,21 @@ impl IntegrationProxy for GptIntegration {
 /// for. It writes the `tsjs.adInit` bootstrap into the head and, when
 /// `rewrite_script` is set, points the GPT script's address at the
 /// first-party path.
-struct PageChange(Arc<GptIntegration>);
+struct PageChange {
+    integration: Arc<GptIntegration>,
+    /// The head scripts as written, then [`SCRIPT_PATH`].
+    template_key: String,
+}
+
+impl PageChange {
+    fn new(integration: Arc<GptIntegration>) -> Self {
+        let template_key = integration.head_markup().concat() + SCRIPT_PATH;
+        Self {
+            integration,
+            template_key,
+        }
+    }
+}
 
 impl Middleware for PageChange {
     fn middleware_id(&self) -> &'static str {
@@ -507,15 +524,21 @@ impl Middleware for PageChange {
 
     fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
         let mut action = MiddlewareAction {
-            head_inserts: self.0.head_markup(),
+            head_inserts: self.integration.head_markup(),
             ..MiddlewareAction::pass()
         };
-        if self.0.config.rewrite_script {
+        if self.integration.config.rewrite_script {
             let decide: Rc<AttributeRewriteFn> =
                 Rc::new(|matched| GptIntegration::rewrite_script_address(matched.value));
             action.element_handlers = AttributeRewrite::each(&["src", "href"], &decide);
         }
         action
+    }
+
+    /// The head scripts and the script path, because the bootstrap and the
+    /// path are compiled into this crate and no setting changes when they do.
+    fn template_key(&self) -> &str {
+        &self.template_key
     }
 }
 
@@ -529,7 +552,7 @@ impl GptIntegration {
             // so on pages that set an external base URL these resolve against
             // that base rather than the address-bar origin — an accepted
             // tradeoff, matching GTM/Didomi/Testlight which are also relative.
-            AttributeRewriteAction::replace("/integrations/gpt/script".to_string())
+            AttributeRewriteAction::replace(SCRIPT_PATH.to_string())
         } else {
             AttributeRewriteAction::keep()
         }
@@ -640,7 +663,7 @@ mod tests {
             MiddlewarePhase::Fetch,
             &document_state,
         );
-        PageChange(integration).create(&context)
+        PageChange::new(integration).create(&context)
     }
 
     fn build_http_request(method: Method, uri: &str) -> http::Request<EdgeBody> {
@@ -1440,7 +1463,31 @@ mod tests {
     #[test]
     fn the_middleware_is_named_as_the_module() {
         let integration = GptIntegration::new(test_config());
-        assert_eq!(PageChange(integration).middleware_id(), MODULE);
+        assert_eq!(PageChange::new(integration).middleware_id(), MODULE);
+    }
+
+    /// The bootstrap and the script path are compiled into this crate and no
+    /// setting changes when they do, so they have to be in the text the
+    /// registered middleware keys a stored page by, or a page stored before a
+    /// change to either keeps the old one until it expires.
+    #[test]
+    fn the_bootstrap_is_in_what_keys_a_stored_page() {
+        let settings = trusted_server_core::html_processor::test_support::page_settings(
+            include_str!("fixtures/page-change.settings.toml"),
+        );
+        let registry = trusted_server_core::integrations::IntegrationRegistry::with_registrations(
+            &settings,
+            &[super::builder(), super::diagnostics::builder()],
+        )
+        .expect("should build the registry");
+
+        let keys = registry.middleware_template_keys();
+        let (_, key) = keys
+            .iter()
+            .find(|(name, _)| *name == MODULE)
+            .expect("the page change should be registered");
+        assert!(key.contains(GPT_BOOTSTRAP_JS), "{key}");
+        assert!(key.contains(SCRIPT_PATH), "{key}");
     }
 
     #[test]

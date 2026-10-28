@@ -53,6 +53,10 @@ use trusted_server_core::settings::{IntegrationConfig, Settings};
 
 const GTM_INTEGRATION_ID: &str = "google_tag_manager";
 
+/// The first-party path Google's tag addresses are pointed under.
+static FIRST_PARTY_PREFIX: LazyLock<String> =
+    LazyLock::new(|| format!("/integrations/{GTM_INTEGRATION_ID}"));
+
 /// The name this module is selected by, in `[tag]`.
 pub const MODULE: &str = "tag.google-tag-manager";
 
@@ -439,7 +443,7 @@ impl GoogleTagManagerIntegration {
     /// all variants (https, protocol-relative) of `googletagmanager.com`,
     /// `google-analytics.com` and `analytics.google.com`.
     fn rewrite_gtm_urls(content: &str) -> String {
-        let first_party = format!("/integrations/{GTM_INTEGRATION_ID}");
+        let first_party = FIRST_PARTY_PREFIX.as_str();
 
         // An attribute value is the whole URL on its own.
         if let Some(captures) = GTM_WHOLE_URL_PATTERN.captures(content) {
@@ -1063,6 +1067,12 @@ impl Middleware for GoogleTagManagerIntegration {
             text_handlers: vec![Box::new(InlineSnippet::default())],
             ..MiddlewareAction::pass()
         }
+    }
+
+    /// The path Google's tag addresses are pointed under, because it is
+    /// compiled into this crate and no setting changes when it does.
+    fn template_key(&self) -> &str {
+        FIRST_PARTY_PREFIX.as_str()
     }
 }
 
@@ -3961,6 +3971,36 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             super::MODULE,
             trusted_server_core::module_name!(),
             "should be named by the folder this crate lives in"
+        );
+    }
+
+    /// The path Google's tag addresses are pointed under is compiled into
+    /// this crate and no setting changes when it does, so it has to be the
+    /// text the registered middleware keys a stored page by, or a page stored
+    /// before a change keeps the old addresses until it expires.
+    #[test]
+    fn the_first_party_path_is_what_keys_a_stored_page() {
+        let settings = trusted_server_core::html_processor::test_support::page_settings(
+            include_str!("fixtures/page-change.settings.toml"),
+        );
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should build the registry");
+
+        let keys = registry.middleware_template_keys();
+        let (_, key) = keys
+            .iter()
+            .find(|(name, _)| *name == MODULE)
+            .expect("the page change should be registered");
+        assert_eq!(*key, FIRST_PARTY_PREFIX.as_str());
+        let recorded = include_str!("fixtures/page-change.recorded.html");
+        let prefix = FIRST_PARTY_PREFIX.as_str();
+        assert!(
+            recorded.contains(&format!("src=\"{prefix}/gtag/js?id=G-TEST1234\"")),
+            "the recorded page should point an attribute under the path the key holds"
+        );
+        assert!(
+            recorded.contains(&format!("'{prefix}/gtm.js?id='")),
+            "the recorded page should point an inline snippet under the path the key holds"
         );
     }
 

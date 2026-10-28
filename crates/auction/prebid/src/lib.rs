@@ -1103,7 +1103,7 @@ pub fn register_for_plan(
     Ok(Some(
         IntegrationRegistration::builder(PREBID_INTEGRATION_ID)
             .with_proxy(integration.clone())
-            .with_middleware(Arc::new(PageChange(integration)))
+            .with_middleware(Arc::new(PageChange::new(integration)))
             .with_deferred_js()
             .build(),
     ))
@@ -1121,7 +1121,7 @@ pub fn register(
     Ok(Some(
         IntegrationRegistration::builder(PREBID_INTEGRATION_ID)
             .with_proxy(integration.clone())
-            .with_middleware(Arc::new(PageChange(integration)))
+            .with_middleware(Arc::new(PageChange::new(integration)))
             .with_deferred_js()
             .build(),
     ))
@@ -1191,7 +1191,21 @@ impl IntegrationProxy for PrebidIntegration {
 /// [`MODULE`] for. It writes the configuration Prebid.js reads and the tag
 /// that loads the bundle into the head, and removes the publisher's own
 /// Prebid script.
-struct PageChange(Arc<PrebidIntegration>);
+struct PageChange {
+    integration: Arc<PrebidIntegration>,
+    /// The head scripts as written.
+    template_key: String,
+}
+
+impl PageChange {
+    fn new(integration: Arc<PrebidIntegration>) -> Self {
+        let template_key = integration.head_markup().concat();
+        Self {
+            integration,
+            template_key,
+        }
+    }
+}
 
 impl Middleware for PageChange {
     fn middleware_id(&self) -> &'static str {
@@ -1203,14 +1217,21 @@ impl Middleware for PageChange {
     }
 
     fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
-        let integration = Arc::clone(&self.0);
+        let integration = Arc::clone(&self.integration);
         let decide: Rc<AttributeRewriteFn> =
             Rc::new(move |matched| integration.rewrite_script_address(matched.value));
         MiddlewareAction {
-            head_inserts: self.0.head_markup(),
+            head_inserts: self.integration.head_markup(),
             element_handlers: AttributeRewrite::each(&["src", "href"], &decide),
             ..MiddlewareAction::pass()
         }
+    }
+
+    /// The head scripts, because the script that hands Prebid.js its
+    /// configuration and the tag that loads the bundle are compiled into this
+    /// crate and no setting changes when they do.
+    fn template_key(&self) -> &str {
+        &self.template_key
     }
 }
 
@@ -3377,6 +3398,49 @@ server_url = "https://prebid.example"
             trusted_server_core::module_name!(),
             "should be named by the folder this crate lives in"
         );
+    }
+
+    /// The script that hands Prebid.js its configuration and the tag that
+    /// loads the bundle are compiled into this crate and no setting changes
+    /// when they do, so what the registered middleware writes into the head
+    /// has to be in the text it keys a stored page by, or a page stored before
+    /// a change keeps the old scripts until it expires.
+    #[test]
+    fn the_head_scripts_are_in_what_keys_a_stored_page() {
+        let settings = trusted_server_core::html_processor::test_support::page_settings(
+            include_str!("fixtures/page-change.settings.toml"),
+        );
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should build the registry");
+        let document_state = IntegrationDocumentState::default();
+        let written = registry
+            .middleware_chain(
+                &settings.fetch,
+                MiddlewarePhase::Fetch,
+                trusted_server_core::middleware::HTML_MEDIA_TYPE,
+                "/",
+            )
+            .plan(&trusted_server_core::middleware::test_support::context(
+                MiddlewarePhase::Fetch,
+                &document_state,
+            ))
+            .expect("should plan the page change")
+            .head_inserts;
+        assert!(
+            written
+                .iter()
+                .any(|script| script.contains("window.__tsjs_prebid=")),
+            "should write the configuration script: {written:?}"
+        );
+
+        let keys = registry.middleware_template_keys();
+        let (_, key) = keys
+            .iter()
+            .find(|(name, _)| *name == MODULE)
+            .expect("the page change should be registered");
+        for script in &written {
+            assert!(key.contains(script.as_str()), "{script} is not in {key}");
+        }
     }
 
     /// The page a reader receives with this module running, kept as a file

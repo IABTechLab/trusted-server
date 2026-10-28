@@ -1917,6 +1917,17 @@ impl IntegrationRegistry {
             .collect()
     }
 
+    /// Each middleware's name with the text it keys a stored page by, in
+    /// registration order. See [`Middleware::template_key`].
+    #[must_use]
+    pub fn middleware_template_keys(&self) -> Vec<(&'static str, &str)> {
+        self.inner
+            .middleware
+            .iter()
+            .map(|(_, middleware)| (middleware.middleware_id(), middleware.template_key()))
+            .collect()
+    }
+
     /// The middleware the first entry covering a response selects, in the
     /// order they run, for a response of `media_type` to a request for `path`.
     /// A response no entry covers gives an empty chain.

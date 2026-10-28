@@ -462,6 +462,9 @@ impl IntegrationProxy for PermutiveIntegration {
     }
 }
 
+/// The first-party path a page loads the SDK from.
+const SDK_PATH: &str = "/integrations/permutive/sdk";
+
 impl PermutiveIntegration {
     /// What becomes of a `src` or an `href`, which is pointed at the
     /// first-party endpoint when it is the SDK's address.
@@ -473,7 +476,7 @@ impl PermutiveIntegration {
             // so on pages that set an external base URL these resolve against
             // that base rather than the address-bar origin — an accepted
             // tradeoff, matching GTM/Didomi/Testlight which are also relative.
-            AttributeRewriteAction::replace("/integrations/permutive/sdk".to_string())
+            AttributeRewriteAction::replace(SDK_PATH.to_string())
         } else {
             AttributeRewriteAction::keep()
         }
@@ -504,6 +507,12 @@ impl Middleware for SdkAddress {
             element_handlers: AttributeRewrite::each(&["src", "href"], &decide),
             ..MiddlewareAction::pass()
         }
+    }
+
+    /// The SDK's path, because it is compiled into this crate and no setting
+    /// changes when it does.
+    fn template_key(&self) -> &str {
+        SDK_PATH
     }
 }
 
@@ -758,6 +767,34 @@ mod tests {
             super::MODULE,
             trusted_server_core::module_name!(),
             "should be named by the folder this crate lives in"
+        );
+    }
+
+    /// The SDK's path is compiled into this crate and no setting changes when
+    /// it does, so it has to be the text the registered middleware keys a
+    /// stored page by, or a page stored before a change keeps loading the SDK
+    /// from the old path until it expires.
+    #[test]
+    fn the_sdk_path_is_what_keys_a_stored_page() {
+        let settings = trusted_server_core::html_processor::test_support::page_settings(
+            include_str!("fixtures/page-change.settings.toml"),
+        );
+        let registry = trusted_server_core::integrations::IntegrationRegistry::with_registrations(
+            &settings,
+            &[builder()],
+        )
+        .expect("should build the registry");
+
+        let keys = registry.middleware_template_keys();
+        let (_, key) = keys
+            .iter()
+            .find(|(name, _)| *name == MODULE)
+            .expect("the SDK's middleware should be registered");
+        assert_eq!(*key, SDK_PATH);
+        assert!(
+            include_str!("fixtures/page-change.recorded.html")
+                .contains(&format!("src=\"{SDK_PATH}\"")),
+            "the recorded page should load the SDK from the path the key holds"
         );
     }
 
