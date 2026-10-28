@@ -380,6 +380,140 @@ impl TypeSections {
 }
 
 /// The section that holds what one vendor's modules share.
+pub const MIDDLEWARE_TYPE: &str = "middleware";
+
+/// The `[middleware]` section, one `[middleware.<name>]` table for each
+/// middleware that has settings of its own, written with the middleware's
+/// full name, so `[middleware.example.cleanup]` is the `example.cleanup`
+/// middleware's table. A table holds values and arrays. A table within one
+/// is the table of the longer name it spells and never a setting, so a
+/// middleware never sees another's settings. Core reads none of a table. A
+/// middleware reads its own through [`Settings::middleware_config`].
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct MiddlewareTables(BTreeMap<String, JsonValue>);
+
+impl std::fmt::Debug for MiddlewareTables {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MiddlewareTables")
+            .field("names", &self.names())
+            .finish()
+    }
+}
+
+impl MiddlewareTables {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Every name a table stands at, the ones on the way to a deeper table
+    /// included, so `[middleware.example.cleanup]` gives `example` and
+    /// `example.cleanup`.
+    #[must_use]
+    pub fn names(&self) -> Vec<String> {
+        fn walk(prefix: &str, table: &serde_json::Map<String, JsonValue>, names: &mut Vec<String>) {
+            for (key, child) in table {
+                if let JsonValue::Object(inner) = child {
+                    let name = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    names.push(name.clone());
+                    walk(&name, inner, names);
+                }
+            }
+        }
+        let mut names = Vec::new();
+        for (key, value) in &self.0 {
+            if let JsonValue::Object(table) = value {
+                names.push(key.clone());
+                walk(key, table, &mut names);
+            }
+        }
+        names
+    }
+
+    /// The table at `name`, with the tables within it left out, because each
+    /// of those is a longer name's table.
+    #[must_use]
+    pub fn table(&self, name: &str) -> Option<serde_json::Map<String, JsonValue>> {
+        let mut parts = name.split('.');
+        let mut node = self.0.get(parts.next()?)?;
+        for part in parts {
+            node = node.as_object()?.get(part)?;
+        }
+        let table = node.as_object()?;
+        Some(
+            table
+                .iter()
+                .filter(|(_, value)| !value.is_object())
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        )
+    }
+
+    /// Reads and validates `[middleware.<name>]` as `T`, or `None` when no
+    /// table stands at `name`.
+    ///
+    /// # Errors
+    ///
+    /// When the table carries a key `T` does not know or a value that fails
+    /// validation.
+    pub fn get_typed<T>(&self, name: &str) -> Result<Option<T>, Report<TrustedServerError>>
+    where
+        T: DeserializeOwned + Validate,
+    {
+        let Some(table) = self.table(name) else {
+            return Ok(None);
+        };
+        let config: T = serde_json::from_value(JsonValue::Object(table)).map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("[{MIDDLEWARE_TYPE}.{name}] could not be read: {error}"),
+            })
+        })?;
+        config.validate().map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("[{MIDDLEWARE_TYPE}.{name}] failed validation: {error}"),
+            })
+        })?;
+        Ok(Some(config))
+    }
+
+    /// Refuses a table at a name no middleware could have, and a value where
+    /// only tables stand.
+    ///
+    /// # Errors
+    ///
+    /// With the key or the name that is wrong.
+    pub fn validate_names(&self) -> Result<(), Report<TrustedServerError>> {
+        if let Some((key, _)) = self.0.iter().find(|(_, value)| !value.is_object()) {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[{MIDDLEWARE_TYPE}] has a value `{key}` where only tables stand, one \
+                     for each middleware, as [{MIDDLEWARE_TYPE}.<name>]"
+                ),
+            }));
+        }
+        if let Some(name) = self
+            .names()
+            .into_iter()
+            .find(|name| !crate::module_name::is_valid(name))
+        {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[{MIDDLEWARE_TYPE}] has a table named `{name}`, which is not a \
+                     middleware's name. A name is parts joined by `.`, each in lower case \
+                     letters, digits, `_` or `-`"
+                ),
+            }));
+        }
+        Ok(())
+    }
+}
+
 pub const SHARED_TYPE: &str = "shared";
 
 /// The `[shared]` section, one `[shared.<vendor>]` table per vendor, holding
@@ -4375,6 +4509,9 @@ pub struct Settings {
     /// What one vendor's modules share, a table per vendor, `[shared.<vendor>]`.
     #[serde(default, skip_serializing_if = "SharedTables::is_empty")]
     pub shared: SharedTables,
+    /// A middleware's own settings, a table per middleware, `[middleware.<name>]`.
+    #[serde(default, skip_serializing_if = "MiddlewareTables::is_empty")]
+    pub middleware: MiddlewareTables,
     #[serde(default)]
     pub proxy: Proxy,
     #[serde(default)]
@@ -4667,6 +4804,7 @@ impl Settings {
             .validate_metadata_keys()?;
         self.validate_asset_image_optimizer_profile_sets()?;
         self.shared.validate_names()?;
+        self.middleware.validate_names()?;
         if let Some(robots_txt) = &self.robots_txt {
             robots_txt.prepare_runtime()?;
             self.require_robots_txt_placed()?;
@@ -4970,6 +5108,21 @@ impl Settings {
         T: DeserializeOwned + Validate,
     {
         self.shared.get_typed(vendor)
+    }
+
+    /// Reads `[middleware.<name>]`, a middleware's own settings, as `T`, or
+    /// `None` when no table stands at `name`. A module's one middleware may
+    /// read the module's own table instead, as the stock modules do.
+    ///
+    /// # Errors
+    ///
+    /// When the table carries a key `T` does not know or a value that fails
+    /// validation.
+    pub fn middleware_config<T>(&self, name: &str) -> Result<Option<T>, Report<TrustedServerError>>
+    where
+        T: DeserializeOwned + Validate,
+    {
+        self.middleware.get_typed(name)
     }
 
     /// The modules `section` selects, to change, with the section created

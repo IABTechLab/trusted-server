@@ -1539,6 +1539,28 @@ fn check_middleware(
             }
         }
     }
+    // A table under [middleware] stands at a middleware's name or on the way to
+    // one, so a table at a name nothing supplies is refused with what could be
+    // written, as an entry naming such a middleware is.
+    let supplied: Vec<&str> = inner
+        .middleware
+        .iter()
+        .map(|(_, middleware)| middleware.middleware_id())
+        .collect();
+    for name in settings.middleware.names() {
+        let on_the_way = supplied.iter().any(|id| {
+            id.strip_prefix(name.as_str())
+                .is_some_and(|rest| rest.starts_with('.'))
+        });
+        if !supplied.contains(&name.as_str()) && !on_the_way {
+            return Err(refuse(format!(
+                "[middleware.{name}] names `{name}`, which no module that runs supplies. The \
+                 middleware the running modules supply is [{}]{}",
+                supplied.join(", "),
+                inner.unselected_module_note(&name)
+            )));
+        }
+    }
     for (integration, middleware) in unnamed_middleware(settings, inner) {
         log::warn!(
             "Module `{integration}` supplies the middleware `{}` and no {} entry names \
@@ -3569,6 +3591,46 @@ pub(crate) mod test_support {
             }
         }
 
+        pub(crate) const LABELED: &str = "testing.middleware-fixture.labeled";
+
+        /// `[middleware.testing.middleware-fixture.labeled]`, the one fixture
+        /// middleware with a table of its own.
+        #[derive(Debug, serde::Deserialize, validator::Validate)]
+        #[serde(deny_unknown_fields)]
+        pub(crate) struct LabeledSettings {
+            pub(crate) text: String,
+        }
+
+        pub(crate) fn labeled_marker(text: &str) -> String {
+            format!("<meta name=\"middleware-fixture-labeled\" content=\"{text}\">")
+        }
+
+        /// Writes the text its own table gives it into the head, and nothing
+        /// when it has no table.
+        struct Labeled {
+            text: Option<String>,
+        }
+
+        impl Middleware for Labeled {
+            fn middleware_id(&self) -> &'static str {
+                LABELED
+            }
+
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Fetch]
+            }
+
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                match &self.text {
+                    Some(text) => MiddlewareAction {
+                        head_inserts: vec![labeled_marker(text)],
+                        ..MiddlewareAction::pass()
+                    },
+                    None => MiddlewareAction::pass(),
+                }
+            }
+        }
+
         /// The name of the serve middleware that writes a header on a text
         /// response.
         pub(crate) const TEXT_HEADER: &str = "testing.middleware-fixture.text-header";
@@ -3791,6 +3853,9 @@ pub(crate) mod test_support {
             let Some(config) = settings.module_config::<FixtureSettings>(MODULE)? else {
                 return Ok(None);
             };
+            let labeled = settings
+                .middleware_config::<LabeledSettings>(LABELED)?
+                .map(|settings| settings.text);
             Ok(Some(
                 IntegrationRegistration::builder(ID)
                     .without_js()
@@ -3806,6 +3871,7 @@ pub(crate) mod test_support {
                     .with_middleware(Arc::new(Refusing))
                     .with_middleware(Arc::new(TextHeader))
                     .with_middleware(Arc::new(Locating))
+                    .with_middleware(Arc::new(Labeled { text: labeled }))
                     .build(),
             ))
         }
@@ -7180,6 +7246,7 @@ mod tests {
                 fixture::REFUSING,
                 fixture::TEXT_HEADER,
                 fixture::LOCATING,
+                fixture::LABELED,
                 crate::service_version::MODULE,
             ],
             "should list the middleware the selected module supplies, and core's own after them"
@@ -7192,7 +7259,8 @@ mod tests {
                 fixture::BROKEN,
                 fixture::TEXT,
                 fixture::PREPARING,
-                fixture::REFUSING
+                fixture::REFUSING,
+                fixture::LABELED
             ],
             "should list the middleware that run in the fetch phase"
         );
@@ -7351,7 +7419,7 @@ mod tests {
             message.contains(
                 "[[fetch]] entry 2 names `testing.nothing`, which no module that runs supplies"
             ) && message.contains(&format!(
-                "[{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}]",
+                "[{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}]",
                 fixture::HEAD,
                 fixture::LINKS,
                 fixture::BROKEN,
@@ -7362,6 +7430,7 @@ mod tests {
                 fixture::REFUSING,
                 fixture::TEXT_HEADER,
                 fixture::LOCATING,
+                fixture::LABELED,
                 crate::service_version::MODULE
             )),
             "should name the entry and list what could be named: {message}"
@@ -7392,6 +7461,127 @@ mod tests {
         );
     }
 
+    fn settings_with_middleware_table(table: serde_json::Value) -> Settings {
+        let mut settings = settings_naming(fixture::MODULE);
+        settings.middleware =
+            serde_json::from_value(table).expect("should read the middleware tables");
+        settings
+    }
+
+    #[test]
+    fn a_middleware_reads_its_own_table_and_not_a_longer_names() {
+        let settings = settings_with_middleware_table(serde_json::json!({
+            "testing": { "middleware-fixture": { "labeled": { "text": "hello" } } }
+        }));
+
+        assert_eq!(
+            settings.middleware.names(),
+            [
+                "testing",
+                "testing.middleware-fixture",
+                "testing.middleware-fixture.labeled"
+            ],
+            "should name every table and the ones on the way to it"
+        );
+        let read = settings
+            .middleware_config::<fixture::LabeledSettings>(fixture::LABELED)
+            .expect("should read the table")
+            .expect("should find the table");
+        assert_eq!(read.text, "hello");
+        assert_eq!(
+            settings
+                .middleware
+                .table("testing.middleware-fixture")
+                .map(|table| table.len()),
+            Some(0),
+            "should leave a longer name's table out of a shorter name's settings"
+        );
+        assert!(
+            settings
+                .middleware_config::<fixture::LabeledSettings>("testing.nothing")
+                .expect("should read nothing")
+                .is_none(),
+            "should give nothing for a name with no table"
+        );
+        IntegrationRegistry::new(&settings).expect("should build with the fixture's table");
+    }
+
+    #[test]
+    fn a_middleware_table_at_a_name_nothing_supplies_is_refused() {
+        for (table, name) in [
+            (
+                serde_json::json!({ "testing": { "nothing": { "text": "x" } } }),
+                "testing.nothing",
+            ),
+            (
+                serde_json::json!({
+                    "testing": {
+                        "middleware-fixture": { "labeled": { "text": "x", "deeper": { "a": 1 } } }
+                    }
+                }),
+                "testing.middleware-fixture.labeled.deeper",
+            ),
+        ] {
+            let settings = settings_with_middleware_table(table);
+            let message = IntegrationRegistry::new(&settings)
+                .err()
+                .expect("should refuse a table at a name nothing supplies")
+                .to_string();
+            assert!(
+                message.contains(&format!(
+                    "[middleware.{name}] names `{name}`, which no module that runs supplies"
+                )) && message.contains(fixture::LABELED),
+                "should name the table and list what could be named: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_middleware_table_with_a_key_it_does_not_know_is_refused_as_its_own() {
+        let settings = settings_with_middleware_table(serde_json::json!({
+            "testing": { "middleware-fixture": { "labeled": { "text": "x", "colour": "red" } } }
+        }));
+
+        let message = IntegrationRegistry::new(&settings)
+            .err()
+            .expect("should refuse a key the middleware does not know")
+            .to_string();
+        assert!(
+            message.contains("[middleware.testing.middleware-fixture.labeled] could not be read")
+                && message.contains("colour"),
+            "should name the table and the key: {message}"
+        );
+    }
+
+    #[test]
+    fn the_middleware_section_refuses_a_value_and_a_name_no_middleware_could_have() {
+        let mut settings = settings_naming(fixture::MODULE);
+        settings.middleware =
+            serde_json::from_value(serde_json::json!({ "enabled": true })).expect("should read");
+        let message = settings
+            .middleware
+            .validate_names()
+            .expect_err("should refuse a value at the top")
+            .to_string();
+        assert!(
+            message.contains("[middleware] has a value `enabled` where only tables stand"),
+            "{message}"
+        );
+
+        settings.middleware =
+            serde_json::from_value(serde_json::json!({ "Testing Fixture": { "text": "x" } }))
+                .expect("should read");
+        let message = settings
+            .middleware
+            .validate_names()
+            .expect_err("should refuse a name no middleware could have")
+            .to_string();
+        assert!(
+            message.contains("[middleware] has a table named `Testing Fixture`"),
+            "{message}"
+        );
+    }
+
     #[test]
     fn a_middleware_no_entry_names_is_listed_for_the_startup_warning() {
         let unnamed = |entries: Vec<PhaseEntry>| -> Vec<&'static str> {
@@ -7419,6 +7609,7 @@ mod tests {
                 fixture::REFUSING,
                 fixture::TEXT_HEADER,
                 fixture::LOCATING,
+                fixture::LABELED,
             ],
             "should list every middleware when there are no entries"
         );
@@ -7435,7 +7626,8 @@ mod tests {
                 fixture::PREPARING,
                 fixture::REFUSING,
                 fixture::TEXT_HEADER,
-                fixture::LOCATING
+                fixture::LOCATING,
+                fixture::LABELED
             ],
             "should leave out a middleware any entry names"
         );
@@ -7507,7 +7699,8 @@ mod tests {
                 fixture::PREPARING,
                 fixture::REFUSING,
                 fixture::TEXT_HEADER,
-                fixture::LOCATING
+                fixture::LOCATING,
+                fixture::LABELED
             ],
             "should count a middleware as named only by an entry of a phase it runs in"
         );

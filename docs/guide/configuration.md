@@ -1407,6 +1407,29 @@ endpoint = "https://api.example.com/v1"
 license_key = "example_license_key"
 ```
 
+## Middleware Settings
+
+### `[middleware]`
+
+A middleware's own settings, one `[middleware.<name>]` table per middleware,
+written with the middleware's full name, so `[middleware.example.cleanup]` is
+the `example.cleanup` middleware's table. Core reads none of a table. The
+middleware reads its own through `Settings::middleware_config`, and refuses a
+key it does not know only when its settings type denies unknown fields.
+
+A table holds values and arrays. A table within one is the table of the
+longer name it spells and never a setting, so `[middleware.example.cleanup]`
+beneath `[middleware.example]` is the `example.cleanup` middleware's and the
+`example` middleware never sees it. A table at a name that no middleware the
+deployment runs supplies is refused at startup, with the names that could be
+written, as an entry naming such a middleware is. A middleware that has no
+table of its own reads its module's table, as the stock modules do.
+
+```toml
+[middleware.example.cleanup]
+selectors = [".promo", "#newsletter"]
+```
+
 ## Request Signing
 
 Configuration for Ed25519 request signing.
@@ -2217,8 +2240,10 @@ module's own request hooks left on that reader's request, and nothing it
 writes is stored. The markup it adds to the head goes straight before the
 script bundle, after the fetch middleware's.
 
-A middleware takes its settings from its module's own `[<section>.<name>]`
-table. An entry carries none and switches nothing on.
+A middleware with settings of its own reads them from its `[middleware.<name>]`
+table, see [`[middleware]`](#middleware), and a module's one middleware may
+read the module's own `[<section>.<name>]` table instead, as the stock modules
+do. An entry carries none and switches nothing on.
 
 ### Entries for a media type other than HTML
 
