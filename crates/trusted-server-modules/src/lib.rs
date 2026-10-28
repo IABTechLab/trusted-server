@@ -21,7 +21,8 @@ use trusted_server_core::integrations::IntegrationBuilder;
 use trusted_server_core::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
 
 /// The builders of the modules a stock build ships from crates of their own,
-/// in hook order.
+/// in hook order. None offers a loading cache, so a deployment that wants
+/// copies kept hands a loading cache module's builder to its adapter.
 #[must_use]
 pub fn builders() -> Vec<IntegrationBuilder> {
     vec![
@@ -49,9 +50,6 @@ pub fn builders() -> Vec<IntegrationBuilder> {
         trusted_server_auction_prebid_server::builder(),
         trusted_server_auction_aps::builder(),
         trusted_server_ad_server_mock::builder(),
-        // The loading cache a stock build caches with, offered whatever the
-        // settings say, which no section selects either.
-        trusted_server_loading_cache_51degrees::builder(),
     ]
 }
 
@@ -509,77 +507,26 @@ middleware = [\"robots_txt\"]
                 "auction.prebid-server",
                 "auction.aps",
                 "ad-server.mock",
-                "loading-cache.51degrees",
             ],
             "should offer the stock modules in the order their hooks run"
         );
     }
 
-    /// A feature selects the stock loading cache by the module's short name,
-    /// so a stock build keeps what it loads rather than asking each source
-    /// every time.
+    /// A stock build links no loading cache module, so every feature loads
+    /// through `NoLoadingCache`, which keeps no copy, and a deployment that
+    /// wants copies kept hands a loading cache module's builder to its
+    /// adapter.
     #[test]
-    fn a_feature_selects_the_stock_loading_cache_by_name() {
-        let mut settings = trusted_server_core::test_support::tests::create_test_settings();
-        settings.cache.robots_txt.module = Some("51degrees".to_owned());
-
-        let caches = trusted_server_core::integrations::loading_caches_from(&settings, &builders())
-            .expect("the stock list should offer the selected loading cache");
-
-        assert!(
-            caches
-                .for_feature(trusted_server_core::settings::ROBOTS_TXT_CACHE)
-                .keeps_values(),
-            "the stock loading cache should keep what it loads"
-        );
-    }
-
-    /// A table naming no module takes the one loading cache module the build
-    /// links, so a stock build holds each answer only while this list links
-    /// exactly one. A second would leave the table holding nothing, with no
-    /// message.
-    #[test]
-    fn a_table_naming_no_module_holds_with_the_stock_loading_cache() {
-        let settings = trusted_server_core::test_support::tests::create_test_settings();
-        assert!(
-            settings.cache.robots_txt.module.is_none(),
-            "the test settings should name no module"
-        );
-
-        let caches = trusted_server_core::integrations::loading_caches_from(&settings, &builders())
-            .expect("a table naming no module is not an error");
+    fn the_stock_build_links_no_loading_cache() {
+        let offering: Vec<&str> = builders()
+            .iter()
+            .filter(|builder| builder.loading_cache().is_some())
+            .map(IntegrationBuilder::id)
+            .collect();
 
         assert!(
-            caches
-                .for_feature(trusted_server_core::settings::ROBOTS_TXT_CACHE)
-                .keeps_values(),
-            "a stock build should hold each robots.txt module's answer"
-        );
-    }
-
-    /// `ts config validate` validates against this list, so it accepts the
-    /// stock loading cache by name and refuses a misspelling, which the
-    /// service would otherwise refuse only as it starts.
-    #[test]
-    fn deploy_validation_knows_the_stock_loading_cache() {
-        use trusted_server_core::config::validate_settings_for_deploy_with;
-
-        let stock = builders();
-        let mut settings = trusted_server_core::test_support::tests::create_test_settings();
-
-        settings.cache.robots_txt.module = Some("51degrees".to_owned());
-        validate_settings_for_deploy_with(&settings, &stock)
-            .expect("the stock loading cache should pass deploy validation");
-
-        settings.cache.robots_txt.module = Some("51degreez".to_owned());
-        let error = validate_settings_for_deploy_with(&settings, &stock)
-            .expect_err("a module nothing offers should be refused");
-        assert!(
-            format!("{error:?}").contains(
-                "[cache.robots-txt] module names `51degreez`, which no linked crate offers a \
-                 loading cache from. The loading cache modules this build has are: 51degrees"
-            ),
-            "should name the table and the stock loading cache: {error:?}"
+            offering.is_empty(),
+            "a stock build should link no loading cache, and links {offering:?}"
         );
     }
 
