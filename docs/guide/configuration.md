@@ -1110,7 +1110,7 @@ allows those too. Set `proxy.allowed_domains` to bound what the proxy serves.
 
 Every adapter removes the three from a response before it finalizes it, unless this server answered a request for a path beneath `/_ts`, which is where a deployment is asked about itself. What the publisher's origin sends loses them beneath `/_ts` too. The removal comes before `[response_headers]` is applied, so a header of one of those names set there is still sent.
 
-No adapter writes a version on a response. What the build was made from is in the [attestation document](./attestation), under `build`, and the platform's version number of the service under `platform.serviceVersion`, which is where a deployment is asked about itself.
+No adapter writes a version on a response unless the deployment names the middleware that writes one.
 
 A deployment that wants the versions on its pages names core's `service_version` middleware in the `[[serve]]` entry that covers them, after the module middleware the entry already names. The middleware runs on every page the entry covers, and on nothing else. It writes `X-TS-Version`, the git version the build compiled in from `TRUSTED_SERVER__GIT_VERSION` or local git, when the build knows one, and `X-TS-Service-Version`, the version the adapter reports for the service, when it reports one. No section selects the middleware, and a deployment that does not name it sends nothing about its versions on a page.
 

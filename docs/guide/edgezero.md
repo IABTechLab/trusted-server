@@ -71,9 +71,8 @@ store before deletion, especially when using `--store` or `--no-env`.
 4. Run `ts config push --adapter ADAPTER`.
 5. Start or deploy the adapter and verify a non-health publisher route. A
    healthy endpoint alone may not prove that application configuration loaded.
-   Confirm which build is serving, from the attestation document's `build`
-   fields, or from the `x-ts-version` header on a page where a `[[serve]]`
-   entry names `service_version`.
+   Confirm which build is serving from the `x-ts-version` header on a page
+   where a `[[serve]]` entry names `service_version`.
 
 See [Configuration](/guide/configuration) for the field contract, the
 [CLI guide](/guide/cli) for exact command help, and
