@@ -5,15 +5,18 @@
 //! stored [`edgezero_core::blob_envelope::BlobEnvelope`] and reconstruct
 //! [`Settings`] from its data value.
 
+use std::sync::Arc;
+
 use edgezero_core::blob_envelope::BlobEnvelope;
-use error_stack::Report;
+use error_stack::{Report, ResultExt as _};
 
 use crate::config::TrustedServerAppConfig;
 use crate::error::TrustedServerError;
 use crate::integrations::IntegrationBuilder;
-use crate::platform::{PlatformSecretStore, StoreName};
+use crate::permissions::{PermissionPolicy, PolicyReference, load_policy};
+use crate::platform::{PlatformSecretStore, PolicyOrigin, StoreName};
 use crate::secret_resolution::resolve_secret_references_with;
-use crate::settings::Settings;
+use crate::settings::{PermissionsConfig, Settings};
 
 /// Canonical logical secret store used by Trusted Server app-config secrets.
 pub const DEFAULT_SECRET_STORE_ID: &str = "trusted_server_secrets";
@@ -37,6 +40,9 @@ pub const CONFIG_BLOB_KEY: &str = DEFAULT_CONFIG_STORE_ID;
 ///
 /// Secret references are resolved after envelope verification and before
 /// deserialization. The envelope data itself is never mutated or rewritten.
+/// The permission policy the settings name is then read from
+/// `policy_origin`, checked and parsed, and kept with the settings, which
+/// keep only its name and digest in `[permissions]`.
 ///
 /// A deployment that composes builders of its own calls
 /// [`settings_from_config_blob_with`] instead, so a `[demand]` or
@@ -45,29 +51,40 @@ pub const CONFIG_BLOB_KEY: &str = DEFAULT_CONFIG_STORE_ID;
 /// # Errors
 ///
 /// Returns [`TrustedServerError::Configuration`] when the envelope cannot be
-/// parsed, fails integrity verification, secret resolution fails, or resolved
-/// settings are invalid.
+/// parsed, fails integrity verification, secret resolution fails, resolved
+/// settings are invalid, or the settings name no permission policy or one
+/// that cannot be read, is not the file that was pushed, or is not valid.
 pub fn settings_from_config_blob(
     envelope_json: &str,
     secret_store: &dyn PlatformSecretStore,
     default_secret_store_name: &StoreName,
+    policy_origin: PolicyOrigin<'_>,
 ) -> Result<Settings, Report<TrustedServerError>> {
-    settings_from_config_blob_with(envelope_json, secret_store, default_secret_store_name, &[])
+    settings_from_config_blob_with(
+        envelope_json,
+        secret_store,
+        default_secret_store_name,
+        policy_origin,
+        &[],
+    )
 }
 
 /// Reconstruct runtime [`Settings`] from a serialized config blob envelope,
 /// validating against the built-in integrations followed by
-/// `extra_integrations`.
+/// `extra_integrations`, with the permission policy read from
+/// `policy_origin` as [`settings_from_config_blob`] reads it.
 ///
 /// # Errors
 ///
 /// Returns [`TrustedServerError::Configuration`] when the envelope cannot be
-/// parsed, fails integrity verification, secret resolution fails, or resolved
-/// settings are invalid.
+/// parsed, fails integrity verification, secret resolution fails, resolved
+/// settings are invalid, or the settings name no permission policy or one
+/// that cannot be read, is not the file that was pushed, or is not valid.
 pub fn settings_from_config_blob_with(
     envelope_json: &str,
     secret_store: &dyn PlatformSecretStore,
     default_secret_store_name: &StoreName,
+    policy_origin: PolicyOrigin<'_>,
     extra_integrations: &[IntegrationBuilder],
 ) -> Result<Settings, Report<TrustedServerError>> {
     let envelope: BlobEnvelope = serde_json::from_str(envelope_json).map_err(|error| {
@@ -101,7 +118,76 @@ pub fn settings_from_config_blob_with(
     settings.set_resolved_secrets(resolved);
     crate::config::validate_settings_for_runtime_with(&settings, extra_integrations)?;
     crate::inspect::config::validate_patterns(&settings)?;
+    let policy = load_domain_policy(&mut settings.permissions, policy_origin)?;
+    log_permission_baseline(&policy);
+    settings.attach_permission_policy(policy);
     Ok(settings)
+}
+
+/// Loads the permission policy `permissions` names from `origin`.
+///
+/// The policy's text is parsed into the policy, so `permissions` keeps only
+/// its name and digest.
+fn load_domain_policy(
+    permissions: &mut PermissionsConfig,
+    origin: PolicyOrigin<'_>,
+) -> Result<Arc<PermissionPolicy>, Report<TrustedServerError>> {
+    let refuse = |message: String| Report::new(TrustedServerError::Configuration { message });
+    let Some(policy) = permissions.policy.clone() else {
+        return Err(refuse(
+            "the configuration names no permission policy, so name the publisher's policy \
+             file in `[permissions] policy` and push it with `ts config push --permissions \
+             <file>`"
+                .to_owned(),
+        ));
+    };
+    let Some(sha256) = permissions.sha256.clone() else {
+        return Err(refuse(format!(
+            "the permission policy `{policy}` has no SHA-256, so the configuration was not \
+             pushed with its file, which `ts config push --permissions <file>` supplies"
+        )));
+    };
+    let blob_text = permissions.text.take();
+    let reference = PolicyReference { policy, sha256 };
+    let text =
+        match origin {
+            PolicyOrigin::Blob => blob_text.ok_or_else(|| {
+                refuse(format!(
+                    "the configuration carries no text for the permission policy `{}`, which \
+                 `ts config push --permissions <file>` writes for this adapter",
+                    reference.policy
+                ))
+            })?,
+            PolicyOrigin::Source(source) => source.policy_text(&reference).change_context(
+                TrustedServerError::Configuration {
+                    message: format!(
+                        "the permission policy `{}` cannot be read",
+                        reference.policy
+                    ),
+                },
+            )?,
+        };
+    load_policy(reference, &text)
+}
+
+/// Logs the policy's declared default once per settings load, so an operator
+/// can see which permissions an unmatched request is granted without a
+/// signal, and which jurisdiction its consent gates apply.
+fn log_permission_baseline(policy: &PermissionPolicy) {
+    let maps = policy.maps();
+    let granted: Vec<String> = maps
+        .baseline(None, None)
+        .permissions()
+        .iter()
+        .map(|permission| permission.to_string())
+        .collect();
+    log::debug!(
+        "Permission baseline: policy `{}` ({}) top node, jurisdiction {}; granted without a signal: [{}]",
+        policy.name(),
+        policy.sha256(),
+        maps.default_jurisdiction(),
+        granted.join(", ")
+    );
 }
 
 fn remove_inactive_secret_references(data: &mut serde_json::Value) {
@@ -147,13 +233,17 @@ mod tests {
         AssetOriginAuth, EcPartner, ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig,
     };
     use crate::test_support::tests::{
-        crate_test_settings_str, hmac_passphrase, select_hmac_module, select_host_signals_module,
+        crate_test_settings_str, hmac_passphrase, sample_permissions, select_hmac_module,
+        select_host_signals_module,
     };
 
+    /// Test settings as `ts config push` writes them, naming the repository's
+    /// sample policy.
     fn test_settings() -> Settings {
         let mut settings =
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
+        settings.permissions = sample_permissions();
         settings
     }
 
@@ -244,6 +334,8 @@ mod tests {
         serde_json::from_value(value).expect("should build pull-sync partner")
     }
 
+    /// The blob envelope `ts config push` writes for `settings`, naming the
+    /// repository's sample policy.
     fn envelope_json(settings: &Settings) -> String {
         let data = serde_json::to_value(settings).expect("should serialize settings to JSON");
         let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_string());
@@ -255,6 +347,7 @@ mod tests {
             envelope_json,
             &EchoSecretStore,
             &StoreName::from("trusted_server_secrets"),
+            PolicyOrigin::Blob,
         )
     }
 
@@ -338,6 +431,7 @@ mod tests {
             &envelope_json(settings),
             &ModuleSecretStore,
             &StoreName::from("trusted_server_secrets"),
+            PolicyOrigin::Blob,
             &[module_with_a_secret()],
         )
         .expect("should load settings with the module's builder")
@@ -398,6 +492,7 @@ mod tests {
             &envelope_json(&settings),
             &ModuleSecretStore,
             &StoreName::from("trusted_server_secrets"),
+            PolicyOrigin::Blob,
         )
         .expect("should load settings without the module's builder");
 
@@ -435,6 +530,7 @@ mod tests {
             &envelope,
             &EchoSecretStore,
             &StoreName::from("trusted_server_secrets"),
+            PolicyOrigin::Blob,
             &extra,
         )
         .expect("should load settings naming the external builder's ad server");
@@ -536,6 +632,7 @@ mod tests {
             &envelope_json(&original),
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
+            PolicyOrigin::Blob,
         )
         .expect("should resolve every static credential from the mapped store");
 
@@ -597,6 +694,7 @@ mod tests {
             &envelope_json(&original),
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
+            PolicyOrigin::Blob,
         )
         .expect("should resolve the trusted client IP shared secret");
 
@@ -625,6 +723,7 @@ mod tests {
             &envelope_json(&original),
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
+            PolicyOrigin::Blob,
         )
         .expect_err("should reject a missing trusted client IP shared secret");
         let message = error.to_string();
@@ -660,6 +759,7 @@ mod tests {
             &envelope_json,
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
+            PolicyOrigin::Blob,
         )
         .expect("should resolve the labeled block's passphrase");
 
@@ -727,6 +827,7 @@ mod tests {
                 &envelope_json,
                 &RefusesAValueAsAKey,
                 &StoreName::from("ts_secrets"),
+                PolicyOrigin::Blob,
             )
             .unwrap_or_else(|error| panic!("[ec.{name}] should load: {error:?}"));
 
@@ -759,6 +860,7 @@ mod tests {
             &envelope_json(&original),
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
+            PolicyOrigin::Blob,
         )
         .expect("should resolve default S3 secret keys");
 
@@ -788,6 +890,7 @@ mod tests {
             &envelope_json(&original),
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
+            PolicyOrigin::Blob,
         )
         .expect("should load partner without resolving an API token");
 
@@ -814,6 +917,7 @@ mod tests {
             &envelope_json,
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
+            PolicyOrigin::Blob,
         )
         .expect("should resolve a pull token enabled by a string boolean");
 
@@ -845,6 +949,7 @@ mod tests {
             &envelope_json,
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
+            PolicyOrigin::Blob,
         )
         .expect("should skip a pull token disabled by a string boolean");
 
@@ -866,6 +971,7 @@ mod tests {
             &envelope_json(&original),
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
+            PolicyOrigin::Blob,
         )
         .expect_err("should reject a missing active pull-sync token");
 
@@ -886,6 +992,7 @@ mod tests {
             &envelope_json(&original),
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
+            PolicyOrigin::Blob,
         )
         .expect("should skip inactive optional feature references");
 
@@ -916,6 +1023,7 @@ mod tests {
             &envelope,
             &ModuleSecretStore,
             &StoreName::from("trusted_server_secrets"),
+            PolicyOrigin::Blob,
             &[module_with_a_secret()],
         )
         .expect_err("should refuse a table its section does not select");
@@ -1045,6 +1153,7 @@ mod tests {
             &envelope_json(&original),
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
+            PolicyOrigin::Blob,
         )
         .expect("should resolve the host_signals passphrase from the mapped store");
 
@@ -1109,5 +1218,204 @@ mod tests {
             err.to_string().contains("integrity verification"),
             "error should mention integrity verification"
         );
+    }
+
+    mod permission_policy {
+        use std::collections::BTreeMap;
+
+        use super::*;
+        use crate::permissions::{SAMPLE_POLICY_NAME, SAMPLE_POLICY_TEXT, policy_sha256};
+        use crate::platform::PlatformPolicySource;
+
+        /// Policy files by name, as a folder of them would hold them.
+        struct MemoryPolicies(BTreeMap<&'static str, &'static str>);
+
+        impl PlatformPolicySource for MemoryPolicies {
+            fn policy_text(
+                &self,
+                reference: &PolicyReference,
+            ) -> Result<String, Report<PlatformError>> {
+                self.0
+                    .get(reference.policy.as_str())
+                    .map(|text| (*text).to_owned())
+                    .ok_or_else(|| {
+                        Report::new(PlatformError::PolicySource)
+                            .attach(format!("no file named `{}`", reference.policy))
+                    })
+            }
+        }
+
+        fn load_with(
+            permissions: PermissionsConfig,
+            origin: PolicyOrigin<'_>,
+        ) -> Result<Settings, Report<TrustedServerError>> {
+            let mut settings = test_settings();
+            settings.permissions = permissions;
+            let data = serde_json::to_value(&settings).expect("should serialize settings");
+            let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_string());
+            settings_from_config_blob(
+                &serde_json::to_string(&envelope).expect("should serialize envelope"),
+                &EchoSecretStore,
+                &StoreName::from("trusted_server_secrets"),
+                origin,
+            )
+        }
+
+        fn refusal(result: Result<Settings, Report<TrustedServerError>>) -> String {
+            let error = result.expect_err("the domain should not load");
+            assert!(
+                matches!(
+                    error.current_context(),
+                    TrustedServerError::Configuration { .. }
+                ),
+                "should be a configuration error, which answers 500: {error:?}"
+            );
+            format!("{error:?}")
+        }
+
+        #[test]
+        fn a_domain_naming_no_policy_does_not_load() {
+            let message = refusal(load_with(PermissionsConfig::default(), PolicyOrigin::Blob));
+
+            assert!(
+                message.contains("names no permission policy")
+                    && message.contains("`[permissions] policy`"),
+                "should say what is missing: {message}"
+            );
+        }
+
+        #[test]
+        fn a_policy_with_no_digest_does_not_load() {
+            let permissions = PermissionsConfig {
+                sha256: None,
+                ..sample_permissions()
+            };
+
+            let message = refusal(load_with(permissions, PolicyOrigin::Blob));
+
+            assert!(message.contains("`sample` has no SHA-256"), "{message}");
+        }
+
+        #[test]
+        fn a_blob_without_its_file_does_not_load_where_the_file_travels_in_the_blob() {
+            let permissions = PermissionsConfig {
+                text: None,
+                ..sample_permissions()
+            };
+
+            let message = refusal(load_with(permissions, PolicyOrigin::Blob));
+
+            assert!(
+                message.contains("carries no text for the permission policy `sample`"),
+                "{message}"
+            );
+        }
+
+        #[test]
+        fn a_file_that_is_not_the_pushed_file_does_not_load() {
+            let permissions = PermissionsConfig {
+                text: Some(format!("{SAMPLE_POLICY_TEXT}\n# edited after the push\n")),
+                ..sample_permissions()
+            };
+
+            let message = refusal(load_with(permissions, PolicyOrigin::Blob));
+
+            assert!(
+                message.contains("`sample` is not the file that was pushed"),
+                "{message}"
+            );
+        }
+
+        #[test]
+        fn a_pushed_file_that_is_not_a_valid_policy_does_not_load() {
+            let text = "groups: [\n";
+            let permissions = PermissionsConfig {
+                policy: Some("broken".to_owned()),
+                sha256: Some(policy_sha256(text)),
+                text: Some(text.to_owned()),
+            };
+
+            let message = refusal(load_with(permissions, PolicyOrigin::Blob));
+
+            assert!(message.contains("`broken` is not valid"), "{message}");
+        }
+
+        #[test]
+        fn the_named_policy_loads_and_only_its_name_and_digest_stay_in_the_settings() {
+            let settings = load_with(sample_permissions(), PolicyOrigin::Blob)
+                .expect("a blob carrying its policy should load");
+
+            let policy = settings
+                .permission_policy()
+                .expect("should keep the policy with the settings");
+            assert_eq!(policy.name(), SAMPLE_POLICY_NAME);
+            assert_eq!(policy.sha256(), policy_sha256(SAMPLE_POLICY_TEXT));
+            assert_eq!(
+                settings.permissions,
+                PermissionsConfig {
+                    text: None,
+                    ..sample_permissions()
+                },
+                "the parsed file should leave only its name and digest"
+            );
+        }
+
+        #[test]
+        fn two_loads_that_pin_one_digest_parse_the_file_once() {
+            let load = || {
+                load_with(sample_permissions(), PolicyOrigin::Blob)
+                    .expect("a blob carrying its policy should load")
+            };
+            let (first, second) = (load(), load());
+
+            let maps = |settings: &Settings| {
+                std::ptr::from_ref(
+                    settings
+                        .permission_policy()
+                        .expect("should keep the policy")
+                        .maps(),
+                )
+            };
+            assert!(
+                std::ptr::eq(maps(&first), maps(&second)),
+                "the second load should keep the rules the first one parsed"
+            );
+        }
+
+        #[test]
+        fn a_policy_source_supplies_the_file_and_any_text_in_the_blob_is_unused() {
+            let source = MemoryPolicies(BTreeMap::from([(SAMPLE_POLICY_NAME, SAMPLE_POLICY_TEXT)]));
+
+            for text in [None, Some("not the pushed file".to_owned())] {
+                let permissions = PermissionsConfig {
+                    text,
+                    ..sample_permissions()
+                };
+                let settings = load_with(permissions, PolicyOrigin::Source(&source))
+                    .expect("the source's file should load");
+                assert_eq!(
+                    settings
+                        .permission_policy()
+                        .expect("should keep the policy")
+                        .name(),
+                    SAMPLE_POLICY_NAME
+                );
+            }
+        }
+
+        #[test]
+        fn a_policy_the_source_cannot_read_does_not_load() {
+            let source = MemoryPolicies(BTreeMap::new());
+
+            let message = refusal(load_with(
+                sample_permissions(),
+                PolicyOrigin::Source(&source),
+            ));
+
+            assert!(
+                message.contains("`sample` cannot be read") && message.contains("no file named"),
+                "should name the policy and the source's reason: {message}"
+            );
+        }
     }
 }

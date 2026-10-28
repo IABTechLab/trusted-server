@@ -27,7 +27,7 @@ use trusted_server_core::module_context::{ModuleContext, test_support};
 use trusted_server_core::permission_signal::{
     PermissionSignalModule, build_permission_signal_modules,
 };
-use trusted_server_core::permissions::{Permission, PermissionState};
+use trusted_server_core::permissions::{Permission, PermissionMaps, PermissionState};
 use trusted_server_core::platform::GeoInfo;
 use trusted_server_core::settings::Settings;
 use trusted_server_permission_signal_gpc::GpcModule;
@@ -94,7 +94,8 @@ fn assembled(
 }
 
 /// The permissions assembled for a request carrying `consent` and `evidence`,
-/// with the modules handed the request's module context.
+/// with the modules handed the request's module context, under the
+/// repository's sample policy.
 fn assembled_with(
     consent: &ConsentContext,
     evidence: &OwnedRequestInfo,
@@ -104,7 +105,7 @@ fn assembled_with(
     let context = ModuleContext::new(test_support::request("/"))
         .with_consent(consent)
         .with_evidence(evidence);
-    assemble_permissions(&context, geo, modules)
+    assemble_permissions(PermissionMaps::sample(), &context, geo, modules)
 }
 
 /// Builds a minimal decoded TCF record consenting to the given 1-indexed
