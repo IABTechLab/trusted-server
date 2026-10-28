@@ -692,7 +692,7 @@
     "3": {
       "branch": "feature/binary-attestations-phase3",
       "base": "feature/binary-attestations-phase2",
-      "pull_request": null
+      "pull_request": 1463
     },
     "4": {
       "branch": "feature/binary-attestations-phase4",
@@ -1363,7 +1363,11 @@
     },
     "crates/trusted-server-release/src/process.rs": {
       "commit": "1534d462d052debae8b5d886268701077bf879a5",
-      "state": "Ported Phase 2 source or approved split"
+      "state": "Ported Phase 2 source or approved split",
+      "review_followup": {
+        "commit": "927109fa13413af1579500ed1256d467c6890370",
+        "reason": "Replace destructive post-reap group confirmation with bounded signal-zero observation; preserve initial pinned SIGKILL, reaping and real errno handling."
+      }
     },
     "crates/trusted-server-release/src/process/environment.rs": {
       "commit": "1534d462d052debae8b5d886268701077bf879a5",
@@ -1383,7 +1387,11 @@
     },
     "crates/trusted-server-release/src/process/supervise.rs": {
       "commit": "1534d462d052debae8b5d886268701077bf879a5",
-      "state": "Ported Phase 2 source or approved split"
+      "state": "Ported Phase 2 source or approved split",
+      "review_followup": {
+        "commit": "927109fa13413af1579500ed1256d467c6890370",
+        "reason": "Replace destructive post-reap group confirmation with bounded signal-zero observation; preserve initial pinned SIGKILL, reaping and real errno handling."
+      }
     },
     "crates/trusted-server-release/src/process/tests.rs": {
       "commit": "1534d462d052debae8b5d886268701077bf879a5",

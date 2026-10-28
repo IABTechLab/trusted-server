@@ -128,7 +128,7 @@ The user approved exact `json-schema.org` and `spdx.org` reference-host entries 
 
 ### Ledger
 
-The landing phase below is exclusive file ownership. Shared files receive later integration hunks as listed above. Phase 1 rows are retained, not re-ported. Phase 2 is draft #1449; Phase 3/4 PRs are not created yet. Exact branches/bases and intended titles are recorded above.
+The landing phase below is exclusive file ownership. Shared files receive later integration hunks as listed above. Phase 1 rows are retained, not re-ported. Phase 2 is draft #1449; Phase 3 is draft #1463, stacked on Phase 2. Phase 4 is not opened. Exact branches/bases and intended titles are recorded above.
 
 | Frozen-source path                                                                                             | Landing phase | State                                                     |
 | -------------------------------------------------------------------------------------------------------------- | ------------- | --------------------------------------------------------- |
