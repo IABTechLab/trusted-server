@@ -77,7 +77,7 @@ use http::{Request, header};
 use url::Url;
 
 use crate::consent::{self as consent_mod, ConsentContext, ConsentPipelineInput};
-use crate::constants::COOKIE_TS_EC;
+use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_REVOKED};
 use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
@@ -279,6 +279,9 @@ pub struct EcContext {
     /// Withdrawn EC IDs whose before-send tombstone returned
     /// [`EcKvSnapshot::Failed`], for the after-send retry.
     failed_withdrawals: Vec<String>,
+    /// The `ts-ec-revoked` marker the request carried: the consent
+    /// fingerprint a global revoke saw (spec 8).
+    revoke_marker: Option<String>,
 }
 
 impl EcContext {
@@ -371,6 +374,11 @@ impl EcContext {
                 identity
             },
             failed_withdrawals: Vec::new(),
+            revoke_marker: parsed
+                .jar
+                .as_ref()
+                .and_then(|jar| jar.get(COOKIE_TS_EC_REVOKED))
+                .map(|cookie| cookie.value().to_owned()),
         })
     }
 
@@ -406,6 +414,11 @@ impl EcContext {
                 "EC generation skipped: consent not granted (jurisdiction={})",
                 self.consent.jurisdiction,
             );
+            return Ok(());
+        }
+
+        if self.revoke_blocks_minting() {
+            log::info!("EC generation skipped: a global revoke holds until consent changes");
             return Ok(());
         }
 
@@ -570,6 +583,25 @@ impl EcContext {
     /// (spec 8).
     pub(crate) fn request_global_revoke(&mut self) {
         self.identity.request_global_revoke();
+    }
+
+    /// Whether the request carries a global-revoke marker for its own
+    /// consent, which stops EC minting (spec 8).
+    #[must_use]
+    pub(crate) fn revoke_blocks_minting(&self) -> bool {
+        self.revoke_marker.as_deref() == Some(cookies::revoke_marker_value(&self.consent).as_str())
+    }
+
+    /// Whether the request carries a global-revoke marker at all.
+    #[must_use]
+    pub(crate) fn has_revoke_marker(&self) -> bool {
+        self.revoke_marker.is_some()
+    }
+
+    /// Sets the request's global-revoke marker, as if it carried the cookie.
+    #[cfg(test)]
+    pub(crate) fn set_revoke_marker_for_test(&mut self, marker: &str) {
+        self.revoke_marker = Some(marker.to_owned());
     }
 
     /// Whether a capture asked for the consent-withdrawal tombstone path.
@@ -821,6 +853,7 @@ impl EcContext {
             eid_sync_source: None,
             identity: RequestIdentity::default(),
             failed_withdrawals: Vec::new(),
+            revoke_marker: None,
         }
     }
 
@@ -866,6 +899,7 @@ impl EcContext {
             eid_sync_source: None,
             identity: RequestIdentity::default(),
             failed_withdrawals: Vec::new(),
+            revoke_marker: None,
         }
     }
 
@@ -894,6 +928,7 @@ impl EcContext {
             eid_sync_source: None,
             identity: RequestIdentity::default(),
             failed_withdrawals: Vec::new(),
+            revoke_marker: None,
         }
     }
 }
@@ -1112,6 +1147,49 @@ mod tests {
             matches!(ec.kv_snapshot(), EcKvSnapshot::Present { .. }),
             "generation should seed a present snapshot"
         );
+    }
+
+    #[test]
+    fn a_revoke_marker_for_this_consent_stops_minting_until_consent_changes() {
+        let settings = create_test_settings();
+        let mint_under = |consent: ConsentContext, marker: &str| {
+            let mut ec =
+                EcContext::new_for_test_with_ip(None, consent, Some("192.0.2.5".to_owned()));
+            ec.set_revoke_marker_for_test(marker);
+            let graph = KvIdentityGraph::in_memory("ec-store");
+            ec.generate_if_needed(&settings, Some(&graph), &BrowserSeed::empty())
+                .expect("should not error");
+            ec.ec_generated()
+        };
+        let same = cookies::revoke_marker_value(&granting_consent());
+        let mut with_gpc = granting_consent();
+        with_gpc.gpc = true;
+        let earlier = cookies::revoke_marker_value(&with_gpc);
+
+        assert_ne!(earlier, same, "precondition: GPC changes the marker value");
+        assert!(
+            !mint_under(granting_consent(), &same),
+            "should not mint while the consent the revoke saw is unchanged"
+        );
+        assert!(
+            mint_under(granting_consent(), &earlier),
+            "should mint once the consent differs from the one the revoke saw"
+        );
+    }
+
+    #[test]
+    fn read_from_request_reads_the_revoke_marker() {
+        let settings = create_test_settings();
+        let req = create_test_request(&[("cookie", "ts-ec-revoked=10009")]);
+
+        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
+
+        assert!(ec.has_revoke_marker(), "should read the marker cookie");
+        let plain =
+            EcContext::read_from_request(&settings, &create_test_request(&[]), &noop_services())
+                .expect("should read EC context");
+        assert!(!plain.has_revoke_marker(), "control: no cookie, no marker");
     }
 
     #[test]

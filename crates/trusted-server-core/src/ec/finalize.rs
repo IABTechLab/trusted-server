@@ -13,7 +13,7 @@ use crate::consent::{ConsentContext, allows_eid_persistence};
 use crate::settings::Settings;
 
 use super::EcContext;
-use super::cookies::{expire_ec_cookie, set_ec_cookie};
+use super::cookies::{expire_ec_cookie, expire_revoke_marker, set_ec_cookie, set_revoke_marker};
 use super::generation::{generate_ec_id, is_valid_ec_id};
 use super::identity::ids::SourceDomain;
 use super::identity::mutation::{IdentityMutation, PartnerIdChange};
@@ -69,6 +69,8 @@ pub fn ec_finalize_response(
     if !consent_allows_ec || global_revoke {
         if global_revoke {
             *ec_context.identity_mut().mutation_mut() = IdentityMutation::default();
+            // No EC is minted until the visitor's consent changes (spec 8).
+            set_revoke_marker(settings, response, ec_context.consent());
         }
         finalize_unusable_consent(
             settings,
@@ -156,6 +158,9 @@ pub fn ec_finalize_response(
                 record_eid_sync_terminal(EidSyncSource::NewEc, EidCookieSyncOutcome::Written);
             }
             set_ec_cookie_on_response(settings, ec_context, response);
+            if ec_context.has_revoke_marker() {
+                expire_revoke_marker(settings, response);
+            }
         } else {
             log::warn!("Skipping generated EC cookie because backing row is not authoritative");
         }
@@ -3091,6 +3096,71 @@ mod tests {
                 "control: without a revoke the cookie stays"
             );
             assert_eq!(store.writes().total(), 0, "control: writes nothing");
+        }
+
+        fn revoke_marker_cookie(response: &Response<EdgeBody>) -> Option<String> {
+            response
+                .headers()
+                .get_all(http::header::SET_COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .find(|cookie| cookie.starts_with("ts-ec-revoked="))
+                .map(str::to_owned)
+        }
+
+        #[test]
+        fn capture_global_revoke_sets_the_minting_marker() {
+            let graph = KvIdentityGraph::in_memory("ec-store");
+            let ec_id = sample_ec_id("marker");
+            graph
+                .create(&ec_id, &KvEntry::minimal("p.example.com", "uid", 1_000))
+                .expect("should seed the row");
+            let mut context = consenting_context(&ec_id);
+            context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+            context.request_global_revoke();
+
+            let response = finalize(&mut context, &graph);
+
+            let marker = revoke_marker_cookie(&response).expect("should set the marker");
+            assert!(
+                marker.starts_with(&format!(
+                    "ts-ec-revoked={};",
+                    crate::ec::cookies::revoke_marker_value(context.consent())
+                )),
+                "should hold the fingerprint of the consent the revoke saw"
+            );
+            assert!(
+                marker.contains("HttpOnly") && marker.contains("Secure"),
+                "should be HttpOnly and Secure"
+            );
+
+            let mut control = consenting_context(&ec_id);
+            control.set_kv_snapshot(graph.load_snapshot(&ec_id));
+            assert!(
+                revoke_marker_cookie(&finalize(&mut control, &graph)).is_none(),
+                "control: without a revoke no marker is set"
+            );
+        }
+
+        #[test]
+        fn minting_under_changed_consent_expires_a_stale_marker() {
+            let graph = KvIdentityGraph::in_memory("ec-store");
+            let mut context = EcContext::new_for_test_with_ip(
+                None,
+                granting_consent(),
+                Some("192.0.2.5".to_owned()),
+            );
+            context.set_revoke_marker_for_test("ffff");
+            context
+                .generate_if_needed(&create_test_settings(), Some(&graph), &BrowserSeed::empty())
+                .expect("should mint");
+
+            let response = finalize(&mut context, &graph);
+
+            assert!(
+                revoke_marker_cookie(&response).is_some_and(|cookie| cookie.contains("Max-Age=0")),
+                "should expire the marker once a new EC is minted"
+            );
         }
 
         #[test]

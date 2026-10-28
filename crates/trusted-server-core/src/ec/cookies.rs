@@ -18,7 +18,10 @@ use std::borrow::Cow;
 use edgezero_core::body::Body as EdgeBody;
 use http::{HeaderValue, Response, header};
 
-use crate::constants::COOKIE_TS_EC;
+use crate::consent::ConsentContext;
+use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_REVOKED};
+use crate::ec::identity::descriptor::ConsentPolicy;
+use crate::ec::identity::policy::{PolicySignals, fingerprint_bits};
 use crate::settings::Settings;
 
 /// Maximum age for the EC cookie (1 year in seconds).
@@ -151,6 +154,53 @@ pub fn set_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>, ec_
             log::warn!("Skipping EC Set-Cookie: invalid header value: {e}");
         }
     }
+}
+
+/// The value of the global-revoke marker for `consent`: the strict
+/// policy's consent fingerprint (TCF bits, US opt-outs and GPC), hex. It
+/// changes when the visitor's consent changes, and not when a CMP re-saves
+/// the same decisions (spec 8).
+#[must_use]
+pub(crate) fn revoke_marker_value(consent: &ConsentContext) -> String {
+    fingerprint_bits(&ConsentPolicy::strict(), consent, PolicySignals::default())
+}
+
+fn append_revoke_marker(
+    settings: &Settings,
+    response: &mut Response<EdgeBody>,
+    value: &str,
+    max_age: i32,
+) {
+    let cookie = format!(
+        "{COOKIE_TS_EC_REVOKED}={value}; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={max_age}; HttpOnly",
+        settings.publisher.ec_cookie_domain()
+    );
+    match HeaderValue::from_str(&cookie) {
+        Ok(val) => {
+            response.headers_mut().append(header::SET_COOKIE, val);
+        }
+        Err(e) => log::warn!("Skipping revoke marker Set-Cookie: invalid header value: {e}"),
+    }
+}
+
+/// Sets the global-revoke marker to the fingerprint of `consent`, so no EC
+/// is minted until the visitor's consent changes (spec 8).
+pub(crate) fn set_revoke_marker(
+    settings: &Settings,
+    response: &mut Response<EdgeBody>,
+    consent: &ConsentContext,
+) {
+    append_revoke_marker(
+        settings,
+        response,
+        &revoke_marker_value(consent),
+        COOKIE_MAX_AGE,
+    );
+}
+
+/// Expires the global-revoke marker once a new EC has been minted.
+pub(crate) fn expire_revoke_marker(settings: &Settings, response: &mut Response<EdgeBody>) {
+    append_revoke_marker(settings, response, "", 0);
 }
 
 /// Expires the EC cookie by setting `Max-Age=0`.

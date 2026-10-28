@@ -672,7 +672,7 @@ Each provider can have an `[ec.identity.providers.<id>]` table. A provider with 
 
 **`cookie_priority`.** When the `__Host-ts-eids-s` mirror exceeds its size cap, whole sources are left out, lowest `cookie_priority` first.
 
-**`revoke_scope`.** For a provider that captures IDs from proxied responses. With `provider`, a captured opt-out removes that provider's records and, for a capture-only provider, the records of its listed sources that no provider wrote. With `global`, a captured opt-out runs the consent-withdrawal tombstone: the row is tombstoned, the `ts-ec` cookie is cleared, and everything is removed, provider opt-outs included. Either way it applies whatever the client, as a consent withdrawal does; only clearing an opt-out needs a real browser.
+**`revoke_scope`.** For a provider that captures IDs from proxied responses. With `provider`, a captured opt-out removes that provider's records and, for a capture-only provider, the records of its listed sources that no provider wrote. With `global`, a captured opt-out runs the consent-withdrawal tombstone: the row is tombstoned, the `ts-ec` cookie is cleared, and everything is removed, provider opt-outs included. It also sets an `HttpOnly` `ts-ec-revoked` cookie holding a fingerprint of the visitor's consent, and no new EC is minted while that consent is unchanged, so a CMP that still grants does not undo the revoke on the next page. Either way it applies whatever the client, as a consent withdrawal does; only clearing an opt-out needs a real browser.
 
 #### Source ownership (`[[ec.partners]].owner`)
 

@@ -1,6 +1,9 @@
 use http::header::HeaderName;
 
 pub const COOKIE_TS_EC: &str = "ts-ec";
+/// Marks a global revoke: holds the consent fingerprint the revoke saw, and
+/// stops EC minting while the request's consent is unchanged.
+pub const COOKIE_TS_EC_REVOKED: &str = "ts-ec-revoked";
 /// Cookie written by the Trusted Server JS SDK containing a standard-base64-encoded
 /// JSON array of Extended User IDs (`[{ source, uids }]`) from identity providers.
 pub const COOKIE_TS_EIDS: &str = "ts-eids";

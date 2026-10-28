@@ -2805,7 +2805,15 @@ visitor starts again with a new EC.
 `opted_out` is the provider opt-out above. With `"global"`, a captured
 `opted_out` runs today's consent-withdrawal tombstone path on that request
 instead (section 5.1): the row is tombstoned, the EC cookie is cleared, and
-everything is removed, provider opt-outs included. It uses the withdrawal's
+everything is removed, provider opt-outs included. Because the CMP may still
+grant, the next navigation would mint a new EC and undo the revoke, so the
+response also sets `ts-ec-revoked` (`Path=/; Secure; SameSite=Lax;
+HttpOnly`, the EC cookie's domain and one-year `Max-Age`), holding the strict
+policy's consent fingerprint for the request (section 8, `fp`, without DNT).
+`generate_if_needed` mints no EC while the request carries that marker and
+its own fingerprint equals it. Once the consent changes, minting resumes and
+the response that sets the new `ts-ec` expires the marker. A CMP re-save with
+the same decisions keeps the fingerprint, so it does not lift the revoke. It uses the withdrawal's
 existing exception, so it adds no page-load exception to G4, and like a
 withdrawal it applies whatever the client (section 4.7). An opt-out from `resolves` is always
 provider-scoped.
@@ -4568,7 +4576,9 @@ a KV migration to version 1, which this spec does not provide.
 3. **Global revoke and a granting CMP.** A global revoke clears the EC
    cookie, as a withdrawal does, but the CMP's consent may still grant. The
    next navigation then mints a new EC. Should a global revoke also stop
-   minting until consent changes?
+   minting until consent changes? **Decided (round 14):** yes. `revoke_scope
+= "global"` stays, and the `ts-ec-revoked` marker stops minting until the
+   consent fingerprint changes (section 8, Revoke scope).
 4. **Durable stager results.** Stagers persist no positive ID (section
    5.3), so a positive Lockr capture, with its full entry set, reaches KV
    only as the one UID browser ingest picks. Should a durable path
@@ -4631,22 +4641,23 @@ Decisions made while writing this spec, with the user:
 Revision 15 applies these decisions, made by the user after the round 14
 review, which allowed breaking changes:
 
-| Decision             | Choice                                                                                                                                                                                                                                                              |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Stager providers     | None. Resolving providers run only on writer navigations, so every outcome, backoff included, is stored. Stagers serve KV                                                                                                                                           |
-| Removals             | Written to KV on the request that carries them. `ts-eids-r`, its keyring and secrets, the overflow write and the strips-only rollout step are removed                                                                                                               |
-| Non-browser removals | Applied, as consent withdrawals are; only clears need a real browser. Changed after the round 14 review from dropping them                                                                                                                                          |
-| Expiry scope         | G7 covers owned expiring sources. A stateless owner keeps its expired record as a refresh anchor until `exp` plus its declared refresh grace. Unowned IDs keep no lifetime (section 2.3). Changed after the round 14 review                                         |
-| Opt-out clears       | A TCF re-grant clears only a denial `fp` recorded (new TCF bit 16), with no `LastUpdated` comparison. A clear stores a watermark, the `at` of the opt-out it read, as `ps.oc`, and clears apply before opt-outs. Changed after the round 14 review                  |
-| Backend budget       | `max_backend_requests` (default 32) bounds origin, auction and provider calls in one execution; a provider call past it is skipped, not a failure, and a hold call reserves the origin and the auction. Added after the round 14 review                             |
-| Per-IP ceiling       | `max_calls_per_ip_per_minute` (default 10) caps one provider's calls per client address across visitors, keyed on an HMAC of the IP, next to the per-visitor cap. Breaker failures are not required to come from distinct visitors. Added after the round 14 review |
-| Reader-first rollout | Rollout step 0, from `main`, reads version 2 rows, never rewrites them except to tombstone, and serves no stored ID from a row with a provider opt-out, so step 1 can roll back and deploy alongside old instances. Added after the round 14 review                 |
-| Capture              | Revoke-only: removals, opt-out and clear. Positive IDs are counted, never stored. `capture_enabled` and request-body consent are removed                                                                                                                            |
-| Capture-only opt-out | Also removes the records of its sources that no provider wrote, and blocks the browser's values for them. A capture-only provider cannot own a source and must list its `sources`                                                                                   |
-| Provider denials     | A provider's `ps.iv` and `ps.ov` filter browser candidates for unowned sources too. An opt-out's removals go to `ps.ov`, which its clear empties                                                                                                                    |
-| Mirror feedback      | The shim never copies `ts-eids-s` into `ts-eids` or the `/auction` body                                                                                                                                                                                             |
-| Dry run              | Removed, with `is_dry_run`                                                                                                                                                                                                                                          |
-| KV schema            | Version 2 with one record shape. Version 1 rows are read and upgraded on write. Rollout step 0 reads version 2 and never rewrites it, so step 1 can roll back to it                                                                                                 |
-| Stored hashes        | `ps.iv` hashes are unkeyed and the consent fingerprint is a plain bitmask, because the row already holds the raw values. No legacy revision hash                                                                                                                    |
-| Pull sync            | The pull-complete marker and the legacy pull sync config keys are removed                                                                                                                                                                                           |
-| Withdrawal retry     | A tombstone that fails before send gets one more attempt after send                                                                                                                                                                                                 |
+| Decision              | Choice                                                                                                                                                                                                                                                              |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Stager providers      | None. Resolving providers run only on writer navigations, so every outcome, backoff included, is stored. Stagers serve KV                                                                                                                                           |
+| Removals              | Written to KV on the request that carries them. `ts-eids-r`, its keyring and secrets, the overflow write and the strips-only rollout step are removed                                                                                                               |
+| Non-browser removals  | Applied, as consent withdrawals are; only clears need a real browser. Changed after the round 14 review from dropping them                                                                                                                                          |
+| Expiry scope          | G7 covers owned expiring sources. A stateless owner keeps its expired record as a refresh anchor until `exp` plus its declared refresh grace. Unowned IDs keep no lifetime (section 2.3). Changed after the round 14 review                                         |
+| Opt-out clears        | A TCF re-grant clears only a denial `fp` recorded (new TCF bit 16), with no `LastUpdated` comparison. A clear stores a watermark, the `at` of the opt-out it read, as `ps.oc`, and clears apply before opt-outs. Changed after the round 14 review                  |
+| Backend budget        | `max_backend_requests` (default 32) bounds origin, auction and provider calls in one execution; a provider call past it is skipped, not a failure, and a hold call reserves the origin and the auction. Added after the round 14 review                             |
+| Per-IP ceiling        | `max_calls_per_ip_per_minute` (default 10) caps one provider's calls per client address across visitors, keyed on an HMAC of the IP, next to the per-visitor cap. Breaker failures are not required to come from distinct visitors. Added after the round 14 review |
+| Reader-first rollout  | Rollout step 0, from `main`, reads version 2 rows, never rewrites them except to tombstone, and serves no stored ID from a row with a provider opt-out, so step 1 can roll back and deploy alongside old instances. Added after the round 14 review                 |
+| Global revoke minting | A global revoke also sets `ts-ec-revoked` with the consent fingerprint, and no EC is minted until the request's fingerprint differs. Decided after the round 14 review                                                                                              |
+| Capture               | Revoke-only: removals, opt-out and clear. Positive IDs are counted, never stored. `capture_enabled` and request-body consent are removed                                                                                                                            |
+| Capture-only opt-out  | Also removes the records of its sources that no provider wrote, and blocks the browser's values for them. A capture-only provider cannot own a source and must list its `sources`                                                                                   |
+| Provider denials      | A provider's `ps.iv` and `ps.ov` filter browser candidates for unowned sources too. An opt-out's removals go to `ps.ov`, which its clear empties                                                                                                                    |
+| Mirror feedback       | The shim never copies `ts-eids-s` into `ts-eids` or the `/auction` body                                                                                                                                                                                             |
+| Dry run               | Removed, with `is_dry_run`                                                                                                                                                                                                                                          |
+| KV schema             | Version 2 with one record shape. Version 1 rows are read and upgraded on write. Rollout step 0 reads version 2 and never rewrites it, so step 1 can roll back to it                                                                                                 |
+| Stored hashes         | `ps.iv` hashes are unkeyed and the consent fingerprint is a plain bitmask, because the row already holds the raw values. No legacy revision hash                                                                                                                    |
+| Pull sync             | The pull-complete marker and the legacy pull sync config keys are removed                                                                                                                                                                                           |
+| Withdrawal retry      | A tombstone that fails before send gets one more attempt after send                                                                                                                                                                                                 |
