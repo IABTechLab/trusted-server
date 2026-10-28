@@ -1,12 +1,12 @@
 # Gate 2 proposal: complete SPDX from owning build evidence
 
-**Status:** Gate 2 design approved on 2026-10-28 for strict admission from retained, artifact-bound owning evidence. Plan only: production generation stays closed until all seven binaries pass. The [coverage matrix and rollout decision](binary-attestations-phase3-complete-spdx-implementation.md) stops at costly evidence gaps before implementation; no code, qualification or rehearsal tag is authorized.
+**Status:** Gate 2 design approved on 2026-10-28 for strict admission from retained, artifact-bound owning evidence. Plan only: production generation stays closed until all seven binaries pass. The [coverage matrix](binary-attestations-phase3-complete-spdx-implementation.md) and [full-cohort cost assessment](binary-attestations-phase3-full-cohort-feasibility.md) expose costly evidence gaps before any implementation; no code, qualification or rehearsal tag is authorized.
 
 **Historical reviewed baseline:** Phase 2 `8a797dbcb0467b867dfbcc571597110b9254d672`, tree-equivalent to `08e1c33b8` after application integration `7d551777daeaee09e24bce9bf4f96edac6e5e0df`. Rehearsal `.13` remains evidence only for `770a425df4b28caaaef68dfd930bceabd9928046`.
 
 **Verification baseline:** [Historical Phase 2 `8a797dbcb` CI passed](https://github.com/IABTechLab/trusted-server/actions/runs/40654745582); signing/publication and manual negative canaries were skipped as configured.
 
-**Current integration baseline:** Phase 2 `5fa3843364f247fdc261c438ab9257323637a42c`; [exact-head CI](https://github.com/IABTechLab/trusted-server/actions/runs/40664514307) and readiness work are tracked in #1449. Historical `.13` does not cover later application inputs; the newly authorized rehearsal is not yet recorded.
+**Current integration baseline:** Phase 2 `5fa3843364f247fdc261c438ab9257323637a42c`; [exact-head CI](https://github.com/IABTechLab/trusted-server/actions/runs/40664514307) and readiness work are tracked in #1449. Rehearsal `.16` covers this exact implementation; [full transcript](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6467368408). Phase 2 `fb4843355` is the later docs-only evidence record.
 
 **Tracking:** Part of #1235.
 

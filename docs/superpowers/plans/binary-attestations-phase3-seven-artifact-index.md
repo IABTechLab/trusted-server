@@ -1,12 +1,12 @@
 # Gate 3 proposal: seven-artifact release-index amendment
 
-**Status:** Gate 3 design approved on 2026-10-28 with new neutral v2 cohort ID `trusted-server-binaries`. Frozen v1 keeps `phase1-fastly-cli`. The [concrete index plan](binary-attestations-phase3-seven-artifact-index-implementation.md), including the explicit repeatability definition and additive policy path, awaits approval. No schema, policy, consumer, producer or workflow implementation is authorized yet.
+**Status:** Gate 3 design approved on 2026-10-28 with new neutral v2 cohort ID `trusted-server-binaries`. Frozen v1 keeps `phase1-fastly-cli`. The [concrete index plan](binary-attestations-phase3-seven-artifact-index-implementation.md), with the CLI-owned v2 policy, a separate producer cohort source and staged execution gates, awaits revised-plan approval. The repeatability definition is approved; no implementation follows until its sequencing gates open. No schema, policy, consumer, producer or workflow implementation is authorized yet.
 
 **Historical reviewed baseline:** Phase 2 `8a797dbcb0467b867dfbcc571597110b9254d672`, tree-equivalent to `08e1c33b8` after application integration `7d551777daeaee09e24bce9bf4f96edac6e5e0df`. `.13` remains attributed exclusively to `770a425df4b28caaaef68dfd930bceabd9928046`.
 
 **Verification baseline:** [Historical Phase 2 `8a797dbcb` CI passed](https://github.com/IABTechLab/trusted-server/actions/runs/40654745582); signing/publication and manual negative canaries were skipped as configured.
 
-**Current integration baseline:** Phase 2 `5fa3843364f247fdc261c438ab9257323637a42c`; [exact-head CI](https://github.com/IABTechLab/trusted-server/actions/runs/40664514307) and readiness work are tracked in #1449. Historical `.13` does not cover later application inputs; the newly authorized rehearsal is not yet recorded.
+**Current integration baseline:** Phase 2 `5fa3843364f247fdc261c438ab9257323637a42c`; [exact-head CI](https://github.com/IABTechLab/trusted-server/actions/runs/40664514307) and readiness work are tracked in #1449. Rehearsal `.16` covers this exact implementation; [full transcript](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6467368408). Phase 2 `fb4843355` is the later docs-only evidence record.
 
 **Tracking:** Part of #1235.
 
