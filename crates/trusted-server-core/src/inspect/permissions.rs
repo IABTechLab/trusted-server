@@ -144,7 +144,7 @@ mod tests {
 
     fn state_with_signal() -> PermissionState {
         PermissionState::new(PermissionSet::none().with(Permission::StoreOnDevice))
-            .with_signals(vec![ValidSignal::new("tcf", "tcf", "CPabc123")].into())
+            .with_signals(vec![ValidSignal::new("example", "example", "CPabc123")].into())
             .with_tdls(
                 vec![
                     Tdl::new("https://terms.example.com/marketing/2.txt")
@@ -171,10 +171,10 @@ mod tests {
     fn the_payload_names_the_signal_and_the_module_that_read_it() {
         let payload = permissions_payload(&state_with_signal(), &create_test_settings());
 
-        assert_eq!(payload["signals"][0]["module"], "tcf");
-        assert_eq!(payload["signals"][0]["scheme"], "tcf");
+        assert_eq!(payload["signals"][0]["module"], "example");
+        assert_eq!(payload["signals"][0]["scheme"], "example");
         assert_eq!(payload["signals"][0]["value"], "CPabc123");
-        assert_eq!(payload["modules"]["contributed"], json!(["tcf"]));
+        assert_eq!(payload["modules"]["contributed"], json!(["example"]));
         assert_eq!(
             payload["tdls"],
             json!(["https://terms.example.com/marketing/2.txt"])
@@ -206,12 +206,15 @@ mod tests {
     #[test]
     fn configured_and_contributed_modules_are_reported_separately() {
         let mut settings = create_test_settings();
-        settings.permission_signal.modules = Some(vec!["tcf".to_owned(), "gpc".to_owned()]);
+        settings.permission_signal.modules = Some(vec!["example".to_owned(), "other".to_owned()]);
 
         let payload = permissions_payload(&state_with_signal(), &settings);
 
-        assert_eq!(payload["modules"]["contributed"], json!(["tcf"]));
-        assert_eq!(payload["modules"]["configured"], json!(["tcf", "gpc"]));
+        assert_eq!(payload["modules"]["contributed"], json!(["example"]));
+        assert_eq!(
+            payload["modules"]["configured"],
+            json!(["example", "other"])
+        );
     }
 
     /// With no modules named the selection is the adapter's, which core
@@ -291,7 +294,7 @@ mod tests {
     #[test]
     fn the_page_escapes_a_hostile_signal_value() {
         let state = PermissionState::new(PermissionSet::none())
-            .with_signals(vec![ValidSignal::new("tcf", "tcf", "</pre><script>x()")].into());
+            .with_signals(vec![ValidSignal::new("example", "example", "</pre><script>x()")].into());
 
         let html = body_of(permissions_response(
             &state,

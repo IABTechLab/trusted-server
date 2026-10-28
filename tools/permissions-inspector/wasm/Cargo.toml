@@ -8,6 +8,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
+http = "1"
 trusted-server-core = { path = "../../../crates/trusted-server-core" }
 # The inspector runs the same permission signal modules an adapter ships,
 # in the same default order, so the page answers as a deployment would.

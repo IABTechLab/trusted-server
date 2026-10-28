@@ -16,10 +16,11 @@ The reasons the schemes live outside core are on the docs page,
 docs/guide/permission-signals.md.
 
 Core holds the trait, the ordering, the country baseline, and the policy
-vocabulary for what a deployment decides about the shipped schemes, being
-whether a TCF record answers, which signals count as a US-style opt-out and
-what an opt-out takes away. It holds no scheme's wire format and no scheme's
-meaning. Every scheme lives in its own crate outside core, including the five
+vocabulary for what a deployment decides about the schemes, being which
+schemes' records answer, which signals count as a US-style opt-out and what
+an opt-out takes away. It holds no scheme's wire format, no scheme's decoder
+and no scheme's meaning. Every scheme lives in its own crate outside core,
+including the five
 that ship by default, so none of them is privileged by being the one that
 happens to be built in. Core does not know what a TCF purpose is, because the
 mapping from purpose to Data Use lives in the TCF crate, and a deployment
@@ -86,11 +87,11 @@ modules = ["gpc", "gpp", "us-privacy", "tcf", "mtm"]
 A module not on the list does not run, and there is no separate switch. A
 publisher who does not want to act on Global Privacy Control removes `"gpc"`
 from the list, and the module that reads the header then does not run. One
-caveat: core's consent pipeline can also synthesize a US Privacy opt-out from
-that header for a visitor in a US state, when the consent settings say to,
-which they do by default, and the `us-privacy` module then acts on the
-record it produced. A publisher who wants the header to have no effect at all
-turns that setting off as well. Leaving `modules` out, or the section
+caveat: the `us-privacy` module also reads that header, and constructs a US
+Privacy opt-out from it for a visitor in a US state when the consent settings
+say to, which they do by default, and then acts on the record it constructed.
+A publisher who wants the header to have no effect at all turns that setting
+off as well. Leaving `modules` out, or the section
 entirely, runs every module the adapter offers, in the order it offers them,
 so a signal is never quietly ignored because someone forgot to list it. An
 unknown or repeated name is refused at startup, so a typo cannot silently stop
@@ -98,11 +99,12 @@ a scheme being honored.
 
 A module is named by its crate folder below `crates/permission-signal`, so
 `gpp` and `us-privacy` are the folders those crates live in, and a name may
-also be written in full, as `permission-signal.gpp`. A module that gains
-settings will take them in a `[permission-signal.<name>]`
-block named for it. None of the five here has settings, so `modules` is the
-only key the section accepts, and a block or any other key is refused as an
-unknown field rather than ignored.
+also be written in full, as `permission-signal.gpp`. The `[consent]` table
+holds the settings the shipped modules read, each module reading the keys of
+its own scheme through `ConsentConfig::read`. A module that gains settings of
+its own will take them in a `[permission-signal.<name>]` block named for it,
+and until one does `modules` is the only key the section accepts, with a
+block or any other key refused as an unknown field rather than ignored.
 
 The default order asks the signal with no interface of its own first and the
 ones carrying a choice made through an interface after. Global Privacy
@@ -193,6 +195,24 @@ context keeps only the raw strings the valid signals name, so a corrupt or
 expired record never reaches a bid request or anything else Trusted Server
 sends on.
 
+## Reading the request
+
+Before any permission is asked, core asks each configured module once,
+through `read` on the trait, to read its signal from the request, and the
+module answers a `SignalRecord`: the string as received, whether it decoded,
+could not be read, has expired or was left as received, where it came from,
+whether the module says the regulation its scheme answers for applies, the
+sections a sectioned signal carries, the permissions the signal itself
+consents to, and the decoded form in the module's own type, which core
+carries without reading. The records, with the request's jurisdiction, are
+the `ConsentContext` the assembly, the server-side auction gate, the bid
+request builders and the identity graph read. A module reads its own record
+back in `signal`, `withdraws` and `valid_signal`, so it answers the same as
+every other reader of the request and nothing decodes a string twice. The
+call carries the evidence, the settings and a consent context holding the
+jurisdiction and no records yet, so a module whose reading depends on the
+jurisdiction can see it.
+
 ## Withdrawal is a separate question
 
 A module may also say that the request explicitly _withdraws_ a permission,
@@ -215,13 +235,12 @@ signal it reads is absent from the request. Returning `Revoke` for an absent
 signal turns silence into refusal and would revoke the permission on every
 request not carrying that scheme, which is most of them.
 
-Read the request through `SignalInput::evidence`, which offers headers,
-cookies, the path and the query, so a scheme core has never heard of can read
-its own signal. The decoded consent record is offered too, for the schemes
-core's consent pipeline already decodes, caches against the identifier and
-expires. Prefer the record where it exists, because a module that
-re-decodes the wire would skip the cached record on a returning visitor and
-answer differently from every other reader of the same request.
+Read the request through the evidence, which offers headers, cookies, the
+path and the query, so a scheme core has never heard of can read its own
+signal. A scheme that decodes a string reads it in `read`, once, and reports
+a record, then reads the record back from `SignalInput::consent` when a
+permission is asked, so it answers the same as every other reader of the same
+request and nothing decodes a string twice.
 
 Read the policy for what is a deployment's decision rather than the scheme's,
 such as which signals count as an opt-out and what an opt-out takes away, so
@@ -237,13 +256,13 @@ from configuration.
 Five crates ship, under `crates/permission-signal/`, and a deployment
 configuring nothing gets all five in this order:
 
-| Name         | Crate        | Reads                                               |
-| ------------ | ------------ | --------------------------------------------------- |
-| `gpc`        | `gpc`        | The `Sec-GPC` header, Global Privacy Control        |
-| `gpp`        | `gpp`        | The US sale opt-out in a GPP string                 |
-| `us-privacy` | `us-privacy` | The sale opt-out in a US Privacy string             |
-| `tcf`        | `tcf`        | A TCF v2 record, with its purpose mapping in code   |
-| `mtm`        | `mtm`        | The PMP answer, under the Model Terms for Marketing |
+| Name         | Crate        | Reads and decodes                                                          |
+| ------------ | ------------ | -------------------------------------------------------------------------- |
+| `gpc`        | `gpc`        | The `Sec-GPC` header, Global Privacy Control                               |
+| `gpp`        | `gpp`        | The `__gpp` string and its `__gpp_sid` hint, for the US sale opt-out       |
+| `us-privacy` | `us-privacy` | The `us_privacy` string, or one constructed from the header in a US state  |
+| `tcf`        | `tcf`        | The `euconsent-v2` string and the EU section of a GPP string, with its map |
+| `mtm`        | `mtm`        | The PMP answer, under the Model Terms for Marketing                        |
 
 The three opt-outs are separate rather than one so that a publisher who does
 not act on Global Privacy Control can remove it and keep the other two.

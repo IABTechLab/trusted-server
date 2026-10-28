@@ -1,14 +1,16 @@
 //! The permissions bit of Trusted Server, compiled to WebAssembly for the
 //! inspector page. Inputs in, resulting permissions out, through the same
-//! functions the server runs: `build_context_from_signals` decodes the raw
-//! consent signals and `assemble_permissions` resolves the policy.
+//! functions the server runs: `read_consent` asks the signal modules to read
+//! the strings from the cookies and header the page fills in, and
+//! `assemble_permissions` resolves the policy.
 
 use std::sync::{Arc, OnceLock};
 
+use http::{HeaderMap, HeaderName, HeaderValue, header};
 use serde::Deserialize;
 use serde_json::json;
-use trusted_server_core::consent::build_context_from_signals;
-use trusted_server_core::consent::types::RawConsentSignals;
+use trusted_server_core::consent::jurisdiction::Jurisdiction;
+use trusted_server_core::consent::read_consent;
 use trusted_server_core::ec::consent::{GeoStatus, assemble_permissions};
 use trusted_server_core::evidence::OwnedRequestInfo;
 use trusted_server_core::module_context::ModuleContext;
@@ -59,27 +61,27 @@ fn eval_json(input: &str) -> String {
         Ok(input) => input,
         Err(e) => return json!({"ok": false, "error": e.to_string()}).to_string(),
     };
-    let signals = RawConsentSignals {
-        raw_tc_string: input.tc.filter(|s| !s.is_empty()),
-        raw_gpp_string: input.gpp.filter(|s| !s.is_empty()),
-        raw_gpp_sid: None,
-        raw_us_privacy: input.us_privacy.filter(|s| !s.is_empty()),
-        gpc: input.gpc,
-    };
-    let ctx = build_context_from_signals(&signals);
-    // The page carries no request, only the consent signals above, and each of
-    // the four modules answers from the consent record rather than from
-    // request evidence, so empty evidence changes none of their answers. A
-    // module that read a header or a cookie would need real evidence here.
-    let evidence = OwnedRequestInfo::default();
-    // The page stands for no request, so the modules are asked in the empty
-    // context with the signals entered.
-    let context = ModuleContext::empty()
-        .with_consent(&ctx)
-        .with_evidence(&evidence);
+    let evidence = evidence_for(&input);
     let modules = modules();
     // The page's repository mode evaluates the repository's sample.
     let maps = sample_maps();
+    // The jurisdiction the modules read the signals under, as the server
+    // detects it from the location the page enters.
+    let detected = match input.geo.as_str() {
+        "failed" => Jurisdiction::Unknown,
+        "none" => maps.default_jurisdiction(),
+        _ => maps.jurisdiction_for(input.country.as_deref(), input.region.as_deref()),
+    };
+    // The page stands for no request, so the modules are asked in the empty
+    // context with the evidence the entered signals make.
+    let ctx = read_consent(
+        &ModuleContext::empty().with_evidence(&evidence),
+        &modules,
+        detected,
+    );
+    let context = ModuleContext::empty()
+        .with_consent(&ctx)
+        .with_evidence(&evidence);
     let (state, jurisdiction) = match input.geo.as_str() {
         "failed" => {
             let state = assemble_permissions(maps, &context, GeoStatus::Failed, &modules);
@@ -115,13 +117,54 @@ fn eval_json(input: &str) -> String {
         "ok": true,
         "jurisdiction": jurisdiction,
         "set": set,
-        "tcf_decoded": ctx.tcf.is_some(),
+        "tcf_decoded": trusted_server_permission_signal_tcf::effective(&ctx).is_some(),
         // No `malformed_record`. Whether an absent, unreadable or expired
         // signal changes the permissions is each module's own decision,
         // taken in its answer, so nothing at this level can report one and
         // `false` would read as "none was found".
     })
     .to_string()
+}
+
+/// The evidence a request carrying the entered signals would give: the
+/// strings in the cookies their modules read and the GPC header.
+fn evidence_for(input: &EvalInput) -> OwnedRequestInfo {
+    let entered = |value: &Option<String>| {
+        value
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let cookies: Vec<String> = [
+        (
+            trusted_server_permission_signal_tcf::COOKIE_EUCONSENT_V2,
+            entered(&input.tc),
+        ),
+        (
+            trusted_server_permission_signal_gpp::COOKIE_GPP,
+            entered(&input.gpp),
+        ),
+        (
+            trusted_server_permission_signal_us_privacy::COOKIE_US_PRIVACY,
+            entered(&input.us_privacy),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| value.map(|value| format!("{name}={value}")))
+    .collect();
+    let mut headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(&cookies.join("; "))
+        && !cookies.is_empty()
+    {
+        headers.insert(header::COOKIE, value);
+    }
+    if input.gpc {
+        headers.insert(
+            HeaderName::from_static(trusted_server_permission_signal_gpc::HEADER_SEC_GPC),
+            HeaderValue::from_static("1"),
+        );
+    }
+    OwnedRequestInfo::new(String::new(), headers)
 }
 
 fn jurisdiction_name(j: trusted_server_core::consent::jurisdiction::Jurisdiction) -> String {

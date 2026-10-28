@@ -4,11 +4,13 @@ Consent signal handling in Trusted Server.
 
 ## Overview
 
-Trusted Server reads consent signals from each request, decodes them,
-and applies built-in enforcement rules to consent-gated activities
-such as EC creation and EID forwarding. The publisher configures how
-signals are interpreted, meaning how Global Privacy Control is read,
-how conflicting signals are resolved, and when stored signals expire.
+A permission signal module reads each consent signal from the request
+and decodes it, one module per scheme, and the resolved permissions
+gate consent-gated activities such as EC creation and EID
+forwarding. The publisher configures how signals are
+interpreted, meaning how Global Privacy Control is read, how
+conflicting signals are resolved, and when stored signals expire,
+through the `[consent]` table the modules read.
 Which countries and US states fall under which jurisdiction's rules is
 not set here, because the `permissions.yaml` rules tree states it. See
 the [Permission Model](/guide/permission-model).

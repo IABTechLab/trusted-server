@@ -1551,8 +1551,8 @@ impl DeviceConfig {
 ///
 /// Mapped from the `[permission-signal]` TOML section, where `modules`
 /// selects. `[ec]`, `[geo]` and `[device]` each name one module with
-/// `module`, whereas signals compose, because a request can carry a TCF string
-/// and a Global Privacy Control header at once and both have something to say.
+/// `module`, whereas signals compose, because a request can carry a consent
+/// string and a browser setting at once and both have something to say.
 /// So here `modules` names a list, and the order is the policy, because the
 /// last module with an opinion decides.
 ///
@@ -4763,7 +4763,6 @@ impl Settings {
         if let Some(analytics) = &mut self.analytics {
             analytics.normalize();
         }
-        self.consent.validate();
         Ok(())
     }
 

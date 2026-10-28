@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 use crate::consent::ConsentContext;
 use crate::consent::jurisdiction::Jurisdiction;
+#[cfg(test)]
+use crate::consent::{SignalRecord, SignalStatus};
 use crate::evidence::{OwnedRequestInfo, RequestInfo};
 use crate::module_context::ModuleContext;
 use crate::permission_signal::{self, PermissionSignalModule};
@@ -420,17 +422,19 @@ mod tests {
     // baseline stands whatever the request carries.
     // ------------------------------------------------------------------
 
+    /// A context carrying a record of `scheme` in `status` with `value`.
+    fn carrying(scheme: &'static str, status: SignalStatus, value: &str) -> ConsentContext {
+        ConsentContext::default().with_record(SignalRecord::new(scheme, status).with_value(value))
+    }
+
     #[test]
     fn core_answers_nothing_ahead_of_the_modules() {
-        let consent = ConsentContext {
-            raw_tc_string: Some("this is not a TC string".to_owned()),
-            ..ConsentContext::default()
-        };
+        let consent = carrying("example", SignalStatus::Unreadable, "this is not a record");
         let geo = us_ca_geo();
         let state = assembled(&consent, GeoStatus::Located(&geo), &[]);
         assert!(
             state.is_set(Permission::StoreOnDevice),
-            "with no module configured, what a TC string says or fails to say is nobody's \
+            "with no module configured, what a record says or fails to say is nobody's \
              to answer, so the baseline stands"
         );
         assert!(
@@ -439,16 +443,15 @@ mod tests {
         );
     }
 
-    /// A module that vouches for whatever TC string the request carries,
-    /// standing in for a scheme that decoded it.
+    /// A module that vouches for whatever string of its scheme the request
+    /// carries, standing in for a scheme that decoded it.
     struct VouchingForTcf;
 
     impl VouchingForTcf {
         fn vouch(&self, consent: &ConsentContext) -> Option<ValidSignal> {
             consent
-                .raw_tc_string
-                .as_deref()
-                .map(|raw| ValidSignal::new("vouching", "tcf", raw))
+                .value("example")
+                .map(|raw| ValidSignal::new("vouching", "example", raw))
         }
     }
 
@@ -516,46 +519,41 @@ mod tests {
 
     #[test]
     fn the_assembled_state_carries_the_signals_the_modules_vouched_for() {
-        let consent = ConsentContext {
-            raw_tc_string: Some("CPxyz".to_owned()),
-            ..ConsentContext::default()
-        };
+        let consent = carrying("example", SignalStatus::Decoded, "CPxyz");
         let modules: Vec<Arc<dyn PermissionSignalModule>> = vec![Arc::new(VouchingForTcf)];
         let state = assembled(&consent, GeoStatus::NoLocation, &modules);
         assert_eq!(
             state.signals(),
-            &[ValidSignal::new("vouching", "tcf", "CPxyz")],
+            &[ValidSignal::new("vouching", "example", "CPxyz")],
             "should carry the signal as received, attributed to the module that read it"
         );
     }
 
     #[test]
     fn the_context_keeps_only_what_was_vouched_for() {
-        let mut consent = ConsentContext {
-            raw_tc_string: Some("CPxyz".to_owned()),
-            raw_gpp_string: Some("not a GPP string".to_owned()),
-            gpp_section_ids: Some(vec![7]),
-            raw_us_privacy: Some("1YNN".to_owned()),
-            ..ConsentContext::default()
-        };
-        consent.keep_only(&[ValidSignal::new("vouching", "tcf", "CPxyz")]);
-        assert_eq!(consent.raw_tc_string.as_deref(), Some("CPxyz"));
+        let mut consent = carrying("example", SignalStatus::Decoded, "CPxyz")
+            .with_record(
+                SignalRecord::new("sectioned", SignalStatus::Unreadable)
+                    .with_value("not a readable string")
+                    .with_sections(vec![7]),
+            )
+            .with_record(SignalRecord::new("other", SignalStatus::Decoded).with_value("1YNN"));
+        consent.keep_only(&[ValidSignal::new("vouching", "example", "CPxyz")]);
+        assert_eq!(consent.value("example"), Some("CPxyz"));
+        let sectioned = consent.record("sectioned").expect("the record stays");
         assert!(
-            consent.raw_gpp_string.is_none() && consent.gpp_section_ids.is_none(),
-            "a GPP string nobody vouched for goes no further, with its section ids"
+            sectioned.value().is_none() && sectioned.sections().is_empty(),
+            "a string nobody vouched for goes no further, with its sections"
         );
         assert!(
-            consent.raw_us_privacy.is_none(),
-            "a US Privacy string nobody vouched for goes no further"
+            consent.value("other").is_none(),
+            "nor does any other string nobody vouched for"
         );
     }
 
     #[test]
     fn an_unreadable_record_is_not_a_withdrawal() {
-        let consent = ConsentContext {
-            raw_tc_string: Some("not-a-tc-string".to_owned()),
-            ..ConsentContext::default()
-        };
+        let consent = carrying("example", SignalStatus::Unreadable, "not-a-record");
         let state = assembled(&consent, GeoStatus::NoLocation, &granting());
         assert!(
             !state.storage_withdrawn(),

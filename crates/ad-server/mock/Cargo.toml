@@ -22,6 +22,9 @@ log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 trusted-server-core = { workspace = true }
+trusted-server-permission-signal-gpp = { workspace = true }
+trusted-server-permission-signal-tcf = { workspace = true }
+trusted-server-permission-signal-us-privacy = { workspace = true }
 url = { workspace = true }
 validator = { workspace = true }
 

@@ -55,8 +55,7 @@ use trusted_server_core::auction::provider::{AuctionProvider, ProviderRequestOut
 use trusted_server_core::auction::types::{AuctionContext, AuctionRequest, MediaType};
 use trusted_server_core::auction::types::{AuctionResponse, Bid as AuctionBid};
 use trusted_server_core::consent::{ConsentContext, ConsentSource};
-use trusted_server_core::consent_config::ConsentForwardingMode;
-use trusted_server_core::cookies::{CONSENT_COOKIE_NAMES, strip_cookies};
+use trusted_server_core::cookies::strip_cookies;
 use trusted_server_core::error::TrustedServerError;
 #[cfg(test)]
 use trusted_server_core::http_util::RequestInfo;
@@ -69,8 +68,8 @@ use trusted_server_core::integrations::{
 };
 #[cfg(test)]
 use trusted_server_core::openrtb::{
-    Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs,
-    RegsExt, Site, ToExt, TrustedServerExt, User, UserExt, to_openrtb_i32,
+    Banner, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs, RegsExt, Site, ToExt,
+    TrustedServerExt, User, UserExt, to_openrtb_i32,
 };
 #[cfg(test)]
 use trusted_server_core::platform::PlatformHttpRequest;
@@ -81,7 +80,12 @@ use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::request_signing::{RequestSigner, SIGNING_VERSION, SigningParams};
 #[cfg(test)]
 use trusted_server_core::settings::{IntegrationConfig, Settings};
+#[cfg(test)]
+use trusted_server_permission_signal_gpc as gpc;
+use trusted_server_permission_signal_gpp as gpp;
 use trusted_server_permission_signal_mtm::COOKIE_MTM_PREF;
+use trusted_server_permission_signal_tcf as tcf;
+use trusted_server_permission_signal_us_privacy as us_privacy;
 
 /// The name an `implementation` line gives this implementation, its module
 /// path, which also serves as its builder's id.
@@ -178,6 +182,61 @@ fn canonicalize_endpoint(endpoint: &mut Url) -> Result<(), String> {
     Ok(())
 }
 
+/// The cookies the consent signals travel in, stripped from a forwarded
+/// `Cookie` header when consent travels in the body alone.
+const CONSENT_COOKIE_NAMES: &[&str] = &[
+    tcf::COOKIE_EUCONSENT_V2,
+    gpp::COOKIE_GPP,
+    gpp::COOKIE_GPP_SID,
+    us_privacy::COOKIE_US_PRIVACY,
+];
+
+/// How consent signals are forwarded to Prebid Server.
+///
+/// Controls whether consent travels through the `OpenRTB` body, raw `Cookie`
+/// headers, or both. The default (`Both`) preserves backward compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsentForwardingMode {
+    /// Forward consent in the `OpenRTB` body only; strip consent cookies.
+    OpenrtbOnly,
+    /// Forward consent cookies only; omit consent fields from the body.
+    CookiesOnly,
+    /// Forward consent in both cookies and body (default).
+    #[default]
+    Both,
+}
+
+impl ConsentForwardingMode {
+    /// Whether consent cookies should be stripped from forwarded requests.
+    ///
+    /// Returns `true` for [`OpenrtbOnly`](Self::OpenrtbOnly) since consent
+    /// travels exclusively through the request body in that mode.
+    #[must_use]
+    pub const fn strips_consent_cookies(self) -> bool {
+        matches!(self, Self::OpenrtbOnly)
+    }
+
+    /// Whether consent fields should be included in the request body.
+    ///
+    /// Returns `true` for [`OpenrtbOnly`](Self::OpenrtbOnly) and
+    /// [`Both`](Self::Both); `false` for [`CookiesOnly`](Self::CookiesOnly).
+    #[must_use]
+    pub const fn includes_body_consent(self) -> bool {
+        !matches!(self, Self::CookiesOnly)
+    }
+}
+
+/// Whether a consent context carries a signal the deployment constructed
+/// from its declared defaults, which has no cookie to forward and so travels
+/// in the body whatever the forwarding mode.
+fn carries_policy_default(consent: &ConsentContext) -> bool {
+    consent
+        .records
+        .iter()
+        .any(|record| record.source() == ConsentSource::PolicyDefault)
+}
+
 #[async_trait(?Send)]
 impl CompiledDemand for PrebidServerDemand {
     fn field_policy(&self) -> DemandFieldPolicy {
@@ -185,7 +244,6 @@ impl CompiledDemand for PrebidServerDemand {
             imp_tagid: true,
             site_ref: true,
             precise_geo: true,
-            additional_consent: true,
             test: self.test_mode,
             unsigned_request_identity: true,
             consumes_bidder_params: true,
@@ -206,8 +264,7 @@ impl CompiledDemand for PrebidServerDemand {
 
     fn body_consent<'c>(&self, consent: Option<&'c ConsentContext>) -> Option<&'c ConsentContext> {
         consent.filter(|value| {
-            self.consent_forwarding.includes_body_consent()
-                || !matches!(value.source, ConsentSource::Cookie)
+            self.consent_forwarding.includes_body_consent() || carries_policy_default(value)
         })
     }
 
@@ -1818,13 +1875,9 @@ impl PrebidAuctionProvider {
         // forwarded Cookie header. Policy-sourced consent has no inbound cookie
         // to forward, so carry it in the OpenRTB body instead.
         let consent_ctx = request.user.consent.as_ref().filter(|ctx| {
-            self.config.consent_forwarding.includes_body_consent()
-                || !matches!(
-                    ctx.source,
-                    trusted_server_core::consent::ConsentSource::Cookie
-                )
+            self.config.consent_forwarding.includes_body_consent() || carries_policy_default(ctx)
         });
-        let raw_tc = consent_ctx.and_then(|c| c.raw_tc_string.clone());
+        let raw_tc = consent_ctx.and_then(|c| tcf::tc_string(c).map(str::to_owned));
         let user = Some(User {
             id: request.user.id.clone(),
             // OpenRTB 2.6 top-level consent field
@@ -1832,11 +1885,7 @@ impl PrebidAuctionProvider {
             ext: UserExt {
                 // Prebid ext-based consent field
                 consent: raw_tc,
-                consented_providers_settings: consent_ctx
-                    .and_then(|c| c.raw_ac_string.as_ref())
-                    .map(|ac| ConsentedProvidersSettings {
-                        consented_providers: Some(ac.clone()),
-                    }),
+                consented_providers_settings: None,
                 // EIDs resolved from the KV identity graph and gated on the
                 // resolved permission state in `handle_auction` via
                 // `gate_eids_by_permissions`.
@@ -2035,11 +2084,15 @@ impl PrebidAuctionProvider {
     ) -> Option<Regs> {
         let ctx = consent_ctx?;
 
-        let has_data = ctx.gdpr_applies
-            || ctx.raw_us_privacy.is_some()
-            || ctx.raw_gpp_string.is_some()
-            || ctx.gpp_section_ids.is_some()
-            || ctx.gpc;
+        let applies = tcf::applies(ctx);
+        let us_privacy = us_privacy::us_privacy_string(ctx).map(str::to_owned);
+        let gpp_string = gpp::gpp_string(ctx).map(str::to_owned);
+        let gpp_sid = gpp::section_ids(ctx).map(<[u16]>::to_vec);
+        let has_data = applies
+            || us_privacy.is_some()
+            || gpp_string.is_some()
+            || gpp_sid.is_some()
+            || gpc::signaled(ctx);
 
         if !has_data {
             return None;
@@ -2054,7 +2107,7 @@ impl PrebidAuctionProvider {
             ctx.jurisdiction,
             trusted_server_core::consent::jurisdiction::Jurisdiction::Gdpr
         );
-        let gdpr = if ctx.gdpr_applies || in_gdpr_jurisdiction {
+        let gdpr = if applies || in_gdpr_jurisdiction {
             Some(true)
         } else if matches!(
             ctx.jurisdiction,
@@ -2068,9 +2121,7 @@ impl PrebidAuctionProvider {
         // Dual-placement: OpenRTB 2.6 top-level fields AND `regs.ext` for
         // backward compatibility with older exchanges. Extract top-level
         // values first, then clone once into the ext to avoid extra copies.
-        let us_privacy = ctx.raw_us_privacy.clone();
-        let gpp = ctx.raw_gpp_string.clone();
-        let gpp_sid = ctx.gpp_section_ids.clone();
+        let gpp = gpp_string;
 
         // RegsExt uses u8 for GDPR (Prebid convention) while the top-level
         // Regs uses bool (OpenRTB proto). Map accordingly.
@@ -2708,7 +2759,27 @@ mod tests {
         AdFormat, AdSlot, AuctionContext, AuctionRequest, DeviceInfo, PublisherInfo, UserInfo,
     };
 
-    use trusted_server_core::consent::{ConsentContext, ConsentSource};
+    use trusted_server_core::consent::{ConsentContext, ConsentSource, SignalRecord, SignalStatus};
+
+    /// A TC String record, as the TCF module reports one it decoded.
+    fn tc_record(raw: &str) -> SignalRecord {
+        SignalRecord::new(tcf::SCHEME, SignalStatus::Decoded)
+            .with_value(raw)
+            .with_applies(true)
+    }
+
+    /// A US Privacy string record, as the US Privacy module reports one it
+    /// decoded.
+    fn usp_record(raw: &str) -> SignalRecord {
+        SignalRecord::new(us_privacy::SCHEME, SignalStatus::Decoded).with_value(raw)
+    }
+
+    /// A GPP string record, as the GPP module reports one it decoded.
+    fn gpp_record(raw: &str, sections: Vec<u16>) -> SignalRecord {
+        SignalRecord::new(gpp::SCHEME, SignalStatus::Decoded)
+            .with_value(raw)
+            .with_sections(sections)
+    }
     use trusted_server_core::geo::GeoInfo;
 
     use trusted_server_core::platform::test_support::{
@@ -3351,11 +3422,8 @@ assume_single_jurisdiction = true
     fn to_openrtb_includes_consent_and_gdpr_flag_from_geo() {
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
-        auction_request.user.consent = Some(ConsentContext {
-            raw_tc_string: Some("BOtest-consent-string".to_string()),
-            gdpr_applies: true,
-            ..Default::default()
-        });
+        auction_request.user.consent =
+            Some(ConsentContext::default().with_record(tc_record("BOtest-consent-string")));
         // Set device with EU geo so GDPR applies from geo check
         auction_request.device = Some(DeviceInfo {
             user_agent: Some("TestAgent".to_string()),
@@ -3402,13 +3470,11 @@ assume_single_jurisdiction = true
         config.consent_forwarding = ConsentForwardingMode::CookiesOnly;
         let provider = PrebidAuctionProvider::new(config);
         let mut auction_request = create_test_auction_request();
-        auction_request.user.consent = Some(ConsentContext {
-            raw_tc_string: Some("BOpolicy-consent-string".to_string()),
-            raw_us_privacy: Some("1YNN".to_string()),
-            gdpr_applies: true,
-            source: ConsentSource::PolicyDefault,
-            ..Default::default()
-        });
+        auction_request.user.consent = Some(
+            ConsentContext::default()
+                .with_record(tc_record("BOpolicy-consent-string"))
+                .with_record(usp_record("1YNN").with_source(ConsentSource::PolicyDefault)),
+        );
 
         let settings = make_settings();
         let request = build_test_request();
@@ -3446,11 +3512,8 @@ assume_single_jurisdiction = true
         // cause false negatives).
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
-        auction_request.user.consent = Some(ConsentContext {
-            raw_tc_string: Some("BOtest-consent-string".to_string()),
-            gdpr_applies: true,
-            ..Default::default()
-        });
+        auction_request.user.consent =
+            Some(ConsentContext::default().with_record(tc_record("BOtest-consent-string")));
         // US geo — but consent string overrides
         auction_request.device = Some(DeviceInfo {
             user_agent: Some("TestAgent".to_string()),
@@ -3529,11 +3592,8 @@ assume_single_jurisdiction = true
     fn to_openrtb_falls_back_to_consent_when_no_geo() {
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
-        auction_request.user.consent = Some(ConsentContext {
-            raw_tc_string: Some("BOtest-consent-string".to_string()),
-            gdpr_applies: true,
-            ..Default::default()
-        });
+        auction_request.user.consent =
+            Some(ConsentContext::default().with_record(tc_record("BOtest-consent-string")));
         // No device/geo
 
         let settings = make_settings();
@@ -3577,13 +3637,13 @@ assume_single_jurisdiction = true
     fn to_openrtb_sets_gpc_us_privacy() {
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
-        // GPC signal is carried via ConsentContext, populated by the
-        // consent extraction pipeline from the Sec-GPC header.
-        auction_request.user.consent = Some(ConsentContext {
-            gpc: true,
-            raw_us_privacy: Some(GPC_US_PRIVACY.to_string()),
-            ..Default::default()
-        });
+        // The browser setting and the string the US Privacy module
+        // constructed from it, as the modules report them.
+        auction_request.user.consent = Some(
+            ConsentContext::default()
+                .with_record(gpc::record())
+                .with_record(usp_record(GPC_US_PRIVACY).with_source(ConsentSource::PolicyDefault)),
+        );
 
         let settings = make_settings();
         let request = build_test_request();
@@ -3629,11 +3689,7 @@ assume_single_jurisdiction = true
 
     #[test]
     fn build_regs_populates_gpp_and_section_ids() {
-        let ctx = ConsentContext {
-            raw_gpp_string: Some("DBACNYA~CPXxRfA".to_string()),
-            gpp_section_ids: Some(vec![2, 6]),
-            ..Default::default()
-        };
+        let ctx = ConsentContext::default().with_record(gpp_record("DBACNYA~CPXxRfA", vec![2, 6]));
 
         let regs = PrebidAuctionProvider::build_regs(Some(&ctx))
             .expect("should produce regs for GPP data");
@@ -3670,12 +3726,10 @@ assume_single_jurisdiction = true
     fn build_regs_sets_gdpr_true_from_jurisdiction() {
         // EU user with GPC but no TCF string — GDPR should still be flagged
         // based on jurisdiction alone.
-        let ctx = ConsentContext {
-            gpc: true,
-            raw_us_privacy: Some("1YYN".to_string()),
-            jurisdiction: trusted_server_core::consent::jurisdiction::Jurisdiction::Gdpr,
-            ..Default::default()
-        };
+        let ctx =
+            ConsentContext::new(trusted_server_core::consent::jurisdiction::Jurisdiction::Gdpr)
+                .with_record(gpc::record())
+                .with_record(usp_record("1YYN"));
 
         let regs = PrebidAuctionProvider::build_regs(Some(&ctx))
             .expect("should produce regs for GDPR jurisdiction");
@@ -3691,12 +3745,10 @@ assume_single_jurisdiction = true
     fn build_regs_omits_gdpr_for_unknown_jurisdiction_without_tcf() {
         // GPC-only request with no geo — jurisdiction is Unknown, no TCF
         // signal. GDPR field should be None (omitted) rather than false.
-        let ctx = ConsentContext {
-            gpc: true,
-            raw_us_privacy: Some("1YYN".to_string()),
-            jurisdiction: trusted_server_core::consent::jurisdiction::Jurisdiction::Unknown,
-            ..Default::default()
-        };
+        let ctx =
+            ConsentContext::new(trusted_server_core::consent::jurisdiction::Jurisdiction::Unknown)
+                .with_record(gpc::record())
+                .with_record(usp_record("1YYN"));
 
         let regs = PrebidAuctionProvider::build_regs(Some(&ctx))
             .expect("should produce regs for GPC signal");
@@ -3710,11 +3762,10 @@ assume_single_jurisdiction = true
     #[test]
     fn build_regs_sets_gdpr_false_for_non_regulated_jurisdiction() {
         // Non-EU, non-US-state user with a US privacy string.
-        let ctx = ConsentContext {
-            raw_us_privacy: Some("1NNN".to_string()),
-            jurisdiction: trusted_server_core::consent::jurisdiction::Jurisdiction::NonRegulated,
-            ..Default::default()
-        };
+        let ctx = ConsentContext::new(
+            trusted_server_core::consent::jurisdiction::Jurisdiction::NonRegulated,
+        )
+        .with_record(usp_record("1NNN"));
 
         let regs = PrebidAuctionProvider::build_regs(Some(&ctx))
             .expect("should produce regs for us_privacy");
@@ -3728,14 +3779,11 @@ assume_single_jurisdiction = true
 
     #[test]
     fn build_regs_dual_placement_mirrors_all_fields() {
-        let ctx = ConsentContext {
-            gdpr_applies: true,
-            raw_us_privacy: Some("1YNN".to_string()),
-            raw_gpp_string: Some("DBACNYA~CPXxRfA".to_string()),
-            gpp_section_ids: Some(vec![7]),
-            jurisdiction: trusted_server_core::consent::jurisdiction::Jurisdiction::Gdpr,
-            ..Default::default()
-        };
+        let ctx =
+            ConsentContext::new(trusted_server_core::consent::jurisdiction::Jurisdiction::Gdpr)
+                .with_record(tc_record("tc-string"))
+                .with_record(usp_record("1YNN"))
+                .with_record(gpp_record("DBACNYA~CPXxRfA", vec![7]));
 
         let regs = PrebidAuctionProvider::build_regs(Some(&ctx))
             .expect("should produce regs with full consent data");
@@ -3781,10 +3829,8 @@ assume_single_jurisdiction = true
         // gdpr_applies=true but no strings — only gdpr flag is set.
         // RegsExt should serialize to an object with only gdpr, which is
         // non-empty, so ext should still be present.
-        let ctx = ConsentContext {
-            gdpr_applies: true,
-            ..Default::default()
-        };
+        let ctx = ConsentContext::default()
+            .with_record(SignalRecord::new(tcf::SCHEME, SignalStatus::Absent).with_applies(true));
 
         let regs = PrebidAuctionProvider::build_regs(Some(&ctx))
             .expect("should produce regs for gdpr_applies");
@@ -7314,14 +7360,15 @@ set = { networkId = 42 }
             serde_json::to_string(&disabled).expect("should serialize disabled PBS request");
         let disabled_value: Json =
             serde_json::from_str(&disabled).expect("should parse disabled PBS golden request");
-        assert_eq!(
-            disabled_value["user"]["ext"]["ConsentedProvidersSettings"]["consented_providers"],
-            json!("fictional-ac"),
-            "should retain Google Additional Consent only in PBS's existing extension"
+        assert!(
+            disabled_value["user"]["ext"]
+                .get("ConsentedProvidersSettings")
+                .is_none(),
+            "no module reads an additional consent string, so none is sent"
         );
         assert_eq!(
             disabled,
-            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"request_host":"publisher.example","request_scheme":"https"}}}"#,
+            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"request_host":"publisher.example","request_scheme":"https"}}}"#,
             "should preserve the complete disabled PBS wire shape"
         );
 
@@ -7360,7 +7407,7 @@ set = { networkId = 42 }
             serde_json::to_string(&enabled).expect("should serialize enabled PBS request");
         assert_eq!(
             enabled,
-            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
+            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
             "should preserve the complete enabled PBS wire shape"
         );
     }
@@ -7382,6 +7429,7 @@ mod engine_tests {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 
+    use super::{gpc, gpp, tcf, us_privacy};
     use edgezero_core::body::Body as EdgeBody;
     use http::{Request, header};
     use serde_json::{Value, json};
@@ -7396,7 +7444,7 @@ mod engine_tests {
         AdFormat, AdSlot, AuctionContext, AuctionRequest, MediaType, PublisherInfo, UserInfo,
     };
     use trusted_server_core::consent::jurisdiction::Jurisdiction;
-    use trusted_server_core::consent::{ConsentContext, ConsentSource};
+    use trusted_server_core::consent::{ConsentContext, ConsentSource, SignalRecord, SignalStatus};
     use trusted_server_core::openrtb::OpenRtbRequest;
     use trusted_server_core::platform::BackendNamingPolicy;
     use trusted_server_core::platform::test_support::{
@@ -7449,42 +7497,35 @@ mod engine_tests {
 
     #[test]
     fn consent_matrix_holds_for_prebid_server() {
+        let applying = SignalRecord::new(tcf::SCHEME, SignalStatus::Decoded)
+            .with_value("tc-string")
+            .with_applies(true);
         let cases = [
             ("empty", ConsentContext::default()),
             (
                 "gdpr",
-                ConsentContext {
-                    gdpr_applies: true,
-                    raw_tc_string: Some("tc-string".to_string()),
-                    jurisdiction: Jurisdiction::Gdpr,
-                    ..Default::default()
-                },
+                ConsentContext::new(Jurisdiction::Gdpr).with_record(applying),
             ),
             (
                 "unknown-gpc",
-                ConsentContext {
-                    gpc: true,
-                    jurisdiction: Jurisdiction::Unknown,
-                    ..Default::default()
-                },
+                ConsentContext::new(Jurisdiction::Unknown).with_record(gpc::record()),
             ),
             (
                 "nonregulated-gpc",
-                ConsentContext {
-                    gpc: true,
-                    jurisdiction: Jurisdiction::NonRegulated,
-                    ..Default::default()
-                },
+                ConsentContext::new(Jurisdiction::NonRegulated).with_record(gpc::record()),
             ),
             (
                 "usp-gpp",
-                ConsentContext {
-                    raw_us_privacy: Some("1YNN".to_string()),
-                    raw_gpp_string: Some("gpp-string".to_string()),
-                    gpp_section_ids: Some(vec![7, 8]),
-                    jurisdiction: Jurisdiction::NonRegulated,
-                    ..Default::default()
-                },
+                ConsentContext::new(Jurisdiction::NonRegulated)
+                    .with_record(
+                        SignalRecord::new(us_privacy::SCHEME, SignalStatus::Decoded)
+                            .with_value("1YNN"),
+                    )
+                    .with_record(
+                        SignalRecord::new(gpp::SCHEME, SignalStatus::Decoded)
+                            .with_value("gpp-string")
+                            .with_sections(vec![7, 8]),
+                    ),
             ),
         ];
         for (name, consent) in cases {
@@ -7499,8 +7540,8 @@ mod engine_tests {
                 let regs = regs.expect("should emit actionable regs");
                 let expected_gdpr = match consent.jurisdiction {
                     Jurisdiction::Gdpr => Some(true),
-                    Jurisdiction::Unknown if !consent.gdpr_applies => None,
-                    _ => Some(consent.gdpr_applies),
+                    Jurisdiction::Unknown if !tcf::applies(&consent) => None,
+                    _ => Some(tcf::applies(&consent)),
                 };
                 assert_eq!(
                     regs.get("gdpr"),
@@ -7534,12 +7575,15 @@ mod engine_tests {
             ("both", ConsentSource::Cookie, true),
         ] {
             let mut canonical = canonical_parity_auction_request();
-            canonical
+            for record in &mut canonical
                 .user
                 .consent
                 .as_mut()
                 .expect("should have consent context")
-                .source = source;
+                .records
+            {
+                *record = record.clone().with_source(source);
+            }
             let value = serde_json::to_value(build_with_request(
                 json!({"consent_forwarding": mode}),
                 canonical,
@@ -7806,7 +7850,7 @@ mod engine_tests {
 
         assert_eq!(
             serde_json::to_string(&request).expect("should serialize PBS driver request"),
-            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"request_host":"publisher.example","request_scheme":"https"}}}"#,
+            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"request_host":"publisher.example","request_scheme":"https"}}}"#,
             "should preserve PBS parity differences"
         );
     }
@@ -7826,7 +7870,7 @@ mod engine_tests {
 
         assert_eq!(
             serde_json::to_string(&request).expect("should serialize signed request"),
-            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
+            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
             "signed wire fixture should stay exact"
         );
     }

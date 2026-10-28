@@ -12,9 +12,11 @@ a third, and a TCF v2 record a fourth. Each is a crate that depends on the
 core, implements one trait, and is linked by the adapter that runs it. The
 core holds the trait, the order the modules are asked in, the country and
 region baseline, and the policy vocabulary for what a deployment decides about
-the shipped schemes, being whether a TCF record answers, which signals count as
-a US-style opt-out and what an opt-out takes away. It holds no scheme's wire
-format and no scheme's meaning.
+the schemes, being which schemes' records answer, which signals count as a
+US-style opt-out and what an opt-out takes away. It holds no scheme's wire
+format, no scheme's decoder and no scheme's meaning. Each crate reads its own
+string from the request, decodes it, and reports what it read as a record the
+rest of the system reads through a neutral interface.
 
 That is deliberate. Privacy is a non-price factor of competition. Publishers,
 browsers and standards bodies compete on it, and schemes come and go.
@@ -80,11 +82,11 @@ modules = ["gpc", "gpp", "us-privacy", "tcf", "mtm"]
 A module not on the list does not run, and there is no separate switch. A
 publisher who does not want to act on Global Privacy Control removes `"gpc"`
 from the list, and the module that reads the header then does not run. One
-caveat: the core's consent pipeline can also synthesize a US Privacy opt-out
-from that header for a visitor in a US state, when the consent settings say to,
-which they do by default, and the `us-privacy` module then acts on the record
-it produced. A publisher who wants the header to have no effect at all turns
-that setting off as well. Leaving `modules` out, or the section entirely, runs
+caveat: the `us-privacy` module also reads that header, and constructs a US
+Privacy opt-out from it for a visitor in a US state when the consent settings
+say to, which they do by default, and then acts on the record it constructed.
+A publisher who wants the header to have no effect at all turns that setting
+off as well. Leaving `modules` out, or the section entirely, runs
 every module the adapter offers, in the order it offers them, so a signal is
 never quietly ignored because someone forgot to list it. An empty list runs
 none of them, which is a publisher acting on no signal at all, and leaves every
@@ -97,10 +99,14 @@ once at startup.
 
 A module is named by its crate folder below `crates/permission-signal`, so
 `gpp` and `us-privacy` are the folders those crates live in, and a name may
-also be written in full, as `permission-signal.gpp`. A module that gains
-settings will take them in a `[permission-signal.<name>]`
-block named for it. None of the five that ship has settings, so `modules` is
-the only key the section accepts, and a block or any other key is refused as
+also be written in full, as `permission-signal.gpp`. The `[consent]` table
+holds the settings the shipped modules read: the TCF module reads
+`check_expiration`, `max_consent_age_days` and `conflict_resolution`, the US
+Privacy module reads `us_privacy_defaults`, and the TCF, GPP and US Privacy
+modules read `mode`, which says whether the strings are decoded or left as
+received. A module that gains settings of its own will take them in a
+`[permission-signal.<name>]` block named for it, and until one does `modules`
+is the only key the section accepts, with a block or any other key refused as
 an unknown field rather than ignored.
 
 The default order asks the signal with no interface of its own first and the
@@ -114,19 +120,22 @@ question about a jurisdiction and a publisher.
 
 ## The modules that ship
 
-| Name         | Crate                                 | Reads                                                                   |
-| ------------ | ------------------------------------- | ----------------------------------------------------------------------- |
-| `gpc`        | `crates/permission-signal/gpc`        | The `Sec-GPC` header, Global Privacy Control                            |
-| `gpp`        | `crates/permission-signal/gpp`        | The US sale opt-out carried in a GPP string                             |
-| `us-privacy` | `crates/permission-signal/us-privacy` | The sale opt-out in a US Privacy string                                 |
-| `tcf`        | `crates/permission-signal/tcf`        | A TCF v2 record, with the purpose mapping in code                       |
-| `mtm`        | `crates/permission-signal/mtm`        | The PMP answer, one of three words, under the Model Terms for Marketing |
+| Name         | Crate                                 | Reads and decodes                                                                  |
+| ------------ | ------------------------------------- | ---------------------------------------------------------------------------------- |
+| `gpc`        | `crates/permission-signal/gpc`        | The `Sec-GPC` header, Global Privacy Control                                       |
+| `gpp`        | `crates/permission-signal/gpp`        | The `__gpp` string and its `__gpp_sid` hint, for the US sale opt-out               |
+| `us-privacy` | `crates/permission-signal/us-privacy` | The `us_privacy` string, or one constructed from the header in a US state          |
+| `tcf`        | `crates/permission-signal/tcf`        | The `euconsent-v2` string and the EU section of a GPP string, with the purpose map |
+| `mtm`        | `crates/permission-signal/mtm`        | The PMP answer, one of three words, under the Model Terms for Marketing            |
 
 The three opt-outs are separate so that a publisher who does not act on Global
 Privacy Control can remove it and keep the other two. What an opt-out takes
-away, and whether a TCF record answers for the deployment at all, remain the
-policy's decisions in the `signals` section of `permissions.yaml`, so a
-deployment changes those without changing a module.
+away, and whether a scheme's record answers for the deployment at all, remain
+the policy's decisions in the `signals` section of `permissions.yaml`, so a
+deployment changes those without changing a module. The GPP crate hands the
+EU section of a GPP string to the TCF crate, which decodes it with its own
+decoder, and a demand crate that carries a string in its standard's own form
+asks the crate for that standard rather than the core.
 
 ## Who could still answer
 
@@ -161,6 +170,21 @@ from one scheme means beside an unreadable one from another.
 A signal nobody vouched for goes no further. After the permissions are
 assembled the consent context keeps only the strings the valid signals name,
 so a corrupt or expired record never reaches a bid request.
+
+## Reading the request
+
+Before any permission is asked, each configured module is asked once to read
+its signal from the request, through `read` on the trait, and answers a
+record: the string as received, whether it decoded, could not be read, has
+expired or was left as received, where it came from, whether the module says
+the regulation its scheme answers for applies, the sections a sectioned
+signal carries, the permissions the signal itself consents to, and the
+decoded form in the module's own type. The records every module answered,
+with the request's jurisdiction, are the consent context the permission
+assembly, the server-side auction gate, the bid request builders and the
+identity graph read. A module reads its own record back when a permission
+is asked, so it answers the same as every other reader of the request about
+expiry and which string is in force, and nothing decodes a string twice.
 
 ## The terms the data is available under
 
@@ -229,11 +253,9 @@ request carries for it.
    the scheme, which is most of them.
 3. Read the request through the evidence the seam offers, which is the
    headers, cookies, path and query, so the core keeps no list of what a
-   scheme may read. The decoded consent record is offered too, for the
-   schemes the consent pipeline already decodes, caches against the
-   identifier and expires, and a module for one of those should read the
-   record rather than the wire, so it answers the same as every other reader
-   of the same request.
+   scheme may read. A scheme that decodes a string reads it in `read`, once,
+   and reports a record, then reads the record back when a permission is
+   asked, so it answers the same as every other reader of the same request.
 4. Link the crate at the adapter's composition root, in the list of modules
    it offers, and give it a place in the default order.
 

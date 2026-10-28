@@ -419,8 +419,10 @@ mod tests {
             v: 1,
             created: CREATED,
             consent: KvConsent {
-                tcf: Some("tcf-string".to_owned()),
-                gpp: Some("gpp-string".to_owned()),
+                signals: BTreeMap::from([
+                    ("first".to_owned(), "first-signal".to_owned()),
+                    ("second".to_owned(), "second-signal".to_owned()),
+                ]),
                 ok: true,
                 updated: CREATED + 60,
             },
@@ -459,9 +461,9 @@ mod tests {
         assert_eq!(
             shown.iter().map(String::as_str).collect::<Vec<_>>(),
             [
-                "consent.gpp",
+                "consent.first",
                 "consent.ok",
-                "consent.tcf",
+                "consent.second",
                 "consent.updated",
                 "created",
                 "device.h2_fp_hash",
@@ -503,8 +505,7 @@ mod tests {
             v: 1,
             created: made,
             consent: KvConsent {
-                tcf: Some("CP...".to_owned()),
-                gpp: None,
+                signals: BTreeMap::from([("example".to_owned(), "CP...".to_owned())]),
                 ok: true,
                 updated: made,
             },
@@ -536,7 +537,7 @@ mod tests {
                 "held": true,
                 "identifier": "XXXX",
                 "record": {
-                    "consent": { "ok": true, "tcf": "CP...", "updated": 1_773_480_600 },
+                    "consent": { "example": "CP...", "ok": true, "updated": 1_773_480_600 },
                     "created": 1_773_480_600,
                     "geo": { "country": "GB", "region": "ENG" },
                     "ids": { "partner.example.com": { "uid": "XXXX" } },

@@ -21,8 +21,8 @@ use super::routing::{ProviderAuctionInput, ProviderSlotInput, RoutedAuction, Tra
 use super::types::{AdFormat, AdSlot, AuctionResponse, Bid};
 use crate::error::TrustedServerError;
 use crate::openrtb::{
-    Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs,
-    RegsExt, Site, ToExt as _, TrustedServerExt, User, UserExt, to_openrtb_i32,
+    Banner, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs, RegsExt, Site, ToExt as _,
+    TrustedServerExt, User, UserExt, to_openrtb_i32,
 };
 use crate::platform::PlatformResponse;
 use crate::request_signing::{RequestSigner, SIGNING_VERSION, SigningParams};
@@ -365,22 +365,13 @@ fn build_common_request(
     let site_domain = demand.site_domain(&common.publisher.domain);
     let page = demand.site_page(common.publisher.page_url.as_deref(), &site_domain);
     let body_consent = demand.body_consent(common.user.consent.as_ref());
-    let raw_tc = body_consent.and_then(|value| value.raw_tc_string.clone());
+    let raw_tc = body_consent.and_then(|value| value.value(SCHEME_TCF).map(str::to_owned));
     let user = Some(User {
         id: common.user.id.clone(),
         consent: raw_tc.clone(),
         ext: UserExt {
             consent: raw_tc,
-            consented_providers_settings: policy
-                .additional_consent
-                .then(|| {
-                    body_consent
-                        .and_then(|value| value.raw_ac_string.clone())
-                        .map(|consented_providers| ConsentedProvidersSettings {
-                            consented_providers: Some(consented_providers),
-                        })
-                })
-                .flatten(),
+            consented_providers_settings: None,
             eids: common.user.eids.clone(),
         }
         .to_ext(),
@@ -544,29 +535,42 @@ fn finalize_request(
     Ok(())
 }
 
+/// The schemes whose signals the request carries in its own fields, by the
+/// names the modules for them record. The strings are read through the
+/// consent context's neutral interface here, and the crate for each scheme
+/// answers the same question for a reader that depends on it.
+const SCHEME_TCF: &str = "tcf";
+const SCHEME_GPP: &str = "gpp";
+const SCHEME_US_PRIVACY: &str = "us_privacy";
+
 fn build_regs(
     consent: Option<&crate::consent::ConsentContext>,
     policy: RegsPolicy,
 ) -> Option<Regs> {
     let consent = consent?;
+    let applies = consent.applies();
+    let us_privacy = consent.value(SCHEME_US_PRIVACY).map(str::to_owned);
+    let gpp = consent.value(SCHEME_GPP).map(str::to_owned);
+    let gpp_sid = consent
+        .record(SCHEME_GPP)
+        .map(|record| record.sections().to_vec())
+        .filter(|sections| !sections.is_empty());
     if policy == RegsPolicy::ApplicabilityBit {
         // Any admitted context produces regs and GDPR comes from the
         // applicability bit alone, without jurisdiction rules.
         let ext = RegsExt {
-            gdpr: Some(u8::from(consent.gdpr_applies)),
-            us_privacy: consent.raw_us_privacy.clone(),
-            gpp: consent.raw_gpp_string.clone(),
-            gpp_sid: consent.gpp_section_ids.clone(),
+            gdpr: Some(u8::from(applies)),
+            us_privacy: us_privacy.clone(),
+            gpp: gpp.clone(),
+            gpp_sid: gpp_sid.clone(),
         };
         return Some(Regs {
             coppa: None,
-            gdpr: Some(consent.gdpr_applies),
-            us_privacy: ext.us_privacy.clone(),
-            gpp: ext.gpp.clone(),
-            gpp_sid: ext
-                .gpp_sid
-                .as_ref()
-                .map(|ids| ids.iter().copied().map(i32::from).collect())
+            gdpr: Some(applies),
+            us_privacy,
+            gpp,
+            gpp_sid: gpp_sid
+                .map(|ids| ids.into_iter().map(i32::from).collect())
                 .unwrap_or_default(),
             ext: ext.to_ext(),
         });
@@ -574,15 +578,11 @@ fn build_regs(
 
     // The jurisdiction policy sends no regs for an empty context and reads
     // GDPR from the applicability bit or from a GDPR jurisdiction.
-    let has_data = consent.gdpr_applies
-        || consent.raw_us_privacy.is_some()
-        || consent.raw_gpp_string.is_some()
-        || consent.gpp_section_ids.is_some()
-        || consent.gpc;
+    let has_data = applies || !consent.is_empty() || gpp_sid.is_some();
     if !has_data {
         return None;
     }
-    let gdpr = if consent.gdpr_applies
+    let gdpr = if applies
         || matches!(
             consent.jurisdiction,
             crate::consent::jurisdiction::Jurisdiction::Gdpr
@@ -596,9 +596,6 @@ fn build_regs(
     } else {
         Some(false)
     };
-    let us_privacy = consent.raw_us_privacy.clone();
-    let gpp = consent.raw_gpp_string.clone();
-    let gpp_sid = consent.gpp_section_ids.clone();
     let ext = RegsExt {
         gdpr: gdpr.map(u8::from),
         us_privacy: us_privacy.clone(),

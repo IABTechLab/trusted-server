@@ -75,13 +75,12 @@ pub fn log_id(ec_id: &str) -> String {
 
 use std::sync::Arc;
 
-use cookie::CookieJar;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
 use http::Request;
 
 use crate::consent::jurisdiction::Jurisdiction;
-use crate::consent::{self as consent_mod, ConsentContext, ConsentPipelineInput};
+use crate::consent::{self as consent_mod, ConsentContext};
 use crate::constants::{COOKIE_EC, COOKIE_EC_PULL_COMPLETE};
 use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
@@ -198,8 +197,6 @@ struct RequestEc {
     cookie_ec: Option<String>,
     /// Pull-sync completeness marker, if present.
     pull_sync_marker: Option<String>,
-    /// The parsed cookie jar (retained for consent pipeline input).
-    jar: Option<CookieJar>,
 }
 
 /// Parses EC identity from request cookies in a single pass.
@@ -226,7 +223,6 @@ fn parse_ec_from_request(
     Ok(RequestEc {
         cookie_ec,
         pull_sync_marker,
-        jar,
     })
 }
 
@@ -491,29 +487,9 @@ impl EcContext {
         // The policy the request's domain loaded decides its permissions.
         let maps = services.permission_policy().maps();
 
-        // Build consent context from request-local cookies, headers, and geo.
-        // Jurisdiction detection follows the permission model's fallback: with
-        // no location resolved the policy's declared jurisdiction stands in, so
-        // a deployment that declared one is not treated as unknown, while a
-        // failed lookup stays unknown so the consent gates fail closed
-        // alongside the requires-signal floor.
-        let consent = consent_mod::build_consent_context(&ConsentPipelineInput {
-            jar: parsed.jar.as_ref(),
-            req,
-            config: &settings.consent,
-            geo: geo_info,
-            default_jurisdiction: consent::default_jurisdiction(maps, geo_status),
-            permission_maps: maps,
-        });
-
-        // Assemble the permission state once, here, through the permission
-        // model, building the country/region baseline amended by what the
-        // signal modules the adapter selected say about the request.
-        // Downstream consumers read the stored result via
-        // [`EcContext::permissions`] and [`EcContext::ec_allowed`] rather than
-        // re-deriving it. The modules see the request as evidence, the same
-        // abstraction the Edge Cookie and device modules read, so a scheme
-        // core has never heard of can read its own signal from it.
+        // The modules see the request as evidence, the same abstraction the
+        // Edge Cookie and device modules read, so a scheme core has never
+        // heard of can read its own signal from it.
         let evidence = crate::evidence::BorrowedRequestInfo::new(
             client_ip.as_deref().unwrap_or_default(),
             Some(req.headers()),
@@ -521,13 +497,36 @@ impl EcContext {
         .with_request_target(req.uri().path(), req.uri().query().unwrap_or_default());
         let mut module_context = ModuleContext::new(ModuleRequest::of(req, services.client_info()))
             .with_evidence(&evidence)
-            .with_consent(&consent)
             .with_settings(settings)
             .with_services(services)
             .with_client(services.client_info());
         if let Some(geo) = geo_info {
             module_context = module_context.with_geo(geo, services.geo().required_permissions());
         }
+
+        // Read the consent once, each signal module reading its own scheme.
+        // Jurisdiction detection follows the permission model's fallback: with
+        // no location resolved the policy's declared jurisdiction stands in, so
+        // a deployment that declared one is not treated as unknown, while a
+        // failed lookup stays unknown so the consent gates fail closed
+        // alongside the requires-signal floor.
+        let consent = consent_mod::read_consent(
+            &module_context,
+            services.permission_signal_modules(),
+            consent_mod::request_jurisdiction(
+                maps,
+                geo_info,
+                consent::default_jurisdiction(maps, geo_status),
+            ),
+        );
+
+        // Assemble the permission state once, here, through the permission
+        // model, building the country/region baseline amended by what the
+        // signal modules the adapter selected say about the request.
+        // Downstream consumers read the stored result via
+        // [`EcContext::permissions`] and [`EcContext::ec_allowed`] rather than
+        // re-deriving it.
+        let module_context = module_context.with_consent(&consent);
         let permissions = consent::assemble_permissions(
             maps,
             &module_context,
@@ -1142,10 +1141,9 @@ impl EcContext {
     /// storage, scoped to the jurisdiction's storage baseline.
     ///
     /// Answered by the signal modules at construction and recorded on the
-    /// permission state, see [`PermissionState::storage_withdrawn`]. Of the
-    /// schemes that ship, only a TCF record refusing storage withdraws, and
-    /// only where the storage baseline is not `granted`. Suppression (the
-    /// permission merely not set) is reported by
+    /// permission state, see [`PermissionState::storage_withdrawn`]. A module
+    /// withdraws only where the storage baseline is not `granted`.
+    /// Suppression (the permission merely not set) is reported by
     /// [`ec_allowed`](Self::ec_allowed) being `false` instead.
     #[must_use]
     pub fn storage_withdrawn(&self) -> bool {
@@ -1167,6 +1165,14 @@ impl EcContext {
         self.ec_allowed()
             && self.permissions.is_set(Permission::StoreOnDevice)
             && self.permissions.is_set(Permission::SelectPersonalisedAds)
+    }
+
+    /// Whether a server-side auction may be dispatched for this request, read
+    /// from the request's consent records and jurisdiction rather than its
+    /// permissions, see [`crate::consent::consent_allows_server_side_auction`].
+    #[must_use]
+    pub fn server_side_auction_allowed(&self) -> bool {
+        consent_mod::consent_allows_server_side_auction(&self.consent)
     }
 
     /// Returns the permissions resolved for this request.
@@ -1233,7 +1239,6 @@ impl EcContext {
         consent: ConsentContext,
         ec_allowed: bool,
     ) -> Self {
-        let permissions = permissions_for_test(ec_allowed);
         Self {
             ec_was_present: ec_value.is_some(),
             cookie_ec_value: ec_value.clone(),
@@ -1241,7 +1246,7 @@ impl EcContext {
             ec_generated: false,
             consent,
             ec_allowed,
-            permissions,
+            permissions: permissions_for_test(ec_allowed),
             client_ip: None,
             geo_info: None,
             device_signals: None,
@@ -1357,10 +1362,11 @@ impl EcContext {
     /// storage, as assembly records it when a signal module answers so.
     ///
     /// Core links no module, so a core test cannot derive the withdrawal
-    /// from a consent record the way a deployment does through the TCF
+    /// from a consent record the way a deployment does through a signal
     /// module. It states the answer instead and tests what finalization does
-    /// with it. That a TCF refusal produces this answer is proved where the
-    /// modules are linked, in the Axum adapter's `permission_signals` test.
+    /// with it. That a record refusing storage produces this answer is proved
+    /// where the modules are linked, in the Axum adapter's
+    /// `permission_signals` test.
     #[cfg(test)]
     #[must_use]
     pub fn with_storage_withdrawn_for_test(mut self, withdrawn: bool) -> Self {
@@ -1432,7 +1438,7 @@ pub(crate) fn std_system_time_now() -> std::time::SystemTime {
 pub(crate) mod tests {
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
-    use crate::consent::types::{ConsentContext, ConsentSource};
+    use crate::consent::types::ConsentContext;
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
     use crate::ec::kv_backend::{
         EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
@@ -1503,11 +1509,7 @@ pub(crate) mod tests {
     }
 
     fn granting_consent() -> ConsentContext {
-        ConsentContext {
-            jurisdiction: Jurisdiction::NonRegulated,
-            source: ConsentSource::Cookie,
-            ..Default::default()
-        }
+        ConsentContext::new(Jurisdiction::NonRegulated)
     }
 
     #[tokio::test]

@@ -1,368 +1,176 @@
-//! Consent forwarding configuration types.
+//! The `[consent]` settings table, read by the permission signal modules.
 //!
-//! Defines the `[consent]` TOML section and its nested sub-sections for
-//! controlling how Trusted Server interprets, validates, and forwards
-//! privacy consent signals to advertising partners.
+//! Core reads one key, `mode`, which says whether the modules decode the
+//! signals they read or leave them as received. Every other key is the
+//! business of the module for the scheme it concerns, which reads the table
+//! into a type of its own through [`ConsentConfig::read`].
 
-use serde::{Deserialize, Serialize};
+use error_stack::Report;
+use serde::de::{DeserializeOwned, Error as _};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Map, Value};
 
-/// TCF spec recommends 13 months (≈395 days).
-const MAX_CONSENT_AGE_DAYS: u32 = 395;
+use crate::error::TrustedServerError;
 
-/// How many days newer one string must be to win under the `newest` strategy.
-const FRESHNESS_THRESHOLD_DAYS: u32 = 30;
+/// A key the table once held and refuses now, so a document still carrying
+/// it is told rather than silently kept.
+const REMOVED_KEYS: &[&str] = &["consent_store"];
 
-/// Top-level consent configuration (`[consent]` in TOML).
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+/// The `[consent]` table.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ConsentConfig {
-    /// Operating mode for consent handling.
-    ///
-    /// - `"interpreter"` — decode consent strings and forward structured data
-    ///   (recommended; enables observability and enforcement).
-    /// - `"proxy"` — forward raw strings without decoding.
-    #[serde(default = "default_consent_mode")]
+    /// Whether the signal modules decode what they read.
+    #[serde(default)]
     pub mode: ConsentMode,
-
-    /// Whether to check consent expiration based on TCF timestamps.
-    #[serde(default = "default_true")]
-    pub check_expiration: bool,
-
-    /// Maximum consent age in days before it is considered expired.
-    ///
-    /// TCF spec recommends 13 months (≈395 days). Valid range: 1–3650.
-    /// Values outside this range are clamped during [`validate`](Self::validate).
-    #[serde(default = "default_max_consent_age_days")]
-    pub max_consent_age_days: u32,
-
-    /// Defaults for constructing a US Privacy string when only `Sec-GPC`
-    /// is present and no explicit `us_privacy` cookie exists.
-    #[serde(default)]
-    pub us_privacy_defaults: UsPrivacyDefaultsConfig,
-
-    /// How to resolve conflicts when both TCF and GPP strings are present
-    /// but disagree on consent status.
-    #[serde(default)]
-    pub conflict_resolution: ConflictResolutionConfig,
+    /// Every other key, as written, for the modules to read.
+    #[serde(flatten)]
+    settings: Map<String, Value>,
 }
 
-impl Default for ConsentConfig {
-    fn default() -> Self {
-        Self {
-            mode: ConsentMode::Interpreter,
-            check_expiration: true,
-            max_consent_age_days: MAX_CONSENT_AGE_DAYS,
-            us_privacy_defaults: UsPrivacyDefaultsConfig::default(),
-            conflict_resolution: ConflictResolutionConfig::default(),
+/// The table as written, before the removed keys are refused.
+#[derive(Deserialize)]
+struct WrittenConsentConfig {
+    #[serde(default)]
+    mode: ConsentMode,
+    #[serde(flatten)]
+    settings: Map<String, Value>,
+}
+
+impl<'de> Deserialize<'de> for ConsentConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let written = WrittenConsentConfig::deserialize(deserializer)?;
+        if let Some(removed) = REMOVED_KEYS
+            .iter()
+            .find(|key| written.settings.contains_key(**key))
+        {
+            return Err(D::Error::custom(format!(
+                "[consent] {removed} was removed and is no longer accepted. Remove the \
+                 line, because consent is read from the request on every request and \
+                 kept with the identity graph, never in a store of its own"
+            )));
         }
+        Ok(Self {
+            mode: written.mode,
+            settings: written.settings,
+        })
     }
 }
 
 impl ConsentConfig {
-    /// Clamps configuration values to valid ranges and logs warnings.
+    /// The table read as `T`, `mode` included.
     ///
-    /// Call after deserialization to catch out-of-range values early.
-    pub fn validate(&mut self) {
-        let clamped = self.max_consent_age_days.clamp(1, 3650);
-        if clamped != self.max_consent_age_days {
-            log::warn!(
-                "max_consent_age_days={} is outside the valid range 1\u{2013}3650; clamped to {clamped}",
-                self.max_consent_age_days
-            );
-            self.max_consent_age_days = clamped;
-        }
+    /// A module names the keys it reads in `T` and leaves the rest to the
+    /// other modules, so `T` must accept keys it does not name.
+    ///
+    /// # Errors
+    ///
+    /// A key `T` names whose value is not of the type `T` expects.
+    pub fn read<T: DeserializeOwned>(&self) -> Result<T, Report<TrustedServerError>> {
+        let mut table = self.settings.clone();
+        table.insert(
+            "mode".to_owned(),
+            serde_json::to_value(self.mode).unwrap_or_default(),
+        );
+        serde_json::from_value(Value::Object(table)).map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("[consent] could not be read: {error}"),
+            })
+        })
+    }
+
+    /// Whether the table carries `key`.
+    #[must_use]
+    pub fn has(&self, key: &str) -> bool {
+        self.settings.contains_key(key)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Consent mode
-// ---------------------------------------------------------------------------
-
-/// Operating mode for the consent pipeline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+/// Whether the signal modules decode what they read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ConsentMode {
-    /// Decode consent strings and forward structured data.
+    /// Decode each signal and act on what it says.
+    #[default]
     Interpreter,
-    /// Forward raw strings without decoding.
+    /// Leave each signal as received and forward it without reading it.
     Proxy,
 }
 
-// ---------------------------------------------------------------------------
-// Consent forwarding mode (per-partner)
-// ---------------------------------------------------------------------------
-
-/// How consent signals are forwarded to a specific partner integration.
-///
-/// Controls whether consent travels through the `OpenRTB` body, raw `Cookie`
-/// headers, or both. The default (`Both`) preserves backward compatibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ConsentForwardingMode {
-    /// Forward consent in the `OpenRTB` body only; strip consent cookies.
-    OpenrtbOnly,
-    /// Forward consent cookies only; omit consent fields from the body.
-    CookiesOnly,
-    /// Forward consent in both cookies and body (default).
-    #[default]
-    Both,
-}
-
-impl ConsentForwardingMode {
-    /// Whether consent cookies should be stripped from forwarded requests.
-    ///
-    /// Returns `true` for [`OpenrtbOnly`](Self::OpenrtbOnly) since consent
-    /// travels exclusively through the request body in that mode.
-    #[must_use]
-    pub const fn strips_consent_cookies(self) -> bool {
-        matches!(self, Self::OpenrtbOnly)
-    }
-
-    /// Whether consent fields should be included in the request body.
-    ///
-    /// Returns `true` for [`OpenrtbOnly`](Self::OpenrtbOnly) and
-    /// [`Both`](Self::Both); `false` for [`CookiesOnly`](Self::CookiesOnly).
-    #[must_use]
-    pub const fn includes_body_consent(self) -> bool {
-        !matches!(self, Self::CookiesOnly)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// US Privacy defaults (GPC handling)
-// ---------------------------------------------------------------------------
-
-/// Publisher-configurable defaults for constructing a US Privacy string
-/// when only the `Sec-GPC` header is present (`[consent.us_privacy_defaults]`).
-///
-/// These reflect the publisher's actual compliance posture — they are
-/// **publisher policy**, not protocol requirements.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct UsPrivacyDefaultsConfig {
-    /// Whether the publisher has actually shown a CCPA notice to the user.
-    #[serde(default = "default_true")]
-    pub notice_given: bool,
-
-    /// Whether the publisher is subject to the Limited Service Provider
-    /// Agreement.
-    #[serde(default)]
-    pub lspa_covered: bool,
-
-    /// Whether a `Sec-GPC: 1` header should be interpreted as an opt-out
-    /// of sale.
-    #[serde(default = "default_true")]
-    pub gpc_implies_optout: bool,
-}
-
-impl Default for UsPrivacyDefaultsConfig {
-    fn default() -> Self {
-        Self {
-            notice_given: true,
-            lspa_covered: false,
-            gpc_implies_optout: true,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Conflict resolution
-// ---------------------------------------------------------------------------
-
-/// How to resolve disagreements between GPP and TC String when both are
-/// present (`[consent.conflict_resolution]`).
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConflictResolutionConfig {
-    /// Resolution strategy.
-    #[serde(default = "default_conflict_mode")]
-    pub mode: ConflictMode,
-
-    /// How many days newer one string must be to win under the `newest`
-    /// strategy.
-    #[serde(default = "default_freshness_threshold_days")]
-    pub freshness_threshold_days: u32,
-}
-
-impl Default for ConflictResolutionConfig {
-    fn default() -> Self {
-        Self {
-            mode: ConflictMode::Restrictive,
-            freshness_threshold_days: FRESHNESS_THRESHOLD_DAYS,
-        }
-    }
-}
-
-/// Conflict resolution strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ConflictMode {
-    /// Deny consent when signals disagree (most restrictive).
-    Restrictive,
-    /// Use the newer signal based on timestamps.
-    Newest,
-    /// Grant consent when signals disagree (least restrictive).
-    Permissive,
-}
-
-// ---------------------------------------------------------------------------
-// Serde default value functions
-// ---------------------------------------------------------------------------
-
-const fn default_consent_mode() -> ConsentMode {
-    ConsentMode::Interpreter
-}
-
-const fn default_true() -> bool {
-    true
-}
-
-const fn default_max_consent_age_days() -> u32 {
-    MAX_CONSENT_AGE_DAYS
-}
-
-const fn default_conflict_mode() -> ConflictMode {
-    ConflictMode::Restrictive
-}
-
-const fn default_freshness_threshold_days() -> u32 {
-    FRESHNESS_THRESHOLD_DAYS
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
-    use super::{ConflictMode, ConsentConfig, ConsentMode};
+    use super::*;
 
-    #[test]
-    fn default_config_uses_interpreter_mode() {
-        let config = ConsentConfig::default();
-        assert_eq!(
-            config.mode,
-            ConsentMode::Interpreter,
-            "default mode should be interpreter"
-        );
+    #[derive(Debug, Default, Deserialize, PartialEq)]
+    #[serde(default)]
+    struct ExampleSettings {
+        mode: ConsentMode,
+        example_days: u32,
     }
 
     #[test]
-    fn default_config_enables_expiration_checking() {
-        let config = ConsentConfig::default();
-        assert!(
-            config.check_expiration,
-            "expiration checking should be enabled by default"
-        );
-        assert_eq!(
-            config.max_consent_age_days, 395,
-            "default max age should be 395 days"
-        );
-    }
-
-    #[test]
-    fn default_us_privacy_defaults_reflect_common_posture() {
-        let config = ConsentConfig::default();
-        let defaults = &config.us_privacy_defaults;
-        assert!(defaults.notice_given, "notice_given should default to true");
-        assert!(
-            !defaults.lspa_covered,
-            "lspa_covered should default to false"
-        );
-        assert!(
-            defaults.gpc_implies_optout,
-            "gpc_implies_optout should default to true"
-        );
-    }
-
-    #[test]
-    fn default_conflict_resolution_is_restrictive() {
-        let config = ConsentConfig::default();
-        assert_eq!(
-            config.conflict_resolution.mode,
-            ConflictMode::Restrictive,
-            "default conflict mode should be restrictive"
-        );
-        assert_eq!(
-            config.conflict_resolution.freshness_threshold_days, 30,
-            "default freshness threshold should be 30 days"
-        );
-    }
-
-    #[test]
-    fn deserializes_from_empty_json() {
+    fn an_empty_table_decodes_and_reads_as_defaults() {
         let config: ConsentConfig =
-            serde_json::from_str("{}").expect("should deserialize empty JSON with defaults");
+            serde_json::from_str("{}").expect("should deserialize an empty table");
         assert_eq!(config.mode, ConsentMode::Interpreter);
-        assert!(config.check_expiration);
+        assert_eq!(
+            config.read::<ExampleSettings>().expect("should read"),
+            ExampleSettings::default()
+        );
     }
 
     #[test]
-    fn deserializes_proxy_mode() {
-        let config: ConsentConfig =
-            serde_json::from_str(r#"{"mode": "proxy"}"#).expect("should deserialize proxy mode");
+    fn a_module_reads_its_keys_and_leaves_the_others() {
+        let config: ConsentConfig = serde_json::from_value(serde_json::json!({
+            "mode": "proxy",
+            "example_days": 7,
+            "another": { "key": true }
+        }))
+        .expect("should deserialize the table");
         assert_eq!(config.mode, ConsentMode::Proxy, "should parse proxy mode");
-    }
-
-    #[test]
-    fn consent_forwarding_mode_strips_cookies_only_for_openrtb() {
-        use super::ConsentForwardingMode;
-
-        assert!(
-            ConsentForwardingMode::OpenrtbOnly.strips_consent_cookies(),
-            "openrtb_only should strip consent cookies"
-        );
-        assert!(
-            !ConsentForwardingMode::CookiesOnly.strips_consent_cookies(),
-            "cookies_only should not strip consent cookies"
-        );
-        assert!(
-            !ConsentForwardingMode::Both.strips_consent_cookies(),
-            "both should not strip consent cookies"
-        );
-    }
-
-    #[test]
-    fn consent_forwarding_mode_includes_body_consent_except_cookies_only() {
-        use super::ConsentForwardingMode;
-
-        assert!(
-            ConsentForwardingMode::OpenrtbOnly.includes_body_consent(),
-            "openrtb_only should include body consent"
-        );
-        assert!(
-            !ConsentForwardingMode::CookiesOnly.includes_body_consent(),
-            "cookies_only should not include body consent"
-        );
-        assert!(
-            ConsentForwardingMode::Both.includes_body_consent(),
-            "both should include body consent"
-        );
-    }
-
-    #[test]
-    fn deserializes_full_config() {
-        let json = serde_json::json!({
-            "mode": "interpreter",
-            "check_expiration": false,
-            "max_consent_age_days": 180,
-            "us_privacy_defaults": {
-                "notice_given": false,
-                "lspa_covered": true,
-                "gpc_implies_optout": false
-            },
-            "conflict_resolution": {
-                "mode": "newest",
-                "freshness_threshold_days": 15
+        assert!(config.has("another") && !config.has("missing"));
+        assert_eq!(
+            config.read::<ExampleSettings>().expect("should read"),
+            ExampleSettings {
+                mode: ConsentMode::Proxy,
+                example_days: 7,
             }
-        });
+        );
+    }
+
+    #[test]
+    fn a_key_of_the_wrong_type_is_refused_naming_the_table() {
         let config: ConsentConfig =
-            serde_json::from_value(json).expect("should deserialize full config");
-        assert!(!config.check_expiration);
-        assert_eq!(config.max_consent_age_days, 180);
-        assert!(!config.us_privacy_defaults.notice_given);
-        assert!(config.us_privacy_defaults.lspa_covered);
-        assert_eq!(config.conflict_resolution.mode, ConflictMode::Newest);
-        assert_eq!(config.conflict_resolution.freshness_threshold_days, 15);
+            serde_json::from_value(serde_json::json!({ "example_days": "seven" }))
+                .expect("should deserialize the table");
+        let error = config
+            .read::<ExampleSettings>()
+            .expect_err("should refuse a string where a number is expected");
+        assert!(format!("{error:?}").contains("[consent] could not be read"));
+    }
+
+    #[test]
+    fn a_removed_key_is_refused_by_name() {
+        let error = serde_json::from_value::<ConsentConfig>(serde_json::json!({
+            "consent_store": "legacy-consent-store"
+        }))
+        .expect_err("should refuse the removed key");
+        assert!(
+            error.to_string().contains("consent_store"),
+            "should name the removed key: {error}"
+        );
+    }
+
+    #[test]
+    fn the_table_serializes_as_written() {
+        let config: ConsentConfig = serde_json::from_value(serde_json::json!({
+            "mode": "proxy",
+            "example_days": 7
+        }))
+        .expect("should deserialize the table");
+        let written = serde_json::to_value(&config).expect("should serialize");
+        assert_eq!(
+            written,
+            serde_json::json!({ "mode": "proxy", "example_days": 7 })
+        );
     }
 }

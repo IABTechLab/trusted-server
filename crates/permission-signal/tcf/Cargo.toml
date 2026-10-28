@@ -1,6 +1,6 @@
 [package]
 name = "trusted-server-permission-signal-tcf"
-description = "IAB TCF v2 as a permission signal module, with the purpose mapping."
+description = "The IAB TCF v2 string decoder and the record as a permission signal module, with the purpose mapping."
 authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
@@ -14,9 +14,18 @@ doctest = false
 workspace = true
 
 [dependencies]
+base64 = { workspace = true }
+derive_more = { workspace = true }
+error-stack = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
 trusted-server-core = { workspace = true }
+trusted-server-permission-signal-gpp = { workspace = true }
+web-time = { workspace = true }
 
 [dev-dependencies]
+http = { workspace = true }
+serde_json = { workspace = true }
 # The tests read the repository's sample policy, which only core's
 # test-utils feature compiles.
 trusted-server-core = { workspace = true, features = ["test-utils"] }

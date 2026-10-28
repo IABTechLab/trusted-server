@@ -20,10 +20,11 @@ gets, the resulting permission per Data Use with the reason for each.
 
 ## The engine is the real code
 
-Step 3 is computed by trusted-server-core itself, compiled to
-WebAssembly and run in the page. The wrapper crate in `wasm/` exposes
-the production path (`build_context_from_signals` decodes the raw
-signals, `assemble_permissions` resolves the policy, and
+Step 3 is computed by trusted-server-core and the permission signal
+modules every adapter offers by default, compiled to WebAssembly and
+run in the page. The wrapper crate in `wasm/` exposes the production
+path (`read_consent` asks those modules to read the signals the page
+enters, `assemble_permissions` resolves the policy, and
 `PermissionMaps::from_yaml` validates files with the server's own error
 messages), so what the page shows is what the server does, and the page
 states the trusted-server version, branch, commit and date the engine

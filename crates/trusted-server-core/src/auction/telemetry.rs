@@ -119,7 +119,8 @@ pub struct AuctionObservationContext {
     pub is_known_browser: u8,
     /// Complete User-Agent supplied by the auction request, when present.
     pub user_agent: Option<String>,
-    /// Whether GDPR applies.
+    /// Whether a signal module says the regulation its scheme answers for
+    /// applies.
     pub gdpr_applies: bool,
     /// Whether any consent signal was present.
     pub consent_present: bool,
@@ -201,7 +202,7 @@ impl AuctionObservationContext {
                 None => 2,
             },
             user_agent: user_agent.map(str::to_owned),
-            gdpr_applies: consent.gdpr_applies,
+            gdpr_applies: consent.applies(),
             consent_present: !consent.is_empty(),
             slot_count,
             origin_cache_shareable: None,

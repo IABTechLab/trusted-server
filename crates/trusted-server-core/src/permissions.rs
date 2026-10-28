@@ -11,14 +11,14 @@
 //! declaration is not consulted, because geo runs before the permissions are
 //! assembled and supplies the country they depend on.
 //!
-//! The vocabulary is the IAB Privacy Taxonomy Data Uses, mapped from the IAB TCF
-//! Europe purposes and used **only** as a technical identifier for a permission.
-//! Two purposes have no Data Use yet: TCF purpose 1 (device storage) uses a
-//! proposed `necessary.operations.storage` key and TCF purpose 11 keeps its TCF
-//! identifier. No CMP or TCF *policy* is implemented here. Every TCF purpose
-//! is resolved against the session's signals (a present TCF record grants or
-//! revokes each purpose, and a US-style opt-out revokes), and the Data Uses
-//! with no TCF purpose keep their configured baseline.
+//! The vocabulary is the Privacy Taxonomy Data Uses, used **only** as a
+//! technical identifier for a permission. Two Data Uses the shipped modules
+//! gate on have no taxonomy key yet, so device storage uses a proposed
+//! `necessary.operations.storage` key and limited-data content selection keeps
+//! the identifier `select-basic-content`. No scheme's policy is implemented
+//! here. Each permission is resolved against the session's signals, which the
+//! permission signal modules read, and a Data Use no module speaks for keeps
+//! its configured baseline.
 //!
 //! How a permission is acquired varies by place, so the policy is written as a
 //! tree of places: the top of the tree stands for the whole world, countries
@@ -51,44 +51,44 @@ use crate::consent::jurisdiction::Jurisdiction;
 use crate::error::TrustedServerError;
 use crate::tdl::Tdl;
 
-/// A technical permission a module may require, labeled with its IAB Privacy
-/// Taxonomy Data Use, or its IAB TCF Europe purpose where no Data Use exists yet.
+/// A technical permission a module may require, labeled with its Privacy
+/// Taxonomy Data Use, or a proposed key where no Data Use exists yet.
 ///
-/// Only the identifier is used, with no TCF or taxonomy policy implemented. Every
-/// named variant with a TCF purpose in `permissions.yaml` is resolved against
-/// the session's signals. Only [`Permission::StoreOnDevice`] (and
-/// [`Permission::SelectPersonalisedAds`] for sharing) gates a shipped module.
+/// Only the identifier is used, with no taxonomy policy implemented. Every
+/// named variant is resolved against the session's signals. Only
+/// [`Permission::StoreOnDevice`] (and [`Permission::SelectPersonalisedAds`]
+/// for sharing) gates a shipped module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Permission {
-    /// TCF Purpose 1, store and/or access information on a device. It gates
-    /// every shipped Edge Cookie module. No IAB Privacy Taxonomy Data Use exists
-    /// for device storage yet, so this uses a proposed `necessary.operations`
-    /// key pending an upstream addition.
+    /// Store and/or access information on a device. It gates every shipped
+    /// Edge Cookie module. No Privacy Taxonomy Data Use exists for device
+    /// storage yet, so this uses a proposed `necessary.operations` key pending
+    /// an upstream addition.
     StoreOnDevice,
-    /// TCF Purpose 2, use limited data to select advertising.
+    /// Use limited data to select advertising.
     SelectBasicAds,
-    /// TCF Purpose 3, create profiles for personalised advertising.
+    /// Create profiles for personalised advertising.
     CreateAdsProfile,
-    /// TCF Purpose 4, use profiles to select personalised advertising.
+    /// Use profiles to select personalised advertising.
     SelectPersonalisedAds,
-    /// TCF Purpose 5, create profiles to personalise content.
+    /// Create profiles to personalise content.
     CreateContentProfile,
-    /// TCF Purpose 6, use profiles to select personalised content.
+    /// Use profiles to select personalised content.
     SelectPersonalisedContent,
-    /// TCF Purpose 7, measure advertising performance.
+    /// Measure advertising performance.
     MeasureAdPerformance,
-    /// TCF Purpose 8, measure content performance.
+    /// Measure content performance.
     MeasureContentPerformance,
-    /// TCF Purpose 9, understand audiences through statistics.
+    /// Understand audiences through statistics.
     MarketResearch,
-    /// TCF Purpose 10, develop and improve services.
+    /// Develop and improve services.
     DevelopServices,
-    /// TCF Purpose 11, use limited data to select content. No IAB Privacy
-    /// Taxonomy Data Use exists for limited-data content selection yet, so this
-    /// keeps its TCF identifier and is proposed upstream. No shipped module
+    /// Use limited data to select content. No Privacy Taxonomy Data Use
+    /// exists for limited-data content selection yet, so this keeps the
+    /// identifier `select-basic-content`, proposed upstream. No shipped module
     /// gates on it.
     SelectBasicContent,
-    /// An IAB Privacy Taxonomy Data Use with no dedicated variant, identified by
+    /// A Privacy Taxonomy Data Use with no dedicated variant, identified by
     /// its index into [`EXTRA_DATA_USES`]. These carry a policy flag in
     /// `permissions.yaml` for completeness, and no shipped module gates on them.
     Extra(u8),
@@ -110,7 +110,7 @@ const NAMED_DATA_USES: [&str; 11] = [
     "select-basic-content",
 ];
 
-/// Every other IAB Privacy Taxonomy Data Use, carried so `permissions.yaml` can
+/// Every other Privacy Taxonomy Data Use, carried so `permissions.yaml` can
 /// set a policy flag for the whole taxonomy (bit index 11..). No shipped module
 /// gates on these. They exist for completeness, testing, and demonstration.
 const EXTRA_DATA_USES: [&str; 53] = [
@@ -340,7 +340,7 @@ impl FromIterator<Permission> for PermissionSet {
 pub enum Acquisition {
     /// Set without any signal, exempt or strictly necessary here.
     Granted,
-    /// Set only when the incoming signals grant the matching TCF purpose.
+    /// Set only when a signal module grants it.
     /// The default, matching the floor an unresolved location falls to.
     #[default]
     RequiresSignal,
@@ -418,40 +418,51 @@ enum RevokeSet {
     Set(PermissionSet),
 }
 
-/// What a deployment decides about the shipped signal schemes, parsed from the
+/// What a deployment decides about the signal schemes, parsed from the
 /// `signals` section of `permissions.yaml`.
 ///
 /// The permission model holds this as data so a deployment changes it without
 /// changing a module. It is jurisdiction-free, and it carries only the
-/// decisions that are a deployment's to make: whether a TCF record answers at
+/// decisions that are a deployment's to make: which schemes' records answer at
 /// all, which signals count as a US-style opt-out, and what an opt-out takes
-/// away. What each scheme's own signal means, such as which TCF purpose grants
-/// which Data Use, is that scheme's module crate's, not this policy's. The
-/// country/region baseline decides the rest.
+/// away. What each scheme's own signal means is that scheme's module crate's,
+/// not this policy's, and the schemes are named by the modules, so this file
+/// knows none of them. The country/region baseline decides the rest.
 #[derive(Debug, Clone, Default)]
 pub struct SignalPolicy {
-    /// Whether a present TCF record's grants and revokes apply. Whether a
-    /// consenting record then stands over an opt-out, or the opt-out over it,
-    /// is decided by the order the modules are asked in, which is
-    /// `[permission-signal] modules`, not by this flag.
-    tcf_authoritative: bool,
-    /// The signals that constitute a US-style opt-out.
-    opt_out_sources: Vec<OptOutSource>,
+    /// The schemes whose present record's grants and revokes apply, each
+    /// written as `signals.<scheme>.authoritative`. Whether a consenting
+    /// record then stands over an opt-out, or the opt-out over it, is decided
+    /// by the order the modules are asked in, which is `[permission-signal]
+    /// modules`, not by this flag.
+    authoritative: Vec<String>,
+    /// The signals that constitute a US-style opt-out, by the names the
+    /// modules give them.
+    opt_out_sources: Vec<String>,
     /// Which Data Uses a US-style opt-out revokes.
     opt_out_revokes: RevokeSet,
 }
 
 impl SignalPolicy {
-    /// Whether a present TCF record's grants and revokes apply.
+    /// Whether a present record of `scheme` has grants and revokes that
+    /// apply, being `signals.<scheme>.authoritative` in the policy. A scheme
+    /// the policy does not name does not answer.
     #[must_use]
-    pub fn tcf_authoritative(&self) -> bool {
-        self.tcf_authoritative
+    pub fn authoritative(&self, scheme: &str) -> bool {
+        self.authoritative.iter().any(|name| name == scheme)
     }
 
-    /// The signals that constitute a US-style opt-out.
+    /// The signals that constitute a US-style opt-out, by the names the
+    /// modules give them.
     #[must_use]
-    pub fn opt_out_sources(&self) -> &[OptOutSource] {
+    pub fn opt_out_sources(&self) -> &[String] {
         &self.opt_out_sources
+    }
+
+    /// Whether the policy counts `source` as a US-style opt-out.
+    #[must_use]
+    pub fn is_opt_out_source(&self, source: &str) -> bool {
+        self.opt_out_sources.iter().any(|name| name == source)
     }
 
     /// Whether a US-style opt-out revokes `permission`.
@@ -469,8 +480,10 @@ impl SignalPolicy {
 /// erroring when it names an unknown Data Use or revoke rule.
 fn build_signal_policy(spec: &SignalsSpec) -> Result<SignalPolicy, PermissionsError> {
     let mut policy = SignalPolicy::default();
-    if let Some(tcf) = &spec.tcf {
-        policy.tcf_authoritative = tcf.authoritative;
+    for (scheme, record) in &spec.schemes {
+        if record.authoritative {
+            policy.authoritative.push(scheme.clone());
+        }
     }
     if let Some(opt_out) = &spec.us_opt_out {
         policy.opt_out_sources = opt_out.sources.clone();
@@ -1003,8 +1016,8 @@ impl PermissionMaps {
 pub struct ValidSignal {
     /// The module that read and used the signal, by its configured id.
     pub module: &'static str,
-    /// The scheme the signal belongs to, for example `tcf` or `gpp`, so a
-    /// reader can find a scheme without knowing which module read it.
+    /// The scheme the signal belongs to, by the name the module gives it, so
+    /// a reader can find a scheme without knowing which module read it.
     pub scheme: &'static str,
     /// The signal as it was received.
     pub value: String,
@@ -1280,23 +1293,25 @@ struct RulesFile {
 /// into a [`SignalPolicy`] by [`build_signal_policy`].
 #[derive(Debug, Default, Deserialize)]
 struct SignalsSpec {
-    /// The TCF record mapping, or `None` when the file declares no TCF policy.
-    #[serde(default)]
-    tcf: Option<TcfSignalSpec>,
     /// The US-style opt-out mapping, or `None` when none is declared.
     #[serde(default)]
     us_opt_out: Option<OptOutSpec>,
+    /// A block per scheme, `signals.<scheme>`, for the schemes whose record
+    /// answers for this deployment.
+    #[serde(flatten)]
+    schemes: BTreeMap<String, SchemeSpec>,
 }
 
-/// The `signals.tcf` block.
+/// A `signals.<scheme>` block.
 ///
-/// Only whether a TCF record answers for this deployment. Which purpose grants
-/// which Data Use is the TCF scheme's own knowledge and lives in the TCF
-/// permission signal module crate, so this file carries no table of another
-/// scheme's numbers and a deployment running no TCF configures none.
+/// Only whether a record of that scheme answers for this deployment. What the
+/// record says about each Data Use is the scheme's own knowledge and lives in
+/// its permission signal module crate, so this file carries no table of
+/// another scheme's numbers and a deployment running no such scheme configures
+/// none.
 #[derive(Debug, Deserialize)]
-struct TcfSignalSpec {
-    /// Whether a present TCF record's grants and revokes apply.
+struct SchemeSpec {
+    /// Whether a present record's grants and revokes apply.
     #[serde(default = "default_true")]
     authoritative: bool,
 }
@@ -1304,9 +1319,10 @@ struct TcfSignalSpec {
 /// The `signals.us_opt_out` block.
 #[derive(Debug, Deserialize)]
 struct OptOutSpec {
-    /// The signals that constitute a US-style opt-out.
+    /// The signals that constitute a US-style opt-out, by the names the
+    /// modules give them.
     #[serde(default)]
-    sources: Vec<OptOutSource>,
+    sources: Vec<String>,
     /// Which Data Uses the opt-out revokes.
     #[serde(default)]
     revokes: RevokeSpec,
@@ -1326,18 +1342,6 @@ impl Default for RevokeSpec {
     fn default() -> Self {
         RevokeSpec::List(Vec::new())
     }
-}
-
-/// A single US-style opt-out signal source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OptOutSource {
-    /// The `Sec-GPC` request header (Global Privacy Control).
-    Gpc,
-    /// A GPP US sale opt-out.
-    GppSaleOptOut,
-    /// A US Privacy string sale opt-out.
-    UsPrivacyOptOut,
 }
 
 /// Default for `#[serde(default = ...)]` on a `bool` field that should be `true`.
@@ -2706,15 +2710,28 @@ rules:
   jurisdiction: gdpr
   FR: g
 signals:
-  tcf:
+  example:
     authoritative: true
+  silent:
+    authoritative: false
   us_opt_out:
-    sources: [gpc]
+    sources: [browser-setting]
     revokes: [advertising_marketing.first_party.targeted]
 ";
         let maps = PermissionMaps::from_yaml(yaml).expect("should parse the signals section");
         let signals = maps.signals();
-        assert!(signals.tcf_authoritative(), "tcf should be authoritative");
+        assert!(
+            signals.authoritative("example"),
+            "a scheme written authoritative answers"
+        );
+        assert!(
+            !signals.authoritative("silent") && !signals.authoritative("unwritten"),
+            "a scheme written otherwise, or not written, does not"
+        );
+        assert!(
+            signals.is_opt_out_source("browser-setting") && !signals.is_opt_out_source("other"),
+            "the opt-out sources are the names written"
+        );
         assert!(
             signals.opt_out_revokes(Permission::SelectPersonalisedAds),
             "a listed Data Use is revoked by the opt-out"

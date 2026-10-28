@@ -1,6 +1,6 @@
 [package]
 name = "trusted-server-permission-signal-us-privacy"
-description = "The US Privacy string sale opt-out as a permission signal module."
+description = "The US Privacy string decoder and its sale opt-out as a permission signal module."
 authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
@@ -14,9 +14,16 @@ doctest = false
 workspace = true
 
 [dependencies]
+derive_more = { workspace = true }
+error-stack = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
 trusted-server-core = { workspace = true }
+trusted-server-permission-signal-gpc = { workspace = true }
 
 [dev-dependencies]
+http = { workspace = true }
+serde_json = { workspace = true }
 # The tests read the repository's sample policy, which only core's
 # test-utils feature compiles.
 trusted-server-core = { workspace = true, features = ["test-utils"] }

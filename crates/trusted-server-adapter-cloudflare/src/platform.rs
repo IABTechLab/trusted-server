@@ -876,8 +876,9 @@ mod tests {
         // `detect_jurisdiction` reaches a US state node of the policy tree
         // only when the country is `US` and a region is present. With no
         // region a US visitor falls through to the country node's
-        // `NonRegulated`, where `allows_ec_creation` returns true without
-        // reading `ctx.gpc`, so a Sec-GPC opt-out would be ignored.
+        // `NonRegulated`, which no US state scheme reads as its own, so the
+        // string a module constructs from a browser setting in a US state is
+        // never constructed.
         let ctx = make_ctx_with_headers(&[("cf-ipcountry", "US"), ("cf-region-code", "CA")]);
         let geo = build_geo(&ctx)
             .lookup(None, &test_services())

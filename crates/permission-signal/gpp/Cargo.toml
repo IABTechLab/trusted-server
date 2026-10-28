@@ -1,6 +1,6 @@
 [package]
 name = "trusted-server-permission-signal-gpp"
-description = "The GPP US sale opt-out as a permission signal module."
+description = "The GPP string decoder and its US sale opt-out as a permission signal module."
 authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
@@ -14,9 +14,14 @@ doctest = false
 workspace = true
 
 [dependencies]
+derive_more = { workspace = true }
+error-stack = { workspace = true }
+iab_gpp = { workspace = true }
+log = { workspace = true }
 trusted-server-core = { workspace = true }
 
 [dev-dependencies]
+http = { workspace = true }
 # The tests read the repository's sample policy, which only core's
 # test-utils feature compiles.
 trusted-server-core = { workspace = true, features = ["test-utils"] }

@@ -1,13 +1,12 @@
-//! TCF v2 consent string decoder (core segment only).
+//! The TCF v2 consent string decoder, core segment only.
 //!
-//! Decodes the IAB Transparency & Consent Framework v2 consent string from the
-//! `euconsent-v2` cookie. Only the core segment (segment type 0) is decoded;
-//! publisher restrictions, disclosed vendors, and allowed vendors segments are
-//! not yet supported.
+//! Decodes a TC String from the `euconsent-v2` cookie, or the EU section of a
+//! GPP string. Only the core segment (segment type 0) is decoded, so publisher
+//! restrictions, disclosed vendors and allowed vendors are not read.
 //!
 //! # Binary format
 //!
-//! The TC String is a web-safe base64-encoded binary bitfield. The core segment
+//! The TC String is a web-safe base64-encoded bitfield. The core segment
 //! layout (after base64 decoding) is:
 //!
 //! | Field | Bits | Offset |
@@ -43,35 +42,136 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use error_stack::Report;
 
-use super::types::{ConsentDecodeError, TcfConsent};
-
-/// Maximum length of a raw TC String before decoding.
-///
-/// Real TC Strings are typically under 1 KB. This limit prevents malicious
-/// cookies from triggering large heap allocations during base64 decoding.
+/// Longest raw TC String decoded. Real strings are under 1 KB, and the limit
+/// keeps a hostile cookie from forcing a large allocation.
 const MAX_TC_STRING_LEN: usize = 4096;
 
-/// Maximum vendor ID we will process from a TC String.
-///
-/// The IAB vendor list currently has ~1 200 entries. This cap prevents
-/// malicious range-encoded entries (e.g. `start=1, end=65535`) from
-/// expanding into enormous `Vec`s. Vendors beyond this limit are silently
-/// ignored.
+/// Highest vendor identifier read. The vendor list has about 1200 entries,
+/// and the cap keeps a hostile range entry from expanding into an enormous
+/// list. Vendors beyond it are silently dropped.
 const MAX_VENDOR_ID: u16 = 10_000;
 
-/// Decodes a TC String v2 into a [`TcfConsent`] struct.
-///
-/// Only the core segment is decoded. Additional segments (separated by `.`)
-/// are ignored.
+/// The decoded core segment of a TC String.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcfConsent {
+    /// TCF version (2).
+    pub version: u8,
+    /// CMP ID that collected this consent.
+    pub cmp_id: u16,
+    /// CMP version.
+    pub cmp_version: u16,
+    /// Consent screen number.
+    pub consent_screen: u8,
+    /// CMP language (ISO 639-1, two uppercase letters).
+    pub consent_language: String,
+    /// Vendor list version used.
+    pub vendor_list_version: u16,
+    /// TCF policy version.
+    pub tcf_policy_version: u8,
+    /// When consent was created, in deciseconds since the epoch.
+    pub created_ds: u64,
+    /// When consent was last updated, in deciseconds since the epoch.
+    pub last_updated_ds: u64,
+
+    /// Purpose consents (24 bits, 1-indexed).
+    ///
+    /// `true` at index 0 means purpose 1 is consented, and so on.
+    pub purpose_consents: Vec<bool>,
+    /// Purpose legitimate interests (24 bits, 1-indexed).
+    pub purpose_legitimate_interests: Vec<bool>,
+
+    /// Vendor IDs with consent granted.
+    pub vendor_consents: Vec<u16>,
+    /// Vendor IDs with legitimate interest established.
+    pub vendor_legitimate_interests: Vec<u16>,
+
+    /// Special feature opt-ins (12 bits).
+    pub special_feature_opt_ins: Vec<bool>,
+}
+
+impl TcfConsent {
+    /// Looks up a 1-indexed purpose in a bitfield, `false` for purpose 0
+    /// and for an index past the end.
+    fn purpose_bit(bits: &[bool], purpose: usize) -> bool {
+        purpose
+            .checked_sub(1)
+            .and_then(|idx| bits.get(idx).copied())
+            .unwrap_or(false)
+    }
+
+    /// Whether consent was given for a purpose, 1-indexed as the
+    /// specification numbers them, `false` out of range.
+    #[must_use]
+    pub fn has_purpose_consent(&self, purpose: usize) -> bool {
+        Self::purpose_bit(&self.purpose_consents, purpose)
+    }
+
+    /// Whether legitimate interest was established for a purpose, 1-indexed,
+    /// `false` out of range.
+    #[must_use]
+    pub fn has_purpose_li(&self, purpose: usize) -> bool {
+        Self::purpose_bit(&self.purpose_legitimate_interests, purpose)
+    }
+
+    /// Whether a vendor has consent.
+    #[must_use]
+    pub fn has_vendor_consent(&self, vendor_id: u16) -> bool {
+        self.vendor_consents.contains(&vendor_id)
+    }
+
+    /// Whether a vendor has established legitimate interest.
+    #[must_use]
+    pub fn has_vendor_li(&self, vendor_id: u16) -> bool {
+        self.vendor_legitimate_interests.contains(&vendor_id)
+    }
+
+    /// Whether Purpose 1 (store and/or access information on a device) is
+    /// consented.
+    #[must_use]
+    pub fn has_storage_consent(&self) -> bool {
+        self.has_purpose_consent(1)
+    }
+
+    /// Whether Purpose 2 (use limited data to select advertising) is
+    /// consented.
+    #[must_use]
+    pub fn has_basic_ads_consent(&self) -> bool {
+        self.has_purpose_consent(2)
+    }
+
+    /// Whether Purpose 4 (use profiles to select personalised advertising) is
+    /// consented.
+    #[must_use]
+    pub fn has_personalized_ads_consent(&self) -> bool {
+        self.has_purpose_consent(4)
+    }
+}
+
+/// Why a TC String could not be decoded.
+#[derive(Debug, derive_more::Display)]
+pub enum TcfDecodeError {
+    /// The string is too long, is not base64, is not version 2, or is too
+    /// short to hold the core segment.
+    #[display("invalid TC String: {reason}")]
+    InvalidTcString {
+        /// What was wrong with it.
+        reason: String,
+    },
+}
+
+impl core::error::Error for TcfDecodeError {}
+
+/// Decodes the core segment of a TC String v2. Additional segments, after a
+/// `.`, are ignored.
 ///
 /// # Errors
 ///
-/// - [`ConsentDecodeError::InvalidTcString`] if the string exceeds
-///   `MAX_TC_STRING_LEN`, base64 decoding fails, the version is not 2, or
-///   the bitfield is too short.
-pub fn decode_tc_string(tc_string: &str) -> Result<TcfConsent, Report<ConsentDecodeError>> {
+/// [`TcfDecodeError::InvalidTcString`] when the string exceeds
+/// `MAX_TC_STRING_LEN`, base64 decoding fails, the version is not 2, or the
+/// bitfield is too short.
+pub fn decode_tc_string(tc_string: &str) -> Result<TcfConsent, Report<TcfDecodeError>> {
     if tc_string.len() > MAX_TC_STRING_LEN {
-        return Err(Report::new(ConsentDecodeError::InvalidTcString {
+        return Err(Report::new(TcfDecodeError::InvalidTcString {
             reason: format!(
                 "TC string too long: {} bytes, max {MAX_TC_STRING_LEN}",
                 tc_string.len()
@@ -79,28 +179,27 @@ pub fn decode_tc_string(tc_string: &str) -> Result<TcfConsent, Report<ConsentDec
         }));
     }
 
-    // TC String may have multiple segments separated by '.'
     // The first segment is always the core segment.
     let core_segment = tc_string.split('.').next().unwrap_or(tc_string);
 
     let bytes = URL_SAFE_NO_PAD
         .decode(core_segment)
         .or_else(|_| {
-            // Some CMPs use standard base64 with padding
+            // Some CMPs use standard base64 with padding.
             use base64::engine::general_purpose::STANDARD;
             STANDARD.decode(core_segment)
         })
         .map_err(|e| {
-            Report::new(ConsentDecodeError::InvalidTcString {
+            Report::new(TcfDecodeError::InvalidTcString {
                 reason: format!("base64 decode failed: {e}"),
             })
         })?;
 
     let reader = BitReader::new(&bytes);
 
-    // Minimum size: 230 bits for core fields up to IsRangeEncoding
+    // The core fields up to IsRangeEncoding take 230 bits.
     if reader.bit_len() < 230 {
-        return Err(Report::new(ConsentDecodeError::InvalidTcString {
+        return Err(Report::new(TcfDecodeError::InvalidTcString {
             reason: format!(
                 "bitfield too short: {} bits, need at least 230",
                 reader.bit_len()
@@ -110,7 +209,7 @@ pub fn decode_tc_string(tc_string: &str) -> Result<TcfConsent, Report<ConsentDec
 
     let version = reader.read_u8(0, 6);
     if version != 2 {
-        return Err(Report::new(ConsentDecodeError::InvalidTcString {
+        return Err(Report::new(TcfDecodeError::InvalidTcString {
             reason: format!("unsupported version {version}, expected 2"),
         }));
     }
@@ -121,12 +220,11 @@ pub fn decode_tc_string(tc_string: &str) -> Result<TcfConsent, Report<ConsentDec
     let cmp_version = reader.read_u16(90, 12);
     let consent_screen = reader.read_u8(102, 6);
 
-    // Consent language: two 6-bit values, each offset by 'A' (65).
-    // Valid range is 0–25 (maps to A–Z per ISO 639-1).
+    // Consent language: two 6-bit values, each offset from 'A', so 0 to 25.
     let lang_a = reader.read_u8(108, 6);
     let lang_b = reader.read_u8(114, 6);
     if lang_a > 25 || lang_b > 25 {
-        return Err(Report::new(ConsentDecodeError::InvalidTcString {
+        return Err(Report::new(TcfDecodeError::InvalidTcString {
             reason: format!("invalid consent language values: ({lang_a}, {lang_b}), expected 0-25"),
         }));
     }
@@ -134,20 +232,19 @@ pub fn decode_tc_string(tc_string: &str) -> Result<TcfConsent, Report<ConsentDec
 
     let vendor_list_version = reader.read_u16(120, 12);
     let tcf_policy_version = reader.read_u8(132, 6);
-    // Skip: IsServiceSpecific (138, 1), UseNonStandardTexts (139, 1)
+    // Skipped: IsServiceSpecific (138, 1), UseNonStandardTexts (139, 1).
 
     let special_feature_opt_ins = reader.read_bool_vec(140, 12);
     let purpose_consents = reader.read_bool_vec(152, 24);
     let purpose_legitimate_interests = reader.read_bool_vec(176, 24);
-    // Skip: PurposeOneTreatment (200, 1), PublisherCC (201, 12)
+    // Skipped: PurposeOneTreatment (200, 1), PublisherCC (201, 12).
 
-    // Vendor consents
-    let vendor_consents = decode_vendor_section(&reader, 213)?;
+    let vendor_consents = decode_vendor_section(&reader, 213);
 
-    // Vendor legitimate interests follow after vendor consents
-    let vendor_li_offset = vendor_section_end_offset(&reader, 213)?;
+    // Vendor legitimate interests follow the vendor consents.
+    let vendor_li_offset = vendor_section_end_offset(&reader, 213);
     let vendor_legitimate_interests = if vendor_li_offset + 17 <= reader.bit_len() {
-        decode_vendor_section(&reader, vendor_li_offset).unwrap_or_default()
+        decode_vendor_section(&reader, vendor_li_offset)
     } else {
         Vec::new()
     };
@@ -170,20 +267,12 @@ pub fn decode_tc_string(tc_string: &str) -> Result<TcfConsent, Report<ConsentDec
     })
 }
 
-/// Decodes a vendor section (consents or legitimate interests).
-///
-/// The section starts with:
-/// - `MaxVendorId` (16 bits)
-/// - `IsRangeEncoding` (1 bit)
-///
-/// If bitfield encoding: one bit per vendor up to `MaxVendorId`.
-/// If range encoding: `NumEntries` (12 bits), then entries.
-fn decode_vendor_section(
-    reader: &BitReader<'_>,
-    offset: usize,
-) -> Result<Vec<u16>, Report<ConsentDecodeError>> {
+/// Decodes a vendor section, consents or legitimate interests, which starts
+/// with `MaxVendorId` (16 bits) and `IsRangeEncoding` (1 bit) and is then a
+/// bitfield of one bit per vendor, or `NumEntries` (12 bits) of entries.
+fn decode_vendor_section(reader: &BitReader<'_>, offset: usize) -> Vec<u16> {
     if offset + 17 > reader.bit_len() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
 
     let raw_max_vendor_id = reader.read_u16(offset, 16);
@@ -191,10 +280,9 @@ fn decode_vendor_section(
     let is_range = reader.read_bool(offset + 16);
 
     if is_range {
-        // Range encoding
         let num_entries_offset = offset + 17;
         if num_entries_offset + 12 > reader.bit_len() {
-            return Ok(Vec::new());
+            return Vec::new();
         }
         let num_entries = reader.read_u16(num_entries_offset, 12);
         let mut vendors = Vec::new();
@@ -208,7 +296,7 @@ fn decode_vendor_section(
             pos += 1;
 
             if is_range_entry {
-                // Range: StartVendorId (16) + EndVendorId (16)
+                // StartVendorId (16) and EndVendorId (16).
                 if pos + 32 > reader.bit_len() {
                     break;
                 }
@@ -216,8 +304,7 @@ fn decode_vendor_section(
                 let end = reader.read_u16(pos + 16, 16);
                 pos += 32;
 
-                // Silently clamp to MAX_VENDOR_ID to prevent amplification
-                // from malicious range entries.
+                // Clamped to MAX_VENDOR_ID so a hostile range cannot amplify.
                 if start == 0 || start > end {
                     continue;
                 }
@@ -225,7 +312,7 @@ fn decode_vendor_section(
                     vendors.push(id);
                 }
             } else {
-                // Single vendor: VendorId (16)
+                // A single VendorId (16).
                 if pos + 16 > reader.bit_len() {
                     break;
                 }
@@ -236,9 +323,9 @@ fn decode_vendor_section(
                 }
             }
         }
-        Ok(vendors)
+        vendors
     } else {
-        // Bitfield: one bit per vendor, 1..=max_vendor_id
+        // One bit per vendor, 1..=max_vendor_id.
         let mut vendors = Vec::new();
         let bitfield_start = offset + 17;
         for i in 0..usize::from(max_vendor_id) {
@@ -247,33 +334,29 @@ fn decode_vendor_section(
                 break;
             }
             if reader.read_bool(bit_pos) {
-                // Vendor IDs are 1-indexed
                 vendors.push((i + 1) as u16);
             }
         }
-        Ok(vendors)
+        vendors
     }
 }
 
-/// Calculates the bit offset after a vendor section ends.
-fn vendor_section_end_offset(
-    reader: &BitReader<'_>,
-    offset: usize,
-) -> Result<usize, Report<ConsentDecodeError>> {
+/// The bit offset after a vendor section ends.
+///
+/// Reads the raw `MaxVendorId` rather than the capped one, because the
+/// section's true end in the bitstream depends on it.
+fn vendor_section_end_offset(reader: &BitReader<'_>, offset: usize) -> usize {
     if offset + 17 > reader.bit_len() {
-        return Ok(offset);
+        return offset;
     }
 
-    // Intentionally uncapped: we need the raw max_vendor_id to compute the
-    // true end-of-section offset in the bitstream, even though
-    // `decode_vendor_section` caps at MAX_VENDOR_ID for allocation safety.
     let max_vendor_id = reader.read_u16(offset, 16);
     let is_range = reader.read_bool(offset + 16);
 
     if is_range {
         let num_entries_offset = offset + 17;
         if num_entries_offset + 12 > reader.bit_len() {
-            return Ok(num_entries_offset);
+            return num_entries_offset;
         }
         let num_entries = reader.read_u16(num_entries_offset, 12);
         let mut pos = num_entries_offset + 12;
@@ -286,25 +369,18 @@ fn vendor_section_end_offset(
             pos += 1;
 
             if is_range_entry {
-                pos += 32; // StartVendorId (16) + EndVendorId (16)
+                pos += 32;
             } else {
-                pos += 16; // Single VendorId
+                pos += 16;
             }
         }
-        Ok(pos)
+        pos
     } else {
-        Ok(offset + 17 + usize::from(max_vendor_id))
+        offset + 17 + usize::from(max_vendor_id)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Bit reader utility
-// ---------------------------------------------------------------------------
-
-/// A simple bit-level reader over a byte slice.
-///
-/// All reads are specified as (`bit_offset`, `num_bits`) from the start of the
-/// buffer. No internal cursor is maintained — callers manage offsets explicitly.
+/// A bit-level reader over a byte slice, addressed by bit offset.
 struct BitReader<'a> {
     bytes: &'a [u8],
 }
@@ -318,7 +394,6 @@ impl<'a> BitReader<'a> {
         self.bytes.len() * 8
     }
 
-    /// Reads a single bit as a boolean.
     fn read_bool(&self, bit_offset: usize) -> bool {
         let byte_idx = bit_offset / 8;
         let bit_idx = 7 - (bit_offset % 8);
@@ -328,19 +403,16 @@ impl<'a> BitReader<'a> {
         (self.bytes[byte_idx] >> bit_idx) & 1 == 1
     }
 
-    /// Reads up to 8 bits as a [`u8`].
     fn read_u8(&self, bit_offset: usize, num_bits: usize) -> u8 {
         debug_assert!(num_bits <= 8);
         self.read_u64(bit_offset, num_bits) as u8
     }
 
-    /// Reads up to 16 bits as a [`u16`].
     fn read_u16(&self, bit_offset: usize, num_bits: usize) -> u16 {
         debug_assert!(num_bits <= 16);
         self.read_u64(bit_offset, num_bits) as u16
     }
 
-    /// Reads up to 64 bits as a [`u64`].
     fn read_u64(&self, bit_offset: usize, num_bits: usize) -> u64 {
         debug_assert!(num_bits <= 64);
         let mut value: u64 = 0;
@@ -352,7 +424,6 @@ impl<'a> BitReader<'a> {
         value
     }
 
-    /// Reads a sequence of bits as a [`Vec<bool>`].
     fn read_bool_vec(&self, bit_offset: usize, num_bits: usize) -> Vec<bool> {
         (0..num_bits)
             .map(|i| self.read_bool(bit_offset + i))
@@ -361,33 +432,11 @@ impl<'a> BitReader<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-
-    // A known-good TC String v2 generated by the IAB reference implementation.
-    // This encodes: version=2, cmpId=7, cmpVersion=1, consent for purposes 1-4,
-    // vendor consents for vendors 1-10 (bitfield encoding).
-    //
-    // To generate test strings: https://iabeurope.github.io/TCF-v2-consent-string-editor/
-    // Or use the IAB reference implementation in JavaScript.
 
     #[test]
     fn decodes_minimal_tc_string() {
-        // This is a minimal valid TC String v2 core segment.
-        // Generated with: version=2, created=1970-01-01, lastUpdated=1970-01-01,
-        // cmpId=1, cmpVersion=1, consentScreen=0, language=EN,
-        // vendorListVersion=1, policyVersion=2, purposes=none, vendors=none (max=0)
-        //
-        // Bitfield construction:
-        // version(6)=2, created(36)=0, lastUpdated(36)=0, cmpId(12)=1,
-        // cmpVersion(12)=1, consentScreen(6)=0, language(12)=EN,
-        // vendorListVersion(12)=1, policyVersion(6)=2,
-        // isServiceSpecific(1)=0, useNonStandard(1)=0,
-        // specialFeatures(12)=0, purposeConsents(24)=0,
-        // purposeLI(24)=0, purposeOneTreatment(1)=0, publisherCC(12)=EN,
-        // maxVendorId(16)=0, isRange(1)=0
-        //
-        // We'll build this manually.
         let bytes = build_minimal_tc_bytes(1, 1, b"EN", 1, &[], &[]);
         let encoded = URL_SAFE_NO_PAD.encode(&bytes);
 
@@ -402,7 +451,7 @@ mod tests {
 
     #[test]
     fn decodes_purpose_consents() {
-        let purposes = vec![true, true, false, true]; // purposes 1,2,4
+        let purposes = vec![true, true, false, true];
         let bytes = build_minimal_tc_bytes(1, 1, b"EN", 1, &purposes, &[]);
         let encoded = URL_SAFE_NO_PAD.encode(&bytes);
 
@@ -414,11 +463,14 @@ mod tests {
             "purpose 3 should not be consented"
         );
         assert!(result.purpose_consents[3], "purpose 4 should be consented");
+        assert!(result.has_storage_consent() && result.has_basic_ads_consent());
+        assert!(result.has_personalized_ads_consent());
+        assert!(!result.has_purpose_consent(0) && !result.has_purpose_consent(99));
+        assert!(!result.has_purpose_li(1));
     }
 
     #[test]
     fn decodes_vendor_consents_bitfield() {
-        // Vendors 1, 3, 5 consented (bitfield encoding, max=5)
         let vendor_bits = vec![true, false, true, false, true];
         let bytes = build_minimal_tc_bytes(1, 1, b"EN", 1, &[], &vendor_bits);
         let encoded = URL_SAFE_NO_PAD.encode(&bytes);
@@ -429,14 +481,14 @@ mod tests {
             vec![1, 3, 5],
             "should have vendors 1, 3, 5"
         );
+        assert!(result.has_vendor_consent(3) && !result.has_vendor_consent(2));
+        assert!(!result.has_vendor_li(3));
     }
 
     #[test]
     fn rejects_version_1() {
-        // Build bytes with version=1
         let mut bytes = build_minimal_tc_bytes(1, 1, b"EN", 1, &[], &[]);
-        // Clear version bits (first 6 bits) and set to 1
-        bytes[0] = (bytes[0] & 0x03) | (1 << 2); // version=1 in first 6 bits
+        bytes[0] = (bytes[0] & 0x03) | (1 << 2);
         let encoded = URL_SAFE_NO_PAD.encode(&bytes);
 
         let result = decode_tc_string(&encoded);
@@ -445,7 +497,7 @@ mod tests {
 
     #[test]
     fn rejects_too_short() {
-        let encoded = URL_SAFE_NO_PAD.encode([0_u8; 10]); // only 80 bits
+        let encoded = URL_SAFE_NO_PAD.encode([0_u8; 10]);
         let result = decode_tc_string(&encoded);
         assert!(result.is_err(), "should reject short bitfield");
     }
@@ -457,8 +509,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_an_oversized_string() {
+        let oversized = "A".repeat(MAX_TC_STRING_LEN + 1);
+        assert!(decode_tc_string(&oversized).is_err());
+    }
+
+    #[test]
     fn handles_segmented_tc_string() {
-        // TC Strings can have multiple segments separated by '.'
         let bytes = build_minimal_tc_bytes(1, 1, b"EN", 1, &[], &[]);
         let encoded = format!("{}.extra-segment", URL_SAFE_NO_PAD.encode(&bytes));
 
@@ -477,42 +534,35 @@ mod tests {
 
     #[test]
     fn clamps_range_encoded_vendors_to_max() {
-        // Build a TC String with range encoding where end > MAX_VENDOR_ID.
-        // The decoder should silently clamp to MAX_VENDOR_ID.
         let core_bits: usize = 213;
-        // Vendor section: maxVendorId(16) + isRange(1) + numEntries(12)
-        //   + entry: isRange(1) + start(16) + end(16) = 262 bits
         let total_bits = core_bits + 16 + 1 + 12 + 1 + 16 + 16;
         let total_bytes = total_bits.div_ceil(8);
         let mut buf = vec![0_u8; total_bytes];
         let mut writer = BitWriter::new(&mut buf);
 
-        // Write minimal core fields (version=2, rest zeroed/defaults)
-        writer.write(0, 6, 2); // version
-        writer.write(6, 36, 0); // created
-        writer.write(42, 36, 0); // lastUpdated
-        writer.write(78, 12, 1); // cmpId
-        writer.write(90, 12, 1); // cmpVersion
-        writer.write(102, 6, 0); // consentScreen
-        writer.write(108, 6, 4); // language E
-        writer.write(114, 6, 13); // language N
-        writer.write(120, 12, 1); // vendorListVersion
-        writer.write(132, 6, 2); // policyVersion
-        writer.write(201, 6, 4); // publisherCC E
-        writer.write(207, 6, 13); // publisherCC N
+        writer.write(0, 6, 2);
+        writer.write(6, 36, 0);
+        writer.write(42, 36, 0);
+        writer.write(78, 12, 1);
+        writer.write(90, 12, 1);
+        writer.write(102, 6, 0);
+        writer.write(108, 6, 4);
+        writer.write(114, 6, 13);
+        writer.write(120, 12, 1);
+        writer.write(132, 6, 2);
+        writer.write(201, 6, 4);
+        writer.write(207, 6, 13);
 
-        // Vendor consent section: range encoding with start=9990, end=65535
-        writer.write(213, 16, 65535); // maxVendorId = 65535
-        writer.write_bool(229, true); // isRangeEncoding = true
-        writer.write(230, 12, 1); // numEntries = 1
-        writer.write_bool(242, true); // entry is a range
-        writer.write(243, 16, 9990); // startVendorId
-        writer.write(259, 16, 65535); // endVendorId
+        writer.write(213, 16, 65535);
+        writer.write_bool(229, true);
+        writer.write(230, 12, 1);
+        writer.write_bool(242, true);
+        writer.write(243, 16, 9990);
+        writer.write(259, 16, 65535);
 
         let encoded = URL_SAFE_NO_PAD.encode(&buf);
         let result = decode_tc_string(&encoded).expect("should decode with clamped vendors");
 
-        // Should contain vendors 9990..=10000 (clamped from 9990..=65535)
         assert_eq!(result.vendor_consents.len(), 11);
         assert_eq!(
             *result.vendor_consents.first().expect("should have first"),
@@ -526,10 +576,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_consent_language() {
-        // Language values above 25 are invalid (only A-Z / 0-25 are valid).
         let mut bytes = build_minimal_tc_bytes(1, 1, b"EN", 1, &[], &[]);
-        // Set lang_a to 30 (invalid: exceeds 25) at bit offset 108, 6 bits.
-        // We need to overwrite bits 108..114 with value 30.
         let mut writer = BitWriter::new(&mut bytes);
         writer.write(108, 6, 30);
 
@@ -540,7 +587,6 @@ mod tests {
 
     #[test]
     fn skips_invalid_range_start_gt_end() {
-        // Range entry where start > end should be silently skipped.
         let core_bits: usize = 213;
         let total_bits = core_bits + 16 + 1 + 12 + 1 + 16 + 16;
         let total_bytes = total_bits.div_ceil(8);
@@ -557,12 +603,12 @@ mod tests {
         writer.write(201, 6, 4);
         writer.write(207, 6, 13);
 
-        writer.write(213, 16, 100); // maxVendorId
-        writer.write_bool(229, true); // isRangeEncoding
-        writer.write(230, 12, 1); // numEntries = 1
-        writer.write_bool(242, true); // entry is a range
-        writer.write(243, 16, 50); // startVendorId = 50
-        writer.write(259, 16, 10); // endVendorId = 10 (invalid: start > end)
+        writer.write(213, 16, 100);
+        writer.write_bool(229, true);
+        writer.write(230, 12, 1);
+        writer.write_bool(242, true);
+        writer.write(243, 16, 50);
+        writer.write(259, 16, 10);
 
         let encoded = URL_SAFE_NO_PAD.encode(&buf);
         let result = decode_tc_string(&encoded).expect("should decode with skipped range");
@@ -572,10 +618,17 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Test helper: builds a minimal TC String v2 byte buffer
-    // -----------------------------------------------------------------------
+    /// A TC String consenting to `purpose_consents` (1-indexed from index 0),
+    /// last updated at `last_updated_ds`, encoded as a cookie carries it.
+    pub(crate) fn encode_tc_string(purpose_consents: &[bool], last_updated_ds: u64) -> String {
+        let mut bytes = build_minimal_tc_bytes(1, 1, b"EN", 1, purpose_consents, &[]);
+        let mut writer = BitWriter::new(&mut bytes);
+        writer.write(42, 36, last_updated_ds);
+        URL_SAFE_NO_PAD.encode(&bytes)
+    }
 
+    /// Builds a minimal TC String v2 byte buffer: version 2, the given CMP,
+    /// language, vendor list version and purposes, and a vendor bitfield.
     fn build_minimal_tc_bytes(
         cmp_id: u16,
         cmp_version: u16,
@@ -585,52 +638,31 @@ mod tests {
         vendor_consent_bits: &[bool],
     ) -> Vec<u8> {
         let max_vendor_id = vendor_consent_bits.len() as u16;
-        // Calculate total bits needed
-        // Core fields: 213 bits + 16 (maxVendorId) + 1 (isRange) + max_vendor_id (bitfield)
         let total_bits = 213 + 17 + usize::from(max_vendor_id);
         let total_bytes = total_bits.div_ceil(8);
         let mut buf = vec![0_u8; total_bytes];
 
         let mut writer = BitWriter::new(&mut buf);
 
-        // Version (6 bits) = 2
         writer.write(0, 6, 2);
-        // Created (36 bits) = 0
         writer.write(6, 36, 0);
-        // LastUpdated (36 bits) = 0
         writer.write(42, 36, 0);
-        // CmpId (12 bits)
         writer.write(78, 12, u64::from(cmp_id));
-        // CmpVersion (12 bits)
         writer.write(90, 12, u64::from(cmp_version));
-        // ConsentScreen (6 bits) = 0
         writer.write(102, 6, 0);
-        // ConsentLanguage (12 bits) - two 6-bit chars offset by 'A'
         writer.write(108, 6, u64::from(language[0] - b'A'));
         writer.write(114, 6, u64::from(language[1] - b'A'));
-        // VendorListVersion (12 bits)
         writer.write(120, 12, u64::from(vendor_list_version));
-        // TcfPolicyVersion (6 bits) = 2
         writer.write(132, 6, 2);
-        // IsServiceSpecific (1 bit) = 0
-        // UseNonStandardTexts (1 bit) = 0
-        // SpecialFeatureOptIns (12 bits) = 0
-        // PurposesConsent (24 bits)
         for (i, &consented) in purpose_consents.iter().enumerate() {
             if consented && i < 24 {
                 writer.write_bool(152 + i, true);
             }
         }
-        // PurposesLITransparency (24 bits) = 0
-        // PurposeOneTreatment (1 bit) = 0
-        // PublisherCC (12 bits) - same as language
         writer.write(201, 6, u64::from(language[0] - b'A'));
         writer.write(207, 6, u64::from(language[1] - b'A'));
-        // MaxVendorConsentId (16 bits)
         writer.write(213, 16, u64::from(max_vendor_id));
-        // IsRangeEncoding (1 bit) = 0 (bitfield)
         writer.write_bool(229, false);
-        // Vendor consent bits
         for (i, &consented) in vendor_consent_bits.iter().enumerate() {
             if consented {
                 writer.write_bool(230 + i, true);
@@ -640,7 +672,7 @@ mod tests {
         buf
     }
 
-    /// Simple bit writer for test data construction.
+    /// A bit writer for building test strings.
     struct BitWriter<'a> {
         bytes: &'a mut [u8],
     }

@@ -348,7 +348,7 @@ fn apply_cors_headers(response: &mut Response<EdgeBody>, origin: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consent::types::{ConsentContext, ConsentSource};
+    use crate::consent::types::ConsentContext;
     use crate::ec::registry::PartnerRegistry;
     use crate::ec::tests::{CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY};
     use crate::redacted::Redacted;
@@ -369,11 +369,11 @@ mod tests {
     }
 
     fn make_ec_context(ec_allowed: bool, ec_value: Option<&str>) -> EcContext {
-        let consent = ConsentContext {
-            source: ConsentSource::Cookie,
-            ..ConsentContext::default()
-        };
-        EcContext::new_for_test_gated(ec_value.map(str::to_owned), consent, ec_allowed)
+        EcContext::new_for_test_gated(
+            ec_value.map(str::to_owned),
+            ConsentContext::default(),
+            ec_allowed,
+        )
     }
 
     fn make_test_partner(source_domain: &str, api_token: &str) -> EcPartner {

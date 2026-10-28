@@ -17,6 +17,7 @@ workspace = true
 trusted-server-core = { workspace = true }
 
 [dev-dependencies]
+http = { workspace = true }
 # The tests read the repository's sample policy, which only core's
 # test-utils feature compiles.
 trusted-server-core = { workspace = true, features = ["test-utils"] }

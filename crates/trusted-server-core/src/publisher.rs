@@ -56,7 +56,7 @@ use crate::auction::types::{
 use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
 };
-use crate::consent::{consent_allows_server_side_auction, gate_eids_by_permissions};
+use crate::consent::gate_eids_by_permissions;
 use crate::constants::{COOKIE_SHAREDID, HEADER_X_COMPRESS_HINT, HOST_SIGNAL_HEADERS};
 use crate::cookies::handle_request_cookies;
 use crate::cookies::template_cache_policy::{TemplateCookieDecision, evaluate_cookie_policy};
@@ -5514,10 +5514,10 @@ pub async fn handle_publisher_request(
         Vec::new()
     };
 
-    // Fail closed for GDPR-relevant traffic: GDPR/unknown jurisdictions and
-    // requests carrying an EU TCF signal require effective TCF Purpose 1
-    // (storage/access) before firing. Known non-GDPR jurisdictions are free.
-    let consent_allows_auction = consent_allows_server_side_auction(&consent_context);
+    // Fail closed for GDPR or unknown jurisdictions, and where a consent
+    // record says its regulation applies, unless a record that applies
+    // consents to storage. Known jurisdictions outside GDPR are free.
+    let consent_allows_auction = ec_context.server_side_auction_allowed();
 
     let should_run_ad_stack = evaluate_ad_stack_gate(AdStackGateInput {
         method_get: is_get,
@@ -8341,8 +8341,8 @@ pub async fn handle_page_bids(
     let geo = ec_context.geo_info().cloned();
 
     // Same fail-closed jurisdiction-aware gate the publisher navigation path
-    // uses — relies on the adapter's geo-aware EC context.
-    let consent_allows_auction = consent_allows_server_side_auction(&consent_context);
+    // uses, which relies on the adapter's geo-aware EC context.
+    let consent_allows_auction = ec_context.server_side_auction_allowed();
 
     // Same bot / prefetch guards the publisher path uses — without them this
     // endpoint would fire real SSP auctions on Sec-Purpose=prefetch warm-up
@@ -17231,7 +17231,6 @@ mod tests {
                                 jurisdiction: crate::consent::jurisdiction::Jurisdiction::UsState(
                                     "CA".to_owned(),
                                 ),
-                                gpc: true,
                                 ..Default::default()
                             },
                         )
@@ -31111,7 +31110,8 @@ mod tests {
         }
 
         /// Builds an [`EcContext`] whose consent context permits the server-side
-        /// auction (known non-GDPR jurisdiction, no EU TCF signal).
+        /// auction (a known jurisdiction outside GDPR, with no record saying a
+        /// regulation applies).
         fn consent_allowing_ec_context() -> EcContext {
             let consent = crate::consent::ConsentContext {
                 jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,

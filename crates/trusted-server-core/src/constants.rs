@@ -159,15 +159,6 @@ const fn join_internal_headers() -> [&'static str; INTERNAL_HEADER_COUNT] {
 /// in `const` context.
 pub const INTERNAL_HEADERS: &[&str] = &join_internal_headers();
 
-// Consent-related cookie names
-pub const COOKIE_EUCONSENT_V2: &str = "euconsent-v2";
-pub const COOKIE_GPP: &str = "__gpp";
-pub const COOKIE_GPP_SID: &str = "__gpp_sid";
-pub const COOKIE_US_PRIVACY: &str = "us_privacy";
-
-// Consent-related header names
-pub const HEADER_SEC_GPC: HeaderName = HeaderName::from_static("sec-gpc");
-
 #[cfg(test)]
 mod tests {
     use super::*;

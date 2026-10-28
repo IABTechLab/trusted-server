@@ -1,486 +1,121 @@
-//! Consent signal extraction, decoding, and normalization.
+//! The request's consent, read by the permission signal modules.
 //!
-//! This module implements the consent forwarding pipeline:
-//!
-//! 1. **Extract** raw consent strings from cookies and HTTP headers.
-//! 2. **Decode** each signal into structured data (TCF v2, GPP, US Privacy).
-//! 3. **Build** a request-local [`ConsentContext`] that flows through the
-//!    auction pipeline and populates `OpenRTB` bid requests.
-//!
-//! Consent is interpreted from request cookies, headers, geolocation, and
-//! publisher policy defaults. EC identity lifecycle and withdrawal state are
-//! managed separately by the EC identity graph.
-//!
-//! # Supported signals
-//!
-//! - **TCF v2** — `euconsent-v2` cookie (IAB Transparency & Consent Framework)
-//! - **GPP** — `__gpp` and `__gpp_sid` cookies (IAB Global Privacy Platform)
-//! - **US Privacy** — `us_privacy` cookie (IAB US Privacy / CCPA)
-//! - **GPC** — `Sec-GPC` header (Global Privacy Control)
-//!
-//! # Usage
-//!
-//! ```ignore
-//! let consent = consent::build_consent_context(&consent::ConsentPipelineInput {
-//!     jar: cookie_jar.as_ref(),
-//!     req: &req,
-//!     config: &settings.consent,
-//!     geo: geo.as_ref(),
-//!     default_jurisdiction,
-//!     permission_maps: policy.maps(),
-//! });
-//! ```
+//! Core decodes no scheme. Each configured module reads its own signal from
+//! the request, once, through [`PermissionSignalModule::read`], and reports a
+//! [`SignalRecord`]. The records, with the request's jurisdiction, are the
+//! [`ConsentContext`] the permission assembly, the bid request builders and the
+//! identity graph read. What a record means for a permission is the module's
+//! to say when the permissions are assembled.
 
-mod extraction;
-pub mod gpp;
 pub mod jurisdiction;
-pub mod tcf;
 pub mod types;
-pub mod us_privacy;
 
-pub use extraction::extract_consent_signals;
-pub use types::{
-    ConsentContext, ConsentSource, PrivacyFlag, RawConsentSignals, TcfConsent, UsPrivacy,
-};
+pub use types::{ConsentContext, ConsentSource, SignalRecord, SignalStatus};
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use web_time::{SystemTime, UNIX_EPOCH};
-
-use cookie::CookieJar;
-use edgezero_core::body::Body as EdgeBody;
-use http::Request;
-
-use crate::consent_config::{ConflictMode, ConsentConfig, ConsentMode};
 use crate::geo::GeoInfo;
-use crate::permissions::{Permission, PermissionState};
-
-/// Number of deciseconds in one day (86 400 seconds × 10).
-const DECISECONDS_PER_DAY: u64 = 86_400 * 10;
-
-/// GPP section ID for EU TCF v2.
-const GPP_SECTION_ID_TCF_EU_V2: u16 = 2;
+use crate::module_context::ModuleContext;
+use crate::permission_signal::PermissionSignalModule;
+use crate::permissions::{Permission, PermissionMaps, PermissionState};
 
 static MISSING_GEO_WARNING_LOGGED: AtomicBool = AtomicBool::new(false);
 
-/// Inputs to the consent processing pipeline.
+/// Reads the request's consent, asking each of `modules` in order for the
+/// signal of its scheme.
 ///
-/// Bundles all data needed to extract, decode, classify, and validate
-/// consent signals from a single request.
-pub struct ConsentPipelineInput<'a> {
-    /// Parsed cookie jar from the incoming request.
-    pub jar: Option<&'a CookieJar>,
-    /// The incoming HTTP request (for header access).
-    pub req: &'a Request<EdgeBody>,
-    /// Publisher consent configuration.
-    pub config: &'a ConsentConfig,
-    /// Geolocation data from the request (for jurisdiction detection).
-    pub geo: Option<&'a GeoInfo>,
-    /// The jurisdiction to apply when `geo` resolved no location.
-    ///
-    /// Jurisdiction is detected from geolocation, so with no location every
-    /// request would be [`Jurisdiction::Unknown`] and the consent gates would
-    /// fail closed even where the permission policy declares what to do. This
-    /// carries that declaration (see
-    /// [`PermissionMaps::default_jurisdiction`](crate::permissions::PermissionMaps::default_jurisdiction)).
-    /// Pass [`Jurisdiction::Unknown`] where no declaration applies, for example
-    /// after a failed geo lookup.
-    pub default_jurisdiction: jurisdiction::Jurisdiction,
-    /// The rules of the policy the request's domain loaded, which place a
-    /// located request in its jurisdiction.
-    pub permission_maps: &'a crate::permissions::PermissionMaps,
+/// `context` carries the request's evidence and the deployment's settings,
+/// which is what a module reads. It is offered to the modules carrying a
+/// consent context with no records under `jurisdiction`, so a module whose
+/// reading depends on the jurisdiction can see it. The records every module
+/// reported, in module order, make the returned context.
+#[must_use]
+pub fn read_consent(
+    context: &ModuleContext<'_>,
+    modules: &[Arc<dyn PermissionSignalModule>],
+    jurisdiction: jurisdiction::Jurisdiction,
+) -> ConsentContext {
+    let empty = ConsentContext::new(jurisdiction.clone());
+    let context = (*context).with_consent(&empty);
+    let mut consent = ConsentContext::new(jurisdiction);
+    for module in modules {
+        let call = context.call(module.id(), module.required_permissions());
+        if let Some(record) = module.read(call) {
+            consent = consent.with_record(record);
+        }
+    }
+    log_consent_context(&consent);
+    consent
 }
 
-/// Extracts, decodes, and normalizes consent signals from a request.
+/// The jurisdiction for a request: detected from its location, in the
+/// policy whose rules are `maps`, when one resolved, otherwise the
+/// declaration the caller supplied.
 ///
-/// This is the primary entry point for the consent pipeline. It:
-///
-/// 1. Reads raw consent strings from cookies and headers.
-/// 2. Decodes each signal (TCF v2, GPP, US Privacy).
-/// 3. Detects the privacy jurisdiction from geolocation.
-/// 4. Checks consent expiration (if enabled).
-/// 5. Constructs a US Privacy string from GPC when appropriate.
-/// 6. Builds a [`ConsentContext`] with both raw and decoded data.
-/// 7. Logs a summary for observability.
-///
-/// The returned context reflects request-local consent signals plus policy
-/// defaults only.
-///
-/// Decoding failures are logged and the corresponding decoded field is set to
-/// `None` — the raw string is still preserved for proxy-mode forwarding.
-pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext {
-    let signals = extract_consent_signals(input.jar, input.req);
-    log_consent_signals(&signals);
-
-    if input.geo.is_none() {
-        log_missing_geo_warning_once();
-    }
-
-    // In proxy mode, skip decoding entirely.
-    if input.config.mode == ConsentMode::Proxy {
-        let jur = request_jurisdiction(input);
-        let gpp_section_ids = signals
-            .raw_gpp_sid
-            .as_deref()
-            .and_then(gpp::parse_gpp_sid_cookie);
-        let gdpr_applies =
-            has_eu_tcf_signal(signals.raw_tc_string.is_some(), gpp_section_ids.as_deref());
-        log::debug!("Consent proxy mode: jurisdiction={jur}, skipping decode");
-        return ConsentContext {
-            raw_tc_string: signals.raw_tc_string,
-            raw_gpp_string: signals.raw_gpp_string,
-            gpp_section_ids,
-            raw_us_privacy: signals.raw_us_privacy,
-            raw_ac_string: None,
-            gdpr_applies,
-            tcf: None,
-            gpp: None,
-            us_privacy: None,
-            expired: false,
-            gpc: signals.gpc,
-            jurisdiction: jur,
-            source: ConsentSource::Cookie,
-        };
-    }
-
-    let mut ctx = build_context_from_signals(&signals);
-    ctx.jurisdiction = request_jurisdiction(input);
-    apply_tcf_conflict_resolution(&mut ctx, input.config);
-    apply_expiration_check(&mut ctx, input.config);
-    apply_gpc_us_privacy(&mut ctx, input.config);
-
-    log_consent_context(&ctx);
-    ctx
-}
-
-/// The jurisdiction for a request: detected from its location when one
-/// resolved, otherwise the declaration the caller supplied.
-///
-/// Keeping the two in one place means every path through the pipeline (proxy
-/// mode, the KV read fallback, and the ordinary decode) answers the question
-/// the same way.
-fn request_jurisdiction(input: &ConsentPipelineInput<'_>) -> jurisdiction::Jurisdiction {
-    match input.geo {
-        Some(_) => jurisdiction::detect_jurisdiction(input.permission_maps, input.geo),
-        None => input.default_jurisdiction.clone(),
-    }
-}
-
-/// Marks TCF consent as expired when it exceeds the configured maximum age.
-///
-/// Clears whichever decoded TCF source is active (`tcf` or `gpp.eu_tcf`) but
-/// preserves raw strings for proxy-mode forwarding.
-fn apply_expiration_check(ctx: &mut ConsentContext, config: &ConsentConfig) {
-    if !config.check_expiration {
-        return;
-    }
-
-    let (is_expired, age_days) = {
-        let Some(tcf) = effective_tcf(ctx) else {
-            return;
-        };
-        (
-            is_consent_expired(tcf, config.max_consent_age_days),
-            consent_age_days(tcf),
-        )
-    };
-
-    if !is_expired {
-        return;
-    }
-
-    log::warn!("TCF consent expired: age_days={age_days}");
-    ctx.expired = true;
-
-    ctx.tcf = None;
-    if let Some(gpp) = &mut ctx.gpp {
-        gpp.eu_tcf = None;
-    }
-
-    ctx.gdpr_applies =
-        has_eu_tcf_signal(ctx.raw_tc_string.is_some(), ctx.gpp_section_ids.as_deref());
-}
-
-/// Constructs a US Privacy string from GPC when no explicit cookie exists
-/// and the user is in a US state with a privacy law.
-fn apply_gpc_us_privacy(ctx: &mut ConsentContext, config: &ConsentConfig) {
-    if !ctx.gpc || ctx.us_privacy.is_some() {
-        return;
-    }
-    if !matches!(&ctx.jurisdiction, jurisdiction::Jurisdiction::UsState(_)) {
-        return;
-    }
-
-    if let Some(usp) = build_us_privacy_from_gpc(config) {
-        log::info!("Constructed US Privacy string from GPC: {usp}");
-        ctx.raw_us_privacy = Some(usp.to_string());
-        ctx.us_privacy = Some(usp);
-        ctx.source = ConsentSource::PolicyDefault;
-    }
-}
-
-/// Decodes a raw consent string, logging a warning on failure.
-///
-/// Returns [`None`] and logs at `warn` level if decoding fails, preserving
-/// the raw string for proxy-mode forwarding.
-fn decode_or_warn<T, E: core::fmt::Display>(
-    raw: Option<&str>,
-    label: &str,
-    decode: fn(&str) -> Result<T, E>,
-) -> Option<T> {
-    let s = raw?;
-    match decode(s) {
-        Ok(value) => Some(value),
-        Err(e) => {
-            log::warn!("Failed to decode {label}: {e}");
-            None
+/// Jurisdiction is detected from geolocation, so with no location every
+/// request would be [`Jurisdiction::Unknown`](jurisdiction::Jurisdiction::Unknown)
+/// and the consent gates would fail closed even where the permission policy
+/// declares what to do. `default` carries that declaration (see
+/// [`PermissionMaps::default_jurisdiction`](crate::permissions::PermissionMaps::default_jurisdiction)),
+/// and is `Unknown` where no declaration applies, for example after a failed
+/// geo lookup.
+#[must_use]
+pub fn request_jurisdiction(
+    maps: &PermissionMaps,
+    geo: Option<&GeoInfo>,
+    default: jurisdiction::Jurisdiction,
+) -> jurisdiction::Jurisdiction {
+    match geo {
+        Some(_) => jurisdiction::detect_jurisdiction(maps, geo),
+        None => {
+            log_missing_geo_warning_once();
+            default
         }
     }
 }
 
-/// Builds a [`ConsentContext`] from previously extracted raw signals.
+/// Whether a server-side auction may be dispatched for this request.
 ///
-/// This is the decode + normalize stage of the pipeline. Each signal is
-/// decoded independently; failures are logged at `warn` level and the
-/// corresponding decoded field is left as `None`.
-#[must_use]
-pub fn build_context_from_signals(signals: &RawConsentSignals) -> ConsentContext {
-    let decoded_us_privacy = decode_or_warn(
-        signals.raw_us_privacy.as_deref(),
-        "US Privacy string",
-        us_privacy::decode_us_privacy,
-    );
-    let decoded_tcf = decode_or_warn(
-        signals.raw_tc_string.as_deref(),
-        "TC String",
-        tcf::decode_tc_string,
-    );
-    let decoded_gpp = decode_or_warn(
-        signals.raw_gpp_string.as_deref(),
-        "GPP string",
-        gpp::decode_gpp_string,
-    );
-
-    // Resolve GPP section IDs:
-    // - Prefer decoded GPP section IDs (authoritative).
-    // - Fall back to __gpp_sid cookie (transport hint).
-    let gpp_section_ids = decoded_gpp
-        .as_ref()
-        .map(|g| g.section_ids.clone())
-        .or_else(|| {
-            signals
-                .raw_gpp_sid
-                .as_deref()
-                .and_then(gpp::parse_gpp_sid_cookie)
-        });
-
-    // GDPR applies when an EU TCF signal is present via standalone TC string
-    // or via GPP section ID 2.
-    let gdpr_applies =
-        has_eu_tcf_signal(signals.raw_tc_string.is_some(), gpp_section_ids.as_deref());
-
-    ConsentContext {
-        raw_tc_string: signals.raw_tc_string.clone(),
-        raw_gpp_string: signals.raw_gpp_string.clone(),
-        gpp_section_ids,
-        raw_us_privacy: signals.raw_us_privacy.clone(),
-        // AC string extraction not yet implemented — will be added when
-        // the CMP-specific cookie source is determined (Phase 1a).
-        raw_ac_string: None,
-
-        gdpr_applies,
-        tcf: decoded_tcf,
-        gpp: decoded_gpp,
-        us_privacy: decoded_us_privacy,
-
-        expired: false,
-
-        gpc: signals.gpc,
-        jurisdiction: jurisdiction::Jurisdiction::default(),
-        source: ConsentSource::Cookie,
-    }
-}
-
-/// Resolves whether an EU TCF signal is present from raw signal hints.
-#[must_use]
-fn has_eu_tcf_signal(raw_tc_present: bool, gpp_section_ids: Option<&[u16]>) -> bool {
-    raw_tc_present || gpp_section_ids.is_some_and(|ids| ids.contains(&GPP_SECTION_ID_TCF_EU_V2))
-}
-
-/// Returns the effective decoded TCF consent for enforcement decisions.
+/// Fails closed where the request's jurisdiction is GDPR or unknown, or a
+/// record says the regulation its scheme answers for applies. The auction
+/// then runs only when a record that applies holds the visitor's consent to
+/// store and access information on the device,
+/// [`Permission::StoreOnDevice`]. A request from a known jurisdiction outside
+/// GDPR with no record that applies runs freely.
 ///
-/// A standalone TC string wins, and the EU TCF section of a GPP string stands
-/// in when there is none. Public because the TCF permission signal module
-/// lives outside core and reads the record this pipeline produced, rather than
-/// decoding the cookie a second time and disagreeing with every other reader
-/// of the same request about expiry and the cached record.
+/// The gate reads the records and the jurisdiction, not the resolved
+/// permissions, so the place rules, the permission policy, an opt-out and a
+/// module that grants without a record that applies leave it unchanged.
 #[must_use]
-pub fn effective_tcf(ctx: &ConsentContext) -> Option<&types::TcfConsent> {
-    ctx.tcf.as_ref().or_else(|| {
-        let g = ctx.gpp.as_ref()?;
-        g.eu_tcf.as_ref()
-    })
-}
-
-/// Returns whether a server-side auction may be dispatched for this request.
-///
-/// Fails closed for GDPR-relevant traffic: when an EU TCF signal is present
-/// (`gdpr_applies`) **or** the request's geo jurisdiction is GDPR or unknown,
-/// the effective TCF consent (standalone TC string or GPP EU TCF section)
-/// must grant Purpose 1 (storage/access). Only requests from a known
-/// non-GDPR jurisdiction with no EU TCF signal are freely allowed.
-#[must_use]
-pub fn consent_allows_server_side_auction(ctx: &ConsentContext) -> bool {
-    let requires_tcf_purpose1 = ctx.gdpr_applies
+pub fn consent_allows_server_side_auction(consent: &ConsentContext) -> bool {
+    let requires_consent = consent.applies()
         || matches!(
-            ctx.jurisdiction,
+            consent.jurisdiction,
             jurisdiction::Jurisdiction::Gdpr | jurisdiction::Jurisdiction::Unknown
         );
-    if !requires_tcf_purpose1 {
+    if !requires_consent {
         return true;
     }
-    effective_tcf(ctx).is_some_and(|tcf| tcf.has_purpose_consent(1))
-}
-
-/// Returns whether TCF consent allows EID transmission.
-#[must_use]
-fn allows_eid_transmission(tcf: &types::TcfConsent) -> bool {
-    tcf.has_storage_consent() && tcf.has_personalized_ads_consent()
-}
-
-/// Resolves conflicts between standalone TC and GPP EU TCF consents.
-fn apply_tcf_conflict_resolution(ctx: &mut ConsentContext, config: &ConsentConfig) {
-    let Some(standalone_tcf) = ctx.tcf.as_ref() else {
-        return;
-    };
-    let Some(gpp_tcf) = ctx.gpp.as_ref().and_then(|g| g.eu_tcf.as_ref()) else {
-        return;
-    };
-
-    let standalone_allows = allows_eid_transmission(standalone_tcf);
-    let gpp_allows = allows_eid_transmission(gpp_tcf);
-
-    if standalone_allows == gpp_allows {
-        return;
-    }
-
-    let select_gpp = match config.conflict_resolution.mode {
-        ConflictMode::Restrictive => !gpp_allows,
-        ConflictMode::Permissive => gpp_allows,
-        ConflictMode::Newest => select_newest_signal(
-            standalone_tcf,
-            gpp_tcf,
-            config.conflict_resolution.freshness_threshold_days,
-        )
-        // When both signals are within the freshness threshold, fall back
-        // to the restrictive choice (prefer whichever denies consent).
-        .unwrap_or(!gpp_allows),
-    };
-
-    let source = if select_gpp { "gpp" } else { "standalone" };
-    log::info!(
-        "TCF conflict detected; mode={:?}, selected={source}",
-        config.conflict_resolution.mode
-    );
-
-    // Overwrite only when GPP wins; standalone is already in ctx.tcf.
-    if select_gpp {
-        ctx.tcf = Some(gpp_tcf.clone());
-    }
-}
-
-/// Returns whether GPP should win under the `newest` strategy.
-#[must_use]
-fn select_newest_signal(
-    standalone_tcf: &types::TcfConsent,
-    gpp_tcf: &types::TcfConsent,
-    freshness_threshold_days: u32,
-) -> Option<bool> {
-    let threshold_ds = u64::from(freshness_threshold_days) * DECISECONDS_PER_DAY;
-
-    let standalone_delta = standalone_tcf
-        .last_updated_ds
-        .saturating_sub(gpp_tcf.last_updated_ds);
-    if standalone_delta > threshold_ds {
-        return Some(false);
-    }
-
-    let gpp_delta = gpp_tcf
-        .last_updated_ds
-        .saturating_sub(standalone_tcf.last_updated_ds);
-    if gpp_delta > threshold_ds {
-        return Some(true);
-    }
-
-    None
-}
-
-/// Returns the current time in deciseconds since the Unix epoch.
-pub(crate) fn now_deciseconds() -> u64 {
-    let dur = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("should have system time after Unix epoch");
-    dur.as_secs() * 10 + u64::from(dur.subsec_millis()) / 100
-}
-
-/// Returns the age of a TCF consent string in days.
-fn consent_age_days(tcf: &types::TcfConsent) -> u64 {
-    now_deciseconds().saturating_sub(tcf.last_updated_ds) / DECISECONDS_PER_DAY
-}
-
-/// Checks whether a TCF consent string has expired.
-///
-/// Compares `last_updated_ds` (deciseconds since epoch) against the current
-/// time and the configured maximum age. Returns `true` if the consent is
-/// older than `max_age_days`.
-#[must_use]
-pub fn is_consent_expired(tcf: &types::TcfConsent, max_age_days: u32) -> bool {
-    let max_age_ds = u64::from(max_age_days) * DECISECONDS_PER_DAY;
-    now_deciseconds().saturating_sub(tcf.last_updated_ds) > max_age_ds
-}
-
-/// Constructs a US Privacy string from `Sec-GPC` and publisher config defaults.
-///
-/// Called when `gpc = true` but no explicit `us_privacy` cookie exists and the
-/// user is in a US state with a privacy law. The resulting string reflects the
-/// publisher's configured compliance posture, not a protocol assertion.
-///
-/// Returns [`None`] if the config says GPC should not imply opt-out.
-#[must_use]
-pub fn build_us_privacy_from_gpc(config: &ConsentConfig) -> Option<types::UsPrivacy> {
-    let defaults = &config.us_privacy_defaults;
-    if !defaults.gpc_implies_optout {
-        return None;
-    }
-
-    if defaults.notice_given {
-        log::warn!(
-            "GPC-constructed US Privacy string asserts notice_given=true; \
-             verify that the publisher's privacy notice satisfies this claim"
-        );
-    }
-
-    Some(types::UsPrivacy {
-        version: 1,
-        notice_given: PrivacyFlag::from(defaults.notice_given),
-        opt_out_sale: PrivacyFlag::Yes,
-        lspa_covered: PrivacyFlag::from(defaults.lspa_covered),
-    })
+    consent
+        .records
+        .iter()
+        .any(|record| record.applies() && record.consented().contains(Permission::StoreOnDevice))
 }
 
 /// Filters Extended User IDs through the resolved permission state.
 ///
 /// EIDs are partner identifiers carried in the bidstream, so they ride on two
-/// permissions: [`Permission::StoreOnDevice`] (the identifier must be readable,
-/// TCF Purpose 1) and [`Permission::SelectPersonalisedAds`] (it may be shared to
-/// select ads, TCF Purpose 4). They are transmitted only when both are set in
-/// the resolved [`PermissionState`]; otherwise every EID is stripped.
+/// permissions: [`Permission::StoreOnDevice`] (the identifier must be readable)
+/// and [`Permission::SelectPersonalisedAds`] (it may be shared to select ads).
+/// They are transmitted only when both are set in the resolved
+/// [`PermissionState`]; otherwise every EID is stripped.
 ///
-/// The country/region map and any opt-out signal already decided those bits when
-/// the permission state was assembled, so this reads one source of truth rather
-/// than re-inspecting consent. Called by `handle_auction` after resolving
-/// partner EIDs from the KV identity graph, before attaching them to the
-/// outbound `OpenRTB` request.
+/// The country/region map and the signal modules already decided those bits
+/// when the permission state was assembled, so this reads one source of truth
+/// rather than re-inspecting consent. Called by `handle_auction` after
+/// resolving partner EIDs from the KV identity graph, before attaching them to
+/// the outbound bid request.
 #[must_use]
 pub fn gate_eids_by_permissions<T>(
     eids: Option<Vec<T>>,
@@ -503,52 +138,6 @@ pub fn gate_eids_by_permissions<T>(
     }
 }
 
-// ---------------------------------------------------------------------------
-// EC consent gating
-// ---------------------------------------------------------------------------
-
-/// Returns `true` when the request carries a US-style storage/sale opt-out
-/// signal (GPC, a GPP sale opt-out, or a US Privacy opt-out), independent of
-/// jurisdiction.
-///
-/// This reports the signal only. Whether the opt-out changes a permission is
-/// decided by the country/region map when the permission state is assembled: it
-/// drops a `granted` baseline (for example a US opt-out state) and has nothing to
-/// drop where the permission is `requires_signal`. Honoring it everywhere is
-/// intentionally conservative.
-///
-/// TCF consent or refusal is handled separately by
-/// [`crate::ec::consent::permission_signal`], which treats a present TCF record
-/// as authoritative, so this helper does not consider TCF.
-#[must_use]
-pub fn has_storage_optout_signal(ctx: &ConsentContext) -> bool {
-    if ctx.gpc {
-        return true;
-    }
-    if ctx.gpp.as_ref().and_then(|gpp| gpp.us_sale_opt_out) == Some(true) {
-        return true;
-    }
-    ctx.us_privacy
-        .as_ref()
-        .is_some_and(|usp| usp.opt_out_sale == PrivacyFlag::Yes)
-}
-
-// ---------------------------------------------------------------------------
-// Logging helpers
-// ---------------------------------------------------------------------------
-
-/// Logs a summary of the extracted consent signals.
-///
-/// Emits an `info`-level log line when at least one consent signal is present,
-/// or a `debug`-level line when no signals were found.
-fn log_consent_signals(signals: &RawConsentSignals) {
-    if signals.is_empty() {
-        log::debug!("No consent signals found on request");
-    } else {
-        log::info!("Consent signals: {signals}");
-    }
-}
-
 /// Logs a one-time warning when request geolocation is unavailable.
 ///
 /// It says what happens next rather than only that geo is missing, because an
@@ -566,424 +155,416 @@ fn log_missing_geo_warning_once() {
     );
 }
 
-/// Derives a human-readable status label for a decoded signal.
-///
-/// Returns `"present"` when decoded data exists, `"decode-failed"` when only
-/// the raw string exists, or `"absent"` when neither is available.
-fn signal_status(decoded: bool, raw: bool) -> &'static str {
-    if decoded {
-        "present"
-    } else if raw {
-        "decode-failed"
-    } else {
-        "absent"
-    }
-}
-
-/// Logs a structured summary of the fully-processed consent context.
+/// Logs a summary of what the modules read, one entry per scheme.
 fn log_consent_context(ctx: &ConsentContext) {
-    if ctx.is_empty() {
+    if ctx.records.is_empty() {
+        log::debug!("No consent signals read: jurisdiction={}", ctx.jurisdiction);
         return;
     }
-
-    let tcf_status = match (&ctx.tcf, ctx.expired) {
-        (Some(_), _) => "present",
-        (None, true) => "expired",
-        (None, false) if ctx.raw_tc_string.is_some() => "decode-failed",
-        _ => "absent",
-    };
-
-    let gpp_status = signal_status(ctx.gpp.is_some(), ctx.raw_gpp_string.is_some());
-    let usp_status = signal_status(ctx.us_privacy.is_some(), ctx.raw_us_privacy.is_some());
-
+    let records: Vec<String> = ctx
+        .records
+        .iter()
+        .map(|record| {
+            format!(
+                "{}={}{}",
+                record.scheme(),
+                record.status(),
+                if record.source() == ConsentSource::PolicyDefault {
+                    " (policy default)"
+                } else {
+                    ""
+                }
+            )
+        })
+        .collect();
     log::info!(
-        "Consent context: jurisdiction={}, tcf={tcf_status}, gpp={gpp_status}, \
-         us_privacy={usp_status}, gpc={}, gdpr_applies={}, source={:?}",
+        "Consent context: jurisdiction={}, {}, applies={}",
         ctx.jurisdiction,
-        ctx.gpc,
-        ctx.gdpr_applies,
-        ctx.source,
+        records.join(", "),
+        ctx.applies(),
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use edgezero_core::body::Body as EdgeBody;
-    use http::Request;
+    use http::HeaderMap;
 
-    use super::{
-        ConsentPipelineInput, apply_expiration_check, apply_tcf_conflict_resolution,
-        build_consent_context, build_context_from_signals, consent_allows_server_side_auction,
-        gate_eids_by_permissions, has_storage_optout_signal, jurisdiction::Jurisdiction,
-    };
-    use crate::consent::types::{
-        ConsentContext, GppConsent, PrivacyFlag, RawConsentSignals, TcfConsent, UsPrivacy,
-    };
-    use crate::consent_config::{ConflictMode, ConsentConfig, ConsentMode};
-    use crate::cookies::parse_cookies_to_jar;
+    use super::jurisdiction::Jurisdiction;
+    use super::*;
+    use crate::evidence::{OwnedRequestInfo, RequestInfo};
+    use crate::module_context::{ModuleCall, test_support};
+    use crate::permission_signal::SignalInput;
+    use crate::permissions::{ConsentSignal, PermissionMaps};
 
-    fn build_request() -> Request<EdgeBody> {
-        Request::builder()
-            .method("GET")
-            .uri("https://example.com")
-            .body(EdgeBody::empty())
-            .expect("should build consent test request")
-    }
+    /// A module that reads one cookie and reports it decoded, standing in for
+    /// a scheme that decodes a cookie.
+    struct Reading(&'static str, &'static str);
 
-    /// Builder for [`TcfConsent`] test fixtures with sensible defaults.
-    ///
-    /// All purposes default to `false`, timestamps to `0`, and vendor lists
-    /// to empty. Callers set only the fields relevant to their test.
-    struct TcfBuilder {
-        last_updated_ds: u64,
-        purpose_consents: [bool; 24],
-    }
-
-    impl TcfBuilder {
-        fn new() -> Self {
-            Self {
-                last_updated_ds: 0,
-                purpose_consents: [false; 24],
-            }
-        }
-
-        /// Sets Purpose 1 (store/access information on a device).
-        fn with_storage(mut self, consented: bool) -> Self {
-            self.purpose_consents[0] = consented;
-            self
-        }
-
-        /// Sets Purpose 4 (personalized ads / EID transmission).
-        fn with_personalized_ads(mut self, consented: bool) -> Self {
-            self.purpose_consents[3] = consented;
-            self
-        }
-
-        fn with_last_updated(mut self, ds: u64) -> Self {
-            self.last_updated_ds = ds;
-            self
-        }
-
-        fn build(self) -> TcfConsent {
-            TcfConsent {
-                version: 2,
-                cmp_id: 1,
-                cmp_version: 1,
-                consent_screen: 0,
-                consent_language: "EN".to_owned(),
-                vendor_list_version: 1,
-                tcf_policy_version: 4,
-                created_ds: self.last_updated_ds,
-                last_updated_ds: self.last_updated_ds,
-                purpose_consents: self.purpose_consents.to_vec(),
-                purpose_legitimate_interests: vec![false; 24],
-                vendor_consents: Vec::new(),
-                vendor_legitimate_interests: Vec::new(),
-                special_feature_opt_ins: vec![false; 12],
-            }
+    impl Reading {
+        fn record(&self, evidence: &dyn RequestInfo) -> Option<SignalRecord> {
+            let value = evidence.cookie(self.1)?;
+            Some(SignalRecord::new(self.0, SignalStatus::Decoded).with_value(value))
         }
     }
 
-    fn make_tcf(last_updated_ds: u64, allows_eids: bool) -> TcfConsent {
-        TcfBuilder::new()
-            .with_storage(true)
-            .with_personalized_ads(allows_eids)
-            .with_last_updated(last_updated_ds)
-            .build()
-    }
+    impl PermissionSignalModule for Reading {
+        fn id(&self) -> &'static str {
+            self.0
+        }
 
-    fn make_conflicting_context(
-        standalone_last_updated_ds: u64,
-        standalone_allows_eids: bool,
-        gpp_last_updated_ds: u64,
-        gpp_allows_eids: bool,
-    ) -> ConsentContext {
-        ConsentContext {
-            raw_tc_string: Some("standalone".to_owned()),
-            raw_gpp_string: Some("gpp".to_owned()),
-            gpp_section_ids: Some(vec![2]),
-            gdpr_applies: true,
-            tcf: Some(make_tcf(standalone_last_updated_ds, standalone_allows_eids)),
-            gpp: Some(GppConsent {
-                version: 1,
-                section_ids: vec![2],
-                eu_tcf: Some(make_tcf(gpp_last_updated_ds, gpp_allows_eids)),
-                us_sale_opt_out: None,
-            }),
-            ..ConsentContext::default()
+        fn signal(&self, _permission: Permission, _input: &SignalInput<'_>) -> ConsentSignal {
+            ConsentSignal::Neutral
+        }
+
+        fn read(&self, call: ModuleCall<'_>) -> Option<SignalRecord> {
+            call.inject(self, Self::record).ok().flatten()
         }
     }
 
-    #[test]
-    fn auction_allowed_for_known_non_gdpr_jurisdiction_without_tcf_signal() {
-        let ctx = ConsentContext {
-            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
-            ..ConsentContext::default()
-        };
+    /// A module that reports the jurisdiction it was offered, standing in
+    /// for a scheme whose reading depends on it.
+    struct SeeingJurisdiction;
 
-        assert!(
-            consent_allows_server_side_auction(&ctx),
-            "known non-GDPR jurisdiction with no EU TCF signal should allow auction"
+    impl SeeingJurisdiction {
+        fn record(&self, consent: &ConsentContext) -> Option<SignalRecord> {
+            Some(
+                SignalRecord::new("seeing", SignalStatus::Absent)
+                    .with_applies(consent.jurisdiction == jurisdiction::Jurisdiction::Gdpr),
+            )
+        }
+    }
+
+    impl PermissionSignalModule for SeeingJurisdiction {
+        fn id(&self) -> &'static str {
+            "seeing"
+        }
+
+        fn signal(&self, _permission: Permission, _input: &SignalInput<'_>) -> ConsentSignal {
+            ConsentSignal::Neutral
+        }
+
+        fn read(&self, call: ModuleCall<'_>) -> Option<SignalRecord> {
+            call.inject(self, Self::record).ok().flatten()
+        }
+    }
+
+    fn evidence(cookie: &str) -> OwnedRequestInfo {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            cookie.parse().expect("should build a cookie header"),
         );
+        OwnedRequestInfo::new(String::new(), headers)
     }
 
     #[test]
-    fn auction_fails_closed_for_gdpr_jurisdiction_without_consent() {
-        let ctx = ConsentContext {
-            jurisdiction: Jurisdiction::Gdpr,
-            ..ConsentContext::default()
-        };
-
-        assert!(
-            !consent_allows_server_side_auction(&ctx),
-            "GDPR jurisdiction without a TCF signal should fail closed"
-        );
-    }
-
-    #[test]
-    fn auction_fails_closed_for_unknown_jurisdiction_without_consent() {
-        let ctx = ConsentContext {
-            jurisdiction: Jurisdiction::Unknown,
-            ..ConsentContext::default()
-        };
-
-        assert!(
-            !consent_allows_server_side_auction(&ctx),
-            "unknown jurisdiction without a TCF signal should fail closed"
-        );
-    }
-
-    #[test]
-    fn auction_fails_closed_when_tcf_signal_present_without_purpose1() {
-        let ctx = ConsentContext {
-            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
-            gdpr_applies: true,
-            tcf: Some(TcfBuilder::new().with_storage(false).build()),
-            ..ConsentContext::default()
-        };
-
-        assert!(
-            !consent_allows_server_side_auction(&ctx),
-            "EU TCF signal without Purpose 1 should block auction even outside GDPR geo"
-        );
-    }
-
-    #[test]
-    fn auction_allowed_for_gdpr_jurisdiction_with_purpose1_consent() {
-        let ctx = ConsentContext {
-            jurisdiction: Jurisdiction::Gdpr,
-            gdpr_applies: true,
-            tcf: Some(TcfBuilder::new().with_storage(true).build()),
-            ..ConsentContext::default()
-        };
-
-        assert!(
-            consent_allows_server_side_auction(&ctx),
-            "GDPR jurisdiction with Purpose 1 consent should allow auction"
-        );
-    }
-
-    #[test]
-    fn auction_allowed_with_purpose1_via_gpp_eu_tcf_section() {
-        let ctx = ConsentContext {
-            jurisdiction: Jurisdiction::Gdpr,
-            gdpr_applies: true,
-            gpp: Some(GppConsent {
-                version: 1,
-                section_ids: vec![2],
-                eu_tcf: Some(TcfBuilder::new().with_storage(true).build()),
-                us_sale_opt_out: None,
-            }),
-            ..ConsentContext::default()
-        };
-
-        assert!(
-            consent_allows_server_side_auction(&ctx),
-            "Purpose 1 granted via GPP EU TCF section should allow auction"
-        );
-    }
-
-    #[test]
-    fn missing_geo_keeps_unknown_jurisdiction() {
-        let req = build_request();
-        let config = ConsentConfig::default();
-
-        let ctx = build_consent_context(&ConsentPipelineInput {
-            jar: None,
-            req: &req,
-            config: &config,
-            geo: None,
-            default_jurisdiction: Jurisdiction::Unknown,
-            permission_maps: crate::permissions::PermissionMaps::sample(),
-        });
-
+    fn each_module_reads_its_own_signal_in_order() {
+        let evidence = evidence("b=2; a=1");
+        let context = ModuleContext::new(test_support::request("/")).with_evidence(&evidence);
+        let modules: Vec<Arc<dyn PermissionSignalModule>> = vec![
+            Arc::new(Reading("first", "a")),
+            Arc::new(Reading("second", "b")),
+            Arc::new(Reading("third", "c")),
+        ];
+        let consent = read_consent(&context, &modules, jurisdiction::Jurisdiction::NonRegulated);
+        let schemes: Vec<&str> = consent.records.iter().map(SignalRecord::scheme).collect();
         assert_eq!(
-            ctx.jurisdiction,
-            Jurisdiction::Unknown,
-            "missing geo should keep jurisdiction unknown"
+            schemes,
+            vec!["first", "second"],
+            "a module with nothing to read reports no record, and the rest come in order"
+        );
+        assert_eq!(consent.value("first"), Some("1"));
+        assert_eq!(consent.value("second"), Some("2"));
+        assert_eq!(
+            consent.jurisdiction,
+            jurisdiction::Jurisdiction::NonRegulated,
+            "the jurisdiction given is the context's"
         );
     }
 
     #[test]
-    fn proxy_mode_marks_gdpr_when_raw_tc_exists() {
-        let jar = parse_cookies_to_jar("euconsent-v2=CPXxGfAPXxGfA");
-        let req = build_request();
-        let config = ConsentConfig {
-            mode: ConsentMode::Proxy,
-            ..ConsentConfig::default()
-        };
-
-        let ctx = build_consent_context(&ConsentPipelineInput {
-            jar: Some(&jar),
-            req: &req,
-            config: &config,
-            geo: None,
-            default_jurisdiction: Jurisdiction::Unknown,
-            permission_maps: crate::permissions::PermissionMaps::sample(),
-        });
-
+    fn a_module_reading_sees_the_jurisdiction() {
+        let context = ModuleContext::new(test_support::request("/"));
+        let modules: Vec<Arc<dyn PermissionSignalModule>> = vec![Arc::new(SeeingJurisdiction)];
+        let consent = read_consent(&context, &modules, jurisdiction::Jurisdiction::Gdpr);
         assert!(
-            ctx.gdpr_applies,
-            "should set gdpr_applies when raw TC string is present in proxy mode"
+            consent.record("seeing").is_some_and(SignalRecord::applies),
+            "the module read the jurisdiction the context will carry"
+        );
+    }
+
+    #[test]
+    fn no_modules_read_nothing() {
+        let context = ModuleContext::new(test_support::request("/"));
+        let consent = read_consent(&context, &[], jurisdiction::Jurisdiction::Unknown);
+        assert!(consent.records.is_empty());
+        assert!(consent.is_empty());
+    }
+
+    #[test]
+    fn a_located_request_takes_the_jurisdiction_of_its_place() {
+        let geo = GeoInfo {
+            city: String::new(),
+            country: "DE".to_owned(),
+            continent: String::new(),
+            latitude: 0.0,
+            longitude: 0.0,
+            metro_code: 0,
+            region: None,
+            asn: None,
+        };
+        assert_eq!(
+            request_jurisdiction(
+                PermissionMaps::sample(),
+                Some(&geo),
+                jurisdiction::Jurisdiction::Unknown
+            ),
+            jurisdiction::Jurisdiction::Gdpr,
+            "the place decides, not the default"
+        );
+    }
+
+    #[test]
+    fn an_unlocated_request_takes_the_default_jurisdiction() {
+        assert_eq!(
+            request_jurisdiction(
+                PermissionMaps::sample(),
+                None,
+                jurisdiction::Jurisdiction::Unknown
+            ),
+            jurisdiction::Jurisdiction::Unknown,
+            "missing geo should keep the default the caller supplied"
         );
         assert_eq!(
-            ctx.raw_tc_string.as_deref(),
-            Some("CPXxGfAPXxGfA"),
-            "should preserve raw TC string in proxy mode"
+            request_jurisdiction(
+                PermissionMaps::sample(),
+                None,
+                jurisdiction::Jurisdiction::Gdpr
+            ),
+            jurisdiction::Jurisdiction::Gdpr
         );
-        assert!(ctx.tcf.is_none(), "should skip TCF decoding in proxy mode");
+    }
+
+    /// A record of a regulation that applies, holding the visitor's consent
+    /// to `consented`, as a module reports a consent string it decoded.
+    fn consenting(consented: &[Permission]) -> SignalRecord {
+        SignalRecord::new("consent", SignalStatus::Decoded)
+            .with_value("consent-string")
+            .with_applies(true)
+            .with_consented(consented.iter().copied().collect())
+    }
+
+    /// The permissions the shipped policy resolves in a place where the
+    /// modules grant `granted` and revoke `revoked`.
+    fn resolved(
+        country: &str,
+        region: Option<&str>,
+        granted: &[Permission],
+        revoked: &[Permission],
+    ) -> PermissionState {
+        PermissionMaps::sample().resolve_with(Some(country), region, |permission, _| {
+            if granted.contains(&permission) {
+                ConsentSignal::Grant
+            } else if revoked.contains(&permission) {
+                ConsentSignal::Revoke
+            } else {
+                ConsentSignal::Neutral
+            }
+        })
+    }
+
+    /// Whether the gate passes a request in `jurisdiction` carrying
+    /// `records`, whose modules resolved `permissions`.
+    fn gate(
+        jurisdiction: Jurisdiction,
+        records: Vec<SignalRecord>,
+        permissions: PermissionState,
+    ) -> bool {
+        let consent = records.into_iter().fold(
+            ConsentContext::new(jurisdiction),
+            ConsentContext::with_record,
+        );
+        crate::ec::EcContext::new_for_test(None, consent)
+            .with_permissions_for_test(permissions)
+            .server_side_auction_allowed()
+    }
+
+    fn california() -> Jurisdiction {
+        Jurisdiction::UsState("CA".to_owned())
     }
 
     #[test]
-    fn proxy_mode_marks_gdpr_when_gpp_sid_contains_tcf_section() {
-        let jar = parse_cookies_to_jar("__gpp_sid=2,6");
-        let req = build_request();
-        let config = ConsentConfig {
-            mode: ConsentMode::Proxy,
-            ..ConsentConfig::default()
-        };
-
-        let ctx = build_consent_context(&ConsentPipelineInput {
-            jar: Some(&jar),
-            req: &req,
-            config: &config,
-            geo: None,
-            default_jurisdiction: Jurisdiction::Unknown,
-            permission_maps: crate::permissions::PermissionMaps::sample(),
-        });
-
+    fn the_auction_runs_freely_only_outside_gdpr_with_no_record_that_applies() {
+        let allows = |consent: ConsentContext| consent_allows_server_side_auction(&consent);
         assert!(
-            ctx.gdpr_applies,
-            "should set gdpr_applies when __gpp_sid includes section 2"
+            allows(ConsentContext::new(california())),
+            "a US state with no record that applies runs the auction"
+        );
+        assert!(allows(ConsentContext::new(Jurisdiction::NonRegulated)));
+        assert!(
+            !allows(ConsentContext::new(Jurisdiction::Gdpr)),
+            "GDPR with no consent fails closed"
+        );
+        assert!(
+            !allows(ConsentContext::new(Jurisdiction::Unknown)),
+            "an unknown jurisdiction with no consent fails closed"
+        );
+        assert!(
+            allows(
+                ConsentContext::new(Jurisdiction::Gdpr)
+                    .with_record(consenting(&[Permission::StoreOnDevice]))
+            ),
+            "consent to storage from a record that applies runs it"
+        );
+        assert!(
+            !allows(
+                ConsentContext::new(Jurisdiction::Gdpr)
+                    .with_record(consenting(&[Permission::StoreOnDevice]).with_applies(false))
+            ),
+            "and only from a record that applies"
+        );
+    }
+
+    // Each request below is one whose resolved permissions answer the other
+    // way, so each test shows the gate reading the records and the
+    // jurisdiction, not the permissions.
+
+    #[test]
+    fn the_gate_asks_for_consent_to_storage_not_to_basic_ad_selection() {
+        assert!(
+            gate(
+                Jurisdiction::Gdpr,
+                vec![consenting(&[Permission::StoreOnDevice])],
+                resolved(
+                    "FR",
+                    None,
+                    &[Permission::StoreOnDevice],
+                    &[Permission::SelectBasicAds]
+                ),
+            ),
+            "consent to storage alone runs the auction, though basic ad selection is unset"
+        );
+        assert!(
+            !gate(
+                Jurisdiction::Gdpr,
+                vec![consenting(&[Permission::SelectBasicAds])],
+                resolved(
+                    "FR",
+                    None,
+                    &[Permission::SelectBasicAds],
+                    &[Permission::StoreOnDevice]
+                ),
+            ),
+            "consent to basic ad selection alone does not, though it is set"
         );
     }
 
     #[test]
-    fn marks_gdpr_when_gpp_sid_contains_tcf_section_even_if_gpp_decode_fails() {
-        let signals = RawConsentSignals {
-            raw_gpp_string: Some("invalid-gpp".to_owned()),
-            raw_gpp_sid: Some("2,6".to_owned()),
-            ..RawConsentSignals::default()
-        };
-
-        let ctx = build_context_from_signals(&signals);
-
+    fn an_expired_record_that_applies_shuts_the_gate_in_every_place() {
+        let expired = SignalRecord::new("consent", SignalStatus::Expired)
+            .with_value("consent-string")
+            .with_applies(true);
         assert!(
-            ctx.gdpr_applies,
-            "should set gdpr_applies when section 2 exists even if __gpp decode fails"
+            !gate(
+                california(),
+                vec![expired],
+                resolved("US", Some("CA"), &[], &[])
+            ),
+            "an expired record answers nothing, and the auction still waits for consent \
+             where the place grants basic ad selection outright"
         );
     }
 
     #[test]
-    fn conflict_resolution_restrictive_prefers_denial() {
-        let mut ctx = make_conflicting_context(10, true, 20, false);
-        let config = ConsentConfig::default();
-
-        apply_tcf_conflict_resolution(&mut ctx, &config);
-
-        let tcf = ctx
-            .tcf
-            .expect("should keep an effective TCF after resolution");
+    fn the_gate_reads_a_record_whatever_the_policy_lets_it_answer() {
+        // A policy that silences the record leaves every permission at the
+        // place's baseline, and the record's own consent still decides.
         assert!(
-            !tcf.has_personalized_ads_consent(),
-            "restrictive mode should choose the denying signal"
+            gate(
+                Jurisdiction::Gdpr,
+                vec![consenting(&[Permission::StoreOnDevice])],
+                resolved("FR", None, &[], &[]),
+            ),
+            "a silenced record consenting to storage runs the auction"
+        );
+        assert!(
+            !gate(
+                california(),
+                vec![consenting(&[])],
+                resolved("US", Some("CA"), &[], &[])
+            ),
+            "and a silenced record refusing it shuts the gate where the place grants \
+             basic ad selection"
         );
     }
 
     #[test]
-    fn conflict_resolution_permissive_prefers_grant() {
-        let mut ctx = make_conflicting_context(10, true, 20, false);
-        let mut config = ConsentConfig::default();
-        config.conflict_resolution.mode = ConflictMode::Permissive;
-
-        apply_tcf_conflict_resolution(&mut ctx, &config);
-
-        let tcf = ctx
-            .tcf
-            .expect("should keep an effective TCF after resolution");
+    fn a_grant_from_a_module_with_no_record_that_applies_leaves_the_gate_shut() {
+        // A module answering a preference of its own, with no record that
+        // applies, grants storage and basic ad selection in a GDPR place.
+        let granted = [Permission::StoreOnDevice, Permission::SelectBasicAds];
         assert!(
-            tcf.has_personalized_ads_consent(),
-            "permissive mode should choose the granting signal"
+            !gate(
+                Jurisdiction::Gdpr,
+                vec![],
+                resolved("FR", None, &granted, &[])
+            ),
+            "the grant does not stand in for consent from a record that applies"
+        );
+        assert!(
+            !gate(
+                Jurisdiction::Gdpr,
+                vec![consenting(&[])],
+                resolved("FR", None, &granted, &[])
+            ),
+            "nor stand over a record that applies and refuses storage"
         );
     }
 
     #[test]
-    fn conflict_resolution_newest_prefers_fresher_signal() {
-        let mut ctx = make_conflicting_context(2 * super::DECISECONDS_PER_DAY, true, 0, false);
-        let mut config = ConsentConfig::default();
-        config.conflict_resolution.mode = ConflictMode::Newest;
-        config.conflict_resolution.freshness_threshold_days = 1;
-
-        apply_tcf_conflict_resolution(&mut ctx, &config);
-
-        let tcf = ctx
-            .tcf
-            .expect("should keep an effective TCF after resolution");
+    fn the_gate_follows_the_jurisdiction_not_the_place_rules_or_an_opt_out() {
         assert!(
-            tcf.has_personalized_ads_consent(),
-            "newest mode should pick the signal that is newer than threshold"
+            gate(
+                Jurisdiction::NonRegulated,
+                vec![],
+                PermissionState::default()
+            ),
+            "a place outside GDPR whose rules leave basic ad selection unset still runs it"
+        );
+        // An opt-out whose policy revokes basic ad selection, as `revokes: all`
+        // does.
+        let opted_out = SignalRecord::new("opt-out", SignalStatus::Decoded).with_value("opted-out");
+        assert!(
+            gate(
+                california(),
+                vec![opted_out],
+                resolved("US", Some("CA"), &[], &[Permission::SelectBasicAds]),
+            ),
+            "and an opt-out does not stop it"
         );
     }
 
     #[test]
-    fn expiration_clears_gpp_embedded_tcf() {
-        let mut ctx = ConsentContext {
-            raw_gpp_string: Some("DBACNY".to_owned()),
-            gpp_section_ids: Some(vec![2]),
-            gdpr_applies: true,
-            gpp: Some(GppConsent {
-                version: 1,
-                section_ids: vec![2],
-                eu_tcf: Some(make_tcf(0, true)),
-                us_sale_opt_out: None,
-            }),
-            ..ConsentContext::default()
-        };
-        let config = ConsentConfig {
-            max_consent_age_days: 0,
-            ..ConsentConfig::default()
-        };
-
-        apply_expiration_check(&mut ctx, &config);
-
-        assert!(ctx.expired, "should mark embedded TCF as expired");
+    fn a_record_that_applies_with_nothing_decoded_shuts_the_gate_in_every_place() {
+        // A module that sees its regulation applies with no string it could
+        // decode, such as a hint naming a section with no string beside it.
+        let absent = SignalRecord::new("consent", SignalStatus::Absent).with_applies(true);
         assert!(
-            ctx.gpp.as_ref().is_some_and(|g| g.eu_tcf.is_none()),
-            "should clear decoded GPP embedded TCF when expired"
-        );
-        assert!(
-            ctx.gdpr_applies,
-            "should keep gdpr_applies true when raw EU TCF signal is still present"
+            !gate(
+                california(),
+                vec![absent],
+                resolved("US", Some("CA"), &[], &[])
+            ),
+            "the regulation applies, so the auction waits for consent to storage"
         );
     }
 
-    // -----------------------------------------------------------------------
     #[test]
     fn gate_eids_keeps_eids_when_required_permissions_are_set() {
-        // US maps to us-opt-out, where necessary.operations.storage and advertising_marketing.first_party.targeted
-        // are granted with no signal, so bidstream EIDs are transmitted.
-        let permissions =
-            crate::permissions::PermissionMaps::sample().resolve(Some("US"), |_| false);
+        // US maps to us-opt-out, where necessary.operations.storage and
+        // advertising_marketing.first_party.targeted are granted with no
+        // signal, so bidstream EIDs are transmitted.
+        let permissions = PermissionMaps::sample().resolve(Some("US"), |_| false);
         let eids = Some(vec!["eid-1".to_owned()]);
         assert!(
             gate_eids_by_permissions(eids, &permissions).is_some(),
@@ -995,8 +576,7 @@ mod tests {
     fn gate_eids_strips_eids_when_a_required_permission_is_unset() {
         // FR maps to gdpr-eu, where every purpose is requires_signal, so with no
         // signal neither required permission is set and EIDs are stripped.
-        let permissions =
-            crate::permissions::PermissionMaps::sample().resolve(Some("FR"), |_| false);
+        let permissions = PermissionMaps::sample().resolve(Some("FR"), |_| false);
         let eids = Some(vec!["eid-1".to_owned()]);
         assert!(
             gate_eids_by_permissions(eids, &permissions).is_none(),
@@ -1006,8 +586,7 @@ mod tests {
 
     #[test]
     fn gate_eids_returns_none_for_empty_input() {
-        let permissions =
-            crate::permissions::PermissionMaps::sample().resolve(Some("US"), |_| false);
+        let permissions = PermissionMaps::sample().resolve(Some("US"), |_| false);
         assert!(
             gate_eids_by_permissions::<String>(None, &permissions).is_none(),
             "no EIDs should resolve to None"
@@ -1015,48 +594,6 @@ mod tests {
         assert!(
             gate_eids_by_permissions(Some(Vec::<String>::new()), &permissions).is_none(),
             "an empty EID list should resolve to None"
-        );
-    }
-
-    #[test]
-    fn has_storage_optout_signal_detects_us_style_opt_outs() {
-        let gpc = ConsentContext {
-            gpc: true,
-            ..ConsentContext::default()
-        };
-        assert!(has_storage_optout_signal(&gpc), "GPC is a storage opt-out");
-
-        let gpp_sale_opt_out = ConsentContext {
-            gpp: Some(GppConsent {
-                version: 1,
-                section_ids: vec![8],
-                eu_tcf: None,
-                us_sale_opt_out: Some(true),
-            }),
-            ..ConsentContext::default()
-        };
-        assert!(
-            has_storage_optout_signal(&gpp_sale_opt_out),
-            "a GPP US sale opt-out is a storage opt-out"
-        );
-
-        let usp_opt_out = ConsentContext {
-            us_privacy: Some(UsPrivacy {
-                version: 1,
-                notice_given: PrivacyFlag::Yes,
-                opt_out_sale: PrivacyFlag::Yes,
-                lspa_covered: PrivacyFlag::No,
-            }),
-            ..ConsentContext::default()
-        };
-        assert!(
-            has_storage_optout_signal(&usp_opt_out),
-            "a US Privacy sale opt-out is a storage opt-out"
-        );
-
-        assert!(
-            !has_storage_optout_signal(&ConsentContext::default()),
-            "no signal is not a storage opt-out"
         );
     }
 }

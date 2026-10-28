@@ -1147,29 +1147,28 @@ The country and region permission rules are defined in the publisher's permissio
 ## Consent Configuration
 
 `[consent]` controls request-local interpretation and forwarding of privacy
-signals. It does not create a second consent database. Set `consent_store` to a
-KV store name only when consent should persist with the EC identity graph.
+signals. It does not create a second consent database. The core parses `mode`,
+and every other key is read by the permission signal module for the scheme it
+concerns, so a key no linked module reads is kept as written and not refused.
 
 ### `[consent]`
 
-| Field                                          | Type           | Default                     | Contract                                                    |
-| ---------------------------------------------- | -------------- | --------------------------- | ----------------------------------------------------------- |
-| `mode`                                         | String         | `"interpreter"`             | `interpreter` decodes signals; `proxy` forwards raw strings |
-| `check_expiration`                             | Boolean        | `true`                      | Check TCF timestamps                                        |
-| `max_consent_age_days`                         | Integer        | `395`                       | Clamped to `1..=3650`                                       |
-| `consent_store`                                | String or null | `null`                      | Optional KV store for EC-linked consent persistence         |
-| `gdpr.applies_in`                              | Array[String]  | EU/EEA and UK codes         | Observability only; does not synthesize consent             |
-| `us_states.privacy_states`                     | Array[String]  | Checked built-in state list | Jurisdictions with active comprehensive privacy laws        |
-| `us_privacy_defaults.notice_given`             | Boolean        | `true`                      | Publisher policy used for GPC-only requests                 |
-| `us_privacy_defaults.lspa_covered`             | Boolean        | `false`                     | Publisher LSPA posture                                      |
-| `us_privacy_defaults.gpc_implies_optout`       | Boolean        | `true`                      | Treat `Sec-GPC: 1` as sale opt-out                          |
-| `conflict_resolution.mode`                     | String         | `"restrictive"`             | `restrictive`, `newest`, or `permissive`                    |
-| `conflict_resolution.freshness_threshold_days` | Integer        | `30`                        | Age difference required by `newest`                         |
+| Field                                          | Type    | Default         | Read by                    | Contract                                                       |
+| ---------------------------------------------- | ------- | --------------- | -------------------------- | -------------------------------------------------------------- |
+| `mode`                                         | String  | `"interpreter"` | `tcf`, `gpp`, `us-privacy` | `interpreter` decodes signals; `proxy` leaves them as received |
+| `check_expiration`                             | Boolean | `true`          | `tcf`                      | Expire a record older than `max_consent_age_days`              |
+| `max_consent_age_days`                         | Integer | `395`           | `tcf`                      | Clamped to `1..=3650`                                          |
+| `us_privacy_defaults.notice_given`             | Boolean | `true`          | `us-privacy`               | Publisher policy used for a string constructed from `Sec-GPC`  |
+| `us_privacy_defaults.lspa_covered`             | Boolean | `false`         | `us-privacy`               | Publisher LSPA posture                                         |
+| `us_privacy_defaults.gpc_implies_optout`       | Boolean | `true`          | `us-privacy`               | Treat `Sec-GPC: 1` in a US state as a sale opt-out             |
+| `conflict_resolution.mode`                     | String  | `"restrictive"` | `tcf`                      | `restrictive`, `newest`, or `permissive`                       |
+| `conflict_resolution.freshness_threshold_days` | Integer | `30`            | `tcf`                      | Age difference required by `newest`                            |
 
-In `proxy` mode Trusted Server does not decode the TC string, so it cannot
-confirm TCF Purpose 1 + 4. When a TC cookie is present, it fails closed:
-browser-supplied EIDs are neither forwarded in bid requests nor written to the
-EC identity graph, and server-side pull sync is skipped.
+In `proxy` mode no module decodes its string, so a string that arrived is a
+preference the module cannot see and fails closed on the permissions its
+scheme covers, and no module vouches for it, so it is not forwarded in a bid
+request. Browser-supplied EIDs are neither forwarded nor written to the EC
+identity graph, and server-side pull sync is skipped.
 
 ```toml
 [consent]
@@ -1181,10 +1180,6 @@ max_consent_age_days = 395
 mode = "restrictive"
 freshness_threshold_days = 30
 ```
-
-`applies_in` and `privacy_states` are policy inputs. Review them against the
-publisher's operating jurisdictions instead of assuming the built-in lists are
-legal advice.
 
 ## Permission Policy Configuration
 
