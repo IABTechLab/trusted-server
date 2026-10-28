@@ -13,7 +13,7 @@ use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 use error_stack::Report;
-use hmac::{Hmac, Mac as _};
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use http::{HeaderMap, HeaderValue, Method, header};
 use sha2::{Digest as _, Sha256};
 use trusted_server_core::error::TrustedServerError;
