@@ -81,6 +81,7 @@ use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::request_signing::{RequestSigner, SIGNING_VERSION, SigningParams};
 #[cfg(test)]
 use trusted_server_core::settings::{IntegrationConfig, Settings};
+use trusted_server_permission_signal_mtm::COOKIE_MTM_PREF;
 
 /// The name an `implementation` line gives this implementation, its module
 /// path, which also serves as its builder's id.
@@ -1064,9 +1065,9 @@ fn non_empty_override_object(
 /// synthesized from `client_ip` — the platform-attested client address —
 /// matching the trusted IP already sent in `OpenRTB` `device.ip`.
 ///
-/// In [`ConsentForwardingMode::OpenrtbOnly`] mode, consent cookies are
-/// stripped from the `Cookie` header since consent travels exclusively
-/// through the `OpenRTB` body.
+/// In [`ConsentForwardingMode::OpenrtbOnly`] mode, the consent cookies and
+/// the Model Terms for Marketing preference are stripped from the `Cookie`
+/// header since consent travels exclusively through the `OpenRTB` body.
 #[cfg(test)]
 fn copy_request_headers(
     from: &http::Request<EdgeBody>,
@@ -1142,7 +1143,12 @@ fn apply_prebid_header_values(
     }
     match cookie_value.to_str() {
         Ok(value) => {
-            let stripped = strip_cookies(value, CONSENT_COOKIE_NAMES);
+            // The Model Terms for Marketing preference records the visitor's
+            // choice as the consent cookies do, so it is withheld with them.
+            let stripped = strip_cookies(
+                &strip_cookies(value, CONSENT_COOKIE_NAMES),
+                &[COOKIE_MTM_PREF],
+            );
             if !stripped.is_empty()
                 && let Ok(cookie_header) = HeaderValue::from_str(&stripped)
             {
@@ -7187,6 +7193,77 @@ set = { networkId = 42 }
                 "should place the raw Referer in PBS site.ref as well as forwarding it"
             );
         }
+    }
+
+    /// A page request from a visitor who has answered a consent prompt and
+    /// the Model Terms for Marketing preference question.
+    const ANSWERED: &str = "session=fictional; euconsent-v2=fictional-tcf; __mtm_pref=standard";
+
+    /// The `Cookie` header Prebid Server receives in `mode` for a page request
+    /// carrying `cookie`, through the dispatch path.
+    fn cookie_sent_to_prebid_server(
+        mode: ConsentForwardingMode,
+        cookie: &'static str,
+    ) -> Option<Vec<u8>> {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(204, Vec::new());
+        let services = build_services_with_http_client_and_client_ip(
+            Arc::clone(&stub) as Arc<dyn trusted_server_core::platform::PlatformHttpClient>,
+            std::net::IpAddr::from([203, 0, 113, 9]),
+        );
+        let settings = make_settings();
+        let mut config = base_config();
+        config.consent_forwarding = mode;
+        let provider = PrebidAuctionProvider::new(config);
+        let inbound = http::Request::builder()
+            .uri("https://pub.example/auction")
+            .header(header::COOKIE, cookie)
+            .body(EdgeBody::empty())
+            .expect("should build inbound request");
+        let context = AuctionContext {
+            settings: &settings,
+            request: &inbound,
+            timeout_ms: 321,
+            transport_timeout_ms: 321,
+            provider_responses: None,
+            services: &services,
+        };
+
+        futures::executor::block_on(
+            provider.request_bids(&create_test_auction_request(), &context),
+        )
+        .expect("should dispatch PBS request");
+
+        let headers = stub.recorded_request_header_bytes();
+        assert_eq!(headers.len(), 1, "should dispatch one request");
+        header_value(&headers[0], "cookie").map(<[u8]>::to_vec)
+    }
+
+    #[test]
+    fn openrtb_only_withholds_the_model_terms_preference_from_prebid_server() {
+        assert_eq!(
+            cookie_sent_to_prebid_server(ConsentForwardingMode::OpenrtbOnly, ANSWERED).as_deref(),
+            Some(b"session=fictional".as_slice()),
+            "should withhold the preference wherever the consent cookies are withheld"
+        );
+    }
+
+    #[test]
+    fn cookies_only_forwards_the_model_terms_preference_to_prebid_server() {
+        assert_eq!(
+            cookie_sent_to_prebid_server(ConsentForwardingMode::CookiesOnly, ANSWERED).as_deref(),
+            Some(ANSWERED.as_bytes()),
+            "should forward the preference with the consent cookies"
+        );
+    }
+
+    #[test]
+    fn both_forwards_the_model_terms_preference_to_prebid_server() {
+        assert_eq!(
+            cookie_sent_to_prebid_server(ConsentForwardingMode::Both, ANSWERED).as_deref(),
+            Some(ANSWERED.as_bytes()),
+            "should forward the preference with the consent cookies"
+        );
     }
 
     #[test]

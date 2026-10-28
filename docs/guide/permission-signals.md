@@ -114,13 +114,13 @@ question about a jurisdiction and a publisher.
 
 ## The modules that ship
 
-| Name         | Crate                                 | Reads                                                                 |
-| ------------ | ------------------------------------- | --------------------------------------------------------------------- |
-| `gpc`        | `crates/permission-signal/gpc`        | The `Sec-GPC` header, Global Privacy Control                          |
-| `gpp`        | `crates/permission-signal/gpp`        | The US sale opt-out carried in a GPP string                           |
-| `us-privacy` | `crates/permission-signal/us-privacy` | The sale opt-out in a US Privacy string                               |
-| `tcf`        | `crates/permission-signal/tcf`        | A TCF v2 record, with the purpose mapping in code                     |
-| `mtm`        | `crates/permission-signal/mtm`        | The PMP answer, one of two words, under the Model Terms for Marketing |
+| Name         | Crate                                 | Reads                                                                   |
+| ------------ | ------------------------------------- | ----------------------------------------------------------------------- |
+| `gpc`        | `crates/permission-signal/gpc`        | The `Sec-GPC` header, Global Privacy Control                            |
+| `gpp`        | `crates/permission-signal/gpp`        | The US sale opt-out carried in a GPP string                             |
+| `us-privacy` | `crates/permission-signal/us-privacy` | The sale opt-out in a US Privacy string                                 |
+| `tcf`        | `crates/permission-signal/tcf`        | A TCF v2 record, with the purpose mapping in code                       |
+| `mtm`        | `crates/permission-signal/mtm`        | The PMP answer, one of three words, under the Model Terms for Marketing |
 
 The three opt-outs are separate so that a publisher who does not act on Global
 Privacy Control can remove it and keep the other two. What an opt-out takes

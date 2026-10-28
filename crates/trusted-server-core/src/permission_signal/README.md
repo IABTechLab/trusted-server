@@ -36,8 +36,8 @@ reads its own signal from the request, without a change to core. The fifth,
 Model Terms for Marketing (MTM), is the first terms scheme, where a publisher
 and the parties it passes data to agree to be bound by a published set of
 terms, and what the module reads is the visitor's answer to a preference
-platform, one of three words in the first party cookie
-`__mtm_pref`, a name any platform may set. It is one of many terms schemes
+platform, one of three words in a first party cookie whose name the module
+declares and any platform may set. It is one of many terms schemes
 rather than the only one, because a publisher, a trade body or a regulator can
 each publish terms and each set becomes a module. The five here are a
 starting set and not the list.

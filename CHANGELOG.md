@@ -68,6 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- With `consent_forwarding = "openrtb_only"`, the Model Terms for Marketing preference cookie, `__mtm_pref`, is withheld from Prebid Server along with the consent cookies. It was forwarded in every mode.
 - A response no longer carries `X-Served-By`, `X-Cache` or `X-Cache-Hits`, unless this server answered a request for a path beneath `/_ts`. The three name the node that answered and say how a cache treated the request, and arrive from the publisher's origin or a cache on the way to it. Every adapter removes them before it finalizes a response, so one set in `[response_headers]` is still sent.
 - No adapter writes a version on a response. A deployment that wants the versions on its pages names core's `service_version` middleware in a `[[serve]]` entry, which writes `X-TS-Version` from the git version the build compiled in and `X-TS-Service-Version` from the version the adapter reports.
 - A module's table that cannot be read or fails its validation is refused naming the setting at fault and never its value, because at startup the table holds the module's secrets resolved from the secret store and each adapter logs a refusal whole.
