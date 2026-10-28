@@ -838,6 +838,133 @@ fn core_refuses_a_lifetime_out_of_range_in_the_assets_table() {
     );
 }
 
+/// The test settings with `tables` after them, loaded from a document.
+fn settings_with_tables(tables: &str) -> Settings {
+    let toml = format!(
+        "{}\n{tables}",
+        trusted_server_core::test_support::tests::crate_test_settings_str()
+    );
+    Settings::from_toml(&toml).expect("should load the document")
+}
+
+/// The records take the lifetimes of `[cache.51degrees-assets]`, so a
+/// lifetime in `[cache.51degrees-assets-vary]` is refused when the settings
+/// load, whether or not `[asset-cache]` selects the module.
+#[test]
+fn each_lifetime_in_the_vary_table_is_refused_naming_the_table_and_the_setting() {
+    // (setting, a value in its range)
+    let lifetimes = [
+        ("memory_seconds", "5"),
+        ("store_seconds", "3600"),
+        ("store_idle_seconds", "86400"),
+    ];
+    for (setting, value) in lifetimes {
+        for selected in [false, true] {
+            let mut settings = settings_with_tables(&format!(
+                "[cache.51degrees-assets-vary]\n{setting} = {value}\n"
+            ));
+            if selected {
+                settings.select_module("asset-cache", MODULE);
+            }
+
+            let mut refusals = vec![
+                (
+                    "loading the settings",
+                    trusted_server_core::config::validate_settings_for_runtime_with(
+                        &settings,
+                        &[builder()],
+                    )
+                    .err(),
+                ),
+                (
+                    "the deploy check",
+                    trusted_server_core::config::validate_settings_for_deploy_with(
+                        &settings,
+                        &[builder()],
+                    )
+                    .err(),
+                ),
+            ];
+            // The registry builds only a module a section selects.
+            if selected {
+                refusals.push((
+                    "the registry",
+                    IntegrationRegistry::with_registrations(&settings, &[builder()]).err(),
+                ));
+            }
+
+            for (call, refusal) in refusals {
+                let message = format!(
+                    "{:?}",
+                    refusal.unwrap_or_else(|| panic!(
+                        "{call} should refuse `{setting}`, selected {selected}"
+                    ))
+                );
+                assert!(
+                    message.contains(&format!(
+                        "[cache.51degrees-assets-vary] sets `{setting}`, which"
+                    )) && message.contains("[cache.51degrees-assets]."),
+                    "{call} should name the table, the setting and where lifetimes go, \
+                     selected {selected}: {message}"
+                );
+                for (other, _) in lifetimes.iter().filter(|(other, _)| *other != setting) {
+                    assert!(
+                        !message.contains(&format!("`{other}`")),
+                        "{call} should name only `{setting}`: {message}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_vary_table_refusal_names_every_lifetime_it_sets() {
+    let settings = settings_with_tables(
+        "[cache.51degrees-assets-vary]\nmemory_seconds = 5\nstore_seconds = 3600\n\
+         store_idle_seconds = 86400\n",
+    );
+
+    let error = crate::validate(&settings).expect_err("no lifetime of the table is read");
+
+    let message = format!("{error:?}");
+    assert!(
+        message.contains(
+            "[cache.51degrees-assets-vary] sets `memory_seconds`, `store_seconds` and \
+             `store_idle_seconds`, which"
+        ),
+        "{message}"
+    );
+}
+
+/// A vary table that sets no lifetime loads, empty or naming its loading
+/// cache module, beside an assets table that sets all three.
+#[test]
+fn a_vary_table_without_lifetimes_loads() {
+    for vary in ["", "module = \"memory\"\n"] {
+        let mut settings = settings_with_tables(&format!(
+            "[cache.51degrees-assets]\nmemory_seconds = 5\nstore_seconds = 3600\n\
+             store_idle_seconds = 86400\n\n[cache.51degrees-assets-vary]\n{vary}"
+        ));
+        settings.select_module("asset-cache", MODULE);
+        let builders = linked_builders();
+
+        assert!(
+            settings.cache.declared.contains_key(ASSETS_VARY_CACHE),
+            "the document should hold the vary table: {vary:?}"
+        );
+        trusted_server_core::config::validate_settings_for_runtime_with(&settings, &builders)
+            .expect("loading the settings should accept the table");
+        trusted_server_core::config::validate_settings_for_deploy_with(&settings, &builders)
+            .expect("the deploy check should accept the table");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("the registry should accept the table");
+        assert!(registry.asset_cache_module().is_some(), "{vary:?}");
+        trusted_server_core::integrations::loading_caches_from(&settings, &builders)
+            .expect("the caches should be made");
+    }
+}
+
 #[tokio::test]
 async fn a_record_cache_that_keeps_nothing_beside_one_that_does_has_the_origin_asked() {
     let stub = Arc::new(StubHttpClient::new());
