@@ -15,9 +15,7 @@ use std::io::Write as _;
 use std::sync::{Arc, OnceLock};
 
 use error_stack::Report;
-use trusted_server_core::permissions::{
-    PermissionPolicy, PolicyReference, load_policy, policy_sha256,
-};
+use trusted_server_core::permissions::PermissionPolicy;
 use trusted_server_core::platform::{
     BackendNamingPolicy, ClientInfo, DisabledGeo, PlatformBackend, PlatformBackendSpec,
     PlatformConfigStore, PlatformError, PlatformSecretStore, RuntimeServices, StoreId, StoreName,
@@ -36,15 +34,6 @@ const API_NOT_FOUND: &str = "the Fastly API returned 404";
 /// The entries of the config store that are not keys. A key named as one of
 /// them would be written over, or would take the entry with it when deleted.
 const BOOKKEEPING_ENTRIES: [&str; 2] = ["current-kid", "active-kids"];
-
-/// The permission policy the commands' services carry, as every services
-/// graph carries one. The commands read and write the signing stores and
-/// decide no request's permissions, so the policy grants nothing.
-const KEY_COMMANDS_POLICY: &str =
-    "groups:\n  none:\n    default: denied\nrules:\n  group: none\n  jurisdiction: non-regulated\n";
-
-/// The name the commands' policy is loaded under.
-const KEY_COMMANDS_POLICY_NAME: &str = "key-commands";
 
 /// Request signing key commands.
 #[derive(Debug, clap::Subcommand)]
@@ -307,20 +296,10 @@ fn services(runner: Arc<dyn FastlyRunner>, stores: &StoreArgs) -> RuntimeService
         .http_client(Arc::new(UnavailableHttpClient))
         .geo(Arc::new(DisabledGeo))
         .client_info(ClientInfo::default())
-        .permission_policy(key_commands_policy())
+        // The commands decide no request's permissions, and every services
+        // graph carries a policy, so they carry the one that grants nothing.
+        .permission_policy(PermissionPolicy::granting_nothing())
         .build()
-}
-
-/// The policy that grants nothing, which the commands' services carry.
-fn key_commands_policy() -> Arc<PermissionPolicy> {
-    load_policy(
-        PolicyReference {
-            policy: KEY_COMMANDS_POLICY_NAME.to_owned(),
-            sha256: policy_sha256(KEY_COMMANDS_POLICY),
-        },
-        KEY_COMMANDS_POLICY,
-    )
-    .expect("the key commands' policy should load")
 }
 
 /// Refuses a key id that names one of the store's bookkeeping entries.
@@ -651,16 +630,6 @@ mod tests {
         ]));
         fake.add_secret("ts-old");
         fake
-    }
-
-    #[test]
-    fn the_key_commands_policy_grants_nothing() {
-        let policy = key_commands_policy();
-
-        assert!(
-            policy.maps().baseline(None, None).permissions().is_empty(),
-            "commands that decide no request should carry a policy that grants nothing"
-        );
     }
 
     #[test]
