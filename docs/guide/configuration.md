@@ -240,6 +240,7 @@ fail and the service will return its startup-error response.
 | `[geo]`                                                                                                           | one module            | Which module resolves location, if any                                                      |
 | `[[handlers]]`                                                                                                    | nothing               | Ordered HTTP Basic-auth rules                                                               |
 | `[image_optimizer]`                                                                                               | nothing               | Reusable Fastly Image Optimizer profiles                                                    |
+| `[inspect]`                                                                                                       | nothing               | What the configuration page at `/_ts/config` shows                                          |
 | `[permission-signal]`                                                                                             | several modules       | Which permission signals are acted on, in order                                             |
 | `[permissions]`                                                                                                   | nothing               | The publisher's permission policy file, by name                                             |
 | `[proxy]`                                                                                                         | several modules       | Proxy allowlist, TLS policy, asset routes, and the first-party script proxy module          |
@@ -669,6 +670,58 @@ enabled = true
 
 ```bash
 TRUSTED_SERVER__TESTER_COOKIE__ENABLED=true
+```
+
+## Inspect Configuration
+
+A deployment publishes the settings it is running at
+[`/_ts/config`](/guide/api-reference#get-ts-config-and-get-ts-config-json), to
+anyone who asks. Every secret is masked, and so is every value that is
+sensitive by default. This section is where a publisher changes those
+defaults.
+
+### `[inspect]`
+
+| Field    | Type             | Required | Description                                                                             |
+| -------- | ---------------- | -------- | --------------------------------------------------------------------------------------- |
+| `config` | Boolean          | No       | Whether the configuration is published. Default `true`. `false` answers `404 Not Found` |
+| `show`   | Array of strings | No       | Values masked by default that are shown instead. A secret cannot be shown               |
+| `hide`   | Array of strings | No       | Values masked as well as the defaults                                                   |
+
+Each entry of `show` and `hide` is a path pattern, being keys joined by `.`,
+with `[]` for every element of a list and `[N]` for one, such as
+`publisher.origin_url`, `proxy.asset_routes[].origin_url` or
+`handlers[0].path`. A pattern names the values at exactly its own depth.
+
+A masked value shows as `XXXX`, and the page lists every masked path.
+
+| What                                                                                                             | Masked     | Can `show` reveal it             |
+| ---------------------------------------------------------------------------------------------------------------- | ---------- | -------------------------------- |
+| A secret, meaning a value the settings loader fills from the secret store                                        | Always     | No                               |
+| `publisher.origin_url` and `publisher.origin_host_header_override`                                               | By default | Yes                              |
+| `proxy.asset_routes[].origin_url`                                                                                | By default | Yes                              |
+| `handlers[].path` and `handlers[].username`                                                                      | By default | Yes                              |
+| `ec.ec_store`, `request_signing.config_store_id`, `request_signing.secret_store_id` and `auction.creative_store` | By default | Yes                              |
+| Anything `hide` names                                                                                            | When named | It is the publisher's own choice |
+
+A pattern that would not be honored as written refuses the configuration,
+both when a deployment is validated and when the settings load. That is a
+pattern that matches no value, a `show` that names a secret, a pattern another
+pattern of the same list already covers, a `show` that a `hide` covers, a
+pattern that changes nothing the page shows, a pattern under
+`permissions.text`, the policy file the page never shows, and any pattern at
+all beside `config = false`.
+
+`ts config push` always writes `permissions.sha256`, so every check counts it
+as present, and a pattern that names it is judged alike before the push and
+when the pushed settings load.
+
+**Example**:
+
+```toml
+[inspect]
+show = ["publisher.origin_url"]
+hide = ["response_headers"]
 ```
 
 ## EC Configuration

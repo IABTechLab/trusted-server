@@ -440,6 +440,40 @@ mod tests {
     }
 
     #[test]
+    fn the_data_page_keeps_its_sandbox_under_an_operator_content_security_policy() {
+        let settings = settings_with_response_headers(vec![
+            ("Content-Security-Policy", "default-src 'self'"),
+            ("X-Frame-Options", "SAMEORIGIN"),
+        ]);
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/_ts/data")
+            .body(Body::empty())
+            .expect("should build request");
+        let mut response = trusted_server_core::inspect::data::handle_data(None, None, &request)
+            .expect("should answer");
+
+        apply_finalize_headers(&settings, None, &mut response);
+
+        let policy = response
+            .headers()
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .expect("should carry a policy");
+        assert!(
+            policy.starts_with("sandbox;"),
+            "an operator policy must not remove the sandbox: {policy}"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-frame-options")
+                .and_then(|v| v.to_str().ok()),
+            Some("DENY")
+        );
+    }
+
+    #[test]
     fn apply_finalize_headers_downgrades_public_set_cookie_response() {
         // A per-user cookie response that arrives shared-cacheable (origin-public
         // plus a surrogate directive) must be downgraded so a shared cache cannot

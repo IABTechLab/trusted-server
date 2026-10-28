@@ -52,6 +52,7 @@ pub mod host_header;
 pub mod host_rewrite;
 pub mod html_processor;
 pub mod http_util;
+pub mod inspect;
 pub mod integrations;
 pub mod module_context;
 pub mod module_name;

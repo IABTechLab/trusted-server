@@ -50,10 +50,11 @@ pub struct Publisher {
     /// (see [`ec_cookie_domain`](Self::ec_cookie_domain)).
     #[validate(custom(function = validate_cookie_domain))]
     pub cookie_domain: String,
+    #[serde(serialize_with = "crate::redacted::sensitive")]
     #[validate(custom(function = validate_no_trailing_slash))]
     pub origin_url: String,
     /// Optional outbound Host header to send while connecting to `origin_url`.
-    #[serde(default)]
+    #[serde(default, serialize_with = "crate::redacted::sensitive")]
     #[validate(custom(function = validate_host_header_override))]
     pub origin_host_header_override: Option<String>,
     /// Secret used to encrypt/decrypt proxied URLs in `/first-party/proxy`.
@@ -603,7 +604,7 @@ pub struct Ec {
     pub resolve_allowed_origins: Vec<String>,
 
     /// Fastly KV store name for the EC identity graph.
-    #[serde(default)]
+    #[serde(default, serialize_with = "crate::redacted::sensitive")]
     pub ec_store: Option<String>,
 
     /// Maximum number of concurrent pull-sync requests.
@@ -1571,6 +1572,7 @@ impl Rewrite {
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct Handler {
+    #[serde(serialize_with = "crate::redacted::sensitive")]
     #[validate(length(min = 1), custom(function = validate_path))]
     pub path: String,
     #[validate(custom(function = validate_redacted_not_empty))]
@@ -1639,7 +1641,9 @@ impl Handler {
 pub struct RequestSigning {
     #[serde(default = "default_request_signing_enabled")]
     pub enabled: bool,
+    #[serde(serialize_with = "crate::redacted::sensitive")]
     pub config_store_id: String,
+    #[serde(serialize_with = "crate::redacted::sensitive")]
     pub secret_store_id: String,
 }
 
@@ -2426,6 +2430,7 @@ pub struct ProxyAssetRoute {
     /// Only the scheme, host, and port are used. Any path or query configured on
     /// this URL is rejected because the incoming request path/query, or the
     /// configured rewrite result, replaces them at runtime.
+    #[serde(serialize_with = "crate::redacted::sensitive")]
     pub origin_url: String,
     /// Optional regex matched against the incoming request path before proxying.
     pub path_pattern: Option<String>,
@@ -4061,12 +4066,36 @@ pub struct Settings {
         reason = "the field exists so that reading the renamed table fails with directions"
     )]
     renamed_permission_signal: RenamedPermissionSignalTable,
+    /// What the configuration page at `/_ts/config` shows.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::inspect::config::InspectConfig::is_default"
+    )]
+    pub inspect: crate::inspect::config::InspectConfig,
+    /// Where the loader wrote secrets, which the configuration view masks.
+    /// Never read from a document and never written to one.
+    #[serde(skip)]
+    resolved_secrets: crate::secret_resolution::ResolvedSecrets,
     /// The policy the runtime loader read and checked for `permissions`.
     #[serde(skip)]
     permission_policy: Option<std::sync::Arc<crate::permissions::PermissionPolicy>>,
 }
 
 impl Settings {
+    /// Where the loader wrote secrets, for the configuration view.
+    #[must_use]
+    pub(crate) fn resolved_secrets(&self) -> &crate::secret_resolution::ResolvedSecrets {
+        &self.resolved_secrets
+    }
+
+    /// Records where the loader wrote secrets.
+    pub(crate) fn set_resolved_secrets(
+        &mut self,
+        secrets: crate::secret_resolution::ResolvedSecrets,
+    ) {
+        self.resolved_secrets = secrets;
+    }
+
     /// The permission policy this domain loaded.
     ///
     /// The runtime loader attaches it, and refuses a domain without one, so

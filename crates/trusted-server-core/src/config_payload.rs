@@ -108,14 +108,17 @@ pub fn settings_from_config_blob_with(
     let mut data = envelope.into_data();
     remove_inactive_secret_references(&mut data);
     crate::module_secrets::clear_unused(&mut data, &builders);
-    resolve_secret_references_with::<TrustedServerAppConfig>(
+    let resolved = resolve_secret_references_with::<TrustedServerAppConfig>(
         &mut data,
         secret_store,
         default_secret_store_name,
         crate::module_secrets::secret_fields(&builders),
     )?;
     let mut settings = Settings::from_json_value(data)?;
+    // The configuration view masks every leaf a secret was written into.
+    settings.set_resolved_secrets(resolved);
     crate::config::validate_settings_for_runtime_with(&settings, extra_integrations)?;
+    crate::inspect::config::validate_patterns(&settings)?;
     let policy = load_domain_policy(&mut settings.permissions, policy_origin)?;
     log_permission_baseline(&policy);
     settings.attach_permission_policy(policy);

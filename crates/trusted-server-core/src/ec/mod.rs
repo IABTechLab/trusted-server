@@ -236,6 +236,18 @@ fn request_ec_id_if_allowed(value: &str, source: &str) -> Option<String> {
     None
 }
 
+/// The Edge Cookie identifier `req` carries in its `ts-ec` cookie, or `None`
+/// when it carries none, or one holding a character no identifier has.
+///
+/// # Errors
+///
+/// - [`TrustedServerError::InvalidHeaderValue`] if cookie parsing fails
+pub(crate) fn request_cookie_ec(
+    req: &Request<EdgeBody>,
+) -> Result<Option<String>, Report<TrustedServerError>> {
+    Ok(parse_ec_from_request(req)?.cookie_ec)
+}
+
 /// Captures the EC state for a single request lifecycle.
 ///
 /// Created via [`read_from_request`](Self::read_from_request) during

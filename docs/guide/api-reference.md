@@ -8,6 +8,7 @@ Quick reference for all Trusted Server HTTP endpoints.
 - [Edge Cookie Endpoints](#edge-cookie-endpoints) - Identity sync and enrichment
 - [Request Signing](#request-signing-endpoints) - Cryptographic signing and key management
 - [Admin Diagnostics](#admin-diagnostic-endpoints) - Protected EC troubleshooting
+- [Inspection Endpoints](#inspection-endpoints) - What a deployment shows to anyone who asks
 - [TSJS Library](#tsjs-library-endpoint) - JavaScript library serving
 - [Utility Endpoints](#utility-endpoints) - Optional operational helpers
 - [Integration Endpoints](#integration-endpoints) - Third-party service proxying
@@ -45,9 +46,14 @@ authority, scheme, and client-address headers in the innermost middleware.
 | normal  | `/_ts/api/v1/batch-sync`               | `POST`                                                     | literal        | `always`                              | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/api/v1/identify`                 | `GET`, `OPTIONS`                                           | literal        | `always`                              | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/clear-tester`                    | `GET`                                                      | literal        | `settings.tester_cookie.enabled`      | real                  | —                     | —                     | —                     |
+| normal  | `/_ts/config.json`                     | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
+| normal  | `/_ts/config`                          | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
+| normal  | `/_ts/data`                            | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/debug/ja4`                       | `GET`                                                      | conditional    | `settings.debug.ja4_endpoint_enabled` | real                  | —                     | —                     | —                     |
 | normal  | `/_ts/page-bids`                       | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/page-bids`                       | `OPTIONS`                                                  | literal        | `always`                              | guarded               | guarded               | guarded               | guarded               |
+| normal  | `/_ts/permissions.json`                | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
+| normal  | `/_ts/permissions`                     | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/_ts/set-tester`                      | `GET`                                                      | literal        | `settings.tester_cookie.enabled`      | real                  | —                     | —                     | —                     |
 | normal  | `/admin/keys/deactivate`               | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `always`                              | guarded               | guarded               | guarded               | guarded               |
 | normal  | `/admin/keys/rotate`                   | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `always`                              | guarded               | guarded               | guarded               | guarded               |
@@ -88,6 +94,222 @@ There is no repository-wide error body schema. Some handlers return structured
 JSON, some return an empty body, and shared adapter errors are plain text with
 safe client-facing messages. Treat the status and body documented for each
 endpoint as authoritative.
+
+## Inspection Endpoints
+
+What a deployment shows to anyone who asks, with no credential. A publisher
+can point a reader, a regulator or an auditor at these addresses, and each
+sees what the deployment decided for their own request.
+
+### GET /\_ts/config and GET /\_ts/config.json
+
+Shows the settings the deployment is running, after defaults are applied.
+Anyone can read the scripts a page runs, and this lets anyone read the
+configuration that runs at the edge too. Every secret is masked, whatever the
+publisher's document says, and every value that is sensitive by default is
+masked unless the publisher shows it. The publisher decides what else is shown
+or hidden in [`[inspect]`](/guide/configuration#inspect), and `config = false`
+there answers `404 Not Found`. The first address answers a page, and the
+second answers the same information as JSON.
+
+**Contract:** Auth: none. Request body: not applicable. Rate limit: none.
+Endpoint-specific CORS: `Access-Control-Allow-Origin: *`.
+
+**Response:**
+
+- **Status:** `200 OK`
+- **Headers:** `Cache-Control: no-store`
+
+```json
+{
+  "masked": [
+    "handlers[0].password",
+    "handlers[0].path",
+    "handlers[0].username",
+    "publisher.origin_url",
+    "publisher.proxy_secret"
+  ],
+  "settings": {
+    "handlers": [{ "password": "XXXX", "path": "XXXX", "username": "XXXX" }],
+    "publisher": {
+      "cookie_domain": ".example.com",
+      "domain": "example.com",
+      "origin_url": "XXXX",
+      "proxy_secret": "XXXX"
+    }
+  },
+  "version": "0.1.0"
+}
+```
+
+| Field      | Meaning                                                                                                                                         |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `settings` | The running settings, with each masked value replaced by `XXXX` and every object's keys sorted, so the same settings always give the same bytes |
+| `masked`   | Every masked path, sorted, so a reader can see what was withheld                                                                                |
+| `version`  | The version of the core crate that answered                                                                                                     |
+
+A secret is masked twice over. The settings loader records each value it fills
+from the secret store, and those paths are masked. Then any string that still
+contains one of those values is masked wherever it sits, a key included.
+
+`permissions` shows the policy file's name as `policy` and its SHA-256 as
+`sha256`, neither masked by default, so a publisher can check which exact file
+a domain runs. The file itself is never shown, because the settings loader
+takes it out of the settings when it loads the policy.
+
+**Example:**
+
+```bash
+curl -s "https://edge.example.com/_ts/config.json"
+```
+
+### GET /\_ts/data
+
+Shows a reader what the deployment holds against the Edge Cookie their own
+browser sent, being when the record was made, the consent recorded, the
+location and device class kept, and which partners hold an identifier of their
+own for the same browser. It answers as a page only, because the answer is for
+a person.
+
+**Contract:** Auth: none. The record shown is the one stored against the
+identifier in the request's own `ts-ec` cookie, and no other can be asked for.
+Request body: not applicable. Rate limit: none. Endpoint-specific CORS: none,
+so no other origin may read it.
+
+The Edge Cookie is `HttpOnly`, so a script on the page cannot read the
+identifier, and this page does not undo that.
+
+1. Only a browser opening the address as a page is answered, which the browser
+   marks with `Sec-Fetch-Mode: navigate` and `Sec-Fetch-Dest: document`. A
+   script cannot set either header, so a `fetch` from a page, a frame and an
+   embedded object are each answered `403 Forbidden`. A browser sends these
+   headers only to a trustworthy origin, so every browser on a plain `http://`
+   host other than localhost is answered `403 Forbidden` too.
+2. The page is sent with `Content-Security-Policy: sandbox`, which gives the
+   document an origin of its own, so a page that opened it cannot read it.
+3. No identifier is shown. The Edge Cookie's value and each partner's
+   identifier show as `XXXX`.
+
+Two parties other than the reader can still read the page, and neither finds
+an identifier in it. The first is whoever holds an identifier, because a tool
+can send it as the cookie along with both headers. The second is a service
+worker the publisher's site registers for the whole site, because it handles
+this navigation as it does every other on the site.
+
+**Response:**
+
+- **Status:** `200 OK`, or `403 Forbidden` when the request is not a browser
+  opening the page
+- **Headers:** `Cache-Control: no-store, private`, `X-Frame-Options: DENY`,
+  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
+  `Cross-Origin-Resource-Policy: same-origin` and the policy below
+
+```http
+Content-Security-Policy: sandbox; default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'
+```
+
+The page shows this information.
+
+```json
+{
+  "consent_updated": "2026-03-14T09:30:00Z",
+  "created": "2026-03-14T09:30:00Z",
+  "held": true,
+  "identifier": "XXXX",
+  "record": {
+    "consent": { "ok": true, "tcf": "CP...", "updated": 1773480600 },
+    "created": 1773480600,
+    "geo": { "country": "GB", "region": "ENG" },
+    "ids": { "partner.example.com": { "uid": "XXXX" } },
+    "pub_properties": {
+      "origin_domain": "example.com",
+      "seen_domains": ["example.com"]
+    },
+    "v": 1
+  },
+  "version": "0.1.0",
+  "withdrawn": false
+}
+```
+
+| Field                           | Meaning                                                                       |
+| ------------------------------- | ----------------------------------------------------------------------------- |
+| `held`                          | Whether a record is held against the request's Edge Cookie                    |
+| `why`                           | The reason, when nothing is held                                              |
+| `identifier`                    | Always `XXXX`, because the Edge Cookie's value is never shown                 |
+| `record`                        | The record as it is stored, with each partner's identifier replaced by `XXXX` |
+| `created` and `consent_updated` | The two times in the record, written as dates                                 |
+| `withdrawn`                     | Whether the record is the one a withdrawal of consent leaves                  |
+| `version`                       | The version of the core crate that answered                                   |
+
+Nothing is held, and `why` gives the reason, when the deployment keeps no
+identity graph, when the request carried no Edge Cookie, when the cookie is
+not one the deployment issued, and when no record is stored against it. Only
+the Fastly adapter keeps an identity graph, so every other adapter answers
+that nothing is held.
+
+Nothing is created or written for the reader. The Edge Cookie lifecycle does
+not run for this request, so no cookie is set and no identity row is written.
+
+### GET /\_ts/permissions and GET /\_ts/permissions.json
+
+Shows the permissions resolved for the request that asks, the signals that
+produced them and the terms the data is held under. It is the evaluation a
+page receives as `window.tsjs.permissions`, resolved from the request's own
+signals and location. The first address answers a page, and the second
+answers the same information as JSON.
+
+**Contract:** Auth: none. Request body: not applicable. Rate limit: none.
+Endpoint-specific CORS: `Access-Control-Allow-Origin: *`, so a page on another
+site can render the data. A request from another origin carries no cookies, so
+that page reads the resolution of a request with no stored signal.
+
+**Response:**
+
+- **Status:** `200 OK`
+- **Headers:** `Cache-Control: no-store`, because each answer is the asking
+  request's own.
+
+```json
+{
+  "awaiting": [],
+  "modules": { "configured": ["gpc", "tcf"], "contributed": ["tcf"] },
+  "policy": "standard",
+  "set": ["necessary.operations.storage"],
+  "signals": [{ "module": "tcf", "scheme": "tcf", "value": "CP..." }],
+  "storageWithdrawn": false,
+  "tdls": [],
+  "version": "0.1.0"
+}
+```
+
+| Field                 | Meaning                                                                                                   |
+| --------------------- | --------------------------------------------------------------------------------------------------------- |
+| `set`                 | The Data Use identifiers that are set for this request                                                    |
+| `awaiting`            | The ones still waiting for a signal that a configured module could give                                   |
+| `signals`             | Each signal a module read and found valid, as it was received, with the module that read it               |
+| `tdls`                | The terms documents the data is available under                                                           |
+| `storageWithdrawn`    | Whether the request explicitly withdrew device storage, as distinct from not setting it                   |
+| `modules.contributed` | The signal modules that produced a signal used in this resolution                                         |
+| `modules.configured`  | The signal modules the publisher configured, or `null` when it named none and the adapter's own list runs |
+| `policy`              | The permission policy file whose rules the answer resolved, by the name `[permissions] policy` gives it   |
+| `version`             | The version of the core crate that answered                                                               |
+
+A module in `configured` and not in `contributed` ran and found nothing to
+work with, which is a different fact from a module that was never configured.
+
+A policy's name is its file's stem, which two versions of one file share, so
+the SHA-256 that `/_ts/config` shows is what matches the answer to one exact
+copy of the file.
+
+Nothing is created or written for the reader. The Edge Cookie lifecycle does
+not run for this request, so no cookie is set and no identity row is written.
+
+**Example:**
+
+```bash
+curl -s "https://edge.example.com/_ts/permissions.json" -H "Sec-GPC: 1"
+```
 
 ## Utility Endpoints
 
@@ -1295,7 +1517,11 @@ universal numeric limits.
 
 CORS is endpoint-specific. `/_ts/api/v1/identify` implements a closed,
 publisher-domain policy and an explicit `OPTIONS` handler. Page-bids explicitly
-denies preflight. Several integration proxies preserve or synthesize only the
+denies preflight. `/_ts/permissions` and `/_ts/permissions.json` answer any
+origin, because they show nothing but the asking request's own resolution,
+and `/_ts/config` and `/_ts/config.json` answer any origin, because what they
+show is the same for every request. `/_ts/data` answers no other origin,
+because it shows what is held against one reader. Several integration proxies preserve or synthesize only the
 headers described in their contract. `response_headers` is standard response
 finalization, not a substitute for registering and validating an `OPTIONS`
 route; do not infer cross-origin support from a configured header alone.

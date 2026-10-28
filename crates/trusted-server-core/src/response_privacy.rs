@@ -158,6 +158,12 @@ pub fn enforce_set_cookie_cache_privacy(response: &mut Response) {
         .remove::<GeneratedInactiveAdStackBrowserCachePolicy>();
 }
 
+/// Headers a response must leave with, whatever `settings.response_headers`
+/// say. [`apply_response_headers_with_cache_privacy`] sets them again after
+/// the operator's headers.
+#[derive(Debug, Clone)]
+pub struct RequiredHeaders(pub HeaderMap);
+
 /// Applies operator-configured `settings.response_headers` with cookie-privacy
 /// hardening.
 ///
@@ -200,6 +206,12 @@ pub fn apply_response_headers_with_cache_privacy(settings: &Settings, response: 
             }
         };
         response.headers_mut().insert(header_name, header_value);
+    }
+
+    if let Some(RequiredHeaders(required)) = response.extensions_mut().remove::<RequiredHeaders>() {
+        for (name, value) in &required {
+            response.headers_mut().insert(name.clone(), value.clone());
+        }
     }
 
     enforce_uncacheable_cache_privacy(response);
@@ -629,5 +641,31 @@ mod tests {
             Some("value"),
             "operator headers should still apply to cacheable responses"
         );
+    }
+
+    #[test]
+    fn a_required_header_outlasts_an_operator_header_of_the_same_name() {
+        let settings = settings_with_response_headers(&[
+            ("Content-Security-Policy", "default-src 'self'"),
+            ("X-Frame-Options", "SAMEORIGIN"),
+        ]);
+        let mut response = response_builder()
+            .header(
+                header::CONTENT_SECURITY_POLICY,
+                "sandbox; default-src 'none'",
+            )
+            .header(header::X_FRAME_OPTIONS, "DENY")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build response");
+        let required = response.headers().clone();
+        response.extensions_mut().insert(RequiredHeaders(required));
+
+        apply_response_headers_with_cache_privacy(&settings, &mut response);
+
+        assert_eq!(
+            response.headers()[header::CONTENT_SECURITY_POLICY],
+            "sandbox; default-src 'none'"
+        );
+        assert_eq!(response.headers()[header::X_FRAME_OPTIONS], "DENY");
     }
 }

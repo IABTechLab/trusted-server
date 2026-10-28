@@ -370,6 +370,7 @@ pub fn validate_settings_for_deploy_with(
     validate_integration_blocks(settings, &plan, extra_integrations)?;
     PartnerRegistry::validate_config_for_deploy(&settings.ec.partners)?;
     settings.ec.validate_resolve_allowed_origins()?;
+    crate::inspect::config::validate_patterns_for_deploy(settings, extra_integrations)?;
     Ok(())
 }
 
