@@ -22,7 +22,7 @@ use trusted_server_core::asset_cache::{AssetAnswer, AssetCacheModule, AssetFile,
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::{IntegrationBuilder, IntegrationRegistration};
 use trusted_server_core::platform::{CacheLifetimes, CacheSpec, RuntimeServices};
-use trusted_server_core::settings::Settings;
+use trusted_server_core::settings::{LoadingCacheConfig, Settings};
 
 use crate::entry::AssetCacheKey;
 use crate::source_cache::SourceCache;
@@ -66,8 +66,10 @@ pub fn builder() -> IntegrationBuilder {
 /// Reports whether a section selects the module.
 ///
 /// The module reads no table of its own, so it refuses an
-/// `[asset-cache.51degrees]` table, an empty one included.
+/// `[asset-cache.51degrees]` table, an empty one included. It refuses a
+/// lifetime in `[cache.51degrees-assets-vary]` whether or not it is selected.
 fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    refuse_record_lifetimes(settings)?;
     let Some((section, written)) = settings.module_selection(MODULE) else {
         return Ok(false);
     };
@@ -84,6 +86,44 @@ fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
         }));
     }
     Ok(true)
+}
+
+/// Refuses each lifetime `[cache.51degrees-assets-vary]` sets, because the
+/// records take the lifetimes of `[cache.51degrees-assets]` and nothing reads
+/// the table's own.
+fn refuse_record_lifetimes(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    let Some(table) = settings.cache.declared.get(ASSETS_VARY_CACHE) else {
+        return Ok(());
+    };
+    // Every field is named, so a setting added to the table does not build
+    // here until this check reads or refuses it.
+    let LoadingCacheConfig {
+        module: _,
+        memory_seconds,
+        store_seconds,
+        store_idle_seconds,
+    } = table;
+    let set: Vec<String> = [
+        ("memory_seconds", memory_seconds),
+        ("store_seconds", store_seconds),
+        ("store_idle_seconds", store_idle_seconds),
+    ]
+    .into_iter()
+    .filter(|(_, value)| value.is_some())
+    .map(|(name, _)| format!("`{name}`"))
+    .collect();
+    let named = match set.split_last() {
+        None => return Ok(()),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    };
+    Err(Report::new(TrustedServerError::Configuration {
+        message: format!(
+            "[cache.{ASSETS_VARY_CACHE}] sets {named}, which {MODULE} does not read, because \
+             its records take the lifetimes of [cache.{ASSETS_CACHE}]. Set the lifetimes \
+             there, as this table takes only `module`"
+        ),
+    }))
 }
 
 /// Supplies the module when `[asset-cache]` selects it.
