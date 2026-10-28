@@ -231,7 +231,7 @@ More rules:
 - Capture never changes private state, and never touches backoff or the circuit breaker. A proxied call that held nothing is not a failure. A state change in a capture result is ignored with a warning, and the harness fails it.
 - Return `Ok(Resolution::no_match())` for any body you do not recognize.
 - `CaptureInput` never exposes request bodies or request headers.
-- **Real-browser gate.** A capture from a client that fails the real-browser check writes nothing: its removals, opt-outs and global revokes are dropped and logged by provider and source only. A script replaying a copied `ts-ec` cookie through the proxy cannot strip or tombstone a row.
+- **Real-browser gate.** Removals, opt-outs and global revokes apply from any client, as consent withdrawals do. Only a clear needs a real browser: a positive result from a client that fails the real-browser check never clears an opt-out. A script replaying a copied `ts-ec` cookie through the proxy can therefore revoke for that visitor, as it could already withdraw consent, but cannot lift a revocation.
 - **A capture-only provider must list its `sources`** in `[ec.identity.providers.<id>]`, and it **cannot own a source**. Its opt-out removes browser-ingested records of every listed source, so the operator names only the sources it is the delivery path for.
 - `revoke_scope` controls how far a captured opt-out reaches (see [Configuration Reference](/guide/configuration#per-provider-keys)). With `"provider"` (the default) it removes only that provider's records and, for a capture-only provider, the records of its listed sources that no provider wrote. With `"global"`, a captured opt-out runs the consent-withdrawal tombstone, from any client.
 
