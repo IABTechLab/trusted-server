@@ -296,6 +296,8 @@ mod tests {
             "#,
         )
         .expect("should parse test settings")
+        // A loaded domain carries its policy.
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
     }
 
     fn settings_with_response_headers(headers: Vec<(&str, &str)>) -> Settings {

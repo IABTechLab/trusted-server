@@ -13,6 +13,7 @@ use crate::ec::device::DeviceModule;
 use crate::ec::module::EdgeCookieModule;
 use crate::evidence::HostSignals;
 use crate::permission_signal::PermissionSignalModule;
+use crate::permissions::PermissionPolicy;
 
 /// Geographic information extracted from a request.
 ///
@@ -223,6 +224,9 @@ pub struct RuntimeServices {
     /// so building the services for a request bumps a reference count rather
     /// than copying the list, and cloning the services does the same.
     pub(crate) permission_signal_modules: Arc<[Arc<dyn PermissionSignalModule>]>,
+    /// The permission policy the request's domain loaded, which decides its
+    /// permissions.
+    pub(crate) permission_policy: Arc<PermissionPolicy>,
 }
 
 impl RuntimeServices {
@@ -243,6 +247,7 @@ impl RuntimeServices {
     ///     .http_client(Arc::new(MyHttpClient))
     ///     .geo(Arc::new(MyGeo))
     ///     .client_info(client_info)
+    ///     .permission_policy(policy)
     ///     .build();
     /// ```
     #[must_use]
@@ -385,6 +390,12 @@ impl RuntimeServices {
         self.device_module.clone()
     }
 
+    /// The permission policy the request's domain loaded.
+    #[must_use]
+    pub fn permission_policy(&self) -> &Arc<PermissionPolicy> {
+        &self.permission_policy
+    }
+
     /// Wrap the KV store in a [`super::KvHandle`] for ergonomic access to
     /// JSON helpers, pagination, and validation.
     #[must_use]
@@ -512,6 +523,19 @@ impl RuntimeServices {
         self.with_loading_caches(Arc::new(super::LoadingCaches::every(cache)))
     }
 
+    /// Returns a clone of this instance carrying the permission policy the
+    /// request's domain loaded.
+    ///
+    /// An adapter hands each request the policy its domain's settings carry,
+    /// whichever services the request is given.
+    #[must_use]
+    pub fn with_permission_policy(self, permission_policy: Arc<PermissionPolicy>) -> Self {
+        Self {
+            permission_policy,
+            ..self
+        }
+    }
+
     /// Returns a clone of this instance with the template cache replaced.
     #[must_use]
     pub fn with_template_cache(self, cache: Arc<dyn super::PlatformTemplateCache>) -> Self {
@@ -563,6 +587,7 @@ pub struct RuntimeServicesBuilder {
     resolved_ec_module: Option<Arc<dyn EdgeCookieModule>>,
     device_module: Option<Arc<dyn DeviceModule>>,
     permission_signal_modules: Arc<[Arc<dyn PermissionSignalModule>]>,
+    permission_policy: Option<Arc<PermissionPolicy>>,
 }
 
 impl RuntimeServicesBuilder {
@@ -584,6 +609,7 @@ impl RuntimeServicesBuilder {
             resolved_ec_module: None,
             device_module: None,
             permission_signal_modules: Arc::default(),
+            permission_policy: None,
         }
     }
 
@@ -719,6 +745,14 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Set the permission policy the request's domain loaded, which every
+    /// request needs to decide its permissions.
+    #[must_use]
+    pub fn permission_policy(mut self, policy: Arc<PermissionPolicy>) -> Self {
+        self.permission_policy = Some(policy);
+        self
+    }
+
     /// Construct [`RuntimeServices`] from the accumulated configuration.
     ///
     /// # Panics
@@ -767,6 +801,9 @@ impl RuntimeServicesBuilder {
             resolved_ec_module: self.resolved_ec_module,
             device_module: self.device_module,
             permission_signal_modules: self.permission_signal_modules,
+            permission_policy: self
+                .permission_policy
+                .expect("should set permission_policy before building RuntimeServices"),
         }
     }
 }
