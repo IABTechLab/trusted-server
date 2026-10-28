@@ -614,3 +614,39 @@ the code with the row open.
 | Environment override documented but `#[cfg(test)]`-only in PR #838 (§7)                             | Override applied as typed EdgeZero app-config overlays at `ts config push`; the existing CLI overlay test covers the mechanism, and a module-specific override test is still to write                                                                                                                                                                                                          | The same compiled binary switches modules at deployment through the published configuration                                                                  |
 | Pinned known-answer HMAC vectors committed (§3)                                                     | Stability tested per inputs, and the pinned vector is still to commit                                                                                                                                                                                                                                                                                                                          | The cross-version CI pin remains open work under §3                                                                                                          |
 | GB storage baseline change only with citation and sign-off (§2 row 4)                               | The repository's sample adopts `granted` storage for GB without a recorded citation                                                                                                                                                                                                                                                                                                            | Flagged in row 4, since the task force owns the decision and its record                                                                                      |
+
+## Review log
+
+1. **Round 1.** A review in a fresh session, against `split/3-permissions`.
+   Issues found, two of them blocking. The two were that the §5 recipe said
+   an operator no longer carries `consent.gdpr.applies_in` or
+   `consent.us_states.privacy_states` because "the shipped tree" holds the
+   same countries and states, when no policy ships, and that the design gave
+   the policy no rollout order, although a build with permission-model spec
+   §3.1 starts no domain whose blob names no policy and a build without it
+   refuses `[permissions]`, so no one blob starts both. This revision says
+   that the publisher's own tree states its countries and states, that the
+   repository's sample lists the 31 countries and 20 states main's lists
+   held, and that the build and the blob that names its policy go live
+   together, staged first on Fastly. It also calls the sample the
+   repository's sample throughout, says that a rollback needs the previous
+   policy file's exact bytes, and names the folder Axum reads its policy
+   from.
+2. **Round 2.** A review in a fresh session, against `split/3-permissions`,
+   of the round 1 fixes and the new text. Issues found, one of them
+   blocking. The one was that the design cited row 4's head by a commit
+   that no published branch held. This revision cites a commit that the
+   published branch holds, says that row 4 replaces the signal order fixed
+   in code with the order the deployment configures, names the overlay
+   variables after the `module` selectors, and has a service that chooses
+   its blob by host stage each host's blob with `--key`, because EdgeZero
+   refuses `--staging` beside `--key`.
+3. **Round 3.** A review in a fresh session, against `split/3-permissions`,
+   of the round 2 fixes and the new text. Approved, none blocking. The round
+   found that the build and the blob go live together as the design says,
+   because row 4's loader refuses a blob that names no policy and main's
+   settings refuse `[permissions]` as an unknown field, that the example
+   settings name no policy and are refused as written, and that the Axum and
+   Spin adapters refuse the platform lookup from row 33. This revision names
+   the commit of main at which it cites the line that carries
+   `deny_unknown_fields` on `Settings`.

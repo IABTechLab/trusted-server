@@ -1653,3 +1653,27 @@ changes no code and decides none of them.
    that one function is the only response-finalization code the adapters
    share, and the claim in section 7 that a pull request now closed (#1047)
    ships the documentation set.
+3. **Round 3.** A review in a fresh session, against
+   `split/5-response-hook-docs`. Issues found, one of them blocking. Section
+   1a, which states what the code does today, said that the pushed blob is
+   the policy identity, when today each build compiles the repository's
+   sample in, and the pushed blob becomes the policy identity only once
+   row 4 builds section 3.1 of the permission model design. This revision
+   keeps today's code in section 1a and adds, as what row 4 builds, that a
+   domain's blob then names its policy file by name and SHA-256 and gives
+   `active_policy_digest` its value. Open question 2 says that the policy's
+   `sha256` then sits in the settings the template fingerprint hashes, so a
+   policy change changes the fingerprint, where a change to the compiled
+   sample does not.
+4. **Round 4.** A review in a fresh session, against
+   `split/5-response-hook-docs`, of the round 3 fixes and the new text.
+   Approved, none blocking. This revision names the file each build
+   compiles in, `config/permissions/sample.yaml`, where section 1a said
+   `permissions.yaml`, and says that the template fingerprint leaves the
+   policy's `text` out, because `sha256` already names the file.
+5. **Round 5.** A review in a fresh session, against
+   `split/5-response-hook-docs`, with row 4 read on `split/3-permissions`.
+   No issues found. The round found section 1a right at that commit, where
+   `DEFAULT_PERMISSION_RULES` still compiles the repository's sample in, and
+   found that row 4's template fingerprint hashes the policy's `sha256` and
+   leaves its text out, as open question 2 says.
