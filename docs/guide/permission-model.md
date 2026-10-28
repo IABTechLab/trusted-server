@@ -189,13 +189,19 @@ The Edge Cookie `Set-Cookie` operation always requires `necessary.operations.sto
 
 ## Groups and rules
 
-The policy lives in a human-editable permissions YAML document. The repository sample is `config/permissions/sample.yaml`,
-compiled into the build, so policy owners read and change it in version control.
-That sample is for testing and evaluation only. It is not a production policy
-and it is not legal advice, so a deployment reads it, changes it, or replaces
-it, with whoever is accountable for that deployment deciding what it says.
-It has two parts. **Groups** are named baselines, each a set of permission flags.
-**Rules** are a single tree that says which group applies where.
+The policy lives in a human-editable permissions YAML document, the
+publisher's own file, which policy owners keep under version control. A
+domain's settings name it in `[permissions] policy`, by its stem, and
+`ts config push --permissions <file>` supplies it when the service is
+deployed. No build carries a policy, and a domain whose settings name no
+policy, or whose file is missing or is not the file that was pushed, does
+not start and answers 500. The repository sample is
+`config/permissions/sample.yaml`. That sample is for testing and evaluation
+only. It is not a production policy and it is not legal advice, so a
+deployment reads it, changes it, or replaces it, with whoever is accountable
+for that deployment deciding what it says. A policy has two parts.
+**Groups** are named baselines, each a set of permission flags. **Rules** are
+a single tree that says which group applies where.
 
 ### Reading and editing the rules tree
 
@@ -276,7 +282,7 @@ code.
 
 Because the tree now says which regime applies where, the older consent
 settings `[consent.gdpr] applies_in` and `[consent.us_states] privacy_states`
-retire into it. The shipped `permissions.yaml` carries the same 31 GDPR
+retire into it. The repository sample carries the same 31 GDPR
 countries, being the EU 27 plus Iceland, Liechtenstein, Norway and the United
 Kingdom, each inheriting `gdpr` from the top node, and the same 20 US states
 with a comprehensive privacy law, written as region children of `US` carrying
@@ -300,7 +306,7 @@ session signal can then change:
 
 A group lists every permission and its flag, so its meaning is explicit in the
 file. (A group may instead give a single `default` flag for any permission it
-omits, but the shipped groups spell every one out.) A node written as a mapping
+omits, but the sample's groups spell every one out.) A node written as a mapping
 may then make small per-permission tweaks on top of its group with a
 `permissions` map from Data Use to flag (`granted`, `requires_signal`, or
 `denied`), each entry overriding the group baseline for that Data Use.
@@ -326,7 +332,7 @@ permission **unset**, so a module that requires profiling does not run. The
 same consent against a `requires_signal` baseline would set it. Consent lifts
 `requires_signal`; it never lifts `denied`.
 
-The shipped `permissions.yaml` defines `gdpr-eu`, `gdpr-uk`, and `us-opt-out`
+The repository sample defines `gdpr-eu`, `gdpr-uk`, and `us-opt-out`
 groups, and maps the EU 27 and the EEA members (IS, LI, NO) to `gdpr-eu`, the
 UK to `gdpr-uk`, and the US (a country node whose region children are the 20
 states with a comprehensive privacy law, each carrying `jurisdiction: us-state`)
@@ -345,7 +351,9 @@ the baseline for an unresolved request at the top of the rules tree, through its
 so startup fails when either is missing or when the `group` names nothing
 defined in the file. A node that names a
 group not defined in the file, or a flag that is not `granted`,
-`requires_signal`, or `denied`, is rejected at build time, so a typo is caught
+`requires_signal`, or `denied`, is rejected whenever the file is loaded.
+`ts config push` and `ts config validate --permissions` refuse the file, and
+a domain whose file has such a typo does not start, so the typo is caught
 rather than silently ignored.
 
 ## How a request resolves
@@ -483,14 +491,19 @@ resolved and never to widen it.
 
 The geo module, which resolves the country, is selected in
 `trusted-server.toml`. The rules tree, including the baseline for a request with
-no resolvable country, lives in a human-editable permissions YAML document
-compiled into the build (not loaded at runtime). The repository sample is
-`config/permissions/vanilla.yaml`.
+no resolvable country, lives in the publisher's policy file, which the settings
+name and the service loads when it starts.
 
 ```toml
-# trusted-server.toml selects the geo module. The baseline used when a request
-# matches no node, or the geo module resolves no country, is stated at the top
-# of the rules tree in permissions.yaml.
+# trusted-server.toml names the policy file by its stem, so standard.yaml is
+# "standard". `ts config push --permissions standard.yaml` supplies the file
+# and writes its SHA-256 into the blob.
+[permissions]
+policy = "standard"
+
+# The geo module. The baseline used when a request matches no node, or the
+# geo module resolves no country, is stated at the top of the rules tree in
+# the policy file.
 [geo]
 module = "platform"
 # With no geo module, every request resolves at the top of the rules tree. A

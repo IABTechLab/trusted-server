@@ -37,9 +37,10 @@ ts --help
 # Create local config, then edit placeholders before validation
 ts config init
 # Edit trusted-server.toml. Every pluggable component follows one syntax:
-# [<type>] module = "<name>" with settings in [<type>.<name>]. See the
+# [<type>] module = "<name>" with settings in [<type>.<name>], and
+# [permissions] policy names your permission policy file. See the
 # Configuration Rules guide linked above.
-ts config validate
+ts config validate --permissions standard.yaml
 
 # Audit a public page with Chrome/Chromium to bootstrap a draft config
 ts audit generate https://publisher.example
