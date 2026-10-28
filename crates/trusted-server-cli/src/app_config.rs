@@ -91,32 +91,58 @@ pub fn resolve_app_config_file(args: &AppConfigArgs) -> Result<PathBuf, String> 
     Ok(resolve_app_config_path(None, &args.manifest, &app_name))
 }
 
+/// The app-config file a command reads and the app name its environment
+/// overlay is read under.
+#[derive(Debug)]
+pub(crate) struct ResolvedAppConfig {
+    /// The `trusted-server.toml` path.
+    pub(crate) path: PathBuf,
+    /// The manifest's `[app].name`.
+    pub(crate) app_name: String,
+}
+
+/// Resolves the app-config file `app_config` names, or `<app.name>.toml`
+/// beside `manifest`, and the manifest's app name.
+///
+/// # Errors
+///
+/// Returns a user-facing string when the manifest cannot be loaded or has no
+/// `[app].name`.
+pub(crate) fn resolve_app_config(
+    manifest: &Path,
+    app_config: Option<&Path>,
+) -> Result<ResolvedAppConfig, String> {
+    let manifest_loader = ManifestLoader::from_path(manifest)
+        .map_err(|err| format!("failed to load {}: {err}", manifest.display()))?;
+    let app_name = manifest_loader.manifest().app.name.clone().ok_or_else(|| {
+        format!(
+            "{} has no [app].name; cannot resolve trusted-server.toml",
+            manifest.display()
+        )
+    })?;
+    Ok(ResolvedAppConfig {
+        path: resolve_app_config_path(app_config, manifest, &app_name),
+        app_name,
+    })
+}
+
 fn load_settings_with_env_overlay(
     args: &AppConfigArgs,
     env_overlay: bool,
 ) -> Result<LoadedSettings, String> {
-    let manifest_loader = ManifestLoader::from_path(&args.manifest)
-        .map_err(|err| format!("failed to load {}: {err}", args.manifest.display()))?;
-    let app_name = manifest_loader.manifest().app.name.clone().ok_or_else(|| {
-        format!(
-            "{} has no [app].name; cannot resolve trusted-server.toml",
-            args.manifest.display()
-        )
-    })?;
-    let app_config_path =
-        resolve_app_config_path(args.app_config.as_deref(), &args.manifest, &app_name);
+    let resolved = resolve_app_config(&args.manifest, args.app_config.as_deref())?;
 
     let mut opts = AppConfigLoadOptions::default();
     opts.env_overlay = env_overlay;
     let app_config = app_config::deserialize_app_config_with_options::<TrustedServerAppConfig>(
-        &app_config_path,
-        &app_name,
+        &resolved.path,
+        &resolved.app_name,
         &opts,
     )
-    .map_err(|err| format!("failed to load {}: {err}", app_config_path.display()))?;
+    .map_err(|err| format!("failed to load {}: {err}", resolved.path.display()))?;
 
     Ok(LoadedSettings {
-        app_config_path,
+        app_config_path: resolved.path,
         settings: app_config.into_settings(),
     })
 }

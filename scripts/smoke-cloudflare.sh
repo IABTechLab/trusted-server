@@ -143,6 +143,7 @@ run_case missing-config "$BASE_PORT" "" 500 ""
         --local \
         --manifest "$WORKSPACE/edgezero.toml" \
         --app-config "$SMOKE_APP_CONFIG" \
+        --permissions "$SMOKE_POLICY_FILE" \
         --yes \
         --no-diff
 )

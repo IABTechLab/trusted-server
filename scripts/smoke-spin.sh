@@ -122,6 +122,7 @@ EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=default \
     --local \
     --manifest "$WORKSPACE/edgezero.toml" \
     --app-config "$SMOKE_APP_CONFIG" \
+    --permissions "$SMOKE_POLICY_FILE" \
     --yes \
     --no-diff
 CONFIG_PUSHED=true

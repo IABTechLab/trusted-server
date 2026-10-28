@@ -221,6 +221,17 @@ pull_sync_concurrency = 3
 # mode = "restrictive"            # "restrictive" | "newest" | "permissive"
 # freshness_threshold_days = 30
 
+# The permission policy file this domain runs. Name the publisher's own
+# policy file here by its stem, so standard.yaml is "standard", and supply the
+# file when the settings are pushed, with
+# `ts config push --permissions <file>`. The push writes the file's SHA-256
+# into the blob, and on Fastly, Cloudflare and Spin the file itself, so leave
+# `sha256` and `text` out. config/permissions/sample.yaml is a sample for
+# testing and evaluation only.
+#
+# [permissions]
+# policy = "standard"
+
 # Which permission signal modules run, and in what order.
 #
 # Signals compose rather than select. A request can carry a TCF string and a
