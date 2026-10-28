@@ -826,15 +826,25 @@ fn the_view_shows_the_policy_by_name_and_digest_and_never_its_file() {
     }
 }
 
-/// The view never shows `permissions.text`, so a pattern under it is refused
-/// by the deploy check and by the load alike.
+/// The view never shows `permissions.text`, so a pattern naming it, or
+/// anything beneath it, is refused by the deploy check and by the load alike.
 #[test]
 fn a_pattern_under_the_policy_file_is_refused() {
-    for (section, list) in [
-        (r#"show = ["permissions.text"]"#, "show"),
-        (r#"hide = ["permissions.text"]"#, "hide"),
+    for (section, reason) in [
+        (
+            r#"show = ["permissions.text"]"#,
+            "show names `permissions.text`, the policy file the push writes",
+        ),
+        (
+            r#"hide = ["permissions.text"]"#,
+            "hide names `permissions.text`, the policy file the push writes",
+        ),
+        (
+            r#"hide = ["permissions.text[]"]"#,
+            "hide names `permissions.text[]`, which is under `permissions.text`, the policy \
+             file the push writes",
+        ),
     ] {
-        let reason = format!("{list} names `permissions.text`, which is under `permissions.text`");
         let toml = format!("{}\n[inspect]\n{section}\n", crate_test_settings_str());
         let mut settings = Settings::from_toml(&toml).expect("should parse the document");
         settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
@@ -851,8 +861,8 @@ fn a_pattern_under_the_policy_file_is_refused() {
                 .expect_err("the load should refuse the pattern")
         );
 
-        assert!(deployed.contains(&reason), "deploy: {deployed}");
-        assert!(loaded.contains(&reason), "load: {loaded}");
+        assert!(deployed.contains(reason), "deploy: {deployed}");
+        assert!(loaded.contains(reason), "load: {loaded}");
     }
 }
 
