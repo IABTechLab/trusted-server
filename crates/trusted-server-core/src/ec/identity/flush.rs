@@ -469,7 +469,9 @@ pub(super) fn request_facts(context: &EcContext, now: u64, runs_auction: bool) -
             dnt: identity.dnt(),
         },
         writer: identity.writer(),
-        new_visitor: context.ec_generated(),
+        // A minted EC whose create waits for the hold dispatch may run
+        // hold-mode providers (spec 4.7, new visitors).
+        new_visitor: context.ec_generated() && context.deferred_entry().is_none(),
         runs_auction,
         now: UnixTime::from_secs(now),
         available_inputs,

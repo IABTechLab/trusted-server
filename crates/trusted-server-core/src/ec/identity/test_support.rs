@@ -2556,12 +2556,17 @@ pub mod fake_http {
             source: &str,
             default: Option<EidProvenance>,
         ) -> Self {
-            Self::build(id, host, source, default, false)
+            Self::build(id, host, source, default, false, false)
         }
 
         /// As [`Self::new`], declaring private state that a `found` replaces.
         pub(crate) fn stateful(id: &str, host: &str, source: &str) -> Self {
-            Self::build(id, host, source, None, true)
+            Self::build(id, host, source, None, true, false)
+        }
+
+        /// As [`Self::new`], reading the EC ID, as generic pull does.
+        pub(crate) fn reading_ec_id(id: &str, host: &str, source: &str) -> Self {
+            Self::build(id, host, source, None, false, true)
         }
 
         fn build(
@@ -2570,10 +2575,14 @@ pub mod fake_http {
             source: &str,
             default: Option<EidProvenance>,
             stateful: bool,
+            ec_id: bool,
         ) -> Self {
             let mut resolves = Resolves::new().with_endpoint(&format!("https://{host}/resolve"));
             if stateful {
                 resolves = resolves.with_private_state();
+            }
+            if ec_id {
+                resolves = resolves.with_ec_id();
             }
             let source: SourceDomain = source.parse().expect("should parse the source");
             let mut builder =
@@ -2674,6 +2683,7 @@ pub(crate) mod hold_fixture {
     use super::fake_http::{FakeBackend, FakeHttpClient, fake_services};
     use super::{FakeRateLimiter, TEST_EC_ID, WriteCountingEcKv, allowing_consent};
     use crate::ec::EcContext;
+    use crate::ec::finalize::BrowserSeed;
     use crate::ec::identity::coordinator::{HoldResults, run_hold};
     use crate::ec::identity::flush::{AfterSendInput, FlushOutcome, run_after_send};
     use crate::ec::identity::ids::{IdentityProviderId, SourceDomain};
@@ -2770,6 +2780,36 @@ pub(crate) mod hold_fixture {
                 context,
                 limiter: Arc::new(FakeRateLimiter::new()),
             }
+        }
+
+        /// A new visitor's writer navigation: no row, and an EC minted with its
+        /// create deferred until after the hold dispatch (spec 4.7).
+        pub(crate) fn new_visitor(
+            providers: Vec<(Arc<dyn IdentityProvider>, ProviderMode)>,
+        ) -> Self {
+            let mut fixture = Self::new(providers, &live_row(), true);
+            let (graph, store) = KvIdentityGraph::write_counting("hold-store");
+            let mut context = EcContext::new_for_test_with_ip(
+                None,
+                allowing_consent(),
+                Some("192.0.2.10".to_owned()),
+            );
+            context.set_identity_runtime(Arc::clone(&fixture.runtime));
+            context.identity_mut().set_writer_decision(WriterDecision {
+                writer: true,
+                is_real_browser: true,
+                user_agent: Some("ExampleBrowser/1.0".to_owned()),
+                dnt: false,
+                page_url: None,
+            });
+            context.identity_mut().set_runs_auction(true);
+            context
+                .mint_deferred(&fixture.settings, &BrowserSeed::empty())
+                .expect("should mint the EC");
+            fixture.graph = graph;
+            fixture.store = store;
+            fixture.context = context;
+            fixture
         }
 
         /// Runs the hold dispatch before the auction.

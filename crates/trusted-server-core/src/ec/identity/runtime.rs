@@ -13,7 +13,7 @@ use crate::ec::rate_limiter::RateLimiter;
 use crate::error::TrustedServerError;
 use crate::integrations::IntegrationRegistry;
 use crate::platform::RuntimeServices;
-use crate::settings::{IdentitySettings, Settings};
+use crate::settings::{IdentitySettings, ProviderMode, Settings};
 
 /// The provider catalog, the keys and the identity policy of one settings load.
 ///
@@ -101,6 +101,22 @@ impl IdentityRuntime {
     #[must_use]
     pub(crate) fn catalog(&self) -> &ProviderCatalog {
         &self.catalog
+    }
+
+    /// Whether a new visitor's first navigation can run a hold-mode provider:
+    /// one is configured that does not read the EC ID. A publisher navigation
+    /// then mints the EC with [`EcContext::mint_deferred`] (spec 4.7).
+    ///
+    /// [`EcContext::mint_deferred`]: crate::ec::EcContext::mint_deferred
+    #[must_use]
+    pub fn holds_on_first_navigation(&self) -> bool {
+        self.catalog.providers().any(|provider| {
+            let descriptor = provider.descriptor();
+            self.identity.provider(descriptor.id()).mode == ProviderMode::Hold
+                && !descriptor
+                    .resolves()
+                    .is_some_and(super::descriptor::Resolves::gets_ec_id)
+        })
     }
 
     /// The keys derived from `ec.passphrase`.

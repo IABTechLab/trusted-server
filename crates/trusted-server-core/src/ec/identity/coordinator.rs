@@ -1782,22 +1782,33 @@ pub(crate) struct HoldResults {
 /// mutation, and every answer that mutation would store is returned for this
 /// auction. No answer goes into a cookie.
 ///
-/// A request that is not a returning writer, runs no auction, or whose phase 1
-/// read is not a live, consenting row dispatches nothing.
+/// A new visitor's writer navigation, whose EC was minted with
+/// [`EcContext::mint_deferred`], dispatches on the row it will create,
+/// skipping every provider that reads the EC ID, since no row backs it yet.
+/// Its answers go into that row instead of a mutation, so the create is the
+/// one write (spec 4.7, new visitors).
+///
+/// A request that is neither, runs no auction, or whose phase 1 read is not a
+/// live, consenting row dispatches nothing.
 pub(crate) async fn run_hold(deps: &IdentityDeps<'_>, context: &mut EcContext) -> HoldResults {
     let mut results = HoldResults::default();
-    if !context.identity().runs_auction() || !may_flush(context) {
+    let new_visitor = context.identity().writer() && context.deferred_entry().is_some();
+    if !context.identity().runs_auction() || !(new_visitor || may_flush(context)) {
         return results;
     }
     let Some(ec_id) = context.ec_value().map(str::to_owned) else {
         return results;
     };
-    let Some(entry) = context
-        .kv_snapshot()
-        .entry_for(&ec_id)
-        .filter(|entry| entry.consent.ok)
-        .cloned()
-    else {
+    let entry = if new_visitor {
+        context.deferred_entry().cloned()
+    } else {
+        context
+            .kv_snapshot()
+            .entry_for(&ec_id)
+            .filter(|entry| entry.consent.ok)
+            .cloned()
+    };
+    let Some(entry) = entry else {
         return results;
     };
 
@@ -1810,6 +1821,13 @@ pub(crate) async fn run_hold(deps: &IdentityDeps<'_>, context: &mut EcContext) -
         .providers()
         .filter_map(|provider| {
             let id = provider.descriptor().id();
+            let reads_ec_id = provider
+                .descriptor()
+                .resolves()
+                .is_some_and(Resolves::gets_ec_id);
+            if new_visitor && reads_ec_id {
+                return None;
+            }
             let provider_settings = deps.settings.ec.identity.provider(id);
             let Eligibility::Eligible { kinds } = eligibility(
                 &EligibilityInput {
@@ -1865,7 +1883,8 @@ pub(crate) async fn run_hold(deps: &IdentityDeps<'_>, context: &mut EcContext) -
         random: deps.random,
         catalog: deps.catalog,
     };
-    if let Some(applied) = apply(&held, &entry, &apply_context) {
+    let applied = apply(&held, &entry, &apply_context);
+    if let Some(applied) = &applied {
         for (source, record) in &applied.entry.ids {
             if entry.ids.get(source) == Some(record) {
                 continue;
@@ -1885,7 +1904,13 @@ pub(crate) async fn run_hold(deps: &IdentityDeps<'_>, context: &mut EcContext) -
             results.writer.insert(source, writer);
         }
     }
-    context.identity_mut().mutation_mut().absorb(held);
+    if new_visitor {
+        if let Some(applied) = applied {
+            context.set_deferred_entry(applied.entry);
+        }
+    } else {
+        context.identity_mut().mutation_mut().absorb(held);
+    }
     results
 }
 
@@ -5525,6 +5550,72 @@ mod tests {
                 }],
                 ..KvEid::default()
             }]
+        }
+
+        #[test]
+        fn new_visitor_hold_answer_feeds_the_auction_and_rides_the_create() {
+            let mut fixture = HoldFixture::new_visitor(vec![
+                hold_provider("p", HOLD_HOST, HOLD_SOURCE),
+                (
+                    AnsweringProvider::reading_ec_id(
+                        "pull",
+                        "pull.example.com",
+                        "pull.example.com",
+                    )
+                    .into_provider(),
+                    ProviderMode::Hold,
+                ),
+            ]);
+            fixture
+                .client
+                .respond(HOLD_HOST, 200, &found_body("held-uid"));
+            fixture
+                .client
+                .respond("pull.example.com", 200, &found_body("pulled-uid"));
+
+            let results = fixture.run_hold();
+
+            assert_eq!(
+                results.additions,
+                BTreeMap::from([(source(HOLD_SOURCE), single_entry("held-uid"))]),
+                "should hand this auction the answer"
+            );
+            assert_eq!(
+                fixture.client.sent_hosts(),
+                [HOLD_HOST],
+                "should call no provider that reads the EC ID before the row exists"
+            );
+            assert_eq!(fixture.store.writes().total(), 0, "should not create yet");
+            assert!(
+                fixture.context.identity().mutation().is_empty(),
+                "should stage nothing for a flush the new EC never runs"
+            );
+
+            fixture
+                .context
+                .complete_deferred_create(&fixture.settings, Some(&fixture.graph))
+                .expect("should create the row");
+
+            let ec_id = fixture
+                .context
+                .ec_value()
+                .expect("should keep the EC ID")
+                .to_owned();
+            let (row, _) = fixture
+                .graph
+                .get(&ec_id)
+                .expect("should read the row")
+                .expect("should hold the row");
+            assert_eq!(
+                row.ids.get(HOLD_SOURCE).map(|record| record.eids.clone()),
+                Some(single_entry("held-uid")),
+                "should create the row with the hold answer"
+            );
+            assert_eq!(
+                fixture.store.writes().add,
+                1,
+                "should create with one write"
+            );
         }
 
         #[test]

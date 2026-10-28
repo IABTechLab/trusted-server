@@ -59,6 +59,11 @@ pub fn ec_finalize_response(
     sharedid_cookie: Option<&str>,
     response: &mut Response<EdgeBody>,
 ) {
+    // A minted EC whose navigation never reached its create gets it here,
+    // before its cookie is set (spec 4.7).
+    if let Err(err) = ec_context.complete_deferred_create(settings, kv) {
+        log::warn!("Deferred EC create failed at finalize: {err:?}");
+    }
     let consent_allows_ec = ec_consent_granted(ec_context.consent());
     // A global revoke captured from any client (spec 8) is a withdrawal:
     // the same tombstone, cookie expiry and after-send run, with whatever the
@@ -595,6 +600,43 @@ mod tests {
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
     use crate::test_support::tests::{create_test_settings, purpose_one_only_consent};
+
+    #[test]
+    fn finalize_creates_a_deferred_ec_its_navigation_did_not() {
+        let settings = create_test_settings();
+        let graph = KvIdentityGraph::in_memory("ec-store");
+        let mut context =
+            EcContext::new_for_test_with_ip(None, granting_consent(), Some("192.0.2.5".to_owned()));
+        context
+            .mint_deferred(&settings, &BrowserSeed::empty())
+            .expect("should mint");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        let ec_id = context.ec_value().expect("should keep the EC").to_owned();
+        assert!(
+            graph.get(&ec_id).expect("should read").is_some(),
+            "should create the row"
+        );
+        assert!(
+            response
+                .headers()
+                .get_all(http::header::SET_COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .any(|cookie| cookie.starts_with(&format!("ts-ec={ec_id};"))),
+            "should set the EC cookie once its row exists"
+        );
+    }
 
     fn empty_response() -> Response<EdgeBody> {
         Response::builder()

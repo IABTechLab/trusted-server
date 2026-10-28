@@ -300,9 +300,11 @@ these costs for it:
 - **Server-only IDs are readable by page scripts.** UID2 advertising tokens
   and LiveRamp envelopes are in `ts-eids-s`, which is not `HttpOnly`.
   `x-ts-eids` already exposes them (section 9.3).
-- **No provider runs on a new visitor's first navigation.** A visitor who
-  leaves after one page never gets a provider ID. Section 15 asks whether
-  hold-mode providers should feed the create.
+- **A new visitor's first navigation runs only hold-mode providers that do
+  not read the EC ID, and only when it runs an auction.** After-send
+  providers and generic pull wait for the second page load, and a
+  first-navigation create waits up to `hold_budget_ms` for its providers
+  (section 4.7, new visitors).
 - **Clients without Fetch Metadata never write.** A writer navigation
   needs `Sec-Fetch-Dest: document` (section 5.1). Safari before 16.4, older
   embedded web views and any client that strips the header are stagers
@@ -1534,10 +1536,9 @@ request when all of these hold:
 5. `ps.n` (next eligible time) has passed, and no sticky `ps.o` opt-out is
    set (section 8).
 6. The provider's circuit breaker is closed (below).
-7. The request is the writer request for a returning EC. Stagers run no
-   resolving provider, in either mode, and a new visitor's first
-   navigation runs none, so its create stays the page load's one write
-   (section 5.2). Within the writer:
+7. The request is the writer request for a returning EC, or a new
+   visitor's writer navigation that runs an auction (below). Stagers run no
+   resolving provider, in either mode. Within the writer:
    - Hold-mode providers run before the auction when the navigation runs
      one (matched slots). When it runs none, they run after send instead,
      so a site whose auctions all go through `/auction` still stores their
@@ -1588,8 +1589,23 @@ returning EC, the writer must have read the live KV row and found it live
 and consenting, and computed eligibility steps 4 and 5 from it. That read
 is the phase 1 read for a provider dispatched before send, and the phase 4
 re-read for one dispatched after send (section 5.2). A new visitor's first
-navigation runs no provider (step 7), so every provider call follows a
-confirmed row.
+navigation calls only providers that never see the EC ID, before its row
+exists (below).
+
+**New visitors.** Decided after the round 14 review (section 15, question
+6). When a hold-mode provider that does not read the EC ID
+(`Resolves::gets_ec_id`) is configured, a publisher navigation from a new
+visitor mints the EC without writing (`EcContext::mint_deferred`). If the
+navigation runs an auction, the hold dispatch runs on the row the create
+will write, skipping every provider that reads the EC ID, and its answers,
+`ps.n` and `ps.f` go into that row. The create then runs, before the
+phase 1 preload and the auction, so the create stays the page load's one
+write and no ID reaches a bidder before its row exists. A collision fails
+the create rather than re-minting, because the auction is about to send the
+minted ID. A navigation that never reaches that point (no auction, an
+origin error) is created by finalize, before `ts-ec` is set. Without such a
+provider the create runs before routing, as before. Only the Fastly adapter
+defers; the others create before routing.
 
 **Dispatch.** For each eligible provider, the coordinator builds a
 `ResolveInput` holding only the declared inputs and calls `request`. It then
@@ -1887,9 +1903,10 @@ tombstone drops its mutation (section 5.4, step 1).
 **Phase 3, finalize, before send.**
 
 - **New visitor.** Nothing to write: the row was created before routing
-  (phase 1). `ts-ec` is set because the create was `Written`, as today
-  (`ec/finalize.rs:145-149`). Phase 4 does nothing for a new visitor, and no
-  provider runs on its first navigation (section 4.7, step 7).
+  (phase 1), or after the hold dispatch (section 4.7, new visitors), or here
+  when the navigation never reached that create. `ts-ec` is set because the
+  create was `Written`, as today (`ec/finalize.rs:145-149`). Phase 4 does
+  nothing for a new visitor.
 - **Returning EC.**
   - Browser ingest from `ts-eids` and sharedId adds `FillMissing` changes to
     the mutation, instead of calling `sync_eid_cookie_updates`
@@ -4674,7 +4691,8 @@ a KV migration to version 1, which this spec does not provide.
    no EC ID; only generic pull does), create the row with their answers,
    then run the auction. It moves the create from before routing into
    routing, and adds the hold budget to every first navigation that runs
-   an auction. Is that worth it?
+   an auction. Is that worth it? **Decided (round 14):** yes, when such a
+   provider is configured (section 4.7, new visitors).
 
 ## 16. Decisions log
 
@@ -4690,7 +4708,7 @@ Decisions made while writing this spec, with the user:
 | Trait shape                      | One required method, `descriptor`. Capabilities are default methods. Synchronous. Additive by construction.                                                                                                                              |
 | Inputs                           | Declared in the descriptor and enforced: a provider can read only what it declared.                                                                                                                                                      |
 | Page load for the one-write rule | A navigation plus every request it causes. Only the navigation writes and only the navigation calls providers. Strict.                                                                                                                   |
-| New-visitor write                | One create before routing, as today, carrying browser EIDs. No provider runs on the first navigation. Changed in rounds 3 and 4; open question 6 asks whether to revisit.                                                                |
+| New-visitor write                | One create, carrying browser EIDs. Before routing, or, with a hold-mode provider that does not read the EC ID, after the hold dispatch of a navigation that runs an auction, carrying its answers. Changed in rounds 3, 4 and 14.        |
 | New-visitor recovery             | Today's rotation. The cookie-proof recreation of revision 3 is removed with the deferred create.                                                                                                                                         |
 | Failed write                     | Not retried. Changed from one merge-retry once Fastly's per-key limit was confirmed.                                                                                                                                                     |
 | Browser EIDs beyond the cookie   | The shim writes only registered sources into `ts-eids`, merged per source, and the next navigation ingests them. Revision 14 removed the KV gap that `/auction` saved in `ts-eids-s`.                                                    |
@@ -4726,6 +4744,7 @@ review, which allowed breaking changes:
 | Global revoke minting | A global revoke also sets `ts-ec-revoked` with the consent fingerprint, and no EC is minted until the request's fingerprint differs. Decided after the round 14 review                                                                                                             |
 | Pending key           | Removals whose writes all failed, and positive captures from a request that is not the writer, go to `pending:<ec_id>` (one-day TTL, CAS append, 16 items). Every writer reads it and merges items above the row's `pg`. Auctions never read it. Decided after the round 14 review |
 | SPA writer            | A same-origin `/_ts/page-bids` call from a real browser is the writer once `spa_writer_interval_sec` (300, 0 = off) has passed since the row's `wa`; it writes only on a row its auction read and runs after-send providers only. Decided after the round 14 review                |
+| New-visitor providers | A new visitor's navigation that runs an auction runs hold-mode providers that do not read the EC ID, and the create carries their answers; finalize creates a row its navigation did not. Decided after the round 14 review                                                        |
 | Capture               | Revoke-only: removals, opt-out and clear. Positive IDs are counted, never stored. `capture_enabled` and request-body consent are removed                                                                                                                                           |
 | Capture-only opt-out  | Also removes the records of its sources that no provider wrote, and blocks the browser's values for them. A capture-only provider cannot own a source and must list its `sources`                                                                                                  |
 | Provider denials      | A provider's `ps.iv` and `ps.ov` filter browser candidates for unowned sources too. An opt-out's removals go to `ps.ov`, which its clear empties                                                                                                                                   |

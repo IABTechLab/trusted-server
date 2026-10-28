@@ -4754,6 +4754,48 @@ mod tests {
         }
 
         #[test]
+        fn new_visitor_hold_answer_is_created_with_the_row_in_one_write() {
+            let scenario = multi_scenario(MultiEntryTestProvider::new(), ProviderMode::Hold);
+            let mut request = navigation(None);
+            *request.uri_mut() = "https://test-publisher.com/"
+                .parse()
+                .expect("should parse the home page URI");
+
+            let (response, outcome) = scenario.drive(request);
+
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::Skipped),
+                "should leave nothing for a flush"
+            );
+            assert_eq!(
+                scenario.network.requests_to(MULTI_HOST).len(),
+                1,
+                "should call the hold-mode provider on the first navigation"
+            );
+            assert_writes(&scenario.store, (1, 0, 0), "one create holds the answer");
+            let ec_id = set_cookie_value(&response, "ts-ec").expect("should set the EC cookie");
+            let (row, _) = scenario
+                .graph()
+                .get(&ec_id)
+                .expect("should read the row")
+                .expect("should create the row");
+            assert_eq!(
+                row.ids
+                    .values()
+                    .find(|record| record.w.as_deref() == Some(MULTI_PROVIDER))
+                    .map(|record| record.eids.clone()),
+                Some(multi_full_set()),
+                "should create the row with the provider's answer"
+            );
+            assert_eq!(
+                bidder_eids(&bidder_body(&scenario)),
+                serde_json::json!([multi_first_eid(), multi_second_eid()]),
+                "should hand this navigation's auction the answer"
+            );
+        }
+
+        #[test]
         fn one_entry_one_uid_result_is_written_as_one_entry() {
             let scenario = multi_scenario(MultiEntryTestProvider::new(), ProviderMode::Hold);
             scenario.seed_live();

@@ -1037,11 +1037,17 @@ async fn dispatch_fallback(
         }
         let is_publisher_navigation = ec.is_real_browser && is_navigation;
         let seed = browser_seed_for(state, &ec);
-        if is_publisher_navigation
-            && let Err(err) =
-                ec.ec_context
-                    .generate_if_needed(&state.settings, ec.kv_graph.as_ref(), &seed)
-        {
+        // With a hold-mode provider that can run before the row exists, the
+        // create waits for it inside the publisher handler (spec 4.7).
+        let minted = if !is_publisher_navigation {
+            Ok(())
+        } else if state.identity.holds_on_first_navigation() {
+            ec.ec_context.mint_deferred(&state.settings, &seed)
+        } else {
+            ec.ec_context
+                .generate_if_needed(&state.settings, ec.kv_graph.as_ref(), &seed)
+        };
+        if let Err(err) = minted {
             log::warn!("EC generation failed for publisher proxy: {err:?}");
         }
 

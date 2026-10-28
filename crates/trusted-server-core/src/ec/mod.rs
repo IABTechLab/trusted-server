@@ -186,6 +186,9 @@ impl EcKvSnapshot {
     }
 }
 
+/// Create attempts a new EC makes, each with a fresh ID after a collision.
+const MAX_CREATE_ATTEMPTS: usize = 5;
+
 pub use generation::{
     ec_hash, generate_ec_id, is_valid_ec_hash, is_valid_ec_id, normalize_ec_id_for_kv,
 };
@@ -282,6 +285,9 @@ pub struct EcContext {
     /// The `ts-ec-revoked` marker the request carried: the consent
     /// fingerprint a global revoke saw (spec 8).
     revoke_marker: Option<String>,
+    /// The row of an EC minted by [`EcContext::mint_deferred`], created after
+    /// the hold dispatch.
+    deferred_create: Option<Box<KvEntry>>,
 }
 
 impl EcContext {
@@ -379,6 +385,7 @@ impl EcContext {
                 .as_ref()
                 .and_then(|jar| jar.get(COOKIE_TS_EC_REVOKED))
                 .map(|cookie| cookie.value().to_owned()),
+            deferred_create: None,
         })
     }
 
@@ -405,8 +412,86 @@ impl EcContext {
         kv: Option<&KvIdentityGraph>,
         seed: &BrowserSeed,
     ) -> Result<(), Report<TrustedServerError>> {
-        if self.ec_value.is_some() {
+        let Some(entry) = self.new_entry_if_needed(settings, seed) else {
             return Ok(());
+        };
+        self.create_entry(settings, kv, entry, MAX_CREATE_ATTEMPTS)
+    }
+
+    /// Mints an EC ID as [`generate_if_needed`](Self::generate_if_needed)
+    /// would, but keeps its row for
+    /// [`complete_deferred_create`](Self::complete_deferred_create), so a new
+    /// visitor's hold-mode providers can join the create (spec 4.7).
+    ///
+    /// No row exists until the create, so nothing may disclose the ID before
+    /// it: the hold dispatch calls no provider that reads it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client IP is unavailable or HMAC generation
+    /// fails.
+    pub fn mint_deferred(
+        &mut self,
+        settings: &Settings,
+        seed: &BrowserSeed,
+    ) -> Result<(), Report<TrustedServerError>> {
+        let Some(entry) = self.new_entry_if_needed(settings, seed) else {
+            return Ok(());
+        };
+        let ec_id = generation::generate_ec_id(settings, self.require_client_ip()?)?;
+        log::info!(
+            "Minted new EC ID with a deferred create: {}",
+            log_id(&ec_id)
+        );
+        self.ec_value = Some(ec_id);
+        self.ec_generated = true;
+        self.deferred_create = Some(Box::new(entry));
+        Ok(())
+    }
+
+    /// Creates the row [`mint_deferred`](Self::mint_deferred) kept, with
+    /// whatever the hold dispatch added. Does nothing without one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the create fails or no unique ID is found.
+    pub fn complete_deferred_create(
+        &mut self,
+        settings: &Settings,
+        kv: Option<&KvIdentityGraph>,
+    ) -> Result<(), Report<TrustedServerError>> {
+        let Some(entry) = self.deferred_create.take() else {
+            return Ok(());
+        };
+        // One attempt: the auction may already hold the minted ID, so a
+        // collision fails the create instead of minting another.
+        self.create_entry(settings, kv, *entry, 1)
+    }
+
+    /// Whether a minted EC still waits for its create.
+    #[must_use]
+    pub fn has_deferred_create(&self) -> bool {
+        self.deferred_create.is_some()
+    }
+
+    /// The row a minted EC will be created with.
+    #[must_use]
+    pub(crate) fn deferred_entry(&self) -> Option<&KvEntry> {
+        self.deferred_create.as_deref()
+    }
+
+    /// Replaces the row a minted EC will be created with.
+    pub(crate) fn set_deferred_entry(&mut self, entry: KvEntry) {
+        if self.deferred_create.is_some() {
+            self.deferred_create = Some(Box::new(entry));
+        }
+    }
+
+    /// The new row for a request without an EC whose consent allows one, or
+    /// `None` when it needs none.
+    fn new_entry_if_needed(&self, settings: &Settings, seed: &BrowserSeed) -> Option<KvEntry> {
+        if self.ec_value.is_some() {
+            return None;
         }
 
         if !consent::ec_consent_granted(&self.consent) {
@@ -414,36 +499,58 @@ impl EcContext {
                 "EC generation skipped: consent not granted (jurisdiction={})",
                 self.consent.jurisdiction,
             );
-            return Ok(());
+            return None;
         }
 
         if self.revoke_blocks_minting() {
             log::info!("EC generation skipped: a global revoke holds until consent changes");
-            return Ok(());
+            return None;
         }
 
-        let client_ip = self.client_ip.as_deref().ok_or_else(|| {
+        let mut entry = KvEntry::new(
+            &self.consent,
+            self.geo_info.as_ref(),
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        entry.device = self
+            .device_signals
+            .as_ref()
+            .map(DeviceSignals::to_kv_device);
+        apply_partner_id_updates(&mut entry, seed.updates());
+        Some(entry)
+    }
+
+    fn require_client_ip(&self) -> Result<&str, Report<TrustedServerError>> {
+        self.client_ip.as_deref().ok_or_else(|| {
             Report::new(TrustedServerError::EdgeCookie {
                 message: "Client IP required for EC generation but unavailable".to_owned(),
             })
-        })?;
+        })
+    }
 
-        const MAX_CREATE_ATTEMPTS: usize = 5;
-        for attempt in 0..MAX_CREATE_ATTEMPTS {
-            let ec_id = generation::generate_ec_id(settings, client_ip)?;
-            log::info!("Generated new EC ID: {}", log_id(&ec_id));
-            let now = current_timestamp();
-            let mut entry = KvEntry::new(
-                &self.consent,
-                self.geo_info.as_ref(),
-                now,
-                &settings.publisher.domain,
-            );
-            entry.device = self
-                .device_signals
-                .as_ref()
-                .map(DeviceSignals::to_kv_device);
-            apply_partner_id_updates(&mut entry, seed.updates());
+    /// Creates `entry` under the minted EC ID, or a fresh one, retrying an ID
+    /// collision with a fresh ID.
+    fn create_entry(
+        &mut self,
+        settings: &Settings,
+        kv: Option<&KvIdentityGraph>,
+        entry: KvEntry,
+        max_attempts: usize,
+    ) -> Result<(), Report<TrustedServerError>> {
+        let client_ip = self.require_client_ip()?.to_owned();
+        let mut minted = self.ec_value.take();
+        self.ec_generated = false;
+
+        for attempt in 0..max_attempts {
+            let ec_id = match minted.take() {
+                Some(ec_id) => ec_id,
+                None => {
+                    let ec_id = generation::generate_ec_id(settings, &client_ip)?;
+                    log::info!("Generated new EC ID: {}", log_id(&ec_id));
+                    ec_id
+                }
+            };
 
             if let Some(graph) = kv {
                 self.identity.record_create_attempt();
@@ -457,7 +564,7 @@ impl EcContext {
                     }
                     Ok(CreateIfAbsentOutcome::AlreadyExists) => {
                         log::warn!(
-                            "Generated EC ID collision on attempt {}/{MAX_CREATE_ATTEMPTS}",
+                            "Generated EC ID collision on attempt {}/{max_attempts}",
                             attempt + 1
                         );
                         continue;
@@ -481,9 +588,7 @@ impl EcContext {
         }
 
         Err(Report::new(TrustedServerError::EdgeCookie {
-            message: format!(
-                "Failed to allocate a unique EC ID after {MAX_CREATE_ATTEMPTS} attempts"
-            ),
+            message: format!("Failed to allocate a unique EC ID after {max_attempts} attempts"),
         }))
     }
 
@@ -894,6 +999,7 @@ impl EcContext {
             identity: RequestIdentity::default(),
             failed_withdrawals: Vec::new(),
             revoke_marker: None,
+            deferred_create: None,
         }
     }
 
@@ -940,6 +1046,7 @@ impl EcContext {
             identity: RequestIdentity::default(),
             failed_withdrawals: Vec::new(),
             revoke_marker: None,
+            deferred_create: None,
         }
     }
 
@@ -969,6 +1076,7 @@ impl EcContext {
             identity: RequestIdentity::default(),
             failed_withdrawals: Vec::new(),
             revoke_marker: None,
+            deferred_create: None,
         }
     }
 }
@@ -1269,6 +1377,57 @@ mod tests {
             EcContext::read_from_request(&settings, &create_test_request(&[]), &noop_services())
                 .expect("should read EC context");
         assert!(!plain.has_revoke_marker(), "control: no cookie, no marker");
+    }
+
+    #[test]
+    fn mint_deferred_writes_nothing_until_the_create() {
+        let settings = create_test_settings();
+        let graph = KvIdentityGraph::in_memory("ec-store");
+        let mut ec =
+            EcContext::new_for_test_with_ip(None, granting_consent(), Some("192.0.2.5".to_owned()));
+
+        ec.mint_deferred(&settings, &BrowserSeed::empty())
+            .expect("should mint");
+
+        let ec_id = ec.ec_value().expect("should hold the minted ID").to_owned();
+        assert!(ec.has_deferred_create(), "should keep the row for later");
+        assert!(
+            graph.get(&ec_id).expect("should read").is_none(),
+            "should write nothing yet"
+        );
+
+        ec.complete_deferred_create(&settings, Some(&graph))
+            .expect("should create");
+
+        assert_eq!(
+            ec.ec_value(),
+            Some(ec_id.as_str()),
+            "should keep the minted ID"
+        );
+        assert!(
+            graph.get(&ec_id).expect("should read").is_some(),
+            "should create the row"
+        );
+        assert!(
+            matches!(ec.kv_snapshot(), EcKvSnapshot::Present { .. }),
+            "should hold the created row"
+        );
+    }
+
+    #[test]
+    fn deferred_create_fails_on_a_collision_instead_of_reminting() {
+        let settings = create_test_settings();
+        let graph = KvIdentityGraph::new(AddCollidingEcKv::new(1));
+        let mut ec =
+            EcContext::new_for_test_with_ip(None, granting_consent(), Some("192.0.2.5".to_owned()));
+        ec.mint_deferred(&settings, &BrowserSeed::empty())
+            .expect("should mint");
+
+        let result = ec.complete_deferred_create(&settings, Some(&graph));
+
+        assert!(result.is_err(), "should fail rather than mint another ID");
+        assert!(ec.ec_value().is_none(), "should keep no EC");
+        assert!(!ec.ec_generated(), "should not count as generated");
     }
 
     #[test]

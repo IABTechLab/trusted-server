@@ -4871,6 +4871,18 @@ pub async fn handle_publisher_request(
                 })?,
         );
     }
+    // A new visitor's row is created now, after the hold-mode providers its
+    // auction waits for, so their answers ride the one create (spec 4.7).
+    let mut new_visitor_hold = None;
+    if ec_context.has_deferred_create() {
+        if should_run_auction && !matched_slots.is_empty() {
+            ec_context.identity_mut().set_runs_auction(true);
+            new_visitor_hold = hold_before_auction(settings, services, ec_context).await;
+        }
+        if let Err(err) = ec_context.complete_deferred_create(settings, kv) {
+            log::warn!("EC generation failed for publisher proxy: {err:?}");
+        }
+    }
     if should_preload_ec && let (Some(graph), Some(active_ec_id)) = (kv, active_ec_id) {
         let refreshed = graph.load_snapshot(active_ec_id);
         // Never downgrade an in-request Add-confirmed Present snapshot: a
@@ -4921,7 +4933,10 @@ pub async fn handle_publisher_request(
             // This navigation runs an auction: hold-mode providers run now,
             // within their budget, and phase 4 leaves them alone (spec 4.7).
             ec_context.identity_mut().set_runs_auction(true);
-            let hold = hold_before_auction(settings, services, ec_context).await;
+            let hold = match new_visitor_hold.take() {
+                Some(hold) => Some(hold),
+                None => hold_before_auction(settings, services, ec_context).await,
+            };
             let slots_ctx = MatchedSlotsContext {
                 matched_slots: &matched_slots,
                 request_path: &request_path,
