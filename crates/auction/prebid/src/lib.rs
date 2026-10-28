@@ -18,6 +18,7 @@
 )]
 
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
@@ -41,9 +42,11 @@ use trusted_server_core::auction::plan::AuctionPlan;
 use trusted_server_core::cache_policy::{CacheControlPolicy, EdgeCacheHeader};
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::{
-    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
-    IntegrationRegistration,
+    AttributeRewriteAction, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+};
+use trusted_server_core::middleware::{
+    AttributeRewrite, AttributeRewriteFn, Middleware, MiddlewareAction, MiddlewareContext,
+    MiddlewarePhase,
 };
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{ProxyRequestConfig, is_host_allowed, proxy_request};
@@ -1100,8 +1103,7 @@ pub fn register_for_plan(
     Ok(Some(
         IntegrationRegistration::builder(PREBID_INTEGRATION_ID)
             .with_proxy(integration.clone())
-            .with_attribute_rewriter(integration.clone())
-            .with_head_injector(integration)
+            .with_middleware(Arc::new(PageChange(integration)))
             .with_deferred_js()
             .build(),
     ))
@@ -1119,8 +1121,7 @@ pub fn register(
     Ok(Some(
         IntegrationRegistration::builder(PREBID_INTEGRATION_ID)
             .with_proxy(integration.clone())
-            .with_attribute_rewriter(integration.clone())
-            .with_head_injector(integration)
+            .with_middleware(Arc::new(PageChange(integration)))
             .with_deferred_js()
             .build(),
     ))
@@ -1186,22 +1187,38 @@ impl IntegrationProxy for PrebidIntegration {
     }
 }
 
-impl IntegrationAttributeRewriter for PrebidIntegration {
-    fn integration_id(&self) -> &'static str {
-        PREBID_INTEGRATION_ID
+/// Prebid's change to a page, on the pages a `[[fetch]]` entry names
+/// [`MODULE`] for. It writes the configuration Prebid.js reads and the tag
+/// that loads the bundle into the head, and removes the publisher's own
+/// Prebid script.
+struct PageChange(Arc<PrebidIntegration>);
+
+impl Middleware for PageChange {
+    fn middleware_id(&self) -> &'static str {
+        MODULE
     }
 
-    fn handles_attribute(&self, attribute: &str) -> bool {
-        matches!(attribute, "src" | "href")
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
     }
 
-    fn rewrite(
-        &self,
-        _attr_name: &str,
-        attr_value: &str,
-        _ctx: &IntegrationAttributeContext<'_>,
-    ) -> AttributeRewriteAction {
-        if self.matches_script_url(attr_value) {
+    fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        let integration = Arc::clone(&self.0);
+        let decide: Rc<AttributeRewriteFn> =
+            Rc::new(move |matched| integration.rewrite_script_address(matched.value));
+        MiddlewareAction {
+            head_inserts: self.0.head_markup(),
+            element_handlers: AttributeRewrite::each(&["src", "href"], &decide),
+            ..MiddlewareAction::pass()
+        }
+    }
+}
+
+impl PrebidIntegration {
+    /// What becomes of a `src` or an `href`, whose element is removed when it
+    /// loads the publisher's own Prebid script.
+    fn rewrite_script_address(&self, value: &str) -> AttributeRewriteAction {
+        if self.matches_script_url(value) {
             AttributeRewriteAction::remove_element()
         } else {
             AttributeRewriteAction::keep()
@@ -1225,12 +1242,10 @@ fn injected_prebid_config_script(config_json: &str) -> String {
     )
 }
 
-impl IntegrationHeadInjector for PrebidIntegration {
-    fn integration_id(&self) -> &'static str {
-        PREBID_INTEGRATION_ID
-    }
-
-    fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+impl PrebidIntegration {
+    /// The scripts written into the head, being the configuration Prebid.js
+    /// reads and the tag that loads the bundle.
+    fn head_markup(&self) -> Vec<String> {
         if let Some(inserts) = &self.planned_head_inserts {
             return inserts.clone();
         }
@@ -1350,7 +1365,10 @@ mod tests {
 
     use trusted_server_core::auction::plan::{BidderId, BidderRouteConfig, ProviderId};
 
-    use trusted_server_core::html_processor::{HtmlProcessorConfig, create_html_processor};
+    use trusted_server_core::html_processor::HtmlProcessorConfig;
+    use trusted_server_core::html_processor::test_support::{
+        create_page_processor, place_on_every_page,
+    };
     use trusted_server_core::integrations::{
         AttributeRewriteAction, IntegrationDocumentState, IntegrationRegistry,
     };
@@ -1417,6 +1435,7 @@ mod tests {
                 }),
             )
             .expect("should select Prebid");
+        place_on_every_page(&mut settings, MiddlewarePhase::Fetch, &[MODULE]);
         settings
     }
 
@@ -1854,14 +1873,21 @@ server_url = "https://prebid.example/openrtb2/auction"
             IntegrationRegistry::with_plan_and_registrations(&settings, plan, &[builder()])
                 .expect("should build integration registry");
         let document_state = IntegrationDocumentState::default();
-        let context = IntegrationHtmlContext {
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
+        let context = trusted_server_core::middleware::test_support::context(
+            MiddlewarePhase::Fetch,
+            &document_state,
+        );
 
-        let inserts = registry.head_inserts(&context);
+        let inserts = registry
+            .middleware_chain(
+                &settings.fetch,
+                MiddlewarePhase::Fetch,
+                trusted_server_core::middleware::HTML_MEDIA_TYPE,
+                "/",
+            )
+            .plan(&context)
+            .expect("should plan the page's middleware")
+            .head_inserts;
         let config_insert = inserts
             .iter()
             .find(|insert| insert.contains("window.__tsjs_prebid"))
@@ -2136,36 +2162,20 @@ excluded_gam_ad_unit_path_suffixes = ["{suffix}"]
     }
 
     #[test]
-    fn attribute_rewriter_removes_prebid_scripts() {
+    fn element_handler_removes_prebid_scripts() {
         let integration = PrebidIntegration::new(base_config());
-        let ctx = IntegrationAttributeContext {
-            attribute_name: "src",
-            element_name: "script",
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-        };
-
-        let rewritten = integration.rewrite("src", "https://cdn.prebid.org/prebid.min.js", &ctx);
+        let rewritten = integration.rewrite_script_address("https://cdn.prebid.org/prebid.min.js");
         assert!(matches!(rewritten, AttributeRewriteAction::RemoveElement));
 
-        let untouched = integration.rewrite("src", "https://cdn.example.com/app.js", &ctx);
+        let untouched = integration.rewrite_script_address("https://cdn.example.com/app.js");
         assert!(matches!(untouched, AttributeRewriteAction::Keep));
     }
 
     #[test]
-    fn attribute_rewriter_handles_query_strings_and_links() {
+    fn element_handler_handles_query_strings_and_links() {
         let integration = PrebidIntegration::new(base_config());
-        let ctx = IntegrationAttributeContext {
-            attribute_name: "href",
-            element_name: "a",
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-        };
-
         let rewritten =
-            integration.rewrite("href", "https://cdn.prebid.org/prebid.js?v=1.2.3", &ctx);
+            integration.rewrite_script_address("https://cdn.prebid.org/prebid.js?v=1.2.3");
         assert!(matches!(rewritten, AttributeRewriteAction::RemoveElement));
     }
 
@@ -2192,7 +2202,7 @@ excluded_gam_ad_unit_path_suffixes = ["{suffix}"]
         let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
             .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
-        let processor = create_html_processor(config);
+        let processor = create_page_processor(&settings, &registry, config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
             output_compression: Compression::None,
@@ -2241,7 +2251,7 @@ excluded_gam_ad_unit_path_suffixes = ["{suffix}"]
         let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
             .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
-        let processor = create_html_processor(config);
+        let processor = create_page_processor(&settings, &registry, config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
             output_compression: Compression::None,
@@ -2963,17 +2973,9 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_emits_config_script() {
+    fn head_markup_emits_config_script() {
         let integration = PrebidIntegration::new(base_config());
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
-
-        let inserts = integration.head_inserts(&ctx);
+        let inserts = integration.head_markup();
         assert_eq!(inserts.len(), 2, "should produce config and bundle inserts");
 
         let script = &inserts[0];
@@ -3028,17 +3030,15 @@ external_bundle_sri = "sha384-AAAA"
         let plan = trusted_server_core::auction::compile_auction_plan(&settings)
             .expect("should compile auction plan");
         let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
+        let context = trusted_server_core::middleware::test_support::context(
+            MiddlewarePhase::Fetch,
+            &document_state,
+        );
         for enabled in [true, false] {
             let registration = register_for_plan(&settings, &plan.clone().with_enabled(enabled))
                 .expect("should register prebid")
                 .expect("should enable prebid");
-            let inserts = registration.head_injectors[0].head_inserts(&ctx);
+            let inserts = registration.middleware[0].create(&context).head_inserts;
             let script = &inserts[0];
             assert!(
                 script.contains(r#""managedUserIds":[{"name":"exampleId""#),
@@ -3060,7 +3060,7 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_includes_managed_user_ids() {
+    fn head_markup_includes_managed_user_ids() {
         let mut config = base_config();
         config.managed_user_ids = vec![PrebidManagedUserIdConfig {
             name: "exampleId".to_string(),
@@ -3076,15 +3076,7 @@ external_bundle_sri = "sha384-AAAA"
             }),
         }];
         let integration = PrebidIntegration::new(config);
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
-
-        let inserts = integration.head_inserts(&ctx);
+        let inserts = integration.head_markup();
         let script = &inserts[0];
 
         assert!(
@@ -3096,7 +3088,7 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_omits_optional_managed_user_id_fields_when_unset() {
+    fn head_markup_omits_optional_managed_user_id_fields_when_unset() {
         let mut config = base_config();
         config.managed_user_ids = vec![PrebidManagedUserIdConfig {
             name: "exampleId".to_string(),
@@ -3104,15 +3096,7 @@ external_bundle_sri = "sha384-AAAA"
             storage: None,
         }];
         let integration = PrebidIntegration::new(config);
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
-
-        let inserts = integration.head_inserts(&ctx);
+        let inserts = integration.head_markup();
         let script = &inserts[0];
 
         assert!(
@@ -3122,17 +3106,9 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_omits_managed_user_ids_when_none_configured() {
+    fn head_markup_omits_managed_user_ids_when_none_configured() {
         let integration = PrebidIntegration::new(base_config());
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
-
-        let inserts = integration.head_inserts(&ctx);
+        let inserts = integration.head_markup();
         let script = &inserts[0];
 
         assert!(
@@ -3207,7 +3183,7 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_escapes_script_breakout_in_managed_user_ids() {
+    fn head_markup_escapes_script_breakout_in_managed_user_ids() {
         let mut config = base_config();
         config.managed_user_ids = vec![PrebidManagedUserIdConfig {
             params: serde_json::Map::from_iter([(
@@ -3217,15 +3193,7 @@ external_bundle_sri = "sha384-AAAA"
             ..valid_managed_user_id()
         }];
         let integration = PrebidIntegration::new(config);
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
-
-        let inserts = integration.head_inserts(&ctx);
+        let inserts = integration.head_markup();
         let script = &inserts[0];
 
         assert!(
@@ -3248,20 +3216,12 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_includes_excluded_gam_ad_unit_path_suffixes() {
+    fn head_markup_includes_excluded_gam_ad_unit_path_suffixes() {
         let mut config = base_config();
         config.excluded_gam_ad_unit_path_suffixes =
             vec!["/trackingonly".to_string(), "/measurement-only".to_string()];
         let integration = PrebidIntegration::new(config);
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
-
-        let inserts = integration.head_inserts(&ctx);
+        let inserts = integration.head_markup();
         let script = &inserts[0];
         assert!(
             script.contains(
@@ -3273,19 +3233,11 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_handles_missing_account_id() {
+    fn head_markup_handles_missing_account_id() {
         let mut config = base_config();
         config.account_id = None;
         let integration = PrebidIntegration::new(config);
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
-
-        let inserts = integration.head_inserts(&ctx);
+        let inserts = integration.head_markup();
         let script = &inserts[0];
         assert!(
             script.contains(r#""accountId":"""#),
@@ -3295,7 +3247,7 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_emits_external_bundle_script_with_hash_and_integrity() {
+    fn head_markup_emits_external_bundle_script_with_hash_and_integrity() {
         let sha256 = "a".repeat(64);
         let mut config = base_config();
         config.external_bundle_url =
@@ -3303,15 +3255,7 @@ external_bundle_sri = "sha384-AAAA"
         config.external_bundle_sha256 = Some(sha256.clone());
         config.external_bundle_sri = Some(test_sri("sha384", &[0; 48]));
         let integration = PrebidIntegration::new(config);
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
-
-        let inserts = integration.head_inserts(&ctx);
+        let inserts = integration.head_markup();
 
         assert_eq!(inserts.len(), 2, "should emit config and bundle scripts");
         assert!(
@@ -3332,20 +3276,12 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_emits_external_bundle_script_without_hash_query_when_unhashed() {
+    fn head_markup_emits_external_bundle_script_without_hash_query_when_unhashed() {
         let mut config = base_config();
         config.external_bundle_url =
             Some("https://assets.example/prebid/trusted-prebid.js".to_string());
         let integration = PrebidIntegration::new(config);
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
-
-        let inserts = integration.head_inserts(&ctx);
+        let inserts = integration.head_markup();
 
         assert_eq!(inserts.len(), 2, "should emit config and bundle scripts");
         assert!(
@@ -3361,19 +3297,11 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_escapes_less_than_signs_in_values() {
+    fn head_markup_escapes_less_than_signs_in_values() {
         let mut config = base_config();
         config.account_id = Some("</script><script>alert(1)</script>".to_string());
         let integration = PrebidIntegration::new(config);
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
-
-        let inserts = integration.head_inserts(&ctx);
+        let inserts = integration.head_markup();
         let script = &inserts[0];
         assert!(
             script.contains(r#""accountId":"\u003c/script>\u003cscript>alert(1)\u003c/script>""#),
@@ -3383,17 +3311,9 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_omits_client_side_bidders_when_empty() {
+    fn head_markup_omits_client_side_bidders_when_empty() {
         let integration = PrebidIntegration::new(base_config());
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
-
-        let inserts = integration.head_inserts(&ctx);
+        let inserts = integration.head_markup();
         let script = &inserts[0];
         assert!(
             !script.contains("clientSideBidders"),
@@ -3403,19 +3323,11 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_includes_client_side_bidders_when_configured() {
+    fn head_markup_includes_client_side_bidders_when_configured() {
         let mut config = base_config();
         config.client_side_bidders = vec!["rubicon".to_string(), "magnite".to_string()];
         let integration = PrebidIntegration::new(config);
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
-
-        let inserts = integration.head_inserts(&ctx);
+        let inserts = integration.head_markup();
         let script = &inserts[0];
         assert!(
             script.contains(r#""clientSideBidders":["rubicon","magnite"]"#),
@@ -3469,6 +3381,23 @@ server_url = "https://prebid.example"
             super::MODULE,
             trusted_server_core::module_name!(),
             "should be named by the folder this crate lives in"
+        );
+    }
+
+    /// The page a reader receives with this module running, kept as a file
+    /// so that changing how the page change is made can be shown to leave
+    /// the page as it was.
+    #[test]
+    fn the_page_a_reader_receives_is_the_recorded_one() {
+        trusted_server_core::html_processor::test_support::assert_page_is_recorded(
+            include_str!("fixtures/page-change.settings.toml"),
+            &[super::builder()],
+            include_str!("fixtures/page-change.input.html"),
+            include_str!("fixtures/page-change.recorded.html"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/fixtures/page-change.recorded.html"
+            ),
         );
     }
 }

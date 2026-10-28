@@ -22,9 +22,11 @@ use validator::{Validate, ValidationError};
 
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::{
-    INTEGRATION_MAX_BODY_BYTES, IntegrationEndpoint, IntegrationHeadInjector,
-    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, collect_body_bounded,
-    ensure_integration_backend,
+    INTEGRATION_MAX_BODY_BYTES, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    collect_body_bounded, ensure_integration_backend,
+};
+use trusted_server_core::middleware::{
+    Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase,
 };
 use trusted_server_core::platform::{GeoInfo, PlatformHttpRequest, RuntimeServices};
 use trusted_server_core::settings::{IntegrationConfig, Settings};
@@ -437,7 +439,7 @@ pub fn register(
     Ok(Some(
         IntegrationRegistration::builder(DIDOMI_INTEGRATION_ID)
             .with_proxy(integration.clone())
-            .with_head_injector(integration)
+            .with_middleware(Arc::new(ClientConfig(integration)))
             .build(),
     ))
 }
@@ -565,12 +567,10 @@ impl IntegrationProxy for DidomiIntegration {
     }
 }
 
-impl IntegrationHeadInjector for DidomiIntegration {
-    fn integration_id(&self) -> &'static str {
-        DIDOMI_INTEGRATION_ID
-    }
-
-    fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+impl DidomiIntegration {
+    /// The script that hands the browser module the path this deployment
+    /// serves Didomi under.
+    fn client_config_script(&self) -> String {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct InjectedDidomiClientConfig {
@@ -589,9 +589,28 @@ impl IntegrationHeadInjector for DidomiIntegration {
             })
             .replace("</", "<\\/");
 
-        vec![format!(
-            r#"<script>window.__tsjs_didomi={config_json};</script>"#
-        )]
+        format!(r#"<script>window.__tsjs_didomi={config_json};</script>"#)
+    }
+}
+
+/// Writes the browser module's settings into the head, on the pages a
+/// `[[fetch]]` entry names [`MODULE`] for.
+struct ClientConfig(Arc<DidomiIntegration>);
+
+impl Middleware for ClientConfig {
+    fn middleware_id(&self) -> &'static str {
+        MODULE
+    }
+
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
+    }
+
+    fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        MiddlewareAction {
+            head_inserts: vec![self.0.client_config_script()],
+            ..MiddlewareAction::pass()
+        }
     }
 }
 
@@ -602,7 +621,7 @@ mod tests {
 
     use super::*;
     use http::Method;
-    use trusted_server_core::integrations::{IntegrationDocumentState, IntegrationRegistry};
+    use trusted_server_core::integrations::IntegrationRegistry;
     use trusted_server_core::platform::PlatformCacheIntent;
     use trusted_server_core::platform::test_support::{
         NoopConfigStore, NoopSecretStore, StubBackend, StubHttpClient,
@@ -1353,7 +1372,7 @@ mod tests {
     }
 
     #[test]
-    fn head_injector_emits_proxy_path() {
+    fn head_markup_emits_proxy_path() {
         let custom_config = DidomiIntegrationConfig {
             geo_query_parameters: false,
             proxy_path: Some("my-consent".to_string()),
@@ -1361,18 +1380,25 @@ mod tests {
             api_origin: default_api_origin(),
         };
         let integration = DidomiIntegration::new(Arc::new(custom_config));
-        let doc_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "example.com",
-            request_scheme: "https",
-            origin_host: "example.com",
-            document_state: &doc_state,
-        };
-        let inserts = integration.head_inserts(&ctx);
-        assert_eq!(inserts.len(), 1);
+        let document_state = trusted_server_core::integrations::IntegrationDocumentState::default();
+        let context = trusted_server_core::middleware::test_support::context(
+            MiddlewarePhase::Fetch,
+            &document_state,
+        );
+
+        let action = ClientConfig(integration).create(&context);
+
         assert_eq!(
-            inserts[0],
-            r#"<script>window.__tsjs_didomi={"proxyPath":"/my-consent/"};</script>"#
+            action.head_inserts,
+            [r#"<script>window.__tsjs_didomi={"proxyPath":"/my-consent/"};</script>"#],
+            "should write the one script, with the path this deployment serves Didomi under"
+        );
+        assert!(
+            action.after_bundle_inserts.is_empty()
+                && action.element_handlers.is_empty()
+                && action.text_handlers.is_empty()
+                && action.stream.is_none(),
+            "should change nothing else of the page"
         );
     }
 
@@ -1435,18 +1461,11 @@ mod tests {
     }
 
     #[test]
-    fn head_injector_default_path() {
+    fn head_markup_default_path() {
         let integration = DidomiIntegration::new(Arc::new(config()));
-        let doc_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "example.com",
-            request_scheme: "https",
-            origin_host: "example.com",
-            document_state: &doc_state,
-        };
-        let inserts = integration.head_inserts(&ctx);
+
         assert_eq!(
-            inserts[0],
+            integration.client_config_script(),
             r#"<script>window.__tsjs_didomi={"proxyPath":"/integrations/didomi/consent/"};</script>"#
         );
     }
@@ -1457,6 +1476,23 @@ mod tests {
             super::MODULE,
             trusted_server_core::module_name!(),
             "should be named by the folder this crate lives in"
+        );
+    }
+
+    /// The page a reader receives with this module running, kept as a file
+    /// so that changing how the page change is made can be shown to leave
+    /// the page as it was.
+    #[test]
+    fn the_page_a_reader_receives_is_the_recorded_one() {
+        trusted_server_core::html_processor::test_support::assert_page_is_recorded(
+            include_str!("fixtures/page-change.settings.toml"),
+            &[super::builder()],
+            include_str!("fixtures/page-change.input.html"),
+            include_str!("fixtures/page-change.recorded.html"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/fixtures/page-change.recorded.html"
+            ),
         );
     }
 }

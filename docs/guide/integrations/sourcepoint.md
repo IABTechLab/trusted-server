@@ -49,6 +49,8 @@ The Sourcepoint browser module is now opt-in through `[cmp] module`. Existing de
 
 ## HTML Rewriting
 
+Sourcepoint's changes to a page are the middleware `cmp.sourcepoint`, which runs on the pages a `[[fetch]]` entry names it for. See [Placing page changes](/guide/configuration#placing-page-changes).
+
 When `rewrite_sdk = true`, Trusted Server rewrites matching Sourcepoint URLs in HTML responses:
 
 ```html

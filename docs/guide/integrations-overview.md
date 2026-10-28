@@ -67,8 +67,9 @@ families and adapter availability.
 
 Selected integrations share ordered request, HTML, and browser pipelines. They
 are not guaranteed to be independent. Registration predicates determine which
-proxy routes, attribute or script rewriters, head injectors, request filters,
-post-processors, auction providers, and browser modules are active. Validate
+proxy routes, middleware, request filters, auction providers, and browser
+modules are active, and a middleware changes a page only where a `[[fetch]]`
+or `[[serve]]` entry names it. Validate
 the complete configuration and test the resulting page rather than assuming
 that any arbitrary combination is conflict-free.
 

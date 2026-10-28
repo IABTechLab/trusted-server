@@ -447,8 +447,7 @@ Integrations register in Rust via:
 ```rust
 IntegrationRegistration::builder(ID)
     .with_proxy()
-    .with_attribute_rewriter()
-    .with_head_injector()
+    .with_middleware()
     .build()
 ```
 

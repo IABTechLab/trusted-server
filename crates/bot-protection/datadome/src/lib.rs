@@ -50,8 +50,8 @@
 //!
 //! # HTML Attribute Rewriting
 //!
-//! When `rewrite_sdk = true`, the integration implements [`IntegrationAttributeRewriter`] to
-//! automatically rewrite `DataDome` script URLs in HTML responses:
+//! When `rewrite_sdk = true`, the module's fetch middleware rewrites `DataDome` script URLs in
+//! the pages a `[[fetch]]` entry names it for:
 //!
 //! - `<script src="https://js.datadome.co/tags.js">` becomes
 //!   `<script src="/integrations/datadome/tags.js">`
@@ -69,6 +69,7 @@
     )
 )]
 
+use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
@@ -85,11 +86,14 @@ use validator::Validate;
 use trusted_server_core::constants::ENV_FASTLY_IS_STAGING;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::{
-    AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
-    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationHeadInjector,
-    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, IntegrationRequestFilter,
+    AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationDocumentState,
+    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration, IntegrationRequestFilter,
     RequestFilterDecision, RequestFilterInput, UPSTREAM_SDK_MAX_RESPONSE_BYTES,
     collect_body_bounded, collect_response_bounded, ensure_integration_backend,
+};
+use trusted_server_core::middleware::{
+    AttributeRewrite, AttributeRewriteFn, Middleware, MiddlewareAction, MiddlewareContext,
+    MiddlewarePhase,
 };
 use trusted_server_core::platform::{PlatformHttpRequest, RuntimeServices};
 use trusted_server_core::redacted::Redacted;
@@ -106,8 +110,13 @@ use protection_scope::ProtectionScope;
 
 pub(crate) const DATADOME_INTEGRATION_ID: &str = "datadome";
 
-/// The name this module is selected by, in `[bot-protection]`.
+/// The name this module is selected by, in `[bot-protection]`, and the name
+/// of its fetch middleware, which loads the SDK from the first-party path.
 pub const MODULE: &str = "bot-protection.datadome";
+
+/// The name of the module's serve middleware, which writes the client tag
+/// into each reader's copy of a page.
+pub const TAG_MIDDLEWARE: &str = "bot-protection.datadome.tag";
 
 /// The builder a deployment hands to an adapter, which the registry runs when
 /// a section selects [`MODULE`].
@@ -162,8 +171,8 @@ pub(crate) const HEADER_DATADOME_TEST_BYPASS: &str = "x-ts-datadome-bypass";
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DataDomeClientTagSuppressed;
 
-/// Leaves the marker on `request` for the head injector of the document the
-/// request produces.
+/// Leaves the marker on `request` for the serve middleware of the document
+/// the request produces.
 pub(crate) fn suppress_client_tag(request: &mut http::Request<EdgeBody>) {
     trusted_server_core::integrations::IntegrationRequestState::insert(
         request,
@@ -937,14 +946,63 @@ impl IntegrationRequestFilter for DataDomeIntegration {
     }
 }
 
-impl IntegrationHeadInjector for DataDomeIntegration {
-    fn integration_id(&self) -> &'static str {
-        DATADOME_INTEGRATION_ID
+/// Writes `DataDome`'s client tag into the head of each reader's copy, on the
+/// pages a `[[serve]]` entry names [`TAG_MIDDLEWARE`] for.
+///
+/// It runs for each reader, and not once for a stored page, because the
+/// request filter leaves the tag out for a request it marked.
+struct ClientTag(Arc<DataDomeIntegration>);
+
+impl Middleware for ClientTag {
+    fn middleware_id(&self) -> &'static str {
+        TAG_MIDDLEWARE
     }
 
-    fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        if ctx
-            .document_state
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Serve]
+    }
+
+    fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        MiddlewareAction {
+            head_inserts: self.0.client_tag(context.document_state),
+            ..MiddlewareAction::pass()
+        }
+    }
+}
+
+/// Loads the `DataDome` SDK from the first-party path, on the pages a
+/// `[[fetch]]` entry names [`MODULE`] for. It does nothing unless
+/// `rewrite_sdk` is set.
+struct SdkAddress(Arc<DataDomeIntegration>);
+
+impl Middleware for SdkAddress {
+    fn middleware_id(&self) -> &'static str {
+        MODULE
+    }
+
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
+    }
+
+    fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        if !self.0.config.rewrite_sdk {
+            return MiddlewareAction::pass();
+        }
+        let decide: Rc<AttributeRewriteFn> =
+            Rc::new(|matched| DataDomeIntegration::rewrite_sdk_address(matched.value));
+        MiddlewareAction {
+            element_handlers: AttributeRewrite::each(&["src", "href"], &decide),
+            ..MiddlewareAction::pass()
+        }
+    }
+}
+
+impl DataDomeIntegration {
+    /// The client tag for a document, or nothing when the request that
+    /// produced the document was marked, the tag is switched off or no
+    /// client-side key is set.
+    fn client_tag(&self, document_state: &IntegrationDocumentState) -> Vec<String> {
+        if document_state
             .get::<DataDomeClientTagSuppressed>(DATADOME_INTEGRATION_ID)
             .is_some()
         {
@@ -973,23 +1031,10 @@ impl IntegrationHeadInjector for DataDomeIntegration {
             "<script>window.ddjskey={key};window.ddoptions={options};</script><script src=\"{tag_url}\" async></script>"
         )]
     }
-}
 
-impl IntegrationAttributeRewriter for DataDomeIntegration {
-    fn integration_id(&self) -> &'static str {
-        DATADOME_INTEGRATION_ID
-    }
-
-    fn handles_attribute(&self, attribute: &str) -> bool {
-        self.config.rewrite_sdk && matches!(attribute, "src" | "href")
-    }
-
-    fn rewrite(
-        &self,
-        _attr_name: &str,
-        attr_value: &str,
-        _ctx: &IntegrationAttributeContext<'_>,
-    ) -> AttributeRewriteAction {
+    /// What becomes of a `src` or an `href`, which is pointed at the
+    /// first-party path when it is a `DataDome` script's address.
+    fn rewrite_sdk_address(attr_value: &str) -> AttributeRewriteAction {
         // Check if this is a DataDome script URL
         let is_datadome =
             attr_value.contains("js.datadome.co") || attr_value.contains("datadome.co/tags.js");
@@ -1084,8 +1129,8 @@ pub fn register(
 
     let mut builder = IntegrationRegistration::builder(DATADOME_INTEGRATION_ID)
         .with_proxy(integration.clone())
-        .with_attribute_rewriter(integration.clone())
-        .with_head_injector(integration.clone());
+        .with_middleware(Arc::new(SdkAddress(integration.clone())))
+        .with_middleware(Arc::new(ClientTag(integration.clone())));
 
     if integration.config.enable_protection {
         builder = builder.with_request_filter(integration);
@@ -1284,17 +1329,6 @@ mod tests {
             integration.build_api_url("/js/check", Some("foo=bar")),
             "https://api-js.datadome.co/js/check?foo=bar"
         );
-    }
-
-    fn html_context_for_tests(
-        document_state: &trusted_server_core::integrations::IntegrationDocumentState,
-    ) -> IntegrationHtmlContext<'_> {
-        IntegrationHtmlContext {
-            request_host: "publisher.example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-            document_state,
-        }
     }
 
     #[test]
@@ -1517,15 +1551,13 @@ mod tests {
     }
 
     #[test]
-    fn head_injector_escapes_client_side_tag_url_attribute() {
+    fn head_markup_escapes_client_side_tag_url_attribute() {
         let mut config = test_config();
         config.client_side_key = "test-client-key".to_string();
         config.client_side_tag_url = "/integrations/datadome/tags.js?one=1&two=2".to_string();
         let integration = DataDomeIntegration::new(config);
-        let document_state = trusted_server_core::integrations::IntegrationDocumentState::default();
-        let ctx = html_context_for_tests(&document_state);
-
-        let inserts = integration.head_inserts(&ctx);
+        let document_state = IntegrationDocumentState::default();
+        let inserts = integration.client_tag(&document_state);
 
         assert!(
             inserts[0].contains(
@@ -1536,15 +1568,13 @@ mod tests {
     }
 
     #[test]
-    fn head_injector_emits_client_side_tag_when_key_configured() {
+    fn head_markup_emits_client_side_tag_when_key_configured() {
         let mut config = test_config();
         config.client_side_key = "test-client-key".to_string();
         config.client_side_configuration = serde_json::json!({ "ajaxListenerPath": true });
         let integration = DataDomeIntegration::new(config);
-        let document_state = trusted_server_core::integrations::IntegrationDocumentState::default();
-        let ctx = html_context_for_tests(&document_state);
-
-        let inserts = integration.head_inserts(&ctx);
+        let document_state = IntegrationDocumentState::default();
+        let inserts = integration.client_tag(&document_state);
 
         assert_eq!(inserts.len(), 1, "should emit one combined DataDome insert");
         assert!(
@@ -1562,18 +1592,16 @@ mod tests {
     }
 
     #[test]
-    fn head_injector_omits_client_side_tag_when_disabled_or_blank() {
+    fn head_markup_omits_client_side_tag_when_disabled_or_blank() {
         let mut suppressed = test_config();
         suppressed.client_side_key = "test-client-key".to_string();
         let suppressed_integration = DataDomeIntegration::new(suppressed);
-        let suppressed_state =
-            trusted_server_core::integrations::IntegrationDocumentState::default();
+        let suppressed_state = IntegrationDocumentState::default();
         suppressed_state
             .get_or_insert_with(DATADOME_INTEGRATION_ID, || DataDomeClientTagSuppressed);
-        let suppressed_ctx = html_context_for_tests(&suppressed_state);
         assert!(
             suppressed_integration
-                .head_inserts(&suppressed_ctx)
+                .client_tag(&suppressed_state)
                 .is_empty(),
             "should omit the tag when the request is IP-excluded"
         );
@@ -1581,10 +1609,9 @@ mod tests {
         let mut blank_key = test_config();
         blank_key.client_side_key = " ".to_string();
         let integration = DataDomeIntegration::new(blank_key);
-        let document_state = trusted_server_core::integrations::IntegrationDocumentState::default();
-        let ctx = html_context_for_tests(&document_state);
+        let document_state = IntegrationDocumentState::default();
         assert!(
-            integration.head_inserts(&ctx).is_empty(),
+            integration.client_tag(&document_state).is_empty(),
             "should not inject a tag without a client-side key"
         );
 
@@ -1593,7 +1620,7 @@ mod tests {
         disabled.inject_client_side_tag = false;
         let integration = DataDomeIntegration::new(disabled);
         assert!(
-            integration.head_inserts(&ctx).is_empty(),
+            integration.client_tag(&document_state).is_empty(),
             "should not inject a tag when injection is disabled"
         );
     }
@@ -1641,24 +1668,50 @@ mod tests {
     }
 
     #[test]
-    fn attribute_rewriter_matches_datadome() {
-        let integration = DataDomeIntegration::new(test_config());
+    fn the_tag_middleware_is_named_after_the_module() {
+        assert_eq!(
+            TAG_MIDDLEWARE,
+            trusted_server_core::module_name!("tag"),
+            "should be the module's name with a part of its own"
+        );
+    }
 
-        // Should handle both src and href attributes
-        assert!(integration.handles_attribute("src"));
-        assert!(integration.handles_attribute("href"));
-        assert!(!integration.handles_attribute("data-src"));
+    #[test]
+    fn the_sdk_rewrite_is_off_without_rewrite_sdk() {
+        let mut config = test_config();
+        config.rewrite_sdk = false;
+        let document_state = IntegrationDocumentState::default();
+        let context = trusted_server_core::middleware::test_support::context(
+            MiddlewarePhase::Fetch,
+            &document_state,
+        );
 
-        let ctx = IntegrationAttributeContext {
-            attribute_name: "src",
-            element_name: "script",
-            request_host: "publisher.com",
-            request_scheme: "https",
-            origin_host: "origin.publisher.com",
-        };
+        assert!(
+            SdkAddress(DataDomeIntegration::new(config))
+                .create(&context)
+                .is_pass(),
+            "should leave every page alone when rewrite_sdk is false"
+        );
+    }
+
+    #[test]
+    fn element_handler_matches_datadome() {
+        // Should judge both src and href attributes, and no other
+        let document_state = IntegrationDocumentState::default();
+        let context = trusted_server_core::middleware::test_support::context(
+            MiddlewarePhase::Fetch,
+            &document_state,
+        );
+        let action = SdkAddress(DataDomeIntegration::new(test_config())).create(&context);
+        let judged: Vec<&str> = action
+            .element_handlers
+            .iter()
+            .map(|handler| handler.attribute())
+            .collect();
+        assert_eq!(judged, ["src", "href"]);
 
         // Should rewrite DataDome URLs in src
-        let action = integration.rewrite("src", "https://js.datadome.co/tags.js", &ctx);
+        let action = DataDomeIntegration::rewrite_sdk_address("https://js.datadome.co/tags.js");
         match action {
             AttributeRewriteAction::Replace(new_url) => {
                 assert_eq!(new_url, "/integrations/datadome/tags.js");
@@ -1667,7 +1720,7 @@ mod tests {
         }
 
         // Should rewrite DataDome URLs in href (for link preload/prefetch)
-        let action = integration.rewrite("href", "https://js.datadome.co/tags.js", &ctx);
+        let action = DataDomeIntegration::rewrite_sdk_address("https://js.datadome.co/tags.js");
         match action {
             AttributeRewriteAction::Replace(new_url) => {
                 assert_eq!(new_url, "/integrations/datadome/tags.js");
@@ -1676,24 +1729,14 @@ mod tests {
         }
 
         // Should not rewrite other URLs
-        let action = integration.rewrite("src", "https://example.com/script.js", &ctx);
+        let action = DataDomeIntegration::rewrite_sdk_address("https://example.com/script.js");
         assert!(matches!(action, AttributeRewriteAction::Keep));
     }
 
     #[test]
-    fn attribute_rewriter_preserves_path() {
-        let integration = DataDomeIntegration::new(test_config());
-
-        let ctx = IntegrationAttributeContext {
-            attribute_name: "src",
-            element_name: "script",
-            request_host: "publisher.com",
-            request_scheme: "https",
-            origin_host: "origin.publisher.com",
-        };
-
+    fn element_handler_preserves_path() {
         // Should preserve /js/... paths for signal collection API
-        let action = integration.rewrite("src", "https://js.datadome.co/js/check", &ctx);
+        let action = DataDomeIntegration::rewrite_sdk_address("https://js.datadome.co/js/check");
         match action {
             AttributeRewriteAction::Replace(new_url) => {
                 assert_eq!(new_url, "/integrations/datadome/js/check");
@@ -1702,7 +1745,7 @@ mod tests {
         }
 
         // Should handle protocol-relative URLs
-        let action = integration.rewrite("href", "//js.datadome.co/js/signal", &ctx);
+        let action = DataDomeIntegration::rewrite_sdk_address("//js.datadome.co/js/signal");
         match action {
             AttributeRewriteAction::Replace(new_url) => {
                 assert_eq!(new_url, "/integrations/datadome/js/signal");
@@ -1711,7 +1754,7 @@ mod tests {
         }
 
         // Bare domain without path should default to /tags.js
-        let action = integration.rewrite("src", "https://js.datadome.co", &ctx);
+        let action = DataDomeIntegration::rewrite_sdk_address("https://js.datadome.co");
         match action {
             AttributeRewriteAction::Replace(new_url) => {
                 assert_eq!(new_url, "/integrations/datadome/tags.js");
@@ -1763,7 +1806,10 @@ mod tests {
     const PUBLISHER_TAGGED_DOCUMENT: &[u8] = br#"<html><head><script id="publisher-datadome" src="https://js.datadome.co/tags.js"></script></head><body>content</body></html>"#;
 
     fn process_document(suppress: bool) -> String {
-        use trusted_server_core::html_processor::{HtmlProcessorConfig, create_html_processor};
+        use trusted_server_core::html_processor::HtmlProcessorConfig;
+        use trusted_server_core::html_processor::test_support::{
+            create_page_processor, place_on_every_page,
+        };
         use trusted_server_core::integrations::{IntegrationRegistry, IntegrationRequestState};
         use trusted_server_core::streaming_processor::StreamProcessor as _;
 
@@ -1775,6 +1821,8 @@ mod tests {
                 &serde_json::json!({ "client_side_key": "test-client-key" }),
             )
             .expect("should configure DataDome integration");
+        place_on_every_page(&mut settings, MiddlewarePhase::Fetch, &[MODULE]);
+        place_on_every_page(&mut settings, MiddlewarePhase::Serve, &[TAG_MIDDLEWARE]);
         let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
             .expect("should create integration registry with DataDome");
         let mut request = http::Request::builder()
@@ -1792,7 +1840,7 @@ mod tests {
             "https",
         )
         .with_request_state(IntegrationRequestState::of(&request));
-        let mut processor = create_html_processor(config);
+        let mut processor = create_page_processor(&settings, &registry, config);
 
         let output = processor
             .process_chunk(PUBLISHER_TAGGED_DOCUMENT, true)
@@ -2041,6 +2089,23 @@ mod tests {
         assert!(
             format!("{error:?}").contains("account_id"),
             "should identify the removed field: {error:?}"
+        );
+    }
+
+    /// The page a reader receives with this module running, kept as a file
+    /// so that changing how the page change is made can be shown to leave
+    /// the page as it was.
+    #[test]
+    fn the_page_a_reader_receives_is_the_recorded_one() {
+        trusted_server_core::html_processor::test_support::assert_page_is_recorded(
+            include_str!("fixtures/page-change.settings.toml"),
+            &[super::builder()],
+            include_str!("fixtures/page-change.input.html"),
+            include_str!("fixtures/page-change.recorded.html"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/fixtures/page-change.recorded.html"
+            ),
         );
     }
 }

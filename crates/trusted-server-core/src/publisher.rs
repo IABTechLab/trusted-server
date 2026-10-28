@@ -637,6 +637,8 @@ struct ProcessResponseParams<'a> {
     origin_url: &'a str,
     request_host: &'a str,
     request_scheme: &'a str,
+    /// See [`OwnedProcessResponseParams::request_path`].
+    request_path: &'a str,
     settings: &'a Settings,
     content_type: &'a str,
     integration_registry: &'a IntegrationRegistry,
@@ -683,6 +685,7 @@ impl PublisherBodyProcessor {
                 origin_host: &params.origin_host,
                 request_host: &params.request_host,
                 request_scheme: &params.request_scheme,
+                request_path: &params.request_path,
                 settings,
                 integration_registry,
                 permissions_script: permissions_script_for(params, settings),
@@ -767,6 +770,7 @@ fn process_response_streaming<W: Write>(
             origin_host: params.origin_host,
             request_host: params.request_host,
             request_scheme: params.request_scheme,
+            request_path: params.request_path,
             settings: params.settings,
             integration_registry: params.integration_registry,
             permissions_script: params.permissions_script.map(str::to_string),
@@ -1324,6 +1328,8 @@ struct HtmlStreamProcessorParams<'a> {
     origin_host: &'a str,
     request_host: &'a str,
     request_scheme: &'a str,
+    /// See [`OwnedProcessResponseParams::request_path`].
+    request_path: &'a str,
     settings: &'a Settings,
     integration_registry: &'a IntegrationRegistry,
     /// Head script carrying this request's permission state, or [`None`] under a
@@ -1331,8 +1337,8 @@ struct HtmlStreamProcessorParams<'a> {
     permissions_script: Option<String>,
     ad_slots_script: Option<String>,
     ad_bids_state: Arc<Mutex<Option<String>>>,
-    /// What modules left on the request for their page hooks. See
-    /// [`template_request_state`].
+    /// What modules left on the request, which the `[[serve]]` entry's
+    /// middleware read where that entry runs on this pass.
     request_state: IntegrationRequestState,
     /// Whether a shared template was authorized for this response.
     ///
@@ -1343,25 +1349,6 @@ struct HtmlStreamProcessorParams<'a> {
     csp_nonce_observed: Option<Arc<AtomicBool>>,
     /// Request-specific parser marker used by a pending inline auction.
     deferred_inline_marker: Option<String>,
-}
-
-/// The request state a document's page hooks may read.
-///
-/// What a module leaves on a request is made for that one request, so it
-/// must not reach a template that is stored and served to other readers.
-///
-/// [`handle_publisher_request`] already keeps a request that carries any off
-/// the shared template path, so a shared mode never sees one today. This
-/// makes the same guarantee where the document is built, so that neither
-/// place depends on the other.
-pub(crate) fn template_request_state(
-    mode: AssemblyMode,
-    request_state: IntegrationRequestState,
-) -> IntegrationRequestState {
-    match mode {
-        AssemblyMode::Inline => request_state,
-        AssemblyMode::Esi => IntegrationRequestState::default(),
-    }
 }
 
 /// The marker emitted at the `</body>` seam under [`AssemblyMode::Esi`], reserving the
@@ -1520,7 +1507,8 @@ fn deferred_inline_seam_token(
 fn create_html_stream_processor(
     params: HtmlStreamProcessorParams<'_>,
 ) -> Result<impl StreamProcessor + use<>, Report<TrustedServerError>> {
-    use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
+    use crate::html_processor::{HtmlProcessorConfig, create_html_processor_with_middleware};
+    use crate::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
 
     let config = HtmlProcessorConfig::from_settings(
         params.settings,
@@ -1538,8 +1526,6 @@ fn create_html_stream_processor(
         _ => body_close_injection(assembly_mode, params.ad_slots_script.is_some()),
     };
 
-    let request_state = template_request_state(assembly_mode, params.request_state);
-
     // Only a response that can be stored has a consumer for the observation, so the
     // handlers are not registered for ordinary inline traffic.
     let csp_nonce_observed = params
@@ -1550,11 +1536,100 @@ fn create_html_stream_processor(
     let config = config
         .with_permissions_script(params.permissions_script)
         .with_ad_state(params.ad_slots_script, params.ad_bids_state)
-        .with_request_state(request_state)
+        .with_request_state(params.request_state)
         .with_body_close(body_close)
         .with_csp_nonce_observer(csp_nonce_observed);
 
-    Ok(create_html_processor(config))
+    // The middleware of the first [[fetch]] entry covering this path.
+    let fetch = params.integration_registry.middleware_chain(
+        &params.settings.fetch,
+        MiddlewarePhase::Fetch,
+        HTML_MEDIA_TYPE,
+        params.request_path,
+    );
+    // A response that may be stored leaves this processor as the template
+    // every reader shares, so its [[serve]] entry runs on each reader's copy
+    // once that copy is assembled. See `run_serve_pass`.
+    let serve = (!params.shared_template_authorized).then(|| {
+        params.integration_registry.middleware_chain(
+            &params.settings.serve,
+            MiddlewarePhase::Serve,
+            HTML_MEDIA_TYPE,
+            params.request_path,
+        )
+    });
+    create_html_processor_with_middleware(config, &fetch, serve.as_ref())
+        .map_err(|message| Report::new(TrustedServerError::Configuration { message }))
+}
+
+/// The processor that carries out the `[[serve]]` entry covering this request
+/// on a reader's copy that is assembled and not yet encoded, or `None` when
+/// no entry covers the request or its middleware have nothing to do.
+///
+/// The origin host is read from the settings. A page served from the store
+/// keeps no record of it, and a serve middleware is told the same about a
+/// page from the store as about one fetched for this request.
+fn reader_serve_processor(
+    params: &OwnedProcessResponseParams,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) -> Result<Option<Box<dyn StreamProcessor>>, Report<TrustedServerError>> {
+    use crate::html_processor::{ReaderDocument, create_serve_processor};
+    use crate::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
+
+    if !is_html_content_type(&params.content_type) {
+        return Ok(None);
+    }
+    let chain = integration_registry.middleware_chain(
+        &settings.serve,
+        MiddlewarePhase::Serve,
+        HTML_MEDIA_TYPE,
+        &params.request_path,
+    );
+    let origin_host = settings.publisher.origin_host();
+    create_serve_processor(
+        &chain,
+        &ReaderDocument {
+            request_host: &params.request_host,
+            request_scheme: &params.request_scheme,
+            origin_host: &origin_host,
+            request_state: &params.request_state,
+            max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
+        },
+    )
+    .map_err(|message| Report::new(TrustedServerError::Configuration { message }))
+}
+
+/// Runs the `[[serve]]` entry covering this request over a reader's whole
+/// copy, assembled and not yet encoded.
+fn run_serve_pass(
+    bytes: Vec<u8>,
+    params: &OwnedProcessResponseParams,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) -> Result<Vec<u8>, Report<TrustedServerError>> {
+    let Some(mut processor) = reader_serve_processor(params, settings, integration_registry)?
+    else {
+        return Ok(bytes);
+    };
+    processor
+        .process_chunk(&bytes, true)
+        .change_context(TrustedServerError::Proxy {
+            message: "a serve middleware could not rewrite the page".to_string(),
+        })
+}
+
+/// One piece of a streamed reader's copy through the `[[serve]]` entry, when
+/// one covers the request.
+fn serve_chunk(
+    serve: &mut Option<Box<dyn StreamProcessor>>,
+    bytes: Vec<u8>,
+    is_last: bool,
+) -> Result<Vec<u8>, std::io::Error> {
+    match serve {
+        Some(processor) => processor.process_chunk(&bytes, is_last),
+        None => Ok(bytes),
+    }
 }
 
 /// Result of publisher request handling, indicating whether the response body
@@ -1738,6 +1813,9 @@ pub struct OwnedProcessResponseParams {
     pub(crate) origin_url: String,
     pub(crate) request_host: String,
     pub(crate) request_scheme: String,
+    /// The path the reader asked for, which decides the `[[fetch]]` and
+    /// `[[serve]]` entries that cover the document.
+    pub(crate) request_path: String,
     pub(crate) content_type: String,
     pub(crate) ad_slots_script: Option<String>,
     pub(crate) ad_bids_state: AdBidsState,
@@ -1751,7 +1829,8 @@ pub struct OwnedProcessResponseParams {
     pub(crate) dispatched_auction: Option<DispatchedAuction>,
     /// Price granularity used to bucket bids when building `tsjs.bids`.
     pub(crate) price_granularity: PriceGranularity,
-    /// What modules left on the request for their page hooks.
+    /// What modules left on the request, for their serve middleware and
+    /// their response finalizers.
     pub(crate) request_state: IntegrationRequestState,
     /// Set by the transform when the document carries a response-bound CSP nonce.
     ///
@@ -1967,6 +2046,9 @@ pub async fn buffer_publisher_response_async(
                 set_assembly_response_state(&mut response, state);
             }
             let bytes = if was_authorized {
+                // The [[serve]] entry runs here on a shared template, and
+                // inside the transform on a page that was never authorized.
+                let bytes = run_serve_pass(bytes, &params, settings, integration_registry)?;
                 encode_complete_body(bytes, response_compression(&response))?
             } else {
                 bytes
@@ -2016,6 +2098,7 @@ pub async fn buffer_publisher_response_async(
             assembled.extend_from_slice(head);
             assembled.extend_from_slice(seam.as_bytes());
             assembled.extend_from_slice(tail);
+            let assembled = run_serve_pass(assembled, &params, settings, integration_registry)?;
             let assembled = encode_complete_body(assembled, response_compression(&response))?;
             response.headers_mut().insert(
                 http::header::CONTENT_LENGTH,
@@ -2208,6 +2291,8 @@ fn build_template_assembly_params(
         origin_url: settings.publisher.origin_url.clone(),
         request_host: request_host.to_string(),
         request_scheme: request_scheme.to_string(),
+        // Set by the caller, with the rest of what belongs to the request.
+        request_path: String::new(),
         content_type: entry.metadata.content_type.clone(),
         // The template already carries the head seam; re-injecting would duplicate it.
         permissions_json,
@@ -2516,6 +2601,23 @@ pub async fn publisher_response_into_streaming_response(
                 return Ok(response);
             }
 
+            // Planned before the lazy body is built, so a serve entry that
+            // cannot run fails the response while it still can be failed.
+            let mut serve = match reader_serve_processor(&params, &settings, integration_registry) {
+                Ok(serve) => serve,
+                Err(err) => {
+                    if let Some(dispatched) = params.dispatched_auction.take() {
+                        emit_abandoned_auction(
+                            &services,
+                            params.auction_observation.take(),
+                            dispatched,
+                            "processor_init_error",
+                        )
+                        .await;
+                    }
+                    return Err(err);
+                }
+            };
             let services = services.clone();
             let settings = Arc::clone(&settings);
             let orchestrator = Arc::clone(&orchestrator);
@@ -2539,8 +2641,10 @@ pub async fn publisher_response_into_streaming_response(
                 let (head, tail) = split_template_at_seam(&template)
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
                 let mut encoder = BodyStreamEncoder::new(compression);
+                // Each piece goes through the serve entry as it leaves, so
+                // the head is still written before the auction is awaited.
                 let encoded_head = encoder
-                    .encode_chunk(head.to_vec())
+                    .encode_chunk(serve_chunk(&mut serve, head.to_vec(), false)?)
                     .map_err(publisher_stream_error)?;
                 if !encoded_head.is_empty() {
                     yield bytes::Bytes::from(encoded_head);
@@ -2571,14 +2675,14 @@ pub async fn publisher_response_into_streaming_response(
                 let seam = seam_script_for(&params);
                 if !seam.is_empty() {
                     let encoded_seam = encoder
-                        .encode_chunk(seam.into_bytes())
+                        .encode_chunk(serve_chunk(&mut serve, seam.into_bytes(), false)?)
                         .map_err(publisher_stream_error)?;
                     if !encoded_seam.is_empty() {
                         yield bytes::Bytes::from(encoded_seam);
                     }
                 }
                 let encoded_tail = encoder
-                    .encode_chunk(tail.to_vec())
+                    .encode_chunk(serve_chunk(&mut serve, tail.to_vec(), true)?)
                     .map_err(publisher_stream_error)?;
                 if !encoded_tail.is_empty() {
                     yield bytes::Bytes::from(encoded_tail);
@@ -2977,6 +3081,7 @@ pub fn stream_publisher_body<W: Write>(
         origin_url: &params.origin_url,
         request_host: &params.request_host,
         request_scheme: &params.request_scheme,
+        request_path: &params.request_path,
         settings,
         content_type: &params.content_type,
         integration_registry,
@@ -3083,6 +3188,7 @@ pub async fn stream_publisher_body_async<W: Write>(
         origin_host: &params.origin_host,
         request_host: &params.request_host,
         request_scheme: &params.request_scheme,
+        request_path: &params.request_path,
         settings,
         integration_registry,
         permissions_script: permissions_script_for(params, settings),
@@ -5227,6 +5333,7 @@ pub async fn handle_publisher_request(
                         ad_bids_state.clone(),
                         permissions_json.clone(),
                     );
+                    params.request_path.clone_from(&request_path);
                     params.seam_ad_slots = seam_ad_slots.clone();
                     params.dispatched_auction = dispatched_auction.take();
                     params.auction_observation = auction_observation.take();
@@ -5617,6 +5724,7 @@ pub async fn handle_publisher_request(
                     origin_url: settings.publisher.origin_url.clone(),
                     request_host: request_host.to_string(),
                     request_scheme: request_scheme.to_string(),
+                    request_path: request_path.clone(),
                     content_type,
                     permissions_json,
                     ad_slots_script: ad_slots_script.clone(),
@@ -7934,9 +8042,8 @@ mod tests {
             &[SCHEDULING_PROVIDER],
         );
         settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
-        settings.select_module(
-            "testing",
-            crate::integrations::registry_test_support::request_fixture::MODULE,
+        crate::integrations::registry_test_support::request_fixture::select_and_place(
+            &mut settings,
         );
         settings
     }
@@ -9263,6 +9370,7 @@ mod tests {
             origin_url: settings.publisher.origin_url.clone(),
             request_host: settings.publisher.domain.clone(),
             request_scheme: "https".to_owned(),
+            request_path: "/".to_owned(),
             content_type: "application/json".to_owned(),
             permissions_json: String::new(),
             ad_slots_script: None,
@@ -9315,9 +9423,8 @@ mod tests {
     #[test]
     fn stream_publisher_body_writes_what_a_module_left_on_the_request_into_materialized_html() {
         let mut settings = create_test_settings();
-        settings.select_module(
-            "testing",
-            crate::integrations::registry_test_support::request_fixture::MODULE,
+        crate::integrations::registry_test_support::request_fixture::select_and_place(
+            &mut settings,
         );
         let integration_registry =
             IntegrationRegistry::new(&settings).expect("should create integration registry");
@@ -9495,17 +9602,19 @@ mod tests {
         //! passing code: the decisions were right and nothing checked what the
         //! composition of them *renders*.
         //!
-        //! These tests render whole documents through `create_html_processor`,
-        //! composing the same three decisions `create_html_stream_processor` uses,
-        //! and compare bytes. A future request-dependent injection added at either
-        //! seam fails here even if every decision function is left untouched.
+        //! These tests render whole documents through the processor
+        //! `create_html_stream_processor` builds, composing the same decisions it
+        //! uses, and compare bytes. A future request-dependent injection added at
+        //! either seam fails here even if every decision function is left untouched.
 
         use super::template_neutrality_tests::{settings_with_slots, slot};
         use super::*;
         use crate::creative_opportunities::AssemblyMode;
-        use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
+        use crate::html_processor::{HtmlProcessorConfig, create_html_processor_with_middleware};
         use crate::integrations::IntegrationRegistry;
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
         use crate::integrations::registry_test_support::request_fixture;
+        use crate::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
 
         const DOCUMENT: &[u8] =
             b"<html><head><title>t</title></head><body><p>content</p></body></html>";
@@ -9516,7 +9625,7 @@ mod tests {
         struct RequestShape {
             /// Folds in consent, bot classification, prefetch and the kill switch.
             ad_stack_ran: bool,
-            /// A module left state on the request for its page hooks.
+            /// A module left state on the request for its serve middleware.
             module_state_left: bool,
             /// A resolved auction, present only when one was dispatched.
             bids_available: bool,
@@ -9528,22 +9637,29 @@ mod tests {
             let mut settings = settings_with_slots();
             settings.proxy.allowed_domains =
                 vec!["*.example".to_string(), "*.example.com".to_string()];
-            // The stand-in is what writes a marked request's state into a
-            // document, so it runs for every shape.
+            // The request stand-in is what writes a marked request's state
+            // into a document, so it runs for every shape. The reader
+            // middleware beside it writes into every reader's copy, marked or
+            // not, so a template that ran the serve entry would show it.
             settings.select_module("testing", request_fixture::MODULE);
+            settings.select_module("testing", fixture::MODULE);
+            crate::html_processor::test_support::place_on_every_page(
+                &mut settings,
+                MiddlewarePhase::Serve,
+                &[request_fixture::MODULE, fixture::READER],
+            );
+            let registry = IntegrationRegistry::new(&settings)
+                .expect("should build a registry that runs the stand-in");
             let slots = [slot()];
 
             let ad_slots_script =
                 template_ad_slots_script(mode, shape.ad_stack_ran, &settings, &slots, "/");
             let body_close = body_close_injection(mode, ad_slots_script.is_some());
-            let request_state = template_request_state(
-                mode,
-                if shape.module_state_left {
-                    request_fixture::marked()
-                } else {
-                    IntegrationRequestState::default()
-                },
-            );
+            let request_state = if shape.module_state_left {
+                request_fixture::marked()
+            } else {
+                IntegrationRequestState::default()
+            };
 
             let ad_bids_state =
                 std::sync::Arc::new(std::sync::Mutex::new(shape.bids_available.then(|| {
@@ -9555,8 +9671,7 @@ mod tests {
                 origin_host: "origin.example.com".to_string(),
                 request_host: "example.com".to_string(),
                 request_scheme: "https".to_string(),
-                integrations: IntegrationRegistry::new(&settings)
-                    .expect("should build a registry that runs the stand-in"),
+                integrations: registry.clone(),
                 permissions_script: template_permissions_script(mode, &permissions_json_fixture()),
                 ad_slots_script,
                 ad_bids_state,
@@ -9565,7 +9680,27 @@ mod tests {
                 body_close,
             };
 
-            let mut processor = create_html_processor(config);
+            let fetch = registry.middleware_chain(
+                &settings.fetch,
+                MiddlewarePhase::Fetch,
+                HTML_MEDIA_TYPE,
+                "/",
+            );
+            // A shared mode builds the template every reader shares, which is
+            // the response `create_html_stream_processor` runs no serve entry
+            // on.
+            let shared_template_authorized = matches!(mode, AssemblyMode::Esi);
+            let serve = (!shared_template_authorized).then(|| {
+                registry.middleware_chain(
+                    &settings.serve,
+                    MiddlewarePhase::Serve,
+                    HTML_MEDIA_TYPE,
+                    "/",
+                )
+            });
+            let mut processor =
+                create_html_processor_with_middleware(config, &fetch, serve.as_ref())
+                    .expect("should plan the document's middleware");
             let out = processor
                 .process_chunk(DOCUMENT, true)
                 .expect("should process the document");
@@ -9646,6 +9781,7 @@ mod tests {
                 "permissions",
                 request_fixture::HEAD_FLAG,
                 request_fixture::MODULE_FILE,
+                fixture::READER_SCRIPT,
             ] {
                 assert!(
                     !rendered.contains(forbidden),
@@ -9727,6 +9863,12 @@ mod tests {
                 !unmarked.contains(request_fixture::HEAD_FLAG)
                     && !unmarked.contains(request_fixture::MODULE_FILE),
                 "a request no module left state on should get neither:\n{unmarked}"
+            );
+            assert!(
+                rendered.contains(fixture::READER_SCRIPT)
+                    && unmarked.contains(fixture::READER_SCRIPT),
+                "an inline document is one reader's copy, so the serve entry should run on \
+                 it whatever the request left:\n{unmarked}"
             );
         }
 
@@ -9885,6 +10027,50 @@ mod tests {
         }
 
         #[test]
+        fn the_fetch_entries_change_the_fingerprint() {
+            use crate::integrations::registry_test_support::middleware_fixture as fixture;
+            use crate::middleware::{HTML_MEDIA_TYPE, PhaseEntries, PhaseEntry};
+
+            // What a fetch middleware writes is stored with the template, so
+            // which run, in what order and on which paths all select one.
+            let fingerprint_with = |entries: &[(Option<&str>, &[&str])]| {
+                let mut settings = create_test_settings();
+                settings.select_module("testing", fixture::MODULE);
+                settings.fetch = PhaseEntries::new(
+                    entries
+                        .iter()
+                        .map(|(path, names)| PhaseEntry {
+                            media_type: HTML_MEDIA_TYPE.to_owned(),
+                            path: path.map(str::to_owned),
+                            middleware: names.iter().map(|name| (*name).to_owned()).collect(),
+                        })
+                        .collect(),
+                );
+                fingerprint(&settings)
+            };
+
+            let fingerprints = [
+                fingerprint_with(&[]),
+                fingerprint_with(&[(None, &[fixture::HEAD])]),
+                fingerprint_with(&[(None, &[fixture::HEAD, fixture::LINKS])]),
+                fingerprint_with(&[(None, &[fixture::LINKS, fixture::HEAD])]),
+                fingerprint_with(&[(Some("/news/"), &[fixture::HEAD])]),
+            ];
+
+            for (index, fingerprint) in fingerprints.iter().enumerate() {
+                assert!(
+                    !fingerprints[..index].contains(fingerprint),
+                    "entries {index} must select a template of their own"
+                );
+            }
+            assert_eq!(
+                fingerprint_with(&[(None, &[fixture::HEAD])]),
+                fingerprints[1],
+                "the same entries must select the same template"
+            );
+        }
+
+        #[test]
         fn production_fingerprint_uses_the_generated_build_digest() {
             let settings = settings_with_integration(true, 1000);
             assert_eq!(
@@ -9936,8 +10122,8 @@ mod tests {
 
         #[test]
         fn reconfiguring_an_integration_changes_the_fingerprint() {
-            // Config reaches the template directly: an integration's head insert
-            // carries its settings into bytes shared between readers.
+            // Config reaches the template directly: a middleware's head markup
+            // carries its module's settings into bytes shared between readers.
             assert_ne!(
                 fingerprint(&settings_with_integration(true, 1000)),
                 fingerprint(&settings_with_integration(true, 2500)),
@@ -10817,8 +11003,9 @@ mod tests {
             request
         }
 
-        /// A navigation a module left state on for its page hooks, the way a
-        /// real one arrives: on the request, left by a preparer or a filter.
+        /// A navigation a module left state on for its serve middleware, the
+        /// way a real one arrives: on the request, left by a preparer or a
+        /// filter.
         fn marked_navigation_request() -> Request<EdgeBody> {
             let mut request = navigation_request();
             crate::integrations::registry_test_support::request_fixture::mark(&mut request);
@@ -11161,6 +11348,468 @@ mod tests {
                 last_summary_row(&sink).is_some(),
                 "the harness must emit a summary row, or every assertion built on it is vacuous"
             );
+        }
+
+        /// [`settings_with_mode`], with core's middleware stand-in selected
+        /// under `label` and one `[[fetch]]` entry naming `names` for `path`.
+        fn settings_with_fetch_entry(
+            mode: &str,
+            label: &str,
+            path: Option<&str>,
+            names: &[&str],
+        ) -> Settings {
+            use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+            let mut settings = settings_with_mode(mode);
+            settings
+                .insert_module_config(
+                    "testing",
+                    fixture::MODULE,
+                    &serde_json::json!({ "label": label }),
+                )
+                .expect("should select the middleware stand-in");
+            settings.fetch =
+                crate::middleware::PhaseEntries::new(vec![crate::middleware::PhaseEntry {
+                    media_type: crate::middleware::HTML_MEDIA_TYPE.to_owned(),
+                    path: path.map(str::to_owned),
+                    middleware: names.iter().map(|name| (*name).to_owned()).collect(),
+                }]);
+            settings
+        }
+
+        /// [`navigation_request`], for another path of the same site.
+        fn navigation_request_for(path: &str) -> Request<EdgeBody> {
+            let mut request = navigation_request();
+            *request.uri_mut() = format!("https://ts.example.com{path}")
+                .parse()
+                .expect("should build the address");
+            request
+        }
+
+        async fn page_of(response: Response<EdgeBody>) -> String {
+            String::from_utf8(body_of(response).await).expect("should serve a UTF-8 page")
+        }
+
+        #[tokio::test]
+        async fn a_fetch_middleware_changes_a_page_under_the_path_its_entry_covers() {
+            use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+            for (finalizer, label) in [
+                (Finalizer::Streaming, "streamed"),
+                (Finalizer::Buffered, "buffered"),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                let services = services_with_cache_and_telemetry(
+                    Arc::clone(&stub),
+                    Arc::new(MemoryTemplateCache::default()),
+                    Arc::new(RecordingTelemetrySink::default()),
+                );
+                let settings = Arc::new(settings_with_fetch_entry(
+                    "inline",
+                    label,
+                    Some("/article"),
+                    &[fixture::HEAD],
+                ));
+                let marker = fixture::head_marker(label);
+
+                queue_shareable_html(&stub);
+                let covered =
+                    page_of(run_via(&settings, &services, navigation_request(), finalizer).await)
+                        .await;
+                assert_eq!(
+                    covered.matches(&marker).count(),
+                    1,
+                    "should run the entry's middleware once on a {label} page under its path, \
+                     with the module's own setting: {covered}"
+                );
+
+                queue_shareable_html(&stub);
+                let elsewhere = page_of(
+                    run_via(
+                        &settings,
+                        &services,
+                        navigation_request_for("/elsewhere"),
+                        finalizer,
+                    )
+                    .await,
+                )
+                .await;
+                assert!(
+                    elsewhere.contains("origin") && !elsewhere.contains(&marker),
+                    "should run nothing on a {label} page no entry covers: {elsewhere}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn what_a_fetch_middleware_writes_is_stored_with_the_shared_template() {
+            use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+            for (finalizer, label) in [
+                (Finalizer::Streaming, "streamed"),
+                (Finalizer::Buffered, "buffered"),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                let services = services_with_cache_and_telemetry(
+                    Arc::clone(&stub),
+                    Arc::new(MemoryTemplateCache::default()),
+                    Arc::new(RecordingTelemetrySink::default()),
+                );
+                let settings = Arc::new(settings_with_fetch_entry(
+                    "esi",
+                    label,
+                    None,
+                    &[fixture::HEAD],
+                ));
+                let marker = fixture::head_marker(label);
+                // One answer from the origin, so the second reader can only
+                // be served from the store.
+                queue_shareable_html(&stub);
+
+                let first =
+                    page_of(run_via(&settings, &services, navigation_request(), finalizer).await)
+                        .await;
+                let second =
+                    page_of(run_via(&settings, &services, navigation_request(), finalizer).await)
+                        .await;
+
+                assert_eq!(
+                    stub.recorded_cache_intents().len(),
+                    1,
+                    "should serve the second {label} reader from the stored template"
+                );
+                for (reader, page) in [("first", &first), ("second", &second)] {
+                    assert_eq!(
+                        page.matches(&marker).count(),
+                        1,
+                        "should serve the {reader} {label} reader what the middleware wrote, \
+                         once: {page}"
+                    );
+                }
+            }
+        }
+
+        /// One `[[serve]]` entry naming `names` for `path`.
+        fn serve_entry(path: Option<&str>, names: &[&str]) -> crate::middleware::PhaseEntries {
+            crate::middleware::PhaseEntries::new(vec![crate::middleware::PhaseEntry {
+                media_type: crate::middleware::HTML_MEDIA_TYPE.to_owned(),
+                path: path.map(str::to_owned),
+                middleware: names.iter().map(|name| (*name).to_owned()).collect(),
+            }])
+        }
+
+        /// Settings in `mode` whose fetch entry runs the stand-in's head
+        /// middleware on every page and whose serve entry runs its reader
+        /// middleware under `serve_path`.
+        fn settings_with_both_phases(
+            mode: &str,
+            label: &str,
+            serve_path: Option<&str>,
+        ) -> Settings {
+            use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+            let mut settings = settings_with_fetch_entry(mode, label, None, &[fixture::HEAD]);
+            settings.serve = serve_entry(serve_path, &[fixture::READER]);
+            settings
+        }
+
+        /// What the stand-in's reader middleware writes for a deployment
+        /// running `settings`, for a request that left a mark or did not.
+        fn reader_marker_for(settings: &Settings, marked: bool) -> String {
+            crate::integrations::registry_test_support::middleware_fixture::reader_marker(
+                &settings.publisher.origin_host(),
+                marked,
+            )
+        }
+
+        fn index_in(page: &str, needle: &str) -> usize {
+            page.find(needle)
+                .unwrap_or_else(|| panic!("should find `{needle}` in: {page}"))
+        }
+
+        #[tokio::test]
+        async fn a_reader_of_a_page_that_is_not_stored_gets_the_serve_entry() {
+            use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+            for (finalizer, label) in [
+                (Finalizer::Streaming, "streamed"),
+                (Finalizer::Buffered, "buffered"),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                let services = services_with_cache_and_telemetry(
+                    Arc::clone(&stub),
+                    Arc::new(MemoryTemplateCache::default()),
+                    Arc::new(RecordingTelemetrySink::default()),
+                );
+                let settings = Arc::new(settings_with_both_phases("inline", label, None));
+                let reader = reader_marker_for(&settings, false);
+                queue_shareable_html(&stub);
+
+                let page =
+                    page_of(run_via(&settings, &services, navigation_request(), finalizer).await)
+                        .await;
+
+                assert_eq!(
+                    page.matches(&reader).count(),
+                    1,
+                    "should run the serve entry once on a {label} page: {page}"
+                );
+                assert_eq!(page.matches(fixture::READER_SCRIPT).count(), 1);
+                let fetch_at = index_in(&page, &fixture::head_marker(label));
+                let reader_at = index_in(&page, &reader);
+                let bundle_at = index_in(&page, "id=\"trustedserver-js\"");
+                let after_at = index_in(&page, fixture::READER_SCRIPT);
+                assert!(
+                    fetch_at < reader_at && reader_at < bundle_at && bundle_at < after_at,
+                    "should write the serve entry's markup around the bundle, after the fetch \
+                     entry's: {page}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_reader_of_a_shared_template_gets_the_serve_entry_and_the_store_never_does() {
+            use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+            for (finalizer, label) in [
+                (Finalizer::Streaming, "streamed"),
+                (Finalizer::Buffered, "buffered"),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let services = services_with_cache_and_telemetry(
+                    Arc::clone(&stub),
+                    Arc::clone(&cache),
+                    Arc::new(RecordingTelemetrySink::default()),
+                );
+                let settings = Arc::new(settings_with_both_phases("esi", label, None));
+                // Told the same origin on the miss as on the hit, where the
+                // page's own record of it is empty.
+                let reader = reader_marker_for(&settings, false);
+                // One answer from the origin, so the second reader can only
+                // be served from the store.
+                queue_shareable_html(&stub);
+
+                let miss =
+                    page_of(run_via(&settings, &services, navigation_request(), finalizer).await)
+                        .await;
+                let hit =
+                    page_of(run_via(&settings, &services, navigation_request(), finalizer).await)
+                        .await;
+
+                assert_eq!(
+                    stub.recorded_cache_intents().len(),
+                    1,
+                    "should serve the second {label} reader from the stored template"
+                );
+                for (reader_of, page) in [("miss", &miss), ("hit", &hit)] {
+                    assert_eq!(
+                        page.matches(&reader).count(),
+                        1,
+                        "should run the serve entry once for the {label} reader of a \
+                         {reader_of}: {page}"
+                    );
+                    assert_eq!(
+                        page.matches(fixture::READER_SCRIPT).count(),
+                        1,
+                        "should write its markup after the bundle once on a {reader_of}: {page}"
+                    );
+                    assert_eq!(
+                        page.matches(&fixture::head_marker(label)).count(),
+                        1,
+                        "should serve what the fetch entry wrote once on a {reader_of}: {page}"
+                    );
+                }
+                let stored: Vec<String> = cache
+                    .entries
+                    .lock()
+                    .expect("should lock the stored templates")
+                    .values()
+                    .map(|entry| String::from_utf8_lossy(&entry.body).into_owned())
+                    .collect();
+                assert_eq!(stored.len(), 1, "should store one template");
+                assert!(
+                    stored[0].contains(&fixture::head_marker(label)),
+                    "should store what the fetch entry wrote: {}",
+                    stored[0]
+                );
+                assert!(
+                    !stored[0].contains("middleware-fixture-reader")
+                        && !stored[0].contains("data-fixture-reader"),
+                    "should store nothing the serve entry wrote: {}",
+                    stored[0]
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_page_from_the_store_sends_its_head_through_the_serve_entry_before_the_auction() {
+            // The streaming finalizer writes a stored page's head at once and
+            // waits for the auction only at the seam. The serve entry is a
+            // rewriter in that stream, so this checks it hands the head on
+            // instead of holding it until the page ends.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_both_phases("esi", "streamed", None));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+
+            let _ = run(&settings, &services, navigation_request()).await;
+            let hit = run(&settings, &services, navigation_request()).await;
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "the second request must be a hit, or this asserts nothing"
+            );
+            let EdgeBody::Stream(mut stream) = hit.into_body() else {
+                panic!("a page from the store must stream, not buffer");
+            };
+            let first = stream
+                .next()
+                .await
+                .expect("the stream should yield a first chunk")
+                .expect("the first chunk should read");
+            let first = String::from_utf8_lossy(&first);
+
+            assert!(
+                first.contains(&reader_marker_for(&settings, false))
+                    && first.contains("id=\"trustedserver-js\""),
+                "the first chunk must be the head, with what the serve entry wrote in it: \
+                 {first}"
+            );
+            assert!(
+                !first.contains("window.tsjs"),
+                "the first chunk must come before the bids script: {first}"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_request_path_picks_the_serve_entry() {
+            for (finalizer, label) in [
+                (Finalizer::Streaming, "streamed"),
+                (Finalizer::Buffered, "buffered"),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                let services = services_with_cache_and_telemetry(
+                    Arc::clone(&stub),
+                    Arc::new(MemoryTemplateCache::default()),
+                    Arc::new(RecordingTelemetrySink::default()),
+                );
+                let settings =
+                    Arc::new(settings_with_both_phases("inline", label, Some("/article")));
+                let reader = reader_marker_for(&settings, false);
+
+                queue_shareable_html(&stub);
+                let covered =
+                    page_of(run_via(&settings, &services, navigation_request(), finalizer).await)
+                        .await;
+                queue_shareable_html(&stub);
+                let elsewhere = page_of(
+                    run_via(
+                        &settings,
+                        &services,
+                        navigation_request_for("/elsewhere"),
+                        finalizer,
+                    )
+                    .await,
+                )
+                .await;
+
+                assert_eq!(
+                    covered.matches(&reader).count(),
+                    1,
+                    "should run the serve entry on a {label} page under its path: {covered}"
+                );
+                assert!(
+                    !elsewhere.contains("middleware-fixture-reader"),
+                    "should run no serve entry on a {label} page no entry covers: {elsewhere}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_serve_middleware_reads_what_a_request_left_and_that_page_is_not_stored() {
+            for (finalizer, label) in [
+                (Finalizer::Streaming, "streamed"),
+                (Finalizer::Buffered, "buffered"),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let services = services_with_cache_and_telemetry(
+                    Arc::clone(&stub),
+                    Arc::clone(&cache),
+                    Arc::new(RecordingTelemetrySink::default()),
+                );
+                // A shared mode, which a request that carries state of its
+                // own never takes.
+                let settings = Arc::new(settings_with_both_phases("esi", label, None));
+                queue_shareable_html(&stub);
+
+                let page = page_of(
+                    run_via(&settings, &services, marked_navigation_request(), finalizer).await,
+                )
+                .await;
+
+                assert_eq!(
+                    page.matches(&reader_marker_for(&settings, true)).count(),
+                    1,
+                    "should hand the serve middleware what the {label} request left: {page}"
+                );
+                assert!(
+                    cache
+                        .entries
+                        .lock()
+                        .expect("should lock the stored templates")
+                        .is_empty(),
+                    "should store nothing of a page made for one request"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_reader_with_an_auction_gets_the_serve_entry_and_its_bids() {
+            use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+            for mode in ["inline", "esi"] {
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let mut settings = settings_with_bidder(mode);
+                settings.select_module("testing", fixture::MODULE);
+                settings.serve = serve_entry(None, &[fixture::READER]);
+                let settings = Arc::new(settings);
+                let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                let reader = reader_marker_for(&settings, false);
+
+                // Bid first, page second: one queue, and the auction is
+                // dispatched before the origin fetch.
+                queue_bid_response(&stub);
+                queue_shareable_html(&stub);
+                let first =
+                    page_of(run_bidding(&settings, &services, navigation_request()).await).await;
+                // A second reader, whose page comes from the store under a
+                // shared mode and from the origin otherwise.
+                queue_bid_response(&stub);
+                if mode == "inline" {
+                    queue_shareable_html(&stub);
+                }
+                let second =
+                    page_of(run_bidding(&settings, &services, navigation_request()).await).await;
+
+                for (which, page) in [("first", &first), ("second", &second)] {
+                    assert_eq!(
+                        page.matches(&reader).count(),
+                        1,
+                        "should run the serve entry once for the {which} {mode} reader: {page}"
+                    );
+                    let bids_at = index_in(page, "3.50");
+                    assert!(
+                        bids_at < index_in(page, "</body>"),
+                        "should write the {which} {mode} reader's bid ahead of the end of the \
+                         body: {page}"
+                    );
+                }
+            }
         }
 
         /// Drive `handle_publisher_request` through the **EC-preload** fetch path.
@@ -13166,14 +13815,20 @@ mod tests {
         async fn two_pass_integration_templates_are_identical_across_request_shapes() {
             let mut settings = settings_with_mode("esi");
             settings.publisher.origin_url = "https://origin.example.com".to_owned();
-            settings.select_module(
-                "testing",
-                crate::integrations::registry_test_support::payload_fixture::MODULE,
+            crate::integrations::registry_test_support::payload_fixture::select_and_place(
+                &mut settings,
             );
             let registry = IntegrationRegistry::new(&settings).expect("should create registry");
             assert!(
-                !registry.html_stream_processor_factories().is_empty(),
-                "should exercise the stand-in's stream processor"
+                !registry
+                    .middleware_chain(
+                        &settings.fetch,
+                        crate::middleware::MiddlewarePhase::Fetch,
+                        crate::middleware::HTML_MEDIA_TYPE,
+                        "/",
+                    )
+                    .is_empty(),
+                "should exercise the stand-in's middleware, which supplies a stream processor"
             );
             let settings = Arc::new(settings);
             let html = br#"<html><head></head><body><script>fixture_payload("link=https://origin.example.com/page")</script><div id="test-slot"></div></body></html>"#;
@@ -13565,6 +14220,7 @@ mod tests {
                     }),
                 )
                 .expect("should insert the stand-in's table");
+            crate::integrations::registry_test_support::deferred_fixture::place(&mut settings);
             settings
         }
 
@@ -13607,9 +14263,20 @@ mod tests {
             queue_shareable_html(&stub);
             queue_shareable_html(&stub);
 
-            let _ = run(&first, &services, navigation_request()).await;
-            let _ = run(&second, &services, navigation_request()).await;
+            let first_page = String::from_utf8(
+                body_of(run(&first, &services, navigation_request()).await).await,
+            )
+            .expect("should serve the first configuration's page as UTF-8");
+            let second_page = String::from_utf8(
+                body_of(run(&second, &services, navigation_request()).await).await,
+            )
+            .expect("should serve the second configuration's page as UTF-8");
 
+            assert!(
+                first_page.contains("\"timeoutMs\":1000")
+                    && second_page.contains("\"timeoutMs\":2500"),
+                "each page should carry the markup its own configuration writes"
+            );
             let stored = stored_cache_keys(&cache);
             assert_eq!(
                 stored.len(),
@@ -14920,10 +15587,7 @@ mod tests {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let mut raw = settings_with_mode("esi");
-            raw.select_module(
-                "testing",
-                crate::integrations::registry_test_support::request_fixture::MODULE,
-            );
+            crate::integrations::registry_test_support::request_fixture::select_and_place(&mut raw);
             let settings = Arc::new(raw);
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
             queue_shareable_html(&stub);
@@ -15012,10 +15676,7 @@ mod tests {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let mut raw = settings_with_mode("esi");
-            raw.select_module(
-                "testing",
-                crate::integrations::registry_test_support::request_fixture::MODULE,
-            );
+            crate::integrations::registry_test_support::request_fixture::select_and_place(&mut raw);
             let settings = Arc::new(raw);
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
             queue_shareable_html(&stub);
@@ -15082,10 +15743,7 @@ mod tests {
                 .as_mut()
                 .expect("fixture configures creative opportunities")
                 .origin_is_cookie_independent = Some(true);
-            raw.select_module(
-                "testing",
-                crate::integrations::registry_test_support::request_fixture::MODULE,
-            );
+            crate::integrations::registry_test_support::request_fixture::select_and_place(&mut raw);
             let settings = Arc::new(raw);
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
             queue_shareable_html(&stub);
@@ -18237,9 +18895,8 @@ mod tests {
         async fn inactive_ad_stack_preserves_the_cache_privacy_of_a_request_a_module_acts_on() {
             // Arrange
             let mut settings = settings_with_disabled_ad_templates();
-            settings.select_module(
-                "testing",
-                crate::integrations::registry_test_support::request_fixture::MODULE,
+            crate::integrations::registry_test_support::request_fixture::select_and_place(
+                &mut settings,
             );
             let stub = Arc::new(StubHttpClient::new());
             queue_html_response_with_cache_control(&stub, "no-cache");
@@ -18906,9 +19563,8 @@ mod tests {
     #[tokio::test]
     async fn what_a_request_filter_leaves_survives_into_the_publisher_html_pipeline() {
         let mut settings = create_test_settings();
-        settings.select_module(
-            "testing",
-            crate::integrations::registry_test_support::request_fixture::MODULE,
+        crate::integrations::registry_test_support::request_fixture::select_and_place(
+            &mut settings,
         );
         let registry = IntegrationRegistry::new(&settings)
             .expect("should create integration registry with the stand-in");
@@ -20746,6 +21402,7 @@ mod tests {
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
             content_type: "text/css".to_string(),
             permissions_json: String::new(),
             ad_slots_script: None,
@@ -20780,6 +21437,294 @@ mod tests {
         );
     }
 
+    /// A selector is chosen for each document, so one that does not parse
+    /// cannot be refused when the settings load. The response is refused
+    /// instead of the parser panicking.
+    #[test]
+    fn a_middleware_whose_selector_does_not_parse_refuses_the_response() {
+        use crate::error::IntoHttpResponse as _;
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::middleware::{HTML_MEDIA_TYPE, PhaseEntries, PhaseEntry};
+
+        let mut settings = create_test_settings();
+        settings.select_module("testing", fixture::MODULE);
+        settings.fetch = PhaseEntries::new(vec![PhaseEntry {
+            media_type: HTML_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::BROKEN.to_owned()],
+        }]);
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let params = OwnedProcessResponseParams {
+            csp_nonce_observed: None,
+            template_cache_key: None,
+            seam_ad_slots: None,
+            policy_headers: Vec::new(),
+            content_encoding: String::new(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
+            content_type: "text/html; charset=utf-8".to_string(),
+            permissions_json: String::new(),
+            ad_slots_script: None,
+            ad_bids_state: AdBidsState::default(),
+            auction_observation: None,
+            auction_request: None,
+            dispatched_auction: None,
+            price_granularity: crate::price_bucket::PriceGranularity::default(),
+            request_state: IntegrationRequestState::default(),
+        };
+
+        let mut output = Vec::new();
+        let error = stream_publisher_body(
+            EdgeBody::from(b"<html><head></head><body><a href=\"/x\">x</a></body></html>".to_vec()),
+            &mut output,
+            &params,
+            &settings,
+            &registry,
+        )
+        .expect_err("should refuse a page whose middleware cannot run");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!(
+                "the fetch middleware `{}` cannot run",
+                fixture::BROKEN
+            )) && message.contains(&format!(
+                "`{}` is not a usable selector",
+                fixture::BROKEN_SELECTOR
+            )),
+            "should name the middleware and the selector: {message}"
+        );
+        assert_eq!(
+            error.current_context().status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should answer as a fault of the deployment's own"
+        );
+        assert!(output.is_empty(), "should write nothing of the page");
+    }
+
+    /// The same refusal through each finalizer, so an adapter answers with an
+    /// error where it would otherwise send the headers of a page it cannot
+    /// deliver.
+    #[tokio::test]
+    async fn a_middleware_whose_selector_does_not_parse_fails_the_response_through_each_finalizer()
+    {
+        use crate::error::IntoHttpResponse as _;
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::middleware::{HTML_MEDIA_TYPE, PhaseEntries, PhaseEntry};
+
+        let mut settings = create_test_settings();
+        settings.select_module("testing", fixture::MODULE);
+        settings.fetch = PhaseEntries::new(vec![PhaseEntry {
+            media_type: HTML_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::BROKEN.to_owned()],
+        }]);
+        let settings = Arc::new(settings);
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let orchestrator = Arc::new(AuctionOrchestrator::new(
+            crate::auction::test_support::legacy_auction_config(&settings),
+        ));
+        let services = noop_services();
+        let page = || PublisherResponse::Stream {
+            response: Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .body(EdgeBody::empty())
+                .expect("should build the response"),
+            body: EdgeBody::from(
+                b"<html><head></head><body><a href=\"/x\">x</a></body></html>".to_vec(),
+            ),
+            params: Box::new(OwnedProcessResponseParams {
+                csp_nonce_observed: None,
+                template_cache_key: None,
+                seam_ad_slots: None,
+                policy_headers: Vec::new(),
+                content_encoding: String::new(),
+                origin_host: "origin.example.com".to_string(),
+                origin_url: "https://origin.example.com".to_string(),
+                request_host: "proxy.example.com".to_string(),
+                request_scheme: "https".to_string(),
+                request_path: "/".to_owned(),
+                content_type: "text/html; charset=utf-8".to_string(),
+                permissions_json: String::new(),
+                ad_slots_script: None,
+                ad_bids_state: AdBidsState::default(),
+                auction_observation: None,
+                auction_request: None,
+                dispatched_auction: None,
+                price_granularity: crate::price_bucket::PriceGranularity::default(),
+                request_state: IntegrationRequestState::default(),
+            }),
+        };
+
+        let streamed = publisher_response_into_streaming_response(
+            page(),
+            &Method::GET,
+            Arc::clone(&settings),
+            &registry,
+            Arc::clone(&orchestrator),
+            services.clone(),
+        )
+        .await;
+        let buffered = buffer_publisher_response_async(
+            page(),
+            &Method::GET,
+            &settings,
+            &registry,
+            &orchestrator,
+            &services,
+        )
+        .await;
+
+        for (finalizer, result) in [("streaming", streamed), ("buffered", buffered)] {
+            let error = result
+                .err()
+                .unwrap_or_else(|| panic!("should fail the response in the {finalizer} finalizer"));
+            assert!(
+                error.to_string().contains(&format!(
+                    "the fetch middleware `{}` cannot run",
+                    fixture::BROKEN
+                )),
+                "should name the middleware in the {finalizer} finalizer: {error}"
+            );
+            assert_eq!(
+                error.current_context().status_code(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "should answer as a fault of the deployment's own in the {finalizer} finalizer"
+            );
+        }
+    }
+
+    /// A serve entry that cannot run fails the response at each place a page
+    /// leaves from, being a page that is not stored and a page from the
+    /// store, through each finalizer.
+    #[tokio::test]
+    async fn a_serve_middleware_whose_selector_does_not_parse_fails_the_response_wherever_it_leaves()
+     {
+        use crate::error::IntoHttpResponse as _;
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::middleware::{HTML_MEDIA_TYPE, PhaseEntries, PhaseEntry};
+
+        let mut settings = create_test_settings();
+        settings.select_module("testing", fixture::MODULE);
+        settings.serve = PhaseEntries::new(vec![PhaseEntry {
+            media_type: HTML_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::BROKEN_READER.to_owned()],
+        }]);
+        let settings = Arc::new(settings);
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let orchestrator = Arc::new(AuctionOrchestrator::new(
+            crate::auction::test_support::legacy_auction_config(&settings),
+        ));
+        let services = noop_services();
+        let response = || {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .body(EdgeBody::empty())
+                .expect("should build the response")
+        };
+        let params = || {
+            Box::new(OwnedProcessResponseParams {
+                csp_nonce_observed: None,
+                template_cache_key: None,
+                seam_ad_slots: None,
+                policy_headers: Vec::new(),
+                content_encoding: String::new(),
+                origin_host: "origin.example.com".to_string(),
+                origin_url: "https://origin.example.com".to_string(),
+                request_host: "proxy.example.com".to_string(),
+                request_scheme: "https".to_string(),
+                request_path: "/".to_owned(),
+                content_type: "text/html; charset=utf-8".to_string(),
+                permissions_json: String::new(),
+                ad_slots_script: None,
+                ad_bids_state: AdBidsState::default(),
+                auction_observation: None,
+                auction_request: None,
+                dispatched_auction: None,
+                price_granularity: crate::price_bucket::PriceGranularity::default(),
+                request_state: IntegrationRequestState::default(),
+            })
+        };
+        let from_the_origin = || PublisherResponse::Stream {
+            response: response(),
+            body: EdgeBody::from(
+                b"<html><head></head><body><a href=\"/x\">x</a></body></html>".to_vec(),
+            ),
+            params: params(),
+        };
+        let from_the_store = || PublisherResponse::AssembleTemplate {
+            response: response(),
+            template: format!(
+                "<html><head></head><body><a href=\"/x\">x</a>{AD_ASSEMBLY_SEAM}</body></html>"
+            )
+            .into_bytes(),
+            params: params(),
+        };
+
+        let mut results = Vec::new();
+        let pages: [(&str, &dyn Fn() -> PublisherResponse); 2] = [
+            ("from the origin", &from_the_origin),
+            ("from the store", &from_the_store),
+        ];
+        for (page, publisher_response) in pages {
+            results.push((
+                page,
+                "streaming",
+                publisher_response_into_streaming_response(
+                    publisher_response(),
+                    &Method::GET,
+                    Arc::clone(&settings),
+                    &registry,
+                    Arc::clone(&orchestrator),
+                    services.clone(),
+                )
+                .await,
+            ));
+            results.push((
+                page,
+                "buffered",
+                buffer_publisher_response_async(
+                    publisher_response(),
+                    &Method::GET,
+                    &settings,
+                    &registry,
+                    &orchestrator,
+                    &services,
+                )
+                .await,
+            ));
+        }
+
+        for (page, finalizer, result) in results {
+            let error = result.err().unwrap_or_else(|| {
+                panic!("should fail a page {page} in the {finalizer} finalizer")
+            });
+            assert!(
+                error.to_string().contains(&format!(
+                    "the serve middleware `{}` cannot run",
+                    fixture::BROKEN_READER
+                )),
+                "should name the middleware for a page {page} in the {finalizer} finalizer: \
+                 {error}"
+            );
+            assert_eq!(
+                error.current_context().status_code(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "should answer as a fault of the deployment's own for a page {page} in the \
+                 {finalizer} finalizer"
+            );
+        }
+    }
+
     /// Empty origin body on the streaming route must produce no output
     /// without erroring. Exercises the `Ok(0)` branch of `process_chunks`
     /// plus the processor's `is_last=true, chunk=[]` terminal call.
@@ -20805,6 +21750,7 @@ mod tests {
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
             permissions_json: String::new(),
             ad_slots_script: None,
@@ -20853,6 +21799,7 @@ mod tests {
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
             permissions_json: String::new(),
             ad_slots_script: None,
@@ -20981,6 +21928,7 @@ mod tests {
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
+                request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
                 permissions_json: String::new(),
                 ad_slots_script: None,
@@ -21047,6 +21995,7 @@ mod tests {
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
+                request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
                 permissions_json: String::new(),
                 ad_slots_script: None,
@@ -21116,6 +22065,7 @@ mod tests {
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
+                request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
                 permissions_json: String::new(),
                 ad_slots_script: None,
@@ -21185,6 +22135,7 @@ mod tests {
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
+                request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
                 permissions_json: String::new(),
                 ad_slots_script: None,
@@ -21254,6 +22205,7 @@ mod tests {
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
+                request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
                 permissions_json: String::new(),
                 ad_slots_script: None,
@@ -21303,6 +22255,7 @@ mod tests {
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
             content_type: "text/css".to_string(),
             permissions_json: String::new(),
             ad_slots_script: None,
@@ -21528,6 +22481,7 @@ mod tests {
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
+                request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
                 permissions_json: String::new(),
                 ad_slots_script: Some(
@@ -21605,6 +22559,7 @@ mod tests {
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
+                request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
                 permissions_json: String::new(),
                 ad_slots_script: Some(
@@ -21684,6 +22639,7 @@ mod tests {
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
+                request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
                 permissions_json: String::new(),
                 ad_slots_script: None,
@@ -21757,6 +22713,7 @@ mod tests {
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
             content_type: "text/css".to_string(),
             permissions_json: String::new(),
             ad_slots_script: None,
@@ -21912,6 +22869,7 @@ mod tests {
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
             permissions_json: String::new(),
             ad_slots_script: Some(
@@ -21941,6 +22899,11 @@ mod tests {
                 }),
             )
             .expect("should insert the stand-in's settings");
+        crate::html_processor::test_support::place_on_every_page(
+            &mut settings,
+            crate::middleware::MiddlewarePhase::Fetch,
+            &[tag::MODULE],
+        );
 
         let body = streaming_finalize_response_with_settings(
             html_stream_params("", None),
@@ -22008,9 +22971,8 @@ mod tests {
         // request token emitted by lol_html at the structural end is a seam.
         let page = br#"<html><head></head><body><script>fixture_payload("href=https://origin.example.com/app text=</body>")</script><article>still streaming</article>"#;
         let mut settings = create_test_settings();
-        settings.select_module(
-            "testing",
-            crate::integrations::registry_test_support::payload_fixture::MODULE,
+        crate::integrations::registry_test_support::payload_fixture::select_and_place(
+            &mut settings,
         );
         let params = html_stream_params(
             "",
@@ -22185,9 +23147,8 @@ mod tests {
             settings.auction.enabled = true;
             settings.auction.provider_names = vec!["seam_test".to_owned()];
             settings.auction.timeout_ms = 60_000;
-            settings.select_module(
-                "testing",
-                crate::integrations::registry_test_support::payload_fixture::MODULE,
+            crate::integrations::registry_test_support::payload_fixture::select_and_place(
+                &mut settings,
             );
             let client = Arc::new(GatedAuctionHttpClient {
                 inner: StubHttpClient::new(),
@@ -22584,6 +23545,7 @@ mod tests {
                 origin_url: "https://origin.example.com".to_string(),
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
+                request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
                 permissions_json: String::new(),
                 ad_slots_script: None,
@@ -22781,6 +23743,7 @@ mod tests {
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
             permissions_json: String::new(),
             ad_slots_script: Some(
@@ -22862,6 +23825,7 @@ mod tests {
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
             content_type: "Text/HTML; Charset=utf-8".to_string(),
             permissions_json: String::new(),
             ad_slots_script: Some(
@@ -22926,6 +23890,7 @@ mod tests {
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
             content_type: "text/html".to_string(),
             permissions_json: String::new(),
             ad_slots_script: None,
@@ -22992,11 +23957,11 @@ mod tests {
     /// routes through `Stream`, and the shared processor pipeline applies it.
     #[test]
     fn streaming_html_with_stream_processors_rewrites_body() {
-        // Select the stand-in so a stream processor is registered.
+        // Select the stand-in and place its middleware, so the page has a
+        // stream processor.
         let mut settings = create_test_settings();
-        settings.select_module(
-            "testing",
-            crate::integrations::registry_test_support::payload_fixture::MODULE,
+        crate::integrations::registry_test_support::payload_fixture::select_and_place(
+            &mut settings,
         );
 
         let registry = IntegrationRegistry::with_plan(
@@ -23009,8 +23974,15 @@ mod tests {
         .expect("should create integration registry");
 
         assert!(
-            !registry.html_stream_processor_factories().is_empty(),
-            "the stand-in must register an HTML stream processor"
+            !registry
+                .middleware_chain(
+                    &settings.fetch,
+                    crate::middleware::MiddlewarePhase::Fetch,
+                    crate::middleware::HTML_MEDIA_TYPE,
+                    "/",
+                )
+                .is_empty(),
+            "the stand-in's middleware, which supplies an HTML stream processor, must run on the page"
         );
         assert_eq!(
             classify_response_route(
@@ -23038,6 +24010,7 @@ mod tests {
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
             permissions_json: String::new(),
             ad_slots_script: None,
@@ -23067,16 +24040,14 @@ mod tests {
         );
     }
 
-    /// Document-state survives from the parser pass into the stream processor.
-    /// A script rewriter writes into `IntegrationDocumentState` during
-    /// parsing, and the request-local stream processor reads it and substitutes.
+    /// What a text handler captures during parsing reaches the stream
+    /// processor of the same document, which substitutes it.
     /// Regression test: placeholders must be inserted and removed from final output.
     #[test]
-    fn document_state_placeholders_substitute_through_streaming_path() {
+    fn a_handler_s_placeholders_are_substituted_through_the_streaming_path() {
         let mut settings = create_test_settings();
-        settings.select_module(
-            "testing",
-            crate::integrations::registry_test_support::payload_fixture::MODULE,
+        crate::integrations::registry_test_support::payload_fixture::select_and_place(
+            &mut settings,
         );
         let registry = IntegrationRegistry::with_plan(
             &settings,
@@ -23099,6 +24070,7 @@ mod tests {
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
+            request_path: "/".to_owned(),
             content_type: "text/html".to_string(),
             permissions_json: String::new(),
             ad_slots_script: None,

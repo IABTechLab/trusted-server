@@ -355,7 +355,10 @@ ts config validate
 ```
 
 The draft also selects, in the section of each module's type, the modules it
-can configure from what it found, and writes their tables. Where it found
+can configure from what it found, and writes their tables. It writes the
+`[[fetch]]` and `[[serve]]` entries that run those modules' page changes on
+every HTML page, because a module changes a page only where an entry names
+its middleware. Where it found
 third-party scripts it writes `[proxy.js_asset_proxy]` with each one
 `proxy = "disabled"`, so they are inventory only, and nothing is served or
 rewritten until you review a candidate and change its `proxy` value to

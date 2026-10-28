@@ -25,7 +25,7 @@ All of these are served from `securepubads.g.doubleclick.net`.
   Publisher HTML
   │
   ├─ <script src="securepubads.g.doubleclick.net/tag/js/gpt.js">
-  │   ↓ (attribute rewriter)
+  │   ↓ (middleware)
   │   <script src="publisher.com/integrations/gpt/script">
   │
   ├─ Server fetches gpt.js from Google, serves it verbatim
@@ -40,7 +40,7 @@ All of these are served from `securepubads.g.doubleclick.net`.
 
 There are three layers:
 
-1. **HTML attribute rewriting** (server-side) -- Rewrites `src`/`href` attributes on the initial `gpt.js` `<script>` tag to the first-party endpoint `/integrations/gpt/script`.
+1. **HTML attribute rewriting** (server-side) -- Rewrites `src`/`href` attributes on the initial `gpt.js` `<script>` tag to the first-party endpoint `/integrations/gpt/script`. This and the bootstrap written into the head are the middleware `ad-tag.google`, which runs on the pages a `[[fetch]]` entry names it for. See [Placing page changes](/guide/configuration#placing-page-changes).
 
 2. **Script proxy** (server-side) -- Fetches scripts from Google and serves them through the publisher's domain. Script bodies are served **verbatim** with no modification.
 

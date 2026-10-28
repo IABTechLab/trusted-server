@@ -58,6 +58,17 @@ project_id = "your-project-id"
 | `organization_id` | string | Yes      | Your Lockr organization ID |
 | `project_id`      | string | Yes      | Your Lockr project ID      |
 
+Pointing the lockr SDK's address at the first-party route is the middleware
+`identity.lockr`, which runs on the pages a `[[fetch]]` entry names it for:
+
+```toml
+[[fetch]]
+media_type = "text/html"
+middleware = ["identity.lockr"]
+```
+
+See [Placing page changes](/guide/configuration#placing-page-changes).
+
 ### Environment Variables
 
 ```bash

@@ -11,12 +11,10 @@ Axum, or Spin SDK types.
   EdgeZero-neutral request and its call into the request's module context,
   from which it names the `Settings`, the `RuntimeServices` and whatever
   else it needs.
-- `IntegrationAttributeRewriter` inspects selected HTML attributes.
-- `IntegrationScriptRewriter` handles one declared selector.
-- `IntegrationHeadInjector` inserts deterministic head markup.
-- `IntegrationHtmlPostProcessor` is for bounded whole-document work that
-  cannot be performed during streaming.
 - `IntegrationRequestFilter` makes an early request decision.
+- `Middleware` changes a page, on the pages where the operator's settings
+  place it, and is the one way a module changes a page. See
+  [Changing a page](#changing-a-page).
 
 Build one `IntegrationRegistration` with only the hooks the feature needs.
 Use `with_deferred_js()` only for a separately loaded integration module and
@@ -25,7 +23,7 @@ namespaced and bounded; do not introduce a general outbound proxy.
 
 ## Compiling core-neutral fixture
 
-The fixture below registers an attribute rewriter and constructs every
+The fixture below registers a middleware and constructs every
 required `RuntimeServices` service without an adapter dependency. The
 documentation test extracts this exact fence and compiles it as an isolated
 crate.
@@ -34,12 +32,16 @@ crate.
 
 ```rust
 use std::net::IpAddr;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use error_stack::Report;
 use trusted_server_core::integrations::{
-    AttributeRewriteAction, IntegrationAttributeContext,
-    IntegrationAttributeRewriter, IntegrationRegistration,
+    AttributeRewriteAction, IntegrationRegistration,
+};
+use trusted_server_core::middleware::{
+    AttributeRewrite, AttributeRewriteFn, Middleware, MiddlewareAction,
+    MiddlewareContext, MiddlewarePhase,
 };
 use trusted_server_core::platform::{
     BackendNamingPolicy, ClientInfo, GeoInfo, PlatformBackend,
@@ -143,33 +145,35 @@ impl PlatformGeo for FixtureGeo {
     }
 }
 
-struct AssetRewriter;
+struct AssetAddress;
 
-impl IntegrationAttributeRewriter for AssetRewriter {
-    fn integration_id(&self) -> &'static str {
-        "example"
+impl Middleware for AssetAddress {
+    fn middleware_id(&self) -> &'static str {
+        "testing.example"
     }
 
-    fn handles_attribute(&self, attribute: &str) -> bool {
-        matches!(attribute, "src" | "href")
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
     }
 
-    fn rewrite(
-        &self,
-        _attribute: &str,
-        value: &str,
-        _context: &IntegrationAttributeContext<'_>,
-    ) -> AttributeRewriteAction {
-        value
-            .strip_prefix("https://assets.example/")
-            .map(|path| AttributeRewriteAction::replace(format!("/assets/{path}")))
-            .unwrap_or_else(AttributeRewriteAction::keep)
+    fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        let decide: Rc<AttributeRewriteFn> = Rc::new(|matched| {
+            matched
+                .value
+                .strip_prefix("https://assets.example/")
+                .map(|path| AttributeRewriteAction::replace(format!("/assets/{path}")))
+                .unwrap_or_else(AttributeRewriteAction::keep)
+        });
+        MiddlewareAction {
+            element_handlers: AttributeRewrite::each(&["src", "href"], &decide),
+            ..MiddlewareAction::pass()
+        }
     }
 }
 
 pub fn registration() -> IntegrationRegistration {
     IntegrationRegistration::builder("example")
-        .with_attribute_rewriter(Arc::new(AssetRewriter))
+        .with_middleware(Arc::new(AssetAddress))
         .build()
 }
 
@@ -298,21 +302,19 @@ this repository that leaves the declaration out.
 The build function returns an `IntegrationRegistration`, built with the
 builder every integration uses.
 
-| Declaration                                           | What it does                                                                        |
-| ----------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `.with_proxy(...)`                                    | Routes the paths the proxy declares                                                 |
-| `.with_head_injector(...)`                            | Emits markup at the start of `<head>` and, if it chooses, after the script bundle   |
-| `.with_attribute_rewriter(...)`                       | Rewrites attribute values in publisher HTML                                         |
-| `.with_script_rewriter(...)`                          | Rewrites inline script contents                                                     |
-| `.with_html_stream_processor(...)`                    | Works on the document as it streams                                                 |
-| `.with_request_filter(...)`                           | Inspects a request and can turn it back before it reaches the origin                |
-| `.with_js_module(CarriedJsModule { source, sha256 })` | Carries the integration's own browser script, built outside `trusted-server-js`     |
-| `.with_deferred_js()`                                 | Serves the script as its own `<script defer>` tag instead of in the main bundle     |
-| `.with_standalone_js()`                               | Serves the script only on its own path, for an integration that injects its own tag |
-| `.without_js()`                                       | Ships no browser script                                                             |
-| `.with_ec_module(name, ...)`                          | Offers an Edge Cookie module that `[ec] module` may select by that name             |
-| `.with_geo_module(name, ...)`                         | Offers a geo module that `[geo] module` may select by that name                     |
-| `.with_device_module(name, ...)`                      | Offers a device module that `[device] module` may select by that name               |
+| Declaration                                           | What it does                                                                                    |
+| ----------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `.with_proxy(...)`                                    | Routes the paths the proxy declares                                                             |
+| `.with_request_filter(...)`                           | Inspects a request and can turn it back before it reaches the origin                            |
+| `.with_middleware(...)`                               | Offers a page change that an entry may place by the middleware's name                           |
+| `.with_bundle_tag_attribute(name, value)`             | Puts an attribute on the script bundle's tag, for a browser module that reads a setting from it |
+| `.with_js_module(CarriedJsModule { source, sha256 })` | Carries the integration's own browser script, built outside `trusted-server-js`                 |
+| `.with_deferred_js()`                                 | Serves the script as its own `<script defer>` tag instead of in the main bundle                 |
+| `.with_standalone_js()`                               | Serves the script only on its own path, for an integration that injects its own tag             |
+| `.without_js()`                                       | Ships no browser script                                                                         |
+| `.with_ec_module(name, ...)`                          | Offers an Edge Cookie module that `[ec] module` may select by that name                         |
+| `.with_geo_module(name, ...)`                         | Offers a geo module that `[geo] module` may select by that name                                 |
+| `.with_device_module(name, ...)`                      | Offers a device module that `[device] module` may select by that name                           |
 
 The three script delivery choices are exclusive and the last call wins.
 
@@ -341,6 +343,129 @@ selected with `[geo] module = "testing.seam-probe"`. A `[geo] module` or
 startup. The message lists the modules of that type the deployment runs, and
 says when the name is a module no section selects or one that supplies no
 module of that type.
+
+### Changing a page
+
+A module changes a page through a middleware, which the operator's settings
+place. The module registers each one with `.with_middleware(...)`, and it
+runs only on the pages where an entry names it, in the order that entry
+gives. See [Placing page changes](/guide/configuration#placing-page-changes).
+
+The fixture below loads a vendor's tag from a first-party path and marks the
+head. The documentation test extracts this exact fence and compiles it as an
+isolated crate.
+
+<!-- documentation-snippet:middleware:start -->
+
+```rust
+use std::rc::Rc;
+use std::sync::Arc;
+
+use trusted_server_core::integrations::{AttributeRewriteAction, IntegrationRegistration};
+use trusted_server_core::middleware::{
+    AttributeRewrite, Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase,
+};
+
+/// The tag the vendor serves, and the first-party path it is loaded from
+/// instead.
+const VENDOR_TAG: &str = "https://cdn.vendor.example/tag.js";
+const FIRST_PARTY_TAG: &str = "/integrations/example_tag/tag.js";
+
+/// Loads the vendor's tag from a first-party path, and says so in the head.
+pub struct ExampleTag;
+
+impl Middleware for ExampleTag {
+    fn middleware_id(&self) -> &'static str {
+        "tag.example"
+    }
+
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
+    }
+
+    fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        MiddlewareAction {
+            head_inserts: vec!["<meta name=\"example-tag\" content=\"first-party\">".to_owned()],
+            element_handlers: vec![Box::new(AttributeRewrite::matching(
+                "script[src]",
+                "src",
+                Rc::new(|matched| {
+                    if matched.value == VENDOR_TAG {
+                        AttributeRewriteAction::replace(FIRST_PARTY_TAG)
+                    } else {
+                        AttributeRewriteAction::keep()
+                    }
+                }),
+            ))],
+            ..MiddlewareAction::pass()
+        }
+    }
+}
+
+/// What the module's build function returns.
+pub fn registration() -> IntegrationRegistration {
+    IntegrationRegistration::builder("example_tag")
+        .without_js()
+        .with_middleware(Arc::new(ExampleTag))
+        .build()
+}
+```
+
+<!-- documentation-snippet:middleware:end -->
+
+A middleware says which phase it runs in, and an entry of the other phase
+that names it refuses startup.
+
+| Phase                    | Runs                                                                               | `document_state` holds                      |
+| ------------------------ | ---------------------------------------------------------------------------------- | ------------------------------------------- |
+| `MiddlewarePhase::Fetch` | On the page as the origin sent it. What it leaves is what a shared template stores | Nothing a request left                      |
+| `MiddlewarePhase::Serve` | On each reader's copy, whether the page came from the store or from the origin     | What the module's request hooks left for it |
+
+A middleware is asked once for each document, by `create`, and what it
+answers is used for that document alone, so a handler may hold state between
+the chunks of one script. The answer is a `MiddlewareAction`, which may set
+any of five things.
+
+| Field                  | What it does                                                                                             |
+| ---------------------- | -------------------------------------------------------------------------------------------------------- |
+| `head_inserts`         | Writes markup in `<head>`, ahead of the script bundle                                                    |
+| `after_bundle_inserts` | Writes markup straight after the script bundle, for a script that needs the bundle to have run           |
+| `element_handlers`     | For the elements a CSS selector matches, keeps the element, replaces one attribute's value or removes it |
+| `text_handlers`        | For the text inside the elements a CSS selector matches, keeps a chunk, replaces it or removes it        |
+| `stream`               | Runs a stream processor over the document the handlers left                                              |
+
+A middleware can rely on these rules.
+
+- The middleware of one entry run in the order the entry names them. Two
+  handlers that match one element, or one script, are both asked, and each is
+  handed what the one before it left.
+- An element handler is asked after core has moved the origin's address in
+  the attribute to the reader's host, and an element an earlier handler
+  removed is not asked about again.
+- A script's text arrives in chunks. A handler that needs the whole script
+  removes each chunk while keeping a copy, and writes back what it kept with
+  the last chunk. A replacement is written as it is, except that a `<` that
+  would end the script, or begin `<script` after `<!--`, is written as
+  `\u003c`.
+- A fetch middleware is told nothing about the reader, because what it leaves
+  is what a shared template stores. `MiddlewareContext::document_state` is
+  shared by the middleware working on one document in one phase.
+- A serve middleware works on the page as core and the fetch middleware left
+  it, the script bundle's tag included. What a request preparer or a request
+  filter left with `IntegrationRequestState::insert` is in its
+  `document_state`, and a request that carries any is never answered from a
+  shared template. It is told the same origin host for a page from the store
+  as for one fetched for that request.
+- A selector that does not parse fails the response with a `500` and a
+  message naming the middleware. A middleware chooses its selectors for each
+  document, so they cannot be checked when the service starts.
+
+A middleware's name is the module's own name, as `module_name!()` gives it,
+with a part of its own after it when the module supplies several, as
+`module_name!("cleanup")` gives `tag.example.cleanup`. Startup refuses two
+registrations that supply one name, and a name an entry could not write. A
+middleware reads its settings from the module's own table, which the build
+function is handed.
 
 ### What a module is handed
 
@@ -428,12 +553,13 @@ preparer or a request filter leaves a value under the integration's id.
 IntegrationRequestState::insert(request, EXAMPLE_ID, ExampleDecision::default());
 ```
 
-When the request produces an HTML document, each value is copied into the
-document's state before parsing starts, so the head injector, the rewriters
-and the stream processors read it with
-`ctx.document_state.get::<ExampleDecision>(EXAMPLE_ID)`. The same values are
-handed to the response finalizer the builder declared, which runs on the
-response the page path returns.
+Where the request's reader is served an HTML document, each value is copied
+into the state the `[[serve]]` entry's middleware share, so the module's
+serve middleware reads it with
+`context.document_state.get::<ExampleDecision>(EXAMPLE_ID)`. A fetch
+middleware is handed none of it. The same values are handed to the response
+finalizer the builder declared, which runs on the response the page path
+returns.
 
 A request that carries any value gets a document made for it alone. The
 document is fetched from the origin, never read from a shared template and
@@ -441,10 +567,10 @@ never stored as one, and an HTML response with a body is sent
 `private, no-store`. So a module leaves a value only for a request it will
 act on, and an ordinary request stays on the shared path.
 
-A head injector has two places to write. `head_inserts` writes at the start
-of `<head>`, before the script bundle, and `after_bundle_inserts` writes
-straight after the bundle, for a script that needs the bundle to have run and
-has to run before the page's own scripts.
+A serve middleware has two places to write markup. `head_inserts` writes
+straight before the script bundle, and `after_bundle_inserts` writes straight
+after it, for a script that needs the bundle to have run and has to run
+before the page's own scripts.
 
 ### A module's own secrets
 
@@ -537,13 +663,14 @@ probe through the Fastly adapter under Viceroy.
 ### The modules a stock build ships
 
 `crates/trusted-server-modules` lists the modules a stock build ships from
-crates of their own, in the order their hooks run. Every adapter builds its
-state with that list followed by the builders a deployment added, and loads
-its settings against the same list. The `ts` tool registers it for deploy
-validation. A module joins a stock build by adding its crate and its builder
-to that list, in the place its hooks should run. Offering a module does not
-run it, because the registry builds a module only when a section of the
-settings selects it.
+crates of their own, in the order their request hooks run. Every adapter
+builds its state with that list followed by the builders a deployment added,
+and loads its settings against the same list. The `ts` tool registers it for
+deploy validation. A module joins a stock build by adding its crate and its
+builder to that list, in the place its request hooks should run. The order of
+the list does not order page changes, which run in the order an entry names
+them. Offering a module does not run it, because the registry builds a module
+only when a section of the settings selects it.
 
 ### Two traps a vendor will hit
 

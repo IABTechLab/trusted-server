@@ -3,15 +3,30 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const GUIDE: &str = include_str!("../../../docs/guide/integration-guide.md");
-const START: &str = "<!-- documentation-snippet:runtime-services:start -->";
-const END: &str = "<!-- documentation-snippet:runtime-services:end -->";
 
 #[test]
 fn integration_guide_runtime_services_fixture_compiles() {
+    assert_documented_fixture_compiles("runtime-services");
+}
+
+#[test]
+fn integration_guide_middleware_fixture_compiles() {
+    assert_documented_fixture_compiles("middleware");
+}
+
+/// Compiles the fence the guide marks as the snippet `name`, exactly as
+/// written, as an isolated crate that depends on core alone.
+#[allow(
+    clippy::panic,
+    reason = "a helper of the tests above, which fails the test that called it"
+)]
+fn assert_documented_fixture_compiles(name: &str) {
+    let start = format!("<!-- documentation-snippet:{name}:start -->");
+    let end = format!("<!-- documentation-snippet:{name}:end -->");
     let marked = GUIDE
-        .split_once(START)
-        .and_then(|(_, tail)| tail.split_once(END).map(|(body, _)| body))
-        .expect("should contain one bounded runtime-services snippet");
+        .split_once(&start)
+        .and_then(|(_, tail)| tail.split_once(&end).map(|(body, _)| body))
+        .unwrap_or_else(|| panic!("should contain one bounded {name} snippet"));
     let source = marked
         .trim()
         .strip_prefix("```rust\n")
@@ -23,7 +38,7 @@ fn integration_guide_runtime_services_fixture_compiles() {
         .expect("should have a current system clock")
         .as_nanos();
     let fixture_root = std::env::temp_dir().join(format!(
-        "trusted-server-documentation-snippet-{}-{nonce}",
+        "trusted-server-documentation-snippet-{name}-{}-{nonce}",
         std::process::id()
     ));
     let source_dir = fixture_root.join("src");
@@ -82,7 +97,7 @@ fn integration_guide_runtime_services_fixture_compiles() {
 
     assert!(
         output.status.success(),
-        "documented integration fixture must compile:\nstdout:\n{}\nstderr:\n{}",
+        "the documented {name} fixture must compile:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

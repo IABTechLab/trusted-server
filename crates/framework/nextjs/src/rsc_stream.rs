@@ -2,9 +2,8 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use trusted_server_core::integrations::{
-    IntegrationDocumentState, IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory,
-};
+use trusted_server_core::integrations::IntegrationDocumentState;
+use trusted_server_core::middleware::MiddlewareContext;
 use trusted_server_core::streaming_processor::StreamProcessor;
 
 use super::rsc::{
@@ -151,24 +150,19 @@ impl NextJsRscStreamProcessorFactory {
     pub(super) fn new(config: Arc<NextJsIntegrationConfig>) -> Self {
         Self { config }
     }
-}
 
-impl IntegrationHtmlStreamProcessorFactory for NextJsRscStreamProcessorFactory {
-    fn integration_id(&self) -> &'static str {
-        NEXTJS_INTEGRATION_ID
-    }
-
-    fn create(&self, context: IntegrationHtmlStreamContext) -> Box<dyn StreamProcessor> {
+    /// The processor of the one document `context` describes.
+    pub(super) fn create(&self, context: &MiddlewareContext<'_>) -> Box<dyn StreamProcessor> {
         let limit = if self.config.max_combined_payload_bytes == 0 {
             DEFAULT_MAX_COMBINED_PAYLOAD_BYTES
         } else {
             self.config.max_combined_payload_bytes
         };
         Box::new(NextJsRscStreamProcessor::new(
-            document_state(&context.document_state),
-            context.origin_host,
-            context.request_host,
-            context.request_scheme,
+            document_state(context.document_state),
+            context.origin_host.to_owned(),
+            context.request_host.to_owned(),
+            context.request_scheme.to_owned(),
             limit,
         ))
     }

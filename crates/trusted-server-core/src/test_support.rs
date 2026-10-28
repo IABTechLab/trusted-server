@@ -350,6 +350,12 @@ pub mod nextjs_auction {
             # fails closed on an unknown jurisdiction.
             [geo]
             module = "platform"
+
+            # What Next.js changes in a page is a middleware, which runs on
+            # the pages an entry names it for.
+            [[fetch]]
+            media_type = "text/html"
+            middleware = ["framework.nextjs"]
             "#,
         )
         .expect("should parse Next.js auction fixture settings");

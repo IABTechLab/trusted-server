@@ -310,8 +310,8 @@ impl lol_html::OutputSink for RcVecSink {
 /// Adapter to use `lol_html` [`HtmlRewriter`](lol_html::HtmlRewriter) as a [`StreamProcessor`].
 ///
 /// Output is emitted incrementally on every [`process_chunk`](StreamProcessor::process_chunk)
-/// call. Script rewriters that receive text from `lol_html` must be fragment-safe —
-/// they accumulate text fragments internally until `is_last_in_text_node` is true.
+/// call. A text handler that receives text from `lol_html` must be fragment-safe,
+/// so it accumulates text fragments until the last chunk of the text node arrives.
 ///
 /// The adapter is single-use: one adapter per request. Calling [`StreamProcessor::reset`]
 /// is a no-op because the rewriter consumes its settings on construction.
@@ -1731,8 +1731,8 @@ mod tests {
     }
 
     /// Verify that `lol_html` fragments text nodes when input chunks split
-    /// mid-text-node. Script rewriters must be fragment-safe — they accumulate
-    /// text fragments internally until `is_last_in_text_node` is true.
+    /// mid-text-node. A text handler must be fragment-safe, so it accumulates
+    /// text fragments until the last chunk of the text node arrives.
     #[test]
     fn lol_html_fragments_text_across_chunk_boundaries() {
         use std::cell::RefCell;

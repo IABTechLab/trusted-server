@@ -120,8 +120,8 @@ mod tests {
             "Osano v1 should not register Rust proxy routes"
         );
         assert!(
-            registration.head_injectors.is_empty(),
-            "Osano v1 should not inject HTML from Rust"
+            registration.middleware.is_empty(),
+            "Osano v1 should not change a page from Rust"
         );
     }
 

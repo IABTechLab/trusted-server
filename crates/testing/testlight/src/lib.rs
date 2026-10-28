@@ -9,6 +9,7 @@
         reason = "tests use direct diagnostics and panic-on-failure helpers"
     )
 )]
+use std::rc::Rc;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -23,9 +24,13 @@ use validator::Validate;
 use trusted_server_core::edge_cookie::recognized_ec_id;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::{
-    AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
-    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
-    UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_body_bounded, collect_response_bounded,
+    AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationEndpoint, IntegrationProxy,
+    IntegrationRegistration, UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_body_bounded,
+    collect_response_bounded,
+};
+use trusted_server_core::middleware::{
+    AttributeRewrite, AttributeRewriteFn, Middleware, MiddlewareAction, MiddlewareContext,
+    MiddlewarePhase,
 };
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{ProxyRequestConfig, proxy_request};
@@ -192,7 +197,7 @@ pub fn register(
     Ok(Some(
         IntegrationRegistration::builder(TESTLIGHT_INTEGRATION_ID)
             .with_proxy(integration.clone())
-            .with_attribute_rewriter(integration)
+            .with_middleware(Arc::new(ShimScript(integration)))
             .build(),
     ))
 }
@@ -280,30 +285,43 @@ impl IntegrationProxy for TestlightIntegration {
     }
 }
 
-impl IntegrationAttributeRewriter for TestlightIntegration {
-    fn integration_id(&self) -> &'static str {
-        TESTLIGHT_INTEGRATION_ID
-    }
-
-    fn handles_attribute(&self, attribute: &str) -> bool {
-        self.config.rewrite_scripts && matches!(attribute, "src" | "href")
-    }
-
-    fn rewrite(
-        &self,
-        _attr_name: &str,
-        attr_value: &str,
-        _ctx: &IntegrationAttributeContext<'_>,
-    ) -> AttributeRewriteAction {
-        if !self.config.rewrite_scripts {
-            return AttributeRewriteAction::keep();
-        }
-
-        let lowered = attr_value.to_ascii_lowercase();
+impl TestlightIntegration {
+    /// What becomes of a `src` or an `href`, which is pointed at the shim
+    /// when it is the vendor's script.
+    fn rewrite_script_address(&self, value: &str) -> AttributeRewriteAction {
+        let lowered = value.to_ascii_lowercase();
         if lowered.contains("testlight.js") {
             AttributeRewriteAction::replace(self.config.shim_src.clone())
         } else {
             AttributeRewriteAction::keep()
+        }
+    }
+}
+
+/// Loads the shim in place of the vendor's script, on the pages a `[[fetch]]`
+/// entry names [`MODULE`] for. It does nothing unless `rewrite_scripts` is
+/// set.
+struct ShimScript(Arc<TestlightIntegration>);
+
+impl Middleware for ShimScript {
+    fn middleware_id(&self) -> &'static str {
+        MODULE
+    }
+
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
+    }
+
+    fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        if !self.0.config.rewrite_scripts {
+            return MiddlewareAction::pass();
+        }
+        let integration = Arc::clone(&self.0);
+        let decide: Rc<AttributeRewriteFn> =
+            Rc::new(move |matched| integration.rewrite_script_address(matched.value));
+        MiddlewareAction {
+            element_handlers: AttributeRewrite::each(&["src", "href"], &decide),
+            ..MiddlewareAction::pass()
         }
     }
 }
@@ -353,16 +371,8 @@ mod tests {
         };
         let integration = TestlightIntegration::new(config);
 
-        let ctx = IntegrationAttributeContext {
-            attribute_name: "src",
-            element_name: "script",
-            request_host: "edge.example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-        };
-
         let rewritten =
-            integration.rewrite("src", "https://cdn.testlight.net/v1/testlight.js", &ctx);
+            integration.rewrite_script_address("https://cdn.testlight.net/v1/testlight.js");
         assert!(
             matches!(
                 rewritten,
@@ -382,18 +392,16 @@ mod tests {
             rewrite_scripts: false,
         };
         let integration = TestlightIntegration::new(config);
-        let ctx = IntegrationAttributeContext {
-            attribute_name: "src",
-            element_name: "script",
-            request_host: "edge.example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-        };
+        let document_state = trusted_server_core::integrations::IntegrationDocumentState::default();
+        let context = trusted_server_core::middleware::test_support::context(
+            MiddlewarePhase::Fetch,
+            &document_state,
+        );
 
-        assert!(matches!(
-            integration.rewrite("src", "https://cdn.testlight.net/script.js", &ctx),
-            AttributeRewriteAction::Keep
-        ));
+        assert!(
+            ShimScript(integration).create(&context).is_pass(),
+            "should leave every page alone when script rewriting is off"
+        );
     }
 
     #[test]
@@ -613,7 +621,10 @@ mod tests {
     fn a_served_page_loads_the_shim_in_place_of_the_vendor_script() {
         use std::io::Cursor;
 
-        use trusted_server_core::html_processor::{HtmlProcessorConfig, create_html_processor};
+        use trusted_server_core::html_processor::HtmlProcessorConfig;
+        use trusted_server_core::html_processor::test_support::{
+            create_page_processor, place_on_every_page,
+        };
         use trusted_server_core::integrations::IntegrationRegistry;
         use trusted_server_core::streaming_processor::{
             Compression, PipelineConfig, StreamingPipeline,
@@ -636,6 +647,7 @@ mod tests {
                 }),
             )
             .expect("should insert testlight config");
+        place_on_every_page(&mut settings, MiddlewarePhase::Fetch, &[MODULE]);
 
         let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
             .expect("should create registry");
@@ -652,7 +664,7 @@ mod tests {
                 output_compression: Compression::None,
                 chunk_size: 8192,
             },
-            create_html_processor(config),
+            create_page_processor(&settings, &registry, config),
         );
 
         let mut output = Vec::new();
@@ -668,6 +680,23 @@ mod tests {
         assert!(
             !processed.contains("cdn.testlight.com"),
             "the vendor's own URL should be gone from the page"
+        );
+    }
+
+    /// The page a reader receives with this module running, kept as a file
+    /// so that changing how the page change is made can be shown to leave
+    /// the page as it was.
+    #[test]
+    fn the_page_a_reader_receives_is_the_recorded_one() {
+        trusted_server_core::html_processor::test_support::assert_page_is_recorded(
+            include_str!("fixtures/page-change.settings.toml"),
+            &[builder()],
+            include_str!("fixtures/page-change.input.html"),
+            include_str!("fixtures/page-change.recorded.html"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/fixtures/page-change.recorded.html"
+            ),
         );
     }
 }

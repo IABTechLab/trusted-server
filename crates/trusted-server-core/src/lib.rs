@@ -54,6 +54,7 @@ pub mod html_processor;
 pub mod http_util;
 pub mod inspect;
 pub mod integrations;
+pub mod middleware;
 pub mod module_context;
 pub mod module_name;
 pub(crate) mod module_secrets;

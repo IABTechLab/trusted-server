@@ -1,0 +1,4 @@
+# The recording is compared byte for byte with the page made from the input
+# beside it, so both must arrive with the line endings they were committed
+# with on every platform.
+src/integrations/fixtures/*.html text eol=lf

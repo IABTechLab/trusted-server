@@ -24,6 +24,7 @@
     )
 )]
 
+use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
@@ -36,12 +37,13 @@ use serde::{Deserialize, Serialize};
 use validator::{Validate, ValidationError};
 
 use trusted_server_core::error::TrustedServerError;
-use trusted_server_core::integrations::ScriptTextAccumulator;
 use trusted_server_core::integrations::{
-    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration, IntegrationScriptContext,
-    IntegrationScriptRewriter, ScriptRewriteAction, UPSTREAM_SDK_MAX_RESPONSE_BYTES,
-    collect_response_bounded,
+    AttributeRewriteAction, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    ScriptRewriteAction, UPSTREAM_SDK_MAX_RESPONSE_BYTES, collect_response_bounded,
+};
+use trusted_server_core::middleware::{
+    AttributeRewrite, AttributeRewriteFn, Middleware, MiddlewareAction, MiddlewareContext,
+    MiddlewarePhase, TextHandler,
 };
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
@@ -312,9 +314,9 @@ fn default_max_beacon_body_size() -> usize {
     65536 // 64KB - prevents memory pressure from oversized payloads
 }
 
-/// GTM domain markers the script rewriter looks for. Kept in one place so the
+/// GTM domain markers the script handler looks for. Kept in one place so the
 /// boundary-safe prefix check in [`might_contain_gtm_prefix`] and the full-match
-/// check in [`GoogleTagManagerIntegration::rewrite`] cannot drift apart.
+/// check in [`InlineSnippet`] cannot drift apart.
 const GTM_SCRIPT_MARKERS: &[&str] = &["googletagmanager.com", "google-analytics.com"];
 
 /// Minimum trailing-prefix length required to engage the accumulation path.
@@ -331,13 +333,11 @@ const GTM_MIN_PREFIX_LEN: usize = 6;
 
 /// Return true if `text` either already contains a GTM marker or ends with a
 /// proper prefix of one of length ≥ [`GTM_MIN_PREFIX_LEN`] — i.e., the next
-/// fragment could still complete a match. Used to gate whether the GTM
-/// rewriter should claim ownership of a script's output via
-/// `RemoveNode`/`Replace`.
+/// fragment could still complete a match. It gates whether the script
+/// handler holds a script's text via `RemoveNode`/`Replace`.
 ///
-/// Returning false means the rewriter can safely return `Keep` and leave the
-/// script untouched, preserving any replacement a more-specific rewriter
-/// (e.g., `NextJsNextDataRewriter`) made on the same element.
+/// Returning false means the handler can safely return `Keep` and leave the
+/// script untouched.
 fn might_contain_gtm_prefix(text: &str) -> bool {
     for marker in GTM_SCRIPT_MARKERS {
         if text.contains(marker) {
@@ -941,8 +941,7 @@ pub fn register(
     Ok(Some(
         IntegrationRegistration::builder(GTM_INTEGRATION_ID)
             .with_proxy(integration.clone())
-            .with_attribute_rewriter(integration.clone())
-            .with_script_rewriter(integration)
+            .with_middleware(integration)
             .build(),
     ))
 }
@@ -1032,64 +1031,81 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
     }
 }
 
-impl IntegrationAttributeRewriter for GoogleTagManagerIntegration {
-    fn integration_id(&self) -> &'static str {
-        GTM_INTEGRATION_ID
-    }
-
-    fn handles_attribute(&self, attribute: &str) -> bool {
-        matches!(attribute, "src" | "href")
-    }
-
-    fn rewrite(
-        &self,
-        _attr_name: &str,
-        attr_value: &str,
-        _ctx: &IntegrationAttributeContext<'_>,
-    ) -> AttributeRewriteAction {
-        if Self::is_rewritable_url(attr_value) {
-            AttributeRewriteAction::replace(Self::rewrite_gtm_urls(attr_value))
+impl GoogleTagManagerIntegration {
+    /// What becomes of a `src` or an `href`, which is pointed at the
+    /// first-party path when it is one of Google's tag addresses.
+    fn rewrite_address(value: &str) -> AttributeRewriteAction {
+        if Self::is_rewritable_url(value) {
+            AttributeRewriteAction::replace(Self::rewrite_gtm_urls(value))
         } else {
             AttributeRewriteAction::keep()
         }
     }
 }
 
-impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
-    fn integration_id(&self) -> &'static str {
-        GTM_INTEGRATION_ID
+/// Google Tag Manager's change to a page, on the pages a `[[fetch]]` entry
+/// names [`MODULE`] for. It points Google's tag addresses at the first-party
+/// path, in `src` and `href` attributes and in the text of inline scripts.
+impl Middleware for GoogleTagManagerIntegration {
+    fn middleware_id(&self) -> &'static str {
+        MODULE
     }
 
-    fn selector(&self) -> &'static str {
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
+    }
+
+    fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        let decide: Rc<AttributeRewriteFn> =
+            Rc::new(|matched| Self::rewrite_address(matched.value));
+        MiddlewareAction {
+            element_handlers: AttributeRewrite::each(&["src", "href"], &decide),
+            text_handlers: vec![Box::new(InlineSnippet::default())],
+            ..MiddlewareAction::pass()
+        }
+    }
+}
+
+/// Rewrites Google's tag addresses in the text of inline scripts.
+///
+/// Made for one document, so text held for a script that never ends cannot
+/// reach another document.
+#[derive(Default)]
+struct InlineSnippet {
+    /// Text held back while it might still turn out to hold a marker.
+    held: String,
+}
+
+impl TextHandler for InlineSnippet {
+    fn selector(&self) -> &str {
         "script" // Match all scripts to find inline GTM snippets
     }
 
-    fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
-        // Per document, never per registry: a registry-lifetime buffer would
-        // carry one document's partial script into the next.
-        let accumulator = ctx
-            .document_state
-            .get_or_insert_with(GTM_INTEGRATION_ID, ScriptTextAccumulator::default);
-        let mut buf = accumulator.buffer();
+    fn decide(&mut self, content: &str, is_last: bool) -> ScriptRewriteAction {
+        let buf = &mut self.held;
 
-        // Cheap gate: only engage the accumulation path for scripts whose
-        // running text could plausibly contain a GTM/GA domain. Unrelated
-        // scripts (the vast majority) return Keep on every fragment so they
-        // stay visible in `lol_html`'s output unchanged — and, critically,
-        // so a Replace from this rewriter does not clobber a Replace from
-        // another rewriter on the same element (e.g., `NextJsNextDataRewriter`
-        // on `script#__NEXT_DATA__`). See `might_contain_gtm_prefix` for the
-        // boundary-safe substring check.
+        // Cheap gate: only hold text for scripts whose running text could
+        // plausibly contain a GTM/GA domain. Unrelated scripts (the vast
+        // majority) are kept on every fragment, so they pass through
+        // untouched. See `might_contain_gtm_prefix` for the boundary-safe
+        // substring check.
         let prior_and_current_might_match =
-            might_contain_gtm_prefix(&buf) || might_contain_gtm_prefix(content);
+            might_contain_gtm_prefix(buf) || might_contain_gtm_prefix(content);
 
-        if !ctx.is_last_in_text_node {
+        if !is_last {
             // Intermediate fragment. Only accumulate + suppress when the script
             // might still resolve to a GTM match. Otherwise return Keep so the
             // fragment is emitted as-is by `lol_html` and untouched by us.
             if prior_and_current_might_match {
                 buf.push_str(content);
                 return ScriptRewriteAction::RemoveNode;
+            }
+            // Nothing held can become a marker now, so what was held goes out
+            // ahead of this fragment. Left for the last fragment, it would be
+            // written after text that came later in the script.
+            if !buf.is_empty() {
+                buf.push_str(content);
+                return ScriptRewriteAction::replace(std::mem::take(buf));
             }
             return ScriptRewriteAction::keep();
         }
@@ -1099,7 +1115,7 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
             None
         } else {
             buf.push_str(content);
-            Some(std::mem::take(&mut *buf))
+            Some(std::mem::take(buf))
         };
         let text = full_content.as_deref().unwrap_or(content);
 
@@ -1112,7 +1128,9 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
             .iter()
             .any(|marker| text.contains(marker))
         {
-            return ScriptRewriteAction::replace(Self::rewrite_gtm_urls(text));
+            return ScriptRewriteAction::replace(GoogleTagManagerIntegration::rewrite_gtm_urls(
+                text,
+            ));
         }
 
         // No GTM content — if we accumulated fragments, emit them unchanged.
@@ -1128,11 +1146,12 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trusted_server_core::html_processor::{HtmlProcessorConfig, create_html_processor};
+    use trusted_server_core::html_processor::HtmlProcessorConfig;
+    use trusted_server_core::html_processor::test_support::{
+        create_page_processor, place_on_every_page,
+    };
     use trusted_server_core::integrations::{
-        AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-        IntegrationDocumentState, IntegrationRegistry, IntegrationScriptContext,
-        IntegrationScriptRewriter, ScriptRewriteAction,
+        AttributeRewriteAction, IntegrationDocumentState, IntegrationRegistry, ScriptRewriteAction,
     };
     use trusted_server_core::platform::test_support::{
         StubHttpClient, build_services_with_http_client,
@@ -2365,24 +2384,10 @@ mod tests {
     }
 
     #[test]
-    fn test_attribute_rewriter() {
-        let config = tag_config("GTM-TEST1234", &[]);
-        let integration = GoogleTagManagerIntegration::new(config);
-
-        let ctx = IntegrationAttributeContext {
-            attribute_name: "src",
-            element_name: "script",
-            request_host: "example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-        };
-
+    fn test_element_handler() {
         // Case 1: Standard HTTPS URL
-        let action = IntegrationAttributeRewriter::rewrite(
-            &*integration,
-            "src",
+        let action = GoogleTagManagerIntegration::rewrite_address(
             "https://www.googletagmanager.com/gtm.js?id=GTM-TEST1234",
-            &ctx,
         );
         if let AttributeRewriteAction::Replace(val) = action {
             assert_eq!(
@@ -2394,11 +2399,8 @@ mod tests {
         }
 
         // Case 2: Protocol-relative URL
-        let action = IntegrationAttributeRewriter::rewrite(
-            &*integration,
-            "src",
+        let action = GoogleTagManagerIntegration::rewrite_address(
             "//www.googletagmanager.com/gtm.js?id=GTM-TEST1234",
-            &ctx,
         );
         if let AttributeRewriteAction::Replace(val) = action {
             assert_eq!(
@@ -2413,11 +2415,8 @@ mod tests {
         }
 
         // Case 3: gtag/js URL in href (preload link)
-        let action = IntegrationAttributeRewriter::rewrite(
-            &*integration,
-            "href",
+        let action = GoogleTagManagerIntegration::rewrite_address(
             "https://www.googletagmanager.com/gtag/js?id=G-DQMZGMPHXN",
-            &ctx,
         );
         if let AttributeRewriteAction::Replace(val) = action {
             assert_eq!(
@@ -2432,11 +2431,8 @@ mod tests {
         }
 
         // Case 4: google-analytics.com URL in href
-        let action = IntegrationAttributeRewriter::rewrite(
-            &*integration,
-            "href",
+        let action = GoogleTagManagerIntegration::rewrite_address(
             "https://www.google-analytics.com/g/collect",
-            &ctx,
         );
         if let AttributeRewriteAction::Replace(val) = action {
             assert_eq!(val, "/integrations/google_tag_manager/g/collect");
@@ -2448,11 +2444,8 @@ mod tests {
         }
 
         // Case 5: analytics.google.com URL in href
-        let action = IntegrationAttributeRewriter::rewrite(
-            &*integration,
-            "href",
+        let action = GoogleTagManagerIntegration::rewrite_address(
             "https://analytics.google.com/g/collect?v=2",
-            &ctx,
         );
         if let AttributeRewriteAction::Replace(val) = action {
             assert_eq!(val, "/integrations/google_tag_manager/g/collect?v=2");
@@ -2464,36 +2457,17 @@ mod tests {
         }
 
         // Case 6: Other URL (should be kept)
-        let action = IntegrationAttributeRewriter::rewrite(
-            &*integration,
-            "src",
-            "https://other.com/script.js",
-            &ctx,
-        );
+        let action = GoogleTagManagerIntegration::rewrite_address("https://other.com/script.js");
         assert!(matches!(action, AttributeRewriteAction::Keep));
     }
 
     #[test]
-    fn test_attribute_rewriter_rejects_false_positives() {
+    fn test_element_handler_rejects_false_positives() {
         // Test that URLs with GTM domains in query parameters or paths are NOT rewritten
         // This verifies the fix for P2: proper URL parsing instead of substring matching
-        let config = tag_config("GTM-TEST1234", &[]);
-        let integration = GoogleTagManagerIntegration::new(config);
-
-        let ctx = IntegrationAttributeContext {
-            attribute_name: "href",
-            element_name: "a",
-            request_host: "example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-        };
-
         // Case 1: GTM domain in query parameter - should NOT be rewritten
-        let action = IntegrationAttributeRewriter::rewrite(
-            &*integration,
-            "href",
+        let action = GoogleTagManagerIntegration::rewrite_address(
             "https://evil.com/?redirect=https://www.google-analytics.com/collect",
-            &ctx,
         );
         assert!(
             matches!(action, AttributeRewriteAction::Keep),
@@ -2501,11 +2475,8 @@ mod tests {
         );
 
         // Case 2: GTM domain in path component - should NOT be rewritten
-        let action = IntegrationAttributeRewriter::rewrite(
-            &*integration,
-            "href",
+        let action = GoogleTagManagerIntegration::rewrite_address(
             "https://example.com/www.googletagmanager.com/gtm.js",
-            &ctx,
         );
         assert!(
             matches!(action, AttributeRewriteAction::Keep),
@@ -2513,11 +2484,8 @@ mod tests {
         );
 
         // Case 3: Unsupported path on valid GTM domain - should NOT be rewritten
-        let action = IntegrationAttributeRewriter::rewrite(
-            &*integration,
-            "href",
+        let action = GoogleTagManagerIntegration::rewrite_address(
             "https://www.googletagmanager.com/ns.html",
-            &ctx,
         );
         assert!(
             matches!(action, AttributeRewriteAction::Keep),
@@ -2525,11 +2493,8 @@ mod tests {
         );
 
         // Case 4: Fragment with GTM domain - should NOT be rewritten
-        let action = IntegrationAttributeRewriter::rewrite(
-            &*integration,
-            "href",
+        let action = GoogleTagManagerIntegration::rewrite_address(
             "https://example.com/page#https://www.googletagmanager.com/gtm.js",
-            &ctx,
         );
         assert!(
             matches!(action, AttributeRewriteAction::Keep),
@@ -2537,11 +2502,8 @@ mod tests {
         );
 
         // Case 5: Valid GTM URL should STILL be rewritten (sanity check)
-        let action = IntegrationAttributeRewriter::rewrite(
-            &*integration,
-            "src",
+        let action = GoogleTagManagerIntegration::rewrite_address(
             "https://www.googletagmanager.com/gtm.js?id=GTM-TEST",
-            &ctx,
         );
         assert!(
             matches!(action, AttributeRewriteAction::Replace(_)),
@@ -2550,20 +2512,8 @@ mod tests {
     }
 
     #[test]
-    fn test_script_rewriter() {
-        let config = tag_config("GTM-TEST1234", &[]);
-        let integration = GoogleTagManagerIntegration::new(config);
-        let doc_state = IntegrationDocumentState::default();
-
-        let ctx = IntegrationScriptContext {
-            selector: "script",
-            request_host: "example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-            is_last_in_text_node: true,
-            max_buffered_script_bytes: 16 * 1024 * 1024,
-            document_state: &doc_state,
-        };
+    fn test_text_handler() {
+        let mut script = InlineSnippet::default();
 
         // Case 1: Inline GTM snippet
         let snippet = r#"(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
@@ -2572,7 +2522,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
 'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
 })(window,document,'script','dataLayer','GTM-XXXX');"#;
 
-        let action = IntegrationScriptRewriter::rewrite(&*integration, snippet, &ctx);
+        let action = script.decide(snippet, true);
         if let ScriptRewriteAction::Replace(val) = action {
             assert!(val.contains("/integrations/google_tag_manager/gtm.js"));
             assert!(!val.contains("https://www.googletagmanager.com/gtm.js"));
@@ -2582,7 +2532,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
 
         // Case 2: Protocol relative
         let snippet_proto = r#"j.src='//www.googletagmanager.com/gtm.js?id='+i+dl;"#;
-        let action = IntegrationScriptRewriter::rewrite(&*integration, snippet_proto, &ctx);
+        let action = script.decide(snippet_proto, true);
         if let ScriptRewriteAction::Replace(val) = action {
             assert!(val.contains("/integrations/google_tag_manager/gtm.js"));
             assert!(!val.contains("//www.googletagmanager.com/gtm.js"));
@@ -2595,7 +2545,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
 
         // Case 3: Irrelevant script
         let other_script = "console.log('hello');";
-        let action = IntegrationScriptRewriter::rewrite(&*integration, other_script, &ctx);
+        let action = script.decide(other_script, true);
         assert!(matches!(action, ScriptRewriteAction::Keep));
     }
 
@@ -3076,8 +3026,12 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         assert!(!rewritten.contains("https://www.google-analytics.com"));
     }
 
+    /// Settings that run this module's middleware on every page, for the
+    /// tests that select the module.
     fn make_settings() -> Settings {
-        create_test_settings()
+        let mut settings = create_test_settings();
+        place_on_every_page(&mut settings, MiddlewarePhase::Fetch, &[MODULE]);
+        settings
     }
 
     fn config_from_settings(
@@ -3190,7 +3144,7 @@ assume_single_jurisdiction = true
         let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
             .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
-        let processor = create_html_processor(config);
+        let processor = create_page_processor(&settings, &registry, config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
             output_compression: Compression::None,
@@ -3230,7 +3184,7 @@ assume_single_jurisdiction = true
         let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
             .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
-        let processor = create_html_processor(config);
+        let processor = create_page_processor(&settings, &registry, config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
             output_compression: Compression::None,
@@ -3295,7 +3249,7 @@ assume_single_jurisdiction = true
         let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
             .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
-        let processor = create_html_processor(config);
+        let processor = create_page_processor(&settings, &registry, config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
             output_compression: Compression::None,
@@ -3333,6 +3287,136 @@ assume_single_jurisdiction = true
         assert!(
             !processed.contains("j.src='https://www.googletagmanager.com/gtm.js"),
             "Original src should be gone"
+        );
+    }
+
+    /// The page a reader receives when `html` arrives from the origin
+    /// `chunk_size` bytes at a time, with Google Tag Manager running.
+    fn page_with_gtm(html: &str, chunk_size: usize) -> String {
+        let mut settings = make_settings();
+        settings
+            .insert_module_config(
+                "tag",
+                MODULE,
+                &serde_json::json!({
+                    "container_id": "GTM-12345",
+                    "upstream_url": "https://www.googletagmanager.com"
+                }),
+            )
+            .expect("should update config");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
+        let config = config_from_settings(&settings, &registry);
+        let mut pipeline = StreamingPipeline::new(
+            PipelineConfig {
+                input_compression: Compression::None,
+                output_compression: Compression::None,
+                chunk_size,
+            },
+            create_page_processor(&settings, &registry, config),
+        );
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("should process");
+        String::from_utf8(output).expect("should stay UTF-8")
+    }
+
+    #[test]
+    fn the_rewritten_snippet_keeps_its_data_layer_parameter() {
+        // The standard snippet adds `'&l='+l` to the container's address when
+        // a page names its own data layer. A browser decodes no entity inside
+        // a script, so `&amp;l=` would send a parameter called `amp;l`, and
+        // the container would read the default data layer instead.
+        let processed = page_with_gtm(
+            r#"<html><head><script>(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+})(window,document,'script','pageData','GTM-12345');</script></head><body></body></html>"#,
+            8192,
+        );
+
+        assert!(
+            processed.contains("'/integrations/google_tag_manager/gtm.js?id='+i+dl"),
+            "should point the snippet at the first-party path: {processed}"
+        );
+        assert!(
+            processed.contains("dl=l!='dataLayer'?'&l='+l:''"),
+            "should keep the data layer parameter as the snippet wrote it: {processed}"
+        );
+        assert!(
+            !processed.contains("&amp;"),
+            "should escape nothing inside the script: {processed}"
+        );
+    }
+
+    #[test]
+    fn a_loader_of_the_page_s_own_keeps_its_operators() {
+        let processed = page_with_gtm(
+            r#"<html><head><script>if (ready && tries < 3 || waited > 9) { load('https://www.googletagmanager.com/gtm.js?id=GTM-12345'); }</script></head><body></body></html>"#,
+            8192,
+        );
+
+        assert!(
+            processed.contains(
+                "<script>if (ready && tries < 3 || waited > 9) { \
+                 load('/integrations/google_tag_manager/gtm.js?id=GTM-12345'); }</script>"
+            ),
+            "should change the address and leave the script's operators as they were: \
+             {processed}"
+        );
+    }
+
+    #[test]
+    fn a_script_held_for_a_marker_that_never_comes_is_written_back_as_it_was() {
+        // The first chunk ends on `google`, which could be the start of a
+        // marker, so the script's text is held until its last chunk shows it
+        // names no Google Tag Manager host.
+        let script = r#"var engine = "google"; if (a && b < c) { search(engine); }"#;
+        let html = format!("<html><head><script>{script}</script></head><body></body></html>");
+        let first_chunk_ends = html.find("google").expect("should find the word") + "google".len();
+
+        let processed = page_with_gtm(&html, first_chunk_ends);
+
+        assert!(
+            processed.contains(&format!("<script>{script}</script>")),
+            "should write a script it held and did not change back as the page wrote it: \
+             {processed}"
+        );
+    }
+
+    #[test]
+    fn a_script_held_and_then_let_go_keeps_its_order() {
+        // The first chunk ends on `google`, so the script's text is held. Two
+        // chunks later nothing held can become a marker any more, and what was
+        // held has to go out ahead of the text that follows it.
+        let script = r#"var engine = "google"; var one = 1; var two = 2; var three = 3; var four = 4; var five = 5; var six = 6;"#;
+        let html = format!("<html><head><script>{script}</script></head><body></body></html>");
+        let first_chunk_ends = html.find("google").expect("should find the word") + "google".len();
+
+        let processed = page_with_gtm(&html, first_chunk_ends);
+
+        assert!(
+            processed.contains(&format!("<script>{script}</script>")),
+            "should write the script back in the order the page wrote it: {processed}"
+        );
+    }
+
+    #[test]
+    fn a_script_that_writes_markup_keeps_its_order() {
+        // The page arrives in one piece. The parser still hands a script's
+        // text over in parts, split where a `<` might close the script, so the
+        // part ending on `google` is held without any help from the network.
+        let script =
+            r#"footer.innerHTML = '<b>Search with google</b> <i>or</i> <u>another</u> engine';"#;
+        let html = format!("<html><head><script>{script}</script></head><body></body></html>");
+
+        let processed = page_with_gtm(&html, 8192);
+
+        assert!(
+            processed.contains(&format!("<script>{script}</script>")),
+            "should write the script back in the order the page wrote it: {processed}"
         );
     }
 
@@ -3434,32 +3518,14 @@ assume_single_jurisdiction = true
 
     #[test]
     fn fragmented_gtm_snippet_is_accumulated_and_rewritten() {
-        let config = tag_config("GTM-FRAG1", &[]);
-        let integration = GoogleTagManagerIntegration::new(config);
-
-        let document_state = IntegrationDocumentState::default();
-
         // Simulate lol_html splitting the GTM snippet mid-domain.
         let fragment1 = r#"(function(w,d,s,l,i){j.src='https://www.google"#;
         let fragment2 = r#"tagmanager.com/gtm.js?id='+i;f.parentNode.insertBefore(j,f);})(window,document,'script','dataLayer','GTM-FRAG1');"#;
 
-        let ctx_intermediate = IntegrationScriptContext {
-            selector: "script",
-            request_host: "publisher.example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-            is_last_in_text_node: false,
-            max_buffered_script_bytes: 16 * 1024 * 1024,
-            document_state: &document_state,
-        };
-        let ctx_last = IntegrationScriptContext {
-            is_last_in_text_node: true,
-            ..ctx_intermediate
-        };
+        let mut script = InlineSnippet::default();
 
         // Intermediate fragment: should be suppressed.
-        let action1 =
-            IntegrationScriptRewriter::rewrite(&*integration, fragment1, &ctx_intermediate);
+        let action1 = script.decide(fragment1, false);
         assert_eq!(
             action1,
             ScriptRewriteAction::RemoveNode,
@@ -3467,7 +3533,7 @@ assume_single_jurisdiction = true
         );
 
         // Last fragment: should emit full rewritten content.
-        let action2 = IntegrationScriptRewriter::rewrite(&*integration, fragment2, &ctx_last);
+        let action2 = script.decide(fragment2, true);
         match action2 {
             ScriptRewriteAction::Replace(rewritten) => {
                 assert!(
@@ -3485,32 +3551,31 @@ assume_single_jurisdiction = true
 
     #[test]
     fn an_interrupted_document_leaves_no_residue_for_the_next_document() {
-        // The registry holds one `Arc<dyn IntegrationScriptRewriter>` for the
-        // lifetime of the application, so both documents below go through the
-        // SAME rewriter instance. Only the document state differs. With the
-        // buffer owned by the rewriter this test fails: document two emits
-        // document one's secret.
+        // The registry holds one middleware for the lifetime of the
+        // application, so both documents below go through the SAME instance.
+        // Each is given a handler of its own, which is what holds the text.
+        // With the text held by the middleware this test fails: document two
+        // emits document one's secret.
         let integration = GoogleTagManagerIntegration::new(tag_config("GTM-LEAK01", &[]));
+        let handler_for = |document_state: &IntegrationDocumentState| {
+            let context = trusted_server_core::middleware::test_support::context(
+                MiddlewarePhase::Fetch,
+                document_state,
+            );
+            integration.create(&context).text_handlers.remove(0)
+        };
 
         // Document one: a GTM snippet that is cut off before its final
         // fragment ever arrives, as a client disconnect or truncated origin
         // body would do.
         let first_document = IntegrationDocumentState::default();
-        let interrupted = IntegrationScriptContext {
-            selector: "script",
-            request_host: "first.example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-            is_last_in_text_node: false,
-            max_buffered_script_bytes: 16 * 1024 * 1024,
-            document_state: &first_document,
-        };
+        let mut interrupted = handler_for(&first_document);
         // Must end mid-domain: that is what makes the cheap prefix gate
         // accumulate rather than pass the fragment through untouched.
         let secret =
             r#"(function(w,d,s,l,i){var token='SESSION-ONE-SECRET'; j.src='https://www.google"#;
 
-        let action = IntegrationScriptRewriter::rewrite(&*integration, secret, &interrupted);
+        let action = interrupted.decide(secret, false);
         assert_eq!(
             action,
             ScriptRewriteAction::RemoveNode,
@@ -3518,20 +3583,12 @@ assume_single_jurisdiction = true
         );
 
         // Document two: a different request, a fresh document state, the same
-        // registry and the same rewriter.
+        // registry and the same middleware.
         let second_document = IntegrationDocumentState::default();
-        let fresh = IntegrationScriptContext {
-            selector: "script",
-            request_host: "second.example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-            is_last_in_text_node: true,
-            max_buffered_script_bytes: 16 * 1024 * 1024,
-            document_state: &second_document,
-        };
+        let mut fresh = handler_for(&second_document);
         let benign = r#"(function(w,d,s,l,i){j.src='https://www.googletagmanager.com/gtm.js?id='+i;})(window,document,'script','dataLayer','GTM-LEAK01');"#;
 
-        let action = IntegrationScriptRewriter::rewrite(&*integration, benign, &fresh);
+        let action = fresh.decide(benign, true);
 
         let emitted = match action {
             ScriptRewriteAction::Replace(rewritten) => rewritten,
@@ -3556,40 +3613,21 @@ assume_single_jurisdiction = true
     #[test]
     fn non_gtm_fragmented_script_returns_keep_on_every_fragment() {
         // A script with no GTM marker in flight (and no plausible prefix) must
-        // return `Keep` on every fragment. Returning `RemoveNode` +
-        // `Replace(unchanged)` would stomp on other rewriters' replacements
-        // when selectors overlap (see `GoogleTagManagerIntegration::rewrite`).
-        let config = tag_config("GTM-PASS1", &[]);
-        let integration = GoogleTagManagerIntegration::new(config);
-
-        let document_state = IntegrationDocumentState::default();
-
+        // return `Keep` on every fragment, so a script that is none of this
+        // module's business is never held or written again.
         let fragment1 = "console.log('hel";
         let fragment2 = "lo world');";
 
-        let ctx_intermediate = IntegrationScriptContext {
-            selector: "script",
-            request_host: "publisher.example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-            is_last_in_text_node: false,
-            max_buffered_script_bytes: 16 * 1024 * 1024,
-            document_state: &document_state,
-        };
-        let ctx_last = IntegrationScriptContext {
-            is_last_in_text_node: true,
-            ..ctx_intermediate
-        };
+        let mut script = InlineSnippet::default();
 
-        let action1 =
-            IntegrationScriptRewriter::rewrite(&*integration, fragment1, &ctx_intermediate);
+        let action1 = script.decide(fragment1, false);
         assert_eq!(
             action1,
             ScriptRewriteAction::Keep,
             "non-GTM intermediate fragment should not be claimed"
         );
 
-        let action2 = IntegrationScriptRewriter::rewrite(&*integration, fragment2, &ctx_last);
+        let action2 = script.decide(fragment2, true);
         assert_eq!(
             action2,
             ScriptRewriteAction::Keep,
@@ -3602,33 +3640,16 @@ assume_single_jurisdiction = true
     /// is a fragmented non-GTM script. Both must produce correct output.
     #[test]
     fn accumulation_buffer_drains_between_consecutive_script_elements() {
-        let config = tag_config("GTM-MULTI1", &[]);
-        let integration = GoogleTagManagerIntegration::new(config);
-        let document_state = IntegrationDocumentState::default();
-
         // --- First <script>: fragmented GTM snippet ---
         let gtm_frag1 = r#"j.src='https://www.google"#;
         let gtm_frag2 = r#"tagmanager.com/gtm.js?id=GTM-MULTI1';"#;
 
-        let ctx_intermediate = IntegrationScriptContext {
-            selector: "script",
-            request_host: "publisher.example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-            is_last_in_text_node: false,
-            max_buffered_script_bytes: 16 * 1024 * 1024,
-            document_state: &document_state,
-        };
-        let ctx_last = IntegrationScriptContext {
-            is_last_in_text_node: true,
-            ..ctx_intermediate
-        };
+        let mut script = InlineSnippet::default();
 
-        let action =
-            IntegrationScriptRewriter::rewrite(&*integration, gtm_frag1, &ctx_intermediate);
+        let action = script.decide(gtm_frag1, false);
         assert_eq!(action, ScriptRewriteAction::RemoveNode);
 
-        let action = IntegrationScriptRewriter::rewrite(&*integration, gtm_frag2, &ctx_last);
+        let action = script.decide(gtm_frag2, true);
         assert!(
             matches!(action, ScriptRewriteAction::Replace(ref s) if s.contains("/integrations/google_tag_manager/gtm.js")),
             "first element: should rewrite GTM URL. Got: {action:?}"
@@ -3637,19 +3658,18 @@ assume_single_jurisdiction = true
         // --- Second <script>: fragmented non-GTM script ---
         // Buffer must be empty here — no leftover from the first element. With
         // no GTM marker in flight, both fragments return Keep so `lol_html`
-        // emits them unchanged and other rewriters remain unaffected.
+        // emits them unchanged.
         let other_frag1 = "console.log('hel";
         let other_frag2 = "lo');";
 
-        let action =
-            IntegrationScriptRewriter::rewrite(&*integration, other_frag1, &ctx_intermediate);
+        let action = script.decide(other_frag1, false);
         assert_eq!(
             action,
             ScriptRewriteAction::Keep,
             "second element intermediate (non-GTM) should not be claimed"
         );
 
-        let action = IntegrationScriptRewriter::rewrite(&*integration, other_frag2, &ctx_last);
+        let action = script.decide(other_frag2, true);
         assert_eq!(
             action,
             ScriptRewriteAction::Keep,
@@ -3676,7 +3696,7 @@ assume_single_jurisdiction = true
         let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
             .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
-        let processor = create_html_processor(config);
+        let processor = create_page_processor(&settings, &registry, config);
 
         // Chunks small enough to split a script mid-URL. Accumulation
         // reassembles the text before it is rewritten, so the rewrite survives.
@@ -3726,7 +3746,7 @@ assume_single_jurisdiction = true
         let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
             .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
-        let processor = create_html_processor(config);
+        let processor = create_page_processor(&settings, &registry, config);
         let mut pipeline = StreamingPipeline::new(
             PipelineConfig {
                 input_compression: Compression::None,
@@ -3753,15 +3773,11 @@ assume_single_jurisdiction = true
         );
     }
 
-    /// Regression test for the overlapping-rewriter bug: when both the GTM and
-    /// Next.js integrations run and a `<script id="__NEXT_DATA__">`
-    /// payload is fragmented across chunk boundaries, the GTM rewriter must
-    /// NOT clobber the Next.js URL rewrite. In `lol_html`, multiple `text!`
-    /// handlers on overlapping selectors run in registration order and the
-    /// last `text.replace(...)` wins. Before the fix, GTM accumulated every
-    /// script's fragments and re-emitted the unchanged text on `is_last`,
-    /// overwriting Next.js's rewrite. The fix is to return `Keep` on scripts
-    /// that can't plausibly contain a GTM domain.
+    /// When both the GTM and Next.js integrations run and a
+    /// `<script id="__NEXT_DATA__">` payload is fragmented across chunk
+    /// boundaries, the Next.js URL rewrite must reach the page. Both match the
+    /// script, so this module keeps every fragment of a script that cannot
+    /// plausibly contain a GTM domain, and leaves the text to the other.
     #[test]
     fn fragmented_next_data_survives_with_gtm_enabled() {
         use std::io::Cursor;
@@ -3789,14 +3805,19 @@ assume_single_jurisdiction = true
             )
             .expect("should update nextjs config");
 
-        // Next.js first, as a stock build orders the two.
+        // Both modules change the page, Next.js first.
+        place_on_every_page(
+            &mut settings,
+            MiddlewarePhase::Fetch,
+            &[trusted_server_framework_nextjs::MODULE, MODULE],
+        );
         let registry = IntegrationRegistry::with_registrations(
             &settings,
             &[trusted_server_framework_nextjs::builder(), builder()],
         )
         .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
-        let processor = create_html_processor(config);
+        let processor = create_page_processor(&settings, &registry, config);
 
         // Small chunks force fragmentation of the __NEXT_DATA__ text node.
         let pipeline_config = PipelineConfig {
@@ -3860,14 +3881,19 @@ assume_single_jurisdiction = true
             )
             .expect("should update nextjs config");
 
-        // Next.js first, as a stock build orders the two.
+        // Both modules change the page, Next.js first.
+        place_on_every_page(
+            &mut settings,
+            MiddlewarePhase::Fetch,
+            &[trusted_server_framework_nextjs::MODULE, MODULE],
+        );
         let registry = IntegrationRegistry::with_registrations(
             &settings,
             &[trusted_server_framework_nextjs::builder(), builder()],
         )
         .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
-        let processor = create_html_processor(config);
+        let processor = create_page_processor(&settings, &registry, config);
 
         // chunk_size=32 with this payload produces fragments whose tails
         // include "config", "img", "slug", and "thing" — all ending in `g`.
@@ -3917,7 +3943,7 @@ assume_single_jurisdiction = true
         // English or minified tokens and must NOT engage GTM accumulation.
         // Previously these returned true because any non-empty prefix of a
         // marker was accepted, which let GTM claim and clobber fragments
-        // from overlapping script rewriters (see PR #618 P1).
+        // from overlapping text handlers (see PR #618 P1).
         for text in [
             "x",                  // "g"-less
             "img",                // ends in 'g'
@@ -3945,6 +3971,23 @@ assume_single_jurisdiction = true
             super::MODULE,
             trusted_server_core::module_name!(),
             "should be named by the folder this crate lives in"
+        );
+    }
+
+    /// The page a reader receives with this module running, kept as a file
+    /// so that changing how the page change is made can be shown to leave
+    /// the page as it was.
+    #[test]
+    fn the_page_a_reader_receives_is_the_recorded_one() {
+        trusted_server_core::html_processor::test_support::assert_page_is_recorded(
+            include_str!("fixtures/page-change.settings.toml"),
+            &[super::builder()],
+            include_str!("fixtures/page-change.input.html"),
+            include_str!("fixtures/page-change.recorded.html"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/fixtures/page-change.recorded.html"
+            ),
         );
     }
 }

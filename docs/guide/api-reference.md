@@ -1290,7 +1290,7 @@ All integration modules are built at compile time. At runtime, the server concat
 
 Every row below records a compiled integration registration predicate.
 An integration with no HTTP route can still contribute a browser module,
-rewriter, injector, post-processor, request filter, or ad server. In the
+middleware, request filter, or ad server. In the
 predicates below, `named` means a section selects the integration's module.
 
 | Integration          | Registration predicate                                              | HTTP routes                                       |

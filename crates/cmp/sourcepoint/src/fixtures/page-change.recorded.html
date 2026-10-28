@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head><script>window.__tsjs_sourcepoint={"rewriteSdk":true};</script><script>(function(){try{var C="cdn.privacy-mgmt.com";var P="/integrations/sourcepoint/cdn";function r(s){if(typeof s!=="string")return s;return s.replace("https://"+C,P).replace("http://"+C,P).replace("//"+C,P)}function p(o){if(!o||typeof o!=="object")return o;if(o.config){if(typeof o.config.baseEndpoint==="string")o.config.baseEndpoint=r(o.config.baseEndpoint);if(typeof o.config.mmsDomain==="string")o.config.mmsDomain=r(o.config.mmsDomain);if(typeof o.config.wrapperAPIOrigin==="string")o.config.wrapperAPIOrigin=r(o.config.wrapperAPIOrigin);if(typeof o.config.cmpOrigin==="string")o.config.cmpOrigin=r(o.config.cmpOrigin);}if(typeof o.metricUrl==="string")o.metricUrl=r(o.metricUrl);return o}var v=window._sp_?p(window._sp_):undefined;Object.defineProperty(window,"_sp_",{configurable:true,get:function(){return v},set:function(n){v=p(n)}});}catch(e){if(window.console&&console.warn)console.warn("Sourcepoint: failed to install runtime config rewrite trap",e)}})();</script><script src="/static/tsjs=tsjs-unified.min.js?v=BUNDLE-HASH" id="trustedserver-js"></script>
+<meta charset="utf-8">
+<title>Sourcepoint</title>
+<link rel="preload" as="script" href="/integrations/sourcepoint/cdn/unified/wrapperMessagingWithoutDetection.js">
+<script src="/integrations/sourcepoint/cdn/unified/wrapperMessagingWithoutDetection.js" async></script>
+<script src="/integrations/sourcepoint/cdn/wrapper/v2/messages.js"></script>
+<script>window._sp_ = { config: { baseEndpoint: "https://cdn.privacy-mgmt.com" } };</script>
+<script src="https://cdn.example.net/unrelated.js"></script>
+</head>
+<body>
+<a href="https://publisher.example.com/article">An article on the origin</a>
+<img src="https://publisher.example.com/image.png" alt="">
+<a href="https://www.privacy-mgmt.com/about">A link to another host</a>
+</body>
+</html>

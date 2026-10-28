@@ -1,0 +1,13 @@
+[bot-protection]
+modules = ["datadome"]
+
+[bot-protection.datadome]
+client_side_key = "test-client-key"
+
+[[fetch]]
+media_type = "text/html"
+middleware = ["bot-protection.datadome"]
+
+[[serve]]
+media_type = "text/html"
+middleware = ["bot-protection.datadome.tag"]

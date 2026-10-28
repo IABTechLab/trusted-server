@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>JS asset proxy</title>
+<link rel="preload" as="script" href="https://cdn.example.com/vendor-loader.js">
+<script src="https://cdn.example.com/vendor-loader.js" async></script>
+<script src="//cdn.example.com/vendor-loader.js?cb=1"></script>
+<script src="https://cdn.example.com/another-script.js"></script>
+<script src="https://cdn.example.net/unrelated.js"></script>
+</head>
+<body>
+<a href="https://origin.example.com/article">An article on the origin</a>
+<img src="https://origin.example.com/image.png" alt="">
+<a href="https://cdn.example.com/vendor-loader.js">A link to the same address</a>
+</body>
+</html>

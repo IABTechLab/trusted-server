@@ -1,6 +1,6 @@
 use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
@@ -18,12 +18,13 @@ use crate::ec::module::{EcModuleSelection, EdgeCookieModule};
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
+use crate::middleware::{Middleware, MiddlewareChain, MiddlewarePhase, PhaseEntries};
 use crate::module_context::{ModuleCall, ModuleContext, ResolvedRequest};
 use crate::platform::{DisabledGeo, PlatformGeo, RuntimeServices};
 use crate::settings::Settings;
-use crate::streaming_processor::StreamProcessor;
 
-/// Action returned by attribute rewriters to describe how the runtime should mutate the element.
+/// What a middleware's element handler decides about one attribute of an
+/// element.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttributeRewriteAction {
     /// Leave the attribute and element untouched.
@@ -51,15 +52,8 @@ impl AttributeRewriteAction {
     }
 }
 
-/// Outcome returned by the registry after running every matching attribute rewriter.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AttributeRewriteOutcome {
-    Unchanged,
-    Replaced(String),
-    RemoveElement,
-}
-
-/// Action returned by inline script rewriters to describe how to mutate the node.
+/// What a middleware's text handler decides about one chunk of the text
+/// inside an element.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScriptRewriteAction {
     Keep,
@@ -84,33 +78,13 @@ impl ScriptRewriteAction {
     }
 }
 
-/// Context provided to integration HTML attribute rewriters.
-#[derive(Debug)]
-pub struct IntegrationAttributeContext<'a> {
-    pub attribute_name: &'a str,
-    pub element_name: &'a str,
-    pub request_host: &'a str,
-    pub request_scheme: &'a str,
-    pub origin_host: &'a str,
-}
-
-/// Context passed to script/text rewriters for inline HTML handling.
-#[derive(Debug)]
-pub struct IntegrationScriptContext<'a> {
-    pub selector: &'a str,
-    pub request_host: &'a str,
-    pub request_scheme: &'a str,
-    pub origin_host: &'a str,
-    pub is_last_in_text_node: bool,
-    pub max_buffered_script_bytes: usize,
-    pub document_state: &'a IntegrationDocumentState,
-}
-
 type IntegrationDocumentStateMap = BTreeMap<(&'static str, TypeId), Arc<dyn Any + Send + Sync>>;
 
-/// Per-document state shared between HTML/script rewriters and post-processors.
+/// State shared by the middleware working on one document in one phase.
 ///
-/// This exists to support multi-phase HTML processing without requiring a second HTML parse.
+/// What one handler leaves here a later handler or a stream processor reads,
+/// so the document is parsed once. In the serve phase it starts with what
+/// the request's hooks left, see [`IntegrationRequestState`].
 #[derive(Clone, Default)]
 pub struct IntegrationDocumentState {
     inner: Arc<Mutex<IntegrationDocumentStateMap>>,
@@ -195,20 +169,20 @@ impl IntegrationDocumentState {
     }
 }
 
-/// Values a module's request hooks leave for its own page hooks, for one
-/// request.
+/// Values a module's request hooks leave for its own serve middleware, for
+/// one request.
 ///
 /// A request preparer or a request filter leaves a value under its
-/// integration id with [`IntegrationRequestState::insert`]. When the request
-/// produces an HTML document for that one reader, every value is copied into
-/// the document's [`IntegrationDocumentState`] before parsing starts, so the
-/// module's head injector, rewriters and stream processors read it there, and
-/// the same values are handed to the module's response finalizer.
+/// integration id with [`IntegrationRequestState::insert`]. Where the
+/// request's reader is served an HTML document, every value is copied into
+/// the [`IntegrationDocumentState`] the `[[serve]]` entry's middleware share,
+/// so the module's serve middleware reads it there, and the same values are
+/// handed to the module's response finalizer.
 ///
 /// A request that carries any value keeps to the origin path. Its document is
 /// never read from a shared template and never stored as one, and an HTML
-/// response with a body is sent `private, no-store`. A document built to be
-/// shared starts with none of these values.
+/// response with a body is sent `private, no-store`. A fetch middleware is
+/// handed none of these values.
 #[derive(Clone, Default)]
 pub struct IntegrationRequestState {
     values: IntegrationDocumentStateMap,
@@ -223,8 +197,8 @@ impl std::fmt::Debug for IntegrationRequestState {
 }
 
 impl IntegrationRequestState {
-    /// Leaves `value` on `request` for the page hooks of `integration_id`,
-    /// in place of a value of the same type left earlier.
+    /// Leaves `value` on `request` for the serve middleware of
+    /// `integration_id`, in place of a value of the same type left earlier.
     pub fn insert<T>(request: &mut Request<EdgeBody>, integration_id: &'static str, value: T)
     where
         T: Any + Send + Sync + 'static,
@@ -237,8 +211,8 @@ impl IntegrationRequestState {
         request.extensions_mut().insert(state);
     }
 
-    /// Holds `value` for the page hooks of `integration_id`, in place of a
-    /// value of the same type held earlier.
+    /// Holds `value` for the serve middleware of `integration_id`, in place
+    /// of a value of the same type held earlier.
     pub fn set<T>(&mut self, integration_id: &'static str, value: T)
     where
         T: Any + Send + Sync + 'static,
@@ -290,38 +264,6 @@ impl IntegrationRequestState {
         for (key, value) in &self.values {
             guard.insert(*key, Arc::clone(value));
         }
-    }
-}
-
-/// Per-document buffer for script text fragments split across chunks.
-///
-/// `lol_html` can deliver one text node as several chunks, so a rewriter that
-/// needs the whole script must accumulate until `is_last_in_text_node`.
-///
-/// This lives in [`IntegrationDocumentState`] rather than on the rewriter.
-/// Rewriters are registered once as `Arc<dyn IntegrationScriptRewriter>` and
-/// live as long as the [`IntegrationRegistry`], so a buffer owned by a
-/// rewriter is shared by every document that registry serves. A document whose
-/// stream ends before the final fragment — client disconnect, origin error,
-/// truncated body — leaves its partial script in that buffer, and the next
-/// document prepends the residue to its own accumulation. That corrupts the
-/// response and can disclose the previous document's content.
-///
-/// Keyed per integration id, so each integration gets its own buffer, and
-/// dropped with the document state at end of document.
-#[derive(Debug, Default)]
-pub struct ScriptTextAccumulator {
-    buffer: Mutex<String>,
-}
-
-impl ScriptTextAccumulator {
-    /// Locks the buffer.
-    ///
-    /// Recovers from poisoning rather than panicking: a poisoned buffer holds
-    /// at worst a partial script, and the caller's `is_last_in_text_node`
-    /// handling already tolerates unexpected contents.
-    pub fn buffer(&self) -> MutexGuard<'_, String> {
-        self.buffer.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -669,83 +611,6 @@ fn apply_header_mutation_to_response(response: &mut Response<EdgeBody>, mutation
     }
 }
 
-/// Trait for integration-provided HTML attribute rewrite hooks.
-pub trait IntegrationAttributeRewriter: Send + Sync {
-    /// Identifier for logging/diagnostics.
-    fn integration_id(&self) -> &'static str;
-    /// Return true when this rewriter wants to inspect a given attribute.
-    fn handles_attribute(&self, attribute: &str) -> bool;
-    /// Attempt to rewrite the attribute value. Return `AttributeRewriteAction::Replace`
-    /// to update the attribute, `Keep` to leave it untouched, or `RemoveElement` to drop the node.
-    fn rewrite(
-        &self,
-        attr_name: &str,
-        attr_value: &str,
-        ctx: &IntegrationAttributeContext<'_>,
-    ) -> AttributeRewriteAction;
-}
-
-/// Trait for integration-provided inline script/text rewrite hooks.
-pub trait IntegrationScriptRewriter: Send + Sync {
-    /// Identifier for logging/diagnostics.
-    fn integration_id(&self) -> &'static str;
-    /// CSS selector (e.g. `script#__NEXT_DATA__`) that should trigger this rewriter.
-    fn selector(&self) -> &'static str;
-    /// Attempt to rewrite the inline text content for the selector.
-    fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction;
-}
-
-/// Context for HTML post-processors.
-#[derive(Debug)]
-pub struct IntegrationHtmlContext<'a> {
-    pub request_host: &'a str,
-    pub request_scheme: &'a str,
-    pub origin_host: &'a str,
-    pub document_state: &'a IntegrationDocumentState,
-}
-
-/// Owned request data supplied when an integration creates an HTML stream processor.
-#[derive(Clone)]
-pub struct IntegrationHtmlStreamContext {
-    /// Publisher-facing host used for rewritten URLs.
-    pub request_host: String,
-    /// Publisher-facing scheme used for rewritten URLs.
-    pub request_scheme: String,
-    /// Origin host whose URLs may be rewritten.
-    pub origin_host: String,
-    /// Request-local state shared with the document's integration rewriters.
-    pub document_state: IntegrationDocumentState,
-}
-
-/// Creates one mutable HTML output processor for each document.
-pub trait IntegrationHtmlStreamProcessorFactory: Send + Sync {
-    /// Identifier for logging and diagnostics.
-    fn integration_id(&self) -> &'static str;
-
-    /// Create a request-local streaming processor.
-    fn create(&self, context: IntegrationHtmlStreamContext) -> Box<dyn StreamProcessor>;
-}
-
-/// Trait for integration-provided HTML head injections.
-pub trait IntegrationHeadInjector: Send + Sync {
-    /// Identifier for logging/diagnostics.
-    fn integration_id(&self) -> &'static str;
-    /// Return HTML snippets to insert at the start of `<head>`.
-    fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String>;
-
-    /// Return HTML snippets to insert straight after the main script bundle
-    /// and before any deferred one, for a script that needs the bundle to
-    /// have run and has to run before the page's own scripts.
-    fn after_bundle_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        Vec::new()
-    }
-
-    /// Return attributes to add to the publisher TSJS bundle tag.
-    fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
-        Vec::new()
-    }
-}
-
 /// A browser module a registration carries, for a module built outside
 /// `trusted-server-js`. The crate embeds its built IIFE with `include_str!`
 /// and states its SHA-256 as a literal next to it; the registry verifies the
@@ -771,11 +636,16 @@ pub struct IntegrationRegistration {
     /// integration injects the tag itself when it decides to.
     pub js_standalone: bool,
     pub proxies: Vec<Arc<dyn IntegrationProxy>>,
-    pub attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
-    pub script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
-    pub html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
-    pub head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     pub request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    /// The page changes this registration supplies, see [`crate::middleware`].
+    ///
+    /// Declaring one does not make it run, because a middleware changes a
+    /// page only where an entry of the settings names it.
+    pub middleware: Vec<Arc<dyn Middleware>>,
+    /// Attributes this registration puts on the script bundle's tag, each a
+    /// name and a value, for a browser module that reads a setting from the
+    /// tag it was loaded by.
+    pub bundle_tag_attributes: Vec<(&'static str, &'static str)>,
     /// Geo module this registration supplies, with the name `[geo] module`
     /// selects it by.
     ///
@@ -819,11 +689,9 @@ impl IntegrationRegistrationBuilder {
                 js_module: None,
                 js_standalone: false,
                 proxies: Vec::new(),
-                attribute_rewriters: Vec::new(),
-                script_rewriters: Vec::new(),
-                html_stream_processors: Vec::new(),
-                head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                middleware: Vec::new(),
+                bundle_tag_attributes: Vec::new(),
                 geo_module: None,
                 ec_module: None,
                 device_module: None,
@@ -838,38 +706,33 @@ impl IntegrationRegistrationBuilder {
     }
 
     #[must_use]
-    pub fn with_attribute_rewriter(
-        mut self,
-        rewriter: Arc<dyn IntegrationAttributeRewriter>,
-    ) -> Self {
-        self.registration.attribute_rewriters.push(rewriter);
-        self
-    }
-
-    #[must_use]
-    pub fn with_script_rewriter(mut self, rewriter: Arc<dyn IntegrationScriptRewriter>) -> Self {
-        self.registration.script_rewriters.push(rewriter);
-        self
-    }
-
-    #[must_use]
-    pub fn with_html_stream_processor(
-        mut self,
-        processor: Arc<dyn IntegrationHtmlStreamProcessorFactory>,
-    ) -> Self {
-        self.registration.html_stream_processors.push(processor);
-        self
-    }
-
-    #[must_use]
-    pub fn with_head_injector(mut self, injector: Arc<dyn IntegrationHeadInjector>) -> Self {
-        self.registration.head_injectors.push(injector);
-        self
-    }
-
-    #[must_use]
     pub fn with_request_filter(mut self, filter: Arc<dyn IntegrationRequestFilter>) -> Self {
         self.registration.request_filters.push(filter);
+        self
+    }
+
+    /// Declare a page change this registration supplies, see
+    /// [`crate::middleware`]. Called once for each one.
+    ///
+    /// The middleware changes a page only where an entry of the settings
+    /// names it, and one no entry names is logged as a warning when the
+    /// registry is built.
+    #[must_use]
+    pub fn with_middleware(mut self, middleware: Arc<dyn Middleware>) -> Self {
+        self.registration.middleware.push(middleware);
+        self
+    }
+
+    /// Put an attribute on the script bundle's tag, on every page the bundle
+    /// is written into.
+    ///
+    /// The name is lower case letters, digits and hyphens, and the value
+    /// holds none of `"`, `&`, `<` and `>`, or startup is refused. Where two
+    /// registrations give one name different values the first is kept, and
+    /// the other is logged as a warning.
+    #[must_use]
+    pub fn with_bundle_tag_attribute(mut self, name: &'static str, value: &'static str) -> Self {
+        self.registration.bundle_tag_attributes.push((name, value));
         self
     }
 
@@ -987,11 +850,14 @@ struct IntegrationRegistryInner {
     // Modules carried by their registrations, verified against their
     // declared hash at construction.
     carried_js: Vec<(&'static str, CarriedJsModule)>,
-    html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
-    script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
-    html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
-    head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    // The middleware the running registrations supply, each against the
+    // integration that supplied it, in registration order.
+    middleware: Vec<(&'static str, Arc<dyn Middleware>)>,
+    // The attributes the running registrations put on the script bundle's
+    // tag, each against the integration that asked for it, in registration
+    // order.
+    bundle_tag_attributes: Vec<(&'static str, (&'static str, &'static str))>,
     /// JS module IDs to include in the bundle that come from a source other than
     /// a registered integration, for example a module tied to the selected Edge
     /// Cookie module. Populated in [`IntegrationRegistry::new`] from settings.
@@ -1038,11 +904,9 @@ impl Default for IntegrationRegistryInner {
             disabled_js_ids: Vec::new(),
             standalone_js_ids: Vec::new(),
             carried_js: Vec::new(),
-            html_rewriters: Vec::new(),
-            script_rewriters: Vec::new(),
-            html_stream_processors: Vec::new(),
-            head_injectors: Vec::new(),
             request_filters: Vec::new(),
+            middleware: Vec::new(),
+            bundle_tag_attributes: Vec::new(),
             extra_js_module_ids: Vec::new(),
             request_preparers: Vec::new(),
             response_finalizers: Vec::new(),
@@ -1081,6 +945,35 @@ const DEVICE_TYPE: &str = "device";
 const GEO_TYPE: &str = "geo";
 
 impl IntegrationRegistryInner {
+    /// The registered middleware an entry means by `name`.
+    fn middleware_named(&self, name: &str) -> Option<&Arc<dyn Middleware>> {
+        self.middleware
+            .iter()
+            .map(|(_, middleware)| middleware)
+            .find(|middleware| middleware.middleware_id() == name)
+    }
+
+    /// A sentence to follow the refusal of a middleware name an entry wrote,
+    /// when the name is that of a module no section selects, or begins with
+    /// one. Empty otherwise.
+    fn unselected_module_note(&self, name: &str) -> String {
+        self.builder_modules
+            .iter()
+            .find(|(module, selected)| {
+                !*selected
+                    && name
+                        .strip_prefix(*module)
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+            })
+            .map(|(module, _)| {
+                format!(
+                    ". `{module}` is a module no section selects, so nothing it supplies is \
+                     running"
+                )
+            })
+            .unwrap_or_default()
+    }
+
     /// A sentence to follow the refusal of a name a selector wrote, when the
     /// name is a builder's module: one no section selects, which is why
     /// nothing it supplies is running, or one that is selected and supplies no
@@ -1333,9 +1226,8 @@ fn resolve_geo_module(
 pub struct IntegrationMetadata {
     pub id: &'static str,
     pub routes: Vec<IntegrationEndpoint>,
-    pub attribute_rewriters: usize,
-    pub script_selectors: Vec<&'static str>,
-    pub head_injectors: usize,
+    /// The names of the middleware the integration supplies.
+    pub middleware: Vec<&'static str>,
     pub request_filters: usize,
 }
 
@@ -1344,9 +1236,7 @@ impl IntegrationMetadata {
         Self {
             id,
             routes: Vec::new(),
-            attribute_rewriters: 0,
-            script_selectors: Vec::new(),
-            head_injectors: 0,
+            middleware: Vec::new(),
             request_filters: 0,
         }
     }
@@ -1365,6 +1255,108 @@ pub struct ProxyDispatchInput<'a> {
     pub ec_context: &'a mut EcContext,
     pub services: &'a RuntimeServices,
     pub req: Request<EdgeBody>,
+}
+
+/// Refuses a registered middleware no entry could name, and an entry this
+/// deployment cannot run.
+///
+/// A middleware no entry names is left alone and logged.
+///
+/// # Errors
+///
+/// Naming the module or the entry at fault.
+fn check_middleware(
+    settings: &Settings,
+    inner: &IntegrationRegistryInner,
+) -> Result<(), Report<TrustedServerError>> {
+    let refuse = |message: String| Report::new(TrustedServerError::Configuration { message });
+    let phases_of = |middleware: &Arc<dyn Middleware>| -> Vec<String> {
+        middleware
+            .phases()
+            .iter()
+            .map(|phase| format!("[[{phase}]]"))
+            .collect()
+    };
+    for (position, (integration, middleware)) in inner.middleware.iter().enumerate() {
+        let id = middleware.middleware_id();
+        if !crate::module_name::is_valid(id) {
+            return Err(refuse(format!(
+                "module `{integration}` supplies a middleware named `{id}`, which is not a \
+                 name an entry can write. A name is parts joined by `.`, each in lower case \
+                 letters, digits, `_` or `-`"
+            )));
+        }
+        if middleware.phases().is_empty() {
+            return Err(refuse(format!(
+                "module `{integration}` supplies the middleware `{id}`, which says it runs \
+                 in no phase, so no entry could name it"
+            )));
+        }
+        if let Some((earlier, _)) = inner.middleware[..position]
+            .iter()
+            .find(|(_, earlier)| earlier.middleware_id() == id)
+        {
+            return Err(refuse(format!(
+                "modules `{earlier}` and `{integration}` both supply a middleware named \
+                 `{id}`, so an entry could not say which one it means"
+            )));
+        }
+    }
+    for phase in MiddlewarePhase::ALL {
+        for (index, entry) in settings.phase_entries(phase).entries().iter().enumerate() {
+            let at = format!("[[{phase}]] entry {}", index + 1);
+            for name in &entry.middleware {
+                let Some(middleware) = inner.middleware_named(name) else {
+                    let supplied: Vec<&str> = inner
+                        .middleware
+                        .iter()
+                        .map(|(_, middleware)| middleware.middleware_id())
+                        .collect();
+                    return Err(refuse(format!(
+                        "{at} names `{name}`, which no module that runs supplies. The \
+                         middleware the running modules supply is [{}]{}",
+                        supplied.join(", "),
+                        inner.unselected_module_note(name)
+                    )));
+                };
+                if !middleware.phases().contains(&phase) {
+                    return Err(refuse(format!(
+                        "{at} names `{name}`, which does not run in that phase. It runs in {}",
+                        phases_of(middleware).join(" and ")
+                    )));
+                }
+            }
+        }
+    }
+    for (integration, middleware) in unnamed_middleware(settings, inner) {
+        log::warn!(
+            "Module `{integration}` supplies the middleware `{}` and no {} entry names \
+             it, so it changes no page",
+            middleware.middleware_id(),
+            phases_of(middleware).join(" or ")
+        );
+    }
+    Ok(())
+}
+
+/// The middleware no entry names in a phase it runs in, each with the
+/// integration that supplies it, in registration order.
+fn unnamed_middleware<'a>(
+    settings: &Settings,
+    inner: &'a IntegrationRegistryInner,
+) -> Vec<(&'static str, &'a Arc<dyn Middleware>)> {
+    inner
+        .middleware
+        .iter()
+        .filter(|(_, middleware)| {
+            let id = middleware.middleware_id();
+            !middleware
+                .phases()
+                .iter()
+                .any(|phase| settings.phase_entries(*phase).names().contains(&id))
+        })
+        .map(|(integration, middleware)| (*integration, middleware))
+        .collect()
 }
 
 /// In-memory registry of integrations discovered from settings.
@@ -1629,15 +1621,37 @@ impl IntegrationRegistry {
                     inner.routes.push((route, registration.integration_id));
                 }
             }
-            inner
-                .html_rewriters
-                .extend(registration.attribute_rewriters);
-            inner.script_rewriters.extend(registration.script_rewriters);
-            inner
-                .html_stream_processors
-                .extend(registration.html_stream_processors);
-            inner.head_injectors.extend(registration.head_injectors);
             inner.request_filters.extend(registration.request_filters);
+            for middleware in registration.middleware {
+                inner
+                    .middleware
+                    .push((registration.integration_id, middleware));
+            }
+            for (name, value) in registration.bundle_tag_attributes {
+                // The tag is written as markup with no escaping, so a name
+                // or a value that could end the attribute is refused.
+                let name_is_plain = !name.is_empty()
+                    && name.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    });
+                let value_is_plain = !value
+                    .bytes()
+                    .any(|byte| matches!(byte, b'"' | b'&' | b'<' | b'>'));
+                if !name_is_plain || !value_is_plain {
+                    return Err(Report::new(TrustedServerError::Configuration {
+                        message: format!(
+                            "integration `{}` puts the attribute `{name}` on the script \
+                             bundle's tag with the value `{value}`. A name is lower case \
+                             letters, digits and hyphens, and a value holds none of `\"`, `&`, \
+                             `<` and `>`",
+                            registration.integration_id
+                        ),
+                    }));
+                }
+                inner
+                    .bundle_tag_attributes
+                    .push((registration.integration_id, (name, value)));
+            }
             if let Some((name, module)) = registration.geo_module {
                 claim_module_name(&mut claimed, "geo", name, registration.integration_id)?;
                 inner.geo_modules.push((name, module));
@@ -1717,6 +1731,7 @@ impl IntegrationRegistry {
         inner.ec_module = resolve_ec_module(settings, &inner);
         inner.device_module = resolve_device_module(settings, &inner)?;
         inner.geo_module = geo_module;
+        check_middleware(settings, &inner)?;
 
         Ok(Self {
             inner: Arc::new(inner),
@@ -1752,6 +1767,48 @@ impl IntegrationRegistry {
     #[must_use]
     pub fn device_module(&self) -> Option<Arc<dyn DeviceModule>> {
         self.inner.device_module.clone()
+    }
+
+    /// The name of every middleware a running module supplies, in
+    /// registration order.
+    #[must_use]
+    pub fn middleware_ids(&self) -> Vec<&'static str> {
+        self.inner
+            .middleware
+            .iter()
+            .map(|(_, middleware)| middleware.middleware_id())
+            .collect()
+    }
+
+    /// The names of the middleware that run in `phase`, in registration
+    /// order.
+    #[must_use]
+    pub fn middleware_in(&self, phase: MiddlewarePhase) -> Vec<&'static str> {
+        self.inner
+            .middleware
+            .iter()
+            .filter(|(_, middleware)| middleware.phases().contains(&phase))
+            .map(|(_, middleware)| middleware.middleware_id())
+            .collect()
+    }
+
+    /// The middleware the first entry covering a response selects, in the
+    /// order they run, for a response of `media_type` to a request for `path`.
+    /// A response no entry covers gives an empty chain.
+    #[must_use]
+    pub fn middleware_chain(
+        &self,
+        entries: &PhaseEntries,
+        phase: MiddlewarePhase,
+        media_type: &str,
+        path: &str,
+    ) -> MiddlewareChain {
+        let middleware = entries
+            .for_response(media_type, path)
+            .iter()
+            .filter_map(|name| self.inner.middleware_named(name).map(Arc::clone))
+            .collect();
+        MiddlewareChain::new(phase, middleware)
     }
 
     /// Every integration id the registry was built from, named or not, in
@@ -1946,102 +2003,29 @@ impl IntegrationRegistry {
         }
     }
 
-    /// Give integrations a chance to rewrite HTML attributes.
-    #[must_use]
-    pub fn rewrite_attribute(
-        &self,
-        attr_name: &str,
-        attr_value: &str,
-        ctx: &IntegrationAttributeContext<'_>,
-    ) -> AttributeRewriteOutcome {
-        let mut current = attr_value.to_owned();
-        let mut changed = false;
-        for rewriter in &self.inner.html_rewriters {
-            if !rewriter.handles_attribute(attr_name) {
-                continue;
-            }
-            match rewriter.rewrite(attr_name, &current, ctx) {
-                AttributeRewriteAction::Keep => {}
-                AttributeRewriteAction::Replace(next_value) => {
-                    current = next_value;
-                    changed = true;
-                }
-                AttributeRewriteAction::RemoveElement => {
-                    return AttributeRewriteOutcome::RemoveElement;
-                }
-            }
-        }
-
-        if changed {
-            AttributeRewriteOutcome::Replaced(current)
-        } else {
-            AttributeRewriteOutcome::Unchanged
-        }
-    }
-
-    /// Expose registered script/text rewriters for HTML processing.
-    #[must_use]
-    pub fn script_rewriters(&self) -> Vec<Arc<dyn IntegrationScriptRewriter>> {
-        self.inner.script_rewriters.clone()
-    }
-
-    /// Expose registered per-document HTML stream processor factories.
-    #[must_use]
-    pub fn html_stream_processor_factories(
-        &self,
-    ) -> Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>> {
-        self.inner.html_stream_processors.clone()
-    }
-
-    /// Collect HTML snippets for insertion at the start of `<head>`.
-    #[must_use]
-    pub fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        let mut inserts = Vec::new();
-        for injector in &self.inner.head_injectors {
-            let mut next = injector.head_inserts(ctx);
-            if !next.is_empty() {
-                inserts.append(&mut next);
-            }
-        }
-        inserts
-    }
-
-    /// Collect HTML snippets for insertion straight after the main script
-    /// bundle.
-    #[must_use]
-    pub fn after_bundle_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        self.inner
-            .head_injectors
-            .iter()
-            .flat_map(|injector| injector.after_bundle_inserts(ctx))
-            .collect()
-    }
-
-    /// Collect static attributes for the publisher TSJS bundle tag.
+    /// Collect the attributes the registrations put on the publisher TSJS
+    /// bundle tag, each keeping the first value a name is given.
     #[must_use]
     pub fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
         let mut attributes: Vec<(&'static str, &'static str)> = Vec::new();
-        for injector in &self.inner.head_injectors {
-            for attribute in injector.tsjs_script_tag_attributes() {
-                let existing = attributes
-                    .iter()
-                    .find(|(name, _)| *name == attribute.0)
-                    .copied();
-                match existing {
-                    None => attributes.push(attribute),
-                    Some((_, kept_value)) if kept_value != attribute.1 => log::warn!(
-                        "Integration `{}` emits conflicting value for publisher tag attribute `{}`; keeping the first",
-                        injector.integration_id(),
-                        attribute.0
-                    ),
-                    Some(_) => {}
-                }
+        for (integration, attribute) in self.inner.bundle_tag_attributes.iter().copied() {
+            let existing = attributes
+                .iter()
+                .find(|(name, _)| *name == attribute.0)
+                .copied();
+            match existing {
+                None => attributes.push(attribute),
+                Some((_, kept_value)) if kept_value != attribute.1 => log::warn!(
+                    "Integration `{integration}` emits conflicting value for publisher tag attribute `{}`; keeping the first",
+                    attribute.0
+                ),
+                Some(_) => {}
             }
         }
         attributes
     }
 
-    /// Provide a snapshot of registered integrations and their hooks.
+    /// Provide a snapshot of registered integrations and what each supplies.
     #[must_use]
     pub fn registered_integrations(&self) -> Vec<IntegrationMetadata> {
         let mut map: BTreeMap<&'static str, IntegrationMetadata> = BTreeMap::new();
@@ -2061,25 +2045,11 @@ impl IntegrationRegistry {
             ));
         }
 
-        for rewriter in &self.inner.html_rewriters {
+        for (integration_id, middleware) in &self.inner.middleware {
             let entry = map
-                .entry(rewriter.integration_id())
-                .or_insert_with(|| IntegrationMetadata::new(rewriter.integration_id()));
-            entry.attribute_rewriters += 1;
-        }
-
-        for rewriter in &self.inner.script_rewriters {
-            let entry = map
-                .entry(rewriter.integration_id())
-                .or_insert_with(|| IntegrationMetadata::new(rewriter.integration_id()));
-            entry.script_selectors.push(rewriter.selector());
-        }
-
-        for injector in &self.inner.head_injectors {
-            let entry = map
-                .entry(injector.integration_id())
-                .or_insert_with(|| IntegrationMetadata::new(injector.integration_id()));
-            entry.head_injectors += 1;
+                .entry(*integration_id)
+                .or_insert_with(|| IntegrationMetadata::new(integration_id));
+            entry.middleware.push(middleware.middleware_id());
         }
 
         for filter in &self.inner.request_filters {
@@ -2276,91 +2246,6 @@ impl IntegrationRegistry {
         }
     }
 
-    #[cfg(test)]
-    #[must_use]
-    pub fn from_rewriters(
-        attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
-        script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
-    ) -> Self {
-        Self {
-            inner: Arc::new(IntegrationRegistryInner {
-                get_router: Router::new(),
-                post_router: Router::new(),
-                put_router: Router::new(),
-                delete_router: Router::new(),
-                patch_router: Router::new(),
-                head_router: Router::new(),
-                options_router: Router::new(),
-                routes: Vec::new(),
-                builder_ids: Vec::new(),
-                running_integration_ids: Vec::new(),
-                html_rewriters: attribute_rewriters,
-                script_rewriters,
-                html_stream_processors: Vec::new(),
-                head_injectors: Vec::new(),
-                request_filters: Vec::new(),
-                request_preparers: Vec::new(),
-                response_finalizers: Vec::new(),
-                deferred_js_ids: Vec::new(),
-                disabled_js_ids: Vec::new(),
-                extra_js_module_ids: Vec::new(),
-                standalone_js_ids: Vec::new(),
-                carried_js: Vec::new(),
-                geo_modules: Vec::new(),
-                ec_modules: Vec::new(),
-                device_modules: Vec::new(),
-                builder_modules: Vec::new(),
-                geo_module: None,
-                ec_module: None,
-                device_module: None,
-            }),
-            plan: None,
-        }
-    }
-
-    #[cfg(test)]
-    #[must_use]
-    pub fn from_rewriters_with_head_injectors(
-        attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
-        script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
-        head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
-    ) -> Self {
-        Self {
-            inner: Arc::new(IntegrationRegistryInner {
-                get_router: Router::new(),
-                post_router: Router::new(),
-                put_router: Router::new(),
-                delete_router: Router::new(),
-                patch_router: Router::new(),
-                head_router: Router::new(),
-                options_router: Router::new(),
-                routes: Vec::new(),
-                builder_ids: Vec::new(),
-                running_integration_ids: Vec::new(),
-                html_rewriters: attribute_rewriters,
-                script_rewriters,
-                html_stream_processors: Vec::new(),
-                head_injectors,
-                request_filters: Vec::new(),
-                request_preparers: Vec::new(),
-                response_finalizers: Vec::new(),
-                deferred_js_ids: Vec::new(),
-                disabled_js_ids: Vec::new(),
-                extra_js_module_ids: Vec::new(),
-                standalone_js_ids: Vec::new(),
-                carried_js: Vec::new(),
-                geo_modules: Vec::new(),
-                ec_modules: Vec::new(),
-                device_modules: Vec::new(),
-                builder_modules: Vec::new(),
-                geo_module: None,
-                ec_module: None,
-                device_module: None,
-            }),
-            plan: None,
-        }
-    }
-
     #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
     pub fn from_request_filters(request_filters: Vec<Arc<dyn IntegrationRequestFilter>>) -> Self {
@@ -2376,11 +2261,9 @@ impl IntegrationRegistry {
                 routes: Vec::new(),
                 builder_ids: Vec::new(),
                 running_integration_ids: Vec::new(),
-                html_rewriters: Vec::new(),
-                script_rewriters: Vec::new(),
-                html_stream_processors: Vec::new(),
-                head_injectors: Vec::new(),
                 request_filters,
+                middleware: Vec::new(),
+                bundle_tag_attributes: Vec::new(),
                 request_preparers: Vec::new(),
                 response_finalizers: Vec::new(),
                 deferred_js_ids: Vec::new(),
@@ -2455,11 +2338,9 @@ impl IntegrationRegistry {
                 routes: Vec::new(),
                 builder_ids: Vec::new(),
                 running_integration_ids: Vec::new(),
-                html_rewriters: Vec::new(),
-                script_rewriters: Vec::new(),
-                html_stream_processors: Vec::new(),
-                head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                middleware: Vec::new(),
+                bundle_tag_attributes: Vec::new(),
                 request_preparers: Vec::new(),
                 response_finalizers: Vec::new(),
                 deferred_js_ids: Vec::new(),
@@ -2534,10 +2415,10 @@ pub(crate) mod test_support {
     /// does, the way a module that reserves a cookie does. Selected, its
     /// request filter leaves the same mark on a request that carries its
     /// header, which is the route a module that decides in its filter takes.
-    /// Selected, the
-    /// stand-in's head injector reads the mark from the document's state and
-    /// writes one script at the start of `<head>` and the tag of its
-    /// standalone module after the bundle. Its response finalizer sets a
+    /// Selected, it supplies one serve middleware under its own name, which
+    /// reads the mark from the state the request left and writes one script
+    /// ahead of the bundle and the tag of its standalone module after it,
+    /// into that reader's copy alone. Its response finalizer sets a
     /// cookie on the response to a marked request, and its builder declares
     /// that it reads the auction token.
     pub(crate) mod request_fixture {
@@ -2549,11 +2430,12 @@ pub(crate) mod test_support {
 
         use crate::error::TrustedServerError;
         use crate::integrations::registry::{
-            CarriedJsModule, IntegrationHeadInjector, IntegrationHtmlContext,
-            IntegrationRegistration, IntegrationRequestFilter, IntegrationRequestState,
-            RequestFilterDecision, RequestFilterEffects, RequestFilterInput,
+            CarriedJsModule, IntegrationRegistration, IntegrationRequestFilter,
+            IntegrationRequestState, RequestFilterDecision, RequestFilterEffects,
+            RequestFilterInput,
         };
         use crate::integrations::{CORE_SOURCE, IntegrationBuilder};
+        use crate::middleware::{Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase};
         use crate::settings::Settings;
         use crate::tsjs_bundle::JsModulePart;
 
@@ -2707,38 +2589,44 @@ pub(crate) mod test_support {
 
         struct Head;
 
-        impl Head {
-            fn marked(ctx: &IntegrationHtmlContext<'_>) -> bool {
-                ctx.document_state.get::<Mark>(ID).is_some()
-            }
-        }
-
-        impl IntegrationHeadInjector for Head {
-            fn integration_id(&self) -> &'static str {
-                ID
+        impl Middleware for Head {
+            fn middleware_id(&self) -> &'static str {
+                MODULE
             }
 
-            fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-                if !Self::marked(ctx) {
-                    return Vec::new();
-                }
-                vec![format!("<script>{HEAD_FLAG}</script>")]
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Serve]
             }
 
-            fn after_bundle_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-                if !Self::marked(ctx) {
-                    return Vec::new();
+            fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                if context.document_state.get::<Mark>(ID).is_none() {
+                    return MiddlewareAction::pass();
                 }
                 let module = JsModulePart {
                     id: ID,
                     source: JS,
                     sha256: JS_SHA256,
                 };
-                vec![format!(
-                    "<script src=\"{}\"></script>",
-                    crate::tsjs::tsjs_single_module_script_src(&module)
-                )]
+                MiddlewareAction {
+                    head_inserts: vec![format!("<script>{HEAD_FLAG}</script>")],
+                    after_bundle_inserts: vec![format!(
+                        "<script src=\"{}\"></script>",
+                        crate::tsjs::tsjs_single_module_script_src(&module)
+                    )],
+                    ..MiddlewareAction::pass()
+                }
             }
+        }
+
+        /// Has `settings` select the stand-in and run its middleware, and no
+        /// other, on every reader's copy of a page.
+        pub(crate) fn select_and_place(settings: &mut Settings) {
+            settings.select_module("testing", MODULE);
+            crate::html_processor::test_support::place_on_every_page(
+                settings,
+                MiddlewarePhase::Serve,
+                &[MODULE],
+            );
         }
 
         fn register(
@@ -2754,7 +2642,7 @@ pub(crate) mod test_support {
                         sha256: JS_SHA256,
                     })
                     .with_standalone_js()
-                    .with_head_injector(Arc::new(Head))
+                    .with_middleware(Arc::new(Head))
                     .with_request_filter(Arc::new(Filter))
                     .build(),
             ))
@@ -2771,19 +2659,18 @@ pub(crate) mod test_support {
     /// core's own tests of how modules are divided between the bundle and
     /// deferred tags, and of how a module's settings reach a page template.
     ///
-    /// Selected, it carries a deferred browser module and writes its two
-    /// settings into `<head>`.
+    /// Selected, it carries a deferred browser module and supplies one fetch
+    /// middleware under its own name, which writes its two settings into
+    /// `<head>`.
     pub(crate) mod deferred_fixture {
         use std::sync::Arc;
 
         use error_stack::Report;
 
         use crate::error::TrustedServerError;
-        use crate::integrations::registry::{
-            CarriedJsModule, IntegrationHeadInjector, IntegrationHtmlContext,
-            IntegrationRegistration,
-        };
+        use crate::integrations::registry::{CarriedJsModule, IntegrationRegistration};
         use crate::integrations::{CORE_SOURCE, IntegrationBuilder};
+        use crate::middleware::{Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase};
         use crate::settings::Settings;
 
         /// The integration id the stand-in registers under.
@@ -2817,20 +2704,37 @@ pub(crate) mod test_support {
             timeout_ms: u32,
         }
 
-        impl IntegrationHeadInjector for Head {
-            fn integration_id(&self) -> &'static str {
-                ID
+        impl Middleware for Head {
+            fn middleware_id(&self) -> &'static str {
+                MODULE
             }
 
-            fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Fetch]
+            }
+
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
                 let config = serde_json::json!({
                     "label": self.label,
                     "timeoutMs": self.timeout_ms,
                 });
-                vec![format!(
-                    "<script>window.__ts_deferred_fixture={config};</script>"
-                )]
+                MiddlewareAction {
+                    head_inserts: vec![format!(
+                        "<script>window.__ts_deferred_fixture={config};</script>"
+                    )],
+                    ..MiddlewareAction::pass()
+                }
             }
+        }
+
+        /// Has `settings` run the stand-in's middleware, and no other, on
+        /// every page.
+        pub(crate) fn place(settings: &mut Settings) {
+            crate::html_processor::test_support::place_on_every_page(
+                settings,
+                MiddlewarePhase::Fetch,
+                &[MODULE],
+            );
         }
 
         fn register(
@@ -2846,7 +2750,7 @@ pub(crate) mod test_support {
                         sha256: JS_SHA256,
                     })
                     .with_deferred_js()
-                    .with_head_injector(Arc::new(Head {
+                    .with_middleware(Arc::new(Head {
                         label: config.label,
                         timeout_ms: config.timeout_ms,
                     }))
@@ -2861,24 +2765,245 @@ pub(crate) mod test_support {
         }
     }
 
-    /// A stand-in for an integration that tags a page, for core's own tests
-    /// of the HTML processor and the JavaScript asset proxy.
+    /// A stand-in for a module that changes a page through middleware, for
+    /// core's own tests of the entries and of the page path.
     ///
-    /// Selected, it inserts one script at the start of `<head>` and rewrites
-    /// the address of its own script to a first-party path. With
-    /// `mark_bundle` set it also asks for an attribute on the publisher
-    /// bundle tag.
-    pub(crate) mod tag_fixture {
+    /// Selected, it supplies three fetch middleware. The one under the
+    /// module's own name writes a marker carrying the module's `label`
+    /// setting at the start of `<head>`. The one named `.links` points every
+    /// link that carries `data-fixture` at a fixed path. The one named
+    /// `.broken` asks for a selector that does not parse.
+    ///
+    /// It supplies two serve middleware as well. The one named `.reader`
+    /// writes a marker ahead of the script bundle, saying which origin it was
+    /// told of and whether the request stand-in left its mark, and a script
+    /// straight after the bundle. The one named `.broken-reader` asks for a
+    /// selector that does not parse.
+    pub(crate) mod middleware_fixture {
+        use std::rc::Rc;
         use std::sync::Arc;
 
         use error_stack::Report;
 
         use crate::error::TrustedServerError;
-        use crate::integrations::registry::{
-            AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-            IntegrationHeadInjector, IntegrationHtmlContext, IntegrationRegistration,
-        };
+        use crate::integrations::registry::{AttributeRewriteAction, IntegrationRegistration};
         use crate::integrations::{CORE_SOURCE, IntegrationBuilder};
+        use crate::middleware::{
+            AttributeRewrite, Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase,
+        };
+        use crate::settings::Settings;
+
+        /// The integration id the stand-in registers under.
+        pub(crate) const ID: &str = "middleware_fixture";
+        /// The name a test's settings select the stand-in by, in `[testing]`.
+        pub(crate) const MODULE: &str = "testing.middleware-fixture";
+        /// The name of the middleware that marks the head.
+        pub(crate) const HEAD: &str = MODULE;
+        /// The name of the middleware that moves links.
+        pub(crate) const LINKS: &str = "testing.middleware-fixture.links";
+        /// The name of the middleware whose selector does not parse.
+        pub(crate) const BROKEN: &str = "testing.middleware-fixture.broken";
+        /// The name of the serve middleware that marks a reader's copy.
+        pub(crate) const READER: &str = "testing.middleware-fixture.reader";
+        /// The name of the serve middleware whose selector does not parse.
+        pub(crate) const BROKEN_READER: &str = "testing.middleware-fixture.broken-reader";
+        /// What the reader middleware writes straight after the bundle.
+        pub(crate) const READER_SCRIPT: &str = "<script data-fixture-reader></script>";
+        /// Where the links middleware points a link.
+        pub(crate) const LINK_TARGET: &str = "/fixture/link";
+        /// The selector the broken middleware asks for.
+        pub(crate) const BROKEN_SELECTOR: &str = "a[";
+
+        /// The builder core's test build lists beside its own.
+        pub(crate) const BUILDER: IntegrationBuilder =
+            IntegrationBuilder::new(ID, CORE_SOURCE, register, validate).with_module_name(MODULE);
+
+        #[derive(Debug, serde::Deserialize, validator::Validate)]
+        #[serde(deny_unknown_fields)]
+        struct FixtureSettings {
+            #[serde(default)]
+            label: String,
+        }
+
+        impl crate::settings::IntegrationConfig for FixtureSettings {}
+
+        /// The marker the head middleware writes for `label`.
+        pub(crate) fn head_marker(label: &str) -> String {
+            format!("<meta name=\"middleware-fixture\" content=\"{label}\">")
+        }
+
+        struct Head {
+            label: String,
+        }
+
+        impl Middleware for Head {
+            fn middleware_id(&self) -> &'static str {
+                HEAD
+            }
+
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Fetch]
+            }
+
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                MiddlewareAction {
+                    head_inserts: vec![head_marker(&self.label)],
+                    ..MiddlewareAction::pass()
+                }
+            }
+        }
+
+        /// The marker the reader middleware writes when told of `origin_host`,
+        /// for a request the request stand-in marked or did not.
+        pub(crate) fn reader_marker(origin_host: &str, marked: bool) -> String {
+            format!(
+                "<meta name=\"middleware-fixture-reader\" content=\"origin {origin_host}; marked \
+                 {marked}\">"
+            )
+        }
+
+        struct Reader;
+
+        impl Middleware for Reader {
+            fn middleware_id(&self) -> &'static str {
+                READER
+            }
+
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Serve]
+            }
+
+            fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                use super::request_fixture;
+
+                let marked = context
+                    .document_state
+                    .get::<request_fixture::Mark>(request_fixture::ID)
+                    .is_some();
+                MiddlewareAction {
+                    head_inserts: vec![reader_marker(context.origin_host, marked)],
+                    after_bundle_inserts: vec![READER_SCRIPT.to_owned()],
+                    ..MiddlewareAction::pass()
+                }
+            }
+        }
+
+        struct BrokenReader;
+
+        impl Middleware for BrokenReader {
+            fn middleware_id(&self) -> &'static str {
+                BROKEN_READER
+            }
+
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Serve]
+            }
+
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                MiddlewareAction {
+                    element_handlers: vec![Box::new(AttributeRewrite::matching(
+                        BROKEN_SELECTOR,
+                        "href",
+                        Rc::new(|_matched| AttributeRewriteAction::keep()),
+                    ))],
+                    ..MiddlewareAction::pass()
+                }
+            }
+        }
+
+        struct Links;
+
+        impl Middleware for Links {
+            fn middleware_id(&self) -> &'static str {
+                LINKS
+            }
+
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Fetch]
+            }
+
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                MiddlewareAction {
+                    element_handlers: vec![Box::new(AttributeRewrite::matching(
+                        "a[data-fixture]",
+                        "href",
+                        Rc::new(|_matched| AttributeRewriteAction::replace(LINK_TARGET)),
+                    ))],
+                    ..MiddlewareAction::pass()
+                }
+            }
+        }
+
+        struct Broken;
+
+        impl Middleware for Broken {
+            fn middleware_id(&self) -> &'static str {
+                BROKEN
+            }
+
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Fetch]
+            }
+
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                MiddlewareAction {
+                    element_handlers: vec![Box::new(AttributeRewrite::matching(
+                        BROKEN_SELECTOR,
+                        "href",
+                        Rc::new(|_matched| AttributeRewriteAction::keep()),
+                    ))],
+                    ..MiddlewareAction::pass()
+                }
+            }
+        }
+
+        fn register(
+            settings: &Settings,
+        ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+            let Some(config) = settings.module_config::<FixtureSettings>(MODULE)? else {
+                return Ok(None);
+            };
+            Ok(Some(
+                IntegrationRegistration::builder(ID)
+                    .without_js()
+                    .with_middleware(Arc::new(Head {
+                        label: config.label,
+                    }))
+                    .with_middleware(Arc::new(Links))
+                    .with_middleware(Arc::new(Broken))
+                    .with_middleware(Arc::new(Reader))
+                    .with_middleware(Arc::new(BrokenReader))
+                    .build(),
+            ))
+        }
+
+        fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+            settings
+                .module_config::<FixtureSettings>(MODULE)
+                .map(|config| config.is_some())
+        }
+    }
+
+    /// A stand-in for an integration that tags a page, for core's own tests
+    /// of the HTML processor and the JavaScript asset proxy.
+    ///
+    /// Selected, it supplies one fetch middleware under its own name, which
+    /// writes one script in `<head>` ahead of the bundle and rewrites the
+    /// address of its own script to a first-party path. With `mark_bundle`
+    /// set it also asks for an attribute on the publisher bundle tag.
+    pub(crate) mod tag_fixture {
+        use std::rc::Rc;
+        use std::sync::Arc;
+
+        use error_stack::Report;
+
+        use crate::error::TrustedServerError;
+        use crate::integrations::registry::{AttributeRewriteAction, IntegrationRegistration};
+        use crate::integrations::{CORE_SOURCE, IntegrationBuilder};
+        use crate::middleware::{
+            AttributeRewrite, AttributeRewriteFn, Middleware, MiddlewareAction, MiddlewareContext,
+            MiddlewarePhase,
+        };
         use crate::settings::Settings;
 
         /// The integration id the stand-in registers under.
@@ -2907,47 +3032,29 @@ pub(crate) mod test_support {
 
         impl crate::settings::IntegrationConfig for FixtureSettings {}
 
-        struct Tag {
-            mark_bundle: bool,
-        }
+        struct Tag;
 
-        impl IntegrationHeadInjector for Tag {
-            fn integration_id(&self) -> &'static str {
-                ID
+        impl Middleware for Tag {
+            fn middleware_id(&self) -> &'static str {
+                MODULE
             }
 
-            fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-                vec![format!("<script>{HEAD_FLAG}</script>")]
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Fetch]
             }
 
-            fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
-                if self.mark_bundle {
-                    vec![(BUNDLE_ATTRIBUTE, "true")]
-                } else {
-                    Vec::new()
-                }
-            }
-        }
-
-        impl IntegrationAttributeRewriter for Tag {
-            fn integration_id(&self) -> &'static str {
-                ID
-            }
-
-            fn handles_attribute(&self, attribute: &str) -> bool {
-                attribute == "src"
-            }
-
-            fn rewrite(
-                &self,
-                _attr_name: &str,
-                attr_value: &str,
-                _ctx: &IntegrationAttributeContext<'_>,
-            ) -> AttributeRewriteAction {
-                if attr_value == SCRIPT_URL {
-                    AttributeRewriteAction::Replace(FIRST_PARTY_SCRIPT.to_owned())
-                } else {
-                    AttributeRewriteAction::Keep
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                let decide: Rc<AttributeRewriteFn> = Rc::new(|matched| {
+                    if matched.value == SCRIPT_URL {
+                        AttributeRewriteAction::Replace(FIRST_PARTY_SCRIPT.to_owned())
+                    } else {
+                        AttributeRewriteAction::Keep
+                    }
+                });
+                MiddlewareAction {
+                    head_inserts: vec![format!("<script>{HEAD_FLAG}</script>")],
+                    element_handlers: vec![Box::new(AttributeRewrite::new("src", decide))],
+                    ..MiddlewareAction::pass()
                 }
             }
         }
@@ -2958,16 +3065,13 @@ pub(crate) mod test_support {
             let Some(config) = settings.module_config::<FixtureSettings>(MODULE)? else {
                 return Ok(None);
             };
-            let tag = Arc::new(Tag {
-                mark_bundle: config.mark_bundle,
-            });
-            Ok(Some(
-                IntegrationRegistration::builder(ID)
-                    .without_js()
-                    .with_attribute_rewriter(tag.clone())
-                    .with_head_injector(tag)
-                    .build(),
-            ))
+            let mut registration = IntegrationRegistration::builder(ID)
+                .without_js()
+                .with_middleware(Arc::new(Tag));
+            if config.mark_bundle {
+                registration = registration.with_bundle_tag_attribute(BUNDLE_ATTRIBUTE, "true");
+            }
+            Ok(Some(registration.build()))
         }
 
         fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
@@ -2980,13 +3084,14 @@ pub(crate) mod test_support {
     /// A stand-in for an integration that rewrites script payloads in two
     /// passes, for core's own tests of the page pipeline.
     ///
-    /// The script rewriter swaps the payload of each `fixture_payload("...")`
-    /// call for a placeholder that carries a namespace made per document, and
-    /// keeps the payload in the document state. The stream processor swaps
-    /// each placeholder back for its payload with the origin host rewritten.
-    /// A payload pushed with `fixture_payload_open` leaves its group
-    /// unresolved, and the processor holds its output from that placeholder
-    /// on until a `fixture_payload_close` arrives.
+    /// Selected, it supplies one fetch middleware under its own name. Its
+    /// text handler swaps the payload of each `fixture_payload("...")` call
+    /// for a placeholder that carries a namespace made per document, and
+    /// keeps the payload. Its stream processor swaps each placeholder back
+    /// for its payload with the origin host rewritten. A payload pushed with
+    /// `fixture_payload_open` leaves its group unresolved, and the processor
+    /// holds its output from that placeholder on until a
+    /// `fixture_payload_close` arrives.
     pub(crate) mod payload_fixture {
         use std::io;
         use std::sync::{Arc, Mutex, PoisonError};
@@ -2994,12 +3099,11 @@ pub(crate) mod test_support {
         use error_stack::Report;
 
         use crate::error::TrustedServerError;
-        use crate::integrations::registry::{
-            IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory,
-            IntegrationRegistration, IntegrationScriptContext, IntegrationScriptRewriter,
-            ScriptRewriteAction, ScriptTextAccumulator,
-        };
+        use crate::integrations::registry::{IntegrationRegistration, ScriptRewriteAction};
         use crate::integrations::{CORE_SOURCE, IntegrationBuilder};
+        use crate::middleware::{
+            Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase, TextHandler,
+        };
         use crate::settings::Settings;
         use crate::streaming_processor::StreamProcessor;
 
@@ -3024,7 +3128,7 @@ pub(crate) mod test_support {
             unresolved: bool,
         }
 
-        /// What one document's script rewriter has captured so far.
+        /// What one document's text handler has captured so far.
         struct Captured {
             namespace: String,
             payloads: Vec<Payload>,
@@ -3039,18 +3143,16 @@ pub(crate) mod test_support {
             }
         }
 
-        fn captured(
-            state: &crate::integrations::registry::IntegrationDocumentState,
-        ) -> Arc<Mutex<Captured>> {
-            state.get_or_insert_with(ID, || Mutex::new(Captured::default()))
+        /// The scripts of one document, each held until its last chunk.
+        struct Scripts {
+            captured: Arc<Mutex<Captured>>,
+            held: String,
         }
 
-        struct ScriptRewriter;
-
-        impl ScriptRewriter {
+        impl Scripts {
             /// Swaps the payload of a whole script for a placeholder, or
             /// leaves a script that pushes no payload as it is.
-            fn rewrite_whole(script: &str, ctx: &IntegrationScriptContext<'_>) -> Option<String> {
+            fn rewrite_whole(&self, script: &str) -> Option<String> {
                 let (call, opens, closes) = [
                     ("fixture_payload_open(\"", true, false),
                     ("fixture_payload_close(\"", false, true),
@@ -3064,8 +3166,7 @@ pub(crate) mod test_support {
                     return None;
                 }
 
-                let shared = captured(ctx.document_state);
-                let mut captured = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut captured = self.captured.lock().unwrap_or_else(PoisonError::into_inner);
                 let placeholder = format!(
                     "{PLACEHOLDER_PREFIX}{}_{}{PLACEHOLDER_END}",
                     captured.namespace,
@@ -3088,55 +3189,61 @@ pub(crate) mod test_support {
             }
         }
 
-        impl IntegrationScriptRewriter for ScriptRewriter {
-            fn integration_id(&self) -> &'static str {
-                ID
-            }
-
-            fn selector(&self) -> &'static str {
+        impl TextHandler for Scripts {
+            fn selector(&self) -> &str {
                 "script"
             }
 
-            fn rewrite(
-                &self,
-                content: &str,
-                ctx: &IntegrationScriptContext<'_>,
-            ) -> ScriptRewriteAction {
-                let accumulator = ctx
-                    .document_state
-                    .get_or_insert_with(ID, ScriptTextAccumulator::default);
-                let mut buffer = accumulator.buffer();
-                let claimed = !buffer.is_empty() || content.contains("fixture_payload");
+            fn decide(&mut self, text: &str, is_last: bool) -> ScriptRewriteAction {
+                let claimed = !self.held.is_empty() || text.contains("fixture_payload");
                 if !claimed {
                     return ScriptRewriteAction::Keep;
                 }
-                buffer.push_str(content);
-                if !ctx.is_last_in_text_node {
+                self.held.push_str(text);
+                if !is_last {
                     return ScriptRewriteAction::RemoveNode;
                 }
-                let script = std::mem::take(&mut *buffer);
-                let rewritten = Self::rewrite_whole(&script, ctx).unwrap_or(script);
+                let script = std::mem::take(&mut self.held);
+                let rewritten = self.rewrite_whole(&script).unwrap_or(script);
                 ScriptRewriteAction::replace(rewritten)
             }
         }
 
-        struct StreamFactory;
+        struct Payloads;
 
-        impl IntegrationHtmlStreamProcessorFactory for StreamFactory {
-            fn integration_id(&self) -> &'static str {
-                ID
+        impl Middleware for Payloads {
+            fn middleware_id(&self) -> &'static str {
+                MODULE
             }
 
-            fn create(&self, context: IntegrationHtmlStreamContext) -> Box<dyn StreamProcessor> {
-                Box::new(Processor {
-                    context,
-                    held: Vec::new(),
-                })
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Fetch]
+            }
+
+            /// The text handler and the stream processor of one document
+            /// share what the handler captures.
+            fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                let captured = Arc::new(Mutex::new(Captured::default()));
+                MiddlewareAction {
+                    text_handlers: vec![Box::new(Scripts {
+                        captured: Arc::clone(&captured),
+                        held: String::new(),
+                    })],
+                    stream: Some(Box::new(Processor {
+                        captured,
+                        origin_host: context.origin_host.to_owned(),
+                        request_host: context.request_host.to_owned(),
+                        held: Vec::new(),
+                    })),
+                    ..MiddlewareAction::pass()
+                }
             }
         }
 
         struct Processor {
-            context: IntegrationHtmlStreamContext,
+            captured: Arc<Mutex<Captured>>,
+            origin_host: String,
+            request_host: String,
             /// Output not yet released, because it ends inside a placeholder
             /// or starts at one whose group is unresolved.
             held: Vec<u8>,
@@ -3153,8 +3260,7 @@ pub(crate) mod test_support {
         impl StreamProcessor for Processor {
             fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
                 self.held.extend_from_slice(chunk);
-                let shared = captured(&self.context.document_state);
-                let captured = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                let captured = self.captured.lock().unwrap_or_else(PoisonError::into_inner);
                 let prefix = PLACEHOLDER_PREFIX.as_bytes();
                 let mut out = Vec::with_capacity(self.held.len());
                 let mut at = 0;
@@ -3188,7 +3294,7 @@ pub(crate) mod test_support {
                             out.extend_from_slice(
                                 payload
                                     .original
-                                    .replace(&self.context.origin_host, &self.context.request_host)
+                                    .replace(&self.origin_host, &self.request_host)
                                     .as_bytes(),
                             );
                             at = end;
@@ -3222,6 +3328,17 @@ pub(crate) mod test_support {
             }
         }
 
+        /// Has `settings` select the stand-in and run its middleware, and no
+        /// other, on every page.
+        pub(crate) fn select_and_place(settings: &mut Settings) {
+            settings.select_module("testing", MODULE);
+            crate::html_processor::test_support::place_on_every_page(
+                settings,
+                MiddlewarePhase::Fetch,
+                &[MODULE],
+            );
+        }
+
         fn register(
             settings: &Settings,
         ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
@@ -3230,8 +3347,7 @@ pub(crate) mod test_support {
             }
             Ok(Some(
                 IntegrationRegistration::builder(ID)
-                    .with_script_rewriter(Arc::new(ScriptRewriter))
-                    .with_html_stream_processor(Arc::new(StreamFactory))
+                    .with_middleware(Arc::new(Payloads))
                     .build(),
             ))
         }
@@ -3254,87 +3370,16 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::middleware_fixture as fixture;
     use super::test_support::{
         PROBE_JS, PROBE_JS_SHA256, carried_probe_registration, probe_registration, validate_nothing,
     };
     use super::*;
     use crate::constants::COOKIE_TS_EC;
+    use crate::middleware::{HTML_MEDIA_TYPE, MiddlewareAction, MiddlewareContext, PhaseEntry};
     use crate::permissions::{Permission, PermissionSet, PermissionState};
     use crate::platform::test_support::noop_services;
     use http::{HeaderValue, StatusCode, header};
-
-    struct DefaultMetadataHeadInjector;
-
-    impl IntegrationHeadInjector for DefaultMetadataHeadInjector {
-        fn integration_id(&self) -> &'static str {
-            "default-metadata"
-        }
-
-        fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-            Vec::new()
-        }
-    }
-
-    struct StaticMetadataHeadInjector;
-
-    impl IntegrationHeadInjector for StaticMetadataHeadInjector {
-        fn integration_id(&self) -> &'static str {
-            "static-metadata"
-        }
-
-        fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-            Vec::new()
-        }
-
-        fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
-            vec![
-                ("data-ts-gam-attribution", "true"),
-                ("data-test-order", "second"),
-            ]
-        }
-    }
-
-    struct ConflictingMetadataHeadInjector;
-
-    impl IntegrationHeadInjector for ConflictingMetadataHeadInjector {
-        fn integration_id(&self) -> &'static str {
-            "conflicting-metadata"
-        }
-
-        fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-            Vec::new()
-        }
-
-        fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
-            vec![
-                ("data-ts-gam-attribution", "false"),
-                ("data-third-attribute", "third"),
-            ]
-        }
-    }
-
-    #[test]
-    fn tsjs_script_tag_attributes_preserve_registration_order_and_default_empty() {
-        let registry = IntegrationRegistry::from_rewriters_with_head_injectors(
-            Vec::new(),
-            Vec::new(),
-            vec![
-                Arc::new(DefaultMetadataHeadInjector),
-                Arc::new(StaticMetadataHeadInjector),
-                Arc::new(ConflictingMetadataHeadInjector),
-            ],
-        );
-
-        assert_eq!(
-            registry.tsjs_script_tag_attributes(),
-            vec![
-                ("data-ts-gam-attribution", "true"),
-                ("data-test-order", "second"),
-                ("data-third-attribute", "third"),
-            ],
-            "should keep the first value for duplicate names and preserve attribute order"
-        );
-    }
 
     // Mock integration proxy for testing
     struct MockProxy;
@@ -3473,76 +3518,6 @@ mod tests {
             label.as_str(),
             "first",
             "should return inserted string state"
-        );
-    }
-
-    struct CountingStreamFactory(&'static str);
-
-    impl IntegrationHtmlStreamProcessorFactory for CountingStreamFactory {
-        fn integration_id(&self) -> &'static str {
-            self.0
-        }
-
-        fn create(&self, _context: IntegrationHtmlStreamContext) -> Box<dyn StreamProcessor> {
-            struct CountingStreamProcessor(usize);
-
-            impl StreamProcessor for CountingStreamProcessor {
-                fn process_chunk(
-                    &mut self,
-                    chunk: &[u8],
-                    _is_last: bool,
-                ) -> std::io::Result<Vec<u8>> {
-                    self.0 += 1;
-                    let mut output = self.0.to_string().into_bytes();
-                    output.extend_from_slice(chunk);
-                    Ok(output)
-                }
-            }
-
-            Box::new(CountingStreamProcessor(0))
-        }
-    }
-
-    #[test]
-    fn html_stream_factories_preserve_order_and_create_isolated_sessions() {
-        let registration = IntegrationRegistration::builder("test")
-            .with_html_stream_processor(Arc::new(CountingStreamFactory("first")))
-            .with_html_stream_processor(Arc::new(CountingStreamFactory("second")))
-            .build();
-        let identifiers: Vec<_> = registration
-            .html_stream_processors
-            .iter()
-            .map(|factory| factory.integration_id())
-            .collect();
-        assert_eq!(
-            identifiers,
-            ["first", "second"],
-            "should preserve factory registration order",
-        );
-
-        let context = IntegrationHtmlStreamContext {
-            request_host: "proxy.example.com".to_owned(),
-            request_scheme: "https".to_owned(),
-            origin_host: "origin.example.com".to_owned(),
-            document_state: IntegrationDocumentState::default(),
-        };
-        let factory = &registration.html_stream_processors[0];
-        let mut first = factory.create(context.clone());
-        let mut second = factory.create(context);
-
-        assert_eq!(
-            first
-                .process_chunk(b"a", false)
-                .expect("should process first session"),
-            b"1a",
-            "should initialize the first session counter",
-        );
-        assert_eq!(
-            second
-                .process_chunk(b"b", true)
-                .expect("should process second session"),
-            b"1b",
-            "should initialize an independent second session counter",
         );
     }
 
@@ -4932,33 +4907,20 @@ mod tests {
         );
     }
 
-    /// Writes one fixed insert, so a test can read the order hooks ran in.
-    struct FixedHeadInsert {
-        id: &'static str,
-        insert: &'static str,
-    }
-
-    impl IntegrationHeadInjector for FixedHeadInsert {
-        fn integration_id(&self) -> &'static str {
-            self.id
-        }
-
-        fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-            vec![self.insert.to_owned()]
-        }
-    }
-
-    const SECTION_INSERT: &str = "<!--from the section-->";
-    const PLAN_INSERT: &str = "<!--from the plan-->";
+    // Each probe supplies a middleware that changes nothing, so a test can
+    // read the order registrations were made in from the names the registry
+    // lists.
+    const SECTION_MIDDLEWARE: &str = "testing.probe-section";
+    const PLAN_MIDDLEWARE: &str = "testing.probe-plan";
 
     fn section_probe_registration(
         _settings: &Settings,
     ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
         Ok(Some(
             IntegrationRegistration::builder("probe-section")
-                .with_head_injector(Arc::new(FixedHeadInsert {
-                    id: "probe-section",
-                    insert: SECTION_INSERT,
+                .with_middleware(Arc::new(Named {
+                    id: SECTION_MIDDLEWARE,
+                    phases: FETCH_ONLY,
                 }))
                 .build(),
         ))
@@ -4972,9 +4934,9 @@ mod tests {
     ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
         Ok(plan.enabled().then(|| {
             IntegrationRegistration::builder("probe-plan")
-                .with_head_injector(Arc::new(FixedHeadInsert {
-                    id: "probe-plan",
-                    insert: PLAN_INSERT,
+                .with_middleware(Arc::new(Named {
+                    id: PLAN_MIDDLEWARE,
+                    phases: FETCH_ONLY,
                 }))
                 .build()
         }))
@@ -5002,17 +4964,11 @@ mod tests {
             .with_module_name("testing.probe-plan")
             .with_plan_registration(plan_probe_registration),
         ];
-        let probe_inserts = |registry: &IntegrationRegistry| {
-            let document_state = IntegrationDocumentState::default();
+        let probe_middleware = |registry: &IntegrationRegistry| {
             registry
-                .head_inserts(&IntegrationHtmlContext {
-                    request_host: "publisher.example.com",
-                    request_scheme: "https",
-                    origin_host: "origin.example.com",
-                    document_state: &document_state,
-                })
+                .middleware_ids()
                 .into_iter()
-                .filter(|insert| insert == SECTION_INSERT || insert == PLAN_INSERT)
+                .filter(|name| *name == SECTION_MIDDLEWARE || *name == PLAN_MIDDLEWARE)
                 .collect::<Vec<_>>()
         };
 
@@ -5023,7 +4979,7 @@ mod tests {
             !registry.integration_runs("probe-plan"),
             "should register nothing where the function finds nothing in the plan"
         );
-        assert_eq!(probe_inserts(&registry), vec![SECTION_INSERT]);
+        assert_eq!(probe_middleware(&registry), vec![SECTION_MIDDLEWARE]);
 
         settings.auction.enabled = true;
         let registry = IntegrationRegistry::with_registrations(&settings, &extra)
@@ -5033,9 +4989,9 @@ mod tests {
             "should register from the plan a module no section selects"
         );
         assert_eq!(
-            probe_inserts(&registry),
-            vec![PLAN_INSERT, SECTION_INSERT],
-            "should run the hooks of what the plan registered ahead of a section's module"
+            probe_middleware(&registry),
+            vec![PLAN_MIDDLEWARE, SECTION_MIDDLEWARE],
+            "should register what the plan supplies ahead of a section's module"
         );
     }
 
@@ -5886,6 +5842,505 @@ mod tests {
                 && message.contains("`geo-probe`")
                 && message.contains("`geo-second`"),
             "error should name the module and both integrations: {message}"
+        );
+    }
+
+    fn html_entry(path: Option<&str>, names: &[&str]) -> PhaseEntry {
+        PhaseEntry {
+            media_type: HTML_MEDIA_TYPE.to_owned(),
+            path: path.map(str::to_owned),
+            middleware: names.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    }
+
+    /// Settings that select core's middleware stand-in and hold `entries`.
+    fn fixture_settings_with_entries(entries: Vec<PhaseEntry>) -> Settings {
+        let mut settings = settings_naming(fixture::MODULE);
+        settings.fetch = PhaseEntries::new(entries);
+        settings
+    }
+
+    #[test]
+    fn a_selected_module_s_middleware_run_where_an_entry_names_them() {
+        let settings = fixture_settings_with_entries(vec![
+            html_entry(Some("/news/"), &[fixture::LINKS, fixture::HEAD]),
+            html_entry(None, &[fixture::HEAD]),
+        ]);
+
+        let registry = IntegrationRegistry::new(&settings)
+            .expect("should build a registry whose entries name registered middleware");
+
+        assert_eq!(
+            registry.middleware_ids(),
+            [
+                fixture::HEAD,
+                fixture::LINKS,
+                fixture::BROKEN,
+                fixture::READER,
+                fixture::BROKEN_READER,
+            ],
+            "should list the middleware the selected module supplies"
+        );
+        assert_eq!(
+            registry.middleware_in(MiddlewarePhase::Fetch),
+            [fixture::HEAD, fixture::LINKS, fixture::BROKEN],
+            "should list the middleware that run in the fetch phase"
+        );
+        assert_eq!(
+            registry.middleware_in(MiddlewarePhase::Serve),
+            [fixture::READER, fixture::BROKEN_READER],
+            "should list the middleware that run in the serve phase"
+        );
+        let chain_for = |media_type: &str, path: &str| {
+            registry
+                .middleware_chain(&settings.fetch, MiddlewarePhase::Fetch, media_type, path)
+                .ids()
+        };
+        assert_eq!(
+            chain_for(HTML_MEDIA_TYPE, "/news/today"),
+            [fixture::LINKS, fixture::HEAD],
+            "should run the first covering entry's middleware in the order it names them"
+        );
+        assert_eq!(chain_for(HTML_MEDIA_TYPE, "/"), [fixture::HEAD]);
+        assert!(
+            chain_for("text/css", "/news/site.css").is_empty(),
+            "should run nothing on a media type no entry covers"
+        );
+    }
+
+    #[test]
+    fn a_module_no_section_selects_supplies_no_middleware() {
+        let settings = crate::test_support::tests::create_test_settings();
+
+        let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
+
+        assert!(
+            !registry.middleware_ids().contains(&fixture::HEAD),
+            "should register nothing of a module that does not run"
+        );
+    }
+
+    #[test]
+    fn an_entry_naming_a_middleware_nothing_supplies_is_refused_with_what_is_supplied() {
+        let settings = fixture_settings_with_entries(vec![
+            html_entry(Some("/news/"), &[fixture::HEAD]),
+            html_entry(None, &[fixture::HEAD, "testing.nothing"]),
+        ]);
+
+        let error = IntegrationRegistry::new(&settings)
+            .err()
+            .expect("should refuse an entry naming a middleware nothing supplies");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "[[fetch]] entry 2 names `testing.nothing`, which no module that runs supplies"
+            ) && message.contains(&format!(
+                "[{}, {}, {}, {}, {}]",
+                fixture::HEAD,
+                fixture::LINKS,
+                fixture::BROKEN,
+                fixture::READER,
+                fixture::BROKEN_READER
+            )),
+            "should name the entry and list what could be named: {message}"
+        );
+        assert!(
+            !message.contains("no section selects"),
+            "should not blame a selection when the name is no module's: {message}"
+        );
+    }
+
+    #[test]
+    fn an_entry_naming_the_middleware_of_a_module_no_section_selects_says_so() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.fetch = PhaseEntries::new(vec![html_entry(None, &[fixture::LINKS])]);
+
+        let error = IntegrationRegistry::new(&settings)
+            .err()
+            .expect("should refuse an entry naming the middleware of a module that does not run");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("[[fetch]] entry 1 names `{}`", fixture::LINKS))
+                && message.contains(&format!(
+                    "`{}` is a module no section selects, so nothing it supplies is running",
+                    fixture::MODULE
+                )),
+            "should say the module is not selected: {message}"
+        );
+    }
+
+    #[test]
+    fn a_middleware_no_entry_names_is_listed_for_the_startup_warning() {
+        let unnamed = |entries: Vec<PhaseEntry>| -> Vec<&'static str> {
+            let settings = fixture_settings_with_entries(entries);
+            let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
+            unnamed_middleware(&settings, &registry.inner)
+                .into_iter()
+                .map(|(integration, middleware)| {
+                    assert_eq!(integration, fixture::ID, "should name the supplier");
+                    middleware.middleware_id()
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            unnamed(Vec::new()),
+            [
+                fixture::HEAD,
+                fixture::LINKS,
+                fixture::BROKEN,
+                fixture::READER,
+                fixture::BROKEN_READER,
+            ],
+            "should list every middleware when there are no entries"
+        );
+        assert_eq!(
+            unnamed(vec![
+                html_entry(Some("/news/"), &[fixture::LINKS]),
+                html_entry(None, &[fixture::HEAD]),
+            ]),
+            [fixture::BROKEN, fixture::READER, fixture::BROKEN_READER],
+            "should leave out a middleware any entry names"
+        );
+    }
+
+    #[test]
+    fn an_entry_naming_a_middleware_in_a_phase_it_does_not_run_in_is_refused() {
+        let mut settings = settings_naming(fixture::MODULE);
+        settings.serve = PhaseEntries::new(vec![html_entry(None, &[fixture::HEAD])]);
+        let error = IntegrationRegistry::new(&settings)
+            .err()
+            .expect("should refuse a fetch middleware named in a serve entry");
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("[[serve]] entry 1 names `{}`", fixture::HEAD))
+                && message.contains("does not run in that phase. It runs in [[fetch]]"),
+            "should say which phase the middleware runs in: {message}"
+        );
+
+        let mut settings = settings_naming(fixture::MODULE);
+        settings.fetch = PhaseEntries::new(vec![html_entry(None, &[fixture::READER])]);
+        let error = IntegrationRegistry::new(&settings)
+            .err()
+            .expect("should refuse a serve middleware named in a fetch entry");
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("[[fetch]] entry 1 names `{}`", fixture::READER))
+                && message.contains("does not run in that phase. It runs in [[serve]]"),
+            "should say which phase the middleware runs in: {message}"
+        );
+    }
+
+    #[test]
+    fn each_phase_has_entries_of_its_own() {
+        let mut settings = settings_naming(fixture::MODULE);
+        settings.fetch = PhaseEntries::new(vec![html_entry(None, &[fixture::HEAD])]);
+        settings.serve = PhaseEntries::new(vec![html_entry(Some("/news/"), &[fixture::READER])]);
+        let registry = IntegrationRegistry::new(&settings)
+            .expect("should build a registry with an entry in each phase");
+
+        let chain_for = |phase: MiddlewarePhase, path: &str| {
+            registry
+                .middleware_chain(settings.phase_entries(phase), phase, HTML_MEDIA_TYPE, path)
+                .ids()
+        };
+        assert_eq!(
+            chain_for(MiddlewarePhase::Fetch, "/news/today"),
+            [fixture::HEAD]
+        );
+        assert_eq!(
+            chain_for(MiddlewarePhase::Serve, "/news/today"),
+            [fixture::READER]
+        );
+        assert!(
+            chain_for(MiddlewarePhase::Serve, "/sport/today").is_empty(),
+            "should run no serve middleware on a path only the fetch entries cover"
+        );
+        let unnamed: Vec<&str> = unnamed_middleware(&settings, &registry.inner)
+            .into_iter()
+            .map(|(_, middleware)| middleware.middleware_id())
+            .collect();
+        assert_eq!(
+            unnamed,
+            [fixture::LINKS, fixture::BROKEN, fixture::BROKEN_READER],
+            "should count a middleware as named only by an entry of a phase it runs in"
+        );
+    }
+
+    /// A middleware under a name of the test's choosing, running in the
+    /// phases given.
+    struct Named {
+        id: &'static str,
+        phases: &'static [MiddlewarePhase],
+    }
+
+    impl Middleware for Named {
+        fn middleware_id(&self) -> &'static str {
+            self.id
+        }
+
+        fn phases(&self) -> &[MiddlewarePhase] {
+            self.phases
+        }
+
+        fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+            MiddlewareAction::pass()
+        }
+    }
+
+    const FETCH_ONLY: &[MiddlewarePhase] = &[MiddlewarePhase::Fetch];
+
+    fn first_supplier(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("first_supplier")
+                .without_js()
+                .with_middleware(Arc::new(Named {
+                    id: "testing.shared-name",
+                    phases: FETCH_ONLY,
+                }))
+                .build(),
+        ))
+    }
+
+    fn second_supplier(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("second_supplier")
+                .without_js()
+                .with_middleware(Arc::new(Named {
+                    id: "testing.shared-name",
+                    phases: FETCH_ONLY,
+                }))
+                .build(),
+        ))
+    }
+
+    fn misnamed_supplier(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("misnamed_supplier")
+                .without_js()
+                .with_middleware(Arc::new(Named {
+                    id: "Not A Name",
+                    phases: FETCH_ONLY,
+                }))
+                .build(),
+        ))
+    }
+
+    fn phaseless_supplier(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("phaseless_supplier")
+                .without_js()
+                .with_middleware(Arc::new(Named {
+                    id: "testing.phaseless",
+                    phases: &[],
+                }))
+                .build(),
+        ))
+    }
+
+    /// A builder for `register`, selected in `settings` under a module name
+    /// made from its id.
+    fn selected_supplier(
+        settings: &mut Settings,
+        id: &'static str,
+        module: &'static str,
+        register: crate::integrations::IntegrationBuilderFn,
+    ) -> crate::integrations::IntegrationBuilder {
+        settings.select_module("testing", module);
+        crate::integrations::IntegrationBuilder::new(
+            id,
+            "a-vendor-crate",
+            register,
+            validate_nothing,
+        )
+        .with_module_name(module)
+    }
+
+    #[test]
+    fn two_modules_supplying_one_middleware_name_are_refused() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        let extra = [
+            selected_supplier(
+                &mut settings,
+                "first_supplier",
+                "testing.first-supplier",
+                first_supplier,
+            ),
+            selected_supplier(
+                &mut settings,
+                "second_supplier",
+                "testing.second-supplier",
+                second_supplier,
+            ),
+        ];
+
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
+            .err()
+            .expect("should refuse one middleware name supplied twice");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("`first_supplier` and `second_supplier` both supply a middleware")
+                && message.contains("`testing.shared-name`"),
+            "should name both suppliers and the name: {message}"
+        );
+    }
+
+    fn marking_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("marking")
+                .without_js()
+                .with_bundle_tag_attribute("data-example-mode", "first")
+                .with_bundle_tag_attribute("data-example-flag", "true")
+                .build(),
+        ))
+    }
+
+    fn disagreeing_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("disagreeing")
+                .without_js()
+                .with_bundle_tag_attribute("data-example-mode", "second")
+                .with_bundle_tag_attribute("data-example-other", "kept")
+                .build(),
+        ))
+    }
+
+    fn unsafe_name_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("unsafe_name")
+                .without_js()
+                .with_bundle_tag_attribute("onload=alert(1) data-x", "true")
+                .build(),
+        ))
+    }
+
+    fn unsafe_value_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("unsafe_value")
+                .without_js()
+                .with_bundle_tag_attribute("data-example-mode", "\"><script>")
+                .build(),
+        ))
+    }
+
+    #[test]
+    fn a_registration_s_attributes_reach_the_bundle_s_tag_in_registration_order() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        let extra = [
+            selected_supplier(
+                &mut settings,
+                "marking",
+                "testing.marking",
+                marking_registration,
+            ),
+            selected_supplier(
+                &mut settings,
+                "disagreeing",
+                "testing.disagreeing",
+                disagreeing_registration,
+            ),
+        ];
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build a registry");
+
+        assert_eq!(
+            registry.tsjs_script_tag_attributes(),
+            vec![
+                ("data-example-mode", "first"),
+                ("data-example-flag", "true"),
+                ("data-example-other", "kept"),
+            ],
+            "should keep the first value a name is given and the order the registrations \
+             gave them in"
+        );
+    }
+
+    #[test]
+    fn an_attribute_that_could_end_the_bundle_s_tag_is_refused() {
+        for (id, module, register, shown) in [
+            (
+                "unsafe_name",
+                "testing.unsafe-name",
+                unsafe_name_registration as crate::integrations::IntegrationBuilderFn,
+                "`onload=alert(1) data-x`",
+            ),
+            (
+                "unsafe_value",
+                "testing.unsafe-value",
+                unsafe_value_registration,
+                "`\"><script>`",
+            ),
+        ] {
+            let mut settings = crate::test_support::tests::create_test_settings();
+            let extra = [selected_supplier(&mut settings, id, module, register)];
+
+            let error = IntegrationRegistry::with_registrations(&settings, &extra)
+                .err()
+                .expect("should refuse an attribute that is not plain");
+
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("integration `{id}` puts the attribute"))
+                    && message.contains(shown),
+                "should name the integration and show what it asked for: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_middleware_no_entry_could_name_is_refused() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        let extra = [selected_supplier(
+            &mut settings,
+            "misnamed_supplier",
+            "testing.misnamed-supplier",
+            misnamed_supplier,
+        )];
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
+            .err()
+            .expect("should refuse a middleware whose name no entry can write");
+        let message = error.to_string();
+        assert!(
+            message.contains("`misnamed_supplier` supplies a middleware named `Not A Name`")
+                && message.contains("not a name an entry can write"),
+            "should name the supplier and the name: {message}"
+        );
+
+        let mut settings = crate::test_support::tests::create_test_settings();
+        let extra = [selected_supplier(
+            &mut settings,
+            "phaseless_supplier",
+            "testing.phaseless-supplier",
+            phaseless_supplier,
+        )];
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
+            .err()
+            .expect("should refuse a middleware that runs in no phase");
+        let message = error.to_string();
+        assert!(
+            message.contains("`phaseless_supplier` supplies the middleware `testing.phaseless`")
+                && message.contains("runs in no phase"),
+            "should name the supplier and the middleware: {message}"
         );
     }
 }

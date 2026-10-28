@@ -17,6 +17,9 @@ use validator::Validate;
 
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::IntegrationRegistration;
+use trusted_server_core::middleware::{
+    Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase,
+};
 use trusted_server_core::settings::{IntegrationConfig, Settings};
 
 const NEXTJS_INTEGRATION_ID: &str = "nextjs";
@@ -45,9 +48,10 @@ mod shared;
 
 pub use rsc::rewrite_rsc_scripts_combined;
 
-use rsc_placeholders::NextJsRscPlaceholderRewriter;
+use rsc_placeholders::{NextJsRscPlaceholderRewriter, RscPlaceholderText};
 use rsc_stream::NextJsRscStreamProcessorFactory;
-use script_rewriter::NextJsNextDataRewriter;
+use script_rewriter::{NextDataText, NextJsNextDataRewriter};
+use shared::ScriptDocument;
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
@@ -114,21 +118,59 @@ pub fn register(
         log::info!("NextJS integration not registered (no section selects it)");
         return Ok(None);
     };
-    // Register a structured (Pages Router __NEXT_DATA__) rewriter.
-    let structured = Arc::new(NextJsNextDataRewriter::new(config.clone())?);
+    let page_change = PageChange {
+        // The Pages Router's `__NEXT_DATA__` script.
+        structured: Arc::new(NextJsNextDataRewriter::new(config.clone())?),
+        // Placeholders for the App Router's RSC payload scripts, written
+        // during the HTML rewrite pass and substituted by the bounded output
+        // stream processor.
+        placeholders: Arc::new(NextJsRscPlaceholderRewriter::new(config.clone())),
+        stream: NextJsRscStreamProcessorFactory::new(config),
+    };
 
-    // Insert placeholders for App Router RSC payload scripts during the HTML rewrite pass,
-    // then substitute them through the bounded output stream processor.
-    let placeholders = Arc::new(NextJsRscPlaceholderRewriter::new(config.clone()));
+    Ok(Some(
+        IntegrationRegistration::builder(NEXTJS_INTEGRATION_ID)
+            .with_middleware(Arc::new(page_change))
+            .build(),
+    ))
+}
 
-    let stream_processor = Arc::new(NextJsRscStreamProcessorFactory::new(config.clone()));
+/// Moves the origin's address to the publisher's in the data Next.js writes
+/// into a page, on the pages a `[[fetch]]` entry names [`MODULE`] for.
+struct PageChange {
+    structured: Arc<NextJsNextDataRewriter>,
+    placeholders: Arc<NextJsRscPlaceholderRewriter>,
+    stream: NextJsRscStreamProcessorFactory,
+}
 
-    let builder = IntegrationRegistration::builder(NEXTJS_INTEGRATION_ID)
-        .with_script_rewriter(structured)
-        .with_script_rewriter(placeholders)
-        .with_html_stream_processor(stream_processor);
+impl Middleware for PageChange {
+    fn middleware_id(&self) -> &'static str {
+        MODULE
+    }
 
-    Ok(Some(builder.build()))
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
+    }
+
+    /// A `__NEXT_DATA__` script is put to the structured rewriter before the
+    /// placeholder rewriter, which is asked about every script. The stream
+    /// processor then works on the document the two left.
+    fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        MiddlewareAction {
+            text_handlers: vec![
+                Box::new(NextDataText {
+                    rewriter: Arc::clone(&self.structured),
+                    document: ScriptDocument::new(context),
+                }),
+                Box::new(RscPlaceholderText {
+                    rewriter: Arc::clone(&self.placeholders),
+                    document: ScriptDocument::new(context),
+                }),
+            ],
+            stream: Some(self.stream.create(context)),
+            ..MiddlewareAction::pass()
+        }
+    }
 }
 
 fn build(
@@ -145,12 +187,23 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::io::Cursor;
-    use trusted_server_core::html_processor::{HtmlProcessorConfig, create_html_processor};
+    use trusted_server_core::html_processor::HtmlProcessorConfig;
+    use trusted_server_core::html_processor::test_support::{
+        create_page_processor, place_on_every_page,
+    };
     use trusted_server_core::integrations::IntegrationRegistry;
     use trusted_server_core::streaming_processor::{
         Compression, PipelineConfig, StreamingPipeline,
     };
     use trusted_server_core::test_support::tests::create_test_settings;
+
+    /// Test settings whose `[[fetch]]` entry runs the module's middleware on
+    /// every page.
+    fn settings_placing_the_module() -> Settings {
+        let mut settings = create_test_settings();
+        place_on_every_page(&mut settings, MiddlewarePhase::Fetch, &[MODULE]);
+        settings
+    }
 
     fn config_from_settings(
         settings: &Settings,
@@ -173,7 +226,7 @@ mod tests {
             </script>
         </body></html>"#;
 
-        let mut settings = create_test_settings();
+        let mut settings = settings_placing_the_module();
         settings
             .insert_module_config(
                 "framework",
@@ -186,7 +239,7 @@ mod tests {
         let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
             .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
-        let processor = create_html_processor(config);
+        let processor = create_page_processor(&settings, &registry, config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
             output_compression: Compression::None,
@@ -228,6 +281,50 @@ mod tests {
     }
 
     #[test]
+    fn html_processor_keeps_what_a_rewritten_next_data_script_holds() {
+        // The payload is rewritten because it names the origin, and the rest
+        // of it has to come back as the page wrote it.
+        let html = r#"<html><body><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"primary":{"href":"https://origin.example.com/search?q=shoes&page=2"},"note":"a < b && c > d"}}}</script></body></html>"#;
+
+        let mut settings = settings_placing_the_module();
+        settings
+            .insert_module_config(
+                "framework",
+                "framework.nextjs",
+                &json!({
+                    "rewrite_attributes": ["href", "link", "url"],
+                }),
+            )
+            .expect("should update nextjs config");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
+        let config = config_from_settings(&settings, &registry);
+        let mut pipeline = StreamingPipeline::new(
+            PipelineConfig {
+                input_compression: Compression::None,
+                output_compression: Compression::None,
+                chunk_size: 8192,
+            },
+            create_page_processor(&settings, &registry, config),
+        );
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("pipeline should process HTML");
+        let processed = String::from_utf8_lossy(&output);
+
+        assert!(
+            processed.contains(r#""href":"https://test.example.com/search?q=shoes&page=2""#),
+            "should move the address and keep its query string as written: {processed}"
+        );
+        assert!(
+            processed.contains(r#""note":"a < b && c > d""#),
+            "should keep a value it did not rewrite as written: {processed}"
+        );
+    }
+
+    #[test]
     fn html_processor_rewrites_next_data_fixture_like_payload() {
         let html = r#"<html><body>
             <script id="__NEXT_DATA__" type="application/json">
@@ -253,7 +350,7 @@ mod tests {
             </script>
         </body></html>"#;
 
-        let mut settings = create_test_settings();
+        let mut settings = settings_placing_the_module();
         settings
             .insert_module_config(
                 "framework",
@@ -272,7 +369,7 @@ mod tests {
         let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
             .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
-        let processor = create_html_processor(config);
+        let processor = create_page_processor(&settings, &registry, config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
             output_compression: Compression::None,
@@ -329,7 +426,7 @@ mod tests {
             <script>self.__next_f.push([1,"prefix {\"inner\":\"value\"} \\\"href\\\":\\\"http://origin.example.com/dashboard\\\", \\\"link\\\":\\\"https://origin.example.com/api-test\\\" suffix"])</script>
         </body></html>"#;
 
-        let mut settings = create_test_settings();
+        let mut settings = settings_placing_the_module();
         settings
             .insert_module_config(
                 "framework",
@@ -342,7 +439,7 @@ mod tests {
         let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
             .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
-        let processor = create_html_processor(config);
+        let processor = create_page_processor(&settings, &registry, config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
             output_compression: Compression::None,
@@ -375,7 +472,7 @@ mod tests {
 <script>self.__next_f.push([1,'{"href":"https://origin.example.com/app","url":"http://origin.example.com/api"}'])</script>
         </body></html>"#;
 
-        let mut settings = create_test_settings();
+        let mut settings = settings_placing_the_module();
         settings
             .insert_module_config(
                 "framework",
@@ -388,7 +485,7 @@ mod tests {
         let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
             .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
-        let processor = create_html_processor(config);
+        let processor = create_page_processor(&settings, &registry, config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
             output_compression: Compression::None,
@@ -423,7 +520,7 @@ mod tests {
 <script>self.__next_f.push([1," with https://origin.example.com/page goes here"])</script>
 </body></html>"#;
 
-        let mut settings = create_test_settings();
+        let mut settings = settings_placing_the_module();
         settings
             .insert_module_config(
                 "framework",
@@ -437,7 +534,7 @@ mod tests {
         let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
             .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
-        let processor = create_html_processor(config);
+        let processor = create_page_processor(&settings, &registry, config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
             output_compression: Compression::None,
@@ -486,7 +583,7 @@ mod tests {
 <script>self.__next_f.push([1,'458:{"ID":879000,"title":"Makes","url":"https://origin.example.com/makes","children":"$45a"}\n442:["$443"]'])</script>
 </body></html>"#;
 
-        let mut settings = create_test_settings();
+        let mut settings = settings_placing_the_module();
         settings
             .insert_module_config(
                 "framework",
@@ -500,7 +597,7 @@ mod tests {
         let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
             .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
-        let processor = create_html_processor(config);
+        let processor = create_page_processor(&settings, &registry, config);
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
             output_compression: Compression::None,
@@ -556,7 +653,7 @@ mod tests {
 <script>window.analytics = { track: function(e) { console.log(e); } };</script>
 </body></html>"#;
 
-        let mut settings = create_test_settings();
+        let mut settings = settings_placing_the_module();
         settings
             .insert_module_config(
                 "framework",
@@ -569,7 +666,7 @@ mod tests {
         let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
             .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
-        let processor = create_html_processor(config);
+        let processor = create_page_processor(&settings, &registry, config);
         // Use small chunk size to force fragmentation
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
@@ -617,7 +714,7 @@ mod tests {
         // Build a __NEXT_DATA__ payload large enough to cross a 32-byte chunk boundary.
         let html = r#"<html><body><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"href":"https://origin.example.com/reviews","title":"Hello World"}}}</script></body></html>"#;
 
-        let mut settings = create_test_settings();
+        let mut settings = settings_placing_the_module();
         settings
             .insert_module_config(
                 "framework",
@@ -630,7 +727,7 @@ mod tests {
         let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
             .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
-        let processor = create_html_processor(config);
+        let processor = create_page_processor(&settings, &registry, config);
 
         // Use a very small chunk size to force fragmentation.
         let pipeline_config = PipelineConfig {
@@ -672,7 +769,7 @@ mod tests {
             "x".repeat(400), // pad to guarantee chunk-boundary fragmentation
         );
 
-        let mut settings = create_test_settings();
+        let mut settings = settings_placing_the_module();
         settings
             .insert_module_config(
                 "framework",
@@ -685,7 +782,7 @@ mod tests {
         let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
             .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
-        let processor = create_html_processor(config);
+        let processor = create_page_processor(&settings, &registry, config);
 
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
@@ -729,7 +826,7 @@ mod tests {
     /// Build the production HTML processor for the Next.js integration and run
     /// `html` through it at `chunk_size`, returning the streamed output.
     fn stream_nextjs_html(html: &str, chunk_size: usize) -> String {
-        let mut settings = create_test_settings();
+        let mut settings = settings_placing_the_module();
         settings
             .insert_module_config(
                 "framework",
@@ -741,7 +838,11 @@ mod tests {
             .expect("should update nextjs config");
         let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
             .expect("should create registry");
-        let processor = create_html_processor(config_from_settings(&settings, &registry));
+        let processor = create_page_processor(
+            &settings,
+            &registry,
+            config_from_settings(&settings, &registry),
+        );
         let mut pipeline = StreamingPipeline::new(
             PipelineConfig {
                 input_compression: Compression::None,
@@ -834,7 +935,7 @@ mod tests {
              <script>self.__next_f.push([1,\"{second}\"])</script></body></html>"
         );
 
-        let mut settings = create_test_settings();
+        let mut settings = settings_placing_the_module();
         settings
             .insert_module_config(
                 "framework",
@@ -848,7 +949,11 @@ mod tests {
             .expect("should update nextjs config");
         let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
             .expect("should create registry");
-        let processor = create_html_processor(config_from_settings(&settings, &registry));
+        let processor = create_page_processor(
+            &settings,
+            &registry,
+            config_from_settings(&settings, &registry),
+        );
         let mut pipeline = StreamingPipeline::new(
             PipelineConfig {
                 input_compression: Compression::None,
@@ -906,7 +1011,7 @@ mod tests {
     fn output_overflow_restores_an_in_progress_script_at_every_split() {
         use trusted_server_core::streaming_processor::StreamProcessor as _;
 
-        let mut settings = create_test_settings();
+        let mut settings = settings_placing_the_module();
         settings
             .insert_module_config(
                 "framework",
@@ -922,7 +1027,11 @@ mod tests {
         let expected = format!("{first}{padding}<script>{script}</script></body></html>");
 
         for split in 1..script.len() {
-            let mut processor = create_html_processor(config_from_settings(&settings, &registry));
+            let mut processor = create_page_processor(
+                &settings,
+                &registry,
+                config_from_settings(&settings, &registry),
+            );
             let mut output = processor
                 .process_chunk(first.as_bytes(), false)
                 .expect("should process unresolved RSC group");
@@ -944,5 +1053,22 @@ mod tests {
                 "should restore all original bytes when overflow occurs at script split {split}"
             );
         }
+    }
+
+    /// The page a reader receives with this module running, kept as a file
+    /// so that changing how the page change is made can be shown to leave
+    /// the page as it was.
+    #[test]
+    fn the_page_a_reader_receives_is_the_recorded_one() {
+        trusted_server_core::html_processor::test_support::assert_page_is_recorded(
+            include_str!("fixtures/page-change.settings.toml"),
+            &[super::builder()],
+            include_str!("fixtures/page-change.input.html"),
+            include_str!("fixtures/page-change.recorded.html"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/fixtures/page-change.recorded.html"
+            ),
+        );
     }
 }

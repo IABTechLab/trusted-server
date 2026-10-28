@@ -108,7 +108,7 @@ client_side_key = "YOUR_DATADOME_JS_KEY"
 inject_client_side_tag = true
 ```
 
-Trusted Server emits the DataDome configuration before the Trusted Server JavaScript bundle:
+The tag is the serve middleware `bot-protection.datadome.tag`, which runs on each reader's copy of the pages a `[[serve]]` entry names it for. See [Placing page changes](/guide/configuration#placing-page-changes). It writes the DataDome configuration straight before the Trusted Server JavaScript bundle:
 
 ```html
 <script>
@@ -140,7 +140,7 @@ You can also load DataDome manually through the first-party path:
 <script src="/integrations/datadome/tags.js" async></script>
 ```
 
-If `rewrite_sdk` is enabled, Trusted Server rewrites existing DataDome script tags in HTML:
+If `rewrite_sdk` is enabled, Trusted Server rewrites existing DataDome script tags in HTML, on the pages a `[[fetch]]` entry names the middleware `bot-protection.datadome` for:
 
 ```html
 <!-- Original -->
@@ -441,7 +441,7 @@ Also verify the request is not excluded by the default internal/static route exc
 
 ### HTML rewriting not working
 
-Ensure `rewrite_sdk = true` and that your pages are being proxied through Trusted Server's HTML processing pipeline.
+Ensure `rewrite_sdk = true`, that a `[[fetch]]` entry names `bot-protection.datadome` for the page, and that your pages are being proxied through Trusted Server's HTML processing pipeline.
 
 ## See also
 

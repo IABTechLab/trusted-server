@@ -455,7 +455,9 @@ Optional Ed25519 request signing for bid request authentication and fraud preven
 
 ### Script Interception
 
-The `script_patterns` configuration controls which publisher-provided Prebid scripts are intercepted and replaced with empty JavaScript. Trusted Server always injects its managed first-party `/integrations/prebid/bundle.js` script for the configured external bundle, so interception prevents duplicate Prebid instances.
+The `script_patterns` configuration controls which publisher-provided Prebid scripts are intercepted and replaced with empty JavaScript. Trusted Server injects its managed first-party `/integrations/prebid/bundle.js` script for the configured external bundle, so interception prevents duplicate Prebid instances.
+
+Both changes to a page, the removal of the publisher's own script tags and the configuration and bundle tag written into the head, are the middleware `auction.prebid`. It runs on the pages a `[[fetch]]` entry names it for, so name it for every page that runs Prebid. See [Placing page changes](/guide/configuration#placing-page-changes).
 
 **Pattern Matching**:
 

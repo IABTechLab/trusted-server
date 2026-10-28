@@ -1,0 +1,10 @@
+[audience]
+modules = ["permutive"]
+
+[audience.permutive]
+organization_id = "myorg"
+workspace_id = "abc123"
+
+[[fetch]]
+media_type = "text/html"
+middleware = ["audience.permutive"]

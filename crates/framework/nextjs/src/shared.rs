@@ -8,6 +8,60 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use trusted_server_core::host_rewrite::rewrite_bare_host_at_boundaries;
+use trusted_server_core::integrations::IntegrationDocumentState;
+use trusted_server_core::middleware::MiddlewareContext;
+
+/// What a script rewriter is told about the chunk of text in front of it.
+#[derive(Debug)]
+pub(crate) struct ScriptContext<'a> {
+    /// The host the page is served on.
+    pub(crate) request_host: &'a str,
+    /// The scheme the page is served over.
+    pub(crate) request_scheme: &'a str,
+    /// The host the page was fetched from.
+    pub(crate) origin_host: &'a str,
+    /// Whether the chunk is the last of its text node.
+    pub(crate) is_last_in_text_node: bool,
+    /// The most script text a rewriter may hold while it waits for the rest.
+    pub(crate) max_buffered_script_bytes: usize,
+    /// The state kept for the document the script is in.
+    pub(crate) document_state: &'a IntegrationDocumentState,
+}
+
+/// What a script rewriter keeps of the document it works on, to tell it about
+/// each chunk.
+pub(crate) struct ScriptDocument {
+    request_host: String,
+    request_scheme: String,
+    origin_host: String,
+    max_buffered_script_bytes: usize,
+    document_state: IntegrationDocumentState,
+}
+
+impl ScriptDocument {
+    /// What `context` says of the document.
+    pub(crate) fn new(context: &MiddlewareContext<'_>) -> Self {
+        Self {
+            request_host: context.request_host.to_owned(),
+            request_scheme: context.request_scheme.to_owned(),
+            origin_host: context.origin_host.to_owned(),
+            max_buffered_script_bytes: context.max_buffered_script_bytes,
+            document_state: context.document_state.clone(),
+        }
+    }
+
+    /// The context of one chunk of a script's text.
+    pub(crate) fn chunk(&self, is_last_in_text_node: bool) -> ScriptContext<'_> {
+        ScriptContext {
+            request_host: &self.request_host,
+            request_scheme: &self.request_scheme,
+            origin_host: &self.origin_host,
+            is_last_in_text_node,
+            max_buffered_script_bytes: self.max_buffered_script_bytes,
+            document_state: &self.document_state,
+        }
+    }
+}
 
 // These are static code-defined literals, not config-derived patterns, so they
 // intentionally remain lazy statics instead of participating in

@@ -18,7 +18,7 @@
 //!
 //! ## How It Works
 //!
-//! 1. **HTML rewriting** – The [`IntegrationAttributeRewriter`] swaps `src`/`href`
+//! 1. **HTML rewriting** – The module's middleware swaps `src`/`href`
 //!    attributes pointing at Google's GPT script with a first-party URL
 //!    (`/integrations/gpt/script`).
 //! 2. **Script proxy** – [`IntegrationProxy`] endpoints serve `gpt.js`
@@ -49,6 +49,7 @@
 
 pub mod diagnostics;
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -64,9 +65,11 @@ use trusted_server_core::constants::{
 };
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::{
-    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
-    IntegrationRegistration,
+    AttributeRewriteAction, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+};
+use trusted_server_core::middleware::{
+    AttributeRewrite, AttributeRewriteFn, Middleware, MiddlewareAction, MiddlewareContext,
+    MiddlewarePhase,
 };
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{ProxyRequestConfig, proxy_request};
@@ -431,13 +434,13 @@ pub fn register(
         return Ok(None);
     };
 
-    Ok(Some(
-        IntegrationRegistration::builder(GPT_INTEGRATION_ID)
-            .with_proxy(integration.clone())
-            .with_attribute_rewriter(integration.clone())
-            .with_head_injector(integration)
-            .build(),
-    ))
+    let mut registration = IntegrationRegistration::builder(GPT_INTEGRATION_ID)
+        .with_proxy(integration.clone())
+        .with_middleware(Arc::new(PageChange(integration.clone())));
+    if let Some((name, value)) = integration.bundle_tag_attribute() {
+        registration = registration.with_bundle_tag_attribute(name, value);
+    }
+    Ok(Some(registration.build()))
 }
 
 impl GptIntegration {
@@ -487,25 +490,39 @@ impl IntegrationProxy for GptIntegration {
     }
 }
 
-impl IntegrationAttributeRewriter for GptIntegration {
-    fn integration_id(&self) -> &'static str {
-        GPT_INTEGRATION_ID
+/// GPT's change to a page, on the pages a `[[fetch]]` entry names [`MODULE`]
+/// for. It writes the `tsjs.adInit` bootstrap into the head and, when
+/// `rewrite_script` is set, points the GPT script's address at the
+/// first-party path.
+struct PageChange(Arc<GptIntegration>);
+
+impl Middleware for PageChange {
+    fn middleware_id(&self) -> &'static str {
+        MODULE
     }
 
-    fn handles_attribute(&self, attribute: &str) -> bool {
-        self.config.rewrite_script && matches!(attribute, "src" | "href")
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
     }
 
-    fn rewrite(
-        &self,
-        _attr_name: &str,
-        attr_value: &str,
-        _ctx: &IntegrationAttributeContext<'_>,
-    ) -> AttributeRewriteAction {
-        if !self.config.rewrite_script {
-            return AttributeRewriteAction::keep();
+    fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        let mut action = MiddlewareAction {
+            head_inserts: self.0.head_markup(),
+            ..MiddlewareAction::pass()
+        };
+        if self.0.config.rewrite_script {
+            let decide: Rc<AttributeRewriteFn> =
+                Rc::new(|matched| GptIntegration::rewrite_script_address(matched.value));
+            action.element_handlers = AttributeRewrite::each(&["src", "href"], &decide);
         }
+        action
+    }
+}
 
+impl GptIntegration {
+    /// What becomes of a `src` or an `href`, which is pointed at the
+    /// first-party path when it is the GPT script's address.
+    fn rewrite_script_address(attr_value: &str) -> AttributeRewriteAction {
         if Self::is_gpt_script_url(attr_value) {
             // Root-relative so the browser resolves it against the page host.
             // Note: a page-level `<base href>` participates in this resolution,
@@ -517,14 +534,8 @@ impl IntegrationAttributeRewriter for GptIntegration {
             AttributeRewriteAction::keep()
         }
     }
-}
 
-impl IntegrationHeadInjector for GptIntegration {
-    fn integration_id(&self) -> &'static str {
-        GPT_INTEGRATION_ID
-    }
-
-    /// Injects the `tsjs.adInit` bootstrap script into `<head>`.
+    /// The `tsjs.adInit` bootstrap scripts written into `<head>`.
     ///
     /// ## Scroll / refresh handoff contract (Phase 1)
     ///
@@ -541,7 +552,7 @@ impl IntegrationHeadInjector for GptIntegration {
     /// auction via `GET /_ts/page-bids` on pushState / replaceState / popstate
     /// route changes (see `auction/endpoints.rs`).
     /// The `POST /auction` endpoint is not involved in scroll or refresh flows.
-    fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+    fn head_markup(&self) -> Vec<String> {
         let gam_attribution_flag = if self.config.gam_attribution_enabled {
             "window.__tsjs_gam_attribution_enabled=true;"
         } else {
@@ -571,12 +582,12 @@ impl IntegrationHeadInjector for GptIntegration {
         scripts
     }
 
-    fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
-        if self.config.gam_attribution_enabled {
-            vec![("data-ts-gam-attribution", "true")]
-        } else {
-            Vec::new()
-        }
+    /// The attribute on the script bundle's tag that lets the bundle apply
+    /// GAM attribution, when `gam_attribution_enabled` is set.
+    fn bundle_tag_attribute(&self) -> Option<(&'static str, &'static str)> {
+        self.config
+            .gam_attribution_enabled
+            .then_some(("data-ts-gam-attribution", "true"))
     }
 }
 
@@ -622,14 +633,14 @@ mod tests {
         }
     }
 
-    fn test_context() -> IntegrationAttributeContext<'static> {
-        IntegrationAttributeContext {
-            attribute_name: "src",
-            element_name: "script",
-            request_host: "edge.example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-        }
+    /// What the module's middleware decides to do with a page.
+    fn page_action(integration: Arc<GptIntegration>) -> MiddlewareAction {
+        let document_state = IntegrationDocumentState::default();
+        let context = trusted_server_core::middleware::test_support::context(
+            MiddlewarePhase::Fetch,
+            &document_state,
+        );
+        PageChange(integration).create(&context)
     }
 
     fn build_http_request(method: Method, uri: &str) -> http::Request<EdgeBody> {
@@ -713,17 +724,12 @@ mod tests {
         );
     }
 
-    // -- Attribute rewriter --
+    // -- Element handler --
 
     #[test]
-    fn attribute_rewriter_rewrites_gpt_urls() {
-        let integration = GptIntegration::new(test_config());
-        let ctx = test_context();
-
-        let result = integration.rewrite(
-            "src",
+    fn element_handler_rewrites_gpt_urls() {
+        let result = GptIntegration::rewrite_script_address(
             "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
-            &ctx,
         );
 
         match result {
@@ -738,11 +744,8 @@ mod tests {
     }
 
     #[test]
-    fn attribute_rewriter_keeps_non_gpt_urls() {
-        let integration = GptIntegration::new(test_config());
-        let ctx = test_context();
-
-        let result = integration.rewrite("src", "https://cdn.example.com/analytics.js", &ctx);
+    fn element_handler_keeps_non_gpt_urls() {
+        let result = GptIntegration::rewrite_script_address("https://cdn.example.com/analytics.js");
 
         assert_eq!(
             result,
@@ -752,50 +755,45 @@ mod tests {
     }
 
     #[test]
-    fn attribute_rewriter_noop_when_disabled() {
+    fn element_handler_noop_when_disabled() {
         let config = GptConfig {
             rewrite_script: false,
             ..test_config()
         };
-        let integration = GptIntegration::new(config);
-        let ctx = test_context();
+        let action = page_action(GptIntegration::new(config));
 
-        let result = integration.rewrite(
-            "src",
-            "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
-            &ctx,
+        assert!(
+            action.element_handlers.is_empty(),
+            "should judge no address when rewrite_script is disabled"
         );
-
         assert_eq!(
-            result,
-            AttributeRewriteAction::Keep,
-            "should keep GPT URLs when rewrite_script is disabled"
+            action.head_inserts.len(),
+            2,
+            "should still write the bootstrap into the head"
         );
     }
 
     #[test]
     fn handles_attribute_respects_config() {
-        let enabled = GptIntegration::new(test_config());
-        assert!(
-            enabled.handles_attribute("src"),
-            "should handle src when rewrite_script is true"
-        );
-        assert!(
-            enabled.handles_attribute("href"),
-            "should handle href when rewrite_script is true"
-        );
-        assert!(
-            !enabled.handles_attribute("action"),
-            "should not handle action attribute"
+        let enabled = page_action(GptIntegration::new(test_config()));
+        let judged: Vec<&str> = enabled
+            .element_handlers
+            .iter()
+            .map(|handler| handler.attribute())
+            .collect();
+        assert_eq!(
+            judged,
+            ["src", "href"],
+            "should judge src and href, and no other attribute, when rewrite_script is true"
         );
 
-        let disabled = GptIntegration::new(GptConfig {
+        let disabled = page_action(GptIntegration::new(GptConfig {
             rewrite_script: false,
             ..test_config()
-        });
+        }));
         assert!(
-            !disabled.handles_attribute("src"),
-            "should not handle src when rewrite_script is false"
+            disabled.element_handlers.is_empty(),
+            "should judge no attribute when rewrite_script is false"
         );
     }
 
@@ -1205,20 +1203,12 @@ mod tests {
         );
     }
 
-    // -- Head injector --
+    // -- Head markup --
 
     #[test]
-    fn head_injector_emits_enable_flag() {
+    fn head_markup_emits_enable_flag() {
         let integration = GptIntegration::new(test_config());
-        let doc_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "edge.example.com",
-            request_scheme: "https",
-            origin_host: "example.com",
-            document_state: &doc_state,
-        };
-
-        let inserts = integration.head_inserts(&ctx);
+        let inserts = integration.head_markup();
 
         assert_eq!(inserts.len(), 2, "should emit exactly two head inserts");
         assert_eq!(
@@ -1227,7 +1217,7 @@ mod tests {
             "should set the enable flag and call the GPT shim activation function"
         );
         assert!(
-            integration.tsjs_script_tag_attributes().is_empty(),
+            integration.bundle_tag_attribute().is_none(),
             "should not authorize GAM attribution metadata by default"
         );
     }
@@ -1238,15 +1228,7 @@ mod tests {
             gam_attribution_enabled: true,
             ..test_config()
         });
-        let document_state = IntegrationDocumentState::default();
-        let context = IntegrationHtmlContext {
-            request_host: "edge.example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-            document_state: &document_state,
-        };
-
-        let inserts = integration.head_inserts(&context);
+        let inserts = integration.head_markup();
 
         assert_eq!(inserts.len(), 2, "should not add another head insert");
         assert!(
@@ -1254,8 +1236,8 @@ mod tests {
             "should activate the early bootstrap marker"
         );
         assert_eq!(
-            integration.tsjs_script_tag_attributes(),
-            vec![("data-ts-gam-attribution", "true")],
+            integration.bundle_tag_attribute(),
+            Some(("data-ts-gam-attribution", "true")),
             "should authorize the bundle fallback on the publisher tag"
         );
     }
@@ -1264,14 +1246,7 @@ mod tests {
     fn head_inserts_includes_ts_ad_init_with_synchronous_bids_read() {
         let config = test_config();
         let integration = GptIntegration::new(config);
-        let doc_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "edge.example.com",
-            request_scheme: "https",
-            origin_host: "example.com",
-            document_state: &doc_state,
-        };
-        let inserts = integration.head_inserts(&ctx);
+        let inserts = integration.head_markup();
         let combined = inserts.join("");
         assert!(combined.contains("ts.adInit"), "should define tsjs.adInit");
         assert!(
@@ -1322,14 +1297,7 @@ mod tests {
         // fallback lives in the Vitest suite (gpt_bootstrap.test.ts).
         let config = test_config();
         let integration = GptIntegration::new(config);
-        let doc_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "edge.example.com",
-            request_scheme: "https",
-            origin_host: "example.com",
-            document_state: &doc_state,
-        };
-        let combined = integration.head_inserts(&ctx).join("");
+        let combined = integration.head_markup().join("");
         assert!(
             combined.contains("ts.scheduleInitialAdInit"),
             "should install the fallback scheduler for bundle-load failures"
@@ -1356,14 +1324,7 @@ mod tests {
     fn head_inserts_bootstrap_uses_css_safe_div_prefix_lookup() {
         let config = test_config();
         let integration = GptIntegration::new(config);
-        let doc_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "edge.example.com",
-            request_scheme: "https",
-            origin_host: "example.com",
-            document_state: &doc_state,
-        };
-        let combined = integration.head_inserts(&ctx).join("");
+        let combined = integration.head_markup().join("");
         assert!(
             combined.contains("querySelectorAll(\"[id]\")"),
             "bootstrap should scan ID-bearing elements instead of interpolating div_id into CSS"
@@ -1381,14 +1342,7 @@ mod tests {
     #[test]
     fn head_inserts_bootstrap_installs_inner_div_slot_handoff() {
         let integration = GptIntegration::new(test_config());
-        let doc_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "edge.example.com",
-            request_scheme: "https",
-            origin_host: "example.com",
-            document_state: &doc_state,
-        };
-        let combined = integration.head_inserts(&ctx).join("");
+        let combined = integration.head_markup().join("");
         assert!(
             combined.contains("gptSlotHandoffs"),
             "bootstrap should keep late publisher slot handoff state on window.tsjs"
@@ -1411,14 +1365,7 @@ mod tests {
     fn head_inserts_bootstrap_guards_enable_services_with_idempotency_flag() {
         let config = test_config();
         let integration = GptIntegration::new(config);
-        let doc_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "edge.example.com",
-            request_scheme: "https",
-            origin_host: "example.com",
-            document_state: &doc_state,
-        };
-        let combined = integration.head_inserts(&ctx).join("");
+        let combined = integration.head_markup().join("");
         assert!(
             combined.contains("ts.servicesEnabled"),
             "should guard enableServices/enableSingleRequest with the tsjs.servicesEnabled flag"
@@ -1438,14 +1385,7 @@ mod tests {
         // slots or they render blank.
         let config = test_config();
         let integration = GptIntegration::new(config);
-        let doc_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "edge.example.com",
-            request_scheme: "https",
-            origin_host: "example.com",
-            document_state: &doc_state,
-        };
-        let combined = integration.head_inserts(&ctx).join("");
+        let combined = integration.head_markup().join("");
         assert!(
             combined.contains("gpt.setConfig"),
             "bootstrap should wrap googletag.setConfig() to detect the disabled state"
@@ -1498,11 +1438,36 @@ mod tests {
     }
 
     #[test]
-    fn head_injector_integration_id() {
+    fn the_middleware_is_named_as_the_module() {
         let integration = GptIntegration::new(test_config());
+        assert_eq!(PageChange(integration).middleware_id(), MODULE);
+    }
+
+    #[test]
+    fn a_registration_states_the_attribution_attribute_only_when_it_is_enabled() {
+        let attributes_with = |gam_attribution_enabled: bool| {
+            let mut settings = create_test_settings();
+            settings
+                .insert_module_config(
+                    "ad-tag",
+                    MODULE,
+                    &serde_json::json!({ "gam_attribution_enabled": gam_attribution_enabled }),
+                )
+                .expect("should select GPT");
+            register(&settings)
+                .expect("should register GPT")
+                .expect("should run GPT")
+                .bundle_tag_attributes
+        };
+
         assert_eq!(
-            IntegrationHeadInjector::integration_id(integration.as_ref()),
-            "gpt"
+            attributes_with(true),
+            [("data-ts-gam-attribution", "true")],
+            "should put the attribute on the bundle's tag"
+        );
+        assert!(
+            attributes_with(false).is_empty(),
+            "should put nothing on the bundle's tag by default"
         );
     }
 
@@ -1513,15 +1478,7 @@ mod tests {
             ..test_config()
         };
         let integration = GptIntegration::new(config);
-        let doc_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "edge.example.com",
-            request_scheme: "https",
-            origin_host: "example.com",
-            document_state: &doc_state,
-        };
-
-        let inserts = integration.head_inserts(&ctx);
+        let inserts = integration.head_markup();
 
         assert_eq!(
             inserts.len(),
@@ -1543,15 +1500,7 @@ mod tests {
             ..test_config()
         };
         let integration = GptIntegration::new(config);
-        let doc_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "edge.example.com",
-            request_scheme: "https",
-            origin_host: "example.com",
-            document_state: &doc_state,
-        };
-
-        let inserts = integration.head_inserts(&ctx);
+        let inserts = integration.head_markup();
 
         // The injected `</script><img ...>` must be neutralised: the only
         // `</script>` left is the tag's own legitimate closer.
@@ -1576,15 +1525,7 @@ mod tests {
     #[test]
     fn head_inserts_omits_slim_prebid_url_when_not_configured() {
         let integration = GptIntegration::new(test_config());
-        let doc_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "edge.example.com",
-            request_scheme: "https",
-            origin_host: "example.com",
-            document_state: &doc_state,
-        };
-
-        let inserts = integration.head_inserts(&ctx);
+        let inserts = integration.head_markup();
 
         assert_eq!(
             inserts.len(),
@@ -1605,6 +1546,23 @@ mod tests {
             super::MODULE,
             trusted_server_core::module_name!(),
             "should be named by the folder this crate lives in"
+        );
+    }
+
+    /// The page a reader receives with this module running, kept as a file
+    /// so that changing how the page change is made can be shown to leave
+    /// the page as it was.
+    #[test]
+    fn the_page_a_reader_receives_is_the_recorded_one() {
+        trusted_server_core::html_processor::test_support::assert_page_is_recorded(
+            include_str!("fixtures/page-change.settings.toml"),
+            &[super::builder(), super::diagnostics::builder()],
+            include_str!("fixtures/page-change.input.html"),
+            include_str!("fixtures/page-change.recorded.html"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/fixtures/page-change.recorded.html"
+            ),
         );
     }
 }

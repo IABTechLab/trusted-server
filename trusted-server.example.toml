@@ -335,6 +335,34 @@ pull_sync_concurrency = 3
 # startup. Nothing is selected by default. The sections and tables are
 # further down, commented out.
 
+# A module changes a page through a middleware, and a middleware runs only on
+# the pages where a [[fetch]] or [[serve]] entry names it. A page takes the
+# first entry that covers it and runs that entry's middleware in the order
+# written. The two entries below name every middleware the modules further
+# down supply, in the order `ts audit` writes them. Keep the names of the
+# modules that are selected and remove the rest, because an entry that names
+# the middleware of a module no section selects refuses startup. See "Placing
+# page changes" in the configuration guide.
+# [[fetch]]
+# media_type = "text/html"
+# middleware = [
+#   "auction.prebid",
+#   "js_asset_proxy",
+#   "testing.testlight",
+#   "framework.nextjs",
+#   "audience.permutive",
+#   "identity.lockr",
+#   "cmp.didomi",
+#   "cmp.sourcepoint",
+#   "tag.google-tag-manager",
+#   "bot-protection.datadome",
+#   "ad-tag.google",
+# ]
+
+# [[serve]]
+# media_type = "text/html"
+# middleware = ["bot-protection.datadome.tag", "ad-tag.google.diagnostics"]
+
 # First-party proxying of named third-party scripts. Uncomment the
 # `modules` line under [proxy] below to switch it on.
 # [proxy.js_asset_proxy]

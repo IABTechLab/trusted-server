@@ -26,6 +26,7 @@ use crate::ec::module::{
 };
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
+use crate::middleware::{MiddlewarePhase, PhaseEntries};
 use crate::platform::PlatformImageOptimizerRegion;
 use crate::provider_table::{ProviderChoice, ProviderList, SectionModules};
 use crate::redacted::Redacted;
@@ -4072,6 +4073,14 @@ pub struct Settings {
         skip_serializing_if = "crate::inspect::config::InspectConfig::is_default"
     )]
     pub inspect: crate::inspect::config::InspectConfig,
+    /// The page changes run on a document fetched from the origin, written
+    /// as `[[fetch]]` entries. See [`crate::middleware`].
+    #[serde(default, skip_serializing_if = "PhaseEntries::is_empty")]
+    pub fetch: PhaseEntries,
+    /// The page changes run on each reader's copy of a document, written as
+    /// `[[serve]]` entries.
+    #[serde(default, skip_serializing_if = "PhaseEntries::is_empty")]
+    pub serve: PhaseEntries,
     /// Where the loader wrote secrets, which the configuration view masks.
     /// Never read from a document and never written to one.
     #[serde(skip)]
@@ -4258,6 +4267,7 @@ impl Settings {
         settings.ec.validate_module_selection()?;
         settings.ec.validate_resolve_allowed_origins()?;
         settings.validate_module_sections()?;
+        settings.validate_phase_entries()?;
         settings.device.validate_module_selection()?;
         settings.geo.validate_module_selection()?;
         settings
@@ -4751,6 +4761,32 @@ impl Settings {
         };
         let written = crate::module_name::short_form(section, name).to_owned();
         self.section_modules_mut(section).insert(&written, table);
+        Ok(())
+    }
+
+    /// The entries of `phase`, in the order written.
+    #[must_use]
+    pub fn phase_entries(&self, phase: MiddlewarePhase) -> &PhaseEntries {
+        match phase {
+            MiddlewarePhase::Fetch => &self.fetch,
+            MiddlewarePhase::Serve => &self.serve,
+        }
+    }
+
+    /// Checks the shape of each phase's entries, see
+    /// [`PhaseEntries::validate`]. Whether a name is one a running module
+    /// supplies is only knowable where the registry is built, so it is
+    /// checked there.
+    ///
+    /// # Errors
+    ///
+    /// Naming the entry at fault.
+    pub fn validate_phase_entries(&self) -> Result<(), Report<TrustedServerError>> {
+        for phase in MiddlewarePhase::ALL {
+            self.phase_entries(phase)
+                .validate(phase)
+                .map_err(|message| Report::new(TrustedServerError::Configuration { message }))?;
+        }
         Ok(())
     }
 

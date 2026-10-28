@@ -698,86 +698,67 @@ exclude_domains = ["assets.publisher.com"]
 
 Skip resources already on your domain.
 
-## Integration Hooks
+## Page Changes by Modules
 
-### Attribute Rewriters
+A module changes a page through a middleware, which runs on the pages a
+`[[fetch]]` or `[[serve]]` entry names it for. A middleware may do any of
+these to a document.
 
-Integrations can override attribute rewriting:
-
-**Example**: Next.js integration rewrites origin URLs
-
-```rust
-impl IntegrationAttributeRewriter for NextJsIntegration {
-    fn rewrite(&self, attr_name: &str, attr_value: &str, ctx: &Context)
-        -> AttributeRewriteAction
-    {
-        if attr_name == "href" && attr_value.contains(&ctx.origin_host) {
-            let rewritten = attr_value.replace(&ctx.origin_host, &ctx.request_host);
-            return AttributeRewriteAction::replace(rewritten);
-        }
-        AttributeRewriteAction::keep()
-    }
-}
-```
-
-**Actions**:
+**Decide about an attribute** of the elements a CSS selector matches:
 
 - `keep()` - Leave attribute unchanged
 - `replace(value)` - Change attribute value
 - `remove_element()` - Delete entire element
 
-### Script Rewriters
+**Decide about the text** inside the elements a selector matches, such as a
+script's:
 
-Integrations can modify `<script>` content:
+- `keep()` - Leave the text unchanged
+- `replace(content)` - Replace the text
+- `remove_node()` - Remove the text
 
-**Example**: Next.js rewrites `__NEXT_DATA__` JSON
+**Write markup into `<head>`**, ahead of the unified TSJS bundle or straight
+after it.
+
+**Run a stream processor** over the document the handlers left.
+
+**Example**: a middleware that moves the origin's address in an attribute
+core does not rewrite
 
 ```rust
-impl IntegrationScriptRewriter for NextJsIntegration {
-    fn selector(&self) -> &'static str {
-        "script#__NEXT_DATA__"
+impl Middleware for ExampleLinks {
+    fn middleware_id(&self) -> &'static str {
+        "framework.example"
     }
 
-    fn rewrite(&self, content: &str, ctx: &Context) -> ScriptRewriteAction {
-        let rewritten = rewrite_next_data_urls(content, ctx);
-        ScriptRewriteAction::replace(rewritten)
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
+    }
+
+    fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        let origin = context.origin_host.to_owned();
+        let host = context.request_host.to_owned();
+        MiddlewareAction {
+            element_handlers: vec![Box::new(AttributeRewrite::new(
+                "data-link",
+                Rc::new(move |matched| {
+                    if matched.value.contains(&origin) {
+                        AttributeRewriteAction::replace(matched.value.replace(&origin, &host))
+                    } else {
+                        AttributeRewriteAction::keep()
+                    }
+                }),
+            ))],
+            ..MiddlewareAction::pass()
+        }
     }
 }
 ```
 
-**Actions**:
-
-- `keep()` - Leave script unchanged
-- `replace(content)` - Replace script content
-- `remove_node()` - Delete script element
-
-### Head Injectors
-
-Integrations can inject HTML snippets at the start of `<head>`, immediately after the unified TSJS bundle:
-
-**Example**: An integration injects configuration that runs after the TSJS API is available
-
-```rust
-impl IntegrationHeadInjector for MyIntegration {
-    fn integration_id(&self) -> &'static str { "my_integration" }
-
-    fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        vec![format!(
-            r#"<script>tsjs.setConfig({{ host: "{}" }});</script>"#,
-            ctx.request_host
-        )]
-    }
-}
-```
-
-**Behavior**:
-
-- Snippets are prepended into `<head>` after the TSJS bundle tag
-- Called once per HTML response
-- Multiple integrations can each contribute snippets
-- If no snippets are returned, no extra markup is added
-
-See [Integration Guide](/guide/integration-guide) for creating custom rewriters.
+See [Changing a page](/guide/integration-guide#changing-a-page) for what a
+middleware can rely on, and
+[Placing page changes](/guide/configuration#placing-page-changes) for the
+entries that place one.
 
 ## TSJS Injection
 

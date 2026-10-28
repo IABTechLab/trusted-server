@@ -47,7 +47,7 @@ type PbjsGlobal = typeof _pbjsDefault & {
 // Prebid.js itself is NOT bundled into this module. It is served as the
 // external bundle configured via `auction.prebid.external_bundle_url`
 // (required whenever the prebid integration runs) and owns the
-// `window.pbjs` global. The Rust head injector emits a stub
+// `window.pbjs` global. The Rust module's middleware emits a stub
 // (`window.pbjs = window.pbjs || {que:[],cmd:[]}`) before any script runs and
 // Prebid.js installs its API onto that same object, so capturing the reference
 // at module scope is safe regardless of evaluation order.
@@ -179,7 +179,7 @@ export interface PrebidNpmConfig {
 
 /**
  * Shape of the server-injected config at `window.__tsjs_prebid`.
- * Set by the Rust IntegrationHeadInjector from trusted-server.toml values.
+ * Set by the Rust module's middleware from trusted-server.toml values.
  */
 interface InjectedPrebidConfig {
   accountId?: string;

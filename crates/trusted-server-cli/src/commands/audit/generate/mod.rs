@@ -19,6 +19,7 @@ use serde::Serialize;
 use trusted_server_core::creative_opportunities::{
     CreativeOpportunitiesConfig, validate_page_pattern,
 };
+use trusted_server_core::middleware::MiddlewarePhase;
 use url::Url;
 
 use crate::commands::audit::ad_templates::{origin_changed, without_fragment};
@@ -160,6 +161,7 @@ struct DraftConfig {
 
 /// Id of the integration the audit writes its discovered assets for.
 const JS_ASSET_PROXY_ID: &str = "js_asset_proxy";
+const GOOGLE_TAG_MANAGER_ID: &str = "google_tag_manager";
 
 #[derive(Debug, Clone)]
 struct JsAssetProxySection {
@@ -480,7 +482,9 @@ fn build_draft_config_with_generator(
     }
 
     // The template documents every module as a commented example, so the
-    // sections the audit fills in are appended after it.
+    // sections the audit fills in are appended after it. The integrations
+    // whose modules it selects are kept, so their page changes can be placed.
+    let mut selected: Vec<&str> = Vec::new();
     for id in ["datadome", "didomi", "gpt"] {
         if detected.contains(id)
             && let Some((section, written)) = module_section(id)
@@ -493,15 +497,21 @@ fn build_draft_config_with_generator(
                      modules = [\"{written}\"]\n"
                 ),
             );
+            selected.push(id);
         }
     }
     if let Some(container_id) = &gtm_container_id {
         append_section(&mut draft, &build_google_tag_manager_section(container_id));
+        selected.push(GOOGLE_TAG_MANAGER_ID);
     }
     if asset_proxy_section.candidate_count > 0 {
         append_section(&mut draft, &asset_proxy_section.toml);
+        selected.push(JS_ASSET_PROXY_ID);
     } else {
         append_section(&mut draft, &asset_proxy_section.notes);
+    }
+    if let Some(entries) = build_page_entries(&selected) {
+        append_section(&mut draft, &entries);
     }
 
     let mut manual_review = Vec::new();
@@ -650,6 +660,40 @@ fn build_google_tag_manager_section(container_id: &str) -> String {
          container_id = {}\n",
         toml_string(container_id)
     )
+}
+
+/// The entries that run the middleware of the selected modules on every
+/// HTML page, or `None` when none of them changes a page.
+///
+/// A module changes a page only where an entry names its middleware, so a
+/// draft that selected a module and wrote no entry would leave the module
+/// changing nothing. The names and their order come from the stock list.
+fn build_page_entries(integration_ids: &[&str]) -> Option<String> {
+    let mut entries = String::new();
+    for phase in MiddlewarePhase::ALL {
+        let names = trusted_server_modules::middleware_for(integration_ids, phase);
+        if names.is_empty() {
+            continue;
+        }
+        if entries.is_empty() {
+            entries.push_str(
+                "# Written by `ts audit`. A module changes a page only where an entry names\n\
+                 # its middleware, so these run what the modules selected above supply on\n\
+                 # every HTML page, in the order written.\n",
+            );
+        } else {
+            entries.push('\n');
+        }
+        let listed = names
+            .iter()
+            .map(|name| toml_string(name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        entries.push_str(&format!(
+            "[[{phase}]]\nmedia_type = \"text/html\"\nmiddleware = [{listed}]\n"
+        ));
+    }
+    (!entries.is_empty()).then_some(entries)
 }
 
 /// Selects the JavaScript asset proxy in the template's `[proxy]` section by
@@ -2738,6 +2782,146 @@ mod tests {
             parsed["tag"]["google-tag-manager"]["container_id"].as_str(),
             Some("GTM-ABC123"),
             "should write the container it found"
+        );
+    }
+
+    /// What the draft's entries of `phase` hold, each as its media type,
+    /// whether it has a path, and the middleware it names.
+    fn drafted_entries(parsed: &toml::Value, phase: &str) -> Vec<(String, bool, Vec<String>)> {
+        parsed
+            .get(phase)
+            .and_then(toml::Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| {
+                        (
+                            entry["media_type"]
+                                .as_str()
+                                .expect("should write a media type")
+                                .to_owned(),
+                            entry.get("path").is_some(),
+                            entry["middleware"]
+                                .as_array()
+                                .expect("should write the middleware")
+                                .iter()
+                                .filter_map(toml::Value::as_str)
+                                .map(str::to_owned)
+                                .collect(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn build_draft_config_places_the_page_changes_of_the_modules_it_selects() {
+        let url = Url::parse("https://publisher.example.com/page").expect("should parse URL");
+        let mut detected_integrations: Vec<DetectedIntegration> = ["gpt", "datadome", "didomi"]
+            .into_iter()
+            .map(|id| DetectedIntegration {
+                id: id.to_string(),
+                evidence: format!("https://{id}.example.com/tag.js"),
+            })
+            .collect();
+        detected_integrations.push(DetectedIntegration {
+            id: "google_tag_manager".to_string(),
+            evidence: "GTM-ABC123".to_string(),
+        });
+        let artifact = AuditArtifact {
+            audited_url: url.to_string(),
+            page_title: Some("Example".to_string()),
+            js_asset_count: 1,
+            third_party_asset_count: 1,
+            detected_integrations,
+            assets: vec![audited_asset(
+                "https://cdn.vendor.example.com/sdk.js",
+                AssetParty::ThirdParty,
+                None,
+            )],
+            warnings: Vec::new(),
+        };
+        let mut generator = FixedPathGenerator::new(&["/assets/aaaaaaaaaaaaaaaaaaaaaaaa.js"]);
+
+        let draft = build_draft_config_with_generator(
+            &url,
+            &artifact,
+            &gpt_slots::DiscoveredSlots::default(),
+            &mut generator,
+        )
+        .expect("should build draft config");
+
+        let parsed =
+            toml::from_str::<toml::Value>(&draft.toml).expect("draft should parse as TOML");
+        assert_eq!(
+            drafted_entries(&parsed, "fetch"),
+            vec![(
+                "text/html".to_owned(),
+                false,
+                vec![
+                    "js_asset_proxy".to_owned(),
+                    "cmp.didomi".to_owned(),
+                    "tag.google-tag-manager".to_owned(),
+                    "bot-protection.datadome".to_owned(),
+                    "ad-tag.google".to_owned(),
+                ],
+            )],
+            "should run the fetch middleware of every module it selected on every HTML \
+             page, in the order the stock modules register"
+        );
+        assert_eq!(
+            drafted_entries(&parsed, "serve"),
+            vec![(
+                "text/html".to_owned(),
+                false,
+                vec!["bot-protection.datadome.tag".to_owned()],
+            )],
+            "should run the one serve middleware the selected modules supply"
+        );
+        trusted_server_core::settings::Settings::from_toml(
+            &draft
+                .toml
+                .replace(
+                    "password = \"handler_password\"",
+                    "password = \"test-admin-password-32-bytes-minimum\"",
+                )
+                .replace(
+                    "passphrase = \"ec_passphrase\"",
+                    "passphrase = \"test-ec-passphrase-32-bytes-minimum\"",
+                )
+                .replace(
+                    "proxy_secret = \"publisher_proxy_secret\"",
+                    "proxy_secret = \"test-proxy-secret-32-bytes-minimum\"",
+                ),
+        )
+        .expect("should load the draft, its entries included, as settings");
+    }
+
+    #[test]
+    fn build_draft_config_writes_no_entry_when_it_selects_no_module() {
+        let url = Url::parse("https://publisher.example/path").expect("should parse URL");
+        let artifact = AuditArtifact {
+            audited_url: url.to_string(),
+            page_title: None,
+            js_asset_count: 0,
+            third_party_asset_count: 0,
+            detected_integrations: vec![DetectedIntegration {
+                id: "prebid".to_string(),
+                evidence: "inline script matched `prebid`".to_string(),
+            }],
+            assets: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        let draft = build_draft_config(&url, &artifact, &gpt_slots::DiscoveredSlots::default())
+            .expect("should build draft config");
+
+        let parsed = toml::from_str::<toml::Value>(&draft).expect("draft should parse as TOML");
+        assert!(
+            drafted_entries(&parsed, "fetch").is_empty()
+                && drafted_entries(&parsed, "serve").is_empty(),
+            "should place nothing for a module it leaves to manual review"
         );
     }
 

@@ -7,7 +7,7 @@ end-to-end publisher behavior. It is not linked into an adapter artifact.
 
 - `tests/parity.rs` calls Axum, Cloudflare, and Spin routers in process and
   compares their shared route behavior.
-- `tests/documentation_snippets.rs` extracts the checked integration-guide
+- `tests/documentation_snippets.rs` extracts each checked integration-guide
   fixture and compiles it in an isolated offline crate.
 - `tests/integration.rs` exercises the Fastly/Viceroy and Axum paths against the
   WordPress and Next.js fixture containers.

@@ -237,6 +237,7 @@ fail and the service will return its startup-error response.
 | `[demand]`                                                                                                        | several modules       | The auction's demand sources                                                                |
 | `[device]`                                                                                                        | one module            | Device classification                                                                       |
 | `[ec]`                                                                                                            | one module            | Edge Cookie identity, persistence, and partner sync                                         |
+| `[[fetch]]`                                                                                                       | nothing               | Which page changes run on a page as it is fetched, and in what order                        |
 | `[geo]`                                                                                                           | one module            | Which module resolves location, if any                                                      |
 | `[[handlers]]`                                                                                                    | nothing               | Ordered HTTP Basic-auth rules                                                               |
 | `[image_optimizer]`                                                                                               | nothing               | Reusable Fastly Image Optimizer profiles                                                    |
@@ -248,6 +249,7 @@ fail and the service will return its startup-error response.
 | `[request_signing]`                                                                                               | nothing               | Outbound Ed25519 request signing and management-store IDs                                   |
 | `[response_headers]`                                                                                              | nothing               | Headers added to Trusted Server responses                                                   |
 | `[rewrite]`                                                                                                       | nothing               | First-party URL rewrite exclusions                                                          |
+| `[[serve]]`                                                                                                       | nothing               | Which page changes run on each reader's copy of a page, and in what order                   |
 | `[tester_cookie]`                                                                                                 | nothing               | Optional tester-cookie endpoints                                                            |
 | `[tinybird]`                                                                                                      | nothing               | Direct Tinybird auction telemetry                                                           |
 | `[trusted_client_ip]`                                                                                             | nothing               | Authenticated front-door client-IP forwarding                                               |
@@ -1858,6 +1860,97 @@ not page integrations, so a section that names one refuses startup like any
 name no module supplies. Their settings live in `[demand.<name>]` and
 `[ad-server.<name>]`.
 
+### Placing page changes
+
+A module changes a page through a middleware, and a middleware runs only on
+the pages where an entry names it. Selecting the module makes its middleware
+available, and the `[[fetch]]` and `[[serve]]` entries say which pages each
+one runs on and in what order.
+
+The two lists are the two phases of a page. A middleware runs in the phase
+its module built it for, and an entry of the other list that names it refuses
+startup.
+
+| Phase       | Runs                                                                           | Told about the reader | Stored in a shared template |
+| ----------- | ------------------------------------------------------------------------------ | --------------------- | --------------------------- |
+| `[[fetch]]` | On the page as the origin sent it, once for each fetch                         | No                    | Yes                         |
+| `[[serve]]` | On each reader's copy, whether the page came from the store or from the origin | Yes                   | No                          |
+
+An entry of either list has the same three fields.
+
+| Field        | Type             | Required | Description                                                                                    |
+| ------------ | ---------------- | -------- | ---------------------------------------------------------------------------------------------- |
+| `media_type` | String           | Yes      | The media type the entry covers. Only `text/html` is accepted                                  |
+| `path`       | String           | No       | A prefix of the request path, compared as written. Absent, or `/`, the entry covers every path |
+| `middleware` | Array of strings | Yes      | The middleware to run, in order, each handed the page as the one before it left it             |
+
+A page takes the first entry that covers it and runs that entry's middleware
+alone. Entries are therefore written from the longest path to the entry with
+no path, and a folder is written with its closing slash, because `/news` also
+begins `/newsletter`.
+
+```toml
+[[fetch]]
+media_type = "text/html"
+path = "/news/"
+middleware = ["tag.example.cleanup", "tag.example"]
+
+[[fetch]]
+media_type = "text/html"
+middleware = ["tag.example"]
+
+[[serve]]
+media_type = "text/html"
+middleware = ["tag.example.reader"]
+```
+
+A fetch middleware runs on the page as the origin sent it. It is told nothing
+about the reader, because what it leaves is what a
+[shared template](#shared-template-assembly-assembly-mode-esi) stores for
+every reader, and the entries are part of what selects a stored template, so
+changing them never serves a page built under the old ones.
+
+A serve middleware runs on one reader's copy, after the fetch middleware and
+after a stored page is assembled for that reader. It is told what the
+module's own request hooks left on that reader's request, and nothing it
+writes is stored. The markup it adds to the head goes straight before the
+script bundle, after the fetch middleware's.
+
+A middleware takes its settings from its module's own `[<section>.<name>]`
+table. An entry carries none and switches nothing on.
+
+The modules this repository ships supply the middleware below. A deployment
+that runs several of them names them all in one entry's list, because a page
+takes one entry, and the order written is the order they run in. The table
+is in the order the modules register, which is the order `ts audit` writes
+the names in and the order `trusted-server.example.toml` shows them in.
+
+| Middleware                    | Phase       | What it changes                                                                                                                                                                                                   |
+| ----------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `auction.prebid`              | `[[fetch]]` | Writes `window.__tsjs_prebid` and the tag that loads the bundle into the head, and removes an element whose `src` or `href` matches `script_patterns`                                                             |
+| `js_asset_proxy`              | `[[fetch]]` | Points each configured script at its first-party path and removes one that is blocked. It is asked about an address as the middleware named before it left it, so name it ahead of one that moves the same script |
+| `testing.testlight`           | `[[fetch]]` | Points a `src` or `href` that names `testlight.js` at the shim, when `rewrite_scripts` is set                                                                                                                     |
+| `framework.nextjs`            | `[[fetch]]` | Moves the origin's address to the publisher's in the data Next.js writes into a page, being the `__NEXT_DATA__` script and the React Server Components payload scripts                                            |
+| `audience.permutive`          | `[[fetch]]` | Points a `src` or `href` that is the Permutive SDK's address at `/integrations/permutive/sdk`, when `rewrite_sdk` is set                                                                                          |
+| `identity.lockr`              | `[[fetch]]` | Points a `src` or `href` that is the lockr SDK's address at `/integrations/lockr/sdk`, when `rewrite_sdk` is set                                                                                                  |
+| `cmp.didomi`                  | `[[fetch]]` | Writes `window.__tsjs_didomi` into the head, which hands the browser module the path Didomi is served under                                                                                                       |
+| `cmp.sourcepoint`             | `[[fetch]]` | Writes `window.__tsjs_sourcepoint` into the head and, when `rewrite_sdk` is set, the trap on `window._sp_`, and points a `src` or `href` on Sourcepoint's CDN at `/integrations/sourcepoint/cdn`                  |
+| `tag.google-tag-manager`      | `[[fetch]]` | Points Google Tag Manager and Google Analytics addresses at `/integrations/google_tag_manager`, in `src` and `href` attributes and in the text of inline scripts                                                  |
+| `bot-protection.datadome`     | `[[fetch]]` | Points a `src` or `href` that is a DataDome script's address at `/integrations/datadome`, when `rewrite_sdk` is set                                                                                               |
+| `bot-protection.datadome.tag` | `[[serve]]` | Writes DataDome's client tag into the head, unless the request filter marked the request, `inject_client_side_tag` is off or no `client_side_key` is set                                                          |
+| `ad-tag.google`               | `[[fetch]]` | Writes the `tsjs.adInit` bootstrap into the head and, when `rewrite_script` is set, points a `src` or `href` that is the GPT script's address at `/integrations/gpt/script`                                       |
+| `ad-tag.google.diagnostics`   | `[[serve]]` | For a request that activated diagnostics, writes the bootstrap ahead of the script bundle and the tag that loads the diagnostics module straight after it                                                         |
+
+An entry that could not do what it says refuses the configuration, both when
+a deployment is validated and when the settings load. That is a media type
+other than `text/html`, a path that does not start with `/` or that holds a
+`*`, a `?` or a `#`, an entry that names no middleware or names one twice, a
+key an entry does not read, and an entry that an earlier one already covers.
+An entry naming a middleware that no running module supplies refuses startup,
+and the message lists the names that could be written. A middleware that no
+entry of its phase names changes no page, and startup logs a warning that
+names it.
+
 The sections below give each module's settings, and the integration guides
 describe what each one does.
 
@@ -1981,6 +2074,12 @@ Each `[[proxy.js_asset_proxy.assets]]` entry:
 | `proxy`             | String  | `enabled` | `enabled`, `disabled`, or `blocked` (removes script tags) |
 | `cache_ttl_seconds` | Integer | None      | Optional per-asset downstream cache TTL override          |
 
+Rewriting and removing script tags is the middleware `js_asset_proxy`, which
+runs on the pages a `[[fetch]]` entry names it for. It knows a script by the
+address it is handed, which is the address as the middleware named before it
+left it, so name it ahead of a middleware that moves the address of a script
+it is to proxy or block. See [Placing page changes](#placing-page-changes).
+
 ### lockr Integration
 
 **Section**: `[identity.lockr]`
@@ -1995,7 +2094,10 @@ Each `[[proxy.js_asset_proxy.assets]]` entry:
 | `rewrite_sdk_host`  | Boolean or null | `null`                                              | Deprecated compatibility input      |
 | `origin_override`   | URL or null     | `null`                                              | Optional upstream `Origin` override |
 
-See [lockr](/guide/integrations/lockr).
+The SDK rewrite is the middleware `identity.lockr`, which runs on the pages
+a `[[fetch]]` entry names it for. See
+[Placing page changes](#placing-page-changes) and
+[lockr](/guide/integrations/lockr).
 
 ### Prebid Integration
 
@@ -3288,6 +3390,12 @@ from the file, and startup checks the rest and runs the first set again.
 - Each integration validates its own block, selected or not, so a typo in a
   block that is switched off is still caught
 
+**Page changes**:
+
+- Every `[[fetch]]` and `[[serve]]` entry covers `text/html`, has a path no
+  earlier entry of its list already covers, and names at least one
+  middleware, each once
+
 ### Checked when the service starts
 
 Everything above runs again on the loaded configuration, and these join it:
@@ -3296,6 +3404,10 @@ Everything above runs again on the loaded configuration, and these join it:
   this build does not have, a missing settings table, or a table the selector
   does not name, stops the service on its next start. A passing
   `ts config validate` is not proof that a change to those four will start
+- The middleware each `[[fetch]]` and `[[serve]]` entry names. A name no
+  running module supplies, or one named in the phase it does not run in,
+  stops the service on its next start, because which middleware a build has
+  is only known where its modules are registered
 - Resolved secret values, so a passphrase shorter than 32 bytes, a placeholder
   or a weak handler password fails here
 - The compiled `permissions.yaml` policy, and the `assume_single_jurisdiction`

@@ -1,0 +1,10 @@
+[tag]
+modules = ["google-tag-manager"]
+
+[tag.google-tag-manager]
+container_id = "GTM-TEST1234"
+upstream_url = "https://www.googletagmanager.com"
+
+[[fetch]]
+media_type = "text/html"
+middleware = ["tag.google-tag-manager"]

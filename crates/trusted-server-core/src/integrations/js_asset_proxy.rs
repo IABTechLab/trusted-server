@@ -6,6 +6,7 @@
 //! proxying, or block matching script tags from publisher HTML.
 
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -22,8 +23,11 @@ use crate::constants::{
 };
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    AttributeRewriteAction, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+};
+use crate::middleware::{
+    AttributeRewrite, AttributeRewriteFn, Middleware, MiddlewareAction, MiddlewareContext,
+    MiddlewarePhase,
 };
 use crate::platform::RuntimeServices;
 use crate::proxy::{ProxyRequestConfig, proxy_request};
@@ -278,12 +282,30 @@ impl JsAssetProxyIntegration {
     fn asset_for_script_src(
         &self,
         script_src: &str,
-        ctx: &IntegrationAttributeContext<'_>,
+        request_scheme: &str,
     ) -> Option<&JsAssetProxyAsset> {
         self.asset_for_origin_url(script_src).or_else(|| {
-            let normalized_src = normalize_script_src(script_src, ctx.request_scheme)?;
+            let normalized_src = normalize_script_src(script_src, request_scheme)?;
             self.asset_for_origin_url(&normalized_src)
         })
+    }
+
+    /// What happens to a script whose address is `script_src`, on a page
+    /// served over `request_scheme`.
+    fn rewrite_script_address(
+        &self,
+        script_src: &str,
+        request_scheme: &str,
+    ) -> AttributeRewriteAction {
+        let Some(asset) = self.asset_for_script_src(script_src, request_scheme) else {
+            return AttributeRewriteAction::keep();
+        };
+
+        match asset.proxy {
+            JsAssetProxyMode::Enabled => AttributeRewriteAction::replace(asset.path.clone()),
+            JsAssetProxyMode::Disabled => AttributeRewriteAction::keep(),
+            JsAssetProxyMode::Blocked => AttributeRewriteAction::remove_element(),
+        }
     }
 
     fn build_proxy_config<'a>(
@@ -492,7 +514,7 @@ pub fn register(
     Ok(Some(
         IntegrationRegistration::builder(JS_ASSET_PROXY_INTEGRATION_ID)
             .with_proxy(integration.clone())
-            .with_attribute_rewriter(integration)
+            .with_middleware(Arc::new(ScriptAddress(integration)))
             .build(),
     ))
 }
@@ -564,33 +586,36 @@ impl IntegrationProxy for JsAssetProxyIntegration {
     }
 }
 
-impl IntegrationAttributeRewriter for JsAssetProxyIntegration {
-    fn integration_id(&self) -> &'static str {
-        JS_ASSET_PROXY_INTEGRATION_ID
+/// Points a configured script at its first-party path, or removes one that
+/// is blocked, on the pages a `[[fetch]]` entry names [`MODULE`] for.
+///
+/// It is asked about a script's address as the middleware named before it
+/// left it, so it is named first where it has to see the address the page
+/// wrote.
+struct ScriptAddress(Arc<JsAssetProxyIntegration>);
+
+impl Middleware for ScriptAddress {
+    fn middleware_id(&self) -> &'static str {
+        MODULE
     }
 
-    fn handles_attribute(&self, attribute: &str) -> bool {
-        attribute == "src"
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
     }
 
-    fn rewrite(
-        &self,
-        attr_name: &str,
-        attr_value: &str,
-        ctx: &IntegrationAttributeContext<'_>,
-    ) -> AttributeRewriteAction {
-        if attr_name != "src" || !ctx.element_name.eq_ignore_ascii_case("script") {
-            return AttributeRewriteAction::keep();
-        }
-
-        let Some(asset) = self.asset_for_script_src(attr_value, ctx) else {
-            return AttributeRewriteAction::keep();
-        };
-
-        match asset.proxy {
-            JsAssetProxyMode::Enabled => AttributeRewriteAction::replace(asset.path.clone()),
-            JsAssetProxyMode::Disabled => AttributeRewriteAction::keep(),
-            JsAssetProxyMode::Blocked => AttributeRewriteAction::remove_element(),
+    fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        let integration = Arc::clone(&self.0);
+        let request_scheme = context.request_scheme.to_owned();
+        let decide: Rc<AttributeRewriteFn> = Rc::new(move |matched| {
+            integration.rewrite_script_address(matched.value, &request_scheme)
+        });
+        MiddlewareAction {
+            element_handlers: vec![Box::new(AttributeRewrite::matching(
+                "script[src]",
+                "src",
+                decide,
+            ))],
+            ..MiddlewareAction::pass()
         }
     }
 }
@@ -602,10 +627,13 @@ mod tests {
     use std::sync::Arc;
 
     use crate::constants::{HEADER_REFERER, HEADER_X_FORWARDED_FOR, HEADER_X_TS_EC};
-    use crate::html_processor::{BodyCloseInjection, HtmlProcessorConfig, create_html_processor};
-    use crate::integrations::{
-        AttributeRewriteAction, IntegrationAttributeRewriter, IntegrationRegistry,
+    use crate::html_processor::test_support::{place_on_every_page, processed_page};
+    use crate::html_processor::{
+        BodyCloseInjection, HtmlProcessorConfig, create_html_processor_with_middleware,
     };
+    use crate::integrations::registry_test_support::tag_fixture as tag;
+    use crate::integrations::{AttributeRewriteAction, IntegrationRegistry};
+    use crate::middleware::MiddlewareChain;
     use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::create_test_settings;
@@ -636,41 +664,31 @@ mod tests {
         }
     }
 
-    fn rewrite_context() -> IntegrationAttributeContext<'static> {
-        IntegrationAttributeContext {
-            attribute_name: "src",
-            element_name: "script",
-            request_host: "publisher.example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-        }
-    }
-
+    /// The page a reader of `html` receives when `integration`'s middleware
+    /// alone runs on it.
     fn process_html_with_integration(
         html: &str,
         integration: Arc<JsAssetProxyIntegration>,
     ) -> String {
-        let rewriter: Arc<dyn IntegrationAttributeRewriter> = integration;
-        process_html_with_registry(
-            html,
-            IntegrationRegistry::from_rewriters(vec![rewriter], Vec::new()),
-        )
-    }
-
-    fn process_html_with_registry(html: &str, integrations: IntegrationRegistry) -> String {
-        let processor = create_html_processor(HtmlProcessorConfig {
+        let chain = MiddlewareChain::new(
+            MiddlewarePhase::Fetch,
+            vec![Arc::new(ScriptAddress(integration))],
+        );
+        let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "publisher.example.com".to_string(),
             request_scheme: "https".to_string(),
-            integrations,
+            integrations: IntegrationRegistry::default(),
             ad_slots_script: None,
             ad_bids_state: Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             request_state: crate::integrations::IntegrationRequestState::default(),
             permissions_script: None,
-        });
+        };
+        let processor = create_html_processor_with_middleware(config, &chain, None)
+            .expect("should plan the asset proxy's middleware");
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
             output_compression: Compression::None,
@@ -683,6 +701,35 @@ mod tests {
             .process(Cursor::new(html.as_bytes()), &mut output)
             .expect("should process HTML");
         String::from_utf8(output).expect("should produce UTF-8 HTML")
+    }
+
+    /// The page a reader of `html` receives from a deployment running
+    /// `settings`.
+    fn process_html_with_settings(html: &str, settings: &Settings) -> String {
+        let registry = IntegrationRegistry::new(settings).expect("should build registry");
+        processed_page(settings, &registry, html, 8192)
+    }
+
+    /// Settings that run the tag stand-in and proxy its script in `mode`,
+    /// with the two middleware named in the order given.
+    fn settings_proxying_the_tag(mode: &str, middleware: &[&str]) -> Settings {
+        let mut settings = create_test_settings();
+        settings.select_module("testing", tag::MODULE);
+        settings
+            .insert_module_config(
+                "proxy",
+                "js_asset_proxy",
+                &json!({
+                    "assets": [{
+                        "path": "/assets/sdk.js",
+                        "origin_url": tag::SCRIPT_URL,
+                        "proxy": mode
+                    }]
+                }),
+            )
+            .expect("should insert JS asset proxy config");
+        place_on_every_page(&mut settings, MiddlewarePhase::Fetch, middleware);
+        settings
     }
 
     #[test]
@@ -739,17 +786,16 @@ mod tests {
         assert_eq!(routes[0].method, Method::GET);
         assert_eq!(routes[0].path, "/assets/enabled.js");
 
-        let ctx = rewrite_context();
         assert!(matches!(
-            integration.rewrite("src", "https://cdn.example.com/enabled.js", &ctx),
+            integration.rewrite_script_address("https://cdn.example.com/enabled.js", "https"),
             AttributeRewriteAction::Replace(ref value) if value == "/assets/enabled.js"
         ));
         assert!(matches!(
-            integration.rewrite("src", "https://cdn.example.com/disabled.js", &ctx),
+            integration.rewrite_script_address("https://cdn.example.com/disabled.js", "https"),
             AttributeRewriteAction::Keep
         ));
         assert!(matches!(
-            integration.rewrite("src", "https://cdn.example.com/blocked.js", &ctx),
+            integration.rewrite_script_address("https://cdn.example.com/blocked.js", "https"),
             AttributeRewriteAction::RemoveElement
         ));
     }
@@ -761,46 +807,13 @@ mod tests {
             "https://cdn.example.com/vendor.js",
             JsAssetProxyMode::Enabled,
         )]));
-        let ctx = rewrite_context();
 
         assert!(matches!(
-            integration.rewrite("src", "https://cdn.example.com/vendor.js?v=1", &ctx),
+            integration.rewrite_script_address("https://cdn.example.com/vendor.js?v=1", "https"),
             AttributeRewriteAction::Keep
         ));
         assert!(matches!(
-            integration.rewrite("src", "https://cdn.example.com/other.js", &ctx),
-            AttributeRewriteAction::Keep
-        ));
-    }
-
-    #[test]
-    fn non_script_src_matches_are_not_rewritten_or_blocked() {
-        let integration = JsAssetProxyIntegration::new(config_with_assets(vec![
-            asset(
-                "/assets/enabled.js",
-                "https://cdn.example.com/enabled.js",
-                JsAssetProxyMode::Enabled,
-            ),
-            asset(
-                "/assets/blocked.js",
-                "https://cdn.example.com/blocked.js",
-                JsAssetProxyMode::Blocked,
-            ),
-        ]));
-        let ctx = IntegrationAttributeContext {
-            attribute_name: "src",
-            element_name: "img",
-            request_host: "publisher.example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-        };
-
-        assert!(matches!(
-            integration.rewrite("src", "https://cdn.example.com/enabled.js", &ctx),
-            AttributeRewriteAction::Keep
-        ));
-        assert!(matches!(
-            integration.rewrite("src", "https://cdn.example.com/blocked.js", &ctx),
+            integration.rewrite_script_address("https://cdn.example.com/other.js", "https"),
             AttributeRewriteAction::Keep
         ));
     }
@@ -835,13 +848,31 @@ mod tests {
     }
 
     #[test]
+    fn a_script_tag_written_in_upper_case_is_a_script() {
+        let integration = JsAssetProxyIntegration::new(config_with_assets(vec![asset(
+            "/assets/enabled.js",
+            "https://cdn.example.com/enabled.js",
+            JsAssetProxyMode::Enabled,
+        )]));
+
+        let processed = process_html_with_integration(
+            r#"<html><body><SCRIPT SRC="https://cdn.example.com/enabled.js"></SCRIPT></body></html>"#,
+            integration,
+        );
+
+        assert!(
+            processed.contains(r#"SRC="/assets/enabled.js""#),
+            "should rewrite a script whatever case its tag is written in: {processed}"
+        );
+    }
+
+    #[test]
     fn script_src_matching_normalizes_common_browser_url_forms() {
         let integration = JsAssetProxyIntegration::new(config_with_assets(vec![asset(
             "/assets/vendor.js",
             "https://cdn.example.com/vendor.js",
             JsAssetProxyMode::Enabled,
         )]));
-        let ctx = rewrite_context();
 
         for script_src in [
             "//cdn.example.com/vendor.js",
@@ -850,7 +881,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    integration.rewrite("src", script_src, &ctx),
+                    integration.rewrite_script_address(script_src, "https"),
                     AttributeRewriteAction::Replace(ref value) if value == "/assets/vendor.js"
                 ),
                 "script src {script_src} should normalize to the configured origin URL"
@@ -859,119 +890,84 @@ mod tests {
     }
 
     #[test]
-    fn js_asset_proxy_rewriter_takes_precedence_over_native_rewriters() {
-        let mut settings = create_test_settings();
-        settings.select_module(
-            "testing",
-            crate::integrations::registry_test_support::tag_fixture::MODULE,
-        );
-        settings
-            .insert_module_config(
-                "proxy",
-                "js_asset_proxy",
-                &json!({
-                    "assets": [{
-                        "path": "/assets/sdk.js",
-                        "origin_url": crate::integrations::registry_test_support::tag_fixture::SCRIPT_URL,
-                        "proxy": "enabled"
-                    }]
-                }),
-            )
-            .expect("should insert JS asset proxy config");
-        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
+    fn the_asset_proxy_named_first_rewrites_a_script_ahead_of_a_module() {
+        let settings = settings_proxying_the_tag("enabled", &[MODULE, tag::MODULE]);
         let html = format!(
             r#"<html><body><script src="{}"></script></body></html>"#,
-            crate::integrations::registry_test_support::tag_fixture::SCRIPT_URL
+            tag::SCRIPT_URL
         );
 
-        let processed = process_html_with_registry(&html, registry);
+        let processed = process_html_with_settings(&html, &settings);
 
         assert!(
             processed.contains(r#"<script src="/assets/sdk.js"></script>"#),
-            "JS asset proxy should rewrite before the integration's own rewriter: {processed}"
+            "JS asset proxy should rewrite before the module named after it: {processed}"
         );
         assert!(
-            !processed.contains(
-                crate::integrations::registry_test_support::tag_fixture::FIRST_PARTY_SCRIPT
-            ),
-            "the integration's own rewrite should not override JS asset proxy"
+            !processed.contains(tag::FIRST_PARTY_SCRIPT),
+            "the module's own rewrite should not override JS asset proxy"
         );
     }
 
     #[test]
-    fn js_asset_proxy_blocking_takes_precedence_over_native_rewriters() {
-        let mut settings = create_test_settings();
-        settings.select_module(
-            "testing",
-            crate::integrations::registry_test_support::tag_fixture::MODULE,
-        );
-        settings
-            .insert_module_config(
-                "proxy",
-                "js_asset_proxy",
-                &json!({
-                    "assets": [{
-                        "path": "/assets/sdk.js",
-                        "origin_url": crate::integrations::registry_test_support::tag_fixture::SCRIPT_URL,
-                        "proxy": "blocked"
-                    }]
-                }),
-            )
-            .expect("should insert JS asset proxy config");
-        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
+    fn a_module_named_ahead_of_the_asset_proxy_rewrites_the_script_first() {
+        let settings = settings_proxying_the_tag("enabled", &[tag::MODULE, MODULE]);
         let html = format!(
-            r#"<html><body><script src="{}">vendor.cmd.push(() => {{}});</script></body></html>"#,
-            crate::integrations::registry_test_support::tag_fixture::SCRIPT_URL
+            r#"<html><body><script src="{}"></script></body></html>"#,
+            tag::SCRIPT_URL
         );
 
-        let processed = process_html_with_registry(&html, registry);
+        let processed = process_html_with_settings(&html, &settings);
+
+        assert!(
+            processed.contains(&format!(
+                r#"<script src="{}"></script>"#,
+                tag::FIRST_PARTY_SCRIPT
+            )),
+            "the module named first should rewrite the script: {processed}"
+        );
+        assert!(
+            !processed.contains("/assets/sdk.js"),
+            "JS asset proxy should not know an address the module has already moved"
+        );
+    }
+
+    #[test]
+    fn the_asset_proxy_named_first_blocks_a_script_ahead_of_a_module() {
+        let settings = settings_proxying_the_tag("blocked", &[MODULE, tag::MODULE]);
+        let html = format!(
+            r#"<html><body><script src="{}">vendor.cmd.push(() => {{}});</script></body></html>"#,
+            tag::SCRIPT_URL
+        );
+
+        let processed = process_html_with_settings(&html, &settings);
 
         assert!(
             !processed.contains("vendor.cmd"),
-            "blocked JS asset should remove the script element before the integration can rewrite it"
+            "blocked JS asset should remove the script element before the module can rewrite it"
         );
         assert!(
-            !processed.contains(
-                crate::integrations::registry_test_support::tag_fixture::FIRST_PARTY_SCRIPT
-            ),
-            "the integration's own rewrite should not keep a blocked script"
+            !processed.contains(tag::FIRST_PARTY_SCRIPT),
+            "the module's own rewrite should not keep a blocked script"
         );
     }
 
     #[test]
     fn disabled_js_asset_proxy_candidate_allows_native_rewriters() {
-        let mut settings = create_test_settings();
-        settings.select_module(
-            "testing",
-            crate::integrations::registry_test_support::tag_fixture::MODULE,
-        );
-        settings
-            .insert_module_config(
-                "proxy",
-                "js_asset_proxy",
-                &json!({
-                    "assets": [{
-                        "path": "/assets/sdk.js",
-                        "origin_url": crate::integrations::registry_test_support::tag_fixture::SCRIPT_URL,
-                        "proxy": "disabled"
-                    }]
-                }),
-            )
-            .expect("should insert JS asset proxy config");
-        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
+        let settings = settings_proxying_the_tag("disabled", &[MODULE, tag::MODULE]);
         let html = format!(
             r#"<html><body><script src="{}"></script></body></html>"#,
-            crate::integrations::registry_test_support::tag_fixture::SCRIPT_URL
+            tag::SCRIPT_URL
         );
 
-        let processed = process_html_with_registry(&html, registry);
+        let processed = process_html_with_settings(&html, &settings);
 
         assert!(
             processed.contains(&format!(
                 r#"<script src="{}"></script>"#,
-                crate::integrations::registry_test_support::tag_fixture::FIRST_PARTY_SCRIPT
+                tag::FIRST_PARTY_SCRIPT
             )),
-            "disabled JS asset proxy entries should not suppress an integration's own rewrite"
+            "disabled JS asset proxy entries should not suppress a module's own rewrite"
         );
     }
 
@@ -1320,10 +1316,10 @@ mod tests {
                 }),
             )
             .expect("should insert integration config");
-        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
-        let processed = process_html_with_registry(
+        place_on_every_page(&mut settings, MiddlewarePhase::Fetch, &[MODULE]);
+        let processed = process_html_with_settings(
             r#"<script src="https://cdn.example.com/vendor.js"></script>"#,
-            registry,
+            &settings,
         );
 
         assert!(processed.contains(r#"<script src="/assets/vendor.js"></script>"#));
@@ -1692,6 +1688,23 @@ mod tests {
         assert!(
             error.to_string().contains("unknown field `mode`"),
             "should identify the unknown asset field"
+        );
+    }
+
+    /// The page a reader receives with the script proxy running, kept as a
+    /// file so that changing how the page change is made can be shown to
+    /// leave the page as it was.
+    #[test]
+    fn the_page_a_reader_receives_is_the_recorded_one() {
+        crate::html_processor::test_support::assert_page_is_recorded(
+            include_str!("fixtures/js-asset-proxy.settings.toml"),
+            &[],
+            include_str!("fixtures/js-asset-proxy.input.html"),
+            include_str!("fixtures/js-asset-proxy.recorded.html"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/integrations/fixtures/js-asset-proxy.recorded.html"
+            ),
         );
     }
 }

@@ -44,8 +44,8 @@ use trusted_server_core::auction::types::{AdSlot, AuctionContext, AuctionRequest
 use trusted_server_core::auction::types::{AuctionResponse, Bid, BidRenderer, MediaType};
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::{
-    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
-    IntegrationRegistration, UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
+    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
 };
 #[cfg(test)]
 use trusted_server_core::integrations::{
@@ -2078,22 +2078,10 @@ impl IntegrationProxy for ApsRendererIntegration {
     }
 }
 
-impl IntegrationHeadInjector for ApsRendererIntegration {
-    fn integration_id(&self) -> &'static str {
-        APS_INTEGRATION_ID
-    }
-
-    fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        Vec::new()
-    }
-
-    fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
-        (self.rendering_mode == ApsRenderingMode::PublisherNative)
-            .then_some(("data-ts-aps-rendering-mode", "publisher_native"))
-            .into_iter()
-            .collect()
-    }
-}
+/// The attribute on the script bundle's tag that lets the browser render an
+/// APS creative itself. It is written by the server alone, so a page cannot
+/// claim the mode for itself.
+const NATIVE_RENDERING_ATTRIBUTE: (&str, &str) = ("data-ts-aps-rendering-mode", "publisher_native");
 
 /// Register renderer support when the plan selects an APS demand source.
 ///
@@ -2134,14 +2122,13 @@ pub fn register_for_plan(
     let Some((_, rendering_mode)) = selected else {
         return Ok(None);
     };
-    let integration = Arc::new(ApsRendererIntegration { rendering_mode });
-    let registration = IntegrationRegistration::builder(APS_INTEGRATION_ID)
-        .without_js()
-        .with_head_injector(integration.clone());
-    let registration = if rendering_mode == ApsRenderingMode::TrustedServer {
-        registration.with_proxy(integration)
-    } else {
-        registration
+    let registration = IntegrationRegistration::builder(APS_INTEGRATION_ID).without_js();
+    let registration = match rendering_mode {
+        ApsRenderingMode::TrustedServer => {
+            registration.with_proxy(Arc::new(ApsRendererIntegration { rendering_mode }))
+        }
+        ApsRenderingMode::PublisherNative => registration
+            .with_bundle_tag_attribute(NATIVE_RENDERING_ATTRIBUTE.0, NATIVE_RENDERING_ATTRIBUTE.1),
     };
     Ok(Some(registration.build()))
 }
@@ -2154,7 +2141,6 @@ mod tests {
     use trusted_server_core::auction::types::{
         AdFormat, AdSlot, AuctionContext, AuctionRequest, BidStatus, PublisherInfo, UserInfo,
     };
-    use trusted_server_core::integrations::IntegrationDocumentState;
     use trusted_server_core::platform::test_support::{
         StubHttpClient, build_services_with_http_client, noop_services,
     };
@@ -3280,11 +3266,8 @@ mod tests {
             1,
             "a selected APS source should register the trusted-server renderer route"
         );
-        assert_eq!(registration.head_injectors.len(), 1);
         assert!(
-            registration.head_injectors[0]
-                .tsjs_script_tag_attributes()
-                .is_empty(),
+            registration.bundle_tag_attributes.is_empty(),
             "the default rendering mode should not authorize publisher-native rendering"
         );
         assert!(registration.js_disabled);
@@ -3317,7 +3300,16 @@ mod tests {
             registration.proxies.is_empty(),
             "publisher-native rendering should not register the static renderer"
         );
-        assert_eq!(registration.head_injectors.len(), 1);
+        assert!(
+            registration.middleware.is_empty(),
+            "should change no page, so a page cannot be made to carry a forged native-mode \
+             marker"
+        );
+        assert_eq!(
+            registration.bundle_tag_attributes,
+            [("data-ts-aps-rendering-mode", "publisher_native")],
+            "should authorize native mode on the publisher bundle tag"
+        );
 
         let integration = ApsRendererIntegration {
             rendering_mode: ApsRenderingMode::PublisherNative,
@@ -3325,22 +3317,6 @@ mod tests {
         assert!(
             integration.routes().is_empty(),
             "should expose no renderer route"
-        );
-        let document_state = IntegrationDocumentState::default();
-        let context = IntegrationHtmlContext {
-            request_host: "publisher.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
-        assert!(
-            integration.head_inserts(&context).is_empty(),
-            "should not inject a forgeable native-mode marker"
-        );
-        assert_eq!(
-            integration.tsjs_script_tag_attributes(),
-            vec![("data-ts-aps-rendering-mode", "publisher_native")],
-            "should authorize native mode on the publisher bundle tag"
         );
     }
 
@@ -4638,5 +4614,22 @@ mod engine_tests {
         let routing = serde_json::to_string(&response.metadata["routing"])
             .expect("should serialize routing metadata");
         assert!(!routing.contains("example-bidder") && !routing.contains("private"));
+    }
+
+    /// The page a reader receives with this module running, kept as a file
+    /// so that changing how the page change is made can be shown to leave
+    /// the page as it was.
+    #[test]
+    fn the_page_a_reader_receives_is_the_recorded_one() {
+        trusted_server_core::html_processor::test_support::assert_page_is_recorded(
+            include_str!("fixtures/page-change.settings.toml"),
+            &[super::builder()],
+            include_str!("fixtures/page-change.input.html"),
+            include_str!("fixtures/page-change.recorded.html"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/fixtures/page-change.recorded.html"
+            ),
+        );
     }
 }
