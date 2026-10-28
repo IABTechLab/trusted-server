@@ -779,6 +779,11 @@ pub struct ProviderSettings {
     #[serde(default = "ProviderSettings::default_max_calls_per_minute")]
     pub max_calls_per_minute: u32,
 
+    /// Calls per minute from one client address, across every visitor
+    /// behind it. `0` turns the ceiling off.
+    #[serde(default = "ProviderSettings::default_max_calls_per_ip_per_minute")]
+    pub max_calls_per_ip_per_minute: u32,
+
     /// Failures per minute that open the circuit breaker.
     #[serde(default = "ProviderSettings::default_breaker_failures_per_minute")]
     pub breaker_failures_per_minute: u32,
@@ -811,6 +816,12 @@ impl ProviderSettings {
         1
     }
 
+    /// Default calls per minute from one client address.
+    #[must_use]
+    pub const fn default_max_calls_per_ip_per_minute() -> u32 {
+        10
+    }
+
     /// Default breaker failures per minute.
     #[must_use]
     pub const fn default_breaker_failures_per_minute() -> u32 {
@@ -841,6 +852,7 @@ impl Default for ProviderSettings {
             sources: None,
             refresh_after_sec: Self::default_refresh_after_sec(),
             max_calls_per_minute: Self::default_max_calls_per_minute(),
+            max_calls_per_ip_per_minute: Self::default_max_calls_per_ip_per_minute(),
             breaker_failures_per_minute: Self::default_breaker_failures_per_minute(),
             cookie_priority: 0,
             revoke_scope: None,

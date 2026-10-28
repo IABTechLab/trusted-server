@@ -2386,6 +2386,16 @@ pub mod fake_http {
         client: &Arc<FakeHttpClient>,
         backend: &Arc<FakeBackend>,
     ) -> RuntimeServices {
+        fake_services_from(client, backend, ClientInfo::default())
+    }
+
+    /// [`fake_services`] for a request from `client_info`.
+    #[cfg(test)]
+    pub(crate) fn fake_services_from(
+        client: &Arc<FakeHttpClient>,
+        backend: &Arc<FakeBackend>,
+        client_info: ClientInfo,
+    ) -> RuntimeServices {
         client.honour_timeouts_of(backend);
         RuntimeServices::builder()
             .config_store(Arc::new(NoopConfigStore))
@@ -2394,7 +2404,7 @@ pub mod fake_http {
             .backend(backend.clone())
             .http_client(client.clone())
             .geo(Arc::new(NoopGeo))
-            .client_info(ClientInfo::default())
+            .client_info(client_info)
             .build()
     }
 

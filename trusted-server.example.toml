@@ -117,6 +117,7 @@ ec_store = "ec_identity_store"
 # after_send_timeout_ms = 1000    # 1..=10000
 # refresh_after_sec = 86400
 # max_calls_per_minute = 1
+# max_calls_per_ip_per_minute = 10  # 0 turns the per-IP ceiling off
 # breaker_failures_per_minute = 50
 # cookie_priority = 0
 

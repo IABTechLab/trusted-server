@@ -1326,6 +1326,37 @@ fn burst_capped(
         })
 }
 
+/// Whether the per-IP ceiling stops the call: `max_calls_per_ip_per_minute`
+/// calls to one provider from one client address, across every visitor
+/// behind it, so minting a fresh EC per request cannot multiply calls. The
+/// key holds a keyed hash of the address, never the address. `Err` when it
+/// could not be read. A request without a client IP, or a ceiling of 0, is
+/// not capped here; the per-visitor cap still applies.
+fn ip_capped(
+    deps: &IdentityDeps<'_>,
+    provider: &IdentityProviderId,
+    settings: &ProviderSettings,
+) -> Result<bool, ()> {
+    let (Some(limiter), Some(ip)) = (deps.rate_limiter, deps.services.client_info().client_ip)
+    else {
+        return Ok(false);
+    };
+    if settings.max_calls_per_ip_per_minute == 0 {
+        return Ok(false);
+    }
+    let key = format!(
+        "identity-ip:{provider}:{}",
+        visitor_key(deps.keys, &format!("ip:{ip}"))
+    );
+    limiter
+        .exceeded_per_minute(&key, settings.max_calls_per_ip_per_minute)
+        .map_err(|error| {
+            log::warn!(
+                "Identity provider '{provider}' not dispatched, per-IP ceiling unreadable: {error:?}"
+            );
+        })
+}
+
 /// Builds, checks and sends one call.
 async fn prepare_call<'a>(
     deps: &IdentityDeps<'a>,
@@ -1380,6 +1411,14 @@ async fn prepare_call<'a>(
     }
     match burst_capped(deps, id, signals.ec_id.as_deref(), &settings) {
         Ok(true) => return Prepared::Settled(CallOutcome::BurstCapped),
+        Ok(false) => {}
+        Err(()) => return Prepared::Settled(CallOutcome::NotDispatched),
+    }
+    match ip_capped(deps, id, &settings) {
+        Ok(true) => {
+            log::debug!("Identity provider '{id}' not dispatched: the per-IP ceiling is reached");
+            return Prepared::Settled(CallOutcome::BurstCapped);
+        }
         Ok(false) => {}
         Err(()) => return Prepared::Settled(CallOutcome::NotDispatched),
     }
@@ -2210,7 +2249,7 @@ mod tests {
     use crate::ec::identity::revision::{record_revision, uid_hash};
     use crate::ec::identity::test_support::FakeRateLimiter;
     use crate::ec::identity::test_support::fake_http::{
-        FakeBackend, FakeHttpClient, ScriptedProvider, fake_services,
+        FakeBackend, FakeHttpClient, ScriptedProvider, fake_services, fake_services_from,
     };
     use crate::ec::identity::test_support::{
         OutcomeFixture, allowing_consent, facts_for_writer, fixed_capture_provider, fixed_provider,
@@ -2218,6 +2257,7 @@ mod tests {
         test_consent_gdpr_without_vendor,
     };
     use crate::ec::kv_types::{KvEid, KvUid};
+    use crate::platform::ClientInfo;
     use crate::settings::ProviderMode;
     use crate::test_support::tests::create_test_settings;
 
@@ -4718,6 +4758,54 @@ mod tests {
         assert!(
             timeouts[1] <= Duration::from_millis(30),
             "should wait no longer than the remaining budget"
+        );
+    }
+
+    #[test]
+    fn per_ip_ceiling_caps_calls_from_one_address() {
+        let mut fixture =
+            DispatchFixture::new(vec![scripted("p", "p.example.com", "p.example.com")]);
+        fixture.settings.ec.identity.providers.insert(
+            "p".to_owned(),
+            ProviderSettings {
+                max_calls_per_minute: 10_000,
+                max_calls_per_ip_per_minute: 2,
+                ..ProviderSettings::default()
+            },
+        );
+        fixture.client.respond("p.example.com", 200, b"{}");
+        let from = |ip: &str| ClientInfo {
+            client_ip: Some(ip.parse().expect("should parse the IP")),
+            ..ClientInfo::default()
+        };
+        let limiter = FakeRateLimiter::new();
+
+        fixture.services = fake_services_from(&fixture.client, &fixture.backend, from("192.0.2.1"));
+        let first_two: Vec<_> = (0..2)
+            .map(|_| fixture.run(&["p"], 1_000, None, Some(&limiter)))
+            .collect();
+        let third = fixture.run(&["p"], 1_000, None, Some(&limiter));
+        fixture.services =
+            fake_services_from(&fixture.client, &fixture.backend, from("198.51.100.1"));
+        let elsewhere = fixture.run(&["p"], 1_000, None, Some(&limiter));
+
+        assert!(
+            first_two
+                .iter()
+                .all(|outcomes| matches!(outcome_of(outcomes, "p"), CallOutcome::Resolved(_))),
+            "should send while the address is under its ceiling"
+        );
+        assert!(
+            matches!(outcome_of(&third, "p"), CallOutcome::BurstCapped),
+            "should cap a third call from the same address within the minute"
+        );
+        assert!(
+            matches!(outcome_of(&elsewhere, "p"), CallOutcome::Resolved(_)),
+            "control: another address has its own ceiling"
+        );
+        assert!(
+            limiter.keys().iter().all(|key| !key.contains("192.0.2.1")),
+            "should key the ceiling on a keyed hash, never the raw IP"
         );
     }
 

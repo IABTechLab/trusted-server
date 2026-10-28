@@ -1560,7 +1560,16 @@ max_backend_requests` (default 32) bounds them together: the adapter's
    `max_calls_per_minute` on the key `identity:<provider>:<visitor>`, where
    `visitor` is an HMAC of the full EC ID with a key derived from
    `ec.passphrase`. It is not `ec_hash`, which everyone behind one IP shares
-   (section 3.4). A due provider the cap stops is not dispatched and gets
+   (section 3.4). Next to it, a per-IP ceiling,
+   `max_calls_per_ip_per_minute` (default 10, `0` off), counts one
+   provider's calls from one client address across every visitor behind
+   it, on `identity-ip:<provider>:<address>`, where `address` is an HMAC of
+   the request's client IP with the same derived key. Minting ECs has no
+   limiter, so without it a script that alternates a cookieless and a
+   cookied navigation would fire every eligible provider once per minted
+   EC. The ceiling is generous because carrier NAT puts many visitors
+   behind one address, and a request without a client IP skips it. A due
+   provider either cap stops is not dispatched and gets
    `n = max(n, now + 60 s)`, one limiter window, and never a failure
    (section 8).
 
@@ -3019,6 +3028,9 @@ sources = ["id5-sync.com"]
 refresh_after_sec = 86400
 # Burst cap per visitor, enforced in 60-second windows. Default 1.
 max_calls_per_minute = 1
+# Ceiling per client address across visitors, in 60-second windows.
+# Default 10; 0 turns it off.
+max_calls_per_ip_per_minute = 10
 # Skip the provider for every visitor once this many transport failures,
 # timeouts, 429s or 5xx responses happen within one 60-second window.
 # Default 50.
@@ -3178,8 +3190,8 @@ What changes:
 - Errors back off through `ps` (section 8). Today a failing partner is
   retried on every eligible request, within the rate limit.
 - The rate-limit key moves from `pull:<domain>:<ec_hash>`
-  (`pull_sync.rs:373`) to the per-visitor key of section 4.7. Counters reset
-  at deploy.
+  (`pull_sync.rs:373`) to the per-visitor key of section 4.7, next to the
+  per-IP ceiling of that step. Counters reset at deploy.
 - `pull_sync_ttl_sec` and `pull_sync_rate_limit` are removed from
   `[[ec.partners]]` (`settings.rs:430-439`). Their roles move to
   `refresh_after_sec` and `max_calls_per_minute`. Today's hourly limit
@@ -4580,20 +4592,21 @@ Decisions made while writing this spec, with the user:
 Revision 15 applies these decisions, made by the user after the round 14
 review, which allowed breaking changes:
 
-| Decision             | Choice                                                                                                                                                                                                                                             |
-| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Stager providers     | None. Resolving providers run only on writer navigations, so every outcome, backoff included, is stored. Stagers serve KV                                                                                                                          |
-| Removals             | Written to KV on the request that carries them. `ts-eids-r`, its keyring and secrets, the overflow write and the strips-only rollout step are removed                                                                                              |
-| Non-browser removals | Applied, as consent withdrawals are; only clears need a real browser. Changed after the round 14 review from dropping them                                                                                                                         |
-| Expiry scope         | G7 covers owned expiring sources. A stateless owner keeps its expired record as a refresh anchor until `exp` plus its declared refresh grace. Unowned IDs keep no lifetime (section 2.3). Changed after the round 14 review                        |
-| Opt-out clears       | A TCF re-grant clears only a denial `fp` recorded (new TCF bit 16), with no `LastUpdated` comparison. A clear stores a watermark, the `at` of the opt-out it read, as `ps.oc`, and clears apply before opt-outs. Changed after the round 14 review |
-| Backend budget       | `max_backend_requests` (default 32) bounds origin, auction and provider calls in one execution; a provider call past it is skipped, not a failure, and a hold call reserves the origin and the auction. Added after the round 14 review            |
-| Capture              | Revoke-only: removals, opt-out and clear. Positive IDs are counted, never stored. `capture_enabled` and request-body consent are removed                                                                                                           |
-| Capture-only opt-out | Also removes the records of its sources that no provider wrote, and blocks the browser's values for them. A capture-only provider cannot own a source and must list its `sources`                                                                  |
-| Provider denials     | A provider's `ps.iv` and `ps.ov` filter browser candidates for unowned sources too. An opt-out's removals go to `ps.ov`, which its clear empties                                                                                                   |
-| Mirror feedback      | The shim never copies `ts-eids-s` into `ts-eids` or the `/auction` body                                                                                                                                                                            |
-| Dry run              | Removed, with `is_dry_run`                                                                                                                                                                                                                         |
-| KV schema            | Version 2 with one record shape. Version 1 rows are read and upgraded on write. Rollback past rollout step 1 is unsupported                                                                                                                        |
-| Stored hashes        | `ps.iv` hashes are unkeyed and the consent fingerprint is a plain bitmask, because the row already holds the raw values. No legacy revision hash                                                                                                   |
-| Pull sync            | The pull-complete marker and the legacy pull sync config keys are removed                                                                                                                                                                          |
-| Withdrawal retry     | A tombstone that fails before send gets one more attempt after send                                                                                                                                                                                |
+| Decision             | Choice                                                                                                                                                                                                                                                              |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Stager providers     | None. Resolving providers run only on writer navigations, so every outcome, backoff included, is stored. Stagers serve KV                                                                                                                                           |
+| Removals             | Written to KV on the request that carries them. `ts-eids-r`, its keyring and secrets, the overflow write and the strips-only rollout step are removed                                                                                                               |
+| Non-browser removals | Applied, as consent withdrawals are; only clears need a real browser. Changed after the round 14 review from dropping them                                                                                                                                          |
+| Expiry scope         | G7 covers owned expiring sources. A stateless owner keeps its expired record as a refresh anchor until `exp` plus its declared refresh grace. Unowned IDs keep no lifetime (section 2.3). Changed after the round 14 review                                         |
+| Opt-out clears       | A TCF re-grant clears only a denial `fp` recorded (new TCF bit 16), with no `LastUpdated` comparison. A clear stores a watermark, the `at` of the opt-out it read, as `ps.oc`, and clears apply before opt-outs. Changed after the round 14 review                  |
+| Backend budget       | `max_backend_requests` (default 32) bounds origin, auction and provider calls in one execution; a provider call past it is skipped, not a failure, and a hold call reserves the origin and the auction. Added after the round 14 review                             |
+| Per-IP ceiling       | `max_calls_per_ip_per_minute` (default 10) caps one provider's calls per client address across visitors, keyed on an HMAC of the IP, next to the per-visitor cap. Breaker failures are not required to come from distinct visitors. Added after the round 14 review |
+| Capture              | Revoke-only: removals, opt-out and clear. Positive IDs are counted, never stored. `capture_enabled` and request-body consent are removed                                                                                                                            |
+| Capture-only opt-out | Also removes the records of its sources that no provider wrote, and blocks the browser's values for them. A capture-only provider cannot own a source and must list its `sources`                                                                                   |
+| Provider denials     | A provider's `ps.iv` and `ps.ov` filter browser candidates for unowned sources too. An opt-out's removals go to `ps.ov`, which its clear empties                                                                                                                    |
+| Mirror feedback      | The shim never copies `ts-eids-s` into `ts-eids` or the `/auction` body                                                                                                                                                                                             |
+| Dry run              | Removed, with `is_dry_run`                                                                                                                                                                                                                                          |
+| KV schema            | Version 2 with one record shape. Version 1 rows are read and upgraded on write. Rollback past rollout step 1 is unsupported                                                                                                                                         |
+| Stored hashes        | `ps.iv` hashes are unkeyed and the consent fingerprint is a plain bitmask, because the row already holds the raw values. No legacy revision hash                                                                                                                    |
+| Pull sync            | The pull-complete marker and the legacy pull sync config keys are removed                                                                                                                                                                                           |
+| Withdrawal retry     | A tombstone that fails before send gets one more attempt after send                                                                                                                                                                                                 |
