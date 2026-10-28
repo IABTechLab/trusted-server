@@ -34,6 +34,7 @@ commands are shown explicitly.
 | `ts config diff`                 | Linux + macOS | Diff `trusted-server.toml` against the live `EdgeZero` config                                                            | `ts config diff [OPTIONS] --adapter <ADAPTER>`                                                                 |
 | `ts config gc`                   | Linux + macOS | Reclaim orphaned chunk entries leaked from prior oversized pushes                                                        | `ts config gc [OPTIONS] --adapter <ADAPTER>`                                                                   |
 | `ts config init`                 | Linux + macOS | Initialize a Trusted Server config file from the example template                                                        | `ts config init [OPTIONS]`                                                                                     |
+| `ts config migrate`              | Linux + macOS | Rewrite a config written for an earlier release into the shape this release reads                                        | `ts config migrate [OPTIONS] --adapter <ADAPTER> <FILE>`                                                       |
 | `ts config push`                 | Linux + macOS | Push `trusted-server.toml`, with the permission policy file it names, as a blob envelope through `EdgeZero`              | `ts config push [OPTIONS] --adapter <ADAPTER>`                                                                 |
 | `ts config validate`             | Linux + macOS | Validate `edgezero.toml`, the typed Trusted Server config and, with `--permissions`, the permission policy file it names | `ts config validate [OPTIONS]`                                                                                 |
 | `ts deploy`                      | Linux + macOS | Deploy the project through a target adapter                                                                              | `ts deploy [OPTIONS] --adapter <ADAPTER> [-- <ADAPTER_ARGS>...]`                                               |
@@ -183,6 +184,88 @@ window and no writer is targeting it. Unlike the other `config` subcommands,
 sweep, and `--store <id>` overrides the manifest's config-store id outright.
 Both change which store gets swept, so on a destructive run check the store id
 `gc` reports before passing `--yes`.
+
+### Upgrade a configuration written for an earlier release
+
+Run `ts config migrate` first when you upgrade. A configuration written for an
+earlier release does not load until its settings take the shape this release
+reads, and the command rewrites the ones it can. Keep a copy of the original
+before you use `--write`, because a rollback restores it with the old build,
+and it holds the `[request_signing]` store ids that `ts keys rotate` and
+`ts keys deactivate` take.
+
+```bash
+# Print the migrated configuration, with what changed on stderr.
+ts config migrate --adapter fastly trusted-server.toml > trusted-server.migrated.toml
+
+# Rewrite the file in place.
+ts config migrate --adapter fastly --write trusted-server.toml
+
+# Change nothing, and exit 1 when the file needs migrating, for CI.
+ts config migrate --adapter fastly --check trusted-server.toml
+```
+
+`--adapter` names the adapter the deployment runs on, being `fastly`,
+`cloudflare`, `axum` or `spin`. On Fastly and Cloudflare the host's location
+lookup, which an earlier release ran on every request, becomes
+`[geo] module = "platform"`. The Axum dev server and Spin have no lookup and
+refuse that line at startup, so there the command selects no geo module and
+leaves a `to do:` item for the Edge Cookie module, which then needs
+`[geo] assume_single_jurisdiction = true` or a geo module of your choice. A
+configuration you push to more than one adapter, such as the Axum dev server
+and Fastly, is migrated once for each adapter into a file of its own.
+
+`config migrate <file>` prints the migrated configuration on stdout. On stderr it
+prints a line for each change it made, starting `changed:`, a line for each item
+left for you, starting `to do:`, and a line for each change in behavior no
+setting expresses, starting `check:`. Its last line says whether the migrated
+configuration passes the settings validation `ts config validate` runs, except
+with `--check`, which does not validate. A `to do:` item is a setting the
+configuration cannot load without, such as a `[[handlers]]` entry that can guard
+a path of the publisher's own, or one this release ignores whose value you carry
+elsewhere, such as `[consent.gdpr] applies_in`. Each needs a decision or a value
+the configuration does not hold, so the command leaves the setting where it is
+and reports it on every run until it is done. A configuration that names no
+permission policy file leaves one more item, because no policy ships with
+Trusted Server and the command chooses none, so name the publisher's file in
+`[permissions] policy` and supply it with `ts config push --permissions <file>`.
+
+The command reads the file alone, with no manifest and no environment overlay.
+It keeps the comments and the order of the tables you wrote. A module that was
+not enabled is written under its new name as a comment block, and to run it you
+uncomment the block and select the module in the section of its type. The
+command never selects `headers.geo`, because the `x-geo-*` headers carry the
+reader's location, and a `check:` line says what the adapter's responses carried
+before. It never prints a value from the configuration, because a configuration
+can hold secrets. Each line names the setting, a failed validation gives only
+the byte offset or the phase that refused, and `ts config validate` prints the
+whole refusal. Migrating a migrated configuration changes nothing.
+
+It exits 0 when nothing is left to do and the migrated configuration passes
+validation, 1 when an item is left to do or the configuration does not pass,
+and 2 when the file cannot be read, written or parsed as TOML. With `--check`
+it exits 0 when the configuration needs no migrating and 1 otherwise. `--write`
+cannot be used with `--check`, and `--write` writes the result even when an item
+is left to do.
+
+After migrating:
+
+1. Do each `to do:` item, and read each `check:` item.
+2. Rename each environment variable that set a moved setting, such as
+   `TRUSTED_SERVER__PUBLISHER__ORIGIN_URL`, which is now
+   `TRUSTED_SERVER__SOURCE__ORIGIN__URL`, because `ts config push` ignores a
+   variable for a key the configuration does not hold.
+3. Run `ts config validate --permissions <file>` with the publisher's policy
+   file.
+4. Push the configuration and the policy file with the new build, because a
+   build from before this release refuses the migrated configuration and this
+   release refuses the old one. On Fastly, `ts deploy --staging` and
+   `ts config push --staging --permissions <file>` let you check the pair
+   together first. On Cloudflare and Spin, keep the key-value store this
+   release requires, the Workers KV binding `TRUSTED_SERVER_KV` and Spin's
+   `default` store, or every request fails.
+5. Expect the stored pages to be fetched again once after the upgrade, because
+   their keys hold a code worked out from the settings.
 
 ### Diagnose ad-template configuration
 

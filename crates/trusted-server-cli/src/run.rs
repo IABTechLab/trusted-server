@@ -10,6 +10,7 @@ use crate::commands::audit::{AuditArgs, run_audit};
 use crate::commands::config::ad_templates::{AdTemplatesCommand, run_ad_templates};
 use crate::commands::config::init::{ConfigInitArgs, run_config_init};
 use crate::commands::config::keyed_push;
+use crate::commands::config::migrate::{ConfigMigrateArgs, run_config_migrate};
 use crate::commands::config::policy;
 use crate::commands::pbs::{self, PbsArgs};
 use crate::prebid_bundle::{NpmPrebidBundleGenerator, PrebidBundleArgs, run_bundle};
@@ -71,6 +72,9 @@ enum ConfigCommand {
     Diff(policy::DiffArgs),
     /// Reclaim orphaned chunk entries leaked from prior oversized pushes.
     Gc(ConfigGcArgs),
+    /// Rewrite a config written for an earlier release into the shape this
+    /// release reads.
+    Migrate(ConfigMigrateArgs),
     /// Push `trusted-server.toml`, with the permission policy file it names,
     /// as a blob envelope through `EdgeZero`, or under a Fastly `--key` of
     /// its own.
@@ -148,6 +152,7 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
         Command::Config(ConfigCommand::Gc(args)) => {
             edgezero_cli::run_config_gc(&args).map(|()| RunOutcome::Success)
         }
+        Command::Config(ConfigCommand::Migrate(args)) => run_config_migrate(&args),
         Command::Config(ConfigCommand::Push(args)) => match keyed_push::own_key(&args.edgezero) {
             Some(key) => {
                 let stdout = std::io::stdout();
@@ -205,6 +210,7 @@ mod tests {
     use edgezero_cli::args::{AuthSub, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs};
 
     use super::*;
+    use crate::commands::config::migrate::Adapter;
 
     fn parse(args: &[&str]) -> Args {
         Args::try_parse_from(args).expect("should parse args")
@@ -240,6 +246,51 @@ mod tests {
             "https://example.com/article",
         ])
         .expect_err("should refuse both scopes at once");
+    }
+
+    #[test]
+    fn parses_config_migrate_with_its_file_its_adapter_and_one_mode() {
+        let args = parse(&[
+            "ts",
+            "config",
+            "migrate",
+            "--adapter",
+            "spin",
+            "--check",
+            "trusted-server.toml",
+        ]);
+        let Command::Config(ConfigCommand::Migrate(migrate)) = args.command else {
+            panic!("expected config migrate command");
+        };
+        assert_eq!(migrate.file, PathBuf::from("trusted-server.toml"));
+        assert_eq!(migrate.adapter, Adapter::Spin);
+        assert!(migrate.check, "should check");
+        assert!(!migrate.write, "should not write");
+
+        Args::try_parse_from([
+            "ts",
+            "config",
+            "migrate",
+            "--adapter",
+            "fastly",
+            "--write",
+            "--check",
+            "trusted-server.toml",
+        ])
+        .expect_err("should refuse writing and checking at once");
+        Args::try_parse_from(["ts", "config", "migrate", "--adapter", "fastly"])
+            .expect_err("should need the file to migrate");
+        Args::try_parse_from(["ts", "config", "migrate", "trusted-server.toml"])
+            .expect_err("should need the adapter the deployment runs on");
+        Args::try_parse_from([
+            "ts",
+            "config",
+            "migrate",
+            "--adapter",
+            "other",
+            "trusted-server.toml",
+        ])
+        .expect_err("should refuse an adapter the stack does not have");
     }
 
     #[test]

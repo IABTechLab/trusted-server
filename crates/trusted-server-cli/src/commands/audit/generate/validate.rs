@@ -52,7 +52,7 @@ pub(super) fn check_candidate(candidate: &str, baseline: &str) -> CliResult<Vec<
 /// Parse and schema errors report only a byte offset. Deploy validation errors
 /// report only the failed phase because their messages can contain literal
 /// values, including validator parameters and invalid patterns.
-fn validate_source_config(source: &str) -> CliResult<()> {
+pub(crate) fn validate_source_config(source: &str) -> CliResult<()> {
     crate::app_config::register_linked_modules();
     let config: TrustedServerAppConfig = toml::from_str(source).map_err(|error| {
         error.span().map_or_else(
