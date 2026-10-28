@@ -1,4 +1,4 @@
-use crate::common::config::cloudflare_config_json;
+use crate::common::config::integration_app_config_envelope;
 use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult, origin_port,
 };
@@ -6,6 +6,7 @@ use error_stack::{Report, ResultExt as _};
 use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use trusted_server_core::config_payload::{CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_ID};
 
 /// Cloudflare Workers runtime via `wrangler dev`.
 ///
@@ -23,20 +24,18 @@ pub struct CloudflareWorkers;
 
 /// Fallback port when dynamic allocation fails.
 const CLOUDFLARE_DEFAULT_PORT: u16 = 8787;
-const CI_CONFIG_TEMPLATE: &str = "wrangler.ci.toml";
-const GENERATED_CI_CONFIG: &str = "wrangler.integration.generated.toml";
-const TRUSTED_SERVER_CONFIG_PLACEHOLDER: &str = "TRUSTED_SERVER_CONFIG = \"{}\"";
+const CI_CONFIG: &str = "wrangler.ci.toml";
 
-/// The table of the CI wrangler template that binds the key-value namespace
-/// the adapter declares.
+/// The CI wrangler config without the key-value store's namespace, which
+/// [`CloudflareWorkers::spawn_without_kv_binding`] writes.
+const GENERATED_UNBOUND_CONFIG: &str = "wrangler.integration.generated.toml";
+
+/// The header of a table of the CI wrangler config that binds a key-value
+/// namespace.
 const KV_NAMESPACES_TABLE: &str = "[[kv_namespaces]]";
 
-/// Whether a generated wrangler config binds the key-value namespace.
-#[derive(Clone, Copy)]
-enum KvBinding {
-    Bound,
-    Unbound,
-}
+/// The binding of the key-value namespace the adapter declares as its store.
+const KV_STORE_BINDING: &str = "TRUSTED_SERVER_KV";
 
 /// What [`CloudflareWorkers::spawn_wrangler`] waits for before it hands the
 /// Worker to a test.
@@ -48,77 +47,120 @@ enum Readiness {
     AnyAnswer,
 }
 
-fn write_generated_ci_config(
-    wrangler_dir: &Path,
-    config_json: &str,
-    kv: KvBinding,
-) -> TestResult<String> {
-    let template_path = wrangler_dir.join(CI_CONFIG_TEMPLATE);
+/// The arguments that store `envelope_path`'s contents in the Worker's local
+/// config store, the namespace bound as the store's default platform name in
+/// `config`.
+fn seed_config_store_args<'a>(config: &'a str, envelope_path: &'a str) -> Vec<&'a str> {
+    vec![
+        "kv",
+        "key",
+        "put",
+        CONFIG_BLOB_KEY,
+        "--path",
+        envelope_path,
+        "--binding",
+        DEFAULT_CONFIG_STORE_ID,
+        "--local",
+        "--config",
+        config,
+    ]
+}
+
+/// Stores `envelope` as the settings blob in the local config store that
+/// `wrangler dev --config <config>` reads.
+fn seed_config_store(wrangler_dir: &Path, config: &str, envelope: &str) -> TestResult<()> {
+    let envelope_path =
+        std::env::temp_dir().join(format!("ts-integration-config-{}.json", std::process::id()));
+    std::fs::write(&envelope_path, envelope)
+        .change_context(TestError::RuntimeSpawn)
+        .attach(format!(
+            "failed to write the settings blob to {}",
+            envelope_path.display()
+        ))?;
+    let envelope_arg = envelope_path.to_string_lossy().into_owned();
+    let output = Command::new("wrangler")
+        .args(seed_config_store_args(config, &envelope_arg))
+        .current_dir(wrangler_dir)
+        .output();
+    let _ = std::fs::remove_file(&envelope_path);
+    let output = output
+        .change_context(TestError::RuntimeSpawn)
+        .attach("failed to run `wrangler kv key put` for the config store")?;
+    if !output.status.success() {
+        return Err(Report::new(TestError::RuntimeSpawn).attach(format!(
+            "`wrangler kv key put` exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Writes the CI wrangler config without the key-value store's namespace,
+/// keeping the config store's, and returns the file's name.
+fn write_ci_config_without_kv_binding(wrangler_dir: &Path) -> TestResult<String> {
+    let template_path = wrangler_dir.join(CI_CONFIG);
     let template = std::fs::read_to_string(&template_path)
         .change_context(TestError::RuntimeSpawn)
         .attach(format!(
             "failed to read Cloudflare CI wrangler config at {}",
             template_path.display()
         ))?;
-    let mut generated = inject_cloudflare_config(&template, config_json)?;
-    if matches!(kv, KvBinding::Unbound) {
-        generated = without_kv_namespaces(&generated)?;
-    }
-    let output_path = wrangler_dir.join(GENERATED_CI_CONFIG);
+    let generated = without_kv_store_binding(&template)?;
+    let output_path = wrangler_dir.join(GENERATED_UNBOUND_CONFIG);
     std::fs::write(&output_path, generated)
         .change_context(TestError::RuntimeSpawn)
         .attach(format!(
             "failed to write generated Cloudflare CI wrangler config at {}",
             output_path.display()
         ))?;
-    Ok(GENERATED_CI_CONFIG.to_string())
+    Ok(GENERATED_UNBOUND_CONFIG.to_string())
 }
 
-fn inject_cloudflare_config(template: &str, config_json: &str) -> TestResult<String> {
-    let placeholder_count = template.matches(TRUSTED_SERVER_CONFIG_PLACEHOLDER).count();
-    if placeholder_count != 1 {
-        return Err(Report::new(TestError::RuntimeSpawn).attach(format!(
-            "Cloudflare CI wrangler config must contain exactly one `{TRUSTED_SERVER_CONFIG_PLACEHOLDER}` placeholder, found {placeholder_count}"
-        )));
-    }
-
-    Ok(template.replace(
-        TRUSTED_SERVER_CONFIG_PLACEHOLDER,
-        &format!("TRUSTED_SERVER_CONFIG = '''{config_json}'''"),
-    ))
-}
-
-/// `template` without its one `[[kv_namespaces]]` table, being the table's
-/// header and every line after it up to the next blank line or table.
-fn without_kv_namespaces(template: &str) -> TestResult<String> {
-    let tables = template
-        .lines()
-        .filter(|line| line.trim() == KV_NAMESPACES_TABLE)
-        .count();
-    if tables != 1 {
-        return Err(Report::new(TestError::RuntimeSpawn).attach(format!(
-            "Cloudflare CI wrangler config must contain exactly one `{KV_NAMESPACES_TABLE}` table, found {tables}"
-        )));
-    }
-
+/// `template` without the `[[kv_namespaces]]` table that binds
+/// [`KV_STORE_BINDING`], being the table's header and every line after it up
+/// to the next blank line or table. Every other table is kept.
+fn without_kv_store_binding(template: &str) -> TestResult<String> {
+    let binding = format!("binding = \"{KV_STORE_BINDING}\"");
     let mut kept = Vec::new();
-    let mut in_table = false;
+    let mut table = Vec::new();
+    let mut dropped = 0;
     for line in template.lines() {
         let trimmed = line.trim();
-        if trimmed == KV_NAMESPACES_TABLE {
-            in_table = true;
-            continue;
+        if !table.is_empty() && (trimmed.is_empty() || trimmed.starts_with('[')) {
+            dropped += keep_unless_bound(&mut table, &mut kept, &binding);
         }
-        if in_table && (trimmed.is_empty() || trimmed.starts_with('[')) {
-            in_table = false;
-        }
-        if !in_table {
+        if trimmed == KV_NAMESPACES_TABLE || !table.is_empty() {
+            table.push(line);
+        } else {
             kept.push(line);
         }
+    }
+    dropped += keep_unless_bound(&mut table, &mut kept, &binding);
+    if dropped != 1 {
+        return Err(Report::new(TestError::RuntimeSpawn).attach(format!(
+            "Cloudflare CI wrangler config must bind `{KV_STORE_BINDING}` in exactly one `{KV_NAMESPACES_TABLE}` table, found {dropped}"
+        )));
     }
     let mut generated = kept.join("\n");
     generated.push('\n');
     Ok(generated)
+}
+
+/// Moves the lines of `table` onto `kept`, unless the table holds the line
+/// `binding`, and returns the number of tables dropped.
+fn keep_unless_bound<'a>(
+    table: &mut Vec<&'a str>,
+    kept: &mut Vec<&'a str>,
+    binding: &str,
+) -> usize {
+    if table.iter().any(|line| line.trim() == binding) {
+        table.clear();
+        1
+    } else {
+        kept.append(table);
+        0
+    }
 }
 
 /// Polls `base_url` until the Worker answers with any status.
@@ -141,15 +183,16 @@ impl RuntimeEnvironment for CloudflareWorkers {
     fn spawn(&self, _wasm_path: &Path) -> TestResult<RuntimeProcess> {
         let wrangler_dir = self.wrangler_dir();
         let config = if std::env::var("CI").is_ok() {
-            write_generated_ci_config(
+            seed_config_store(
                 &wrangler_dir,
-                &cloudflare_config_json(origin_port())?,
-                KvBinding::Bound,
-            )?
+                CI_CONFIG,
+                &integration_app_config_envelope(origin_port())?,
+            )?;
+            CI_CONFIG
         } else {
-            "wrangler.toml".to_string()
+            "wrangler.toml"
         };
-        self.spawn_wrangler(&wrangler_dir, &config, Readiness::Healthy)
+        self.spawn_wrangler(&wrangler_dir, config, Readiness::Healthy)
     }
 
     fn health_check_path(&self) -> &str {
@@ -158,35 +201,39 @@ impl RuntimeEnvironment for CloudflareWorkers {
 }
 
 impl CloudflareWorkers {
-    /// Start `wrangler dev` with a test-specific `TRUSTED_SERVER_CONFIG` binding.
+    /// Start `wrangler dev` with a test-specific settings blob in its config
+    /// store.
     ///
-    /// Unlike [`RuntimeEnvironment::spawn`], this always renders the CI
-    /// wrangler template, so tests can enable features the shared fixture
+    /// Unlike [`RuntimeEnvironment::spawn`], this always runs the CI
+    /// wrangler config, so tests can enable features the shared fixture
     /// leaves off without changing the other runtimes' configuration.
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::RuntimeSpawn`] if the wrangler config cannot be
-    /// written or `wrangler dev` cannot be started, and
+    /// Returns [`TestError::RuntimeSpawn`] if the config store cannot be
+    /// seeded or `wrangler dev` cannot be started, and
     /// [`TestError::RuntimeNotReady`] if the health check times out.
-    pub fn spawn_with_config_json(&self, config_json: &str) -> TestResult<RuntimeProcess> {
+    pub fn spawn_with_config_envelope(&self, envelope: &str) -> TestResult<RuntimeProcess> {
         let wrangler_dir = self.wrangler_dir();
-        let config = write_generated_ci_config(&wrangler_dir, config_json, KvBinding::Bound)?;
-        self.spawn_wrangler(&wrangler_dir, &config, Readiness::Healthy)
+        seed_config_store(&wrangler_dir, CI_CONFIG, envelope)?;
+        self.spawn_wrangler(&wrangler_dir, CI_CONFIG, Readiness::Healthy)
     }
 
-    /// Start `wrangler dev` with a test-specific `TRUSTED_SERVER_CONFIG`
-    /// binding and no key-value namespace bound, returning once the Worker
-    /// answers at all, because every answer it gives is then an error.
+    /// Start `wrangler dev` with a test-specific settings blob in its config
+    /// store and no namespace bound for the key-value store, returning once
+    /// the Worker answers at all, because every answer it gives is then an
+    /// error.
     ///
     /// # Errors
     ///
     /// Returns [`TestError::RuntimeSpawn`] if the wrangler config cannot be
-    /// written or `wrangler dev` cannot be started, and
-    /// [`TestError::RuntimeNotReady`] if the Worker never answers.
-    pub fn spawn_without_kv_binding(&self, config_json: &str) -> TestResult<RuntimeProcess> {
+    /// written, the config store cannot be seeded or `wrangler dev` cannot be
+    /// started, and [`TestError::RuntimeNotReady`] if the Worker never
+    /// answers.
+    pub fn spawn_without_kv_binding(&self, envelope: &str) -> TestResult<RuntimeProcess> {
         let wrangler_dir = self.wrangler_dir();
-        let config = write_generated_ci_config(&wrangler_dir, config_json, KvBinding::Unbound)?;
+        let config = write_ci_config_without_kv_binding(&wrangler_dir)?;
+        seed_config_store(&wrangler_dir, &config, envelope)?;
         self.spawn_wrangler(&wrangler_dir, &config, Readiness::AnyAnswer)
     }
 
@@ -321,51 +368,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inject_cloudflare_config_replaces_single_placeholder() {
-        let template = format!("[vars]\n{TRUSTED_SERVER_CONFIG_PLACEHOLDER}\n");
+    fn the_seed_writes_the_blob_key_through_the_config_store_binding() {
+        let args = seed_config_store_args(CI_CONFIG, "/tmp/blob.json");
 
-        let generated = inject_cloudflare_config(&template, r#"{"app_config":"blob"}"#)
-            .expect("should inject Cloudflare config");
+        assert_eq!(
+            args,
+            [
+                "kv",
+                "key",
+                "put",
+                "trusted_server_config",
+                "--path",
+                "/tmp/blob.json",
+                "--binding",
+                "trusted_server_config",
+                "--local",
+                "--config",
+                "wrangler.ci.toml",
+            ],
+            "should store the blob where the Worker reads its settings"
+        );
+    }
+
+    #[test]
+    fn the_ci_config_binds_the_config_store_the_seed_writes() {
+        let config: toml::Value = toml::from_str(include_str!(
+            "../../../trusted-server-adapter-cloudflare/wrangler.ci.toml"
+        ))
+        .expect("should parse the CI wrangler config");
+
+        let bound = config["kv_namespaces"]
+            .as_array()
+            .expect("should declare KV namespaces")
+            .iter()
+            .any(|namespace| namespace["binding"].as_str() == Some(DEFAULT_CONFIG_STORE_ID));
 
         assert!(
-            generated.contains("TRUSTED_SERVER_CONFIG = '''{\"app_config\":\"blob\"}'''"),
-            "should inject generated config JSON"
-        );
-        assert!(
-            !generated.contains(TRUSTED_SERVER_CONFIG_PLACEHOLDER),
-            "should remove placeholder"
+            bound,
+            "the CI config should bind the config store's namespace"
         );
     }
 
     #[test]
-    fn inject_cloudflare_config_rejects_missing_placeholder() {
-        let result = inject_cloudflare_config("[vars]\n", r#"{"app_config":"blob"}"#);
-
-        assert!(result.is_err(), "should reject missing placeholder");
-    }
-
-    #[test]
-    fn inject_cloudflare_config_rejects_duplicate_placeholders() {
-        let template = format!(
-            "[vars]\n{TRUSTED_SERVER_CONFIG_PLACEHOLDER}\n{TRUSTED_SERVER_CONFIG_PLACEHOLDER}\n"
-        );
-
-        let result = inject_cloudflare_config(&template, r#"{"app_config":"blob"}"#);
-
-        assert!(result.is_err(), "should reject duplicate placeholders");
-    }
-
-    #[test]
-    fn without_kv_namespaces_drops_only_the_namespace_table() {
+    fn without_kv_store_binding_drops_only_the_key_value_stores_table() {
         let template = include_str!("../../../trusted-server-adapter-cloudflare/wrangler.ci.toml");
 
-        let generated = without_kv_namespaces(template).expect("should drop the namespace table");
+        let generated =
+            without_kv_store_binding(template).expect("should drop the key-value store's table");
 
         let manifest: toml::Value = toml::from_str(&generated).expect("should stay valid TOML");
         let original: toml::Value = toml::from_str(template).expect("should parse the template");
-        assert!(
-            manifest.get("kv_namespaces").is_none(),
-            "should bind no namespace"
+        let bound: Vec<&str> = manifest["kv_namespaces"]
+            .as_array()
+            .expect("should keep the config store's namespace")
+            .iter()
+            .filter_map(|namespace| namespace["binding"].as_str())
+            .collect();
+        assert_eq!(
+            bound,
+            [DEFAULT_CONFIG_STORE_ID],
+            "should bind the config store's namespace alone"
         );
         assert_eq!(
             manifest.get("vars"),
@@ -380,9 +442,12 @@ mod tests {
     }
 
     #[test]
-    fn without_kv_namespaces_rejects_a_template_without_the_table() {
-        let result = without_kv_namespaces("[vars]\n");
+    fn without_kv_store_binding_rejects_a_template_that_does_not_bind_the_store() {
+        let result = without_kv_store_binding("[vars]\n");
 
-        assert!(result.is_err(), "should reject a template with no table");
+        assert!(
+            result.is_err(),
+            "should reject a template that does not bind the store"
+        );
     }
 }

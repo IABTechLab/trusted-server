@@ -29,10 +29,8 @@
 )]
 
 pub(crate) mod asset_image_optimizer;
-pub mod attestation;
 pub mod auction;
 pub mod auction_config_types;
-pub mod build_info;
 pub mod cache_policy;
 pub mod closed_paths;
 pub mod config;
