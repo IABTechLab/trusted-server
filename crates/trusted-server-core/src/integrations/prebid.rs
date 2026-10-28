@@ -3742,7 +3742,7 @@ mod tests {
     }
 
     fn services_with_backend(backend: impl PlatformBackend + 'static) -> RuntimeServices {
-        RuntimeServices::builder()
+        crate::platform::test_support::test_services_builder()
             .config_store(Arc::new(NoopConfigStore))
             .secret_store(Arc::new(NoopSecretStore))
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))

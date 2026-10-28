@@ -918,8 +918,8 @@ format = "pretty"
 ```
 
 ```bash
-ts config validate
-ts config push --adapter fastly --local
+ts config validate --permissions standard.yaml
+ts config push --adapter fastly --local --permissions standard.yaml
 fastly compute serve
 ```
 

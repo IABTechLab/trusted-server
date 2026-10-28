@@ -3,7 +3,7 @@
 //! functions the server runs: `build_context_from_signals` decodes the raw
 //! consent signals and `assemble_permissions` resolves the policy.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde::Deserialize;
 use serde_json::json;
@@ -40,6 +40,19 @@ struct EvalInput {
     gpc: bool,
 }
 
+/// The repository's sample policy, which the page's repository samples tab
+/// evaluates.
+const SAMPLE_POLICY: &str = include_str!("../../../../config/permissions/sample.yaml");
+
+/// The sample's rules, parsed once.
+fn sample_maps() -> &'static PermissionMaps {
+    static MAPS: OnceLock<PermissionMaps> = OnceLock::new();
+    MAPS.get_or_init(|| {
+        PermissionMaps::from_yaml(SAMPLE_POLICY)
+            .expect("should parse the repository's sample policy")
+    })
+}
+
 fn eval_json(input: &str) -> String {
     let input: EvalInput = match serde_json::from_str(input) {
         Ok(input) => input,
@@ -59,14 +72,16 @@ fn eval_json(input: &str) -> String {
     // module that read a header or a cookie would need real evidence here.
     let evidence = OwnedRequestInfo::default();
     let modules = modules();
-    let maps = PermissionMaps::standard();
+    // The page's repository mode evaluates the repository's sample.
+    let maps = sample_maps();
     let (state, jurisdiction) = match input.geo.as_str() {
         "failed" => {
-            let state = assemble_permissions(&ctx, &evidence, GeoStatus::Failed, &modules);
+            let state = assemble_permissions(maps, &ctx, &evidence, GeoStatus::Failed, &modules);
             (state, "unknown".to_string())
         }
         "none" => {
-            let state = assemble_permissions(&ctx, &evidence, GeoStatus::NoLocation, &modules);
+            let state =
+                assemble_permissions(maps, &ctx, &evidence, GeoStatus::NoLocation, &modules);
             (state, jurisdiction_name(maps.default_jurisdiction()))
         }
         _ => {
@@ -81,7 +96,7 @@ fn eval_json(input: &str) -> String {
                 asn: None,
             };
             let state =
-                assemble_permissions(&ctx, &evidence, GeoStatus::Located(&info), &modules);
+                assemble_permissions(maps, &ctx, &evidence, GeoStatus::Located(&info), &modules);
             let jurisdiction = jurisdiction_name(
                 maps.jurisdiction_for(input.country.as_deref(), input.region.as_deref()),
             );

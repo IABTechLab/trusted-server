@@ -27,6 +27,11 @@ ids = ["trusted_server_config"]
 [stores.secrets]
 ids = ["trusted_server_secrets"]
 "#;
+/// The policy file the fixture's settings name.
+const SAMPLE_POLICY: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../config/permissions/sample.yaml"
+);
 const REWRITE_ENV: &str = "TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES";
 const SANITIZE_ENV: &str = "TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES";
 const GAM_ATTRIBUTION_ENV: &str = "TRUSTED_SERVER__INTEGRATIONS__GPT__GAM_ATTRIBUTION_ENABLED";
@@ -127,7 +132,7 @@ fn map_config_applies_rewrite_creatives_environment_override() {
         .arg(&project.manifest_path)
         .arg("--app-config")
         .arg(&project.config_path)
-        .args(["--yes", "--no-diff"])
+        .args(["--yes", "--no-diff", "--permissions", SAMPLE_POLICY])
         .current_dir(project.directory.path())
         .env(REWRITE_ENV, "false")
         .output()
@@ -170,7 +175,7 @@ fn migrated_config_applies_boolean_environment_overrides() {
         .arg(&project.manifest_path)
         .arg("--app-config")
         .arg(&project.config_path)
-        .args(["--yes", "--no-diff"])
+        .args(["--yes", "--no-diff", "--permissions", SAMPLE_POLICY])
         .current_dir(project.directory.path())
         .env(GAM_ATTRIBUTION_ENV, "true")
         .env(AD_TEMPLATES_ENABLED_ENV, "false")
@@ -219,7 +224,7 @@ fn migrated_config_applies_sanitize_creatives_environment_override() {
         .arg(&project.manifest_path)
         .arg("--app-config")
         .arg(&project.config_path)
-        .args(["--yes", "--no-diff"])
+        .args(["--yes", "--no-diff", "--permissions", SAMPLE_POLICY])
         .current_dir(project.directory.path())
         .env(SANITIZE_ENV, "true")
         .output()
@@ -262,7 +267,7 @@ fn map_config_default_rewrite_creatives_has_no_local_diff() {
         .arg(&project.manifest_path)
         .arg("--app-config")
         .arg(&project.config_path)
-        .args(["--yes", "--no-diff"])
+        .args(["--yes", "--no-diff", "--permissions", SAMPLE_POLICY])
         .current_dir(project.directory.path())
         .output()
         .expect("should run ts config push");
@@ -308,6 +313,7 @@ fn map_config_default_rewrite_creatives_has_no_local_diff() {
         .arg(&project.manifest_path)
         .arg("--app-config")
         .arg(&project.config_path)
+        .args(["--permissions", SAMPLE_POLICY])
         .current_dir(project.directory.path())
         .output()
         .expect("should run ts config diff");
@@ -348,7 +354,7 @@ fn map_shaped_provider_and_bidder_environment_overlays_apply() {
         .arg(&project.manifest_path)
         .arg("--app-config")
         .arg(&project.config_path)
-        .args(["--yes", "--no-diff"])
+        .args(["--yes", "--no-diff", "--permissions", SAMPLE_POLICY])
         .current_dir(project.directory.path())
         .env(
             PROVIDER_ENDPOINT_ENV,
@@ -409,6 +415,7 @@ fn pushed_envelope_sha_is_stable_for_one_context_key_allowlist() {
             .arg(&project.manifest_path)
             .arg("--app-config")
             .arg(&project.config_path)
+            .args(["--permissions", SAMPLE_POLICY])
             .args(flags)
             .current_dir(project.directory.path())
             .output()

@@ -1,7 +1,7 @@
 use edgezero_core::blob_envelope::BlobEnvelope;
 use error_stack::Report;
 use trusted_server_core::config::TrustedServerAppConfig;
-use trusted_server_core::config_payload::CONFIG_BLOB_KEY;
+use trusted_server_core::permissions::{SAMPLE_POLICY_TEXT, policy_sha256};
 
 use crate::common::runtime::{TestError, TestResult};
 
@@ -33,6 +33,10 @@ fn app_config_envelope(
         })?;
     let mut settings = app_config.into_settings();
     settings.publisher.origin_url = origin_url;
+    // What `ts config push --permissions` writes for the sample the fixture
+    // names. Axum reads the file from its folder and leaves the text unused.
+    settings.permissions.sha256 = Some(policy_sha256(SAMPLE_POLICY_TEXT));
+    settings.permissions.text = Some(SAMPLE_POLICY_TEXT.to_owned());
     let app_config = TrustedServerAppConfig::new(settings).map_err(|report| {
         Report::new(TestError::ConfigGeneration)
             .attach(format!("invalid generated integration config: {report:?}"))
@@ -50,24 +54,19 @@ fn app_config_envelope(
     })
 }
 
-pub fn cloudflare_config_json(origin_port: u16) -> TestResult<String> {
-    let envelope = integration_app_config_envelope(origin_port)?;
-    cloudflare_binding_json(&serde_json::json!({ CONFIG_BLOB_KEY: envelope }))
-}
-
-/// Builds a Cloudflare config binding with server-side auctions enabled.
+/// Builds the integration app-config envelope with server-side auctions
+/// enabled.
 ///
 /// The fixture's providers are removed so the enabled auction completes
 /// through the orchestrator and telemetry without any outbound provider call.
-pub fn cloudflare_auction_config_json(origin_port: u16) -> TestResult<String> {
-    let envelope = app_config_envelope(origin_port, |table| {
+pub fn auction_app_config_envelope(origin_port: u16) -> TestResult<String> {
+    app_config_envelope(origin_port, |table| {
         let auction = table_mut(table, "auction")?;
         auction.insert("enabled".to_string(), toml::Value::Boolean(true));
         auction.remove("providers");
         auction.remove("bidders");
         Ok(())
-    })?;
-    cloudflare_binding_json(&serde_json::json!({ CONFIG_BLOB_KEY: envelope }))
+    })
 }
 
 fn table_mut<'a>(table: &'a mut toml::Table, key: &str) -> TestResult<&'a mut toml::Table> {
@@ -79,14 +78,6 @@ fn table_mut<'a>(table: &'a mut toml::Table, key: &str) -> TestResult<&'a mut to
                 "integration config should contain a `[{key}]` table"
             ))
         })
-}
-
-fn cloudflare_binding_json(binding: &serde_json::Value) -> TestResult<String> {
-    serde_json::to_string(binding).map_err(|error| {
-        Report::new(TestError::ConfigGeneration).attach(format!(
-            "failed to serialize Cloudflare config binding: {error}"
-        ))
-    })
 }
 
 #[cfg(test)]

@@ -22,7 +22,9 @@ workspace = true
 
 [dependencies]
 edgezero-core = { workspace = true }
+hex = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 toml = { workspace = true }
 trusted-server-core = { workspace = true, features = ["test-utils"] }
 
