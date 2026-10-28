@@ -6791,7 +6791,7 @@ mod tests {
         let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
         let http = Arc::new(StubHttpClient::new());
         http.push_response(204, Vec::new());
-        let services = RuntimeServices::builder()
+        let services = crate::platform::test_support::test_services_builder()
             .config_store(Arc::clone(&config_store) as Arc<_>)
             .secret_store(Arc::clone(&secret_store) as Arc<_>)
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -6857,7 +6857,7 @@ mod tests {
         let http = Arc::new(StubHttpClient::new());
         http.push_response(204, Vec::new());
         http.push_response(204, Vec::new());
-        let services = RuntimeServices::builder()
+        let services = crate::platform::test_support::test_services_builder()
             .config_store(Arc::clone(&config_store) as Arc<_>)
             .secret_store(Arc::clone(&secret_store) as Arc<_>)
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -6917,7 +6917,7 @@ mod tests {
             });
             let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
             let http = Arc::new(StubHttpClient::new());
-            let services = RuntimeServices::builder()
+            let services = crate::platform::test_support::test_services_builder()
                 .config_store(Arc::clone(&config_store) as Arc<_>)
                 .secret_store(Arc::new(UnusedSecretStore))
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -7005,7 +7005,7 @@ mod tests {
         });
         let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
         let http = Arc::new(StubHttpClient::new());
-        let services = RuntimeServices::builder()
+        let services = crate::platform::test_support::test_services_builder()
             .config_store(Arc::clone(&config_store) as Arc<_>)
             .secret_store(Arc::new(UnusedSecretStore))
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
@@ -7060,7 +7060,7 @@ mod tests {
         });
         let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
         let http = Arc::new(StubHttpClient::new());
-        let services = RuntimeServices::builder()
+        let services = crate::platform::test_support::test_services_builder()
             .config_store(Arc::clone(&config_store) as Arc<_>)
             .secret_store(Arc::clone(&secret_store) as Arc<_>)
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))

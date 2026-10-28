@@ -82,6 +82,8 @@ fn settings_with(extra: &str) -> Settings {
         "#
     ))
     .expect("should parse seam probe test settings")
+    // A loaded domain carries its policy.
+    .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
 }
 
 /// Builds this adapter's application state with the supplied builders
