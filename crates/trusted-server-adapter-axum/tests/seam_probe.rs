@@ -77,6 +77,8 @@ assume_single_jurisdiction = true
         "#
     ))
     .expect("should parse seam probe test settings")
+    // A loaded domain carries its policy.
+    .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
 }
 
 /// The probe's own section and table, selecting it with the country the geo
@@ -553,6 +555,8 @@ fn settings_selecting_module(extra: &str) -> Settings {
         "#
     ))
     .expect("should parse settings selecting a module-supplied module")
+    // A loaded domain carries its policy.
+    .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
 }
 
 // ---------------------------------------------------------------------------
@@ -806,5 +810,6 @@ fn stub_services() -> RuntimeServices {
         .http_client(Arc::new(UnavailableHttpClient))
         .geo(Arc::new(DisabledGeo))
         .client_info(ClientInfo::default())
+        .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
         .build()
 }

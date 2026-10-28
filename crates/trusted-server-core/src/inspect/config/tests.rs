@@ -5,7 +5,7 @@ use edgezero_core::blob_envelope::BlobEnvelope;
 use super::*;
 use crate::config_payload::settings_from_config_blob_with;
 use crate::integrations::{IntegrationBuilder, ModuleSecretSetting};
-use crate::platform::{PlatformError, PlatformSecretStore, StoreId, StoreName};
+use crate::platform::{PlatformError, PlatformSecretStore, PolicyOrigin, StoreId, StoreName};
 use crate::redacted::Redacted;
 use crate::secret_resolution::ResolvedSecrets;
 use crate::settings::{ProxyAssetRoute, RequestSigning};
@@ -70,6 +70,7 @@ fn load_with(
         &envelope,
         &CanaryStore,
         &StoreName::from("ts_secrets"),
+        PolicyOrigin::Blob,
         builders,
     )
 }
