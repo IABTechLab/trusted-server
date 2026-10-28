@@ -8,11 +8,12 @@
 //! server to server call sends, so it answers `401`. A license key has no
 //! such restriction and answers with only the properties the call names.
 //!
-//! Answers are held in the loading cache through [`crate::engine_cache`], each
-//! whole call being the load, so a question many requests ask at once is asked
-//! once. The evidence is the `User-Agent` and the `Sec-CH-UA` hints alone, so
-//! one answer serves every reader whose browser sends the same values.
-//! Failures are not held.
+//! Answers load through the loading cache in [`crate::engine_cache`], each
+//! whole call being the load, so where a deployment links a loading cache
+//! module a question many requests ask at once is asked once. A stock build
+//! links none, so there every call asks the service. The evidence is the
+//! `User-Agent` and the `Sec-CH-UA` hints alone, so one held answer serves
+//! every reader whose browser sends the same values. Failures are not held.
 
 use std::time::Duration;
 
@@ -99,8 +100,8 @@ const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 /// registers the properties it reads, so one call for a request carries them
 /// all.
 ///
-/// Each answer is held in the loading cache, so a question many requests ask
-/// at once is asked once.
+/// Each answer loads through the loading cache, so where a deployment links a
+/// loading cache module a question many requests ask at once is asked once.
 #[derive(Debug, Clone)]
 pub struct CloudPipeline {
     /// The base the data endpoint is under, being the configured endpoint
