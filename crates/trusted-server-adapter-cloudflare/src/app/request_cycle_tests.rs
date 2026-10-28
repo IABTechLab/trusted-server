@@ -386,6 +386,9 @@ fn settings_with(extra: &str) -> Settings {
         "#
     ))
     .expect("should parse the request cycle test settings")
+    // A loaded domain carries its policy, and these tests decide under the
+    // repository's sample.
+    .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
 }
 
 /// The router built through the composition root with `builders`, every
