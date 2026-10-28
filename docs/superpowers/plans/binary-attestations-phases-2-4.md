@@ -1,6 +1,6 @@
 # Binary attestations phases 2–4
 
-**Status:** Assignment approved with dependency-closure corrections on 2026-10-26. The Phase 2 source port and approved ordinary Fastly integration are complete in draft #1449, rehearsed at `770a425df4b28caaaef68dfd930bceabd9928046`. The original completion record was docs-only; the later main merge changes application inputs without changing release machinery and is not re-rehearsed. Qualification and the remaining Phase 3/4 design gates stay closed.
+**Status:** Phase 2 port and approved ordinary Fastly integration are complete in draft #1449. Its current baseline `8a797dbcb0467b867dfbcc571597110b9254d672` has green CI and is tree-equivalent to `08e1c33b8`; later application inputs remain unrehearsed, with `.13` exclusively at `770a425df4b28caaaef68dfd930bceabd9928046`. Phase 3 currently contains only [Gate 2 complete-SPDX](binary-attestations-phase3-complete-spdx.md) and [Gate 3 seven-artifact index](binary-attestations-phase3-seven-artifact-index.md) approval proposals. Phase 3 implementation, qualification and remaining design gates stay closed.
 
 **Goal:** Land the remaining reviewed source as three stacked, independently checked draft PRs while preserving the Phase 1 release contract.
 
@@ -8,7 +8,7 @@
 
 Frozen source: `122b78664b1235c717e9208fd200f9a9b0c335df` from #1262; source-map base: `f9281917a7260b723f5f22175911c6d2147ef650`. A fresh read of #1262 on 2026-10-26 confirmed that its published head is still the frozen source. Introducing and shaping SHAs remain recorded per group in [the slice map](binary-attestations-slice-map.json); they are provenance references, not safe whole-commit cherry-pick boundaries.
 
-Current Phase 1 base: `20152315c01dd5fddcfc84b969f8e9993b0bfc69`, docs-only evidence after rehearsal `.15` at `68eef902a8bddd9024676cc3806fa5377ed67fee`. Phase 2 `.13` stays attributed to `770a425df4b28caaaef68dfd930bceabd9928046`; the subsequent main merge is a no-release-machinery merge, with changed application inputs and no fresh Phase 2 rehearsal.
+Phase 1 review log was added at `c9a6117dd452d8a7f9786a14a000fc48d09315ec`, followed by the web merge of main `054c7b777` at `4940928e800fed00e4bddd8f3727fb52dcb2b296`. Its tree equals the already checked synthetic merge `52978c5b`; `.15` remains evidence only for `68eef902a8bddd9024676cc3806fa5377ed67fee`. Phase 2 carries the updated ancestry with no additional file changes. PRs retain ordinary branch-based stacking and merge-only history; the native stack wrapper was removed without changing PR bases or source history.
 
 | Draft PR                                                           | Branch                               | Base                                 | Intended capability                                      |
 | ------------------------------------------------------------------ | ------------------------------------ | ------------------------------------ | -------------------------------------------------------- |
