@@ -161,7 +161,7 @@ use trusted_server_device_fastly::FastlyHostSignals;
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
     FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo, FastlyPlatformHttpClient,
-    FastlyPlatformSecretStore, UnavailableKvStore,
+    FastlyPlatformSecretStore, FastlyPolicyEntries, UnavailableKvStore,
 };
 
 // ---------------------------------------------------------------------------
@@ -245,6 +245,12 @@ pub(crate) fn build_state(
 pub(crate) fn load_settings_from_config_store(
     stores: &RuntimeStoreConfig,
 ) -> Result<Settings, Report<TrustedServerError>> {
+    let entries = FastlyPolicyEntries::new(&FastlyPlatformConfigStore, &stores.config_store_name);
+    let policy_origin = if blob_carries_its_policy(&stores.config_key) {
+        PolicyOrigin::Blob
+    } else {
+        PolicyOrigin::Source(&entries)
+    };
     // The settings are validated as they load, so the stock builders and the
     // ones a deployment registered are supplied here as well as to the state
     // build. Without them a `[demand]` or `[ad-server]` name one of them
@@ -255,9 +261,17 @@ pub(crate) fn load_settings_from_config_store(
         &stores.config_store_name,
         &stores.config_key,
         &stores.secret_store_name,
-        PolicyOrigin::Blob,
+        policy_origin,
         &trusted_server_modules::builders_with(registered_integrations()),
     )
+}
+
+/// Whether the blob under `config_key` carries its policy file, which a blob
+/// at the logical store ID does, as `EdgeZero`'s push writes it. The keyed
+/// push writes every other key, and its blobs name a shared policy entry
+/// instead.
+fn blob_carries_its_policy(config_key: &str) -> bool {
+    config_key == DEFAULT_CONFIG_STORE_ID
 }
 
 /// Build the application state from explicit settings.
@@ -1716,11 +1730,11 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AppContext, AppState, AuctionDispatch, EcContext, EdgeCacheHeader, EidSyncSource,
-        HandlerFuture, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH,
-        RuntimeStoreConfig, TrustedServerApp, build_orchestrator_with_plan,
-        build_per_request_services, build_state_from_settings, handle_publisher_request,
-        publisher_response_into_streaming_response, startup_error_router,
+        AppContext, AppState, AuctionDispatch, DEFAULT_CONFIG_STORE_ID, EcContext, EdgeCacheHeader,
+        EidSyncSource, HandlerFuture, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH,
+        PAGE_BIDS_PATH, RuntimeStoreConfig, TrustedServerApp, blob_carries_its_policy,
+        build_orchestrator_with_plan, build_per_request_services, build_state_from_settings,
+        handle_publisher_request, publisher_response_into_streaming_response, startup_error_router,
     };
     use base64::Engine as _;
     use bytes::Bytes;
@@ -1886,6 +1900,15 @@ mod tests {
     fn test_router() -> RouterService {
         let state = build_state_from_settings(test_settings()).expect("should build test state");
         TrustedServerApp::routes_for_state(&state)
+    }
+
+    #[test]
+    fn only_the_blob_at_the_logical_store_id_carries_its_policy_file() {
+        assert!(blob_carries_its_policy(DEFAULT_CONFIG_STORE_ID));
+        assert!(
+            !blob_carries_its_policy("a.publisher.example"),
+            "a blob the keyed push wrote for a host names a shared entry"
+        );
     }
 
     #[test]
