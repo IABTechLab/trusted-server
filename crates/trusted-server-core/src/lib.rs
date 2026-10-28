@@ -28,6 +28,7 @@
     )
 )]
 
+pub mod asset_cache;
 pub(crate) mod asset_image_optimizer;
 pub mod attestation;
 pub mod auction;

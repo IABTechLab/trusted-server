@@ -37,6 +37,7 @@ use http::{HeaderValue, Method, Request, Response, StatusCode, Uri, header};
 use sha2::Digest as _;
 use web_time::Instant;
 
+use crate::asset_cache::{AssetAnswer, AssetFile, AssetVia, OriginRequest};
 use crate::auction::endpoints::{
     merge_auction_eids, resolve_auction_eids, resolve_client_auction_eids,
 };
@@ -3405,7 +3406,7 @@ pub async fn publisher_response_into_streaming_response(
 }
 
 /// Returns whether a request can render an HTML document context.
-fn is_html_document_request(req: &Request<EdgeBody>) -> bool {
+pub(crate) fn is_html_document_request(req: &Request<EdgeBody>) -> bool {
     if let Some(destination) = req
         .headers()
         .get("sec-fetch-dest")
@@ -5536,6 +5537,12 @@ pub async fn handle_publisher_request(
         });
     let mut template_cache_response_state = matches!(assembly_mode, AssemblyMode::Esi)
         .then_some(TemplateCacheResponseState::BypassRequest);
+    // What a selected asset cache module is told of the reader's request,
+    // read before the request is prepared for the origin. Only a `GET` is
+    // offered, being the one method a copy can answer.
+    let asset_file_url = (method_is_cacheable && services.asset_cache_module().is_some())
+        .then(|| target_uri.to_string());
+    let reader_carries_cookie = req.headers().contains_key(header::COOKIE);
     rewrite_origin_request(&mut req, target_uri, &origin_host_header)?;
 
     let request_method = req.method().clone();
@@ -5963,7 +5970,36 @@ pub async fn handle_publisher_request(
             request_is_document,
             &readthrough_reader_url,
         );
-        services.http_client().send(platform_request).await
+        // The asset cache module the deployment selects may answer for the
+        // file first. An origin request starts early only for a navigation,
+        // which is a document, so no file a module could answer is lost to it.
+        let answer = if let Some(module) = services.asset_cache_module()
+            && let Some(origin_url) = asset_file_url.as_deref()
+            && let Some(origin) = OriginRequest::of(&platform_request)
+        {
+            let origin_identity =
+                format!("{}\0{}", settings.publisher.origin_url, origin_host_header);
+            let file = AssetFile {
+                via: AssetVia::Publisher,
+                carries_authorization: authorization_disqualifies,
+                carries_cookie: reader_carries_cookie,
+                host: request_host,
+                scheme: request_scheme,
+                is_document: request_is_document,
+                asks_for_origin: request_requires_origin,
+                origin_url,
+                origin_identity: &origin_identity,
+                origin,
+            };
+            module.answer(services, file).await
+        } else {
+            AssetAnswer::AskOrigin
+        };
+        match answer {
+            AssetAnswer::Serve(response) => Ok(crate::platform::PlatformResponse::new(response)),
+            AssetAnswer::OriginFailed(report) => Err(report),
+            AssetAnswer::AskOrigin => services.http_client().send(platform_request).await,
+        }
     };
     let mut response = match origin_result {
         // The origin answered, so nothing in it describes this deployment,
@@ -7135,7 +7171,7 @@ pub(crate) enum TemplateCacheBypassReason {
     MalformedPolicyHeader,
 }
 
-fn request_bypasses_template_cache(headers: &edgezero_core::http::HeaderMap) -> bool {
+pub(crate) fn request_bypasses_template_cache(headers: &edgezero_core::http::HeaderMap) -> bool {
     const CONDITIONAL_OR_PARTIAL: &[&str] = &[
         "range",
         "if-range",
@@ -8266,6 +8302,8 @@ mod tests {
     /// The files the publisher's origin sends that are not pages.
     mod origin_file_tests {
         use super::*;
+        use crate::asset_cache::AssetVia;
+        use crate::asset_cache::test_support::{Offered, TestAssetCache};
         use crate::platform::test_support::{
             MemoryLoadingCache, StubHttpClient, build_services_with_http_client,
         };
@@ -8389,6 +8427,354 @@ mod tests {
                 2,
                 "two requests for a file the origin lets be kept are two origin requests"
             );
+        }
+
+        fn services_with(
+            stub: &Arc<StubHttpClient>,
+            module: &Arc<TestAssetCache>,
+        ) -> RuntimeServices {
+            services(stub).with_asset_cache_module(Arc::clone(module) as _)
+        }
+
+        /// A stylesheet that names the publisher's origin, which the page
+        /// path rewrites to the host the reader asked.
+        fn stylesheet_naming_the_origin() -> Response<EdgeBody> {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/css")
+                .body(EdgeBody::from(
+                    "a{background:url(https://origin.test-publisher.com/a.png)}",
+                ))
+                .expect("should build the stylesheet")
+        }
+
+        #[tokio::test]
+        async fn a_module_serving_a_file_stops_the_origin_being_asked() {
+            let stub = Arc::new(StubHttpClient::new());
+            let module = TestAssetCache::serving(stylesheet_naming_the_origin);
+            let services = services_with(&stub, &module);
+
+            let response = run(&settings(), &services, file_request("/site.css", "style")).await;
+            let body = String::from_utf8(body_of(response).await).expect("should be text");
+
+            assert!(
+                stub.recorded_request_uris().is_empty(),
+                "the module's answer takes the place of the origin's"
+            );
+            assert_eq!(module.offered().len(), 1, "the file is offered once");
+            assert!(
+                body.contains("ts.example.com/a.png")
+                    && !body.contains("origin.test-publisher.com"),
+                "the answer is processed as an origin response is: {body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_module_passing_a_file_back_leaves_one_origin_request() {
+            let stub = Arc::new(StubHttpClient::new());
+            let module = TestAssetCache::asking_the_origin();
+            let services = services_with(&stub, &module);
+            queue(&stub, "text/css", b"body{}");
+
+            let response = run(&settings(), &services, file_request("/site.css", "style")).await;
+
+            assert_eq!(body_of(response).await, b"body{}");
+            assert_eq!(module.offered().len(), 1, "the file is offered once");
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "core asks the origin once, as with no module"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_module_that_cannot_reach_the_origin_is_answered_as_a_failed_origin_request() {
+            use crate::error::IntoHttpResponse as _;
+
+            let stub = Arc::new(StubHttpClient::new());
+            let module = TestAssetCache::failing_to_reach_the_origin();
+            let services = services_with(&stub, &module);
+
+            let Err(error) =
+                try_run(&settings(), &services, file_request("/site.css", "style")).await
+            else {
+                panic!("should fail as a failed origin request does");
+            };
+
+            assert_eq!(
+                error.current_context().status_code(),
+                StatusCode::BAD_GATEWAY
+            );
+            assert!(
+                format!("{error:?}").contains("Failed to proxy request to origin"),
+                "{error:?}"
+            );
+            assert!(
+                stub.recorded_request_uris().is_empty(),
+                "the origin is not asked a second time"
+            );
+        }
+
+        /// What the module was offered for `request`, which core then sends
+        /// to the origin.
+        async fn offered_for(request: Request<EdgeBody>) -> Offered {
+            let stub = Arc::new(StubHttpClient::new());
+            let module = TestAssetCache::asking_the_origin();
+            queue(&stub, "text/css", b"body{}");
+            let response = run(&settings(), &services_with(&stub, &module), request).await;
+            let _ = body_of(response).await;
+            let mut offered = module.offered();
+            assert_eq!(offered.len(), 1, "the file is offered once");
+            offered.remove(0)
+        }
+
+        #[tokio::test]
+        async fn the_module_is_told_what_core_knows_of_the_readers_request() {
+            let plain = offered_for(file_request("/site.css?v=2", "style")).await;
+            assert_eq!(plain.via, AssetVia::Publisher);
+            assert!(!plain.carries_authorization && !plain.carries_cookie);
+            assert!(!plain.is_document && !plain.asks_for_origin);
+            assert_eq!(plain.host, "ts.example.com");
+            assert_eq!(
+                plain.origin_url,
+                "https://origin.test-publisher.com/site.css?v=2"
+            );
+            assert_eq!(
+                plain.origin_identity,
+                "https://origin.test-publisher.com\0origin.test-publisher.com"
+            );
+            assert_eq!(
+                plain.origin.uri().to_string(),
+                plain.origin_url,
+                "the origin request asks for the file's URL"
+            );
+
+            let with = |name: header::HeaderName, value: &'static str| {
+                let mut request = file_request("/site.css", "style");
+                request
+                    .headers_mut()
+                    .insert(name, HeaderValue::from_static(value));
+                request
+            };
+            assert!(
+                offered_for(with(header::COOKIE, "session=1"))
+                    .await
+                    .carries_cookie
+            );
+            assert!(
+                offered_for(with(header::AUTHORIZATION, "Bearer reader"))
+                    .await
+                    .carries_authorization
+            );
+            assert!(
+                offered_for(with(header::RANGE, "bytes=0-3"))
+                    .await
+                    .asks_for_origin
+            );
+
+            let mut navigation = file_request("/page", "document");
+            navigation
+                .headers_mut()
+                .insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
+            assert!(offered_for(navigation).await.is_document);
+
+            let mut with_state = file_request("/site.css", "style");
+            IntegrationRequestState::insert(&mut with_state, "a_module", ());
+            assert!(
+                offered_for(with_state).await.asks_for_origin,
+                "state a module left keeps the file to the origin"
+            );
+
+            let mut personalized = file_request("/site.css", "style");
+            personalized
+                .extensions_mut()
+                .insert(crate::response_privacy::PersonalizedResponse);
+            assert!(
+                offered_for(personalized).await.asks_for_origin,
+                "a response an integration marked personalized is the origin's"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_head_request_is_not_offered() {
+            let stub = Arc::new(StubHttpClient::new());
+            let module = TestAssetCache::asking_the_origin();
+            queue(&stub, "text/css", b"body{}");
+            let mut request = file_request("/site.css", "style");
+            *request.method_mut() = Method::HEAD;
+
+            let _ = try_run(&settings(), &services_with(&stub, &module), request).await;
+
+            assert!(module.offered().is_empty(), "only a `GET` is offered");
+            assert_eq!(stub.recorded_request_uris().len(), 1);
+        }
+
+        /// Settings that let a shareable page be held by the platform's
+        /// readthrough cache, so the origin request carries a cache intent of
+        /// its own.
+        fn readthrough_settings() -> Arc<Settings> {
+            let toml = format!(
+                "{}\n[creative_opportunities]\ngam_network_id = \"99999\"\n\
+                 origin_readthrough_enabled = true\n",
+                crate::test_support::tests::crate_test_settings_str()
+            );
+            let mut settings =
+                Settings::from_toml(&toml).expect("should parse the readthrough settings");
+            // Mirrors `create_test_settings`, without which the registry is
+            // not built.
+            settings.proxy.allowed_domains =
+                vec!["*.example".to_string(), "*.example.com".to_string()];
+            Arc::new(settings)
+        }
+
+        #[tokio::test]
+        async fn the_origin_request_a_module_is_handed_is_the_one_core_sends_with_no_module() {
+            let settings = readthrough_settings();
+            let navigation = || {
+                let mut request = file_request("/page?edition=2", "document");
+                request
+                    .headers_mut()
+                    .insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
+                request
+                    .headers_mut()
+                    .insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-GB"));
+                request
+            };
+            let page = b"<html><head></head><body>page</body></html>";
+            for streaming in [false, true] {
+                let stub = Arc::new(StubHttpClient::new());
+                stub.set_streaming_responses_supported(streaming);
+                let module = TestAssetCache::asking_the_origin();
+                for _ in 0..2 {
+                    queue(&stub, "text/html", page);
+                }
+
+                let _ = body_of(run(&settings, &services(&stub), navigation()).await).await;
+                let services = services_with(&stub, &module);
+                let _ = body_of(run(&settings, &services, navigation()).await).await;
+
+                let handed = module.offered().remove(0).origin.platform_request();
+                let headers = |request: &PlatformHttpRequest| -> Vec<(String, String)> {
+                    request
+                        .request
+                        .headers()
+                        .iter()
+                        .map(|(name, value)| {
+                            let value = value.to_str().expect("should be text").to_owned();
+                            (name.as_str().to_owned(), value)
+                        })
+                        .collect()
+                };
+                assert_eq!(handed.request.method(), Method::GET);
+                assert_eq!(
+                    handed.request.uri().to_string(),
+                    stub.recorded_request_uris()[0]
+                );
+                assert_eq!(headers(&handed), stub.recorded_request_headers()[0]);
+                assert_eq!(handed.backend_name, stub.recorded_backend_names()[0]);
+                assert_eq!(handed.cache_intent, stub.recorded_cache_intents()[0]);
+                assert!(
+                    matches!(handed.cache_intent, PlatformCacheIntent::Shared { .. }),
+                    "a shareable page is asked for through the readthrough cache"
+                );
+                assert_eq!(
+                    handed.stream_response,
+                    stub.recorded_stream_response_flags()[0]
+                );
+                assert_eq!(handed.stream_response, streaming);
+                assert_eq!(
+                    stub.recorded_request_uris()[1],
+                    stub.recorded_request_uris()[0],
+                    "core sends the same request once the module passes the file back"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_get_that_describes_a_body_is_not_offered() {
+            for (name, value) in [
+                (header::CONTENT_LENGTH, "4"),
+                (header::TRANSFER_ENCODING, "chunked"),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                let module = TestAssetCache::asking_the_origin();
+                queue(&stub, "text/css", b"body{}");
+                let mut request = file_request("/site.css", "style");
+                request
+                    .headers_mut()
+                    .insert(name.clone(), HeaderValue::from_static(value));
+
+                let _ = try_run(&settings(), &services_with(&stub, &module), request).await;
+
+                assert!(
+                    module.offered().is_empty(),
+                    "a request carrying {name} is not offered, because a module's load \
+                     sends it with no body"
+                );
+                assert_eq!(stub.recorded_request_uris().len(), 1, "{name}");
+            }
+        }
+
+        /// A `GET` of `path` carrying the reader's validators and range.
+        fn request_with_validators_and_range(path: &str) -> Request<EdgeBody> {
+            let mut request = file_request(path, "empty");
+            for (name, value) in VALIDATORS_AND_RANGE {
+                request.headers_mut().insert(
+                    header::HeaderName::from_static(name),
+                    HeaderValue::from_static(value),
+                );
+            }
+            request
+        }
+
+        /// What the module was offered for `request` under `settings`.
+        async fn offered_under(settings: Settings, request: Request<EdgeBody>) -> Offered {
+            let stub = Arc::new(StubHttpClient::new());
+            let module = TestAssetCache::asking_the_origin();
+            queue(&stub, "text/plain", b"User-agent: *\nAllow: /\n");
+            let settings = Arc::new(settings);
+            let _ = try_run(&settings, &services_with(&stub, &module), request).await;
+            let mut offered = module.offered();
+            assert_eq!(offered.len(), 1, "the file is offered once");
+            offered.remove(0)
+        }
+
+        #[tokio::test]
+        async fn asks_for_origin_describes_the_request_after_its_range_is_removed() {
+            // The robots.txt middleware needs the whole file, so core removes
+            // the reader's validators and range before it asks the origin.
+            let whole = offered_under(
+                settings_refusing_every_crawler(),
+                request_with_validators_and_range(crate::robots_txt::ROBOTS_TXT_PATH),
+            )
+            .await;
+            let ranged = offered_under(
+                settings_refusing_every_crawler(),
+                request_with_validators_and_range("/humans.txt"),
+            )
+            .await;
+
+            assert!(
+                !whole.asks_for_origin && !whole.origin.headers().contains_key(header::RANGE),
+                "the origin will be asked for the whole file"
+            );
+            assert!(
+                ranged.asks_for_origin && ranged.origin.headers().contains_key(header::RANGE),
+                "a range no middleware removes asks for the origin"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_module_is_told_the_scheme_the_reader_asked_over() {
+            let plain = offered_for(file_request("/site.css", "style")).await;
+            let mut forwarded = file_request("/site.css", "style");
+            forwarded
+                .headers_mut()
+                .insert("x-forwarded-proto", HeaderValue::from_static("https"));
+            let forwarded = offered_for(forwarded).await;
+
+            assert_eq!(plain.scheme, "http", "no TLS and no forwarded scheme");
+            assert_eq!(forwarded.scheme, "https");
         }
     }
 
