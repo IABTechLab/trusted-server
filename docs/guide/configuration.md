@@ -1926,7 +1926,10 @@ The modules this repository ships supply the middleware below. A deployment
 that runs several of them names them all in one entry's list, because a page
 takes one entry, and the order written is the order they run in. The table
 is in the order the modules register, which is the order `ts audit` writes
-the names in and the order `trusted-server.example.toml` shows them in.
+the names in and the order `trusted-server.example.toml` shows them in. A
+consent management platform's middleware runs in either phase, as the
+publisher chooses, and is listed under `[[fetch]]`, which is the phase a
+generated configuration places it in.
 
 | Middleware                    | Phase       | What it changes                                                                                                                                                                                                   |
 | ----------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -2028,9 +2031,13 @@ See [Didomi](/guide/integrations/didomi) for the routed endpoint shapes.
 | `cmp_id`     | Number | `10`     | The IAB registered CMP identifier, from 1 to 4095, that the GPP stub answers `ping` with while the prompt loads |
 
 The table refuses a field it does not read. Selecting the module is refused
-when the `[[fetch]]` entries leave any page without `cmp.inmobi`, because the
-prompt would not be written there, and each entry names it before any
-middleware that writes a vendor's tag. See [InMobi Choice](/guide/integrations/inmobi)
+when the `[[fetch]]` and `[[serve]]` entries leave any page without
+`cmp.inmobi`, because the prompt would not be written there, and each entry
+names it before any middleware that writes a vendor's tag. A `[[serve]]` entry
+naming it for a page whose `[[fetch]]` entry names another middleware is
+refused, because a serve middleware's head markup is written after what each
+fetch middleware writes ahead of the script bundle, and so is naming it for one
+page in both phases, which would write it twice. See [InMobi Choice](/guide/integrations/inmobi)
 for the tag's parts and what the module keeps to.
 
 ### Google Tag Manager Integration

@@ -10,8 +10,8 @@
 
 InMobi Choice is a TCF consent prompt loaded from the publisher's own InMobi
 account. The module writes the prompt's tag into the head of each page a
-`[[fetch]]` entry for `text/html` names it for, in three parts and in this
-order:
+`[[fetch]]` or `[[serve]]` entry for `text/html` names it for, in three parts
+and in this order:
 
 1. The IAB TCF v2 stub, which creates the `__tcfapiLocator` frame, queues
    every `__tcfapi` call made before the prompt arrives, answers `ping` as a
@@ -57,19 +57,29 @@ The table refuses a field it does not read.
 
 ## Placing the prompt
 
-The prompt changes a page only where a `[[fetch]]` entry names `cmp.inmobi`,
-in the fetch phase alone, because the tag is the same for every reader and
-belongs in the page every reader is served from. Core writes each
+The prompt changes a page only where a `[[fetch]]` or `[[serve]]` entry
+names `cmp.inmobi`, in the phase the publisher chooses. The tag is the same
+for every reader, so the fetch phase stores it in the page every reader is
+served from, which is what `ts audit generate` writes, and the serve phase
+writes it on each reader's copy instead. Core writes each
 middleware's head markup in the order the entry names them, and nothing
 advertising related may run before the reader answers the prompt, so name
 `cmp.inmobi` before any middleware that writes a vendor's tag, as the example
-above does ahead of Google Tag Manager.
+above does ahead of Google Tag Manager. A serve middleware's head markup is
+written after what each fetch middleware writes ahead of the script bundle,
+and the module cannot tell which middleware write a vendor's tag there, so a
+`[[serve]]` entry may name the prompt only for pages whose `[[fetch]]` entry
+names no other middleware.
 
 Selecting the module is refused when the settings load and by `ts config
 validate` if the entries leave any page served as `text/html` without the
-prompt, and the refusal names those pages. A page takes the first entry that
-covers it, so every entry names `cmp.inmobi`, and one with no `path` comes
-after any that has one.
+prompt, and the refusal names those pages. A page takes the first entry of
+each phase that covers it, so each page has to take an entry of one phase or
+the other that names `cmp.inmobi`. With the prompt in `[[fetch]]` alone,
+every entry names it, and one with no `path` comes after any that has one. A
+`[[serve]]` entry naming it for a page whose `[[fetch]]` entry names another
+middleware is refused too, and so is naming it for one page in both phases,
+which would write it twice.
 
 The tag is written at the start of the head, ahead of the page's own
 `<meta charset>`, and is about 3.6 KB. A browser looks for `<meta charset>`
@@ -95,7 +105,7 @@ reader is asked before anything else runs. This module keeps to the
 following, and they are what every `[cmp]` module is held to.
 
 1. The prompt is written before any vendor's tag, and the entry's order is
-   the head's order.
+   the head's order. Which phase it is written in is the publisher's choice.
 2. The IAB interfaces a page may call before the prompt arrives, `__tcfapi`
    and `__gpp`, are stubbed ahead of the loader and queue or answer every
    call, and a stub steps aside where the page already has the interface.
