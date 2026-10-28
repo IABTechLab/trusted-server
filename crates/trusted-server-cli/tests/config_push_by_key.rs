@@ -1,6 +1,7 @@
 //! A Fastly push under a key other than the logical store ID, which `ts`
 //! writes itself because `EdgeZero` writes no such key.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
@@ -30,6 +31,21 @@ const POLICY_FILE: &str = "sample.yaml";
 /// The repository's sample, which the project's app config names.
 const POLICY_TEXT: &str = include_str!("../../../config/permissions/sample.yaml");
 
+/// A small valid policy whose digest no other test uses, given a `group` no
+/// other test passes, so no earlier read-back in the process holds its rules
+/// and a read-back has to read the file from its shared entry.
+fn policy_only_this_test_loads(group: &str) -> String {
+    format!(
+        "groups:
+  {group}:
+    default: requires_signal
+rules:
+  group: {group}
+  jurisdiction: unknown
+"
+    )
+}
+
 /// A project holding the repository's manifests, with only the Fastly
 /// adapter declared, the example app config naming the repository's sample
 /// policy, and that policy's file.
@@ -44,6 +60,13 @@ fn project() -> TempDir {
     .expect("should name the policy");
     fs::write(directory.path().join(POLICY_FILE), POLICY_TEXT)
         .expect("should write the policy file");
+    directory
+}
+
+/// A project as [`project`] makes, with its policy file holding `policy`.
+fn project_with_policy(policy: &str) -> TempDir {
+    let directory = project();
+    fs::write(directory.path().join(POLICY_FILE), policy).expect("should write the policy file");
     directory
 }
 
@@ -219,12 +242,19 @@ impl PlatformSecretStore for FixedSecretStore {
     }
 }
 
+thread_local! {
+    /// The policy file reads [`SharedPolicyEntries`] has answered on this
+    /// thread, which runs one test at a time.
+    static POLICY_READS: Cell<usize> = const { Cell::new(0) };
+}
+
 /// Reads a host's policy file from its shared entry, as the Fastly adapter
 /// does, chunks included.
 struct SharedPolicyEntries<'a>(&'a MemoryConfigStore);
 
 impl PlatformPolicySource for SharedPolicyEntries<'_> {
     fn policy_text(&self, reference: &PolicyReference) -> Result<String, Report<PlatformError>> {
+        POLICY_READS.with(|reads| reads.set(reads.get() + 1));
         let store_name = StoreName::from(DEFAULT_CONFIG_STORE_ID);
         let value = self.0.get(&store_name, &policy_key(&reference.sha256))?;
         policy_entry_text(&value)
@@ -255,9 +285,21 @@ fn read_back(
     )
 }
 
+/// Reads the blob at `key` back as [`read_back`] does, and returns the result
+/// with the number of times a shared policy entry was read, which is none
+/// when the process already holds the rules of the digest the blob pins.
+fn read_back_counting_reads(
+    entries: &[(String, String)],
+    key: &str,
+) -> (Result<Settings, Report<TrustedServerError>>, usize) {
+    let before = POLICY_READS.with(Cell::get);
+    let settings = read_back(entries, key);
+    (settings, POLICY_READS.with(Cell::get) - before)
+}
+
 #[test]
 fn a_local_push_of_a_host_key_writes_the_local_store() {
-    let project = project();
+    let project = project_with_policy(&policy_only_this_test_loads("host-key"));
 
     let output = push(
         &project,
@@ -266,7 +308,12 @@ fn a_local_push_of_a_host_key_writes_the_local_store() {
 
     assert_success(&output);
     let entries = stored_entries(&project);
-    let settings = read_back(&entries, HOST).expect("should read the host's blob back");
+    let (settings, reads) = read_back_counting_reads(&entries, HOST);
+    let settings = settings.expect("should read the host's blob back");
+    assert_eq!(
+        reads, 1,
+        "the read-back should read the policy file from its shared entry"
+    );
     assert_eq!(
         settings.publisher.domain, HOST,
         "should store the pushed app config"
@@ -305,7 +352,7 @@ fn a_local_push_of_a_host_key_writes_the_local_store() {
 
 #[test]
 fn a_long_document_is_written_as_chunks_then_a_pointer() {
-    let project = project();
+    let project = project_with_policy(&policy_only_this_test_loads("chunked-blob"));
     lengthen_app_config(&project);
     let before = fs::read_to_string(fastly_toml(&project)).expect("should read the manifest");
 
@@ -405,8 +452,9 @@ fn a_key_whose_chunk_keys_are_too_long_is_refused_before_writing() {
 /// once however many hosts name it.
 #[test]
 fn two_hosts_naming_one_policy_file_keep_it_once() {
-    let project = project();
-    let policy_entry = policy_key(&policy_sha256(POLICY_TEXT));
+    let policy_text = policy_only_this_test_loads("two-hosts");
+    let project = project_with_policy(&policy_text);
+    let policy_entry = policy_key(&policy_sha256(&policy_text));
 
     assert_success(&push(
         &project,
@@ -453,11 +501,18 @@ fn two_hosts_naming_one_policy_file_keep_it_once() {
         pointer_at < blob_at,
         "the policy entry should be written before the blob that names it"
     );
-    for host in [HOST, OTHER_HOST] {
-        let settings = read_back(&entries, host).expect("each host's blob should load");
+    // The first host's read-back reads the shared entry, and the second
+    // host's is answered by the rules the first one loaded.
+    for (host, expected_reads) in [(HOST, 1), (OTHER_HOST, 0)] {
+        let (settings, reads) = read_back_counting_reads(&entries, host);
+        let settings = settings.expect("each host's blob should load");
+        assert_eq!(
+            reads, expected_reads,
+            "only the first host's read-back should read the shared entry"
+        );
         assert_eq!(
             settings.permission_policy().map(|policy| policy.sha256()),
-            Some(policy_sha256(POLICY_TEXT).as_str()),
+            Some(policy_sha256(&policy_text).as_str()),
             "{host} should run the file both pushes supplied"
         );
     }
