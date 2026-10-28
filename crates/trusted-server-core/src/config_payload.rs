@@ -428,12 +428,126 @@ mod tests {
     }
 
     #[test]
+    fn legacy_blob_without_rewrite_creatives_preserves_rewriting() {
+        let (data, store) = fixture();
+        let auction = data
+            .get("auction")
+            .and_then(serde_json::Value::as_object)
+            .expect("should serialize auction settings as an object");
+        assert!(
+            !auction.contains_key("rewrite_creatives"),
+            "should omit the default rewrite setting from the payload"
+        );
+        let reconstructed =
+            settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
+                .expect("should reconstruct legacy settings");
+
+        assert!(
+            reconstructed.auction.rewrite_creatives,
+            "should enable creative rewriting for legacy blobs"
+        );
+    }
+
+    #[test]
+    fn disabled_rewrite_creatives_survives_blob_round_trip() {
+        let (mut data, store) = fixture();
+        data["auction"]["rewrite_creatives"] = serde_json::json!(false);
+
+        let reconstructed =
+            settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
+                .expect("should reconstruct disabled rewriting");
+
+        assert!(
+            !reconstructed.auction.rewrite_creatives,
+            "should preserve the explicit rewrite opt-out"
+        );
+    }
+
+    #[test]
+    fn legacy_blob_without_rewrite_clicks_follows_rewrite_creatives() {
+        for rewrite_creatives in [true, false] {
+            let (mut data, store) = fixture();
+            data["auction"]["rewrite_creatives"] = serde_json::json!(rewrite_creatives);
+            assert!(
+                data["auction"].get("rewrite_clicks").is_none(),
+                "should omit unset rewrite_clicks from the payload"
+            );
+
+            let reconstructed =
+                settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
+                    .expect("should reconstruct settings without rewrite_clicks");
+
+            assert_eq!(
+                reconstructed.auction.rewrite_clicks, None,
+                "should load a blob without rewrite_clicks as unset"
+            );
+            assert_eq!(
+                reconstructed.auction.rewrites_auction_clicks(),
+                rewrite_creatives,
+                "should follow rewrite_creatives = {rewrite_creatives} when unset"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_rewrite_clicks_survives_blob_round_trip() {
+        for (rewrite_creatives, rewrite_clicks) in [(true, false), (false, true)] {
+            let (mut data, store) = fixture();
+            data["auction"]["rewrite_creatives"] = serde_json::json!(rewrite_creatives);
+            data["auction"]["rewrite_clicks"] = serde_json::json!(rewrite_clicks);
+
+            let reconstructed =
+                settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
+                    .expect("should reconstruct explicit rewrite_clicks");
+
+            assert_eq!(
+                reconstructed.auction.rewrite_clicks,
+                Some(rewrite_clicks),
+                "should preserve rewrite_clicks = {rewrite_clicks} with rewrite_creatives = {rewrite_creatives}"
+            );
+        }
+    }
+
+    #[test]
+    fn strings_that_look_like_json_scalars_load_as_native_strings() {
+        let (data, mut store) = fixture();
+        let config: TrustedServerAppConfig =
+            serde_json::from_value(data.clone()).expect("should parse feature fixture");
+        for entry in compile_bindings(config.settings())
+            .expect("should compile fixture")
+            .entries()
+        {
+            let value = if entry.scope() == "handler" {
+                "true"
+            } else {
+                "12345678901234567890123456789012"
+            };
+            store
+                .values
+                .insert(entry.key().to_owned(), value.as_bytes().to_vec());
+        }
+        let loaded =
+            settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
+                .expect("should load scalar-looking native credentials");
+        assert_eq!(
+            loaded.publisher.proxy_secret.expose(),
+            "12345678901234567890123456789012"
+        );
+        assert_eq!(
+            loaded.ec.passphrase.expose(),
+            "12345678901234567890123456789012"
+        );
+        assert_eq!(loaded.handlers[0].password.expose(), "true");
+    }
+
+    #[test]
     fn implicit_bindings_publish_one_nonserializable_snapshot() {
         let (data, store) = fixture();
         let before = data.clone();
         let loaded =
             settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
                 .expect("should load implicit native bindings");
+
         assert_eq!(
             loaded.publisher.proxy_secret.expose(),
             "fictional-proxy-credential-0123456789"

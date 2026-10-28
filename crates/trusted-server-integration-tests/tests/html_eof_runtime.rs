@@ -271,6 +271,9 @@ impl<'a> Harness<'a> {
         let envelope = value["trusted_server_config"]
             .as_str()
             .ok_or_else(|| Report::new(HarnessError::Configuration))?;
+        let source = fs::read_to_string(self.workspace.join("trusted-server.toml"))
+            .change_context(HarnessError::Io)?;
+        let fixtures = config::native_fixtures(&source, adapter)?;
         match adapter {
             "axum" => {
                 command = self.command(artifact);
@@ -278,14 +281,8 @@ impl<'a> Harness<'a> {
                     "TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG",
                     envelope,
                 );
-                for (key, value) in config::SECRETS {
-                    command.env(
-                        format!(
-                            "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_{}",
-                            key.to_uppercase()
-                        ),
-                        value,
-                    );
+                for fixture in &fixtures {
+                    command.env(&fixture.native.native_name, &fixture.value);
                 }
             }
             "cloudflare" => {
@@ -309,8 +306,11 @@ impl<'a> Harness<'a> {
                 let vars = manifest["vars"]
                     .as_table_mut()
                     .ok_or_else(|| Report::new(HarnessError::Configuration))?;
-                for (key, value) in config::SECRETS {
-                    vars.insert((*key).to_owned(), toml::Value::String((*value).to_owned()));
+                for fixture in &fixtures {
+                    vars.insert(
+                        fixture.native.native_name.clone(),
+                        toml::Value::String(fixture.value.clone()),
+                    );
                 }
                 fs::write(
                     self.workspace.join("wrangler.toml"),
@@ -335,12 +335,18 @@ impl<'a> Harness<'a> {
                     &fs::read_to_string(self.workspace.join("fastly.toml"))
                         .change_context(HarnessError::Io)?,
                 )?;
-                let secrets: Vec<_> = config::SECRETS
+                let secrets: Vec<_> = fixtures
                     .iter()
-                    .map(|(key, value)| {
+                    .map(|fixture| {
                         let mut entry = toml::map::Map::new();
-                        entry.insert("key".to_owned(), toml::Value::String((*key).to_owned()));
-                        entry.insert("data".to_owned(), toml::Value::String((*value).to_owned()));
+                        entry.insert(
+                            "key".to_owned(),
+                            toml::Value::String(fixture.native.native_name.clone()),
+                        );
+                        entry.insert(
+                            "data".to_owned(),
+                            toml::Value::String(fixture.value.clone()),
+                        );
                         toml::Value::Table(entry)
                     })
                     .collect();
@@ -366,6 +372,14 @@ impl<'a> Harness<'a> {
                     .arg(artifact);
             }
             "spin" => {
+                let manifest_path = self.workspace.join("spin.toml");
+                let template =
+                    fs::read_to_string(&manifest_path).change_context(HarnessError::Io)?;
+                fs::write(
+                    &manifest_path,
+                    config::spin_fixture_manifest(&template, &fixtures)?,
+                )
+                .change_context(HarnessError::Io)?;
                 command = self.command("spin");
                 command
                     .args(["up", "--from"])
@@ -376,11 +390,10 @@ impl<'a> Harness<'a> {
                     .arg(self.workspace.join("spin-cache"))
                     .arg("--log-dir")
                     .arg(self.workspace.join("spin-logs"));
-                for (key, value) in config::SECRETS {
-                    command.arg("--variable").arg(format!(
-                        "v_trusted_x5fserver_x5fsecrets_v_{}={value}",
-                        key.replace('_', "_x5f")
-                    ));
+                for fixture in &fixtures {
+                    command
+                        .arg("--variable")
+                        .arg(format!("{}={}", fixture.native.native_name, fixture.value));
                 }
             }
             _ => {

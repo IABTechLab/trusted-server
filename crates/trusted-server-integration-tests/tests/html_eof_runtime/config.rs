@@ -2,17 +2,45 @@ use std::path::Path;
 
 use error_stack::{Report, ResultExt as _};
 use toml::Value;
+use trusted_server_core::config::TrustedServerAppConfig;
+use trusted_server_integration_tests::NativeFixture;
 
 use super::{HarnessError, HarnessResult};
 
-pub(super) const SECRETS: &[(&str, &str)] = &[
-    ("handler_password", "example-handler-password-32-bytes-ok"),
-    (
-        "publisher_proxy_secret",
-        "example-publisher-secret-32-bytes-ok",
-    ),
-    ("ec_passphrase", "example-cookie-passphrase-32-bytes-ok"),
-];
+/// Compile each case's exact context; publisher and route changes alter native identities.
+pub(super) fn native_fixtures(source: &str, adapter: &str) -> HarnessResult<Vec<NativeFixture>> {
+    let config: TrustedServerAppConfig =
+        toml::from_str(source).change_context(HarnessError::Configuration)?;
+    trusted_server_integration_tests::native_fixtures(config.settings(), adapter)
+        .map_err(|_| Report::new(HarnessError::Configuration))
+}
+
+pub(super) fn spin_fixture_manifest(
+    template: &str,
+    fixtures: &[NativeFixture],
+) -> HarnessResult<String> {
+    let mut manifest = parse(template)?;
+    let mut variables = toml::map::Map::new();
+    let mut component_variables = toml::map::Map::new();
+    for fixture in fixtures {
+        for declaration in &fixture.native.declarations {
+            let declaration = parse(declaration)?;
+            if let Some(entries) = declaration.get("variables").and_then(Value::as_table) {
+                variables.extend(entries.clone());
+            } else {
+                let entries = declaration["component"]["trusted-server"]["variables"]
+                    .as_table()
+                    .ok_or_else(|| invalid("component.trusted-server.variables"))?;
+                component_variables.extend(entries.clone());
+            }
+        }
+    }
+    // The isolated template's variable tables contain only app credential bindings.
+    // Replace them on every case so no previous context remains required.
+    manifest["variables"] = Value::Table(variables);
+    manifest["component"]["trusted-server"]["variables"] = Value::Table(component_variables);
+    serialize(&manifest)
+}
 
 fn invalid(field: &str) -> Report<HarnessError> {
     Report::new(HarnessError::Configuration)
@@ -269,6 +297,75 @@ mod tests {
                 Some(750),
                 "should configure the fixture budget"
             );
+        }
+    }
+
+    #[test]
+    fn every_case_provisions_its_compiled_native_bindings_on_every_adapter() {
+        for case in ["disabled", "success", "hung", "auction", "streaming"] {
+            let source = fixture_config(CONFIG, case, 12345, 12346)
+                .expect("should generate the exact case context");
+            let config: TrustedServerAppConfig =
+                toml::from_str(&source).expect("should parse feature-only config");
+            let plan = trusted_server_core::secret_bindings::compile_bindings(config.settings())
+                .expect("should compile the runtime's required bindings");
+            for adapter in ["axum", "fastly", "cloudflare", "spin"] {
+                let fixtures = native_fixtures(&source, adapter)
+                    .expect("should provision generated native identities");
+                assert_eq!(fixtures.len(), plan.entries().len());
+                for entry in plan.entries() {
+                    let fixture = fixtures
+                        .iter()
+                        .find(|fixture| fixture.native.key == entry.key())
+                        .expect("should provision every required runtime lookup");
+                    assert_eq!(
+                        fixture.native,
+                        trusted_server_core::secret_bindings::render_native(
+                            adapter,
+                            trusted_server_core::secret_bindings::SECRET_STORE_ID,
+                            entry.key(),
+                        )
+                        .expect("should render the exact native identity")
+                    );
+                    assert!(fixture.native.key.starts_with("ts1_"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spin_manifest_replaces_previous_context_declarations_without_values() {
+        let mut manifest =
+            include_str!("../../../trusted-server-adapter-spin/spin.toml").to_owned();
+        for origin in [12345, 12347] {
+            let source = fixture_config(CONFIG, "success", origin, 12346)
+                .expect("should generate the current context");
+            let fixtures =
+                native_fixtures(&source, "spin").expect("should compile current Spin declarations");
+            manifest = spin_fixture_manifest(&manifest, &fixtures)
+                .expect("should replace isolated app variable declarations");
+            let parsed = parse(&manifest).expect("should parse generated Spin manifest");
+            let variables = parsed["variables"]
+                .as_table()
+                .expect("should declare variables");
+            let component = parsed["component"]["trusted-server"]["variables"]
+                .as_table()
+                .expect("should map component variables");
+            assert_eq!(variables.len(), fixtures.len());
+            assert_eq!(component.len(), fixtures.len());
+            for fixture in &fixtures {
+                let name = &fixture.native.native_name;
+                assert_eq!(variables[name]["required"].as_bool(), Some(true));
+                assert_eq!(variables[name]["secret"].as_bool(), Some(true));
+                assert_eq!(
+                    component[name].as_str(),
+                    Some(format!("{{{{ {name} }}}}").as_str())
+                );
+                assert!(
+                    !manifest.contains(&fixture.value),
+                    "should not persist credential values"
+                );
+            }
         }
     }
 

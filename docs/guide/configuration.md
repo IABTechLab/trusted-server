@@ -1934,15 +1934,16 @@ provider or bidder route.
 
 ### `[auction]`
 
-| Field                  | Type    | Default            | Description                                                    |
-| ---------------------- | ------- | ------------------ | -------------------------------------------------------------- |
-| `enabled`              | Boolean | `false`            | Enable the auction orchestrator                                |
-| `sanitize_creatives`   | Boolean | `false`            | Strip executable markup from winning-bid `adm` before delivery |
-| `rewrite_creatives`    | Boolean | `true`             | Rewrite winning-bid `adm` through first-party endpoints        |
-| `timeout_ms`           | Integer | `2000`             | Logical auction budget in milliseconds                         |
-| `mediator`             | String  | `None`             | Optional separate `adserver_mock` mediator                     |
-| `creative_store`       | String  | `"creative_store"` | Deprecated; creatives are delivered inline                     |
-| `allowed_context_keys` | Array   | `[]`               | Request context keys admitted into the auction                 |
+| Field                  | Type    | Default            | Description                                                                                                  |
+| ---------------------- | ------- | ------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `enabled`              | Boolean | `false`            | Enable the auction orchestrator                                                                              |
+| `sanitize_creatives`   | Boolean | `false`            | Strip executable markup from winning-bid `adm` before delivery                                               |
+| `rewrite_creatives`    | Boolean | `true`             | Rewrite winning-bid asset URLs through first-party endpoints                                                 |
+| `rewrite_clicks`       | Boolean | unset              | Wrap creative links in `/first-party/click`; unset follows `rewrite_creatives` (proxied HTML keeps wrapping) |
+| `timeout_ms`           | Integer | `2000`             | Logical auction budget in milliseconds                                                                       |
+| `mediator`             | String  | `None`             | Optional separate `adserver_mock` mediator                                                                   |
+| `creative_store`       | String  | `"creative_store"` | Deprecated; creatives are delivered inline                                                                   |
+| `allowed_context_keys` | Array   | `[]`               | Request context keys admitted into the auction                                                               |
 
 Creative markup delivered by `POST /auction` and the publisher SSAT/page-bids
 path is processed by two independent passes. With `sanitize_creatives = true`
@@ -1950,23 +1951,32 @@ path is processed by two independent passes. With `sanitize_creatives = true`
 and event handlers) is stripped together with its inner content. This blanks
 script-based creatives, so enable it only when creatives render in a context
 that shares the publisher's origin. With `rewrite_creatives = true` (the
-default), eligible absolute or protocol-relative resource and click URLs not
-excluded by rewrite configuration are converted to signed first-party
-endpoints, and any bidder-supplied `<base>` element is removed. The
-`POST /auction` path emits root-relative endpoints and injects the creative TSJS
-runtime exactly once, whether or not the bidder supplied a `<body>`, since bare
+default), eligible absolute or protocol-relative asset URLs not excluded by
+rewrite configuration are converted to signed `/first-party/proxy` endpoints.
+`rewrite_clicks` controls click-through links (`<a href>`, `<area href>`)
+separately: when it is unset, it follows `rewrite_creatives`, so existing
+configs keep their asset and link behavior. One change applies to existing
+configs too: whenever either setting is on, a bidder-supplied `<base>` element
+loses its `href`; it keeps a `target` and is removed when it has none (before
+this release the whole element was removed). With `sanitize_creatives = true`,
+the sanitizer removes `<base>` entirely before the rewrite pass. The `POST /auction` path emits
+root-relative endpoints and, when either setting is on, injects the creative
+TSJS runtime exactly once, whether or not the bidder supplied a `<body>`, since bare
 fragments are the common `adm` shape. The foreign-origin SSAT renderer emits
-absolute endpoints and does not inject that bundle. With both disabled, `adm`
-ships exactly as the bidder returned it, except that a creative larger than the
+absolute endpoints and does not inject that bundle. With all three disabled,
+`adm` ships exactly as the bidder returned it, except that a creative larger than the
 1 MiB per-creative cap is rejected in every mode and its `adm` is dropped.
-Accepted external URLs are not host allowlisted by the sanitizer. Neither
-setting affects HTML or CSS fetched through `/first-party/proxy`. See
+Accepted external URLs are not host allowlisted by the sanitizer.
+`rewrite_creatives` and `sanitize_creatives` do not affect HTML or CSS fetched
+through `/first-party/proxy`. An explicitly set `rewrite_clicks` does apply to
+links in proxied HTML; unset, proxied HTML keeps wrapping links. See
 [Creative Processing](/guide/creative-processing#auction-rewrite-control).
 
 ::: warning Existing configs, upgrade sequencing, and rollback
 Default values are omitted from stored JSON; non-default values
-(`sanitize_creatives = true`, `rewrite_creatives = false`) are serialized, and
-older `AuctionConfig` schemas reject unknown fields.
+(`sanitize_creatives = true`, `rewrite_creatives = false`, and any explicit
+`rewrite_clicks`) are serialized, and older `AuctionConfig` schemas reject
+unknown fields.
 
 **Upgrading:** binaries that predate `sanitize_creatives` reject a blob that
 carries it, so in a rolling deployment upgrade the binary **first**, then push
@@ -1980,14 +1990,26 @@ on new code, while an explicit `true` fails startup on old code.
 **Rolling back:** before reverting to a binary that does not know a field,
 remove that field's non-default value (and any environment override), run
 `ts config validate`, push the resulting default-compatible blob, and only then
-roll back the binary.
+roll back the binary. Older binaries tie click wrapping to `rewrite_creatives`
+in both directions: rolling back from `rewrite_creatives = true` with
+`rewrite_clicks = false` turns click wrapping back on, and rolling back from
+`rewrite_creatives = false` with `rewrite_clicks = true` turns it off. Rolling
+back from any `rewrite_clicks = false` also turns click wrapping back on in HTML
+fetched through `/first-party/proxy`.
 
 **Environment overlays:** The pinned EdgeZero loader cannot create missing TOML
 leaves. Existing configs must add **both** leaves under `[auction]`
 (`rewrite_creatives` and `sanitize_creatives`) before
 `TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES` /
 `TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES` can take effect. An override for a
-missing leaf is silently ignored.
+missing leaf is silently ignored. `rewrite_clicks` is unset by default and so
+cannot appear as a TOML leaf until you set it; add `rewrite_clicks = true` or
+`false` under `[auction]` before relying on
+`TRUSTED_SERVER__AUCTION__REWRITE_CLICKS`. The leaf only preserves today's
+behavior when it matches what unset resolves to: with `rewrite_creatives =
+true`, `rewrite_clicks = true` does, but with `rewrite_creatives = false` no
+value does (`true` wraps auction links, `false` stops wrapping links in HTML
+fetched through `/first-party/proxy`).
 :::
 
 ### Provider map
@@ -2175,8 +2197,9 @@ finishes local decision and delivery. An auction can therefore exceed its
 configured wall-clock timeout.
 
 Creative sanitization is opt-in. `sanitize_creatives = true` strips executable
-markup before delivery. `rewrite_creatives = false` skips first-party URL
-rewriting and creative TSJS injection. See
+markup before delivery. `rewrite_creatives = false` leaves asset URLs
+direct; links are wrapped, and creative TSJS injected on `POST /auction`,
+only when `rewrite_clicks = true`. See
 [Creative Processing](/guide/creative-processing#auction-rewrite-control).
 
 **Environment overrides** replace map leaves that already exist in TOML:

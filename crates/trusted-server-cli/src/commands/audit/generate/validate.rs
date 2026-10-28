@@ -9,7 +9,7 @@
 
 use trusted_server_core::config::TrustedServerAppConfig;
 
-use crate::error::{CliResult, cli_error};
+use crate::error::{CliResult, cli_error, toml_error_location};
 
 /// Validates the candidate config text the generator is about to persist.
 ///
@@ -49,15 +49,15 @@ pub(super) fn check_candidate(candidate: &str, baseline: &str) -> CliResult<Vec<
 
 /// Validates one source config without echoing config values.
 ///
-/// Parse and schema errors report only a byte offset when the parser supplies
-/// one, otherwise a fixed load-failure category. Deploy validation errors report
-/// only the failed phase because their messages can contain literal values,
-/// including validator parameters and invalid patterns.
+/// Parse and schema errors report only a line and column when the parser supplies
+/// a span, otherwise a fixed load-failure category. Deploy validation errors
+/// report only the failed phase because their messages can contain literal
+/// values, including validator parameters and invalid patterns.
 fn validate_source_config(source: &str) -> CliResult<()> {
     let config: TrustedServerAppConfig = toml::from_str(source).map_err(|error| {
-        error.span().map_or_else(
-            || "config could not be loaded".to_string(),
-            |span| format!("config could not be loaded at byte offset {}", span.start),
+        format!(
+            "config could not be loaded{}",
+            toml_error_location(source, error.span())
         )
     })?;
     TrustedServerAppConfig::new(config.into_settings())
@@ -94,10 +94,7 @@ mod tests {
             error.contains("refusing to write"),
             "should explain refusal"
         );
-        assert!(
-            error.contains("byte offset"),
-            "should retain parser location"
-        );
+        assert!(error.contains("at line "), "should retain parser location");
     }
 
     #[test]
@@ -112,7 +109,7 @@ mod tests {
             "should not disclose source bytes"
         );
         assert!(
-            warnings[0].contains("byte offset"),
+            warnings[0].contains("at line "),
             "should retain parser location"
         );
     }
@@ -165,10 +162,13 @@ mod tests {
             !error.contains("FICTIONAL_SECRET_SENTINEL"),
             "should not echo schema values"
         );
-        if let Some(offset) = error.strip_prefix("config could not be loaded at byte offset ") {
+        if let Some(location) = error.strip_prefix("config could not be loaded at line ") {
+            let (line, column) = location
+                .split_once(", column ")
+                .expect("should report only line and column");
             assert!(
-                offset.parse::<usize>().is_ok(),
-                "should expose only a numeric source offset"
+                line.parse::<usize>().is_ok() && column.parse::<usize>().is_ok(),
+                "should expose only a numeric source location"
             );
         } else {
             assert_eq!(
