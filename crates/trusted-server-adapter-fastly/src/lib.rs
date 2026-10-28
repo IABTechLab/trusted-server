@@ -3,9 +3,10 @@
 //! A library with a thin binary over it, so a deployment that ships a vendor
 //! crate builds on this adapter rather than editing it. [`run`] serves the way
 //! the binary does, and [`run_with`] serves with the integration builders the
-//! deployment offers composed with the built-in ones.
+//! deployment offers composed with the built-in ones. [`run_with_addressing`]
+//! also takes the deployment's request addressing.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
 use edgezero_adapter_fastly::request::into_core_request;
@@ -20,6 +21,7 @@ use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
+use trusted_server_core::addressing::{ByHostAddressing, RemovedPathPrefix};
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
 use trusted_server_core::ec::device::{DeviceModule, DeviceSignals, build_device_module};
 use trusted_server_core::ec::finalize::ec_finalize_response;
@@ -63,6 +65,9 @@ use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers};
 use crate::platform::client_info_from_request;
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use crate::sandbox::{RetainedApp, Sandbox, SandboxCounters, ServeMode, StartupDiagnostics};
+/// Re-exported so a deployment names the request addressing it hands over
+/// without depending on core directly.
+pub use trusted_server_core::addressing::{Addressing, RequestAddress, RequestAddressing};
 /// Re-exported so a crate registering an integration names the type it hands
 /// over without depending on core directly.
 pub use trusted_server_core::integrations::IntegrationBuilder;
@@ -137,28 +142,135 @@ fn stores_for_request(
     let resolved = config_selection::resolve_key(&stores.config_key, host, |key| {
         config_selection::blob_exists(stores.config_store_name.as_ref(), key)
     });
+    stores_with_key(stores, resolved, || {
+        format!("host {:?}", host.unwrap_or_default())
+    })
+}
+
+/// Chooses the app-config blob from the selector values a request addressing
+/// named, the first whose blob exists.
+///
+/// The values came from the request, so a refusal logs how many there were
+/// and not what they were.
+///
+/// # Errors
+///
+/// Returns why the request is not served, which [`refusal_response`] turns
+/// into the answer.
+fn stores_for_address(
+    stores: RuntimeStoreConfig,
+    selector_values: &[String],
+) -> Result<RuntimeStoreConfig, config_selection::Refusal> {
+    let resolved =
+        config_selection::resolve_addressed_key(&stores.config_key, selector_values, |key| {
+            config_selection::blob_exists(stores.config_store_name.as_ref(), key)
+        });
+    stores_with_key(stores, resolved, || {
+        format!(
+            "any of the {} selector value(s) the request addressing named",
+            selector_values.len()
+        )
+    })
+}
+
+/// The stores with the resolved key, or the refusal, logged with what
+/// `subject` says the request was addressed by.
+///
+/// # Errors
+///
+/// Returns the refusal `resolved` carries.
+fn stores_with_key(
+    stores: RuntimeStoreConfig,
+    resolved: Result<String, config_selection::Refusal>,
+    subject: impl FnOnce() -> String,
+) -> Result<RuntimeStoreConfig, config_selection::Refusal> {
     match resolved {
         Ok(config_key) => Ok(RuntimeStoreConfig {
             config_key,
             ..stores
         }),
         Err(refusal) => {
-            let named = req
-                .get_header_str_lossy(header::HOST.as_str())
-                .unwrap_or_default();
+            let subject = subject();
             match &refusal {
                 config_selection::Refusal::NoConfigForHost => log::warn!(
-                    "no app-config blob for host {named:?} under selector `{}`",
+                    "no app-config blob for {subject} under selector `{}`",
                     stores.config_key
                 ),
                 config_selection::Refusal::StoreUnavailable(reason)
                 | config_selection::Refusal::MalformedSelector(reason) => {
-                    log::error!("cannot choose the app-config blob for host {named:?}: {reason}");
+                    log::error!("cannot tell whether {subject} has an app-config blob: {reason}");
                 }
             }
             Err(refusal)
         }
     }
+}
+
+/// Asks `addressing` about the request, chooses the app-config blob that
+/// serves it and sets the path it continues with.
+///
+/// A request addressed by host is chosen by [`stores_for_request`] and keeps
+/// its path. Otherwise the blob is the first of the hook's selector values
+/// whose blob exists, the path becomes the hook's continuing path with the
+/// query kept, and the prefix the hook removed is returned for the core
+/// request. The hook is handed the request's `Host`, or none where it is
+/// absent or not UTF-8.
+///
+/// # Errors
+///
+/// Returns why the request is not served, which [`refusal_response`] turns
+/// into the answer. The request's path is then left as it was.
+fn address_request(
+    addressing: &dyn RequestAddressing,
+    stores: RuntimeStoreConfig,
+    req: &mut FastlyRequest,
+) -> Result<(RuntimeStoreConfig, Option<RemovedPathPrefix>), config_selection::Refusal> {
+    let host = request_host(req);
+    match addressing.address(host, req.get_path()) {
+        Addressing::ByHost => Ok((stores_for_request(stores, req)?, None)),
+        Addressing::Addressed(address) => {
+            let stores = stores_for_address(stores, address.selector_values())?;
+            req.set_path(address.path());
+            Ok((stores, Some(address.into_removed_prefix())))
+        }
+    }
+}
+
+/// The request addressing a deployment supplied through
+/// [`run_with_addressing`], set once before any request is served.
+///
+/// Held as the integration builders are, because [`run`] takes no arguments.
+/// The first registration wins, and [`run_with_addressing`] is the only
+/// caller, so nothing registers after serving has begun.
+static REGISTERED_ADDRESSING: OnceLock<Arc<dyn RequestAddressing>> = OnceLock::new();
+
+/// The request addressing a deployment registered, or the one that
+/// addresses every request by its host.
+fn registered_addressing() -> &'static dyn RequestAddressing {
+    addressing_in(&REGISTERED_ADDRESSING)
+}
+
+/// The addressing `slot` holds, or [`ByHostAddressing`] when it holds none.
+fn addressing_in(slot: &OnceLock<Arc<dyn RequestAddressing>>) -> &dyn RequestAddressing {
+    slot.get()
+        .map_or(&ByHostAddressing, |addressing| addressing.as_ref())
+}
+
+/// Converts the client request for the router, carrying the prefix the
+/// request addressing removed, when it removed one.
+///
+/// # Errors
+///
+/// Returns the conversion's error.
+fn into_addressed_core_request(
+    req: FastlyRequest,
+    removed_prefix: Option<RemovedPathPrefix>,
+) -> Result<HttpRequest, EdgeError> {
+    let mut core_req = into_core_request(req)?;
+    if let Some(prefix) = removed_prefix {
+        core_req.extensions_mut().insert(prefix);
+    }
+    Ok(core_req)
 }
 
 /// The request's `Host` header as text, or `None` when it is absent or its
@@ -200,6 +312,30 @@ fn health_response(req: &FastlyRequest) -> Option<FastlyResponse> {
     None
 }
 
+/// A debug probe answered before the application is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DebugProbe {
+    /// The sandbox counters snapshot.
+    #[cfg(feature = "reusable-sandbox")]
+    SandboxMetrics,
+    /// The TLS and JA4 signals the request arrived with.
+    Ja4,
+}
+
+/// The debug probe `req` asks for, read from the path it continues with, so
+/// a probe is found at the path the request addressing gives.
+fn debug_probe(req: &FastlyRequest) -> Option<DebugProbe> {
+    if req.get_method() != FastlyMethod::GET {
+        return None;
+    }
+    match req.get_path() {
+        #[cfg(feature = "reusable-sandbox")]
+        sandbox::SANDBOX_METRICS_PATH => Some(DebugProbe::SandboxMetrics),
+        "/_ts/debug/ja4" => Some(DebugProbe::Ja4),
+        _ => None,
+    }
+}
+
 /// Runs the Fastly Compute program with the integrations a deployment offers.
 ///
 /// The builders are composed with the ones this adapter ships rather than
@@ -220,6 +356,38 @@ fn health_response(req: &FastlyRequest) -> Option<FastlyResponse> {
 pub fn run_with(integrations: Vec<IntegrationBuilder>) {
     app::register_integrations(integrations);
     run();
+}
+
+/// Runs the Fastly Compute program with the integrations a deployment offers
+/// and the request addressing it supplies.
+///
+/// The addressing is asked about each request after `/health` and before its
+/// app-config blob is chosen. A request it addresses by host is served as
+/// [`run_with`] serves it.
+///
+/// ```no_run
+/// use std::sync::Arc;
+///
+/// use trusted_server_adapter_fastly::{Addressing, RequestAddressing};
+///
+/// struct ByHostOnly;
+///
+/// impl RequestAddressing for ByHostOnly {
+///     fn address(&self, _host: Option<&str>, _path: &str) -> Addressing {
+///         Addressing::ByHost
+///     }
+/// }
+///
+/// fn main() {
+///     trusted_server_adapter_fastly::run_with_addressing(Vec::new(), Arc::new(ByHostOnly));
+/// }
+/// ```
+pub fn run_with_addressing(
+    integrations: Vec<IntegrationBuilder>,
+    addressing: Arc<dyn RequestAddressing>,
+) {
+    let _ = REGISTERED_ADDRESSING.set(addressing);
+    run_with(integrations);
 }
 
 /// Runs the Fastly Compute program, which the binary's `main()` calls.
@@ -465,11 +633,12 @@ fn heap_mib() -> String {
 /// Handles a request through the `EdgeZero` router path.
 fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, request_id: &str) {
     // Settled before anything reads settings, so every path below reads the
-    // blob of the publisher this request is for.
-    let runtime_stores = match stores_with_stored_selector(RuntimeStoreConfig::logical())
-        .and_then(|stores| stores_for_request(stores, &req))
-    {
-        Ok(stores) => stores,
+    // blob of the publisher this request is for, at the path it continues
+    // with.
+    let addressed = stores_with_stored_selector(RuntimeStoreConfig::logical())
+        .and_then(|stores| address_request(registered_addressing(), stores, &mut req));
+    let (runtime_stores, removed_prefix) = match addressed {
+        Ok(addressed) => addressed,
         Err(refusal) => {
             refusal_response(&refusal).send_to_client();
             return;
@@ -479,8 +648,9 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
     // Short-circuit the sandbox counters probe before app construction. It must
     // not build the application: polling it would otherwise increment the very
     // build counter it reports.
+    let probe = debug_probe(&req);
     #[cfg(feature = "reusable-sandbox")]
-    if req.get_method() == FastlyMethod::GET && req.get_path() == sandbox::SANDBOX_METRICS_PATH {
+    if probe == Some(DebugProbe::SandboxMetrics) {
         match load_settings_from_config_store(&runtime_stores) {
             Ok(settings) if sandbox::metrics_enabled(&settings) => {
                 sandbox_metrics_response(sandbox, ordinal).send_to_client();
@@ -501,7 +671,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
     // Short-circuit the JA4 debug probe before app construction. Must run here
     // because TLS/JA4 accessors are only available on FastlyRequest before
     // conversion to edgezero types.
-    if req.get_method() == FastlyMethod::GET && req.get_path() == "/_ts/debug/ja4" {
+    if probe == Some(DebugProbe::Ja4) {
         match load_settings_from_config_store(&runtime_stores) {
             Ok(settings) if settings.debug.ja4_endpoint_enabled => {
                 build_ja4_debug_response(&req).send_to_client();
@@ -647,7 +817,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
     // Dispatch directly through the EdgeZero router without an intermediate
     // fastly::Response conversion. That preserves duplicate header values such
     // as multiple Set-Cookie headers.
-    let mut response = match into_core_request(req) {
+    let mut response = match into_addressed_core_request(req, removed_prefix) {
         Ok(mut core_req) => {
             core_req.extensions_mut().insert(config_store);
             core_req.extensions_mut().insert(device_signals);
@@ -1129,6 +1299,7 @@ mod tests {
     use edgezero_core::http::response_builder;
     use fastly::mime;
     use trusted_server_core::integrations::HeaderMutation;
+    use trusted_server_core::test_support::addressing::NamesSelectorValues;
 
     fn test_settings() -> Settings {
         Settings::from_toml(
@@ -1397,6 +1568,247 @@ mod tests {
         );
     }
 
+    /// A request for a page under a publisher's path on `host`.
+    fn addressed_page(host: &str) -> FastlyRequest {
+        let mut req = FastlyRequest::get(format!(
+            "https://{host}/publisher.example/news/today?page=2"
+        ));
+        req.set_header(header::HOST.as_str(), host);
+        req
+    }
+
+    /// Asserts that `addressing` chooses every request's blob as
+    /// [`stores_for_request`] does and leaves its path as it is.
+    fn assert_addressed_as_by_host(addressing: &dyn RequestAddressing) {
+        for selector in ["trusted_server_config", "{host}"] {
+            let stores = stores_with_selector(selector);
+            for host in [
+                None,
+                Some("publisher.example"),
+                Some("not a host"),
+                Some("[::1]:7676"),
+            ] {
+                let mut req = request_for_host(host);
+                let today = stores_for_request(stores.clone(), &req);
+
+                let addressed = address_request(addressing, stores.clone(), &mut req);
+
+                assert_eq!(
+                    addressed,
+                    today.map(|stores| (stores, None)),
+                    "should choose as today for `{selector}` and host {host:?}"
+                );
+                assert_eq!(
+                    req.get_path(),
+                    "/article",
+                    "should leave the path as it is for host {host:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn with_no_addressing_supplied_a_request_is_chosen_and_routed_as_today() {
+        let nothing_registered = OnceLock::new();
+
+        assert_addressed_as_by_host(addressing_in(&nothing_registered));
+    }
+
+    #[test]
+    fn an_addressing_answering_by_host_leaves_selection_and_path_as_today() {
+        assert_addressed_as_by_host(&ByHostAddressing);
+    }
+
+    #[test]
+    fn the_addressing_a_deployment_registers_is_the_one_asked() {
+        let registered: OnceLock<Arc<dyn RequestAddressing>> = OnceLock::new();
+        assert!(
+            registered
+                .set(Arc::new(NamesSelectorValues(&["a.example"])))
+                .is_ok(),
+            "should register the addressing"
+        );
+
+        assert!(
+            matches!(
+                addressing_in(&registered).address(None, "/publisher.example/news"),
+                Addressing::Addressed(_)
+            ),
+            "should ask the registered addressing, not the host"
+        );
+    }
+
+    #[test]
+    fn a_rewriting_addressing_continues_at_its_path_keeps_the_query_and_carries_the_prefix() {
+        // A selector without the placeholder reads its one blob, so the
+        // selector values are ignored and nothing is looked up.
+        let stores = stores_with_selector("trusted_server_config");
+        let mut req = addressed_page("front.example");
+
+        let (resolved, removed_prefix) = address_request(
+            &NamesSelectorValues(&["publisher.example"]),
+            stores.clone(),
+            &mut req,
+        )
+        .expect("should serve the addressed request");
+
+        assert_eq!(resolved, stores, "should read the one blob");
+        assert_eq!(req.get_path(), "/news/today", "should continue at the path");
+        assert_eq!(req.get_query_str(), Some("page=2"), "should keep the query");
+
+        let core_req = into_addressed_core_request(req, removed_prefix)
+            .expect("should convert the addressed request");
+        assert_eq!(
+            core_req.uri().path(),
+            "/news/today",
+            "the router should see the continuing path"
+        );
+        assert_eq!(
+            core_req.uri().query(),
+            Some("page=2"),
+            "the router should see the query"
+        );
+        assert_eq!(
+            core_req
+                .extensions()
+                .get::<RemovedPathPrefix>()
+                .map(RemovedPathPrefix::as_str),
+            Some("/publisher.example"),
+            "the core request should carry the prefix the addressing removed"
+        );
+    }
+
+    #[test]
+    fn a_request_addressed_by_host_carries_no_removed_prefix() {
+        let core_req = into_addressed_core_request(addressed_page("front.example"), None)
+            .expect("should convert the request");
+
+        assert!(
+            core_req.extensions().get::<RemovedPathPrefix>().is_none(),
+            "a request whose path nothing removed should carry no prefix"
+        );
+    }
+
+    #[test]
+    fn the_first_selector_value_whose_blob_exists_takes_the_host_s_place() {
+        // The local Viceroy configuration fills `jwks_store`, and
+        // `current-kid` is a key in it that is also a host name, so the
+        // lookups here are real ones.
+        let stores = RuntimeStoreConfig {
+            config_store_name: trusted_server_core::platform::StoreName::from("jwks_store"),
+            ..stores_with_selector("{host}")
+        };
+        let mut req = addressed_page("front.example");
+
+        let (resolved, _) = address_request(
+            &NamesSelectorValues(&["absent-key", "current-kid", "front.example"]),
+            stores.clone(),
+            &mut req,
+        )
+        .expect("should serve from the first value whose blob exists");
+
+        assert_eq!(
+            resolved,
+            RuntimeStoreConfig {
+                config_key: "current-kid".to_owned(),
+                ..stores
+            },
+            "should read the blob of the first value the store holds"
+        );
+        assert_eq!(req.get_path(), "/news/today", "should continue at the path");
+    }
+
+    #[test]
+    fn every_selector_value_missing_is_refused_421_and_the_request_is_left_as_it_was() {
+        // The local store holds no blob for any of these values, and the
+        // request's own host is never tried in their place.
+        let stores = stores_with_selector("{host}");
+        let mut req = addressed_page("front.example");
+
+        let refusal = address_request(
+            &NamesSelectorValues(&["a.example", "b.example", "trusted_server_config"]),
+            stores,
+            &mut req,
+        )
+        .expect_err("should refuse values with no blob");
+
+        assert_eq!(
+            refusal,
+            config_selection::Refusal::NoConfigForHost,
+            "should refuse as a host with no blob is refused"
+        );
+        assert_eq!(
+            refusal_response(&refusal).get_status(),
+            fastly::http::StatusCode::MISDIRECTED_REQUEST,
+            "should be answered 421"
+        );
+        assert_eq!(
+            req.get_path(),
+            "/publisher.example/news/today",
+            "a refused request should keep its path"
+        );
+    }
+
+    /// `path` on `front.example` after the addressing that removes its first
+    /// segment, with the blob the addressing chose.
+    fn probe_addressed_at(path: &str) -> (FastlyRequest, RuntimeStoreConfig) {
+        let mut req = FastlyRequest::get(format!("https://front.example{path}"));
+        req.set_header(header::HOST.as_str(), "front.example");
+        let (stores, _) = address_request(
+            &NamesSelectorValues(&["publisher.example"]),
+            stores_with_selector("trusted_server_config"),
+            &mut req,
+        )
+        .expect("should serve the addressed request");
+        (req, stores)
+    }
+
+    #[test]
+    fn the_ja4_probe_is_found_at_the_path_the_addressing_gives() {
+        let (req, stores) = probe_addressed_at("/publisher.example/_ts/debug/ja4");
+
+        assert_eq!(
+            debug_probe(&req),
+            Some(DebugProbe::Ja4),
+            "the JA4 probe should answer under the publisher's path"
+        );
+        assert_eq!(
+            stores,
+            stores_with_selector("trusted_server_config"),
+            "the probe should read the blob the addressing chose"
+        );
+
+        let (unaddressed, _) = probe_addressed_at("/_ts/debug/ja4");
+        assert_eq!(
+            debug_probe(&unaddressed),
+            None,
+            "the probe should read the path the request continues with, not the one it arrived at"
+        );
+    }
+
+    #[cfg(feature = "reusable-sandbox")]
+    #[test]
+    fn the_counters_probe_is_found_at_the_path_the_addressing_gives() {
+        let (req, _) = probe_addressed_at(&format!(
+            "/publisher.example{}",
+            sandbox::SANDBOX_METRICS_PATH
+        ));
+
+        assert_eq!(
+            debug_probe(&req),
+            Some(DebugProbe::SandboxMetrics),
+            "the counters probe should answer under the publisher's path"
+        );
+    }
+
+    #[test]
+    fn a_debug_probe_is_answered_only_to_a_get() {
+        let mut req = FastlyRequest::post("https://front.example/_ts/debug/ja4");
+        req.set_header(header::HOST.as_str(), "front.example");
+
+        assert_eq!(debug_probe(&req), None, "a POST should not reach the probe");
+    }
+
     /// A `Host` header whose bytes are not valid UTF-8.
     const HOST_NOT_UTF8: &[u8] = b"\xffa.example";
 
@@ -1486,6 +1898,67 @@ mod tests {
         assert!(
             matches!(refusal, config_selection::Refusal::StoreUnavailable(_)),
             "should refuse rather than read the logical key, got {refusal:?}"
+        );
+    }
+
+    /// A request addressing that records the host it is handed and addresses
+    /// every request by its host.
+    struct RecordsHost(std::sync::Mutex<Vec<Option<String>>>);
+
+    impl RequestAddressing for RecordsHost {
+        fn address(&self, host: Option<&str>, _path: &str) -> Addressing {
+            self.0
+                .lock()
+                .expect("should lock")
+                .push(host.map(str::to_owned));
+            Addressing::ByHost
+        }
+    }
+
+    #[test]
+    fn a_hook_is_handed_no_host_for_a_value_that_is_not_utf8() {
+        let hook = RecordsHost(std::sync::Mutex::default());
+        let mut req = request_with_host_not_utf8();
+
+        let refusal = address_request(&hook, stores_with_selector("{host}"), &mut req)
+            .expect_err("should refuse a Host that is not UTF-8 when addressed by host");
+
+        assert_eq!(
+            *hook.0.lock().expect("should lock"),
+            [None],
+            "the hook should be handed no host for a Host that is not UTF-8"
+        );
+        assert_eq!(
+            refusal,
+            config_selection::Refusal::NoConfigForHost,
+            "a request addressed by its host should then be refused as one with no host"
+        );
+    }
+
+    #[test]
+    fn a_request_addressed_by_its_path_with_a_host_that_is_not_utf8_is_served_without_a_panic() {
+        // The local Viceroy configuration fills `jwks_store`, and
+        // `current-kid` is a key in it that is also a host name, so the
+        // lookup here is a real one.
+        let stores = RuntimeStoreConfig {
+            config_store_name: trusted_server_core::platform::StoreName::from("jwks_store"),
+            ..stores_with_selector("{host}")
+        };
+        let mut req = addressed_page("front.example");
+        req.set_header(header::HOST.as_str(), HOST_NOT_UTF8);
+
+        let (resolved, _) =
+            address_request(&NamesSelectorValues(&["current-kid"]), stores, &mut req)
+                .expect("should serve the request from the value the hook names");
+
+        assert_eq!(
+            resolved.config_key, "current-kid",
+            "should read the blob the hook's value names, whatever the Host"
+        );
+        assert_eq!(
+            entry_request(&req).host(),
+            "",
+            "the module request should carry no host where Host is not UTF-8"
         );
     }
 

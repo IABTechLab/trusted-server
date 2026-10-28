@@ -3722,6 +3722,43 @@ serves no host from it.
 Viceroy instance. It checks that each host is answered from its own blob and
 that a host with none is refused.
 
+### One blob for each path
+
+A deployment that serves several publishers from one host, each under a path
+of its own such as `https://front.example/publisher-a.example/news`, supplies a
+request addressing hook. The hook implements `RequestAddressing` from
+`trusted_server_core::addressing`, and a Fastly deployment hands it to
+`trusted_server_adapter_fastly::run_with_addressing` with its integration
+builders. The hook is asked about each request after `/health` is answered and
+before any settings are read. It answers either that the request is addressed
+by its host, as in the section above, or three things, being the selector
+values, the path the request continues with, and the path prefix it removed.
+Which part of a path names a publisher is the deployment's decision.
+
+- Each selector value takes the place of `{host}` in the selector in turn and
+  is keyed as a host is, and the first whose blob exists is read. A value whose
+  key would be over 255 characters is passed over without a lookup. Push a
+  blob, in lower case, under each value the hook can name.
+- A miss on every value is answered `421`, as a host with no blob is. The
+  request is never served from the logical store ID, from the blob of the host
+  it arrived on, or from any other key the hook did not name.
+- The request continues at the path the hook gives, with its query kept, so the
+  routes and every module see that path.
+- The removed prefix travels on the request as a `RemovedPathPrefix` extension.
+  Nothing in core writes it into a response. A deployment whose pages must
+  carry it, in their links for example, puts it back with a serve phase
+  middleware of its own.
+- A page stored for an addressed request is keyed by the host and the
+  continuing path, so `ts cache purge --page` takes that address. Purging it
+  also purges the page at the same continuing path of every other publisher on
+  the host.
+- Publishers on one host share the host's cookies unless the deployment's
+  prefix module names them apart.
+- A selector without `{host}` reads its one blob and the values are ignored.
+  The Axum, Cloudflare and Spin adapters take the hook through
+  `TrustedServerApp::routes_with_addressing` and ignore the values in the same
+  way, while the path and the prefix apply.
+
 ### Local development
 
 The repository's Viceroy configuration uses the logical app-config store ID and

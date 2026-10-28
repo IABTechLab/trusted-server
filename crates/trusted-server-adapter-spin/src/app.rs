@@ -13,6 +13,7 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
+use trusted_server_core::addressing::{RequestAddressing, addressed_router};
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::telemetry::warn_once_when_analytics_is_unsent;
 use trusted_server_core::auction::{
@@ -807,6 +808,29 @@ impl TrustedServerApp {
     ) -> Result<RouterService, Report<TrustedServerError>> {
         let state = build_state_with_registrations(settings, integrations)?;
         Ok(build_router(&state))
+    }
+
+    /// Build the full application router as
+    /// [`TrustedServerApp::routes_with_registrations`] does, asking
+    /// `addressing` about every request before it is routed.
+    ///
+    /// This adapter reads one app-config blob, so the selector values the
+    /// addressing names are ignored. A request it addresses continues at the
+    /// path it gives, with its query kept, and carries the prefix it removed
+    /// as a [`RemovedPathPrefix`](trusted_server_core::addressing::RemovedPathPrefix)
+    /// extension. A request it addresses by host is routed as it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors [`TrustedServerApp::routes_with_registrations`]
+    /// returns.
+    pub fn routes_with_addressing(
+        settings: Settings,
+        integrations: &[IntegrationBuilder],
+        addressing: Arc<dyn RequestAddressing>,
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let router = Self::routes_with_registrations(settings, integrations)?;
+        Ok(addressed_router(router, addressing))
     }
 
     /// Build the full router with explicit settings and runtime services.

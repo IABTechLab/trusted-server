@@ -161,7 +161,7 @@ use crate::platform::{
 /// [`Self::logical`] gives the logical stores and key. The entry point puts
 /// the selector the config store holds in place of the key and resolves it
 /// for the request before anything is built, with
-/// `stores_with_stored_selector` and `stores_for_request`.
+/// `stores_with_stored_selector` and `address_request`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeStoreConfig {
     pub(crate) config_store_name: StoreName,

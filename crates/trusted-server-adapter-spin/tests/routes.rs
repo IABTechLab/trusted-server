@@ -6,11 +6,15 @@
 //! that depends on external stores assert routing only; deterministic auth and
 //! method gates assert exact status codes.
 
+use std::sync::Arc;
+
 use edgezero_core::app::Hooks as _;
 use edgezero_core::http::{Request, Response, request_builder};
 use edgezero_core::router::RouterService;
 use trusted_server_adapter_spin::app::TrustedServerApp;
+use trusted_server_core::addressing::ByHostAddressing;
 use trusted_server_core::settings::Settings;
+use trusted_server_core::test_support::addressing::{FirstSegment, status_and_type};
 
 /// Build the full application router from explicit test settings.
 ///
@@ -23,7 +27,7 @@ fn test_router() -> RouterService {
         .expect("should build router from test settings")
 }
 
-/// The settings [`test_router`] is built from.
+/// Explicit settings for the route tests.
 fn test_settings() -> Settings {
     Settings::from_toml(
         r#"
@@ -1409,4 +1413,30 @@ async fn a_response_carries_no_blanket_rule_without_the_section() {
     .await;
 
     assert_eq!(robots_tag(&response), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_addressing_continues_the_request_at_its_path_before_routing() {
+    let router =
+        TrustedServerApp::routes_with_addressing(test_settings(), &[], Arc::new(FirstSegment))
+            .expect("should build router with a request addressing");
+
+    assert_eq!(
+        status_and_type(router, "/publisher.example/_ts/config.json?view=1").await,
+        (200, "application/json".to_owned()),
+        "the configuration endpoint should answer at the path the addressing continues with"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_addressed_by_host_is_routed_as_it_is() {
+    let router =
+        TrustedServerApp::routes_with_addressing(test_settings(), &[], Arc::new(ByHostAddressing))
+            .expect("should build router with a request addressing");
+
+    assert_eq!(
+        status_and_type(router, "/_ts/config.json").await,
+        status_and_type(test_router(), "/_ts/config.json").await,
+        "should answer as the router with no addressing answers"
+    );
 }

@@ -24273,6 +24273,47 @@ mod tests {
         );
     }
 
+    /// A request that names its host only in its URI, as an HTTP/2 request
+    /// with no `Host` header does, reaches the entry's middleware, which is
+    /// told that host.
+    #[tokio::test]
+    async fn a_request_naming_its_host_only_in_its_uri_reaches_the_middleware() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::middleware::HTML_MEDIA_TYPE;
+
+        let request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/article")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        assert!(
+            request.headers().get(header::HOST).is_none(),
+            "the request must carry no Host header, or it proves nothing"
+        );
+        let proxied = proxy_answered(
+            settings_running_the_middleware_fixture(vec![PhaseEntry {
+                media_type: HTML_MEDIA_TYPE.to_owned(),
+                path: None,
+                middleware: vec![fixture::PREPARING.to_owned()],
+            }]),
+            request,
+            200,
+            b"<html><head></head><body>the origin's page</body></html>",
+            vec![("content-type", "text/html; charset=utf-8")],
+        )
+        .await;
+
+        let (_, page) = streamed(proxied).await;
+
+        assert!(
+            page.contains(&fixture::prepared_marker(
+                fixture::PREPARING,
+                "publisher.example"
+            )),
+            "should run the entry's middleware for the host the URI names: {page}"
+        );
+    }
+
     #[tokio::test]
     async fn a_serve_middleware_prepares_for_each_reader() {
         use crate::integrations::registry_test_support::middleware_fixture as fixture;

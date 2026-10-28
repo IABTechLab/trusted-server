@@ -4,11 +4,15 @@
 //! and self-contained. Each test builds the full `TrustedServerApp` router and
 //! drives it through the Tower `Service` interface.
 
+use std::sync::Arc;
+
 use axum::body::Body as AxumBody;
 use axum::http::Request;
 use edgezero_adapter_axum::service::EdgeZeroAxumService;
 use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp;
+use trusted_server_core::addressing::ByHostAddressing;
+use trusted_server_core::test_support::addressing::{FirstSegment, status_and_type};
 
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
     &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
@@ -1086,5 +1090,31 @@ async fn robots_txt_is_served_through_the_publisher_path_with_its_tag() {
         origin.recorded_request_methods(),
         ["GET", "HEAD", "POST"],
         "each request reaches the origin"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_addressing_continues_the_request_at_its_path_before_routing() {
+    let router =
+        TrustedServerApp::routes_with_addressing(test_settings(), &[], Arc::new(FirstSegment))
+            .expect("should build router with a request addressing");
+
+    assert_eq!(
+        status_and_type(router, "/publisher.example/_ts/config.json?view=1").await,
+        (200, "application/json".to_owned()),
+        "the configuration endpoint should answer at the path the addressing continues with"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_addressed_by_host_is_routed_as_it_is() {
+    let router =
+        TrustedServerApp::routes_with_addressing(test_settings(), &[], Arc::new(ByHostAddressing))
+            .expect("should build router with a request addressing");
+
+    assert_eq!(
+        status_and_type(router, "/_ts/config.json").await,
+        status_and_type(test_router(), "/_ts/config.json").await,
+        "should answer as the router with no addressing answers"
     );
 }

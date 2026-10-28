@@ -220,6 +220,74 @@ pub mod fixtures {
     pub const PUBLISHER_PAGE_HTML: &str = include_str!("html_processor.test.html");
 }
 
+/// Request addressings and a probe that each adapter's route tests share.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod addressing {
+    use edgezero_core::body::Body as EdgeBody;
+    use edgezero_core::http::request_builder;
+    use edgezero_core::router::RouterService;
+
+    use crate::addressing::{Addressing, RequestAddress, RequestAddressing};
+
+    /// A request addressing that continues `/<segment>/<rest>` at `/<rest>`
+    /// and names `segment` as the one selector value, as a deployment serving
+    /// publishers under a path of their own would.
+    pub struct FirstSegment;
+
+    impl RequestAddressing for FirstSegment {
+        fn address(&self, _host: Option<&str>, path: &str) -> Addressing {
+            first_segment_removed(path, |segment| vec![segment.to_owned()])
+        }
+    }
+
+    /// A request addressing that continues `/<segment>/<rest>` at `/<rest>`
+    /// as [`FirstSegment`] does and names these selector values for every
+    /// request.
+    pub struct NamesSelectorValues(pub &'static [&'static str]);
+
+    impl RequestAddressing for NamesSelectorValues {
+        fn address(&self, _host: Option<&str>, path: &str) -> Addressing {
+            first_segment_removed(path, |_| {
+                self.0.iter().map(|value| (*value).to_owned()).collect()
+            })
+        }
+    }
+
+    /// `path` addressed with its first segment removed and the selector
+    /// values `values` gives for that segment.
+    fn first_segment_removed(path: &str, values: impl FnOnce(&str) -> Vec<String>) -> Addressing {
+        let rest = path.strip_prefix('/').unwrap_or(path);
+        let (segment, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        let address =
+            RequestAddress::new(values(segment), format!("/{tail}"), format!("/{segment}"))
+                .expect("should name a valid continuing path");
+        Addressing::Addressed(address)
+    }
+
+    /// The status and content type `router` answers a GET for `uri` on
+    /// `front.example` with.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request cannot be built or routed.
+    pub async fn status_and_type(router: RouterService, uri: &str) -> (u16, String) {
+        let request = request_builder()
+            .method("GET")
+            .uri(uri)
+            .header("host", "front.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let response = router.oneshot(request).await.expect("should route request");
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        (response.status().as_u16(), content_type)
+    }
+}
+
 /// What a test logs on its own thread, for a test of a log line.
 ///
 /// The first use installs a logger for the whole test binary that keeps the
