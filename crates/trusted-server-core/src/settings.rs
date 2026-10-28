@@ -1342,6 +1342,35 @@ impl<'de> Deserialize<'de> for PermissionSignalConfig {
     }
 }
 
+/// The permission policy file a domain runs, mapped from the `[permissions]`
+/// table.
+///
+/// `policy` names the file by its stem. `sha256` is the SHA-256 of the file,
+/// as [`policy_sha256`](crate::permissions::policy_sha256) forms it, and
+/// `text` is the file itself, for the adapters that read the policy from the
+/// blob.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionsConfig {
+    /// The policy file's stem, so `standard.yaml` is `standard`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    /// The SHA-256 of the policy file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// The policy file itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+impl PermissionsConfig {
+    /// Whether the table sets nothing, so it is left out of a blob.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Geo / IP intelligence configuration.
 ///
 /// Mapped from the `[geo]` TOML section. Selects which module resolves a
@@ -3891,6 +3920,9 @@ pub struct Settings {
     )]
     #[validate(nested)]
     pub permission_signal: PermissionSignalConfig,
+    /// The permission policy file this domain runs.
+    #[serde(default, skip_serializing_if = "PermissionsConfig::is_empty")]
+    pub permissions: PermissionsConfig,
     /// The `[permission_signal]` table, kept so a configuration carrying it is
     /// told its new name.
     #[serde(rename = "permission_signal", default, skip_serializing)]
@@ -10302,6 +10334,74 @@ mod permission_signal_config_tests {
             message.contains("unknown field `gpc` in [permission-signal]")
                 && message.contains("[permission-signal.<name>] block is not accepted"),
             "the refusal names the block and says why it is refused: {message}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod permissions_config_tests {
+    use super::*;
+
+    use crate::test_support::tests::crate_test_settings_str;
+
+    /// The test fixture's configuration with `table` written as its
+    /// `[permissions]` table.
+    fn settings_toml_with(table: &str) -> String {
+        format!("{}\n[permissions]\n{table}\n", crate_test_settings_str())
+    }
+
+    #[test]
+    fn the_table_names_the_policy_file_by_its_stem() {
+        let settings = Settings::from_toml(&settings_toml_with(r#"policy = "standard""#))
+            .expect("should parse a table naming a policy");
+
+        assert_eq!(
+            settings.permissions.policy.as_deref(),
+            Some("standard"),
+            "should read the policy's name"
+        );
+        assert_eq!(settings.permissions.sha256, None);
+        assert_eq!(settings.permissions.text, None);
+    }
+
+    #[test]
+    fn an_unknown_key_in_the_table_is_refused() {
+        let error = Settings::from_toml(&settings_toml_with(r#"file = "standard.yaml""#))
+            .expect_err("should refuse a key the table does not define");
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("unknown field `file`"),
+            "the refusal names the key: {message}"
+        );
+    }
+
+    #[test]
+    fn the_table_round_trips_through_a_blob() {
+        let mut settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.permissions = PermissionsConfig {
+            policy: Some("standard".to_owned()),
+            sha256: Some("80b7eafed0d1".to_owned()),
+            text: Some("groups: {}\n".to_owned()),
+        };
+
+        let data = serde_json::to_value(&settings).expect("should serialize settings");
+        let read: Settings = serde_json::from_value(data).expect("should read the blob back");
+
+        assert_eq!(read.permissions, settings.permissions);
+    }
+
+    #[test]
+    fn settings_that_name_no_policy_leave_the_table_out_of_a_blob() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+
+        let data = serde_json::to_value(&settings).expect("should serialize settings");
+
+        assert!(
+            data.get("permissions").is_none(),
+            "an empty table should not be written: {data}"
         );
     }
 }

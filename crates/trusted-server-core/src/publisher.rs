@@ -2128,7 +2128,17 @@ fn template_fingerprint_with_build_digest(settings: &Settings, build_digest: &st
     // Array order is preserved: set-valued settings must serialize deterministically
     // themselves (for example, `allowed_context_keys` uses a `BTreeSet`).
     let canonical = serde_json::to_value(settings)
-        .map(|value| edgezero_core::canonical_form::canonical_data_sha256(&value))
+        .map(|mut value| {
+            // The SHA-256 already names the policy file, so settings that pin
+            // one file fingerprint the same whether or not they carry its text.
+            if let Some(permissions) = value
+                .get_mut("permissions")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                permissions.remove("text");
+            }
+            edgezero_core::canonical_form::canonical_data_sha256(&value)
+        })
         .expect("should serialize typed settings infallibly");
     hasher.update(canonical);
     hex::encode(hasher.finalize())
@@ -9805,6 +9815,30 @@ mod tests {
             let mut origin = base.clone();
             origin.publisher.origin_host_header_override = Some("tenant.example.com".to_string());
             assert_ne!(template_fingerprint(&base), template_fingerprint(&origin));
+        }
+
+        #[test]
+        fn the_policy_file_counts_by_its_digest_and_not_its_text() {
+            let with_policy = |sha256: &str, text: &str| {
+                let mut settings = create_test_settings();
+                settings.permissions = crate::settings::PermissionsConfig {
+                    policy: Some("standard".to_owned()),
+                    sha256: Some(sha256.to_owned()),
+                    text: Some(text.to_owned()),
+                };
+                settings
+            };
+
+            assert_eq!(
+                template_fingerprint(&with_policy("digest-a", "groups: {}\n")),
+                template_fingerprint(&with_policy("digest-a", "a different text\n")),
+                "the text should not reach the fingerprint"
+            );
+            assert_ne!(
+                template_fingerprint(&with_policy("digest-a", "groups: {}\n")),
+                template_fingerprint(&with_policy("digest-b", "groups: {}\n")),
+                "a different policy file should select a different template"
+            );
         }
     }
 
