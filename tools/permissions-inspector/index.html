@@ -146,10 +146,11 @@ footer a{color:var(--accent)}
 <div class="wrap">
 <header>
   <h1>🛂 Permissions Inspector</h1>
-  <p class="sub">Trusted Server never ships a permission policy. The builder
-  of a deployment chooses the <code>permissions.yaml</code> baked into their
-  compiled image, the operator of that image can overlay another, and the
-  visitor's own signals decide the rest at runtime. This page reads such a
+  <p class="sub">Trusted Server never ships a permission policy, and no
+  build carries one. A domain's settings name the publisher's own
+  <code>permissions.yaml</code>, the file is supplied when the service is
+  deployed, and the visitor's own signals decide the rest at runtime. This
+  page reads such a
   policy document, written in the IAB Tech Lab Privacy Taxonomy's own
   vocabulary, and answers the question a policy owner actually has: for a
   visitor in a given place, with given consent signals, which Data Uses are
@@ -169,9 +170,8 @@ footer a{color:var(--accent)}
       <label class="field" for="testfile">Test policy</label>
       <select id="testfile"></select>
       <p class="hint">The samples in the repository's config/permissions
-      directory. No policy ever ships with Trusted Server: the builder bakes
-      their chosen file into the image, the operator can overlay another, and
-      choosing is always explicit.</p>
+      directory. No policy ships with Trusted Server. A domain's settings
+      name the publisher's own file, and choosing is always explicit.</p>
     </div>
     <div id="pane-paste" hidden>
       <textarea id="yaml-in" spellcheck="false" aria-label="permissions.yaml content"></textarea>
