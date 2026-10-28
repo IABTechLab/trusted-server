@@ -15,8 +15,7 @@
 //! reports internal request state over an unauthenticated route, serves a
 //! browser module that does nothing useful, and resolves location from static
 //! configuration rather than from the request. It is a development dependency
-//! of the Axum and Fastly adapters only, so no adapter's production build
-//! reaches it.
+//! of the four adapters only, so no adapter's production build reaches it.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
