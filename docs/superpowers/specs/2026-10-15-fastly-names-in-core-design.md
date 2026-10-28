@@ -137,7 +137,7 @@ Core is built on EdgeZero and names no hosting platform in any line, whether cod
 | Fermyon                    | 1 (1)                           | 1            | 0                   |
 | Every other name or domain | 0                               | 0            | 0                   |
 
-The guard found 172 lines before this change, some of them naming two platforms, and none after. All 172 were comments, documents or test code.
+At `13d57b03f`, this row's last commit before its comments, documents and tests were changed, the guard finds 173 lines. One is the `_vercel` entry of the attestation prefixes, which core no longer has, and the other 172, some of them naming two platforms, are comments, documents or test code. At this row's head the guard finds none.
 
 **What changes for an operator.** Nothing that core does when it runs changes.
 
@@ -178,7 +178,7 @@ Not tested:
 | 2026-10-15 | Fixes from review round 1. The readers of each declared list and the open questions on them, `x-debug-fastly-pop`, the scheme change, the effects on the other adapters, where each refusal happens, the rollout, the narrowed constants, `x-compress-hint`, the file count, the untested paths and the review log.   |
 | 2026-10-15 | Corrections from review round 2. The Fastly sentence of 2.3 and the changelog on the `x-debug-fastly-pop` refusal, the changelog on the spoofable strip and the scheme change, when the Axum, Cloudflare and Spin adapters strip `fastly-client-ip`, and the comment in `request_headers.rs` left for a later change. |
 | 2026-10-16 | Core names no hosting platform or platform domain in any line. Section 2.6 with the counts, the `_vercel` prefix and the test host, the guard and the tests that moved to the Fastly adapter, and section 3 no longer leaves core's comments and tests for later.                                                     |
-| 2026-10-26 | Row 12 no longer adds `ORIGIN_ASSET_PREFIXES`, so core holds no `_vercel` entry before this change. Section 2.6 counts 172 lines before this change, the count of 2026-10-16 less that entry, all of them comments, documents or test code, and no other section names the prefix.                                    |
+| 2026-10-26 | Row 12 no longer adds `ORIGIN_ASSET_PREFIXES`, so core holds no `_vercel` entry before this change. Section 2.6 names the commit it counts at, `13d57b03f`, where the guard finds 173 lines, that entry and 172 comments, documents or test code, and no other section names the prefix.                              |
 | 2026-10-26 | The header no longer calls the pull request a draft.                                                                                                                                                                                                                                                                  |
 
 ## Review log
