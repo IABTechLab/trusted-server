@@ -9,6 +9,7 @@
 //! private to its crate, so the constants below copy it. The writer writes
 //! only the local server's store, in the `fastly.toml` the manifest names.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -243,7 +244,12 @@ fn chunks_of(envelope_json: &str) -> impl Iterator<Item = &str> {
 
 /// The lowercase hex SHA-256 of `text`.
 fn sha256_hex(text: &str) -> String {
-    format!("{:x}", Sha256::digest(text.as_bytes()))
+    let digest = Sha256::digest(text.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(hex, "{byte:02x}").expect("should write hex digit to string");
+    }
+    hex
 }
 
 /// The `fastly.toml` the manifest names for the Fastly adapter, beside the
