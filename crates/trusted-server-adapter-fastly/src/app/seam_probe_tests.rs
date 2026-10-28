@@ -903,9 +903,9 @@ mod module_endpoints {
         let settings = settings_with(&format!(
             r#"{HMAC_BLOCK}
         [testing]
-        modules = ["seam-probe", "own-module"]
+        modules = ["iabtl", "own-module"]
 
-        [testing.seam-probe]
+        [testing.iabtl]
         country = "ZZ"
         "#
         ));
