@@ -5,7 +5,7 @@
 **Related specs:** `2026-10-12-shared-vendor-tables-design.md` (the `[shared.51degrees]` table), `2026-10-12-loading-cache-design.md` (the `51degrees-answers` cache), `2026-10-12-page-middleware-design.md` (the `[[serve]]` entries), `2026-10-14-source-modules-design.md` (the source a page is fetched from) and `2026-10-17-request-filters-on-every-adapter-design.md` (the request filters every adapter runs), all in IABTechLab/trusted-server#1342, which holds every design document of the stack
 **Related PRs:** jwrosewell/trusted-server#39, IABTechLab/trusted-server#1386
 **Issues:** IABTechLab/trusted-server#1333
-**Last updated:** 2026-10-26
+**Last updated:** 2026-10-27
 
 > **Why this spec exists.** A browser sends its high entropy client hints only when the site asks for them and delegates them, and nothing in the stack writes the headers and the tag that do so for a deployment that uses the 51Degrees service, so every first page view of a session is priced on the User-Agent alone.
 
@@ -321,7 +321,7 @@ Six things have no test.
 | 2026-10-15 | Fixes from review round 2. The pull request that holds the design documents, the wait for the first call in the guide, and the code comments left for a later change.                                                                                                                                                                                                                 |
 | 2026-10-15 | Code fixes for the call's scope, what it sends and header merging. The permission question stays open, with what was found, and the answer lifetime is a new open question.                                                                                                                                                                                                           |
 | 2026-10-18 | Every adapter runs the filter, from `2026-10-17-request-filters-on-every-adapter-design.md` and its first review round. The table of parts, the builder, the `timeout_ms` setting, what bounds the call on each adapter, consent, failure, rollout, section 3 and the tests say so. Fixes from review round 3, the wait on Axum for a service that cannot be reached and test item 6. |
-| 2026-10-26 | The service's answer is held only where a deployment links a loading cache module, and a stock build, which links none, calls the service on every page navigation an entry covers (`2026-10-12-loading-cache-design.md`, section 7). The table of parts and the declared cache say so.                                                                                               |
+| 2026-10-27 | The service's answer is held only where a deployment links a loading cache module, and a stock build, which links none, calls the service on every page navigation an entry covers (`2026-10-12-loading-cache-design.md`, section 7). The table of parts and the declared cache say so.                                                                                               |
 
 ## Review log
 
