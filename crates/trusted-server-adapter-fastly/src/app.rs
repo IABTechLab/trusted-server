@@ -135,7 +135,8 @@ use trusted_server_core::integrations::{
 };
 use trusted_server_core::permissions::PermissionState;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, StoreName, build_geo_module,
+    ClientInfo, GeoInfo, PlatformKvStore, PolicyOrigin, RuntimeServices, StoreName,
+    build_geo_module,
 };
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
@@ -219,6 +220,9 @@ pub(crate) struct AppState {
     /// than the first request, and handed to every request's services.
     pub(crate) permission_signal_modules:
         Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>]>,
+    /// The permission policy the domain's settings loaded, which every
+    /// request is given.
+    pub(crate) permission_policy: Arc<trusted_server_core::permissions::PermissionPolicy>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -246,6 +250,7 @@ pub(crate) fn load_settings_from_config_store(
         &stores.config_store_name,
         &stores.config_key,
         &stores.secret_store_name,
+        PolicyOrigin::Blob,
         &trusted_server_modules::builders_with(registered_integrations()),
     )
 }
@@ -345,6 +350,7 @@ pub(crate) fn build_state_with_registrations(
             &settings,
             &shipped_signal_modules(),
         )?;
+    let permission_policy = settings.required_permission_policy()?;
 
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
@@ -357,6 +363,7 @@ pub(crate) fn build_state_with_registrations(
         auction_telemetry_sink,
         ec_module,
         permission_signal_modules,
+        permission_policy,
     }))
 }
 
@@ -458,6 +465,9 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         // crates this adapter links, so every request asks exactly the ones
         // configuration named, in that order.
         .permission_signal_modules(Arc::clone(&state.permission_signal_modules))
+        // The policy the domain's settings loaded decides the request's
+        // permissions.
+        .permission_policy(Arc::clone(&state.permission_policy))
         .host_signals(Arc::new(FastlyHostSignals::new(tls_ja4, h2_fingerprint)));
 
     // Hand every request the module resolved at the composition root, so the
@@ -495,19 +505,25 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
 /// middleware builds this once and clones it per request with
 /// [`RuntimeServices::with_client_info`], and the entry point rebuilds it per
 /// call.
+///
+/// The settings are ones the runtime loader loaded, so they carry the
+/// permission policy their domain names, which every services graph holds.
 pub(crate) fn build_finalize_services(
     settings: &Settings,
     kv_store: Arc<dyn PlatformKvStore>,
 ) -> RuntimeServices {
-    RuntimeServices::builder()
+    let mut builder = RuntimeServices::builder()
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
         .kv_store(kv_store)
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .geo(build_geo_module(settings, Arc::new(FastlyPlatformGeo)))
-        .client_info(ClientInfo::default())
-        .build()
+        .client_info(ClientInfo::default());
+    if let Some(policy) = settings.permission_policy() {
+        builder = builder.permission_policy(Arc::clone(policy));
+    }
+    builder.build()
 }
 
 fn publisher_fallback_methods() -> [Method; 7] {
@@ -1857,11 +1873,33 @@ mod tests {
             "#,
         )
         .expect("should parse test settings")
+        // A loaded domain carries its policy, and these tests decide under the
+        // repository's sample.
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
     }
 
     fn test_router() -> RouterService {
         let state = build_state_from_settings(test_settings()).expect("should build test state");
         TrustedServerApp::routes_for_state(&state)
+    }
+
+    #[test]
+    fn each_request_is_given_the_policy_its_domain_loaded() {
+        let policy = trusted_server_core::test_support::policies::open();
+        let state =
+            build_state_from_settings(test_settings().with_permission_policy(Arc::clone(&policy)))
+                .expect("should build test state");
+        let context = RequestContext::new(
+            empty_request(Method::GET, "/article"),
+            PathParams::default(),
+        );
+
+        let services = build_per_request_services(&state, &context);
+
+        assert!(
+            Arc::ptr_eq(services.permission_policy(), &policy),
+            "the request should decide under its domain's policy, not the sample"
+        );
     }
 
     #[test]
@@ -1928,6 +1966,7 @@ mod tests {
             default_kv_store,
             ec_module,
             permission_signal_modules: Arc::default(),
+            permission_policy: trusted_server_core::permissions::PermissionPolicy::sample(),
         });
         TrustedServerApp::routes_for_state(&state)
     }
@@ -2074,6 +2113,28 @@ mod tests {
             Some("text/plain; charset=utf-8"),
             "startup errors should stay plain-text for OPTIONS requests"
         );
+    }
+
+    #[test]
+    fn the_startup_router_answers_500_to_a_policy_load_error() {
+        use trusted_server_core::test_support::policy_failure;
+
+        let error = policy_failure::load_error();
+        assert!(
+            format!("{error:?}").contains(&format!("`{}`", policy_failure::POLICY_NAME)),
+            "the startup error should name the policy: {error:?}"
+        );
+
+        let router = startup_error_router(&error);
+        for method in super::publisher_fallback_methods() {
+            for path in ["/", "/article"] {
+                assert_eq!(
+                    route(&router, empty_request(method.clone(), path)).status(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "{method} {path} should answer 500"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2363,7 +2424,8 @@ mod tests {
             assume_single_jurisdiction = true
             "#,
         )
-        .expect("should parse production-shaped settings");
+        .expect("should parse production-shaped settings")
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
         let state = build_state_from_settings(settings).expect("should build state");
         let router = TrustedServerApp::routes_for_state(&state);
 
@@ -3190,7 +3252,8 @@ mod tests {
             origin_url = "https://assets.example.com"
             "#,
         )
-        .expect("should parse asset-route settings");
+        .expect("should parse asset-route settings")
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
         let state = build_state_from_settings(settings).expect("should build state");
         let router = TrustedServerApp::routes_for_state(&state);
 
@@ -3281,6 +3344,7 @@ mod tests {
             .http_client(Arc::new(StreamingHttpClient))
             .geo(Arc::new(crate::platform::FastlyPlatformGeo))
             .client_info(ClientInfo::default())
+            .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
             .build()
     }
 
@@ -3480,6 +3544,7 @@ mod tests {
             .http_client(Arc::clone(&origin) as Arc<dyn PlatformHttpClient>)
             .geo(Arc::new(crate::platform::FastlyPlatformGeo))
             .client_info(ClientInfo::default())
+            .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
             .build();
         let stock = trusted_server_modules::builders();
         let plan = Arc::new(
@@ -3633,7 +3698,8 @@ mod tests {
             origin_url = "https://assets.example.com"
             "#,
         )
-        .expect("should parse asset-route settings");
+        .expect("should parse asset-route settings")
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
         let state = build_state_from_settings(settings).expect("should build state");
 
         let services = streaming_runtime_services();
