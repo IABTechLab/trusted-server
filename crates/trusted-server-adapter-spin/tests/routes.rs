@@ -1238,7 +1238,9 @@ fn router_refusing_every_crawler() -> RouterService {
             always_allow = ["/ads.txt"]
         "#,
     )
-    .expect("should parse route test settings");
+    .expect("should parse route test settings")
+    // A loaded domain carries its policy.
+    .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
 
     TrustedServerApp::routes_with_settings(settings)
         .expect("should build router from test settings")
@@ -1469,7 +1471,9 @@ mod robots_txt_from_a_module {
                 modules = ["robots-txt-answers-once"]
             "#,
         )
-        .expect("should parse route test settings");
+        .expect("should parse route test settings")
+        // A loaded domain carries its policy.
+        .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
         let builder = IntegrationBuilder::new(
             ANSWERS_ONCE_ID,
             ANSWERS_ONCE_ID,
