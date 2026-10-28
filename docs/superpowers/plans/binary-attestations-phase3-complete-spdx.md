@@ -2,6 +2,8 @@
 
 **Status:** Gate 2 design approved on 2026-10-28 for strict admission from retained, artifact-bound owning evidence. Plan only: production generation stays closed until all seven binaries pass. The [coverage matrix](binary-attestations-phase3-complete-spdx-implementation.md) and [full-cohort cost assessment](binary-attestations-phase3-full-cohort-feasibility.md) expose costly evidence gaps before any implementation; no code, qualification or rehearsal tag is authorized.
 
+**New option for decision:** The user has not approved target-specific activation. The [issue-scoped all-seven build-derived Cargo/npm SBOM option](binary-attestations-phase3-issue-scoped-sbom-option.md) proposes an explicit narrower coverage amendment, with per-SBOM/guide limits and a separate estimate. It is not adopted; strict Gate 2 still governs and Gate 3 Steps 2–5 remain held.
+
 **Historical reviewed baseline:** Phase 2 `8a797dbcb0467b867dfbcc571597110b9254d672`, tree-equivalent to `08e1c33b8` after application integration `7d551777daeaee09e24bce9bf4f96edac6e5e0df`. Rehearsal `.13` remains evidence only for `770a425df4b28caaaef68dfd930bceabd9928046`.
 
 **Verification baseline:** [Historical Phase 2 `8a797dbcb` CI passed](https://github.com/IABTechLab/trusted-server/actions/runs/40654745582); signing/publication and manual negative canaries were skipped as configured.

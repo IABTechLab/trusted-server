@@ -2,6 +2,8 @@
 
 **Status:** Docs-only assessment requested on 2026-10-28. No capture implementation, acquisition, image build, qualification, production selection or rehearsal tag is authorized. The strict Gate 2 scope remains in force; the identity-only alternative below is a proposed amendment for a user decision, not an adopted definition of completeness.
 
+**New option for decision:** The user has not approved target-specific activation. The [issue-scoped all-seven build-derived Cargo/npm SBOM option](binary-attestations-phase3-issue-scoped-sbom-option.md) proposes an explicit narrower coverage amendment, with per-SBOM/guide limits and a separate estimate. It is not adopted; strict Gate 2 still governs and Gate 3 Steps 2–5 remain held.
+
 **Scope:** All 21 unresolved cells in the [coverage matrix](binary-attestations-phase3-complete-spdx-implementation.md): seven native, seven platform/tool and seven licence cells. Cargo/JS/runtime capture and complete-generator integration also remain work, but their costs are not hidden inside these U-cell estimates. Part of #1235; draft #1463.
 
 ## Basis and limits

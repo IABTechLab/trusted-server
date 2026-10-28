@@ -14,6 +14,8 @@ Each cell names its **exact closure contract** below. **P** means a bounded ordi
 
 **Status:** The user selected full-cohort closure and cost assessment first; see the [21-cell feasibility and scope comparison](binary-attestations-phase3-full-cohort-feasibility.md). Planning remains docs-only, with no capture implementation. Gate 2's strict design is approved; no implementation plan or code is approved. The matrix exposes costly native/platform/acquisition cells for every target, especially Apple SDK/toolchain, GNU derived images and musl startup/compiler runtimes. No promise is made that the existing hosted setup can close them within current job limits. No target is silently removed and no unresolved contributor is excluded.
 
+**New option for decision:** The user has not approved target-specific activation. The [issue-scoped all-seven build-derived Cargo/npm SBOM option](binary-attestations-phase3-issue-scoped-sbom-option.md) proposes an explicit narrower coverage amendment, with per-SBOM/guide limits and a separate estimate. It is not adopted; strict Gate 2 still governs and Gate 3 Steps 2–5 remain held.
+
 **Tracking:** Part of #1235; draft #1463. Source: Phase 2 `5fa3843364f247fdc261c438ab9257323637a42c` and frozen #1262 `122b78664b1235c717e9208fd200f9a9b0c335df`. This document changes no schema, policy, producer, workflow or release selection.
 
 ## Evidence that closes each cell

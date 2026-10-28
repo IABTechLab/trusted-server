@@ -2,6 +2,8 @@
 
 **Status:** Step 1 approved on 2026-10-28 for frozen-v1 regression checks, the assigned source port and restored assertions only. The Gate 3 design is approved with a new neutral v2 cohort ID, `trusted-server-binaries`. No v2 schema/policy/cohort/descriptor/admission/assembly, workflow, release script, signing, production selector or rehearsal tag is authorized. Consumer implementation remains Phase 4; live signing/publication and fork trust remain Gates 4/6.
 
+**New option for decision:** The user has not approved target-specific activation. The [issue-scoped all-seven build-derived Cargo/npm SBOM option](binary-attestations-phase3-issue-scoped-sbom-option.md) proposes an explicit narrower coverage amendment, with per-SBOM/guide limits and a separate estimate. It is not adopted; strict Gate 2 still governs and Gate 3 Steps 2–5 remain held.
+
 **Tracking:** Part of #1235; draft #1463. Read with the [approved design](binary-attestations-phase3-seven-artifact-index.md), [Gate 2 coverage/rollout decision](binary-attestations-phase3-complete-spdx-implementation.md) and [phase assignment](binary-attestations-phases-2-4.md).
 
 ## Frozen and new identities
