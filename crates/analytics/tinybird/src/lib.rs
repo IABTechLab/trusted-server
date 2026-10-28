@@ -689,6 +689,7 @@ mod tests {
                 trusted_server_core::platform::PlatformGeoModule::new("noop", Arc::new(NoopGeo)),
             ))
             .client_info(ClientInfo::default())
+            .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
             .build()
     }
 
