@@ -1302,6 +1302,7 @@ fn services_with_this_adapter_s_backend(origin: &Arc<StubHttpClient>) -> Runtime
             Arc::new(UsGeo),
         )))
         .client_info(ClientInfo::default())
+        .permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
         .build()
 }
 
