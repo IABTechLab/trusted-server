@@ -1974,6 +1974,23 @@ pub(crate) fn classify_response_route(
     ResponseRoute::Stream
 }
 
+/// An empty document of `media_type`, which the middleware a `[[fetch]]`
+/// entry names for a path the origin has nothing at is run on.
+fn empty_document(media_type: &str) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let content_type = if media_type.starts_with("text/") {
+        format!("{media_type}; charset=utf-8")
+    } else {
+        media_type.to_owned()
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .body(EdgeBody::empty())
+        .change_context(TrustedServerError::Proxy {
+            message: format!("failed to build an empty {media_type} document"),
+        })
+}
+
 fn response_cache_control_is_private_or_no_store(response: &Response<EdgeBody>) -> bool {
     cache_control_headers_are_private_or_no_store(response.headers())
 }
@@ -5675,6 +5692,22 @@ pub async fn handle_publisher_request(
         response.status(),
         response.headers().len()
     );
+
+    // A file the origin does not have is made, see `PhaseEntries::making`.
+    // Core runs no middleware for a request that names no host, so there the
+    // made file would go out empty and the origin's answer stands instead.
+    if response.status() == StatusCode::NOT_FOUND
+        && (request_method == Method::GET || request_method == Method::HEAD)
+        && !request_host.is_empty()
+        && let Some(entry) = settings.fetch.making(&request_path)
+    {
+        log::debug!(
+            "Making {} for {request_path}, which the origin does not have, with {}",
+            entry.media_type,
+            entry.middleware.join(", ")
+        );
+        response = empty_document(&entry.media_type)?;
+    }
 
     if should_run_ad_stack && response.status() == StatusCode::NOT_MODIFIED {
         if let Some(dispatched) = dispatched_auction.take() {
@@ -22121,6 +22154,430 @@ mod tests {
         assert_eq!(
             output, "plain\n",
             "should run nothing on a path the entry does not cover"
+        );
+    }
+
+    /// What the publisher path answered one request with.
+    struct Proxied {
+        settings: Settings,
+        registry: IntegrationRegistry,
+        services: crate::platform::RuntimeServices,
+        orchestrator: AuctionOrchestrator,
+        response: PublisherResponse,
+    }
+
+    /// A request through the publisher path, the origin answering `status`.
+    async fn proxy(fetch: Vec<PhaseEntry>, method: Method, path: &str, status: u16) -> Proxied {
+        let settings = settings_running_the_middleware_fixture(fetch);
+        let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            status,
+            b"<html><body>the origin's page</body></html>".to_vec(),
+            vec![("content-type", "text/html; charset=utf-8")],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let consent = crate::consent::ConsentContext {
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+            ..Default::default()
+        };
+        let mut ec_context = EcContext::new_for_test_with_ip(None, consent, None);
+        let orchestrator = AuctionOrchestrator::new(
+            crate::auction::test_support::legacy_auction_config(&settings),
+        );
+        let req = HttpRequest::builder()
+            .method(method)
+            .uri(format!("https://publisher.example{path}"))
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let response = handle_publisher_request(
+            AppContext {
+                settings: &settings,
+                integration_registry: &registry,
+            },
+            &services,
+            None,
+            &mut ec_context,
+            AuctionDispatch {
+                orchestrator: &orchestrator,
+                slots: &[],
+                registry: None,
+            },
+            req,
+            EdgeCacheHeader::SMaxageFallback,
+        )
+        .await
+        .expect("should proxy the request");
+        Proxied {
+            settings,
+            registry,
+            services,
+            orchestrator,
+            response,
+        }
+    }
+
+    /// One entry naming the fixture's text middleware, for `path` or for
+    /// every path.
+    fn text_entry_for(path: Option<&str>) -> Vec<PhaseEntry> {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        vec![PhaseEntry {
+            media_type: fixture::TEXT_MEDIA_TYPE.to_owned(),
+            path: path.map(str::to_owned),
+            middleware: vec![fixture::TEXT.to_owned()],
+        }]
+    }
+
+    /// The response of a proxied request, however it is to be sent.
+    fn response_of(response: PublisherResponse) -> Response<EdgeBody> {
+        match response {
+            PublisherResponse::Buffered(response)
+            | PublisherResponse::Stream { response, .. }
+            | PublisherResponse::PassThrough { response, .. } => response,
+            PublisherResponse::AssembleTemplate { .. } => {
+                panic!("a template is not an answer to these requests")
+            }
+        }
+    }
+
+    fn content_type_of(response: &Response<EdgeBody>) -> Option<&str> {
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+    }
+
+    #[tokio::test]
+    async fn a_file_the_origin_does_not_have_is_made_by_the_middleware_named_for_its_path() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let proxied = proxy(
+            text_entry_for(Some("/ads.txt")),
+            Method::GET,
+            "/ads.txt",
+            404,
+        )
+        .await;
+        let PublisherResponse::Stream {
+            response,
+            body,
+            params,
+        } = proxied.response
+        else {
+            panic!("a made file should stream through the entry's middleware");
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            content_type_of(&response),
+            Some("text/plain; charset=utf-8"),
+            "should be a document of the entry's media type"
+        );
+        let mut params = *params;
+        let mut output = Vec::new();
+        stream_publisher_body_async(
+            body,
+            &mut output,
+            &mut params,
+            &proxied.settings,
+            &proxied.registry,
+            &proxied.orchestrator,
+            &proxied.services,
+        )
+        .await
+        .expect("should stream the made file");
+        assert_eq!(
+            String::from_utf8(output).expect("text"),
+            fixture::TEXT_LINE,
+            "should be what the middleware writes on an empty document"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_head_request_for_a_made_file_gets_the_same_answer() {
+        let proxied = proxy(
+            text_entry_for(Some("/ads.txt")),
+            Method::HEAD,
+            "/ads.txt",
+            404,
+        )
+        .await;
+        let response = buffer_publisher_response_async(
+            proxied.response,
+            &Method::HEAD,
+            &proxied.settings,
+            &proxied.registry,
+            &proxied.orchestrator,
+            &proxied.services,
+        )
+        .await
+        .expect("should buffer the HEAD answer");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            content_type_of(&response),
+            Some("text/plain; charset=utf-8"),
+            "should answer a HEAD as the GET is answered"
+        );
+        assert!(
+            response
+                .into_body()
+                .into_bytes()
+                .expect("should hold the HEAD answer in memory")
+                .is_empty(),
+            "should answer a HEAD with no body"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_html_entry_with_a_path_makes_no_missing_page() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::middleware::HTML_MEDIA_TYPE;
+
+        let proxied = proxy(
+            vec![PhaseEntry {
+                media_type: HTML_MEDIA_TYPE.to_owned(),
+                path: Some("/news/".to_owned()),
+                middleware: vec![fixture::HEAD.to_owned()],
+            }],
+            Method::GET,
+            "/news/missing",
+            404,
+        )
+        .await;
+
+        assert_eq!(
+            response_of(proxied.response).status(),
+            StatusCode::NOT_FOUND,
+            "should keep the origin's answer for a page it does not have"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_html_entry_ahead_does_not_shadow_the_entry_for_a_missing_file() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::middleware::HTML_MEDIA_TYPE;
+
+        let mut fetch = vec![PhaseEntry {
+            media_type: HTML_MEDIA_TYPE.to_owned(),
+            path: Some("/".to_owned()),
+            middleware: vec![fixture::HEAD.to_owned()],
+        }];
+        fetch.extend(text_entry_for(Some("/ads.txt")));
+        let proxied = proxy(fetch, Method::GET, "/ads.txt", 404).await;
+        let response = response_of(proxied.response);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            content_type_of(&response),
+            Some("text/plain; charset=utf-8"),
+            "should make the file from the text/plain entry, not as HTML"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_entry_covering_every_path_makes_no_missing_page() {
+        let proxied = proxy(text_entry_for(None), Method::GET, "/missing.txt", 404).await;
+
+        assert_eq!(
+            response_of(proxied.response).status(),
+            StatusCode::NOT_FOUND,
+            "should keep the origin's answer, because a page the origin does not have is its answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_page_under_an_entry_path_keeps_the_origin_answer() {
+        for (entry_path, path) in [("/", "/missing-page"), ("/ads.txt", "/ads.txt.bak")] {
+            let proxied = proxy(text_entry_for(Some(entry_path)), Method::GET, path, 404).await;
+
+            assert_eq!(
+                response_of(proxied.response).status(),
+                StatusCode::NOT_FOUND,
+                "should keep the origin's answer for {path}, which the entry for {entry_path} \
+                 covers but does not name"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_entry_for_a_folder_makes_no_missing_page() {
+        for folder in ["/", "/feeds/"] {
+            let proxied = proxy(text_entry_for(Some(folder)), Method::GET, folder, 404).await;
+
+            assert_eq!(
+                response_of(proxied.response).status(),
+                StatusCode::NOT_FOUND,
+                "should keep the origin's answer for the folder {folder}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_file_outside_the_entry_path_keeps_the_origin_answer() {
+        let proxied = proxy(
+            text_entry_for(Some("/ads.txt")),
+            Method::GET,
+            "/robots.txt",
+            404,
+        )
+        .await;
+
+        assert_eq!(
+            response_of(proxied.response).status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_that_names_no_host_keeps_the_origin_answer() {
+        let settings = settings_running_the_middleware_fixture(text_entry_for(Some("/ads.txt")));
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            404,
+            b"<html><body>the origin's page</body></html>".to_vec(),
+            vec![("content-type", "text/html; charset=utf-8")],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let request = build_request(Method::GET, "/ads.txt");
+
+        let response = run_publisher_proxy(&settings, &services, request).await;
+
+        assert_eq!(
+            response_of(response).status(),
+            StatusCode::NOT_FOUND,
+            "should keep the origin's answer, because core runs no middleware for a request \
+             that names no host and the made file would go out empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_method_other_than_get_or_head_keeps_the_origin_answer() {
+        for method in [
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ] {
+            let proxied = proxy(
+                text_entry_for(Some("/ads.txt")),
+                method.clone(),
+                "/ads.txt",
+                404,
+            )
+            .await;
+
+            assert_eq!(
+                response_of(proxied.response).status(),
+                StatusCode::NOT_FOUND,
+                "should keep the origin's answer to a {method}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_made_file_carries_none_of_the_headers_of_the_origin_s_404() {
+        let settings = settings_running_the_middleware_fixture(text_entry_for(Some("/ads.txt")));
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            404,
+            b"<html><body>the origin's page</body></html>".to_vec(),
+            vec![
+                ("content-type", "text/html; charset=utf-8"),
+                ("set-cookie", "session=origin; Path=/"),
+                ("cache-control", "public, max-age=600"),
+                ("etag", "\"origin-404\""),
+                ("x-origin", "not found"),
+            ],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/ads.txt")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response = response_of(run_publisher_proxy(&settings, &services, request).await);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let names: Vec<&str> = response
+            .headers()
+            .keys()
+            .map(http::HeaderName::as_str)
+            .collect();
+        assert_eq!(
+            names,
+            [header::CONTENT_TYPE.as_str()],
+            "should carry the Content-Type the file is made with and nothing the origin sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_made_file_streams_through_the_finalizer_fastly_uses() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let proxied = proxy(
+            text_entry_for(Some("/ads.txt")),
+            Method::GET,
+            "/ads.txt",
+            404,
+        )
+        .await;
+        let response = publisher_response_into_streaming_response(
+            proxied.response,
+            &Method::GET,
+            Arc::new(proxied.settings),
+            &proxied.registry,
+            Arc::new(proxied.orchestrator),
+            proxied.services,
+        )
+        .await
+        .expect("should finalize the made file");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            content_type_of(&response),
+            Some("text/plain; charset=utf-8")
+        );
+        let mut body = Vec::new();
+        match response.into_body() {
+            EdgeBody::Stream(mut stream) => {
+                while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+                    body.extend_from_slice(&chunk.expect("should read the made file"));
+                }
+            }
+            other => body.extend_from_slice(&other.into_bytes().expect("should hold the file")),
+        }
+        assert_eq!(
+            String::from_utf8(body).expect("text"),
+            fixture::TEXT_LINE,
+            "should be what the middleware writes on an empty document"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_origin_error_on_the_entry_path_keeps_the_origin_answer() {
+        let proxied = proxy(
+            text_entry_for(Some("/ads.txt")),
+            Method::GET,
+            "/ads.txt",
+            500,
+        )
+        .await;
+
+        assert_eq!(
+            response_of(proxied.response).status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "should make a file only where the origin has none"
         );
     }
 

@@ -212,6 +212,12 @@ markup and the element and text handlers are decisions about HTML, and an
 action that makes one on another media type is refused by name when the
 chain is planned.
 
+A middleware named in an entry with a path, for a media type other than
+HTML, also runs where the origin answers `404 Not Found` for that path
+itself, on an empty document of the entry's media type, and what it writes
+is the file. A middleware that adds to a file therefore writes the same on an
+empty one, with nothing before its first line.
+
 ```rust
 struct Sellers;
 

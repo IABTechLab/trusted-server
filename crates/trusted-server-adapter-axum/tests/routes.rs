@@ -20,7 +20,12 @@ const LEGACY_ADMIN_DENY_METHODS: &[&str] =
 /// every route into a startup error page (and its route table into the
 /// fallback-only set).
 fn test_settings() -> trusted_server_core::settings::Settings {
-    trusted_server_core::settings::Settings::from_toml(
+    test_settings_with("")
+}
+
+/// The route tests' settings with `extra` appended.
+fn test_settings_with(extra: &str) -> trusted_server_core::settings::Settings {
+    trusted_server_core::settings::Settings::from_toml(&format!(
         r#"
             [publisher]
             domain = "test-publisher.example.com"
@@ -36,8 +41,9 @@ fn test_settings() -> trusted_server_core::settings::Settings {
 
             [geo]
             assume_single_jurisdiction = true
-        "#,
-    )
+            {extra}
+        "#
+    ))
     .expect("should parse route test settings")
     // A loaded domain carries its policy, and these tests decide under the
     // repository's sample.
@@ -830,5 +836,85 @@ async fn health_carries_no_version() {
     assert!(
         response.headers().get("x-ts-version").is_none(),
         "should write no version on /health, which the service_version middleware writes on a page"
+    );
+}
+
+/// A publisher whose origin has no `ads.txt` gets one made of the sellers
+/// lines, through this adapter's router and the stock sellers module.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sellers_module_makes_an_ads_txt_the_origin_does_not_have() {
+    use std::sync::Arc;
+
+    use trusted_server_core::platform::PlatformHttpClient;
+    use trusted_server_core::platform::test_support::{
+        StubHttpClient, build_services_with_http_client,
+    };
+
+    const SELLERS: &str = r#"
+        [ads-txt]
+        modules = ["sellers"]
+
+        [ads-txt.sellers]
+        lines = ["ssp.example, 12345, DIRECT, f08c47fec0942fa0"]
+
+        [[fetch]]
+        media_type = "text/plain"
+        path = "/ads.txt"
+        middleware = ["ads-txt.sellers"]
+    "#;
+
+    let origin = Arc::new(StubHttpClient::new());
+    origin.push_response_with_headers(
+        404,
+        b"<html><body>Not found</body></html>".to_vec(),
+        vec![
+            ("content-type", "text/html; charset=utf-8"),
+            ("set-cookie", "session=origin; Path=/"),
+            ("cache-control", "public, max-age=600"),
+        ],
+    );
+    let router = TrustedServerApp::routes_with_settings_and_services(
+        test_settings_with(SELLERS),
+        build_services_with_http_client(Arc::clone(&origin) as Arc<dyn PlatformHttpClient>),
+    )
+    .expect("should build the router with the sellers module");
+    let request = edgezero_core::http::request_builder()
+        .method("GET")
+        .uri("https://test-publisher.example.com/ads.txt")
+        .header("host", "test-publisher.example.com")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build the ads.txt request");
+
+    let response = router
+        .oneshot(request)
+        .await
+        .expect("should answer the ads.txt request");
+
+    assert_eq!(
+        response.status(),
+        200,
+        "should make the file the origin does not have"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain; charset=utf-8")
+    );
+    assert!(
+        response.headers().get("set-cookie").is_none()
+            && response.headers().get("cache-control").is_none(),
+        "should carry none of the headers the origin sent with its 404: {:?}",
+        response.headers()
+    );
+    let body = response
+        .into_body()
+        .into_bytes()
+        .expect("should buffer the made file");
+    assert_eq!(
+        body.as_ref(),
+        b"ssp.example, 12345, DIRECT, f08c47fec0942fa0\n",
+        "should be the sellers lines alone"
     );
 }

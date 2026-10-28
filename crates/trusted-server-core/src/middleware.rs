@@ -482,6 +482,25 @@ impl PhaseEntries {
         names
     }
 
+    /// The entry that makes the document the origin does not have at
+    /// `path`, being the first written, for a media type core streams other
+    /// than HTML, whose `path` is `path` itself and that names a middleware.
+    /// A longer path the entry's `path` begins, and a folder, written with its
+    /// closing slash, get nothing made, so a page the origin does not have
+    /// keeps the origin's answer.
+    #[must_use]
+    pub fn making(&self, path: &str) -> Option<&PhaseEntry> {
+        if path.ends_with('/') {
+            return None;
+        }
+        self.0.iter().find(|entry| {
+            entry.media_type != HTML_MEDIA_TYPE
+                && is_dispatched_media_type(&entry.media_type)
+                && entry.path.as_deref() == Some(path)
+                && !entry.middleware.is_empty()
+        })
+    }
+
     /// Checks each entry's media type, path and names, and that no entry is
     /// hidden behind an earlier one, or covers the same pages as one.
     ///

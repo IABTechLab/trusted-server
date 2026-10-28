@@ -1,6 +1,6 @@
 [package]
 name = "trusted-server-ads-txt-sellers"
-description = "Adds a publisher's sellers to the origin's ads.txt as it passes through, from the lines the settings give."
+description = "Adds a publisher's sellers to the origin's ads.txt from the lines the settings give, or makes the file from them where the origin has none."
 authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
