@@ -33,6 +33,10 @@
 # complete rules, and what is checked when, are in
 # docs/guide/configuration-rules.md.
 #
+# [shared.<vendor>] holds what one vendor's modules share, such as an endpoint
+# and a license key. That vendor's crates alone read it, its presence runs the
+# builder they share, and a table no module reads is refused.
+#
 # `TRUSTED_SERVER__` env vars can override values when the `ts` CLI builds and
 # validates this config for push (e.g. TRUSTED_SERVER__PUBLISHER__DOMAIN=...;
 # nested keys use `__`). The overlay only replaces SCALAR leaves that already

@@ -423,6 +423,7 @@ points at the functions that do the work.
 | `.with_plan_validator(...)`                   | Optional. Checks the module's settings against the compiled auction plan, when a deployment is validated and as the settings load                                                                         |
 | `.with_demand(...)` and `.with_adserver(...)` | Optional. Registers an auction implementation that `[demand]` or `[ad-server]` can name. A crate that supplies nothing else starts from `IntegrationBuilder::implementations(...)`                        |
 | `.with_loading_cache(...)`                    | Optional. Offers the loading cache the crate supplies, which a feature selects by the module's name in its `[cache.<name>]` table. An adapter takes the selections with `loading_caches_from`             |
+| `.with_shared_settings(...)`                  | Optional. Runs the builder when its vendor's `[shared.<vendor>]` table is present, for a vendor whose modules all read that one table. A builder the table runs is selected by no section                 |
 
 ```rust
 pub fn module_name() -> &'static str {
@@ -847,6 +848,20 @@ builder to that list, in the place its request hooks should run. The order of
 the list does not order page changes, which run in the order an entry names
 them. Offering a module does not run it, because the registry builds a module
 only when a section of the settings selects it.
+
+### A vendor's shared table
+
+What every module of one vendor needs, such as an endpoint and a license key,
+goes in one `[shared.<vendor>]` table. Core reads none of it. The vendor's
+crates read it as their own typed settings with
+`Settings::shared_config::<T>(vendor)`, which refuses a table that cannot be
+read as `T` or fails its validation, naming the table and the setting at fault
+and never the setting's value. The vendor's builder marks itself with
+`.with_shared_settings(vendor)`, and the registry builds it when the table is
+present and refuses a table that no builder reads. A secret in the table is
+declared with `.with_secret_settings(...)` at its path inside the table, as a
+module's own secrets are, is checked at push to name a key, and is resolved
+from the secret store when the table is present.
 
 ### Supplying a loading cache
 

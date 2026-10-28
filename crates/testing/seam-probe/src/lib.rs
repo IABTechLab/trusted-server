@@ -824,6 +824,120 @@ pub fn builder() -> IntegrationBuilder {
         .with_adserver(&SEAM_PROBE_ADSERVER)
 }
 
+/// The vendor's name, which names the table `[shared.seam-probe]` that runs
+/// [`shared_builder`].
+pub const SEAM_PROBE_SHARED_VENDOR: &str = "seam-probe";
+
+/// The id of the builder the shared table runs.
+pub const SEAM_PROBE_SHARED_ID: &str = "seam_probe_shared";
+
+/// The route the shared builder answers with the table's marker.
+pub const SEAM_PROBE_SHARED_PATH: &str = "/integrations/seam_probe_shared/marker";
+
+/// The shared route's suffix under the builder's proxy prefix.
+const SHARED_ROUTE_SUFFIX: &str = "/marker";
+
+/// What `[shared.seam-probe]` carries.
+#[derive(Debug, Clone, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct SeamProbeShared {
+    /// The text the shared route answers with.
+    #[validate(length(min = 1))]
+    pub marker: String,
+}
+
+/// A route answering the shared table's marker, which proves the table ran
+/// the builder and reached what it registered.
+#[derive(Debug)]
+struct SharedMarkerRoute {
+    marker: String,
+}
+
+impl SharedMarkerRoute {
+    async fn route(
+        &self,
+        _req: Request<EdgeBody>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        Response::builder()
+            .status(200)
+            .header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            )
+            .body(EdgeBody::from(self.marker.clone().into_bytes()))
+            .map_err(|error| {
+                Report::new(TrustedServerError::Integration {
+                    integration: SEAM_PROBE_SHARED_ID.to_string(),
+                    message: error.to_string(),
+                })
+            })
+    }
+}
+
+#[async_trait(?Send)]
+impl IntegrationProxy for SharedMarkerRoute {
+    fn integration_name(&self) -> &'static str {
+        SEAM_PROBE_SHARED_ID
+    }
+
+    fn routes(&self) -> Vec<IntegrationEndpoint> {
+        vec![self.get(SHARED_ROUTE_SUFFIX)]
+    }
+
+    async fn handle(
+        &self,
+        call: ModuleCall<'_>,
+        req: Request<EdgeBody>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        call.inject_with(self, req, Self::route)?.await
+    }
+}
+
+/// Registers the shared route when `[shared.seam-probe]` is present.
+///
+/// # Errors
+///
+/// Returns an error when the table cannot be read or fails its validation.
+pub fn register_shared(
+    settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    let Some(shared) = settings.shared_config::<SeamProbeShared>(SEAM_PROBE_SHARED_VENDOR)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        IntegrationRegistration::builder(SEAM_PROBE_SHARED_ID)
+            .without_js()
+            .with_proxy(Arc::new(SharedMarkerRoute {
+                marker: shared.marker,
+            }))
+            .build(),
+    ))
+}
+
+/// Reports whether the shared table is present, validating it.
+///
+/// # Errors
+///
+/// Returns an error when the table cannot be read or fails its validation.
+pub fn validate_shared(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    Ok(settings
+        .shared_config::<SeamProbeShared>(SEAM_PROBE_SHARED_VENDOR)?
+        .is_some())
+}
+
+/// The builder `[shared.seam-probe]` runs, which proves a vendor's shared
+/// table from outside core.
+#[must_use]
+pub fn shared_builder() -> IntegrationBuilder {
+    IntegrationBuilder::new(
+        SEAM_PROBE_SHARED_ID,
+        SEAM_PROBE_SOURCE,
+        register_shared,
+        validate_shared,
+    )
+    .with_shared_settings(SEAM_PROBE_SHARED_VENDOR)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

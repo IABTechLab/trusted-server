@@ -258,6 +258,48 @@ async fn proxy_route_reports_the_modules_geo_and_that_the_preparer_ran() {
     );
 }
 
+/// `[shared.seam-probe]` runs the builder the probe shares, whose route
+/// answers the table's marker. Without the table the builder is not built,
+/// and the table with no builder reading it is refused at startup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_vendors_shared_table_runs_its_builder() {
+    let mut with = service_with(
+        settings_with(&format!(
+            "[shared.seam-probe]\nmarker = \"from the shared table\"\n{PROBE_BLOCK}"
+        )),
+        &[seam_probe::builder(), seam_probe::shared_builder()],
+    );
+    let response = get(&mut with, seam_probe::SEAM_PROBE_SHARED_PATH).await;
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "the table runs the builder"
+    );
+    assert_eq!(body_text(response).await, "from the shared table");
+
+    let mut without = service_with(
+        settings_with(PROBE_BLOCK),
+        &[seam_probe::builder(), seam_probe::shared_builder()],
+    );
+    let response = get(&mut without, seam_probe::SEAM_PROBE_SHARED_PATH).await;
+    assert_ne!(
+        response.status().as_u16(),
+        200,
+        "without the table the builder is not built, so the route is not this server's"
+    );
+
+    let refused = TrustedServerApp::routes_with_registrations(
+        settings_with("[shared.seam-probe]\nmarker = \"x\"\n"),
+        &[seam_probe::builder()],
+    )
+    .err()
+    .expect("nothing reads the table");
+    assert!(
+        format!("{refused:?}").contains("[shared.seam-probe] is read by no module"),
+        "{refused:?}"
+    );
+}
+
 /// With `refuse_all` selected every response this adapter finalizes says not
 /// to index, and the file itself is the publisher path's, made by the
 /// `robots_txt` middleware the entry names, so no route of this server names

@@ -15,10 +15,14 @@ use serde_json::{Map, Value};
 use crate::integrations::IntegrationBuilder;
 use crate::module_name::short_form;
 
-/// The section a module is selected in and the names its table can sit
-/// under there: the name with the section's type folder left off, and the
-/// name in full where the two differ.
+/// The section a module's table sits under and the names it can be written
+/// at there, being the name with the section's type folder left off and the
+/// name in full where the two differ, or a vendor's shared table under
+/// `shared`, at the vendor's name alone.
 fn written_forms(builder: &IntegrationBuilder) -> Option<(&'static str, Vec<&'static str>)> {
+    if let Some(vendor) = builder.shared_settings() {
+        return Some((crate::settings::SHARED_TYPE, vec![vendor]));
+    }
     let name = builder.module_name()?;
     let section = builder.section()?;
     let short = short_form(section, name);
@@ -100,7 +104,12 @@ pub(crate) fn clear_unused(data: &mut Value, builders: &[IntegrationBuilder]) {
         let Some((section, forms)) = written_forms(builder) else {
             continue;
         };
-        let selected = selected_as(data, section, &forms);
+        // A vendor's table runs its builder, so a secret in the table counts
+        // as in use by the table's own rules.
+        let selected = match builder.shared_settings() {
+            Some(vendor) => Some(vendor),
+            None => selected_as(data, section, &forms),
+        };
         for form in &forms {
             let Some(table) = table_mut(data, section, form) else {
                 continue;
@@ -187,6 +196,58 @@ mod tests {
         IntegrationBuilder::new("probe", "seam-probe", probe_registration, validate_nothing)
             .with_module_name("testing.probe")
             .with_secret_settings(SECRETS)
+    }
+
+    const VENDOR: &str = "example";
+
+    fn shared_builder() -> IntegrationBuilder {
+        IntegrationBuilder::new(
+            "shared_probe",
+            "seam-probe",
+            probe_registration,
+            validate_nothing,
+        )
+        .with_shared_settings(VENDOR)
+        .with_secret_settings(SECRETS)
+    }
+
+    #[test]
+    fn a_secret_in_a_shared_table_is_kept_when_the_table_is_present_and_in_use() {
+        let mut data = json!({ "shared": { VENDOR: table(true, false) } });
+
+        clear_unused(&mut data, &[shared_builder()]);
+
+        assert_eq!(
+            data.pointer("/shared/example/key_name"),
+            Some(&json!("main-key")),
+            "the table runs the builder, so its setting in use stays"
+        );
+        assert_eq!(data.pointer("/shared/example/spare/key_name"), None);
+    }
+
+    #[test]
+    fn a_secret_in_a_shared_table_is_declared_under_the_vendors_name() {
+        let paths: Vec<String> = secret_fields(&[shared_builder()])
+            .iter()
+            .map(|field| {
+                field
+                    .path
+                    .iter()
+                    .map(|segment| match segment {
+                        SecretPathSegment::Field(name) | SecretPathSegment::OptionalField(name) => {
+                            name.to_string()
+                        }
+                        _ => "*".to_owned(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
+            .collect();
+
+        assert_eq!(
+            paths,
+            vec!["shared.example.key_name", "shared.example.spare.key_name"]
+        );
     }
 
     fn table(lock: bool, spare: bool) -> Value {
