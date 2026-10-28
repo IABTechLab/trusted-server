@@ -127,6 +127,12 @@ impl DeviceSignals {
 /// classification the Edge Cookie gate needs, not a full device-detection
 /// result such as make, model, OS version, or screen size. A richer device
 /// model for the ad request is a separate concern.
+/// Uses `#[async_trait(?Send)]` for the same reason as
+/// [`PlatformHttpClient`](crate::platform::PlatformHttpClient): the trait
+/// object stays `Send + Sync` so it can be shared and run multi-threaded,
+/// while the future it returns is pinned to one thread because the host SDKs
+/// produce `!Send` futures on wasm32.
+#[async_trait::async_trait(?Send)]
 pub trait DeviceModule: Send + Sync {
     /// Returns the stable identifier for this module, used in configuration
     /// and logs.
@@ -139,7 +145,15 @@ pub trait DeviceModule: Send + Sync {
     /// Device signals gate identity operations and must always yield a value,
     /// so this is infallible: a module that cannot determine a signal returns
     /// the unknown variant rather than failing the request.
-    fn detect(&self, request_info: &dyn RequestInfo) -> DeviceSignals;
+    /// Asynchronous because a device module may reach a backend, a
+    /// key-value store or a secret to classify a request, and a module that
+    /// cannot make those calls cannot be written at all. The built-in
+    /// User-Agent provider does no I/O and returns immediately.
+    async fn detect(
+        &self,
+        request_info: &dyn RequestInfo,
+        services: &crate::platform::RuntimeServices,
+    ) -> DeviceSignals;
 
     /// The permissions this module's data use requires.
     ///
@@ -167,17 +181,23 @@ impl BuiltinDeviceModule {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl DeviceModule for BuiltinDeviceModule {
     fn id(&self) -> &'static str {
         "builtin"
     }
 
-    fn detect(&self, request_info: &dyn RequestInfo) -> DeviceSignals {
+    async fn detect(
+        &self,
+        request_info: &dyn RequestInfo,
+        _services: &crate::platform::RuntimeServices,
+    ) -> DeviceSignals {
         DeviceSignals::derive_ua_only(request_info.user_agent())
     }
 }
 
-/// Selects the device module named by the `[device] module` selector.
+/// The device module core or the adapter supplies for the `[device] module`
+/// selector.
 ///
 /// Returns the built-in User-Agent-only module unless the `fastly` selector is
 /// set, in which case it builds the host-specific module through the
@@ -185,10 +205,12 @@ impl DeviceModule for BuiltinDeviceModule {
 /// module is selected, so device classification itself reads no host signals
 /// by default (see [`BuiltinDeviceModule`] for the host-neutral default). The
 /// Fastly entry point still reads the TLS and HTTP/2 signals on every request to
-/// build the host-signal service and client info. A
-/// selected-but-unknown module is rejected at startup by
-/// [`DeviceConfig::validate_module_selection`](crate::settings::DeviceConfig::validate_module_selection),
-/// so this falls back to the built-in module for that case.
+/// build the host-signal service and client info.
+///
+/// A module a registration supplies is resolved by the integration registry,
+/// which refuses a name no module supplies when it is built. A caller uses
+/// this only when the registry resolved no module, so it never sees such a
+/// name.
 #[must_use]
 pub fn build_device_module(
     settings: &Settings,
@@ -774,15 +796,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn builtin_device_module_is_ua_only() {
+    #[tokio::test]
+    async fn builtin_device_module_is_ua_only() {
         let module = BuiltinDeviceModule::new();
         assert_eq!(module.id(), "builtin");
 
         // The built-in module classifies from the User-Agent in the request
         // info passed to `detect` alone, recording no host signal.
         let request_info = request_info_with_ua(CHROME_MAC_UA);
-        let signals = module.detect(&request_info);
+        let signals = module
+            .detect(
+                &request_info,
+                &crate::platform::test_support::noop_services(),
+            )
+            .await;
         assert_eq!(
             signals,
             DeviceSignals::derive_ua_only(CHROME_MAC_UA),
@@ -809,12 +836,17 @@ mod tests {
     /// selection logic can be tested in core without the Fastly module crate.
     struct StubFastlyModule;
 
+    #[async_trait::async_trait(?Send)]
     impl DeviceModule for StubFastlyModule {
         fn id(&self) -> &'static str {
             "fastly"
         }
 
-        fn detect(&self, _request_info: &dyn RequestInfo) -> DeviceSignals {
+        async fn detect(
+            &self,
+            _request_info: &dyn RequestInfo,
+            _services: &crate::platform::RuntimeServices,
+        ) -> DeviceSignals {
             DeviceSignals::derive_ua_only("")
         }
     }

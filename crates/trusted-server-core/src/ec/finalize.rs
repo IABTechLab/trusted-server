@@ -39,7 +39,14 @@ use super::{EcKvSnapshot, EidSyncSource, current_timestamp, log_id};
 ///
 /// `eids_cookie` should be the raw value of the `ts-eids` cookie extracted
 /// from the request *before* routing consumes it.
-pub fn ec_finalize_response(
+///
+/// `services` are the request's runtime services, handed to the selected Edge
+/// Cookie module when an orphaned identifier is replaced.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "orphan recovery asks the selected module for a replacement identifier, which needs the request's services on top of the finalize inputs"
+)]
+pub async fn ec_finalize_response(
     settings: &Settings,
     ec_context: &mut EcContext,
     kv: Option<&KvIdentityGraph>,
@@ -47,6 +54,7 @@ pub fn ec_finalize_response(
     eids_cookie: Option<&str>,
     sharedid_cookie: Option<&str>,
     response: &mut Response<EdgeBody>,
+    services: &crate::platform::RuntimeServices,
 ) {
     // Apply any response headers the active module asked for during
     // generation (for example to request more client evidence). This is empty
@@ -144,8 +152,9 @@ pub fn ec_finalize_response(
                 && ec_context.recovery_eligible()
             {
                 confirm_then_recover_orphaned_ec(
-                    settings, ec_context, graph, &kv_key, &updates, response,
-                );
+                    settings, ec_context, graph, &kv_key, &updates, response, services,
+                )
+                .await;
             }
         }
 
@@ -306,13 +315,14 @@ fn gate_eid_updates_by_permissions(
 /// identifier, and its row is created only when no row already holds its key.
 /// Every exit that does not rotate leaves a failed snapshot bound to the
 /// orphan's key.
-fn recover_orphaned_ec(
+async fn recover_orphaned_ec(
     settings: &Settings,
     ec_context: &mut EcContext,
     graph: &KvIdentityGraph,
     orphan_kv_key: &str,
     updates: &[super::kv::PartnerIdUpdate],
     response: &mut Response<EdgeBody>,
+    services: &crate::platform::RuntimeServices,
 ) {
     // A deployment with no module selected has nothing to rotate to.
     let Some(module) = ec_context.selected_module() else {
@@ -324,7 +334,7 @@ fn recover_orphaned_ec(
     // identifier. Whether the client IP is needed is that module's decision.
     const MAX_RECOVERY_ATTEMPTS: usize = 5;
     for _attempt in 0..MAX_RECOVERY_ATTEMPTS {
-        let ec_id = match ec_context.candidate_id(module.as_ref()) {
+        let ec_id = match ec_context.candidate_id(module.as_ref(), services).await {
             Ok(Some(ec_id)) => ec_id,
             Ok(None) => {
                 log::info!("Orphan EC recovery skipped because the module produced no identifier");
@@ -406,13 +416,14 @@ fn recover_orphaned_ec(
 ///   the identity stays intact and recovery is retried on a later navigation;
 /// - neither a read failure nor a failed existence check is a miss, and neither
 ///   rotates.
-fn confirm_then_recover_orphaned_ec(
+async fn confirm_then_recover_orphaned_ec(
     settings: &Settings,
     ec_context: &mut EcContext,
     graph: &KvIdentityGraph,
     kv_key: &str,
     updates: &[super::kv::PartnerIdUpdate],
     response: &mut Response<EdgeBody>,
+    services: &crate::platform::RuntimeServices,
 ) {
     let confirmed = graph.load_snapshot(kv_key);
     match confirmed {
@@ -430,7 +441,10 @@ fn confirm_then_recover_orphaned_ec(
         }
         EcKvSnapshot::Missing { .. } => match graph.key_exists_confirmed(kv_key) {
             Ok(false) => {
-                recover_orphaned_ec(settings, ec_context, graph, kv_key, updates, response)
+                recover_orphaned_ec(
+                    settings, ec_context, graph, kv_key, updates, response, services,
+                )
+                .await
             }
             Ok(true) => {
                 log::warn!(
@@ -590,6 +604,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::platform::test_support::noop_services;
     use http::HeaderValue;
 
     use base64::Engine as _;
@@ -820,8 +835,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_withdrawal_does_not_create_a_row_for_an_unheld_identity() {
+    #[tokio::test]
+    async fn finalize_withdrawal_does_not_create_a_row_for_an_unheld_identity() {
         let settings = create_test_settings();
         // The cookie value is chosen by the client, so a withdrawal naming an
         // identity this deployment never issued must not put a row in the
@@ -851,7 +866,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert!(
             kv.get(&ec_id).expect("should read back").is_none(),
@@ -868,8 +885,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_withdrawal_tombstones_a_held_identity() {
+    #[tokio::test]
+    async fn finalize_withdrawal_tombstones_a_held_identity() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("held01");
         // A TCF record refusing storage under the requires-signal floor is
@@ -907,7 +924,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         let (entry, _) = kv
             .get(&ec_id)
@@ -925,8 +944,8 @@ mod tests {
         assert_eq!(ec_context.kv_snapshot().generation_for(&ec_id), None);
     }
 
-    #[test]
-    fn withdrawal_still_expires_the_cookie_when_the_store_is_unavailable() {
+    #[tokio::test]
+    async fn withdrawal_still_expires_the_cookie_when_the_store_is_unavailable() {
         // Cookie expiry is the primary enforcement, so it has to survive a
         // store that cannot answer at all — the case where the identity-graph
         // marker is exactly what goes missing.
@@ -962,7 +981,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         let set_cookie = get_header_str(&response, "set-cookie").unwrap_or_default();
         assert!(
@@ -979,8 +1000,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_withdrawal_clears_cookie_and_headers() {
+    #[tokio::test]
+    async fn finalize_withdrawal_clears_cookie_and_headers() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("aBc123");
         // A TCF record refusing storage is the withdrawal trigger, under a
@@ -1013,7 +1034,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert!(
             get_header(&response, "x-ts-ec").is_none(),
@@ -1062,8 +1085,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn finalize_gpc_suppresses_headers_but_keeps_the_cookie() {
+    #[tokio::test]
+    async fn finalize_gpc_suppresses_headers_but_keeps_the_cookie() {
         // A US-style opt-out suppresses use (headers cleared, nothing egressed)
         // but is never destructive: the browser cookie is not expired, so a
         // visitor who later withdraws the opt-out keeps their identity.
@@ -1089,7 +1112,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert!(
             get_header(&response, "x-ts-ec").is_none(),
@@ -1101,8 +1126,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_returning_user_with_cookie_mismatch_sets_no_header_or_cookie() {
+    #[tokio::test]
+    async fn finalize_returning_user_with_cookie_mismatch_sets_no_header_or_cookie() {
         let settings = create_test_settings();
         let active_ec = sample_ec_id("activ1");
         let cookie_ec = sample_ec_id("cook1e");
@@ -1125,7 +1150,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert!(
             get_header(&response, "x-ts-ec").is_none(),
@@ -1137,8 +1164,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_returning_user_sets_no_header_or_cookie() {
+    #[tokio::test]
+    async fn finalize_returning_user_sets_no_header_or_cookie() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("mtch01");
         let mut ec_context = make_context(
@@ -1160,7 +1187,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert!(
             get_header(&response, "x-ts-ec").is_none(),
@@ -1172,8 +1201,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_generated_ec_without_kv_skips_cookie_and_header() {
+    #[tokio::test]
+    async fn finalize_generated_ec_without_kv_skips_cookie_and_header() {
         let settings = create_test_settings();
         let generated_ec = sample_ec_id("gen123");
         let mut ec_context = make_context(
@@ -1195,7 +1224,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert!(
             get_header(&response, "x-ts-ec").is_none(),
@@ -1207,8 +1238,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_rotates_orphaned_cookie_to_new_backed_ec() {
+    #[tokio::test]
+    async fn finalize_rotates_orphaned_cookie_to_new_backed_ec() {
         let settings = create_test_settings();
         let orphaned_ec = sample_ec_id("orphn1");
         let consent = ConsentContext {
@@ -1237,7 +1268,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         let replacement = ec_context.ec_value().expect("should rotate orphan");
         assert_ne!(replacement, orphaned_ec);
@@ -1254,8 +1287,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_recovers_orphaned_ec_when_purpose_four_denial_empties_updates() {
+    #[tokio::test]
+    async fn finalize_recovers_orphaned_ec_when_purpose_four_denial_empties_updates() {
         // Regression test: this request has real EID data (a configured
         // partner and a captured client EID), but TCF Purpose 4 denial gates
         // it away, emptying the update list. That must not also suppress the
@@ -1300,7 +1333,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         let replacement = ec_context.ec_value().expect(
             "should rotate the orphan even though Purpose 4 denial emptied the gated update list",
@@ -1320,8 +1355,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn valid_marker_with_unread_snapshot_defers_orphan_recovery() {
+    #[tokio::test]
+    async fn valid_marker_with_unread_snapshot_defers_orphan_recovery() {
         let settings = create_test_settings();
         let orphaned_ec = sample_ec_id("orphn2");
         let consent = ConsentContext {
@@ -1355,7 +1390,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert_eq!(
             ec_context.ec_value(),
@@ -1372,8 +1409,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_returning_user_subresource_does_not_persist_eid_updates() {
+    #[tokio::test]
+    async fn finalize_returning_user_subresource_does_not_persist_eid_updates() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("subeid");
         let graph = KvIdentityGraph::in_memory("test_store");
@@ -1399,7 +1436,9 @@ mod tests {
             None,
             Some("shared-cookie-id"),
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         let (stored, _) = graph
             .get(&ec_id)
@@ -1411,8 +1450,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_navigation_routes_persist_returning_user_eid_updates() {
+    #[tokio::test]
+    async fn finalize_navigation_routes_persist_returning_user_eid_updates() {
         for (source, suffix, cookie_id) in [
             (EidSyncSource::Navigation, "naveid", "navigation-cookie-id"),
             (EidSyncSource::PageBids, "spaeid", "page-bids-cookie-id"),
@@ -1443,7 +1482,9 @@ mod tests {
                 None,
                 Some(cookie_id),
                 &mut response,
-            );
+                &noop_services(),
+            )
+            .await;
 
             let (stored, _) = graph
                 .get(&ec_id)
@@ -1457,8 +1498,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn finalize_generated_ec_persists_eid_updates() {
+    #[tokio::test]
+    async fn finalize_generated_ec_persists_eid_updates() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("geneid");
         let graph = KvIdentityGraph::in_memory("test_store");
@@ -1492,7 +1533,9 @@ mod tests {
             None,
             Some("generated-cookie-id"),
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         let (stored, _) = graph
             .get(&ec_id)
@@ -1600,8 +1643,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_auction_transient_miss_still_persists_eid_updates() {
+    #[tokio::test]
+    async fn finalize_auction_transient_miss_still_persists_eid_updates() {
         // `/auction` saves its first lookup into the context and is never
         // recovery eligible, so a stale miss there has no later chance to
         // retry. Finalization must revalidate before dropping collected IDs.
@@ -1637,7 +1680,9 @@ mod tests {
             None,
             Some("shared-cookie-id"),
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert_did_not_rotate(&ec_context, &ec_id, &response);
         let (stored, _) = graph
@@ -1651,8 +1696,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_persists_every_configured_partner_from_client_eids_over_a_trimmed_cookie() {
+    #[tokio::test]
+    async fn finalize_persists_every_configured_partner_from_client_eids_over_a_trimmed_cookie() {
         // Regression test for #1184: the `ts-eids` cookie only carries what
         // the browser could fit under its size cap, but `/auction` also
         // hands finalization the full EID set from the request body via
@@ -1716,7 +1761,9 @@ mod tests {
             Some(&eids_cookie),
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         let (stored, _) = graph
             .get(&ec_id)
@@ -1734,8 +1781,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_withholds_eid_kv_writes_when_purpose_four_is_denied() {
+    #[tokio::test]
+    async fn finalize_withholds_eid_kv_writes_when_purpose_four_is_denied() {
         // A GDPR user can grant TCF Purpose 1 (storage/EC) while denying
         // Purpose 4 (personalized ads). `gate_eids_by_consent` already strips
         // EIDs from the outbound /auction bid request in that case; the KV
@@ -1787,7 +1834,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         let (stored, _) = graph
             .get(&ec_id)
@@ -1800,8 +1849,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_auction_confirmed_miss_does_not_create_a_row() {
+    #[tokio::test]
+    async fn finalize_auction_confirmed_miss_does_not_create_a_row() {
         // The same path with a genuinely absent row must stay a no-op: a route
         // without orphan recovery must never mint an identity-graph entry.
         let settings = create_test_settings();
@@ -1827,7 +1876,9 @@ mod tests {
             None,
             Some("shared-cookie-id"),
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert_did_not_rotate(&ec_context, &ec_id, &response);
         assert!(
@@ -1836,8 +1887,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_transient_missing_row_confirms_present_and_does_not_rotate() {
+    #[tokio::test]
+    async fn finalize_transient_missing_row_confirms_present_and_does_not_rotate() {
         // The origin-overlapped preload transiently read `Missing` on an
         // eventually-consistent store, but the row actually exists. The
         // confirming re-read at finalize must adopt the live row instead of
@@ -1871,7 +1922,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert_did_not_rotate(&ec_context, &orphan, &response);
         assert!(
@@ -1880,8 +1933,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_two_missing_reads_do_not_rotate_a_row_the_store_still_lists() {
+    #[tokio::test]
+    async fn finalize_two_missing_reads_do_not_rotate_a_row_the_store_still_lists() {
         // Both the origin-overlapped preload and the confirming re-read missed,
         // but the row is live — the point reads were stale. Two stale reads are
         // not an absence proof, so the identity graph must be left intact and
@@ -1918,7 +1971,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert_did_not_rotate(&ec_context, &orphan, &response);
         assert_eq!(
@@ -1931,8 +1986,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_rotates_when_only_a_longer_key_shares_the_orphan_prefix() {
+    #[tokio::test]
+    async fn finalize_rotates_when_only_a_longer_key_shares_the_orphan_prefix() {
         // `key_exists_confirmed` gates orphan recovery as well as withdrawal.
         // It matches whole keys, so a neighbouring key that merely starts with
         // the orphaned ID cannot answer for it. Under the prefix count this
@@ -1975,7 +2030,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         let replacement = ec_context.ec_value().expect("should rotate the orphan");
         assert_ne!(
@@ -2076,8 +2133,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_orphan_recovery_that_cannot_rotate_leaves_a_failed_snapshot() {
+    #[tokio::test]
+    async fn an_orphan_recovery_that_cannot_rotate_leaves_a_failed_snapshot() {
         // Recovery runs only once the orphan's row is proven absent. Each of
         // these exits gives up without a replacement, and each must leave the
         // orphan in place, write no cookie and record a failed snapshot for
@@ -2127,7 +2184,9 @@ mod tests {
                 None,
                 None,
                 &mut response,
-            );
+                &noop_services(),
+            )
+            .await;
 
             assert_eq!(
                 ec_context.ec_value(),
@@ -2152,8 +2211,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_orphan_rotation_applies_the_replacement_modules_response_headers() {
+    #[tokio::test]
+    async fn an_orphan_rotation_applies_the_replacement_modules_response_headers() {
         // A returning visitor runs no generation earlier in the request, so the
         // headers the module asks for while creating the replacement reach
         // the response through the rotation alone.
@@ -2174,7 +2233,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert_eq!(
             ec_context.ec_value(),
@@ -2209,8 +2270,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_does_not_rotate_when_the_existence_check_fails() {
+    #[tokio::test]
+    async fn finalize_does_not_rotate_when_the_existence_check_fails() {
         // Absence is unprovable when the list itself errors. Rotation abandons a
         // year-lived identity, so it must not run on an unproven miss.
         let settings = create_test_settings();
@@ -2233,13 +2294,15 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert_did_not_rotate(&ec_context, &orphan, &response);
     }
 
-    #[test]
-    fn finalize_generated_ec_does_not_emit_cookie_for_authoritative_missing_row() {
+    #[tokio::test]
+    async fn finalize_generated_ec_does_not_emit_cookie_for_authoritative_missing_row() {
         let settings = create_test_settings();
         let generated_ec = sample_ec_id("genmis");
         let mut ec_context = make_context(
@@ -2264,7 +2327,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert!(
             get_header(&response, "set-cookie").is_none(),
@@ -2272,8 +2337,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_denied_without_cookie_is_noop() {
+    #[tokio::test]
+    async fn finalize_denied_without_cookie_is_noop() {
         let settings = create_test_settings();
         let mut ec_context = make_context(None, None, false, false, Jurisdiction::Unknown, false);
         let mut response = empty_response();
@@ -2287,7 +2352,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert!(
             get_header(&response, "x-ts-ec").is_none(),
@@ -2299,8 +2366,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_not_permitted_without_withdrawal_keeps_cookie() {
+    #[tokio::test]
+    async fn finalize_not_permitted_without_withdrawal_keeps_cookie() {
         // When EC is not permitted (here a fail-closed unknown jurisdiction with
         // no geo) but the request carries no explicit withdrawal signal, the
         // response strips EC headers yet must leave an already-issued cookie
@@ -2329,7 +2396,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert!(
             get_header(&response, "x-ts-ec").is_none(),
@@ -2371,8 +2440,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_permission_gate_decides_whether_a_generated_ec_cookie_is_written() {
+    #[tokio::test]
+    async fn the_permission_gate_decides_whether_a_generated_ec_cookie_is_written() {
         // The generated identifier has a backing row and a snapshot bound to
         // it, so the backing-row guard would let the cookie through and the
         // permission gate is the only thing that can withhold it.
@@ -2406,7 +2475,9 @@ mod tests {
                 None,
                 None,
                 &mut response,
-            );
+                &noop_services(),
+            )
+            .await;
 
             let wrote_ec_cookie = response
                 .headers()
@@ -2421,8 +2492,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn withdrawal_tombstones_the_canonical_row_not_the_cookie_value() {
+    #[tokio::test]
+    async fn withdrawal_tombstones_the_canonical_row_not_the_cookie_value() {
         // The tombstone is the authoritative revocation marker, so it has to
         // land on the key the live row uses. Written under the raw cookie
         // value it creates a second row nothing reads, and the revocation
@@ -2455,7 +2526,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         let (live_row, _) = graph
             .get(CANONICAL_KV_KEY)
@@ -2474,8 +2547,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn eid_ingestion_keys_by_the_modules_canonical_form() {
+    #[tokio::test]
+    async fn eid_ingestion_keys_by_the_modules_canonical_form() {
         // An ingested EID must join the row the identifier already has. Keyed
         // by the raw cookie value the upsert finds no row and the partner ID
         // is dropped.
@@ -2500,7 +2573,9 @@ mod tests {
             None,
             Some("shared-cookie-id"),
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         let (row, _) = graph
             .get(CANONICAL_KV_KEY)
@@ -2526,6 +2601,7 @@ mod tests {
     #[derive(Debug)]
     struct EvidenceHeaderModule;
 
+    #[async_trait::async_trait(?Send)]
     impl crate::ec::module::EdgeCookieModule for EvidenceHeaderModule {
         fn id(&self) -> &'static str {
             "evidence-header"
@@ -2535,10 +2611,11 @@ mod tests {
             crate::module_code!("t0eh")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn crate::evidence::RequestInfo,
             _input: &crate::ec::module::IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<
             crate::ec::module::GeneratedEdgeCookie,
             error_stack::Report<crate::error::TrustedServerError>,
@@ -2564,8 +2641,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn module_response_headers_reach_the_response_without_dropping_the_origins() {
+    #[tokio::test]
+    async fn module_response_headers_reach_the_response_without_dropping_the_origins() {
         // The response finalization runs on is the finished one, so it already
         // carries the publisher origin's own headers. A module effect must
         // add to those, never replace them: replacing `Set-Cookie` would drop
@@ -2581,7 +2658,8 @@ mod tests {
         let mut ec_context = make_context_with_consent(None, None, false, false, consent, true)
             .with_module_for_test(std::sync::Arc::new(EvidenceHeaderModule));
         ec_context
-            .generate_if_needed(&settings, Some(&graph))
+            .generate_if_needed(&settings, Some(&graph), &noop_services())
+            .await
             .expect("should create the identifier through the module");
 
         // What the publisher's origin returned, before EC finalization runs.
@@ -2603,7 +2681,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         let cookies: Vec<&str> = response
             .headers()
@@ -2649,6 +2729,7 @@ mod tests {
     #[derive(Debug)]
     struct SwitchedModule;
 
+    #[async_trait::async_trait(?Send)]
     impl crate::ec::module::EdgeCookieModule for SwitchedModule {
         fn id(&self) -> &'static str {
             "switched"
@@ -2658,10 +2739,11 @@ mod tests {
             crate::module_code!("t0sw")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn crate::evidence::RequestInfo,
             _input: &crate::ec::module::IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<
             crate::ec::module::GeneratedEdgeCookie,
             error_stack::Report<crate::error::TrustedServerError>,
@@ -2678,8 +2760,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn switching_module_leaves_the_previous_modules_row_beyond_withdrawal() {
+    #[tokio::test]
+    async fn switching_module_leaves_the_previous_modules_row_beyond_withdrawal() {
         // A retired module's identifier is owned by nobody this deployment
         // reads, so a later withdrawal expires the browser cookie but cannot
         // tombstone the row, and the identifier is never adopted either.
@@ -2736,7 +2818,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert!(
             ec_context.ec_value().is_none(),
@@ -2765,8 +2849,8 @@ mod tests {
             "withdrawal should still expire the browser cookie after a switch, got {cookies:?}"
         );
     }
-    #[test]
-    fn marker_is_expired_when_the_selected_module_does_not_own_the_cookie() {
+    #[tokio::test]
+    async fn marker_is_expired_when_the_selected_module_does_not_own_the_cookie() {
         // A switch between client-cycle modules looks like this on the first
         // request after the switch. The raw cookie is still presented, but the
         // selected module does not recognize it, so no EC is in play.
@@ -2789,7 +2873,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         let expired = response
             .headers()
@@ -2803,8 +2889,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn marker_is_left_alone_when_the_module_owns_the_cookie() {
+    #[tokio::test]
+    async fn marker_is_left_alone_when_the_module_owns_the_cookie() {
         let settings = create_test_settings();
         let mut ec_context = make_context(
             Some("an-ec"),
@@ -2824,7 +2910,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         let expired = response
             .headers()
@@ -2879,8 +2967,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_not_read_snapshot_does_not_rotate() {
+    #[tokio::test]
+    async fn finalize_not_read_snapshot_does_not_rotate() {
         let settings = create_test_settings();
         let orphan = sample_ec_id("notrd1");
         let mut ec_context = returning_user_context(&orphan, EcKvSnapshot::NotRead, true);
@@ -2895,13 +2983,15 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert_did_not_rotate(&ec_context, &orphan, &response);
     }
 
-    #[test]
-    fn finalize_failed_snapshot_does_not_rotate() {
+    #[tokio::test]
+    async fn finalize_failed_snapshot_does_not_rotate() {
         let settings = create_test_settings();
         let orphan = sample_ec_id("faild1");
         let mut ec_context = returning_user_context(
@@ -2922,13 +3012,15 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert_did_not_rotate(&ec_context, &orphan, &response);
     }
 
-    #[test]
-    fn finalize_tombstone_snapshot_does_not_rotate() {
+    #[tokio::test]
+    async fn finalize_tombstone_snapshot_does_not_rotate() {
         let settings = create_test_settings();
         let orphan = sample_ec_id("tomb01");
         let tombstone = EcKvSnapshot::Present {
@@ -2948,13 +3040,15 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert_did_not_rotate(&ec_context, &orphan, &response);
     }
 
-    #[test]
-    fn finalize_subresource_missing_row_does_not_rotate() {
+    #[tokio::test]
+    async fn finalize_subresource_missing_row_does_not_rotate() {
         let settings = create_test_settings();
         let orphan = sample_ec_id("subrs1");
         // Missing row, but the request is not a recovery-eligible browser navigation.
@@ -2976,7 +3070,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert_did_not_rotate(&ec_context, &orphan, &response);
         assert!(
@@ -2985,8 +3081,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_withdrawal_tombstones_present_id_and_skips_missing_other() {
+    #[tokio::test]
+    async fn finalize_withdrawal_tombstones_present_id_and_skips_missing_other() {
         let settings = create_test_settings();
         let active_ec = sample_ec_id("activ2");
         let cookie_ec = sample_ec_id("cook2e");
@@ -3025,7 +3121,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         let (active_stored, _) = graph
             .get(&active_ec)
@@ -3041,8 +3139,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_withdrawal_tombstones_both_present_ids_once() {
+    #[tokio::test]
+    async fn finalize_withdrawal_tombstones_both_present_ids_once() {
         let settings = create_test_settings();
         let active_ec = sample_ec_id("activ3");
         let cookie_ec = sample_ec_id("cook3e");
@@ -3085,7 +3183,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         let (active_tombstone, active_generation) = graph
             .get(&active_ec)
@@ -3121,7 +3221,9 @@ mod tests {
             None,
             None,
             &mut repeated_response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert_eq!(
             graph
@@ -3143,8 +3245,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_withdrawal_keeps_cookie_deletion_on_kv_failure() {
+    #[tokio::test]
+    async fn finalize_withdrawal_keeps_cookie_deletion_on_kv_failure() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("failw1");
         let consent = ConsentContext {
@@ -3170,7 +3272,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         let cookies = response
             .headers()
@@ -3197,8 +3301,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_sets_marker_for_complete_pull_partner_snapshot() {
+    #[tokio::test]
+    async fn finalize_sets_marker_for_complete_pull_partner_snapshot() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("compl1");
         let mut partner = make_partner("ssp.example.com");
@@ -3237,7 +3341,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         let cookies = response
             .headers()
@@ -3253,8 +3359,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn explicit_withdrawal_without_marker_or_ec_cookie_does_not_set_cookie() {
+    #[tokio::test]
+    async fn explicit_withdrawal_without_marker_or_ec_cookie_does_not_set_cookie() {
         let settings = create_test_settings();
         let consent = ConsentContext {
             jurisdiction: Jurisdiction::UsState("CA".to_owned()),
@@ -3273,7 +3379,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert!(
             response.headers().get(http::header::SET_COOKIE).is_none(),
@@ -3281,8 +3389,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn explicit_withdrawal_expires_marker_without_ec_cookie() {
+    #[tokio::test]
+    async fn explicit_withdrawal_expires_marker_without_ec_cookie() {
         let settings = create_test_settings();
         let consent = ConsentContext {
             jurisdiction: Jurisdiction::UsState("CA".to_owned()),
@@ -3305,7 +3413,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         let cookies = response
             .headers()

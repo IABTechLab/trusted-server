@@ -15,17 +15,28 @@ JavaScript injection.
 
 ```
 crates/
-  trusted-server-core/                  # Core library — shared logic, integrations, HTML processing
+  trusted-server-core/                  # Core library — shared logic, the integration seam, HTML processing
   trusted-server-adapter-fastly/        # Fastly Compute entry point (wasm32-wasip1 binary)
   trusted-server-adapter-axum/          # Axum dev server entry point (native binary)
   trusted-server-adapter-cloudflare/    # Cloudflare Workers entry point (wasm32-unknown-unknown binary)
   trusted-server-adapter-spin/          # Fermyon Spin entry point (wasm32-wasip1 component)
   trusted-server-cli/                   # Host-target `ts` operator CLI
+  trusted-server-modules/               # the modules a stock build ships, in the order their hooks run
+  ad-server/                            # ad server implementation crates (mock)
+  ad-tag/                               # ad tag module crates (google, which holds its diagnostics module too)
+  auction/                              # auction module crates (aps, prebid, prebid-server)
+  audience/                             # audience module crates (permutive)
+  bot-protection/                       # bot protection module crates (datadome)
+  cmp/                                  # consent tool module crates (didomi, osano, sourcepoint)
+  framework/                            # framework module crates (nextjs)
+  identity/                             # identity module crates (lockr)
+  tag/                                  # tag manager module crates (google-tag-manager)
+  testing/                              # test module crates (seam-probe, testlight)
   device/
     fastly/                             # trusted-server-device-fastly (opt-in TLS/H2 device module)
   edgecookie/                           # vendor Edge Cookie module crates (built-in HMAC module is in core)
   geo/                                  # vendor geo module crates (host geo is injected by the adapter)
-  permission-signal/                    # permission signal module crates, one per scheme (gpc, gpp, tcf, us-privacy); core links none
+  permission-signal/                    # permission signal module crates, one per scheme (gpc, gpp, tcf, us-privacy), and core links none
   trusted-server-js/                    # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
 ```
@@ -384,14 +395,26 @@ Bad: `"fix: added feature flags"`
 ## Module Architecture
 
 Each vendor-differentiated capability is pluggable behind its own trait, so a
-deployment selects an implementation and the core stays neutral:
+deployment selects an implementation and the core stays neutral. Every
+pluggable thing follows one configuration convention, which is a top-level
+table named for the job, a `module` key that selects what runs (`modules`
+where several run), and a `[<type>.<name>]`
+table for a selected name that has settings. The rules and what
+is checked when are in `docs/guide/configuration-rules.md`, which is the page
+to read before changing any module configuration.
 
-| Capability            | Trait                                                 | Selector                                        | Built-in (core)                                                                    | Vendor / host crates                |
-| --------------------- | ----------------------------------------------------- | ----------------------------------------------- | ---------------------------------------------------------------------------------- | ----------------------------------- |
-| Edge Cookie identity  | `EdgeCookieModule` (`ec/module.rs`)                   | `[ec] module`                                   | HMAC, client_fixed (opt-in, no default)                                            | `crates/edgecookie/<vendor>`        |
-| Device detection      | `DeviceModule` (`ec/device.rs`)                       | `[device] module`                               | User-Agent only (default)                                                          | `crates/device/<vendor>`            |
-| Geo / IP intelligence | `PlatformGeo` (`platform/traits.rs`)                  | `[geo] module`                                  | Disabled, no location (default)                                                    | `crates/geo/<vendor>`               |
-| Permission signals    | `PermissionSignalModule` (`permission_signal/mod.rs`) | `[permission-signal] modules` (an ordered list) | None, and with no module every permission stays at its country and region baseline | `crates/permission-signal/<scheme>` |
+| Capability            | Trait                                                 | Selector                                                                                                                                                                                                                 | Built-in (core)                                                                                                                                                                                                                                                      | Vendor / host crates                |
+| --------------------- | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
+| Edge Cookie identity  | `EdgeCookieModule` (`ec/module.rs`)                   | `[ec] module`                                                                                                                                                                                                            | `hmac`, `host_signals`, `client_fixed` (opt-in, no default)                                                                                                                                                                                                          | `crates/edgecookie/<vendor>`        |
+| Device detection      | `DeviceModule` (`ec/device.rs`)                       | `[device] module`                                                                                                                                                                                                        | `builtin`, User-Agent only (the default)                                                                                                                                                                                                                             | `crates/device/<vendor>`            |
+| Geo / IP intelligence | `PlatformGeo` (`platform/traits.rs`)                  | `[geo] module`                                                                                                                                                                                                           | None, no location (the default), or `platform`                                                                                                                                                                                                                       | `crates/geo/<vendor>`               |
+| Permission signals    | `PermissionSignalModule` (`permission_signal/mod.rs`) | `[permission-signal] modules` (an ordered list)                                                                                                                                                                          | `gpc`, `gpp`, `us-privacy`, `tcf`, all of them with no list                                                                                                                                                                                                          | `crates/permission-signal/<scheme>` |
+| Auction demand        | `DemandImplementation` (`auction/demand.rs`)          | `[demand] modules` (a list)                                                                                                                                                                                              | `auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps`                                                                                                                                                                                                   | an integration builder              |
+| Ad server             | `AdServerImplementation` (`auction/demand.rs`)        | `[ad-server] module`                                                                                                                                                                                                     | `mock` (`ad-server.mock`)                                                                                                                                                                                                                                            | an integration builder              |
+| Page integrations     | `IntegrationBuilder` (`integrations/mod.rs`)          | the section of the module's type: `[cmp] module`, `[tag] modules`, `[ad-tag] modules`, `[bot-protection] module`, `[identity] module`, `[audience] module`, `[framework] module`, `[auction] modules`, `[proxy] modules` | `cmp.didomi`, `cmp.sourcepoint`, `cmp.osano`, `tag.google-tag-manager`, `ad-tag.google`, `ad-tag.google.diagnostics`, `bot-protection.datadome`, `identity.lockr`, `audience.permutive`, `framework.nextjs`, `auction.prebid`, `testing.testlight`, `js_asset_proxy` | an adapter-supplied builder         |
+
+`auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps` and `ad-server.mock` supply implementations
+only. No module section selects them.
 
 Principles for adding or changing a module:
 
@@ -430,7 +453,8 @@ IntegrationRegistration::builder(ID)
 ```
 
 - Integration IDs match JS directory names: `prebid` (deferred), `lockr`, `permutive`, `datadome`, `didomi`, `testlight`.
-- `creative` is JS-only (no Rust registration); `nextjs`, `aps`, `adserver_mock` are Rust-only.
+- An integration runs when the section of its type selects its module. A module with a crate of its own is named by that crate's path under `crates/` (`permission-signal.gpc`, `testing.seam-probe`). Each page integration lives in a crate of its own and holds that name in a `MODULE` constant (`cmp.didomi`, `tag.google-tag-manager`, `ad-tag.google`, `bot-protection.datadome`, `identity.lockr`, `audience.permutive`, `framework.nextjs`, `auction.prebid`, `testing.testlight`), which a test in the crate holds to the crate's folder. A name is written in its section with the type left off. There is no `enabled` flag and no `[integration]` table.
+- `creative` is JS-only (no Rust registration), and `nextjs` is Rust-only. `auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps` and `ad-server.mock` register demand or ad server implementations rather than page integrations.
 - Integrations opt into deferred loading via `.with_deferred_js()` on the registration builder. Deferred modules are served as separate `<script defer>` tags instead of being concatenated into the main bundle.
 - `IntegrationRegistry::js_module_ids_immediate()` returns modules for the main bundle; `js_module_ids_deferred()` returns modules loaded with `defer`.
 
@@ -440,20 +464,20 @@ IntegrationRegistration::builder(ID)
 - Output: `dist/tsjs-core.js`, `dist/tsjs-{integration}.js` from `npm run build`. `build.rs` passes `--out-dir` to build the same files into a private `OUT_DIR/tsjs-dist`, validates the set, and never reads `dist/`.
 - `build.rs` auto-generates `tsjs_modules.rs` with `include_str!()` for each discovered file.
 - `bundle.rs` provides `concatenate_modules(ids)` and `concatenated_hash(ids)` APIs.
-- Runtime: Rust server concatenates core + enabled integration JS files at request time.
+- Runtime: Rust server concatenates core + the JS files of the integrations that run, at request time.
 
 ---
 
 ## Configuration Files
 
-| File                          | Purpose                                                                                                                                             |
-| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `edgezero.toml`               | EdgeZero app/platform manifest and logical stores                                                                                                   |
-| `fastly.toml`                 | Fastly service configuration and build settings                                                                                                     |
-| `trusted-server.example.toml` | Source-controlled app-config template, which carries the `[ec]`, `[geo]` and `[device]` module selectors and the `[permission-signal] modules` list |
-| `trusted-server.toml`         | Operator-owned app config; gitignored; `ts config push` publishes it as an EdgeZero blob envelope                                                   |
-| `rust-toolchain.toml`         | Pins Rust version to 1.98.1                                                                                                                         |
-| `.env.dev`                    | Local development environment variables                                                                                                             |
+| File                          | Purpose                                                                                                                                                                 |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `edgezero.toml`               | EdgeZero app/platform manifest and logical stores                                                                                                                       |
+| `fastly.toml`                 | Fastly service configuration and build settings                                                                                                                         |
+| `trusted-server.example.toml` | Source-controlled app-config template (includes the `[ec]`, `[geo]`, `[device]`, `[permission-signal]`, `[demand]` and `[ad-server]` selectors and the module sections) |
+| `trusted-server.toml`         | Operator-owned app config; gitignored; `ts config push` publishes it as an EdgeZero blob envelope                                                                       |
+| `rust-toolchain.toml`         | Pins Rust version to 1.98.1                                                                                                                                             |
+| `.env.dev`                    | Local development environment variables                                                                                                                                 |
 
 ---
 

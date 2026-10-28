@@ -38,18 +38,24 @@ fn integration_guide_runtime_services_fixture_compiles() {
     let core_path = repository_root.join("crates/trusted-server-core");
     let workspace_manifest = fs::read_to_string(repository_root.join("Cargo.toml"))
         .expect("should read the workspace manifest");
-    let error_stack_requirement = workspace_manifest
-        .lines()
-        .find_map(|line| {
-            let assignment = line.trim().strip_prefix("error-stack")?.trim_start();
-            let value = assignment.strip_prefix('=')?;
-            let start = value.find('"')? + 1;
-            let end = start + value[start..].find('"')?;
-            Some(value[start..end].to_owned())
-        })
-        .expect("should find the workspace error-stack requirement");
+    let requirement_of = |crate_name: &str| {
+        workspace_manifest
+            .lines()
+            .find_map(|line| {
+                let assignment = line.trim().strip_prefix(crate_name)?.trim_start();
+                let value = assignment.strip_prefix('=')?;
+                let start = value.find('"')? + 1;
+                let end = start + value[start..].find('"')?;
+                Some(value[start..end].to_owned())
+            })
+            .unwrap_or_else(|| panic!("should find the workspace {crate_name} requirement"))
+    };
+    let error_stack_requirement = requirement_of("error-stack");
+    // The documented fixture implements `PlatformGeo`, whose `lookup` is
+    // asynchronous, so it carries the same attribute the trait does.
+    let async_trait_requirement = requirement_of("async-trait");
     let manifest = format!(
-        "[package]\nname = \"documentation-snippet\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[workspace]\n\n[dependencies]\nerror-stack = \"{error_stack_requirement}\"\ntrusted-server-core = {{ path = {:?} }}\n",
+        "[package]\nname = \"documentation-snippet\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[workspace]\n\n[dependencies]\nasync-trait = \"{async_trait_requirement}\"\nerror-stack = \"{error_stack_requirement}\"\ntrusted-server-core = {{ path = {:?} }}\n",
         core_path
     );
     fs::write(fixture_root.join("Cargo.toml"), manifest)

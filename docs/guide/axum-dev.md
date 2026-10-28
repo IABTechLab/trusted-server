@@ -62,10 +62,10 @@ Unrecognized values, including per-module filters such as
 error at startup.
 
 The `trace` level can log auction payloads and TCF consent strings, for example
-the `adserver_mock` mediation request, and the full Prebid Server response
-(including its `ext.debug` echo of the resolved request) when a provider sets
-`profile_config.debug = true`. Enable it only for short local debugging
-sessions.
+the request to the ad server, and the full Prebid Server response (including
+its `ext.debug` echo of the resolved request) when the `[demand.<name>]` table
+of a Prebid Server demand source sets `debug = true`. Enable it only for short
+local debugging sessions.
 
 ## Runtime boundaries
 

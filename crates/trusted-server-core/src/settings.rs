@@ -27,6 +27,7 @@ use crate::ec::module::{
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
+use crate::provider_table::{ProviderChoice, ProviderList, SectionModules};
 use crate::redacted::Redacted;
 
 #[cfg(test)]
@@ -225,165 +226,162 @@ impl Publisher {
     }
 }
 
-#[derive(Default, Clone, Deserialize, Serialize)]
-pub struct IntegrationSettings {
-    #[serde(flatten)]
-    entries: HashMap<String, JsonValue>,
-}
+/// Which integrations run, and the settings each one is given.
+///
+/// The sections of module types core does not read itself, such as `[cmp]` or
+/// `[tag]`, each named for the type of module it selects.
+///
+/// Every top-level table that is not one of Trusted Server's own settings is
+/// read as one of these. Whether its type is one a module on offer has is
+/// only known where the registry is built, so it is checked there.
+#[derive(Clone, Default, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct TypeSections(BTreeMap<String, SectionModules>);
 
-impl std::fmt::Debug for IntegrationSettings {
+impl std::fmt::Debug for TypeSections {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut integration_ids = self.entries.keys().collect::<Vec<_>>();
-        integration_ids.sort_unstable();
-        formatter
-            .debug_struct("IntegrationSettings")
-            .field("integration_ids", &integration_ids)
-            .finish()
+        formatter.debug_map().entries(self.0.iter()).finish()
     }
 }
 
-pub trait IntegrationConfig: DeserializeOwned + Validate {
-    fn is_enabled(&self) -> bool;
-
-    /// Validate the public field schema for an explicitly disabled config.
-    ///
-    /// The default deserializes the integration's normal schema, except it
-    /// permits omitted enabled-only required fields. Override this only when a
-    /// disabled integration has a distinct public schema.
-    ///
-    /// # Errors
-    ///
-    /// Returns a deserialization error when the disabled public field schema is invalid.
-    fn validate_disabled_schema(raw: &JsonValue) -> Result<(), serde_json::Error> {
-        match serde_json::from_value::<Self>(raw.clone()) {
-            Ok(_) => Ok(()),
-            Err(error) if error.to_string().starts_with("missing field ") => Ok(()),
-            Err(error) => Err(error),
-        }
-    }
-}
-
-impl IntegrationSettings {
-    /// Inserts a configuration value for an integration.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the configuration cannot be serialized to JSON.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn insert_config<T>(
-        &mut self,
-        integration_id: impl Into<String>,
-        value: &T,
-    ) -> Result<(), Report<TrustedServerError>>
+impl<'de> Deserialize<'de> for TypeSections {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        T: Serialize,
+        D: Deserializer<'de>,
     {
-        let json =
-            serde_json::to_value(value).change_context(TrustedServerError::Configuration {
-                message: "Failed to serialize integration configuration".to_string(),
+        let entries = serde_json::Map::<String, JsonValue>::deserialize(deserializer)?;
+        let mut sections = BTreeMap::new();
+        for (name, value) in entries {
+            let JsonValue::Object(table) = value else {
+                return Err(serde::de::Error::custom(format!(
+                    "unknown field `{name}`, which is neither a setting Trusted Server reads nor \
+                     the section of a module type, which is a table"
+                )));
+            };
+            if name.contains('.') || !crate::module_name::is_valid(&name) {
+                return Err(serde::de::Error::custom(format!(
+                    "unknown field `{name}`. The section of a module type is named for \
+                     the type, in lower case letters, digits, `_` or `-`"
+                )));
+            }
+            let section = SectionModules::from_entries(table).map_err(|message| {
+                serde::de::Error::custom(format!(
+                    "[{name}] is not a section Trusted Server reads itself, so it is read as \
+                     the section of a module type, and it {message}"
+                ))
             })?;
-        self.entries.insert(integration_id.into(), json);
+            sections.insert(name, section);
+        }
+        Ok(Self(sections))
+    }
+}
+
+impl TypeSections {
+    /// Whether no type section is present.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Each type section, by name.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &SectionModules)> {
+        self.0
+            .iter()
+            .map(|(name, section)| (name.as_str(), section))
+    }
+
+    /// The section of `type_name`, when present.
+    #[must_use]
+    pub fn section(&self, type_name: &str) -> Option<&SectionModules> {
+        self.0.get(type_name)
+    }
+
+    /// The section of `type_name`, created empty when absent.
+    pub fn section_mut(&mut self, type_name: &str) -> &mut SectionModules {
+        self.0.entry(type_name.to_owned()).or_default()
+    }
+
+    /// Refuses a section that selects nothing, and checks each selection.
+    ///
+    /// # Errors
+    ///
+    /// Naming the first section at fault.
+    pub fn validate(&self) -> Result<(), Report<TrustedServerError>> {
+        for (name, section) in &self.0 {
+            if section.selected().is_empty() {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "[{name}] selects no module. A module type's section names what runs \
+                         with `module` or `modules`, so select one or remove the section"
+                    ),
+                }));
+            }
+            section
+                .validate(name)
+                .map_err(|message| Report::new(TrustedServerError::Configuration { message }))?;
+        }
         Ok(())
     }
+}
 
-    fn is_explicitly_disabled(raw: &JsonValue) -> bool {
-        raw.as_object()
-            .and_then(|map| map.get("enabled"))
-            .and_then(JsonValue::as_bool)
-            == Some(false)
-    }
-
-    fn remove_legacy_static_secret_store_selectors(&mut self) {
-        let Some(datadome) = self
-            .entries
-            .get_mut("datadome")
-            .and_then(JsonValue::as_object_mut)
-        else {
-            return;
-        };
-
-        let mut removed = datadome.remove("server_side_key_secret_store").is_some();
-        if let Some(bypass) = datadome
-            .get_mut("protection_test_bypass")
-            .and_then(JsonValue::as_object_mut)
-        {
-            removed |= bypass.remove("credential_secret_store").is_some();
-        }
-        if removed {
-            log::warn!(
-                "DataDome secret-store selectors are deprecated and ignored; static credentials resolve through the default app-config secret store"
-            );
-        }
-    }
-
-    /// Retrieves and validates a typed configuration for an integration.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the configuration cannot be parsed from JSON or fails validation.
-    pub fn get_typed<T>(
-        &self,
-        integration_id: &str,
-    ) -> Result<Option<T>, Report<TrustedServerError>>
-    where
-        T: IntegrationConfig,
-    {
-        let raw = match self.entries.get(integration_id) {
-            Some(value) => value,
-            None => return Ok(None),
-        };
-
-        if Self::is_explicitly_disabled(raw) {
-            T::validate_disabled_schema(raw).change_context(TrustedServerError::Configuration {
-                message: format!(
-                    "Integration '{integration_id}' configuration could not be parsed"
-                ),
-            })?;
-            return Ok(None);
-        }
-
-        let config: T = serde_json::from_value(raw.clone()).change_context(
-            TrustedServerError::Configuration {
-                message: format!(
-                    "Integration '{integration_id}' configuration could not be parsed"
-                ),
-            },
-        )?;
-
-        // Field validation runs only for integrations that resolve to enabled.
-        // An integration whose `enabled` flag is omitted falls back to its
-        // serde default, which the explicit-`false` fast path above cannot
-        // observe. Validating before this check would reject documented
-        // template placeholders in sections that are not actually turned on.
-        if !config.is_enabled() {
-            return Ok(None);
-        }
-
-        config.validate().map_err(|err| {
+/// Reads and validates a table as `T`, where `place` is the table's name as
+/// written, such as `shared.example`.
+///
+/// A message names the setting at fault and the rule it broke, and never
+/// quotes the setting's value, because at startup a table holds each of its
+/// secrets resolved from the secret store.
+fn read_table<T>(
+    place: &str,
+    table: serde_json::Map<String, JsonValue>,
+) -> Result<T, Report<TrustedServerError>>
+where
+    T: DeserializeOwned + Validate,
+{
+    let config: T =
+        serde_path_to_error::deserialize(JsonValue::Object(table)).map_err(|error| {
             Report::new(TrustedServerError::Configuration {
                 message: format!(
-                    "Integration '{integration_id}' configuration failed validation: {err}"
+                    "[{place}] could not be read: {}",
+                    read_error_summary(&error)
                 ),
             })
         })?;
+    config.validate().map_err(|errors| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "[{place}] failed validation: {}",
+                validation_error_summary(&errors)
+            ),
+        })
+    })?;
+    Ok(config)
+}
 
-        Ok(Some(config))
+/// Why a table could not be read, by the path of the setting at fault.
+///
+/// `serde` quotes the value it could not read, so its message is kept only
+/// when it names keys alone: a key missing, unknown or written twice.
+fn read_error_summary(error: &serde_path_to_error::Error<serde_json::Error>) -> String {
+    let message = error.inner().to_string();
+    let names_keys_only = ["missing field `", "unknown field `", "duplicate field `"]
+        .iter()
+        .any(|start| message.starts_with(start));
+    let path = error.path().to_string();
+    match (path.as_str(), names_keys_only) {
+        (".", true) => message,
+        (".", false) => "a setting holds a value of the wrong type or form".to_owned(),
+        (path, true) => format!("{path}: {message}"),
+        (path, false) => format!("`{path}` holds a value of the wrong type or form"),
     }
 }
 
-impl Deref for IntegrationSettings {
-    type Target = HashMap<String, JsonValue>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.entries
-    }
-}
-
-impl DerefMut for IntegrationSettings {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.entries
-    }
-}
+/// The settings type a module reads from its table, beneath the section that
+/// selects it.
+///
+/// The type states which settings the module takes and how they are
+/// validated, and nothing else. Whether the module runs is not its business,
+/// because the section's selection names what runs.
+pub trait IntegrationConfig: DeserializeOwned + Validate {}
 
 /// A partner (SSP, DSP, identity vendor) configured in `[[ec.partners]]`.
 ///
@@ -1308,20 +1306,21 @@ impl DeviceConfig {
         self.module.as_deref().unwrap_or("builtin")
     }
 
-    /// Validates that the selected device-detection module is available in
-    /// this build.
+    /// Validates the selected device-detection module.
+    ///
+    /// `builtin` and `fastly` are resolved by the core and the Fastly adapter.
+    /// Any other key names an integration module that declares a device
+    /// module, and the registry rejects a key no module supplies, so this
+    /// cannot be a closed list without shutting modules out of device detection
+    /// entirely.
     ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError::Configuration`] when the selected module
-    /// key is not one this build provides.
+    /// Returns [`TrustedServerError::Configuration`] never, today. The error
+    /// type is kept because the caller treats module validation uniformly
+    /// across the three capabilities.
     pub fn validate_module_selection(&self) -> Result<(), Report<TrustedServerError>> {
-        match self.module_key() {
-            "builtin" | "fastly" => Ok(()),
-            key => Err(Report::new(TrustedServerError::Configuration {
-                message: format!("Device detection module `{key}` is not available in this build"),
-            })),
-        }
+        Ok(())
     }
 }
 
@@ -1482,12 +1481,11 @@ impl GeoConfig {
     /// Returns [`TrustedServerError::Configuration`] when the selected module
     /// key is not one this build provides.
     pub fn validate_module_selection(&self) -> Result<(), Report<TrustedServerError>> {
-        match self.module.as_deref() {
-            None | Some("platform") | Some("none") => Ok(()),
-            Some(key) => Err(Report::new(TrustedServerError::Configuration {
-                message: format!("Geo module `{key}` is not available in this build"),
-            })),
-        }
+        // Unset, `none` and `platform` are resolved by the core. Any other key
+        // names an integration module that declares a geo module, and the
+        // registry rejects one that no module supplies, so this check cannot be
+        // a closed list without shutting modules out of geo entirely.
+        Ok(())
     }
 
     /// Validates that running jurisdiction consumers without geolocation is
@@ -1511,7 +1509,11 @@ impl GeoConfig {
         &self,
         ec: &Ec,
     ) -> Result<(), Report<TrustedServerError>> {
-        let geo_disabled = !matches!(self.module.as_deref(), Some("platform"));
+        // Location is resolved by the host lookup (`platform`) or by any
+        // integration module that declares a geo module. Only an unset
+        // selector and the explicit `none` resolve nothing, so only those
+        // two leave every request on the declared jurisdiction.
+        let geo_disabled = matches!(self.module.as_deref(), None | Some("none"));
         // The selector is a typed enum, so statelessness is the absent
         // selector or the explicit `none`, matched rather than compared as a
         // string.
@@ -2656,7 +2658,6 @@ impl ProxyAssetRoute {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct Proxy {
     /// Enable TLS certificate verification when proxying to HTTPS origins.
     /// Defaults to true for secure production use.
@@ -2672,13 +2673,17 @@ pub struct Proxy {
     ///
     /// When empty (the default), proxy hosts are not restricted. Configure this
     /// in production to constrain signed and fetched first-party proxy targets.
-    /// When `integrations.prebid.external_bundle_url` is configured, this list
+    /// When `auction.prebid.external_bundle_url` is configured, this list
     /// must include its host and any HTTPS redirect targets.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub allowed_domains: Vec<String>,
     /// Path-prefix-based asset proxy routes evaluated before publisher fallback.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub asset_routes: Vec<ProxyAssetRoute>,
+    /// The modules this section selects, with each one's settings in the
+    /// table at its name.
+    #[serde(flatten)]
+    pub modules: SectionModules,
 }
 
 fn default_certificate_check() -> bool {
@@ -2699,6 +2704,7 @@ impl Default for Proxy {
             certificate_check: default_certificate_check(),
             allowed_domains: Vec::new(),
             asset_routes: Vec::new(),
+            modules: SectionModules::default(),
         }
     }
 }
@@ -3584,6 +3590,34 @@ fn is_default_permission_signal_config(value: &PermissionSignalConfig) -> bool {
     *value == PermissionSignalConfig::default()
 }
 
+/// Message a configuration still carrying the removed `[integrations]` table
+/// is rejected with.
+const REMOVED_INTEGRATIONS_TABLE_MESSAGE: &str = "Configuration table `[integrations]` was removed. Each module is selected in the \
+     section of its type, as [<type>] module = \"<name>\" or modules = [\"<name>\", ...], with its \
+     settings in the table at its name, [<type>.<name>], as described in the CHANGELOG.md \
+     breaking migration";
+
+/// The removed `[integrations]` table.
+///
+/// Reading one always fails, with [`REMOVED_INTEGRATIONS_TABLE_MESSAGE`], so
+/// the value is never held and the type carries no data.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RemovedIntegrationsTable;
+
+impl<'de> Deserialize<'de> for RemovedIntegrationsTable {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // The value is read and discarded first so that a table, a string or
+        // anything else all reach the same message. Reporting a type error
+        // instead would send an operator looking for a type problem in a table
+        // that has simply moved.
+        serde::de::IgnoredAny::deserialize(deserializer)?;
+        Err(serde::de::Error::custom(REMOVED_INTEGRATIONS_TABLE_MESSAGE))
+    }
+}
+
 /// A table that is no longer read under its old name, refused with directions
 /// to its new one when a configuration still carries it.
 macro_rules! refused_table {
@@ -3609,6 +3643,21 @@ macro_rules! refused_table {
 }
 
 refused_table! {
+    /// The `[adserver]` table, renamed `[ad-server]`.
+    RenamedAdServerTable => "Configuration table `[adserver]` is now `[ad-server]`. Select the \
+        ad server with `[ad-server] module` and move its settings to `[ad-server.<name>]` \
+        unchanged"
+}
+
+refused_table! {
+    /// The `[integration]` table, which is no longer read.
+    RemovedIntegrationTable => "Configuration table `[integration]` is no longer read. Each \
+        module is selected in the section of its type, as [<type>] module = \"<name>\" or \
+        modules = [\"<name>\", ...], with its settings in the table at its name, \
+        [<type>.<name>]"
+}
+
+refused_table! {
     /// The `[permission_signal]` table, renamed `[permission-signal]`.
     RenamedPermissionSignalTable => "Configuration table `[permission_signal]` is now \
         `[permission-signal]`, named exactly as its folder crates/permission-signal. Move its \
@@ -3629,9 +3678,9 @@ pub struct AuctionDebugCommentOptions {
     #[serde(default = "default_true")]
     pub include_provider_responses: bool,
 
-    /// Include `mediator_response` when a mediator ran.
+    /// Include `adserver_response` when an ad server ran.
     #[serde(default = "default_true")]
-    pub include_mediator_response: bool,
+    pub include_adserver_response: bool,
 
     /// Include each provider's `bids` array (vs. status/metadata only).
     #[serde(default = "default_true")]
@@ -3673,7 +3722,7 @@ impl Default for AuctionDebugCommentOptions {
     fn default() -> Self {
         Self {
             include_provider_responses: true,
-            include_mediator_response: true,
+            include_adserver_response: true,
             include_bids: true,
             metadata_keys: default_auction_debug_metadata_keys(),
             verbosity: AuctionDebugCommentVerbosity::Redacted,
@@ -3898,7 +3947,6 @@ fn validate_trusted_client_ip_shared_secret(
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
-#[serde(deny_unknown_fields)]
 pub struct Settings {
     #[validate(nested)]
     pub publisher: Publisher,
@@ -3919,8 +3967,30 @@ pub struct Settings {
     #[serde(default)]
     #[validate(nested)]
     pub ec: Ec,
-    #[serde(default)]
-    pub integrations: IntegrationSettings,
+    /// The removed `[integrations]` table.
+    ///
+    /// The name is kept so a configuration written for the previous release is
+    /// told where its blocks moved, rather than being handed a bare
+    /// unknown-field error listing every table Trusted Server accepts. The
+    /// field never holds a value, because reading one always fails.
+    #[serde(default, skip_serializing)]
+    #[allow(
+        dead_code,
+        reason = "the field exists so that reading the removed table fails with directions"
+    )]
+    integrations: RemovedIntegrationsTable,
+    /// The `[integration]` table, kept so a configuration carrying it is
+    /// told where modules are selected now.
+    #[serde(default, skip_serializing)]
+    #[allow(
+        dead_code,
+        reason = "the field exists so that reading the removed table fails with directions"
+    )]
+    integration: RemovedIntegrationTable,
+    /// The sections of module types core does not read itself, such as
+    /// `[cmp]` or `[tag]`, each named for the type of module it selects.
+    #[serde(flatten)]
+    pub sections: TypeSections,
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     #[validate(nested)]
     pub handlers: Vec<Handler>,
@@ -3933,6 +4003,26 @@ pub struct Settings {
     #[serde(default)]
     #[validate(nested)]
     pub auction: AuctionConfig,
+    /// The auction's demand sources. `[demand] modules` selects them and each
+    /// `[demand.<name>]` table holds one source's settings.
+    #[serde(default, skip_serializing_if = "ProviderList::is_unset")]
+    pub demand: ProviderList,
+    /// The ad server that picks the auction winner. `[ad-server] module`
+    /// selects it and `[ad-server.<name>]` holds its settings.
+    #[serde(
+        rename = "ad-server",
+        default,
+        skip_serializing_if = "ProviderChoice::is_unset"
+    )]
+    pub adserver: ProviderChoice,
+    /// The `[adserver]` table, kept so a configuration carrying it is told
+    /// its new name.
+    #[serde(rename = "adserver", default, skip_serializing)]
+    #[allow(
+        dead_code,
+        reason = "the field exists so that reading the renamed table fails with directions"
+    )]
+    renamed_adserver: RenamedAdServerTable,
     #[serde(default)]
     pub consent: ConsentConfig,
     #[serde(default)]
@@ -4115,8 +4205,6 @@ impl Settings {
         self.image_optimizer.normalize()?;
         self.debug.auction_html_comment_options.normalize();
         self.tinybird.normalize();
-        self.integrations
-            .remove_legacy_static_secret_store_selectors();
         self.consent.validate();
         Ok(())
     }
@@ -4140,6 +4228,7 @@ impl Settings {
         settings.ec.migrate_legacy_ec_layout()?;
         settings.ec.validate_module_selection()?;
         settings.ec.validate_resolve_allowed_origins()?;
+        settings.validate_module_sections()?;
         settings.device.validate_module_selection()?;
         settings.geo.validate_module_selection()?;
         settings
@@ -4505,19 +4594,173 @@ impl Settings {
         Ok(())
     }
 
-    /// Retrieves the integration configuration of a specific type.
+    /// Every section that selects modules, with its name: `[proxy]`,
+    /// `[auction]` and each module type's own section.
+    pub fn module_sections(&self) -> impl Iterator<Item = (&str, &SectionModules)> {
+        [
+            ("proxy", &self.proxy.modules),
+            ("auction", &self.auction.modules),
+        ]
+        .into_iter()
+        .chain(self.sections.iter())
+    }
+
+    /// The section that selects the module `name`, and the name as written
+    /// there, whether in full or with the section's type folder left off.
+    #[must_use]
+    pub fn module_selection(&self, name: &str) -> Option<(&str, &str)> {
+        self.module_sections().find_map(|(section, modules)| {
+            modules
+                .selected()
+                .iter()
+                .find(|written| crate::module_name::resolve(section, written, &[name]).is_some())
+                .map(|written| (section, written.as_str()))
+        })
+    }
+
+    /// Whether a section selects the module `name`.
+    #[must_use]
+    pub fn selects_module(&self, name: &str) -> bool {
+        self.module_selection(name).is_some()
+    }
+
+    /// The table `section` holds at the name `written`, as it was written,
+    /// or an empty one when the section holds none.
+    #[must_use]
+    pub fn section_table(
+        &self,
+        section: &str,
+        written: &str,
+    ) -> serde_json::Map<String, JsonValue> {
+        self.module_sections()
+            .find(|(candidate, _)| *candidate == section)
+            .and_then(|(_, modules)| modules.settings_of(written))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Reads and validates a selected module's settings, from the table at the
+    /// name it is written under beneath the section that selects it, or
+    /// returns `None` when no section selects it.
+    ///
+    /// A selected module with no table reads an empty one, so a module that
+    /// takes no settings runs on its selection alone and one that requires a
+    /// setting reports the setting it is missing. The parse and validation
+    /// messages name the setting at fault in the outermost message, because a
+    /// report renders only that in `ts config validate`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the integration configuration exists but cannot be deserialized as the requested type.
-    pub fn integration_config<T>(
-        &self,
-        integration_id: &str,
-    ) -> Result<Option<T>, Report<TrustedServerError>>
+    /// When the table cannot be read as `T` or fails its validation, naming the
+    /// table and the setting at fault but never the setting's value.
+    pub fn module_config<T>(&self, name: &str) -> Result<Option<T>, Report<TrustedServerError>>
     where
         T: IntegrationConfig,
     {
-        self.integrations.get_typed(integration_id)
+        let Some((section, written)) = self.module_selection(name) else {
+            return Ok(None);
+        };
+        let table = self
+            .module_sections()
+            .find(|(candidate, _)| *candidate == section)
+            .and_then(|(_, modules)| modules.settings_of(written))
+            .cloned()
+            .unwrap_or_default();
+        read_table(&format!("{section}.{written}"), table).map(Some)
+    }
+
+    /// The modules `section` selects, to change, with the section created
+    /// empty when it is a module type's and absent.
+    fn section_modules_mut(&mut self, section: &str) -> &mut SectionModules {
+        match section {
+            "proxy" => &mut self.proxy.modules,
+            "auction" => &mut self.auction.modules,
+            _ => self.sections.section_mut(section),
+        }
+    }
+
+    /// Selects the module `name` in `section`, written with the section's
+    /// type folder left off, with no table of its own.
+    pub fn select_module(&mut self, section: &str, name: &str) {
+        let written = crate::module_name::short_form(section, name).to_owned();
+        self.section_modules_mut(section).select(&written);
+    }
+
+    /// Stops selecting the module `name` in `section` and drops its table.
+    pub fn remove_module(&mut self, section: &str, name: &str) {
+        let written = crate::module_name::short_form(section, name).to_owned();
+        self.section_modules_mut(section).remove(&written);
+    }
+
+    /// Selects the module `name` in `section`, with `settings` as its table,
+    /// which is what writing both in a document does.
+    ///
+    /// The section is the name's type folder, except for the sections that
+    /// Trusted Server reads itself and that also select modules, where the
+    /// name is written in full.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `settings` cannot be serialized to a table.
+    pub fn insert_module_config<T>(
+        &mut self,
+        section: &str,
+        name: &str,
+        settings: &T,
+    ) -> Result<(), Report<TrustedServerError>>
+    where
+        T: Serialize,
+    {
+        let JsonValue::Object(table) =
+            serde_json::to_value(settings).change_context(TrustedServerError::Configuration {
+                message: "Failed to serialize module configuration".to_string(),
+            })?
+        else {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!("the settings of `{name}` are not a table"),
+            }));
+        };
+        let written = crate::module_name::short_form(section, name).to_owned();
+        self.section_modules_mut(section).insert(&written, table);
+        Ok(())
+    }
+
+    /// Checks every section's selection and tables, and that no module is
+    /// selected in two sections.
+    ///
+    /// # Errors
+    ///
+    /// Naming the section at fault.
+    pub fn validate_module_sections(&self) -> Result<(), Report<TrustedServerError>> {
+        self.sections.validate()?;
+        for (section, modules) in [
+            ("proxy", &self.proxy.modules),
+            ("auction", &self.auction.modules),
+        ] {
+            modules
+                .validate(section)
+                .map_err(|message| Report::new(TrustedServerError::Configuration { message }))?;
+        }
+        let mut seen: Vec<(&str, String)> = Vec::new();
+        for (section, modules) in self.module_sections() {
+            for written in modules.selected() {
+                let full = if written.contains('.') {
+                    written.clone()
+                } else {
+                    format!("{section}.{written}")
+                };
+                if let Some((earlier, _)) = seen.iter().find(|(_, name)| *name == full) {
+                    return Err(Report::new(TrustedServerError::Configuration {
+                        message: format!(
+                            "`{written}` is selected in both [{earlier}] and [{section}]. A \
+                             module is selected in one section"
+                        ),
+                    }));
+                }
+                seen.push((section, full));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -4605,8 +4848,13 @@ fn validation_error_summary(errors: &validator::ValidationErrors) -> String {
             };
             match kind {
                 validator::ValidationErrorsKind::Field(validations) => {
+                    // A validator's message, where it gives one, says why the
+                    // value was refused, which the code alone does not.
                     for validation in validations {
-                        messages.push(format!("{path}: {}", validation.code));
+                        messages.push(match &validation.message {
+                            Some(message) => format!("{path}: {} ({message})", validation.code),
+                            None => format!("{path}: {}", validation.code),
+                        });
                     }
                 }
                 validator::ValidationErrorsKind::Struct(inner) => {
@@ -4724,7 +4972,7 @@ where
 
 // Helper: allow Vec fields to deserialize from either a JSON array or a map of numeric indices.
 // This lets env vars such as
-// TRUSTED_SERVER__INTEGRATIONS__PREBID__CLIENT_SIDE_BIDDERS__0=example-browser work;
+// TRUSTED_SERVER__AUCTION__PREBID__CLIENT_SIDE_BIDDERS__0=example-browser work;
 // the config env source represents the value as an object rather than a sequence.
 // String inputs may also be JSON arrays or comma-separated values.
 /// Deserializes a `HashMap<String, String>` from either:
@@ -4786,7 +5034,18 @@ where
     }
 }
 
-pub(crate) fn vec_from_seq_or_map<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+/// Reads a list setting written as a sequence, as a map keyed by position,
+/// or as a string holding a JSON array or comma-separated values.
+///
+/// The map and string forms are what an environment overlay produces, so a
+/// list reads the same from a file and from the environment. Public so a
+/// module crate's own list settings read the same way.
+///
+/// # Errors
+///
+/// When the value is none of those forms, a map key is not a position, or an
+/// item cannot be read as `T`.
+pub fn vec_from_seq_or_map<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: DeserializeOwned,
@@ -4862,7 +5121,6 @@ mod tests {
     use regex::Regex;
     use serde_json::json;
     use std::collections::BTreeSet;
-    use std::sync::Arc;
 
     use crate::ec::resolve::NotAnOrigin;
 
@@ -4917,11 +5175,7 @@ mod tests {
         );
     }
 
-    use crate::auction::build_orchestrator;
-    use crate::integrations::{
-        IntegrationRegistry, gpt::GptConfig, nextjs::NextJsIntegrationConfig,
-        prebid::PrebidIntegrationConfig,
-    };
+    use crate::integrations::IntegrationRegistry;
     use crate::redacted::Redacted;
     use crate::test_support::tests::{
         crate_test_settings_str, crate_test_settings_str_with_ec_section, create_test_settings,
@@ -5018,11 +5272,66 @@ mod tests {
         // country, so both selector tables are reset to unset here.
         settings.geo = GeoConfig::default();
         settings.device = DeviceConfig::default();
+        settings.sections = TypeSections::default();
+        settings.auction.modules.clear();
 
         let value = serde_json::to_value(&settings).expect("should serialize settings");
 
         serde_json::from_value::<BaseRevisionSettings>(value)
             .expect("base revision schema should accept a config blob with no trusted client IP");
+    }
+
+    #[test]
+    fn geo_selector_is_omitted_from_serialized_config_when_unset() {
+        // `ts config push` serializes `Settings` verbatim, so a selector nobody
+        // set must not appear in the blob. A `deny_unknown_fields` binary that
+        // predates the selector rejects the key during rollout or rollback.
+        //
+        // The shared fixture writes a `[geo]` table (it acknowledges running
+        // with no geo module), so the assertion is about the selector key
+        // rather than the table, which is what the blob's compatibility
+        // actually turns on.
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without a geo selector");
+
+        let value = serde_json::to_value(&settings).expect("should serialize settings");
+
+        let geo = value
+            .get("geo")
+            .expect("the geo table is written because the fixture acknowledges no geo module");
+        assert!(
+            geo.get("module").is_none(),
+            "an unset geo selector should not be serialized, got {geo}"
+        );
+        assert!(
+            value
+                .get("device")
+                .is_none_or(|device| device.get("module").is_none()),
+            "an unset device selector should not be serialized, got {value}"
+        );
+    }
+
+    #[test]
+    fn a_selected_geo_module_stays_in_the_serialized_config() {
+        // The shared test settings already carry a `[geo]` table, so the
+        // selector is set inside that table rather than in a second one, which
+        // TOML rejects as a duplicate key.
+        let settings = Settings::from_toml(&crate_test_settings_str().replace(
+            "[geo]",
+            "[geo]
+module = \"none\"",
+        ))
+        .expect("should parse settings with a geo selector");
+
+        let value = serde_json::to_value(&settings).expect("should serialize settings");
+
+        assert_eq!(
+            value
+                .pointer("/geo/module")
+                .and_then(serde_json::Value::as_str),
+            Some("none"),
+            "a selected geo module should survive serialization"
+        );
     }
 
     #[test]
@@ -5080,7 +5389,7 @@ mod tests {
         const CANARY_S3_SESSION_TOKEN: &str = "CANARY-S3-SESSION-TOKEN-0123456789";
         const CANARY_TINYBIRD_AUCTION_TOKEN: &str = "CANARY-TINYBIRD-AUCTION-TOKEN-0123456789";
         const CANARY_TINYBIRD_ACCESS_TOKEN: &str = "CANARY-TINYBIRD-ACCESS-TOKEN-0123456789";
-        const CANARY_DATADOME_SERVER_SIDE_KEY: &str = "CANARY-DATADOME-SERVER-SIDE-KEY-0123456789";
+        const CANARY_MODULE_KEY: &str = "CANARY-MODULE-TABLE-KEY-0123456789";
 
         let mut settings = create_test_settings();
 
@@ -5139,20 +5448,18 @@ mod tests {
             max_body_bytes: 0,
         };
 
-        // `IntegrationSettings` stores integration configs as opaque JSON and
-        // relies on a hand-written `Debug` impl to suppress their values. That
-        // impl is the only thing keeping resolved DataDome credentials out of
-        // this output, so pin it here.
+        // A module's table is opaque JSON, and the section's hand-written
+        // `Debug` impl is the only thing keeping a secret a module's table
+        // holds out of this output, so pin it here.
         settings
-            .integrations
-            .insert_config(
-                "datadome",
+            .insert_module_config(
+                "testing",
+                "testing.example",
                 &json!({
-                    "enabled": true,
-                    "server_side_key_secret_name": CANARY_DATADOME_SERVER_SIDE_KEY,
+                    "key_name": CANARY_MODULE_KEY,
                 }),
             )
-            .expect("should insert datadome integration config");
+            .expect("should insert a module's table");
 
         let debug = format!("{settings:?}");
 
@@ -5196,10 +5503,7 @@ mod tests {
                 CANARY_TINYBIRD_AUCTION_TOKEN,
             ),
             ("tinybird.access_token_secret", CANARY_TINYBIRD_ACCESS_TOKEN),
-            (
-                "integrations.datadome.server_side_key_secret_name",
-                CANARY_DATADOME_SERVER_SIDE_KEY,
-            ),
+            ("testing.example.key_name", CANARY_MODULE_KEY),
         ];
 
         for (field, canary) in canaries {
@@ -5616,7 +5920,7 @@ mod tests {
             .expect("should load the test settings fixture");
         let mut value = serde_json::to_value(settings)
             .expect("should serialize the test settings fixture to JSON");
-        value["auction"]["providers"] = json!(["prebid"]);
+        value["auction"]["providers"] = json!(["example"]);
 
         let error = Settings::from_json_value(value)
             .expect_err("should reject the removed auction provider list schema");
@@ -5626,16 +5930,17 @@ mod tests {
             "error should identify the removed field, got {rendered}"
         );
         assert!(
-            rendered.contains("CHANGELOG.md"),
-            "error should direct operators to the migration guidance, got {rendered}"
+            rendered.contains("[demand] modules"),
+            "error should name where the setting moved to, got {rendered}"
         );
     }
 
     #[test]
     fn toml_settings_reject_legacy_auction_provider_list_with_migration_guidance() {
         let toml = format!(
-            "{}\n[auction]\nproviders = [\"prebid\"]\n",
+            "{}\n",
             crate_test_settings_str()
+                .replace("[auction]\n", "[auction]\nproviders = [\"example\"]\n")
         );
 
         let error = Settings::from_toml(&toml)
@@ -5646,8 +5951,8 @@ mod tests {
             "error should identify the removed field, got {rendered}"
         );
         assert!(
-            rendered.contains("CHANGELOG.md"),
-            "error should direct operators to the migration guidance, got {rendered}"
+            rendered.contains("[demand] modules"),
+            "error should name where the setting moved to, got {rendered}"
         );
     }
 
@@ -5655,7 +5960,7 @@ mod tests {
     fn auction_debug_comment_options_default_matches_serde_defaults() {
         let opts = AuctionDebugCommentOptions::default();
         assert!(opts.include_provider_responses, "should default to true");
-        assert!(opts.include_mediator_response, "should default to true");
+        assert!(opts.include_adserver_response, "should default to true");
         assert!(opts.include_bids, "should default to true");
         assert_eq!(
             opts.metadata_keys,
@@ -5913,27 +6218,16 @@ mod tests {
         assert!(settings.is_ok());
 
         let settings = settings.expect("should parse valid TOML");
-        let prebid_cfg = settings
-            .integration_config::<PrebidIntegrationConfig>("prebid")
-            .expect("Prebid config query should succeed")
-            .expect("Prebid config should load from test settings");
-        assert_eq!(prebid_cfg.timeout_ms, 1000);
         assert!(
             settings
-                .integration_config::<NextJsIntegrationConfig>("nextjs")
-                .expect("Next.js config query should succeed")
+                .module_config::<OneRequiredSetting>(ENDPOINT_MODULE)
+                .expect("a query for a module no section selects should succeed")
                 .is_none(),
-            "Next.js integration should default to disabled"
+            "a module no section selects should not run"
         );
-        let raw_nextjs = settings
-            .integrations
-            .get("nextjs")
-            .expect("test settings should include nextjs block");
-        assert_eq!(raw_nextjs["enabled"], json!(false));
-        assert_eq!(
-            raw_nextjs["rewrite_attributes"],
-            json!(["href", "link", "url"]),
-            "Next.js rewrite attributes should default to href/link/url"
+        assert!(
+            settings.auction.modules.selected().is_empty(),
+            "the fixture should select no auction module"
         );
         assert_eq!(settings.publisher.domain, "test-publisher.com");
         assert_eq!(settings.publisher.cookie_domain, ".test-publisher.com");
@@ -6787,12 +7081,30 @@ mod tests {
             .validate_module_selection()
             .expect("should validate the fastly opt-in");
 
-        let unknown = DeviceConfig {
+        // As with geo, a key core does not know is not a settings error,
+        // because a module's name is a legitimate value here too.
+        let module_key = DeviceConfig {
             module: Some("acme".to_owned()),
         };
+        module_key
+            .validate_module_selection()
+            .expect("a module id should be accepted by settings validation");
+
+        // And as with geo, the rejection happens at registry build, so a
+        // mistyped selector cannot fall back to the built-in module in
+        // silence.
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.device.module = Some("acme".to_owned());
+        let error = match crate::integrations::IntegrationRegistry::new(&settings) {
+            Ok(_) => {
+                panic!("a device module no module supplies should be rejected at registry build")
+            }
+            Err(error) => error,
+        };
+        let message = error.to_string();
         assert!(
-            unknown.validate_module_selection().is_err(),
-            "an unknown device module should be rejected at startup"
+            message.contains("acme") && message.contains("[device] module"),
+            "the error should name the selector and the module, got: {message}"
         );
     }
 
@@ -6927,13 +7239,35 @@ passphrase = "another-test-secret-key-32-bytes"
         none.validate_module_selection()
             .expect("should validate the explicit opt-out of geolocation");
 
-        let unknown = GeoConfig {
+        // A key core does not know is not a settings error, because a
+        // module's name is a legitimate value and a closed list here would
+        // shut every module out of geo. Settings accepts it and the registry
+        // decides.
+        let module_key = GeoConfig {
             module: Some("acme".to_owned()),
             assume_single_jurisdiction: false,
         };
+        module_key
+            .validate_module_selection()
+            .expect("a module id should be accepted by settings validation");
+
+        // The rejection moved to registry build, where it is known whether any
+        // module supplies the name. With no module supplying `acme`, building
+        // the registry fails and the error names the selector and the module.
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.geo.module = Some("acme".to_owned());
+        // `IntegrationRegistry` is not `Debug`, so the error is taken by match
+        // rather than `expect_err`.
+        let error = match crate::integrations::IntegrationRegistry::new(&settings) {
+            Ok(_) => {
+                panic!("a geo module no module supplies should be rejected at registry build")
+            }
+            Err(error) => error,
+        };
+        let message = error.to_string();
         assert!(
-            unknown.validate_module_selection().is_err(),
-            "an unknown geo module should be rejected at startup"
+            message.contains("acme") && message.contains("[geo] module"),
+            "the error should name the selector and the module, got: {message}"
         );
     }
 
@@ -8276,145 +8610,296 @@ source_domain = "partner.example.com"
         );
     }
 
-    #[test]
-    fn test_disabled_integration_does_not_register() {
-        use crate::integrations::testlight::TestlightConfig;
-        use serde_json::json;
+    /// The settings of an example module that takes none.
+    #[derive(Debug, Deserialize, Validate)]
+    #[serde(deny_unknown_fields)]
+    struct NoSettings {}
 
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "testlight",
-                &json!({
-                    "enabled": false,
-                    "endpoint": "https://testlight.test/auction",
-                    "rewrite_scripts": true,
-                }),
-            )
-            .expect("should insert integration config");
+    impl IntegrationConfig for NoSettings {}
 
-        let config = settings
-            .integration_config::<TestlightConfig>("testlight")
-            .expect("integration parsing should succeed");
-
-        assert!(config.is_none(), "Disabled integrations should be skipped");
+    /// The settings of an example module that requires one.
+    #[derive(Debug, Deserialize, Validate)]
+    #[serde(deny_unknown_fields)]
+    struct OneRequiredSetting {
+        #[validate(url)]
+        endpoint: String,
     }
 
-    #[test]
-    fn disabled_integration_can_omit_enabled_required_fields_and_skip_semantic_validation() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "gpt",
-                &json!({
-                    "enabled": false,
-                }),
-            )
-            .expect("should insert GPT config");
+    impl IntegrationConfig for OneRequiredSetting {}
 
-        let config = settings
-            .integration_config::<GptConfig>("gpt")
-            .expect("minimal disabled GPT config should be ignored");
-        assert!(config.is_none(), "disabled GPT config should be skipped");
-        IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
+    /// The example modules' names, in a section of their own type.
+    const EXAMPLE_SECTION: &str = "example";
+    const PLAIN_MODULE: &str = "example.plain";
+    const ENDPOINT_MODULE: &str = "example.endpoint";
+
+    /// A module no section selects has no configuration, whatever else the
+    /// settings hold.
+    #[test]
+    fn a_module_that_is_not_selected_has_no_configuration() {
+        let settings = create_test_settings();
+
+        assert!(
+            !settings.selects_module(ENDPOINT_MODULE),
+            "the shared fixture should not select the example module"
+        );
+        assert!(
+            settings
+                .module_config::<OneRequiredSetting>(ENDPOINT_MODULE)
+                .expect("reading an unselected module should succeed")
+                .is_none(),
+            "a module that is not selected should have no configuration"
+        );
+    }
+
+    /// A selected module with no table of its own is read from an empty one,
+    /// so one that takes no settings runs on its selection alone.
+    #[test]
+    fn a_selected_module_with_no_table_is_read_from_an_empty_one() {
+        let mut settings = create_test_settings();
+        settings.select_module(EXAMPLE_SECTION, PLAIN_MODULE);
+
+        assert!(
+            settings
+                .module_config::<NoSettings>(PLAIN_MODULE)
+                .expect("a module that takes no settings should read from an empty table")
+                .is_some(),
+            "selecting the module should be the whole configuration"
+        );
+    }
+
+    /// The same empty table makes a module that requires a setting report the
+    /// setting it is missing, rather than starting without it.
+    #[test]
+    fn a_selected_module_without_a_required_setting_names_it() {
+        let mut settings = create_test_settings();
+        settings.select_module(EXAMPLE_SECTION, ENDPOINT_MODULE);
+
+        let error = settings
+            .module_config::<OneRequiredSetting>(ENDPOINT_MODULE)
+            .expect_err("should reject a selected module with no endpoint");
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("[example.endpoint]") && rendered.contains("endpoint"),
+            "should name the module's table and the missing setting: {rendered}"
+        );
+    }
+
+    /// An example module's settings with a secret in them, as its table holds
+    /// them at startup, once the secret is resolved from the store.
+    #[derive(Debug, Deserialize, Validate)]
+    #[serde(deny_unknown_fields)]
+    struct SecretSetting {
+        #[validate(url)]
+        endpoint: String,
+        #[validate(range(max = 10))]
+        retries: Option<u32>,
+    }
+
+    impl IntegrationConfig for SecretSetting {}
+
+    #[test]
+    fn a_module_table_that_is_refused_names_the_setting_and_never_its_value() {
+        const SECRET: &str = "resolved-secret-value-4f7a";
+        for (table, setting) in [
+            // Fails a rule, whose parameters carry the value checked.
+            (serde_json::json!({ "endpoint": SECRET }), "endpoint"),
+            // Cannot be read, where `serde` quotes the value it found.
+            (
+                serde_json::json!({ "endpoint": "https://example.com", "retries": SECRET }),
+                "retries",
             ),
-        )
-        .expect("disabled invalid integration config should not fail registry startup");
-    }
-
-    #[test]
-    fn minimal_disabled_prebid_deserializes_without_enabled_only_validation() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "prebid",
-                &json!({
-                    "enabled": false,
-                }),
-            )
-            .expect("should insert prebid config");
-
-        let config = settings
-            .integration_config::<PrebidIntegrationConfig>("prebid")
-            .expect("disabled prebid config should be ignored");
-        assert!(config.is_none(), "disabled prebid config should be skipped");
-        IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("disabled default-enabled prebid config should not fail registry startup");
-        build_orchestrator(&settings)
-            .expect("minimal disabled prebid config should not fail orchestrator startup");
-    }
-
-    #[test]
-    fn disabled_removed_prebid_and_aps_fields_are_rejected() {
-        for (integration_id, removed_field) in [("prebid", "server_url"), ("aps", "account_id")] {
+        ] {
             let mut settings = create_test_settings();
             settings
-                .integrations
-                .insert_config(
-                    integration_id,
-                    &json!({
-                        "enabled": false,
-                        (removed_field): "removed-value",
-                    }),
-                )
-                .expect("should insert removed integration config field");
+                .insert_module_config(EXAMPLE_SECTION, ENDPOINT_MODULE, &table)
+                .expect("should insert the module's table");
 
-            let error = match integration_id {
-                "prebid" => settings
-                    .integration_config::<PrebidIntegrationConfig>(integration_id)
-                    .expect_err("should reject removed disabled Prebid field"),
-                "aps" => settings
-                    .integration_config::<crate::integrations::aps::ApsConfig>(integration_id)
-                    .expect_err("should reject removed disabled APS field"),
-                _ => unreachable!("test integration ID should be known"),
-            };
+            let error = settings
+                .module_config::<SecretSetting>(ENDPOINT_MODULE)
+                .expect_err("the table breaks the module's rules");
+
+            let shown = format!("{error}\n{error:?}");
             assert!(
-                format!("{error:?}").contains(removed_field),
-                "should identify removed field `{removed_field}`: {error:?}"
+                !shown.contains(SECRET),
+                "printed a setting's value: {shown}"
+            );
+            // The module's name holds `endpoint` too, so the setting is looked
+            // for after the table's name.
+            let rendered = error.to_string();
+            let reason = rendered
+                .split_once("[example.endpoint]")
+                .map_or("", |(_, reason)| reason);
+            assert!(
+                reason.contains(setting),
+                "should name the table and the setting: {rendered}"
+            );
+        }
+    }
+
+    /// A table written for a module its section does not select is refused,
+    /// rather than sitting in the configuration doing nothing.
+    #[test]
+    fn a_table_for_a_module_that_is_not_selected_is_refused() {
+        let toml = format!(
+            "{}\n[testing]\nmodule = \"example\"\n\n[testing.another]\n",
+            crate_test_settings_str()
+        );
+
+        let error = Settings::from_toml(&toml).expect_err("should reject a table nothing selects");
+        let rendered = format!("{error:?}");
+
+        assert!(
+            rendered.contains("[testing.another] is configured")
+                && rendered.contains("does not select"),
+            "should name the table and the selection it is missing from: {rendered}"
+        );
+    }
+
+    /// A module type's section that selects nothing is refused, which is also
+    /// what a misspelt section of Trusted Server's own meets.
+    #[test]
+    fn a_section_that_selects_no_module_is_refused() {
+        let toml = format!(
+            "{}\n[framework.nextjs]\nrewrite_attributes = [\"href\"]\n",
+            crate_test_settings_str()
+        );
+
+        let error =
+            Settings::from_toml(&toml).expect_err("should reject a section selecting nothing");
+
+        assert!(
+            format!("{error:?}").contains("[framework] selects no module"),
+            "should name the section: {error:?}"
+        );
+    }
+
+    /// A key left in a module's table that its settings do not have, such as
+    /// the removed `enabled`, is refused when the module reads its table, so a
+    /// configuration cannot read as switched off while the module runs.
+    #[test]
+    fn an_enabled_key_left_in_a_table_is_refused() {
+        let toml = format!(
+            "{}\n[example]\nmodules = [\"endpoint\"]\n\n[example.endpoint]\nendpoint = \"https://endpoint.example\"\nenabled = false\n",
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml).expect("core reads no module's table itself");
+
+        let error = settings
+            .module_config::<OneRequiredSetting>(ENDPOINT_MODULE)
+            .expect_err("should reject a leftover enabled key");
+        let rendered = format!("{error:?}");
+
+        assert!(
+            rendered.contains("[example.endpoint]") && rendered.contains("enabled"),
+            "should name the table and the key: {rendered}"
+        );
+    }
+
+    /// Naming one module twice is a mistake rather than a way of running it
+    /// twice, so it is refused.
+    #[test]
+    fn naming_a_module_twice_is_refused() {
+        let toml = format!(
+            "{}\n[example]\nmodules = [\"endpoint\", \"endpoint\"]\n",
+            crate_test_settings_str()
+        );
+
+        let error = Settings::from_toml(&toml).expect_err("should reject a repeated name");
+
+        assert!(
+            format!("{error:?}").contains("more than once"),
+            "should report the repeated name: {error:?}"
+        );
+    }
+
+    /// The tables removed from the configuration are refused with the move
+    /// spelled out, rather than with a bare unknown-field error.
+    #[test]
+    fn the_removed_integration_tables_are_refused_with_directions() {
+        for (table, expected) in [
+            ("[integrations.example]", "CHANGELOG.md"),
+            (
+                "[integration]\nmodules = [\"example\"]",
+                "is no longer read",
+            ),
+        ] {
+            let toml = format!("{}\n{table}\n", crate_test_settings_str());
+
+            let error = Settings::from_toml(&toml).expect_err("should reject the removed table");
+            let rendered = format!("{error:?}");
+
+            assert!(
+                rendered.contains("the section of its type") && rendered.contains(expected),
+                "should say where modules are selected now: {rendered}"
+            );
+        }
+    }
+
+    /// The same refusal reaches a configuration blob, which is the shape the
+    /// runtime loads rather than TOML.
+    #[test]
+    fn json_settings_refuse_the_removed_integration_tables() {
+        for table in ["integrations", "integration"] {
+            let mut value = serde_json::to_value(create_test_settings())
+                .expect("should serialize the test settings fixture to JSON");
+            value
+                .as_object_mut()
+                .expect("settings should serialize as an object")
+                .insert(table.to_owned(), json!({ "example": {} }));
+
+            let error = Settings::from_json_value(value)
+                .expect_err("should reject the removed table in JSON");
+
+            assert!(
+                format!("{error:?}").contains("the section of its type"),
+                "should say where modules are selected now: {error:?}"
             );
         }
     }
 
     #[test]
-    fn enabled_invalid_integration_fails_registry_startup() {
+    fn invalid_settings_for_a_selected_module_fail_registry_startup() {
+        fn build(
+            settings: &Settings,
+        ) -> Result<Option<crate::integrations::IntegrationRegistration>, Report<TrustedServerError>>
+        {
+            Ok(settings
+                .module_config::<OneRequiredSetting>(ENDPOINT_MODULE)?
+                .map(|_| crate::integrations::IntegrationRegistration::builder("endpoint").build()))
+        }
+
+        fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+            settings
+                .module_config::<OneRequiredSetting>(ENDPOINT_MODULE)
+                .map(|config| config.is_some())
+        }
+
         let mut settings = create_test_settings();
         settings
-            .integrations
-            .insert_config(
-                "gpt",
+            .insert_module_config(
+                EXAMPLE_SECTION,
+                ENDPOINT_MODULE,
                 &json!({
-                    "enabled": true,
-                    "script_url": "not a url",
+                    "endpoint": "not a url",
                 }),
             )
-            .expect("should insert GPT config");
+            .expect("should insert the example module's table");
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            "endpoint",
+            "settings-tests",
+            build,
+            validate,
+        )
+        .with_module_name(ENDPOINT_MODULE)];
 
-        let err = match IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        ) {
-            Ok(_) => panic!("enabled invalid integration should fail registry startup"),
+        let err = match IntegrationRegistry::with_registrations(&settings, &extra) {
+            Ok(_) => panic!("a selected module with invalid settings should fail startup"),
             Err(err) => err,
         };
         assert!(
-            err.to_string().contains("Integration 'gpt'"),
-            "should identify the invalid integration config"
+            format!("{err:?}").contains("[example.endpoint]"),
+            "should identify the invalid module table: {err:?}"
         );
     }
 
@@ -8470,11 +8955,8 @@ source_domain = "partner.example.com"
 
     #[test]
     fn test_auction_creative_processing_defaults_when_omitted() {
-        let toml_str = crate_test_settings_str()
-            + r#"
-            [auction]
-            enabled = true
-            "#;
+        let toml_str =
+            crate_test_settings_str().replace("[auction]\n", "[auction]\nenabled = true\n");
 
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
 
@@ -8490,12 +8972,10 @@ source_domain = "partner.example.com"
 
     #[test]
     fn test_auction_rewrite_creatives_accepts_explicit_false() {
-        let toml_str = crate_test_settings_str()
-            + r#"
-            [auction]
-            enabled = true
-            rewrite_creatives = false
-            "#;
+        let toml_str = crate_test_settings_str().replace(
+            "[auction]\n",
+            "[auction]\nenabled = true\nrewrite_creatives = false\n",
+        );
 
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
 
@@ -8516,12 +8996,7 @@ source_domain = "partner.example.com"
 
     #[test]
     fn test_auction_allowed_context_keys_from_toml() {
-        let toml_str = crate_test_settings_str()
-            + r#"
-            [auction]
-            enabled = true
-            allowed_context_keys = ["permutive_segments", "lockr_ids"]
-            "#;
+        let toml_str = crate_test_settings_str().replace("[auction]\n", "[auction]\nenabled = true\nallowed_context_keys = [\"permutive_segments\", \"lockr_ids\"]\n");
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
         assert_eq!(
             settings.auction.allowed_context_keys,
@@ -8531,12 +9006,10 @@ source_domain = "partner.example.com"
 
     #[test]
     fn test_auction_empty_allowed_context_keys_blocks_all() {
-        let toml_str = crate_test_settings_str()
-            + r#"
-            [auction]
-            enabled = true
-            allowed_context_keys = []
-            "#;
+        let toml_str = crate_test_settings_str().replace(
+            "[auction]\n",
+            "[auction]\nenabled = true\nallowed_context_keys = []\n",
+        );
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
         assert!(
             settings.auction.allowed_context_keys.is_empty(),
@@ -8555,6 +9028,7 @@ source_domain = "partner.example.com"
                 "*.Example.Org".to_string(),
             ],
             asset_routes: vec![],
+            modules: SectionModules::default(),
         };
         proxy.normalize();
         assert_eq!(
@@ -8575,6 +9049,7 @@ source_domain = "partner.example.com"
                 "cdn.example.com".to_string(),
             ],
             asset_routes: vec![],
+            modules: SectionModules::default(),
         };
         proxy.normalize();
         assert_eq!(
@@ -8590,6 +9065,7 @@ source_domain = "partner.example.com"
             certificate_check: true,
             allowed_domains: vec!["*".to_string(), "tracker.com".to_string()],
             asset_routes: vec![],
+            modules: SectionModules::default(),
         };
         proxy.normalize();
         assert_eq!(
@@ -8605,6 +9081,7 @@ source_domain = "partner.example.com"
             certificate_check: true,
             allowed_domains: vec!["*".to_string()],
             asset_routes: vec![],
+            modules: SectionModules::default(),
         };
         proxy.normalize();
         assert!(
@@ -8619,6 +9096,7 @@ source_domain = "partner.example.com"
             certificate_check: true,
             allowed_domains: vec!["  ".to_string(), "\t".to_string()],
             asset_routes: vec![],
+            modules: SectionModules::default(),
         };
         proxy.normalize();
         assert!(
@@ -8637,6 +9115,7 @@ source_domain = "partner.example.com"
                 origin_url: "  https://assets.example.com  ".to_string(),
                 ..Default::default()
             }],
+            modules: SectionModules::default(),
         };
         proxy.normalize();
         assert_eq!(
@@ -8661,6 +9140,7 @@ source_domain = "partner.example.com"
                 target_path: Some("  /rewritten/$1  ".to_string()),
                 ..Default::default()
             }],
+            modules: SectionModules::default(),
         };
         proxy.normalize();
 
@@ -9385,6 +9865,7 @@ source_domain = "partner.example.com"
                     ..Default::default()
                 },
             ],
+            modules: SectionModules::default(),
         };
 
         let route = proxy
@@ -9413,6 +9894,7 @@ source_domain = "partner.example.com"
                     ..Default::default()
                 },
             ],
+            modules: SectionModules::default(),
         };
 
         let route = proxy
@@ -10498,6 +10980,20 @@ mod permission_signal_config_tests {
         assert!(
             message.contains("[permission_signal]") && message.contains("[permission-signal]"),
             "the refusal names the old table and the new one: {message}"
+        );
+    }
+
+    #[test]
+    fn the_old_ad_server_table_name_is_refused_with_its_new_name() {
+        let written = format!(
+            "{}\n[adserver]\nmodule = \"adserver_mock\"\n",
+            crate_test_settings_str()
+        );
+        let error = Settings::from_toml(&written).expect_err("should refuse the old table name");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("[adserver]") && message.contains("[ad-server] module"),
+            "the refusal names the old table and the new selector: {message}"
         );
     }
 

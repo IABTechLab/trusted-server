@@ -53,6 +53,7 @@ pub(super) fn check_candidate(candidate: &str, baseline: &str) -> CliResult<Vec<
 /// report only the failed phase because their messages can contain literal
 /// values, including validator parameters and invalid patterns.
 fn validate_source_config(source: &str) -> CliResult<()> {
+    crate::app_config::register_stock_modules();
     let config: TrustedServerAppConfig = toml::from_str(source).map_err(|error| {
         error.span().map_or_else(
             || "config could not be loaded".to_string(),
@@ -125,6 +126,7 @@ mod tests {
         );
         let parsed: TrustedServerAppConfig =
             toml::from_str(&invalid).expect("should accept source syntax and schema");
+        crate::app_config::register_stock_modules();
         assert!(
             TrustedServerAppConfig::new(parsed.into_settings()).is_err(),
             "should exercise deploy validation"

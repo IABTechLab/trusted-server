@@ -47,9 +47,32 @@ pub fn resolve_secret_references<C: ConfiguredSecretFields>(
     secret_store: &dyn PlatformSecretStore,
     default_store_name: &StoreName,
 ) -> Result<(), Report<TrustedServerError>> {
+    resolve_secret_references_with::<C>(data, secret_store, default_store_name, Vec::new())
+}
+
+/// Resolve all secret references in a serialized Trusted Server app config,
+/// together with `extra`, the leaves known only where the configuration is
+/// loaded, such as the ones a deployment's modules declare in their own
+/// tables.
+///
+/// A leaf listed more than once is looked up once, because the second lookup
+/// would read the secret itself as the name of a key.
+///
+/// # Errors
+///
+/// As [`resolve_secret_references`].
+pub fn resolve_secret_references_with<C: ConfiguredSecretFields>(
+    data: &mut Value,
+    secret_store: &dyn PlatformSecretStore,
+    default_store_name: &StoreName,
+    extra: Vec<SecretField>,
+) -> Result<(), Report<TrustedServerError>> {
+    let mut listed = std::collections::BTreeSet::new();
     let fields = C::secret_fields()
         .into_iter()
         .chain(C::configured_secret_fields(data))
+        .chain(extra)
+        .filter(|field| listed.insert(field.dotted_path()))
         .collect::<Vec<_>>();
     let mut resolved_data = data.clone();
     for field in fields {
@@ -343,6 +366,61 @@ mod tests {
         assert_eq!(data["outer"][0]["token"], "resolved-a");
         assert_eq!(data["outer"][1]["token"], "resolved-b");
         assert!(data["outer"][0]["optional"].is_null());
+    }
+
+    #[test]
+    fn a_leaf_listed_twice_is_looked_up_once() {
+        // The second lookup would read the secret itself as the name of a
+        // key, which this store does not hold.
+        let mut data = serde_json::json!({
+            "outer": [{"token": "token-a"}],
+            "feature": {"credential": "feature-key"}
+        });
+        let listed_again = vec![SecretField {
+            kind: SecretKind::KeyInDefault,
+            optional: true,
+            path: vec![
+                SecretPathSegment::OptionalField("feature".into()),
+                SecretPathSegment::Field("credential".into()),
+            ],
+        }];
+
+        resolve_secret_references_with::<Fixture>(
+            &mut data,
+            &store(),
+            &StoreName::from("secrets"),
+            listed_again,
+        )
+        .expect("should look a leaf up once however often it is listed");
+
+        assert_eq!(data["feature"]["credential"], "resolved-feature");
+    }
+
+    #[test]
+    fn resolves_a_leaf_only_the_caller_lists() {
+        let mut data = serde_json::json!({
+            "outer": [{"token": "token-a"}],
+            "added": {"key_name": "token-b"}
+        });
+        let added = vec![SecretField {
+            kind: SecretKind::KeyInDefault,
+            optional: true,
+            path: vec![
+                SecretPathSegment::OptionalField("added".into()),
+                SecretPathSegment::Field("key_name".into()),
+            ],
+        }];
+
+        resolve_secret_references_with::<Fixture>(
+            &mut data,
+            &store(),
+            &StoreName::from("secrets"),
+            added,
+        )
+        .expect("should resolve the leaf the caller listed");
+
+        assert_eq!(data["added"]["key_name"], "resolved-b");
+        assert_eq!(data["outer"][0]["token"], "resolved-a");
     }
 
     #[test]

@@ -177,7 +177,7 @@ The rewrite logic handles multiple URL formats in RSC content:
 
 The current implementation lives in:
 
-- `crates/trusted-server-core/src/integrations/nextjs/rsc.rs`
+- `crates/framework/nextjs/src/rsc.rs`
 - `crates/trusted-server-core/src/rsc_flight.rs`
 
 ## Related Docs

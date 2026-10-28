@@ -14,11 +14,11 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{
-    AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
+    AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan_with,
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-use trusted_server_core::config_payload::settings_from_config_blob;
+use trusted_server_core::config_payload::settings_from_config_blob_with;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
@@ -28,7 +28,9 @@ use trusted_server_core::ec::module::{EdgeCookieModule, build_reusable_module};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::sanitize_forwarded_headers;
-use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
+use trusted_server_core::integrations::{
+    IntegrationBuilder, IntegrationRegistry, ProxyDispatchInput,
+};
 use trusted_server_core::platform::RuntimeServices;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use trusted_server_core::platform::{PlatformConfigStore, StoreName};
@@ -37,7 +39,7 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherResponse,
+    AppContext, AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherResponse,
     buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
     handle_tsjs_dynamic, page_bids_preflight_denied,
 };
@@ -63,7 +65,11 @@ use crate::platform::{ConfigStoreHandleAdapter, SpinSecretStoreAdapter};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 const SPIN_DEFAULT_CONFIG_STORE: &str = "default";
 
-/// Application state built once at startup and shared across all requests.
+/// Application state shared by everything that serves one request.
+///
+/// Not built once per process, because `edgezero_adapter_spin::run_app`
+/// calls `build_app` inside the per-request entry point, so this is
+/// rebuilt on every request.
 pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
@@ -130,11 +136,14 @@ fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
             .attach(error.to_string())
         })?;
     let secret_store = SpinSecretStoreAdapter;
-    settings_from_config_blob(
+    // The settings are validated as they load, against the same builders the
+    // state is built with.
+    settings_from_config_blob_with(
         &raw_envelope,
         &secret_store,
         &default_secret_store_name(),
         trusted_server_core::platform::PolicyOrigin::Blob,
+        &trusted_server_modules::builders(),
     )
 }
 
@@ -156,31 +165,78 @@ fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    build_state_with_services(settings, None)
+    build_state_with_registrations(settings, &[])
 }
 
+/// Build the application state from explicit settings, composing the modules
+/// a stock build ships with the externally supplied builders in
+/// `integrations`.
+///
+/// A deployment that ships a vendor crate calls this to add that crate's
+/// integration builder without the adapter naming the vendor. Auction
+/// providers come from the compiled auction plan, as they do without any
+/// external builders.
+///
+/// # Errors
+///
+/// Returns an error when the selected Edge Cookie module cannot be built for
+/// this adapter, when the auction plan does not compile or cannot run on this
+/// adapter, or when the auction orchestrator or the integration registry fail
+/// to initialize, which includes two builders claiming the same integration
+/// id.
+pub fn build_state_with_registrations(
+    settings: Settings,
+    integrations: &[IntegrationBuilder],
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    build_state_with_registrations_and_services(settings, integrations, None)
+}
+
+/// Build the application state with the services every request will use,
+/// rather than services built per request from the request context.
 fn build_state_with_services(
     settings: Settings,
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    build_state_with_registrations_and_services(settings, &[], services)
+}
+
+fn build_state_with_registrations_and_services(
+    settings: Settings,
+    integrations: &[IntegrationBuilder],
+    services: Option<RuntimeServices>,
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    // The modules a stock build ships come first and the deployment's own
+    // follow, which is the order their hooks run in.
+    let integrations = trusted_server_modules::builders_with(integrations);
+    let integrations = integrations.as_slice();
+
+    // The plan is compiled with the integrations this adapter was given, so an
+    // `[ad-server]` or `[demand]` name one of their builders supplies resolves
+    // here. Compiling without them would drop the implementation and report the
+    // name as one no builder registers.
+    let plan = Arc::new(compile_auction_plan_with(&settings, integrations)?);
+    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Spin)?;
+    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan))?;
+    let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?;
+
     // Composition root: resolve the module selection once, before any request
     // is served, so a selection this adapter can never supply fails here rather
     // than on the first request. Keeping what the resolution produced is what
-    // stops the request path resolving the same settings again. This adapter
-    // supplies no host signals, so that argument is `None`, and injects no
-    // vendor Edge Cookie module of its own, so the only injected module is
-    // one a caller put into the services it supplied.
+    // stops the request path resolving the same settings again. The registry is
+    // built first because a module can supply the vendor Edge Cookie module
+    // the selector names, and resolving without it would reject a selection
+    // this deployment can in fact satisfy. A caller supplying its own
+    // `RuntimeServices` may have resolved one already, and that one comes first
+    // because it is what the request path will see. This adapter supplies no
+    // host signals, so that argument stays `None` until it does.
     let ec_module = build_reusable_module(
         &settings.ec,
         None,
         services
             .as_ref()
-            .and_then(RuntimeServices::resolved_ec_module),
+            .and_then(RuntimeServices::resolved_ec_module)
+            .or_else(|| registry.ec_module()),
     )?;
-    let plan = Arc::new(compile_auction_plan(&settings)?);
-    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Spin)?;
-    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
-    let registry = IntegrationRegistry::with_plan(&settings, plan)?;
     let permission_signal_modules =
         trusted_server_core::permission_signal::build_permission_signal_modules(
             &settings,
@@ -220,14 +276,24 @@ fn shipped_signal_modules()
 }
 
 impl AppState {
-    /// Builds the per-request services, carrying the Edge Cookie module the
-    /// composition root already resolved so the request path does not resolve
-    /// `[ec] module` a second time. Nothing is carried when the composition
-    /// root found nothing safe to keep, and the request path resolves for
-    /// itself. The services also carry the permission policy the domain's
-    /// settings loaded, whichever services the request is given.
+    /// Build per-request [`RuntimeServices`], carrying the Edge Cookie module
+    /// the composition root already resolved and applying the module-supplied
+    /// geo, Edge Cookie and device modules selected by `[geo]`, `[ec]` and
+    /// `[device] module`. The services also carry the permission policy the
+    /// domain's settings loaded, whichever services the request is given.
+    ///
+    /// No Edge Cookie module is carried when the composition root found
+    /// nothing safe to keep, so the request path resolves the selection for
+    /// itself.
+    ///
+    /// For geo, unset and `"none"` both resolve nothing, so no client IP
+    /// reaches a host geo service. `"platform"` opts in to this adapter's own
+    /// lookup, and any other key names an integration module that declares a
+    /// geo module. Identity and device are applied the same way when a module
+    /// supplies them.
     fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
-        self.services
+        let mut services = self
+            .services
             .clone()
             .unwrap_or_else(|| {
                 build_runtime_services(
@@ -238,9 +304,23 @@ impl AppState {
                 )
             })
             .with_resolved_ec_module(self.ec_module.clone())
-            .with_permission_policy(Arc::clone(&self.permission_policy))
+            .with_permission_policy(Arc::clone(&self.permission_policy));
+        if let Some(module) = self.registry.geo_module() {
+            services = services.with_geo(module);
+        }
+        if let Some(module) = self.registry.ec_module() {
+            services = services.with_ec_module(module);
+        }
+        if let Some(module) = self.registry.device_module() {
+            services = services.with_device_module(module);
+        }
+        services
     }
 }
+
+// ---------------------------------------------------------------------------
+// Per-request RuntimeServices
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Publisher response helper
@@ -519,12 +599,12 @@ fn health_response() -> Response {
 ///
 /// Returns an error when the selected Edge Cookie module cannot be built for
 /// this request, or when the request's `Cookie` header is not valid UTF-8.
-fn build_ec_context(
+async fn build_ec_context(
     settings: &Settings,
     services: &RuntimeServices,
     req: &Request,
 ) -> Result<EcContext, Report<TrustedServerError>> {
-    EcContext::read_from_request_resolving_geo(settings, req, services)
+    EcContext::read_from_request_resolving_geo(settings, req, services).await
 }
 
 fn cache_purge_not_supported() -> Response {
@@ -682,6 +762,28 @@ impl TrustedServerApp {
         Ok(build_router(&state))
     }
 
+    /// Build the full application router from explicit settings, composing the
+    /// built-in integrations with the externally supplied builders in
+    /// `integrations`.
+    ///
+    /// The route table is the one [`TrustedServerApp::routes_with_settings`]
+    /// builds, so a composed deployment routes exactly as the plain one does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected Edge Cookie module cannot be built
+    /// for this adapter, when the auction plan does not compile or cannot run
+    /// on this adapter, or when the auction orchestrator or the integration
+    /// registry fail to initialize, which includes two builders claiming the
+    /// same integration id.
+    pub fn routes_with_registrations(
+        settings: Settings,
+        integrations: &[IntegrationBuilder],
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let state = build_state_with_registrations(settings, integrations)?;
+        Ok(build_router(&state))
+    }
+
     /// Build the full router with explicit settings and runtime services.
     ///
     /// Each request receives a clone of the supplied services, allowing callers
@@ -771,12 +873,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 // OpenRTB metadata that auction signing derives from
                 // `RequestInfo::from_request` uses the trusted runtime authority.
                 let mut req = ctx.into_request();
-                if let Err(error) =
-                    trusted_server_core::integrations::gpt_diagnostics::prepare_request(
-                        &s.settings,
-                        &mut req,
-                    )
-                {
+                if let Err(error) = s.registry.prepare_request(&s.settings, &mut req) {
                     return Ok(http_error(&error));
                 }
                 // Build the geo-aware EC context so the auction consent gate sees
@@ -784,7 +881,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 // closed for consented users. When identity cannot be
                 // established at all, answer with an error rather than running
                 // the auction with no identity.
-                let mut ec_context = match build_ec_context(&s.settings, &services, &req) {
+                let mut ec_context = match build_ec_context(&s.settings, &services, &req).await {
                     Ok(context) => context,
                     Err(report) => return Ok(http_error(&report)),
                 };
@@ -809,18 +906,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             async move {
                 let services = s.services_for_request(&ctx);
                 let mut req = ctx.into_request();
-                if let Err(error) =
-                    trusted_server_core::integrations::gpt_diagnostics::prepare_request(
-                        &s.settings,
-                        &mut req,
-                    )
-                {
+                if let Err(error) = s.registry.prepare_request(&s.settings, &mut req) {
                     return Ok(http_error(&error));
                 }
                 // Identity could not be established (for example the selected
                 // Edge Cookie module is unavailable). Answer with an error
                 // rather than re-running the auction with no identity.
-                let mut ec_context = match build_ec_context(&s.settings, &services, &req) {
+                let mut ec_context = match build_ec_context(&s.settings, &services, &req).await {
                     Ok(context) => context,
                     Err(report) => return Ok(http_error(&report)),
                 };
@@ -912,10 +1004,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);
             }
-            if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
-                &state.settings,
-                &mut req,
-            ) {
+            if let Err(error) = state.registry.prepare_request(&state.settings, &mut req) {
                 return Ok(http_error(&error));
             }
 
@@ -949,7 +1038,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 // Identity could not be established (for example the selected
                 // Edge Cookie module is unavailable). Answer with an error
                 // rather than serving the page with no identity.
-                let mut ec_context = match build_ec_context(&state.settings, &services, &req) {
+                let mut ec_context = match build_ec_context(&state.settings, &services, &req).await
+                {
                     Ok(context) => context,
                     Err(report) => return Ok(http_error(&report)),
                 };
@@ -959,7 +1049,10 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     registry: None,
                 };
                 match handle_publisher_request(
-                    &state.settings,
+                    AppContext {
+                        settings: &state.settings,
+                        integration_registry: &state.registry,
+                    },
                     &services,
                     None,
                     &mut ec_context,
@@ -1122,26 +1215,29 @@ mod tests {
         .expect("should parse startup test settings")
         .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample());
         settings.auction.enabled = true;
-        settings.auction.providers =
-            std::iter::IntoIterator::into_iter(["provider-a", "provider-b"])
-                .map(|id| {
+        let names = ["provider_a", "provider_b"];
+        settings.demand = trusted_server_core::provider_table::ProviderList::new(
+            names.iter().map(|name| (*name).to_string()).collect(),
+            names
+                .iter()
+                .map(|name| {
                     (
-                        id.parse().expect("should parse provider ID"),
-                        trusted_server_core::auction::ProviderConfig {
-                            protocol: "openrtb-2.6".to_string(),
-                            profile: "standard".to_string(),
-                            endpoint: format!("https://{id}.example/openrtb"),
-                            timeout_ms: None,
-                            routing: trusted_server_core::auction::RoutingMode::AllEligible,
-                            notifications:
-                                trusted_server_core::auction::NotificationConfig::default(),
-                            profile_config: "{}"
-                                .parse()
-                                .expect("should parse empty profile config object"),
-                        },
+                        (*name).to_string(),
+                        serde_json::Map::from_iter([
+                            (
+                                "implementation".to_string(),
+                                serde_json::json!("auction-protocol.openrtb"),
+                            ),
+                            (
+                                "endpoint".to_string(),
+                                serde_json::json!(format!("https://{name}.example/openrtb")),
+                            ),
+                            ("routing".to_string(), serde_json::json!("all_eligible")),
+                        ]),
                     )
                 })
-                .collect();
+                .collect(),
+        );
         settings
     }
 
@@ -1169,20 +1265,26 @@ mod tests {
     #[test]
     fn startup_registers_aps_renderer_route() {
         let mut settings = multi_provider_settings();
-        settings.auction.providers.clear();
-        settings.auction.providers.insert(
-            "aps-main".parse().expect("should parse APS provider ID"),
-            trusted_server_core::auction::ProviderConfig {
-                protocol: "openrtb-2.6".to_string(),
-                profile: "aps".to_string(),
-                endpoint: "https://aps.example/e/pb/bid".to_string(),
-                timeout_ms: None,
-                routing: trusted_server_core::auction::RoutingMode::AllEligible,
-                notifications: trusted_server_core::auction::NotificationConfig::default(),
-                profile_config: "{\"account_id\":\"example-account\"}"
-                    .parse()
-                    .expect("should parse APS profile config"),
-            },
+        settings.demand = trusted_server_core::provider_table::ProviderList::new(
+            vec!["aps_main".to_string()],
+            std::collections::BTreeMap::from([(
+                "aps_main".to_string(),
+                serde_json::Map::from_iter([
+                    (
+                        "implementation".to_string(),
+                        serde_json::json!("auction.aps"),
+                    ),
+                    (
+                        "endpoint".to_string(),
+                        serde_json::json!("https://aps.example/e/pb/bid"),
+                    ),
+                    ("routing".to_string(), serde_json::json!("all_eligible")),
+                    (
+                        "account_id".to_string(),
+                        serde_json::json!("example-account"),
+                    ),
+                ]),
+            )]),
         );
 
         let state =
@@ -1276,8 +1378,8 @@ mod tests {
     /// settings are parsed directly, bypassing the composition root's startup
     /// check, so the per-request behavior can be exercised with a selection
     /// the adapter cannot supply.
-    #[test]
-    fn build_ec_context_fails_when_the_selected_module_is_unavailable() {
+    #[tokio::test]
+    async fn build_ec_context_fails_when_the_selected_module_is_unavailable() {
         let settings = Settings::from_toml(UNINJECTED_MODULE_TOML)
             .expect("should parse settings selecting an uninjected module");
         let req = request_builder()
@@ -1298,6 +1400,7 @@ mod tests {
         let req = ctx.into_request();
 
         let error = build_ec_context(&settings, &services, &req)
+            .await
             .expect_err("an unavailable Edge Cookie module must fail the request");
 
         assert!(

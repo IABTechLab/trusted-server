@@ -15,6 +15,7 @@ workspace = true
 
 [dependencies]
 trusted-server-core = { workspace = true }
+async-trait = { workspace = true }
 fastly = { workspace = true }
 
 # The visible owner of this vendor crate, the way Prebid.js requires a named

@@ -369,12 +369,15 @@ impl EcContext {
     /// Returns [`TrustedServerError`] when the selected Edge Cookie module
     /// cannot be built, the same as
     /// [`read_from_request_with_geo`](Self::read_from_request_with_geo).
-    pub fn read_from_request_resolving_geo(
+    pub async fn read_from_request_resolving_geo(
         settings: &Settings,
         req: &Request<EdgeBody>,
         services: &RuntimeServices,
     ) -> Result<Self, Report<TrustedServerError>> {
-        let lookup = services.geo().lookup(services.client_info().client_ip);
+        let lookup = services
+            .geo()
+            .lookup(services.client_info().client_ip, services)
+            .await;
         let geo_info = match &lookup {
             Ok(info) => info.clone(),
             Err(error) => {
@@ -558,10 +561,11 @@ impl EcContext {
     /// reserved surface, persisting the identifier to the KV identity graph
     /// failing, or every attempt within the retry limit producing an identifier
     /// the graph already holds.
-    pub fn generate_if_needed(
+    pub async fn generate_if_needed(
         &mut self,
         settings: &Settings,
         kv: Option<&KvIdentityGraph>,
+        services: &RuntimeServices,
     ) -> Result<(), Report<TrustedServerError>> {
         if self.ec_value.is_some() {
             return Ok(());
@@ -601,7 +605,8 @@ impl EcContext {
         // and a module that needs it refuses there, returning the error to
         // the caller. The publisher proxy and integration proxy log it and
         // serve the response without an Edge Cookie.
-        self.generate_with_module(ec_module.as_ref(), settings, kv)
+        self.generate_with_module(ec_module.as_ref(), settings, kv, services)
+            .await
     }
 
     /// Asks the selected module for one new identifier, without persisting
@@ -627,9 +632,10 @@ impl EcContext {
     /// [`reserved_response_effect`](crate::ec::module::reserved_response_effect)),
     /// or produces an identifier that is empty, over the length cap, or outside
     /// the cookie-safe alphabet.
-    pub(crate) fn candidate_id(
+    pub(crate) async fn candidate_id(
         &mut self,
         ec_module: &dyn EdgeCookieModule,
+        services: &RuntimeServices,
     ) -> Result<Option<String>, Report<TrustedServerError>> {
         let input = IdentityInput {
             permissions: Some(&self.permissions),
@@ -640,7 +646,8 @@ impl EcContext {
             Some(&self.request_headers),
         )
         .with_request_target(&self.request_path, &self.request_query);
-        let generated: GeneratedEdgeCookie = ec_module.generate(&request_info, &input)?;
+        let generated: GeneratedEdgeCookie =
+            ec_module.generate(&request_info, &input, services).await?;
         // Check every response header the module asked for against core's
         // reserved surface before any of them are kept. A module may set its
         // own cookies and headers, but not a managed `ts-` cookie, a header in
@@ -729,15 +736,16 @@ impl EcContext {
     /// returns [`TrustedServerError::EdgeCookie`] when persisting a generated
     /// identifier to the KV identity graph fails or every attempt within the
     /// retry limit produces an identifier the graph already holds.
-    fn generate_with_module(
+    async fn generate_with_module(
         &mut self,
         ec_module: &dyn EdgeCookieModule,
         settings: &Settings,
         kv: Option<&KvIdentityGraph>,
+        services: &RuntimeServices,
     ) -> Result<(), Report<TrustedServerError>> {
         const MAX_CREATE_ATTEMPTS: usize = 5;
         for attempt in 0..MAX_CREATE_ATTEMPTS {
-            let Some(ec_id) = self.candidate_id(ec_module)? else {
+            let Some(ec_id) = self.candidate_id(ec_module, services).await? else {
                 return Ok(());
             };
             // Key the identity graph by the module's canonical form of the
@@ -1416,15 +1424,16 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn generate_if_needed_retries_id_collision_then_persists() {
+    #[tokio::test]
+    async fn generate_if_needed_retries_id_collision_then_persists() {
         let settings = create_test_settings();
         let mut ec =
             EcContext::new_for_test_with_ip(None, granting_consent(), Some("192.0.2.5".to_owned()))
                 .with_module_for_test(hmac_module());
         let graph = KvIdentityGraph::new(AddCollidingEcKv::new(2));
 
-        ec.generate_if_needed(&settings, Some(&graph))
+        ec.generate_if_needed(&settings, Some(&graph), &noop_services())
+            .await
             .expect("should generate after bounded collisions");
 
         assert!(ec.ec_value().is_some(), "should allocate a fresh EC ID");
@@ -1435,8 +1444,8 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn generate_if_needed_errors_after_collision_exhaustion() {
+    #[tokio::test]
+    async fn generate_if_needed_errors_after_collision_exhaustion() {
         let settings = create_test_settings();
         let mut ec =
             EcContext::new_for_test_with_ip(None, granting_consent(), Some("192.0.2.6".to_owned()))
@@ -1444,7 +1453,9 @@ pub(crate) mod tests {
         // Collide on every attempt so the bounded retry is exhausted.
         let graph = KvIdentityGraph::new(AddCollidingEcKv::new(u32::MAX));
 
-        let result = ec.generate_if_needed(&settings, Some(&graph));
+        let result = ec
+            .generate_if_needed(&settings, Some(&graph), &noop_services())
+            .await;
 
         assert!(result.is_err(), "should fail after exhausting attempts");
         assert!(
@@ -1513,6 +1524,7 @@ pub(crate) mod tests {
     #[derive(Debug)]
     pub(crate) struct OpaqueModule;
 
+    #[async_trait::async_trait(?Send)]
     impl EdgeCookieModule for OpaqueModule {
         fn id(&self) -> &'static str {
             "opaque"
@@ -1522,10 +1534,11 @@ pub(crate) mod tests {
             crate::module_code!("t0op")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn RequestInfo,
             _input: &IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie::default())
         }
@@ -1656,6 +1669,7 @@ pub(crate) mod tests {
         seen_client_ip: std::sync::Mutex<Option<String>>,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl EdgeCookieModule for EvidenceCapturingModule {
         fn id(&self) -> &'static str {
             "evidence"
@@ -1665,10 +1679,11 @@ pub(crate) mod tests {
             crate::module_code!("t0ev")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             request_info: &dyn RequestInfo,
             _input: &IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             let query_id = request_info.query_param("id").unwrap_or_default();
             let cookie = request_info.header("cookie").unwrap_or_default().to_owned();
@@ -1689,8 +1704,8 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn generate_passes_request_parameters_and_cookies_to_the_module() {
+    #[tokio::test]
+    async fn generate_passes_request_parameters_and_cookies_to_the_module() {
         use crate::platform::test_support::noop_services_with_ec_module;
 
         let module = Arc::new(EvidenceCapturingModule::default());
@@ -1710,7 +1725,8 @@ pub(crate) mod tests {
         let geo = non_regulated_geo();
         let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
             .expect("should read EC context");
-        ec.generate_if_needed(&settings, None)
+        ec.generate_if_needed(&settings, None, &services)
+            .await
             .expect("should run generation");
 
         let seen = module
@@ -1730,8 +1746,8 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn recovery_on_a_navigation_passes_request_parameters_and_cookies_to_the_module() {
+    #[tokio::test]
+    async fn recovery_on_a_navigation_passes_request_parameters_and_cookies_to_the_module() {
         use crate::platform::test_support::noop_services_with_ec_module;
 
         let module = Arc::new(EvidenceCapturingModule::default());
@@ -1755,7 +1771,8 @@ pub(crate) mod tests {
             .expect("should read EC context");
         assert!(ec.ec_was_present(), "the identifier should be read back");
         let selected = ec.selected_module().expect("a module is selected");
-        ec.candidate_id(selected.as_ref())
+        ec.candidate_id(selected.as_ref(), &services)
+            .await
             .expect("should create a replacement");
 
         let seen = module
@@ -1776,6 +1793,7 @@ pub(crate) mod tests {
     #[derive(Debug)]
     struct ServerOpaqueModule;
 
+    #[async_trait::async_trait(?Send)]
     impl EdgeCookieModule for ServerOpaqueModule {
         fn id(&self) -> &'static str {
             "server_opaque"
@@ -1785,10 +1803,11 @@ pub(crate) mod tests {
             crate::module_code!("t0so")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn RequestInfo,
             _input: &IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie {
                 id: Some("Opaque_EC_Value_MixedCase_123".to_owned()),
@@ -1805,8 +1824,8 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn generate_persists_an_opaque_identifier_to_kv_under_its_own_key() {
+    #[tokio::test]
+    async fn generate_persists_an_opaque_identifier_to_kv_under_its_own_key() {
         use crate::platform::test_support::noop_services_with_ec_module;
 
         const OPAQUE: &str = "t0so~Opaque_EC_Value_MixedCase_123";
@@ -1820,7 +1839,8 @@ pub(crate) mod tests {
         let req = create_test_request(&[]);
         let mut ec = EcContext::read_from_request(&settings, &req, &services)
             .expect("should read EC context");
-        ec.generate_if_needed(&settings, Some(&graph))
+        ec.generate_if_needed(&settings, Some(&graph), &services)
+            .await
             .expect("should generate and persist");
 
         assert_eq!(
@@ -1846,8 +1866,152 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn a_module_that_reads_no_client_ip_creates_when_the_host_has_none() {
+    /// A geo module that resolves the country from the config store it is
+    /// handed, the geo counterpart of [`ConfigReadingModule`].
+    #[derive(Debug)]
+    struct ConfigReadingGeo;
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::platform::PlatformGeo for ConfigReadingGeo {
+        async fn lookup(
+            &self,
+            _client_ip: Option<std::net::IpAddr>,
+            services: &crate::platform::RuntimeServices,
+        ) -> Result<Option<GeoInfo>, Report<crate::platform::PlatformError>> {
+            let country = services
+                .config_store()
+                .get(&crate::platform::StoreName::from("vendor_store"), "country")?;
+            Ok(Some(GeoInfo {
+                country,
+                ..non_regulated_geo()
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_geo_module_reads_a_platform_service_through_the_services_it_is_given() {
+        use crate::platform::test_support::FixedConfigStore;
+
+        // The geo half of the seam acceptance test. Geo runs ahead of the
+        // permission model and feeds it the country, so a vendor geo module
+        // that resolves location from a backend or a store needs the platform
+        // services exactly as an Edge Cookie module does. `DE` can only
+        // appear here if the module read it through the services this call
+        // supplied.
+        let settings = create_test_settings();
+        let req = create_test_request(&[]);
+        let services = crate::platform::test_support::test_services_builder()
+            .config_store(Arc::new(FixedConfigStore {
+                store: "vendor_store",
+                key: "country",
+                value: "DE",
+            }))
+            .secret_store(Arc::new(crate::platform::test_support::NoopSecretStore))
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+            .backend(Arc::new(crate::platform::test_support::NoopBackend))
+            .http_client(Arc::new(crate::platform::test_support::NoopHttpClient))
+            .geo(Arc::new(ConfigReadingGeo))
+            .client_info(crate::platform::ClientInfo::default())
+            .build();
+
+        let ec = EcContext::read_from_request_resolving_geo(&settings, &req, &services)
+            .await
+            .expect("should read EC context");
+
+        assert_eq!(
+            ec.geo_info().map(|info| info.country.as_str()),
+            Some("DE"),
+            "the resolved country must come from the value the geo module read              through the services it was handed"
+        );
+    }
+
+    /// A module that derives its identifier from a value it reads out of the
+    /// config store at generate time, which is the whole point of handing modules
+    /// the platform services. Nothing about the value is known when the
+    /// module is constructed, so an identifier carrying it can only come from
+    /// a real read through the services passed to `generate`.
+    #[derive(Debug)]
+    struct ConfigReadingModule;
+
+    #[async_trait::async_trait(?Send)]
+    impl EdgeCookieModule for ConfigReadingModule {
+        fn id(&self) -> &'static str {
+            "config-reading"
+        }
+
+        fn code(&self) -> ModuleCode {
+            crate::module_code!("t0cr")
+        }
+
+        async fn generate(
+            &self,
+            _request_info: &dyn RequestInfo,
+            _input: &IdentityInput<'_>,
+            services: &crate::platform::RuntimeServices,
+        ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+            let tenant = services
+                .config_store()
+                .get(&crate::platform::StoreName::from("vendor_store"), "tenant")
+                .map_err(|error| {
+                    error.change_context(TrustedServerError::EdgeCookie {
+                        message: "config-reading module could not read its tenant".to_owned(),
+                    })
+                })?;
+            Ok(GeneratedEdgeCookie {
+                id: Some(format!("tenant-{tenant}")),
+                response_headers: Vec::new(),
+            })
+        }
+
+        fn accepts_id(&self, value: &str) -> bool {
+            !value.is_empty()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_module_reads_a_platform_service_through_the_services_it_is_given() {
+        use crate::platform::test_support::{
+            FixedConfigStore, services_with_ec_module_and_config_store,
+        };
+
+        // The acceptance test for the asynchronous module seam. Before
+        // modules were handed the platform services, a module could not
+        // reach a config store, a key-value store, a secret or a backend at
+        // all, which made every real vendor module impossible to write. This
+        // proves the services that arrive at `generate` are the caller's real
+        // ones: the identifier can only carry `acme` if the module actually
+        // read it out of the store on this request, because nothing gives the
+        // module that value at construction time.
+        let module = Arc::new(ConfigReadingModule);
+        let mut settings = create_test_settings();
+        settings.ec.module = Some(EcModuleSelection::from("config-reading"));
+        let req = create_test_request(&[]);
+        let geo = non_regulated_geo();
+
+        let services = services_with_ec_module_and_config_store(
+            module.clone(),
+            Arc::new(FixedConfigStore {
+                store: "vendor_store",
+                key: "tenant",
+                value: "acme",
+            }),
+        );
+        let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
+            .expect("should read EC context");
+
+        ec.generate_if_needed(&settings, None, &services)
+            .await
+            .expect("the module should create an identifier from the config value it read");
+
+        assert_eq!(
+            ec.ec_value(),
+            Some("t0cr~tenant-acme"),
+            "the identifier must carry the value the module read through the              services it was handed, which proves the seam delivers them"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_module_that_reads_no_client_ip_creates_when_the_host_has_none() {
         use crate::platform::test_support::noop_services_with_ec_module_without_client_ip;
 
         // The requirement for a client IP belongs to the module that uses
@@ -1876,7 +2040,8 @@ pub(crate) mod tests {
             "the host should supply no client IP in this test"
         );
 
-        ec.generate_if_needed(&settings, None)
+        ec.generate_if_needed(&settings, None, &services)
+            .await
             .expect("a module that reads no client IP should still create an identifier");
         assert_eq!(
             ec.ec_value(),
@@ -1894,8 +2059,8 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn the_hmac_module_refuses_when_the_host_has_no_client_ip() {
+    #[tokio::test]
+    async fn the_hmac_module_refuses_when_the_host_has_no_client_ip() {
         // The other half: the built-in module's only input is the client IP,
         // so with none it fails rather than hashing the empty string into an
         // identifier every visitor on that host would share. Identity cannot be
@@ -1915,7 +2080,8 @@ pub(crate) mod tests {
         );
 
         let err = ec
-            .generate_if_needed(&settings, None)
+            .generate_if_needed(&settings, None, &noop_services())
+            .await
             .expect_err("the HMAC module should refuse without a client IP");
         assert!(
             err.to_string().contains("client IP"),
@@ -1933,6 +2099,7 @@ pub(crate) mod tests {
     #[derive(Debug)]
     struct IllegalIdModule;
 
+    #[async_trait::async_trait(?Send)]
     impl EdgeCookieModule for IllegalIdModule {
         fn id(&self) -> &'static str {
             "illegal"
@@ -1942,10 +2109,11 @@ pub(crate) mod tests {
             crate::module_code!("t0il")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn RequestInfo,
             _input: &IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie {
                 id: Some("bad;value with spaces".to_owned()),
@@ -1958,8 +2126,8 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn generate_rejects_an_identifier_outside_the_cookie_safe_alphabet() {
+    #[tokio::test]
+    async fn generate_rejects_an_identifier_outside_the_cookie_safe_alphabet() {
         use crate::platform::test_support::noop_services_with_ec_module;
 
         let mut settings = create_test_settings();
@@ -1970,7 +2138,8 @@ pub(crate) mod tests {
             .expect("should read EC context");
 
         let err = ec
-            .generate_if_needed(&settings, None)
+            .generate_if_needed(&settings, None, &services)
+            .await
             .expect_err("an identifier outside the alphabet should be rejected at creation");
         assert!(
             err.to_string().contains("illegal"),
@@ -1993,6 +2162,7 @@ pub(crate) mod tests {
         id: Option<&'static str>,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl EdgeCookieModule for HeaderSettingModule {
         fn id(&self) -> &'static str {
             "header_setting"
@@ -2002,10 +2172,11 @@ pub(crate) mod tests {
             crate::module_code!("t0hs")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn RequestInfo,
             _input: &IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie {
                 id: self.id.map(str::to_owned),
@@ -2029,7 +2200,7 @@ pub(crate) mod tests {
     /// Runs generation through `module` and hands back the context whether or
     /// not generation succeeded, so a test can finalize a response on a context
     /// whose generation returned an error.
-    fn generate_with_header_setting_module(
+    async fn generate_with_header_setting_module(
         module: HeaderSettingModule,
         graph: Option<&KvIdentityGraph>,
     ) -> (Settings, EcContext, Result<(), Report<TrustedServerError>>) {
@@ -2041,12 +2212,12 @@ pub(crate) mod tests {
         let req = create_test_request(&[]);
         let mut ec = EcContext::read_from_request(&settings, &req, &services)
             .expect("should read EC context");
-        let outcome = ec.generate_if_needed(&settings, graph);
+        let outcome = ec.generate_if_needed(&settings, graph, &services).await;
         (settings, ec, outcome)
     }
 
-    #[test]
-    fn a_rejected_module_effect_never_reaches_the_finalized_response() {
+    #[tokio::test]
+    async fn a_rejected_module_effect_never_reaches_the_finalized_response() {
         // A module that sets the managed `ts-ec` cookie, a header in the
         // `x-ts-` namespace or a framing header would bypass core's identifier
         // validation and its identity-graph row, so generation returns an
@@ -2074,7 +2245,8 @@ pub(crate) mod tests {
             let (settings, mut ec, outcome) = generate_with_header_setting_module(
                 HeaderSettingModule { name, value, id },
                 Some(&graph),
-            );
+            )
+            .await;
             let Err(err) = outcome else {
                 panic!("{case}: the header is reserved, so generation should return an error");
             };
@@ -2100,7 +2272,9 @@ pub(crate) mod tests {
                 None,
                 None,
                 &mut response,
-            );
+                &noop_services(),
+            )
+            .await;
 
             let cookies: Vec<&str> = response
                 .headers()
@@ -2126,8 +2300,8 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn generate_applies_a_module_owned_cookie_to_the_response() {
+    #[tokio::test]
+    async fn generate_applies_a_module_owned_cookie_to_the_response() {
         // The other half of the rule: a module's own cookie is not core's, so
         // it survives generation and reaches the browser response unchanged,
         // alongside the managed `ts-ec` cookie core writes itself.
@@ -2139,7 +2313,8 @@ pub(crate) mod tests {
                 id: Some("module-value"),
             },
             Some(&graph),
-        );
+        )
+        .await;
         outcome.expect("generation should accept a module-owned cookie");
         assert_eq!(
             ec.ec_value(),
@@ -2159,7 +2334,9 @@ pub(crate) mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         let cookies: Vec<&str> = response
             .headers()
@@ -2185,7 +2362,7 @@ pub(crate) mod tests {
 
     /// Runs EC finalization on `ec` for an empty response and returns the
     /// `Set-Cookie` values the response carries.
-    fn finalized_set_cookies(
+    async fn finalized_set_cookies(
         settings: &Settings,
         ec: &mut EcContext,
         graph: &KvIdentityGraph,
@@ -2202,7 +2379,9 @@ pub(crate) mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
         response
             .headers()
             .get_all(http::header::SET_COOKIE)
@@ -2212,8 +2391,8 @@ pub(crate) mod tests {
             .collect()
     }
 
-    #[test]
-    fn a_discarded_candidate_keeps_none_of_its_module_response_headers() {
+    #[tokio::test]
+    async fn a_discarded_candidate_keeps_none_of_its_module_response_headers() {
         // The module's own cookie is permitted, but each of these candidates
         // is discarded, so generation returns an error and the cookie its
         // module response asked for must not reach the browser.
@@ -2247,13 +2426,14 @@ pub(crate) mod tests {
                     id: Some(id),
                 },
                 Some(&graph),
-            );
+            )
+            .await;
 
             assert!(
                 outcome.is_err(),
                 "{case}: generation should return an error"
             );
-            let cookies = finalized_set_cookies(&settings, &mut ec, &graph);
+            let cookies = finalized_set_cookies(&settings, &mut ec, &graph).await;
             assert!(
                 !cookies
                     .iter()
@@ -2264,8 +2444,8 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn a_module_that_creates_nothing_still_has_its_headers_applied() {
+    #[tokio::test]
+    async fn a_module_that_creates_nothing_still_has_its_headers_applied() {
         // A module may ask for more client evidence before it can create an
         // identifier, for example with `Accept-CH`, so its headers reach the
         // response even though no Edge Cookie is set.
@@ -2277,7 +2457,8 @@ pub(crate) mod tests {
                 id: None,
             },
             Some(&graph),
-        );
+        )
+        .await;
         outcome.expect("a module that creates nothing should not fail the request");
         assert_eq!(ec.ec_value(), None, "the module created no identifier");
 
@@ -2293,7 +2474,9 @@ pub(crate) mod tests {
             None,
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         assert_eq!(
             response
@@ -2323,6 +2506,7 @@ pub(crate) mod tests {
     #[derive(Debug)]
     pub(crate) struct CanonicalizingModule;
 
+    #[async_trait::async_trait(?Send)]
     impl EdgeCookieModule for CanonicalizingModule {
         fn id(&self) -> &'static str {
             "canonical"
@@ -2332,10 +2516,11 @@ pub(crate) mod tests {
             crate::module_code!("t0ca")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn RequestInfo,
             _input: &IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie {
                 id: Some("MiXeD.CaseId".to_owned()),
@@ -2374,8 +2559,8 @@ pub(crate) mod tests {
         ))
     }
 
-    #[test]
-    fn generate_keys_the_identity_graph_by_the_normalized_identifier() {
+    #[tokio::test]
+    async fn generate_keys_the_identity_graph_by_the_normalized_identifier() {
         use crate::platform::test_support::noop_services_with_ec_module;
 
         let mut settings = create_test_settings();
@@ -2385,7 +2570,8 @@ pub(crate) mod tests {
         let req = create_test_request(&[]);
         let mut ec = EcContext::read_from_request(&settings, &req, &services)
             .expect("should read EC context");
-        ec.generate_if_needed(&settings, Some(&graph))
+        ec.generate_if_needed(&settings, Some(&graph), &services)
+            .await
             .expect("should generate and persist");
 
         assert_eq!(
@@ -2410,8 +2596,8 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn hmac_creates_a_coded_identifier_and_reads_the_legacy_bare_form() {
+    #[tokio::test]
+    async fn hmac_creates_a_coded_identifier_and_reads_the_legacy_bare_form() {
         let settings = create_test_settings();
         // Place the request in a US opt-out state, whose baseline grants the
         // storage permission with no signal, so the creation runs.
@@ -2422,7 +2608,8 @@ pub(crate) mod tests {
         );
         let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
             .expect("should read EC context");
-        ec.generate_if_needed(&settings, None)
+        ec.generate_if_needed(&settings, None, &services)
+            .await
             .expect("should generate");
         let created = ec.ec_value().expect("should create an identifier");
         assert!(
@@ -2445,8 +2632,8 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn the_request_path_hashes_an_ipv6_client_ip_by_its_64_prefix() {
+    #[tokio::test]
+    async fn the_request_path_hashes_an_ipv6_client_ip_by_its_64_prefix() {
         // A device rotates the lower 64 bits of its IPv6 address, so the
         // context keeps only the /64 prefix and the HMAC module hashes that.
         // Two addresses in one /64 share an identity hash, and it is the hash
@@ -2474,7 +2661,8 @@ pub(crate) mod tests {
                 Some(prefix),
                 "{ip}: the context should keep the /64 prefix alone"
             );
-            ec.generate_if_needed(&settings, None)
+            ec.generate_if_needed(&settings, None, &services)
+                .await
                 .expect("should generate");
             let created = ec
                 .ec_value()
@@ -2518,10 +2706,12 @@ pub(crate) mod tests {
     #[derive(Debug)]
     struct FailingGeo;
 
+    #[async_trait::async_trait(?Send)]
     impl crate::platform::PlatformGeo for FailingGeo {
-        fn lookup(
+        async fn lookup(
             &self,
             _client_ip: Option<std::net::IpAddr>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<Option<GeoInfo>, Report<crate::platform::PlatformError>> {
             Err(Report::new(crate::platform::PlatformError::Geo))
         }
@@ -2542,8 +2732,8 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn a_geo_module_failure_resolves_permissions_at_the_requires_signal_floor() {
+    #[tokio::test]
+    async fn a_geo_module_failure_resolves_permissions_at_the_requires_signal_floor() {
         use crate::permissions::Permission;
         use crate::platform::test_support::build_services_with_geo;
 
@@ -2563,6 +2753,7 @@ pub(crate) mod tests {
 
         let services = build_services_with_geo(std::sync::Arc::new(FailingGeo));
         let failed = EcContext::read_from_request_resolving_geo(&settings, &req, &services)
+            .await
             .expect("a failed lookup should resolve permissions, not fail the request");
         assert!(
             !failed.permissions().is_set(Permission::StoreOnDevice),
@@ -2767,8 +2958,8 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn generate_if_needed_skips_when_ec_exists() {
+    #[tokio::test]
+    async fn generate_if_needed_skips_when_ec_exists() {
         let settings = create_test_settings();
         let ec_id = valid_ec_id("d", "Exist1");
         let cookie = format!("ts-ec={ec_id}");
@@ -2776,7 +2967,8 @@ pub(crate) mod tests {
 
         let mut ec = EcContext::read_from_request(&settings, &req, &noop_services())
             .expect("should read EC context");
-        ec.generate_if_needed(&settings, None)
+        ec.generate_if_needed(&settings, None, &noop_services())
+            .await
             .expect("should not error when EC already exists");
 
         assert_eq!(

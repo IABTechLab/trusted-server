@@ -617,6 +617,12 @@ impl<'a> AcceptedModules<'a> {
 /// A module that cannot derive an identifier at the edge returns a
 /// [`GeneratedEdgeCookie`] whose [`id`](GeneratedEdgeCookie::id) is `None`, so
 /// the request proceeds without an Edge Cookie rather than failing.
+/// Uses `#[async_trait(?Send)]` for the same reason as
+/// [`PlatformHttpClient`](crate::platform::PlatformHttpClient): the trait
+/// object stays `Send + Sync` so it can be shared and run multi-threaded,
+/// while the future it returns is pinned to one thread because the host SDKs
+/// produce `!Send` futures on wasm32.
+#[async_trait::async_trait(?Send)]
 pub trait EdgeCookieModule: Send + Sync + core::fmt::Debug {
     /// Returns the stable implementation id for this module, used in
     /// configuration and logs.
@@ -664,10 +670,16 @@ pub trait EdgeCookieModule: Send + Sync + core::fmt::Debug {
     /// # Errors
     ///
     /// Returns [`TrustedServerError::EdgeCookie`] when derivation fails.
-    fn generate(
+    /// Asynchronous, and handed the platform services, because a module may
+    /// reach a backend, a key-value store or a secret to derive an identifier,
+    /// and a module that cannot make those calls cannot be written at all.
+    /// A module that derives from data already in hand still declares an
+    /// async method and returns immediately.
+    async fn generate(
         &self,
         request_info: &dyn RequestInfo,
         input: &IdentityInput<'_>,
+        services: &crate::platform::RuntimeServices,
     ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>>;
 
     /// Returns whether `value` is a well-formed identifier this module issues.
@@ -740,9 +752,14 @@ pub trait EdgeCookieModule: Send + Sync + core::fmt::Debug {
     /// Returns [`TrustedServerError::EdgeCookie`] when processing the payload
     /// fails. A payload that is merely unverified or absent yields `id: None`
     /// rather than an error, so the request proceeds without an Edge Cookie.
-    fn resolve_from_client(
+    /// Asynchronous, and handed the platform services, for the same reason as
+    /// [`generate`](Self::generate). Verifying a payload the browser posted is
+    /// the case that most needs them, because checking a signature or a nonce
+    /// generally means reading a secret or calling the vendor's backend.
+    async fn resolve_from_client(
         &self,
         _input: &ClientResolveInput<'_>,
+        _services: &crate::platform::RuntimeServices,
     ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
         Ok(GeneratedEdgeCookie::default())
     }
@@ -774,6 +791,7 @@ impl HmacModule {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl EdgeCookieModule for HmacModule {
     fn id(&self) -> &'static str {
         HMAC_MODULE_KEY
@@ -783,10 +801,11 @@ impl EdgeCookieModule for HmacModule {
         HMAC_MODULE_CODE
     }
 
-    fn generate(
+    async fn generate(
         &self,
         request_info: &dyn RequestInfo,
         _input: &IdentityInput<'_>,
+        _services: &crate::platform::RuntimeServices,
     ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
         let client_ip = request_info.client_ip();
         if client_ip.is_empty() {
@@ -835,6 +854,7 @@ impl HostSignalModule {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl EdgeCookieModule for HostSignalModule {
     fn id(&self) -> &'static str {
         HOST_SIGNALS_MODULE_KEY
@@ -850,10 +870,11 @@ impl EdgeCookieModule for HostSignalModule {
         crate::module_code!("hs00")
     }
 
-    fn generate(
+    async fn generate(
         &self,
         request_info: &dyn RequestInfo,
         _input: &IdentityInput<'_>,
+        _services: &crate::platform::RuntimeServices,
     ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
         let ja4 = self.host_signals.ja4().unwrap_or_default();
         let h2 = self.host_signals.h2().unwrap_or_default();
@@ -914,6 +935,7 @@ const EXPECTED_VALUE: &str = "an-ec";
 pub struct ClientFixedModule;
 
 #[cfg(any(test, feature = "client-fixed-demo"))]
+#[async_trait::async_trait(?Send)]
 impl EdgeCookieModule for ClientFixedModule {
     fn id(&self) -> &'static str {
         CLIENT_FIXED_MODULE_KEY
@@ -923,19 +945,21 @@ impl EdgeCookieModule for ClientFixedModule {
         crate::module_code!("cfix")
     }
 
-    fn generate(
+    async fn generate(
         &self,
         _request_info: &dyn RequestInfo,
         _input: &IdentityInput<'_>,
+        _services: &crate::platform::RuntimeServices,
     ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
         // No identifier is derived at the edge: the value comes from the page
         // script, which posts it to the resolve endpoint.
         Ok(GeneratedEdgeCookie::default())
     }
 
-    fn resolve_from_client(
+    async fn resolve_from_client(
         &self,
         input: &ClientResolveInput<'_>,
+        _services: &crate::platform::RuntimeServices,
     ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
         // Verify the posted value against the known shared word, then create it as
         // the Edge Cookie. A value that does not match yields no Edge Cookie.
@@ -1350,6 +1374,7 @@ pub fn request_module(
 #[derive(Debug)]
 struct SharedModule(Arc<dyn EdgeCookieModule>);
 
+#[async_trait::async_trait(?Send)]
 impl EdgeCookieModule for SharedModule {
     fn code(&self) -> ModuleCode {
         self.0.code()
@@ -1363,12 +1388,13 @@ impl EdgeCookieModule for SharedModule {
         self.0.is_request_scoped()
     }
 
-    fn generate(
+    async fn generate(
         &self,
         request_info: &dyn RequestInfo,
         input: &IdentityInput<'_>,
+        services: &crate::platform::RuntimeServices,
     ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
-        self.0.generate(request_info, input)
+        self.0.generate(request_info, input, services).await
     }
 
     fn accepts_id(&self, value: &str) -> bool {
@@ -1383,11 +1409,12 @@ impl EdgeCookieModule for SharedModule {
         self.0.required_permissions()
     }
 
-    fn resolve_from_client(
+    async fn resolve_from_client(
         &self,
         input: &ClientResolveInput<'_>,
+        services: &crate::platform::RuntimeServices,
     ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
-        self.0.resolve_from_client(input)
+        self.0.resolve_from_client(input, services).await
     }
 }
 
@@ -1395,6 +1422,7 @@ impl EdgeCookieModule for SharedModule {
 mod tests {
     use super::*;
     use crate::evidence::OwnedRequestInfo;
+    use crate::platform::test_support::noop_services;
     use crate::test_support::tests::{select_hmac_module, select_host_signals_module};
     use http::HeaderMap;
 
@@ -1579,6 +1607,7 @@ mod tests {
     #[derive(Debug)]
     struct VendorModule;
 
+    #[async_trait::async_trait(?Send)]
     impl EdgeCookieModule for VendorModule {
         fn id(&self) -> &'static str {
             "acme"
@@ -1588,10 +1617,11 @@ mod tests {
             crate::module_code!("t0ac")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn RequestInfo,
             _input: &IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie::default())
         }
@@ -1871,6 +1901,7 @@ mod tests {
         #[derive(Debug)]
         struct Inner;
 
+        #[async_trait::async_trait(?Send)]
         impl EdgeCookieModule for Inner {
             fn id(&self) -> &'static str {
                 "inner"
@@ -1880,10 +1911,11 @@ mod tests {
                 crate::module_code!("t0in")
             }
 
-            fn generate(
+            async fn generate(
                 &self,
                 _request_info: &dyn RequestInfo,
                 _input: &IdentityInput<'_>,
+                _services: &crate::platform::RuntimeServices,
             ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
                 Ok(GeneratedEdgeCookie::default())
             }
@@ -1926,6 +1958,7 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl EdgeCookieModule for ReissuedEnvelopeModule {
         fn id(&self) -> &'static str {
             "reissued_envelope"
@@ -1935,10 +1968,11 @@ mod tests {
             crate::module_code!("t0re")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn RequestInfo,
             _input: &IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie::default())
         }
@@ -1991,6 +2025,7 @@ mod tests {
     #[derive(Debug)]
     struct VendorNamedHmacModule;
 
+    #[async_trait::async_trait(?Send)]
     impl EdgeCookieModule for VendorNamedHmacModule {
         fn id(&self) -> &'static str {
             HMAC_MODULE_KEY
@@ -2000,10 +2035,11 @@ mod tests {
             crate::module_code!("t0vh")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn RequestInfo,
             _input: &IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie::default())
         }
@@ -2070,8 +2106,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn host_signal_module_mints_from_fingerprints_and_requires_store_on_device() {
+    #[tokio::test]
+    async fn host_signal_module_mints_from_fingerprints_and_requires_store_on_device() {
         let signals = Arc::new(TestHostSignals {
             ja4: Some("t13d1516h2_8daaf6152771_e5627efa2ab1".to_owned()),
             h2: Some("1:65536;4:6291456".to_owned()),
@@ -2079,7 +2115,8 @@ mod tests {
         let module = HostSignalModule::new(test_passphrase(), signals);
         let request_info = test_request_info();
         let generated = module
-            .generate(&request_info, &IdentityInput::default())
+            .generate(&request_info, &IdentityInput::default(), &noop_services())
+            .await
             .expect("should generate");
         assert!(
             generated.id.is_some(),
@@ -2098,6 +2135,7 @@ mod tests {
     #[derive(Debug)]
     struct MinimalModule;
 
+    #[async_trait::async_trait(?Send)]
     impl EdgeCookieModule for MinimalModule {
         fn id(&self) -> &'static str {
             "minimal"
@@ -2107,10 +2145,11 @@ mod tests {
             crate::module_code!("t0mi")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn RequestInfo,
             _input: &IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie::default())
         }
@@ -2152,11 +2191,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn client_fixed_defers_in_generate() {
+    #[tokio::test]
+    async fn client_fixed_defers_in_generate() {
         let request_info = test_request_info();
         let generated = ClientFixedModule
-            .generate(&request_info, &IdentityInput::default())
+            .generate(&request_info, &IdentityInput::default(), &noop_services())
+            .await
             .expect("should generate");
         assert!(
             generated.id.is_none(),
@@ -2164,8 +2204,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_from_client_creates_only_from_a_verified_payload() {
+    #[tokio::test]
+    async fn resolve_from_client_creates_only_from_a_verified_payload() {
         // `client_fixed` creates the Edge Cookie only from the known shared
         // word. `HmacModule` does not override `resolve_from_client`, so it
         // inherits the no-op default, because a server-side module takes no
@@ -2197,7 +2237,8 @@ mod tests {
                 consent: None,
             };
             let generated = module
-                .resolve_from_client(&input)
+                .resolve_from_client(&input, &noop_services())
+                .await
                 .unwrap_or_else(|err| panic!("{case}: should resolve, got: {err}"));
             assert_eq!(
                 generated.id.as_deref(),
@@ -2272,8 +2313,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn host_signal_module_defers_without_fingerprints() {
+    #[tokio::test]
+    async fn host_signal_module_defers_without_fingerprints() {
         let signals = Arc::new(TestHostSignals {
             ja4: None,
             h2: None,
@@ -2281,7 +2322,8 @@ mod tests {
         let module = HostSignalModule::new(test_passphrase(), signals);
         let request_info = test_request_info();
         let generated = module
-            .generate(&request_info, &IdentityInput::default())
+            .generate(&request_info, &IdentityInput::default(), &noop_services())
+            .await
             .expect("should generate");
         assert!(
             generated.id.is_none(),

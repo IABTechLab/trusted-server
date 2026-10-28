@@ -1,0 +1,31 @@
+[package]
+name = "trusted-server-auction-protocol-openrtb"
+description = "The plain OpenRTB 2.6 demand implementation, for an exchange that needs no code of its own."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+error-stack = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+trusted-server-core = { workspace = true }
+
+[dev-dependencies]
+trusted-server-core = { workspace = true, features = ["test-utils"] }
+
+# The visible owner of this crate, the way Prebid.js requires a named
+# maintainer of every adapter. The plain OpenRTB implementation is the
+# project's own, so the Trusted Server maintainers own it.
+[package.metadata.maintainers]
+owner = "Trusted Server maintainers"
+status = "project owned"

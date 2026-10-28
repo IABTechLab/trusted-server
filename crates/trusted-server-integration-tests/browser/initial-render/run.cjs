@@ -67,7 +67,7 @@ const scriptContents = new Map(
   [
     path.join(
       repo,
-      "crates/trusted-server-core/src/integrations/gpt_bootstrap.js",
+      "crates/ad-tag/google/src/gpt_bootstrap.js",
     ),
     path.join(dist, "tsjs-core.js"),
     path.join(dist, "tsjs-gpt.js"),
@@ -163,7 +163,7 @@ const scenarios = [
           scripts.push(
             path.join(
               repo,
-              "crates/trusted-server-core/src/integrations/gpt_bootstrap.js",
+              "crates/ad-tag/google/src/gpt_bootstrap.js",
             ),
           );
         scripts.push(
@@ -474,7 +474,7 @@ const scenarios = [
           files: [
             path.join(
               repo,
-              "crates/trusted-server-core/src/integrations/gpt_bootstrap.js",
+              "crates/ad-tag/google/src/gpt_bootstrap.js",
             ),
             path.join(dist, "tsjs-core.js"),
             path.join(dist, "tsjs-gpt.js"),

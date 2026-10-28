@@ -12,9 +12,10 @@ use error_stack::{Report, ResultExt as _};
 
 use crate::config::TrustedServerAppConfig;
 use crate::error::TrustedServerError;
+use crate::integrations::IntegrationBuilder;
 use crate::permissions::{PermissionPolicy, PolicyReference, held_policy, load_policy};
 use crate::platform::{PlatformSecretStore, PolicyOrigin, StoreName};
-use crate::secret_resolution::resolve_secret_references;
+use crate::secret_resolution::resolve_secret_references_with;
 use crate::settings::{PermissionsConfig, Settings};
 
 /// Canonical logical secret store used by Trusted Server app-config secrets.
@@ -34,7 +35,8 @@ pub const DEFAULT_CONFIG_STORE_ID: &str = env!("TRUSTED_SERVER_DEFAULT_CONFIG_ST
 /// process-environment overrides.
 pub const CONFIG_BLOB_KEY: &str = DEFAULT_CONFIG_STORE_ID;
 
-/// Reconstruct runtime [`Settings`] from a serialized config blob envelope.
+/// Reconstruct runtime [`Settings`] from a serialized config blob envelope,
+/// validating against the built-in integrations only.
 ///
 /// Secret references are resolved after envelope verification and before
 /// deserialization. The envelope data itself is never mutated or rewritten.
@@ -42,6 +44,10 @@ pub const CONFIG_BLOB_KEY: &str = DEFAULT_CONFIG_STORE_ID;
 /// `policy_origin`, checked and parsed, and kept with the settings, which
 /// keep only its name and digest in `[permissions]`. A policy source is not
 /// read for a digest whose rules this instance already holds.
+///
+/// A deployment that composes builders of its own calls
+/// [`settings_from_config_blob_with`] instead, so a `[demand]` or
+/// `[ad-server]` name one of them supplies is not refused here.
 ///
 /// # Errors
 ///
@@ -54,6 +60,33 @@ pub fn settings_from_config_blob(
     secret_store: &dyn PlatformSecretStore,
     default_secret_store_name: &StoreName,
     policy_origin: PolicyOrigin<'_>,
+) -> Result<Settings, Report<TrustedServerError>> {
+    settings_from_config_blob_with(
+        envelope_json,
+        secret_store,
+        default_secret_store_name,
+        policy_origin,
+        &[],
+    )
+}
+
+/// Reconstruct runtime [`Settings`] from a serialized config blob envelope,
+/// validating against the built-in integrations followed by
+/// `extra_integrations`, with the permission policy read from
+/// `policy_origin` as [`settings_from_config_blob`] reads it.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when the envelope cannot be
+/// parsed, fails integrity verification, secret resolution fails, resolved
+/// settings are invalid, or the settings name no permission policy or one
+/// that cannot be read, is not the file that was pushed, or is not valid.
+pub fn settings_from_config_blob_with(
+    envelope_json: &str,
+    secret_store: &dyn PlatformSecretStore,
+    default_secret_store_name: &StoreName,
+    policy_origin: PolicyOrigin<'_>,
+    extra_integrations: &[IntegrationBuilder],
 ) -> Result<Settings, Report<TrustedServerError>> {
     let envelope: BlobEnvelope = serde_json::from_str(envelope_json).map_err(|error| {
         Report::new(TrustedServerError::Configuration {
@@ -68,15 +101,21 @@ pub fn settings_from_config_blob(
         .attach(error.to_string())
     })?;
 
+    // The modules' own secret settings are found through the builders the
+    // settings are validated against, so a module a deployment added has its
+    // secrets looked up here as a stock one does.
+    let builders = crate::integrations::all_builders(extra_integrations).collect::<Vec<_>>();
     let mut data = envelope.into_data();
     remove_inactive_secret_references(&mut data);
-    resolve_secret_references::<TrustedServerAppConfig>(
+    crate::module_secrets::clear_unused(&mut data, &builders);
+    resolve_secret_references_with::<TrustedServerAppConfig>(
         &mut data,
         secret_store,
         default_secret_store_name,
+        crate::module_secrets::secret_fields(&builders),
     )?;
     let mut settings = Settings::from_json_value(data)?;
-    crate::config::validate_settings_for_runtime(&settings)?;
+    crate::config::validate_settings_for_runtime_with(&settings, extra_integrations)?;
     let policy = load_domain_policy(&mut settings.permissions, policy_origin)?;
     log_permission_baseline(&policy);
     settings.attach_permission_policy(policy);
@@ -181,38 +220,6 @@ fn remove_inactive_secret_references(data: &mut serde_json::Value) {
             }
         }
     }
-
-    let Some(datadome) = data
-        .pointer_mut("/integrations/datadome")
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return;
-    };
-    let integration_enabled =
-        datadome.get("enabled").and_then(serde_json::Value::as_bool) == Some(true);
-    let protection_enabled = integration_enabled
-        && datadome
-            .get("enable_protection")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true);
-    if !protection_enabled {
-        datadome.remove("server_side_key_secret_name");
-    }
-
-    let bypass_enabled = protection_enabled
-        && datadome
-            .get("protection_test_bypass")
-            .and_then(serde_json::Value::as_object)
-            .and_then(|bypass| bypass.get("enabled"))
-            .and_then(serde_json::Value::as_bool)
-            == Some(true);
-    if !bypass_enabled
-        && let Some(bypass) = datadome
-            .get_mut("protection_test_bypass")
-            .and_then(serde_json::Value::as_object_mut)
-    {
-        bypass.remove("credential_secret_name");
-    }
 }
 
 fn json_bool_or_string_is_true(value: Option<&serde_json::Value>) -> bool {
@@ -224,7 +231,6 @@ fn json_bool_or_string_is_true(value: Option<&serde_json::Value>) -> bool {
 mod tests {
     use super::*;
     use crate::ec::module::{HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY};
-    use crate::integrations::didomi::DidomiIntegrationConfig;
     use crate::platform::{PlatformError, StoreId};
     use crate::redacted::Redacted;
     use crate::settings::{
@@ -289,8 +295,6 @@ mod tests {
             let value = match key {
                 "unit-test-proxy-secret" => "unit-test-proxy-secret-32-bytes-ok",
                 "tinybird-token-key" => "resolved-tinybird-token",
-                "datadome-server-key" => "resolved-datadome-server-key",
-                "datadome-bypass-key" => "resolved-datadome-bypass-credential-32-bytes",
                 "access_key_id" | "s3-access-key" => "AKIAIOSFODNN7EXAMPLE",
                 "secret_access_key" | "s3-secret-key" => "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
                 "s3-session-key" => "resolved-session-token",
@@ -351,29 +355,194 @@ mod tests {
         )
     }
 
-    fn settings_with_browser_bidder_overlap(auction_enabled: bool) -> Settings {
+    /// The ad server implementation a crate outside core supplies.
+    static EXTERNAL_ADSERVER: crate::auction::demand::AdServerImplementation =
+        crate::auction::demand::AdServerImplementation {
+            id: "ad-server.example",
+            build: build_external_adserver,
+        };
+
+    fn build_external_adserver(
+        name: &str,
+        _settings: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<
+        std::sync::Arc<dyn crate::auction::provider::AuctionProvider>,
+        Report<TrustedServerError>,
+    > {
+        Ok(std::sync::Arc::new(
+            crate::auction::test_support::adserver_fixture::FixtureAdServer::new(name, 500),
+        ))
+    }
+
+    /// Holds the one key a deployment's module names, and refuses the secret
+    /// itself as a key, so a leaf looked up twice fails.
+    struct ModuleSecretStore;
+
+    impl PlatformSecretStore for ModuleSecretStore {
+        fn get_bytes(
+            &self,
+            store_name: &StoreName,
+            key: &str,
+        ) -> Result<Vec<u8>, Report<PlatformError>> {
+            match key {
+                "module-key" => Ok(b"resolved-module-secret".to_vec()),
+                "resolved-module-secret" | "unused-module-key" => {
+                    Err(Report::new(PlatformError::SecretStore))
+                }
+                _ => EchoSecretStore.get_bytes(store_name, key),
+            }
+        }
+
+        fn create(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+
+        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+    }
+
+    fn module_lock_is_on(table: &serde_json::Map<String, serde_json::Value>) -> bool {
+        table.get("lock").and_then(serde_json::Value::as_bool) == Some(true)
+    }
+
+    const MODULE_SECRETS: &[crate::integrations::ModuleSecretSetting] =
+        &[crate::integrations::ModuleSecretSetting {
+            path: &["key_name"],
+            in_use: module_lock_is_on,
+        }];
+
+    /// A builder a deployment added, whose module names a secret in its own
+    /// table.
+    fn module_with_a_secret() -> IntegrationBuilder {
+        IntegrationBuilder::new(
+            "probe",
+            "example-crate",
+            crate::integrations::registry_test_support::probe_registration,
+            crate::integrations::registry_test_support::validate_nothing,
+        )
+        .with_module_name("testing.probe")
+        .with_secret_settings(MODULE_SECRETS)
+    }
+
+    fn load_with_module(settings: &Settings) -> Settings {
+        settings_from_config_blob_with(
+            &envelope_json(settings),
+            &ModuleSecretStore,
+            &StoreName::from("trusted_server_secrets"),
+            PolicyOrigin::Blob,
+            &[module_with_a_secret()],
+        )
+        .expect("should load settings with the module's builder")
+    }
+
+    #[test]
+    fn the_load_looks_up_a_secret_a_deployment_s_module_declares() {
         let mut settings = test_settings();
-        settings.proxy.allowed_domains = vec!["*.example".to_string()];
-        settings.auction.enabled = auction_enabled;
-        settings.auction.providers = crate::auction::AuctionConfig::legacy_provider_map(&["pbs"]);
-        settings.auction.bidders.insert(
-            "exampleBidder"
-                .parse()
-                .expect("should parse server-side bidder"),
-            crate::auction::BidderRouteConfig {
-                provider: "pbs".parse().expect("should parse provider"),
-            },
+        settings
+            .insert_module_config(
+                "testing",
+                "testing.probe",
+                &serde_json::json!({ "lock": true, "key_name": "module-key" }),
+            )
+            .expect("should insert the module's table");
+
+        let loaded = load_with_module(&settings);
+
+        assert_eq!(
+            loaded.section_table("testing", "probe").get("key_name"),
+            Some(&serde_json::json!("resolved-module-secret")),
+            "should hold the secret where the table held the name of its key"
         );
-        let mut prebid = settings
-            .integration_config::<crate::integrations::prebid::PrebidIntegrationConfig>("prebid")
-            .expect("should parse Prebid config")
-            .expect("should have enabled Prebid config");
-        prebid.client_side_bidders = vec!["exampleBidder".to_string()];
+    }
+
+    #[test]
+    fn the_load_clears_a_declared_secret_the_module_s_table_does_not_use() {
+        let mut settings = test_settings();
         settings
-            .integrations
-            .insert_config("prebid", &prebid)
-            .expect("should replace Prebid config");
+            .insert_module_config(
+                "testing",
+                "testing.probe",
+                &serde_json::json!({ "lock": false, "key_name": "unused-module-key" }),
+            )
+            .expect("should insert the module's table");
+
+        let loaded = load_with_module(&settings);
+
+        assert_eq!(
+            loaded.section_table("testing", "probe").get("key_name"),
+            None,
+            "should clear a key name nothing uses, where looking it up would fail"
+        );
+    }
+
+    #[test]
+    fn a_table_s_key_name_is_left_as_written_without_its_module_s_builder() {
+        let mut settings = test_settings();
         settings
+            .insert_module_config(
+                "testing",
+                "testing.probe",
+                &serde_json::json!({ "lock": true, "key_name": "module-key" }),
+            )
+            .expect("should insert the module's table");
+
+        let loaded = settings_from_config_blob(
+            &envelope_json(&settings),
+            &ModuleSecretStore,
+            &StoreName::from("trusted_server_secrets"),
+            PolicyOrigin::Blob,
+        )
+        .expect("should load settings without the module's builder");
+
+        assert_eq!(
+            loaded.section_table("testing", "probe").get("key_name"),
+            Some(&serde_json::json!("module-key")),
+            "should look nothing up for a table whose module declared nothing to this load"
+        );
+    }
+
+    /// The settings are validated as they load, so a deployment that composes
+    /// a builder hands it to the load. Without it the load refuses the ad
+    /// server that builder supplies, and with it the settings load.
+    #[test]
+    fn the_load_accepts_an_external_ad_server_only_when_given_its_builder() {
+        let mut settings = test_settings();
+        settings.adserver = crate::provider_table::ProviderChoice::new(
+            Some("example".to_string()),
+            std::collections::BTreeMap::from([("example".to_string(), serde_json::Map::new())]),
+        );
+        let envelope = envelope_json(&settings);
+        let extra = [
+            IntegrationBuilder::implementations("example-adserver", "example-crate")
+                .with_adserver(&EXTERNAL_ADSERVER),
+        ];
+
+        let error =
+            load_settings(&envelope).expect_err("built-ins alone should not know this ad server");
+        assert!(
+            error.to_string().contains("example"),
+            "should name the ad server: {error:?}"
+        );
+
+        let loaded = settings_from_config_blob_with(
+            &envelope,
+            &EchoSecretStore,
+            &StoreName::from("trusted_server_secrets"),
+            PolicyOrigin::Blob,
+            &extra,
+        )
+        .expect("should load settings naming the external builder's ad server");
+        assert_eq!(
+            loaded.adserver.selected().first().copied(),
+            Some("example"),
+            "the loaded settings should still select the external ad server"
+        );
     }
 
     #[test]
@@ -397,33 +566,45 @@ mod tests {
         );
     }
 
+    /// The settings of an example module, with a flag that defaults to off.
+    #[derive(Debug, serde::Deserialize, serde::Serialize, validator::Validate)]
+    #[serde(deny_unknown_fields)]
+    struct ExampleModuleSettings {
+        #[serde(default)]
+        opted_in: bool,
+        endpoint: String,
+    }
+
+    impl crate::settings::IntegrationConfig for ExampleModuleSettings {}
+
     #[test]
-    fn didomi_geo_query_parameters_survive_blob_round_trip() {
+    fn a_module_s_table_survives_the_blob_round_trip() {
         let mut original = test_settings();
         original
-            .integrations
-            .insert_config(
-                "didomi",
-                &DidomiIntegrationConfig {
-                    enabled: true,
-                    geo_query_parameters: true,
-                    proxy_path: None,
-                    sdk_origin: "https://sdk.example.com".to_string(),
-                    api_origin: "https://api.example.com".to_string(),
+            .insert_module_config(
+                "example",
+                "example.notice",
+                &ExampleModuleSettings {
+                    opted_in: true,
+                    endpoint: "https://api.example.com".to_string(),
                 },
             )
-            .expect("should insert Didomi configuration");
+            .expect("should insert the example module's table");
 
         let reconstructed =
             load_settings(&envelope_json(&original)).expect("should reconstruct settings");
         let config = reconstructed
-            .integration_config::<DidomiIntegrationConfig>("didomi")
-            .expect("should read Didomi configuration")
-            .expect("should enable Didomi");
+            .module_config::<ExampleModuleSettings>("example.notice")
+            .expect("should read the example module's table")
+            .expect("should still select the example module");
 
         assert!(
-            config.geo_query_parameters,
-            "should preserve Didomi geo opt-in"
+            config.opted_in,
+            "should preserve a flag the table set away from its default"
+        );
+        assert_eq!(
+            config.endpoint, "https://api.example.com",
+            "should preserve the table's other settings"
         );
     }
 
@@ -434,21 +615,6 @@ mod tests {
         original.tinybird.api_host = "api.example.com".to_string();
         original.tinybird.auction_token_secret =
             Some(Redacted::new("tinybird-token-key".to_string()));
-        original
-            .integrations
-            .insert_config(
-                "datadome",
-                &serde_json::json!({
-                    "enabled": true,
-                    "enable_protection": true,
-                    "server_side_key_secret_name": "datadome-server-key",
-                    "protection_test_bypass": {
-                        "enabled": true,
-                        "credential_secret_name": "datadome-bypass-key",
-                    },
-                }),
-            )
-            .expect("should configure DataDome references");
         let mut route = ProxyAssetRoute::new(
             "/assets/",
             "https://examplebucket.s3.us-east-1.amazonaws.com",
@@ -483,30 +649,6 @@ mod tests {
                 .map(Redacted::expose)
                 .map(String::as_str),
             Some("resolved-tinybird-token")
-        );
-        let datadome = reconstructed
-            .integration_config::<crate::integrations::datadome::DataDomeConfig>("datadome")
-            .expect("should parse DataDome config")
-            .expect("should enable DataDome");
-        assert_eq!(
-            datadome
-                .server_side_key_secret_name
-                .as_ref()
-                .map(Redacted::expose)
-                .map(String::as_str),
-            Some("resolved-datadome-server-key")
-        );
-        let bypass = datadome
-            .protection_test_bypass
-            .as_ref()
-            .expect("should configure bypass");
-        assert_eq!(
-            bypass
-                .credential_secret_name
-                .as_ref()
-                .map(Redacted::expose)
-                .map(String::as_str),
-            Some("resolved-datadome-bypass-credential-32-bytes")
         );
         let auth = reconstructed.proxy.asset_routes[0]
             .auth
@@ -847,21 +989,6 @@ mod tests {
         original.tinybird.auction_token_secret =
             Some(Redacted::new("unused-tinybird-key".to_string()));
         original
-            .integrations
-            .insert_config(
-                "datadome",
-                &serde_json::json!({
-                    "enabled": true,
-                    "enable_protection": false,
-                    "server_side_key_secret_name": "unused-datadome-key",
-                    "protection_test_bypass": {
-                        "enabled": false,
-                        "credential_secret_name": "unused-bypass-key",
-                    },
-                }),
-            )
-            .expect("should configure inactive references");
-        original
             .ec
             .partners
             .push(partner_with_pull_sync(false, "unused-partner-pull-token"));
@@ -876,50 +1003,44 @@ mod tests {
 
         assert!(reconstructed.tinybird.auction_token_secret.is_none());
         assert!(reconstructed.ec.partners[0].ts_pull_token.is_none());
-        let datadome = reconstructed
-            .integration_config::<crate::integrations::datadome::DataDomeConfig>("datadome")
-            .expect("should parse inactive DataDome config")
-            .expect("client-side DataDome remains enabled");
-        assert!(datadome.server_side_key_secret_name.is_none());
-        assert!(
-            datadome
-                .protection_test_bypass
-                .as_ref()
-                .is_some_and(|bypass| bypass.credential_secret_name.is_none())
-        );
     }
 
+    /// A table for a module its section does not select is refused, and its
+    /// secret references are dropped before resolution, so the operator reads
+    /// the table's own fault rather than a secret-store failure that follows
+    /// from it.
     #[test]
-    fn omitted_datadome_enabled_does_not_resolve_stale_protection_references() {
-        let mut original = test_settings();
-        original
-            .integrations
-            .insert_config(
-                "datadome",
-                &serde_json::json!({
-                    "enable_protection": true,
-                    "server_side_key_secret_name": "unused-datadome-key",
-                    "protection_test_bypass": {
-                        "enabled": true,
-                        "credential_secret_name": "unused-bypass-key",
-                    },
+    fn an_unselected_module_s_table_is_refused_without_resolving_its_secrets() {
+        let original = test_settings();
+        let mut data = serde_json::to_value(&original).expect("should serialize settings to JSON");
+        data.as_object_mut()
+            .expect("settings should serialize as an object")
+            .insert(
+                "testing".to_owned(),
+                serde_json::json!({
+                    "probe": { "lock": true, "key_name": "unused-module-key" },
                 }),
-            )
-            .expect("should configure disabled DataDome references");
+            );
+        let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_string());
+        let envelope = serde_json::to_string(&envelope).expect("should serialize envelope");
 
-        let reconstructed = settings_from_config_blob(
-            &envelope_json(&original),
-            &UnifiedSecretStore,
-            &StoreName::from("ts_secrets"),
+        let error = settings_from_config_blob_with(
+            &envelope,
+            &ModuleSecretStore,
+            &StoreName::from("trusted_server_secrets"),
             PolicyOrigin::Blob,
+            &[module_with_a_secret()],
         )
-        .expect("should skip stale DataDome protection references");
+        .expect_err("should refuse a table its section does not select");
+        let rendered = format!("{error:?}");
 
         assert!(
-            reconstructed
-                .integration_config::<crate::integrations::datadome::DataDomeConfig>("datadome")
-                .expect("should parse disabled DataDome config")
-                .is_none()
+            rendered.contains("[testing] selects no module"),
+            "should name the section and what it is missing: {rendered}"
+        );
+        assert!(
+            !rendered.contains("unused-module-key"),
+            "should not have tried to resolve the stale secret reference: {rendered}"
         );
     }
 
@@ -1009,20 +1130,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_blob_rejects_enabled_browser_bidder_ownership_conflict() {
-        let original = settings_with_browser_bidder_overlap(true);
-        let error = load_settings(&envelope_json(&original))
-            .expect_err("should reject enabled browser bidder ownership conflict");
-
-        assert!(error.to_string().contains("exampleBidder"));
-        assert!(
-            error
-                .to_string()
-                .contains("both client-side and server-side")
-        );
-    }
-
-    #[test]
     fn runtime_validation_rejects_short_resolved_passphrase() {
         let mut settings = test_settings();
         select_hmac_module(&mut settings.ec, HMAC_MODULE_KEY, "short_key");
@@ -1098,14 +1205,6 @@ mod tests {
             !err.to_string().contains("change-me-proxy-secret"),
             "error should not expose the resolved secret value"
         );
-    }
-
-    #[test]
-    fn runtime_blob_accepts_disabled_browser_bidder_ownership_overlap() {
-        let original = settings_with_browser_bidder_overlap(false);
-
-        load_settings(&envelope_json(&original))
-            .expect("runtime should accept disabled browser bidder ownership overlap");
     }
 
     #[test]

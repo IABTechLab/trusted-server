@@ -13,7 +13,7 @@ use trusted_server_adapter_axum::app::TrustedServerApp;
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
     &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
 
-/// Build the full application router from explicit test settings.
+/// Explicit test settings for the route tests.
 ///
 /// The process reads its settings from its config store when it starts,
 /// which a test does not set up, so `TrustedServerApp::routes()` would turn
@@ -49,6 +49,7 @@ fn test_settings() -> trusted_server_core::settings::Settings {
     .with_permission_policy(trusted_server_core::permissions::PermissionPolicy::sample())
 }
 
+/// Build the full application router from explicit test settings.
 fn test_router() -> edgezero_core::router::RouterService {
     TrustedServerApp::routes_with_settings(test_settings())
         .expect("should build router from test settings")
@@ -75,24 +76,29 @@ fn assert_route_registered(method: &str, path: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn aps_profile_serves_renderer_through_adapter_fallback() {
+async fn an_aps_demand_source_serves_the_renderer_through_adapter_fallback() {
     let mut settings = test_settings();
-    settings.auction.providers.insert(
-        "aps-main".parse().expect("should parse APS provider ID"),
-        trusted_server_core::auction::ProviderConfig {
-            protocol: "openrtb-2.6".to_string(),
-            profile: "aps".to_string(),
-            endpoint: "https://aps.example/e/pb/bid".to_string(),
-            timeout_ms: None,
-            routing: trusted_server_core::auction::RoutingMode::AllEligible,
-            notifications: trusted_server_core::auction::NotificationConfig::default(),
-            profile_config: "{\"account_id\":\"example-account\"}"
-                .parse()
-                .expect("should parse APS profile config"),
-        },
+    let table = serde_json::Map::from_iter([
+        (
+            "implementation".to_string(),
+            serde_json::json!("auction.aps"),
+        ),
+        (
+            "endpoint".to_string(),
+            serde_json::json!("https://aps.example/e/pb/bid"),
+        ),
+        ("routing".to_string(), serde_json::json!("all_eligible")),
+        (
+            "account_id".to_string(),
+            serde_json::json!("example-account"),
+        ),
+    ]);
+    settings.demand = trusted_server_core::provider_table::ProviderList::new(
+        vec!["aps_main".to_string()],
+        std::collections::BTreeMap::from([("aps_main".to_string(), table)]),
     );
     let router = TrustedServerApp::routes_with_settings(settings)
-        .expect("should build router with APS profile");
+        .expect("should build a router with an APS demand source");
     let mut service = EdgeZeroAxumService::new(router);
     let request = Request::builder()
         .method("GET")
@@ -262,7 +268,9 @@ async fn tsjs_route_prefix_is_handled_not_5xx() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tsjs_route_matching_hash_uses_s_maxage_fallback() {
     let mut svc = make_service();
-    let src = trusted_server_core::tsjs::tsjs_script_src(&["creative"]);
+    let src = trusted_server_core::tsjs::tsjs_script_src(
+        &trusted_server_core::tsjs_bundle::compile_time_parts(&["creative"]),
+    );
     let req = Request::builder()
         .method("GET")
         .uri(src)
@@ -931,6 +939,46 @@ fn selecting_a_module_this_adapter_cannot_supply_fails_at_startup() {
     assert!(
         error.to_string().contains("acme"),
         "the startup error should name the selected module, got: {error}"
+    );
+}
+
+/// Builds a registration claiming an id a stock module already owns.
+fn duplicate_lockr_registration(
+    _settings: &trusted_server_core::settings::Settings,
+) -> Result<
+    Option<trusted_server_core::integrations::IntegrationRegistration>,
+    error_stack::Report<trusted_server_core::error::TrustedServerError>,
+> {
+    Ok(Some(
+        trusted_server_core::integrations::IntegrationRegistration::builder("lockr").build(),
+    ))
+}
+
+fn validate_nothing(
+    _settings: &trusted_server_core::settings::Settings,
+) -> Result<bool, error_stack::Report<trusted_server_core::error::TrustedServerError>> {
+    Ok(true)
+}
+
+#[test]
+fn routes_with_registrations_rejects_a_duplicate_integration_id_naming_both_sources() {
+    let extra = [trusted_server_core::integrations::IntegrationBuilder::new(
+        "lockr",
+        "seam-probe",
+        duplicate_lockr_registration,
+        validate_nothing,
+    )];
+
+    let error = TrustedServerApp::routes_with_registrations(test_settings(), &extra)
+        .err()
+        .expect("should reject a duplicate integration id supplied through the adapter");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("lockr")
+            && message.contains("trusted-server-identity-lockr")
+            && message.contains("seam-probe"),
+        "error should name the id and both sources: {message}"
     );
 }
 

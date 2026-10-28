@@ -13,5 +13,5 @@ import { resolve } from 'node:path';
  */
 export const GPT_BOOTSTRAP_PATH = resolve(
   import.meta.dirname,
-  '../../../../trusted-server-core/src/integrations/gpt_bootstrap.js'
+  '../../../../ad-tag/google/src/gpt_bootstrap.js'
 );

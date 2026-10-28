@@ -30,9 +30,6 @@ pub enum TrustedServerError {
     #[display("Auction error: {message}")]
     Auction { message: String },
 
-    /// GAM (Google Ad Manager) integration error.
-    #[display("GAM error: {message}")]
-    Gam { message: String },
     /// GDPR consent handling error.
     ///
     /// **Note:** Unlike [`BadRequest`](Self::BadRequest), the detail `message`
@@ -56,10 +53,6 @@ pub enum TrustedServerError {
     /// Key-value store operation failed.
     #[display("KV store error: {store_name} - {message}")]
     KvStore { store_name: String, message: String },
-
-    /// Prebid integration error.
-    #[display("Prebid error: {message}")]
-    Prebid { message: String },
 
     /// Integration module error.
     #[display("Integration error ({integration}): {message}")]
@@ -118,12 +111,10 @@ impl IntoHttpResponse for TrustedServerError {
             Self::Auction { .. } => StatusCode::BAD_GATEWAY,
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
             Self::Configuration { .. } | Self::Settings { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Gam { .. } => StatusCode::BAD_GATEWAY,
             Self::GdprConsent { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidUtf8 { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
-            Self::Prebid { .. } => StatusCode::BAD_GATEWAY,
             Self::Integration { .. } => StatusCode::BAD_GATEWAY,
             Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
             Self::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
@@ -175,12 +166,6 @@ mod tests {
                 StatusCode::BAD_GATEWAY,
             ),
             (
-                TrustedServerError::Gam {
-                    message: String::from("request failed"),
-                },
-                StatusCode::BAD_GATEWAY,
-            ),
-            (
                 TrustedServerError::GdprConsent {
                     message: String::from("missing consent string"),
                 },
@@ -210,12 +195,6 @@ mod tests {
                     message: String::from("timeout"),
                 },
                 StatusCode::SERVICE_UNAVAILABLE,
-            ),
-            (
-                TrustedServerError::Prebid {
-                    message: String::from("adapter error"),
-                },
-                StatusCode::BAD_GATEWAY,
             ),
             (
                 TrustedServerError::Integration {
@@ -280,13 +259,11 @@ mod tests {
                     StatusCode::INTERNAL_SERVER_ERROR
                 }
                 TrustedServerError::Auction { .. } => StatusCode::BAD_GATEWAY,
-                TrustedServerError::Gam { .. } => StatusCode::BAD_GATEWAY,
                 TrustedServerError::GdprConsent { .. } => StatusCode::BAD_REQUEST,
                 TrustedServerError::InvalidUtf8 { .. } => StatusCode::INTERNAL_SERVER_ERROR,
                 TrustedServerError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
                 TrustedServerError::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
                 TrustedServerError::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
-                TrustedServerError::Prebid { .. } => StatusCode::BAD_GATEWAY,
                 TrustedServerError::Integration { .. } => StatusCode::BAD_GATEWAY,
                 TrustedServerError::Proxy { .. } => StatusCode::BAD_GATEWAY,
                 TrustedServerError::Forbidden { .. } => StatusCode::FORBIDDEN,
@@ -329,12 +306,6 @@ mod tests {
             },
             TrustedServerError::Auction {
                 message: "bid timeout".into(),
-            },
-            TrustedServerError::Gam {
-                message: "api key invalid".into(),
-            },
-            TrustedServerError::Prebid {
-                message: "adapter error".into(),
             },
             TrustedServerError::Integration {
                 integration: "foo".into(),
@@ -408,12 +379,10 @@ mod tests {
             TrustedServerError::BadRequest { .. }
             | TrustedServerError::Configuration { .. }
             | TrustedServerError::Auction { .. }
-            | TrustedServerError::Gam { .. }
             | TrustedServerError::GdprConsent { .. }
             | TrustedServerError::InvalidUtf8 { .. }
             | TrustedServerError::InvalidHeaderValue { .. }
             | TrustedServerError::KvStore { .. }
-            | TrustedServerError::Prebid { .. }
             | TrustedServerError::Integration { .. }
             | TrustedServerError::Proxy { .. }
             | TrustedServerError::Forbidden { .. }
@@ -502,18 +471,6 @@ mod tests {
             (
                 TrustedServerError::Auction {
                     message: "auction failed".to_string(),
-                },
-                StatusCode::BAD_GATEWAY,
-            ),
-            (
-                TrustedServerError::Gam {
-                    message: "gam failed".to_string(),
-                },
-                StatusCode::BAD_GATEWAY,
-            ),
-            (
-                TrustedServerError::Prebid {
-                    message: "prebid failed".to_string(),
                 },
                 StatusCode::BAD_GATEWAY,
             ),

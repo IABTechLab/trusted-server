@@ -212,7 +212,7 @@ pub async fn handle_auction(
 
         let empty_result = OrchestrationResult {
             provider_responses: Vec::new(),
-            mediator_response: None,
+            adserver_response: None,
             winning_bids: HashMap::new(),
             total_time_ms: 0,
             metadata: HashMap::new(),
@@ -265,7 +265,7 @@ pub async fn handle_auction(
 
         let empty_result = OrchestrationResult {
             provider_responses: Vec::new(),
-            mediator_response: None,
+            adserver_response: None,
             winning_bids: HashMap::new(),
             total_time_ms: 0,
             metadata: HashMap::new(),
@@ -332,7 +332,8 @@ pub async fn handle_auction(
     // Look up geo for device info.
     let geo = services
         .geo()
-        .lookup(services.client_info().client_ip)
+        .lookup(services.client_info().client_ip, services)
+        .await
         .unwrap_or_else(|e| {
             log::warn!("geo lookup failed: {e}");
             None
@@ -741,9 +742,9 @@ mod tests {
         let settings = create_test_settings();
         let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
             enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
+            provider_names: vec!["eid_capturing_provider".to_string()],
             timeout_ms: 2000,
-            mediator: None,
+            adserver_name: None,
             ..Default::default()
         });
         orchestrator.register_provider(Arc::new(EidCapturingProvider {
@@ -810,7 +811,9 @@ mod tests {
             None,
             Some("shared-cookie-id"),
             &mut response,
-        );
+            &crate::platform::test_support::noop_services(),
+        )
+        .await;
 
         assert_eq!(
             lookups.load(std::sync::atomic::Ordering::Relaxed),
@@ -839,9 +842,9 @@ mod tests {
         let had_eids = Arc::new(std::sync::Mutex::new(None));
         let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
             enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
+            provider_names: vec!["eid_capturing_provider".to_string()],
             timeout_ms: 2000,
-            mediator: None,
+            adserver_name: None,
             ..Default::default()
         });
         orchestrator.register_provider(Arc::new(EidCapturingProvider {
@@ -917,9 +920,9 @@ mod tests {
         let settings = create_test_settings();
         let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
             enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
+            provider_names: vec!["eid_capturing_provider".to_string()],
             timeout_ms: 2000,
-            mediator: None,
+            adserver_name: None,
             ..Default::default()
         });
         orchestrator.register_provider(Arc::new(EidCapturingProvider {
@@ -994,7 +997,9 @@ mod tests {
             None, // No `ts-eids` cookie on this request at all.
             None,
             &mut response,
-        );
+            &noop_services(),
+        )
+        .await;
 
         let (stored, _) = graph
             .get(&ec_id)
@@ -1051,7 +1056,7 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl AuctionProvider for TemplateSwitchProbeProvider {
         fn provider_name(&self) -> &'static str {
-            "template-switch-probe"
+            "template_switch_probe"
         }
 
         async fn request_bids(
@@ -1103,13 +1108,15 @@ mod tests {
     #[tokio::test]
     async fn direct_auction_remains_available_when_templates_are_disabled() {
         let settings_toml = format!(
-            "{}\n[auction]\nenabled = true\n\n[auction.providers.template-switch-probe]\nprotocol = \"openrtb-2.6\"\nendpoint = \"https://bidder.example/auction\"\nrouting = \"all_eligible\"\n\n[creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
-            crate_test_settings_str()
+            "{}\n[demand]\nmodules = [\"template_switch_probe\"]\n\n[demand.template_switch_probe]\nimplementation = \"auction.plain-fixture\"\nendpoint = \"https://bidder.example/auction\"\nrouting = \"all_eligible\"\n\n[creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
+            crate_test_settings_str().replace("[auction]\n", "[auction]\nenabled = true\n")
         );
         let settings = Settings::from_toml(&settings_toml)
             .expect("should parse settings with disabled templates");
         let calls = Arc::new(Mutex::new(0));
-        let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let mut orchestrator = AuctionOrchestrator::new(
+            crate::auction::test_support::legacy_auction_config(&settings),
+        );
         orchestrator.register_provider(Arc::new(TemplateSwitchProbeProvider {
             calls: Arc::clone(&calls),
         }));
@@ -1169,9 +1176,9 @@ mod tests {
         let settings = create_test_settings();
         let config = AuctionConfig {
             enabled: false,
-            providers: AuctionConfig::legacy_provider_map(&["panic_provider"]),
+            provider_names: vec!["panic_provider".to_string()],
             timeout_ms: 2000,
-            mediator: None,
+            adserver_name: None,
             ..Default::default()
         };
         let mut orchestrator = AuctionOrchestrator::new(config);
@@ -1229,8 +1236,8 @@ mod tests {
     #[tokio::test]
     async fn all_planned_launch_failures_return_bad_gateway_and_execution_failed_telemetry() {
         let settings_toml = format!(
-            "{}\n[auction]\nenabled = true\n\n[auction.providers.launch-fail]\nprotocol = \"openrtb-2.6\"\nprofile = \"standard\"\nendpoint = \"https://bidder.example/auction\"\nrouting = \"all_eligible\"\n",
-            crate_test_settings_str()
+            "{}\n[demand]\nmodules = [\"launch_fail\"]\n\n[demand.launch_fail]\nimplementation = \"auction.plain-fixture\"\nendpoint = \"https://bidder.example/auction\"\nrouting = \"all_eligible\"\n",
+            crate_test_settings_str().replace("[auction]\n", "[auction]\nenabled = true\n")
         );
         let settings =
             Settings::from_toml(&settings_toml).expect("should parse launch-failure settings");
@@ -1293,9 +1300,9 @@ mod tests {
         let settings = create_test_settings();
         let config = AuctionConfig {
             enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["panic_provider"]),
+            provider_names: vec!["panic_provider".to_string()],
             timeout_ms: 2000,
-            mediator: None,
+            adserver_name: None,
             ..Default::default()
         };
         let mut orchestrator = AuctionOrchestrator::new(config);
@@ -1423,9 +1430,9 @@ mod tests {
         let settings = create_test_settings();
         let config = AuctionConfig {
             enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
+            provider_names: vec!["eid_capturing_provider".to_string()],
             timeout_ms: 2000,
-            mediator: None,
+            adserver_name: None,
             ..Default::default()
         };
         let mut orchestrator = AuctionOrchestrator::new(config);

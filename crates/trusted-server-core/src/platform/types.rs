@@ -9,6 +9,7 @@ use super::{
     PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformHttpClient, PlatformKvStore,
     PlatformSecretStore,
 };
+use crate::ec::device::DeviceModule;
 use crate::ec::module::EdgeCookieModule;
 use crate::evidence::HostSignals;
 use crate::permission_signal::PermissionSignalModule;
@@ -204,6 +205,7 @@ pub struct RuntimeServices {
     /// path resolves the selection itself, which is what a deployment that
     /// selects no module, the Axum adapter, and the core tests all do.
     pub(crate) resolved_ec_module: Option<Arc<dyn EdgeCookieModule>>,
+    pub(crate) device_module: Option<Arc<dyn DeviceModule>>,
     /// The permission signal modules this deployment runs, in the order
     /// they are asked, selected at the composition root from the scheme
     /// crates the adapter links. Empty when the adapter offers none, in which
@@ -335,6 +337,13 @@ impl RuntimeServices {
         &self.permission_signal_modules
     }
 
+    /// The device module a module supplied, when `[device] module` selected
+    /// one. `None` leaves core's own device classification in place.
+    #[must_use]
+    pub fn device_module(&self) -> Option<Arc<dyn DeviceModule>> {
+        self.device_module.clone()
+    }
+
     /// The permission policy the request's domain loaded.
     #[must_use]
     pub fn permission_policy(&self) -> &Arc<PermissionPolicy> {
@@ -376,6 +385,61 @@ impl RuntimeServices {
     ) -> Self {
         Self {
             resolved_ec_module,
+            ..self
+        }
+    }
+
+    /// Returns a clone of this instance with the geo module replaced by
+    /// `geo`.
+    ///
+    /// Adapters use this to apply the module-supplied geo module selected by
+    /// `[geo] module`, so a vendor module can resolve location in place of
+    /// the host's own lookup without the rest of the runtime services graph
+    /// being rebuilt.
+    #[must_use]
+    pub fn with_geo(self, geo: Arc<dyn PlatformGeo>) -> Self {
+        Self { geo, ..self }
+    }
+
+    /// Returns a clone of this instance with the per-request client metadata
+    /// replaced.
+    ///
+    /// A response-side path that builds the rest of the services graph once and
+    /// varies only the client metadata per request uses this to apply the real
+    /// client data without rebuilding the graph. A module called from such a
+    /// path still needs that data.
+    #[must_use]
+    pub fn with_client_info(self, client_info: ClientInfo) -> Self {
+        Self {
+            client_info,
+            ..self
+        }
+    }
+
+    /// Returns a clone of this instance with the Edge Cookie module replaced.
+    ///
+    /// Adapters use this to apply the module-supplied module selected by
+    /// `[ec] module`, the same way they apply a module's geo module, so a
+    /// vendor declares identity on its registration rather than through a
+    /// second extension mechanism. The registry already matched the selector
+    /// against the registered modules, so the module's module is the
+    /// resolved answer and lands on the one seam the request path reads.
+    #[must_use]
+    pub fn with_ec_module(self, ec_module: Arc<dyn EdgeCookieModule>) -> Self {
+        Self {
+            resolved_ec_module: Some(ec_module),
+            ..self
+        }
+    }
+
+    /// Returns a clone of this instance with the device module replaced.
+    ///
+    /// Adapters use this to apply the module-supplied module selected by
+    /// `[device] module`.
+    #[must_use]
+    pub fn with_device_module(self, device_module: Arc<dyn DeviceModule>) -> Self {
+        Self {
+            device_module: Some(device_module),
             ..self
         }
     }
@@ -440,6 +504,7 @@ pub struct RuntimeServicesBuilder {
     client_info: Option<ClientInfo>,
     host_signals: Option<Arc<dyn HostSignals>>,
     resolved_ec_module: Option<Arc<dyn EdgeCookieModule>>,
+    device_module: Option<Arc<dyn DeviceModule>>,
     permission_signal_modules: Arc<[Arc<dyn PermissionSignalModule>]>,
     permission_policy: Option<Arc<PermissionPolicy>>,
 }
@@ -459,6 +524,7 @@ impl RuntimeServicesBuilder {
             client_info: None,
             host_signals: None,
             resolved_ec_module: None,
+            device_module: None,
             permission_signal_modules: Arc::default(),
             permission_policy: None,
         }
@@ -632,6 +698,7 @@ impl RuntimeServicesBuilder {
                 .expect("should set client_info before building RuntimeServices"),
             host_signals: self.host_signals,
             resolved_ec_module: self.resolved_ec_module,
+            device_module: self.device_module,
             permission_signal_modules: self.permission_signal_modules,
             permission_policy: self
                 .permission_policy

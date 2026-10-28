@@ -173,6 +173,9 @@ fn build_app_config_envelope(
     if let Some(origin_url) = origin_url {
         settings.publisher.origin_url = origin_url.to_string();
     }
+    // The fixture selects modules a stock build ships, so validation needs
+    // the stock list as the adapters and the `ts` tool have it.
+    trusted_server_core::config::register_deploy_integrations(trusted_server_modules::builders());
     let app_config = TrustedServerAppConfig::new(settings)
         .map_err(|report| error_box(format!("invalid Trusted Server app config: {report:?}")))?;
 
@@ -282,12 +285,12 @@ mod tests {
     use super::*;
     use error_stack::Report;
     use std::collections::HashMap;
-    use trusted_server_core::config_payload::settings_from_config_blob;
+    use trusted_server_core::config_payload::settings_from_config_blob_with;
     use trusted_server_core::permissions::{SAMPLE_POLICY_NAME, SAMPLE_POLICY_TEXT};
     use trusted_server_core::platform::{
         PlatformConfigStore, PlatformError, PlatformSecretStore, PolicyOrigin, StoreId, StoreName,
     };
-    use trusted_server_core::settings_data::get_settings_from_config_store;
+    use trusted_server_core::settings_data::get_settings_from_config_store_with;
 
     /// The repository's sample, which the fixture names.
     fn sample() -> PolicyFile {
@@ -501,13 +504,14 @@ mod tests {
             .expect("should inject generated stores");
         let store = GeneratedConfigStore(generated_entries(&generated));
 
-        let settings = get_settings_from_config_store(
+        let settings = get_settings_from_config_store_with(
             &store,
             &integration_secret_store(),
             &StoreName::from(DEFAULT_CONFIG_STORE_ID),
             CONFIG_BLOB_KEY,
             &StoreName::from("trusted_server_secrets"),
             PolicyOrigin::Blob,
+            &trusted_server_modules::builders(),
         )
         .expect("should load the settings through the chunk pointer");
 
@@ -532,11 +536,12 @@ mod tests {
         let envelope =
             build_app_config_envelope(APP_CONFIG, &sample(), Some("http://127.0.0.1:9999"))
                 .expect("should build envelope");
-        let settings = settings_from_config_blob(
+        let settings = settings_from_config_blob_with(
             &envelope,
             &integration_secret_store(),
             &StoreName::from("trusted_server_secrets"),
             PolicyOrigin::Blob,
+            &trusted_server_modules::builders(),
         )
         .expect("should verify blob");
 

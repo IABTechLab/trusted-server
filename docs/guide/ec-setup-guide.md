@@ -43,7 +43,7 @@ secret store, not the credential values. This workflow calls the inbound
 identify and batch-sync APIs, so its partner needs `api_token`. Partners that
 do not call either API may omit it. Provision high-entropy values under
 `ec_passphrase` and `partner_api_token`; see
-[Configuration](/guide/configuration#secret-store-migration).
+[Configuration](/guide/configuration#static-secret-references).
 
 Required behavior assumptions:
 

@@ -14,7 +14,7 @@
 //! The consent records here are built by hand, so nothing in core's consent
 //! pipeline runs. In a deployment that pipeline also synthesizes a US Privacy
 //! opt-out from a Global Privacy Control header in a US state when the consent
-//! settings say to, and the `us_privacy` module then acts on it, which is
+//! settings say to, and the `us-privacy` module then acts on it, which is
 //! why removing `gpc` from the list alone does not make that header inert.
 
 use std::sync::Arc;

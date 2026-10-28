@@ -4,52 +4,66 @@ use std::path::Path;
 use error_stack::Report;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
+use trusted_server_auction_prebid_server::MODULE as PREBID_SERVER_MODULE;
 use trusted_server_core::auction_config_types::{BidderId, ProviderId};
 
 use super::{Output, PbsError, Result, identifier, read_text};
+
+/// The name `[auction] modules` selects the Prebid module by.
+const PREBID_MODULE: &str = "prebid";
 
 /// Deliberately partial: inspecting PBS requirements must not require unrelated TS settings.
 #[derive(Default, Deserialize)]
 struct Source {
     auction: Option<Auction>,
     #[serde(default)]
-    integrations: Integrations,
+    demand: Demand,
 }
 
 #[derive(Default, Deserialize)]
 struct Auction {
     enabled: Option<bool>,
     #[serde(default)]
-    providers: BTreeMap<ProviderId, AuctionProvider>,
-    #[serde(default)]
     bidders: BTreeMap<BidderId, AuctionBidder>,
+    /// The modules `[auction]` selects, `prebid` among them.
+    #[serde(default)]
+    modules: Vec<String>,
+    /// The Prebid module's own table, `[auction.prebid]`.
+    prebid: Option<Prebid>,
+}
+
+/// The `[demand]` table: `modules` selects what runs, and every other key is
+/// one demand source's settings table.
+#[derive(Default, Deserialize)]
+struct Demand {
+    #[serde(default)]
+    modules: Vec<ProviderId>,
+    #[serde(flatten)]
+    sources: BTreeMap<ProviderId, DemandSource>,
 }
 
 #[derive(Deserialize)]
-struct AuctionProvider {
-    profile: Option<String>,
+struct DemandSource {
+    implementation: Option<String>,
     endpoint: Option<String>,
     timeout_ms: Option<u32>,
-    profile_config: Option<toml::Value>,
+    test_mode: Option<bool>,
+    debug: Option<bool>,
+    #[serde(default)]
+    bid_param_override_rules: Vec<toml::Value>,
 }
 
-impl AuctionProvider {
-    fn profile_bool(&self, key: &str) -> Option<bool> {
-        self.profile_config.as_ref()?.get(key)?.as_bool()
-    }
-
-    fn override_rule_count(&self) -> usize {
-        self.profile_config
-            .as_ref()
-            .and_then(|config| config.get("bid_param_override_rules"))
-            .and_then(toml::Value::as_array)
-            .map_or(0, Vec::len)
+impl DemandSource {
+    /// A demand table runs the implementation its `implementation` line
+    /// names by module path.
+    fn runs_prebid_server(&self) -> bool {
+        self.implementation.as_deref() == Some(PREBID_SERVER_MODULE)
     }
 }
 
 #[derive(Deserialize)]
 struct AuctionBidder {
-    provider: ProviderId,
+    module: ProviderId,
 }
 
 #[derive(Serialize)]
@@ -63,6 +77,7 @@ struct ServerBidderCandidate {
 #[derive(Serialize)]
 struct ServerProviderReport {
     provider: String,
+    selected: bool,
     endpoint_configured: bool,
     timeout_ms_explicit: Option<u32>,
     test_mode_explicit: Option<bool>,
@@ -71,14 +86,8 @@ struct ServerProviderReport {
     server_bidder_candidates: Vec<ServerBidderCandidate>,
 }
 
-#[derive(Default, Deserialize)]
-struct Integrations {
-    prebid: Option<Prebid>,
-}
-
-#[derive(Default, Deserialize)]
+#[derive(Default, Clone, Deserialize)]
 struct Prebid {
-    enabled: Option<bool>,
     account_id: Option<String>,
     timeout_ms: Option<u32>,
     debug: Option<bool>,
@@ -88,14 +97,14 @@ struct Prebid {
     bundle: Bundle,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Clone, Deserialize)]
 struct Bundle {
     #[serde(default)]
     modules: BundleModules,
 }
 
 /// Explicit selections from core's bundle module schema; never expand generator presets.
-#[derive(Default, Deserialize)]
+#[derive(Default, Clone, Deserialize)]
 struct BundleModules {
     #[serde(default)]
     bidder: Vec<String>,
@@ -179,8 +188,12 @@ pub(super) fn inspect(path: &Path) -> Result<Output> {
     })?;
     let auction_present = source.auction.is_some();
     let auction = source.auction.unwrap_or_default();
-    let prebid_present = source.integrations.prebid.is_some();
-    let prebid = source.integrations.prebid.unwrap_or_default();
+    let prebid_present = auction.prebid.is_some();
+    let prebid_selected = auction
+        .modules
+        .iter()
+        .any(|name| name == PREBID_MODULE || name == "auction.prebid");
+    let prebid = auction.prebid.clone().unwrap_or_default();
     for name in prebid
         .client_side_bidders
         .iter()
@@ -194,29 +207,31 @@ pub(super) fn inspect(path: &Path) -> Result<Output> {
             )));
         }
     }
-    let server_providers: Vec<_> = auction
-        .providers
+    let server_providers: Vec<_> = source
+        .demand
+        .sources
         .iter()
-        .filter(|(_, provider)| provider.profile.as_deref() == Some("prebid-server"))
-        .map(|(provider_id, provider)| {
+        .filter(|(_, demand_source)| demand_source.runs_prebid_server())
+        .map(|(name, demand_source)| {
             let requirements: Vec<_> = auction
                 .bidders
                 .iter()
-                .filter(|(_, bidder)| &bidder.provider == provider_id)
+                .filter(|(_, bidder)| &bidder.module == name)
                 .map(|(bidder_id, _)| ServerBidderCandidate {
                     bidder: bidder_id.as_str().to_owned(),
-                    source_key: format!("auction.bidders.{}.provider", bidder_id.as_str()),
+                    source_key: format!("auction.bidders.{}.module", bidder_id.as_str()),
                     host_secret_requirement: "unresolved",
                     partner_authorization: "unresolved",
                 })
                 .collect();
             ServerProviderReport {
-                provider: provider_id.as_str().to_owned(),
-                endpoint_configured: provider.endpoint.is_some(),
-                timeout_ms_explicit: provider.timeout_ms,
-                test_mode_explicit: provider.profile_bool("test_mode"),
-                debug_explicit: provider.profile_bool("debug"),
-                bid_param_override_rule_count: provider.override_rule_count(),
+                provider: name.as_str().to_owned(),
+                selected: source.demand.modules.contains(name),
+                endpoint_configured: demand_source.endpoint.is_some(),
+                timeout_ms_explicit: demand_source.timeout_ms,
+                test_mode_explicit: demand_source.test_mode,
+                debug_explicit: demand_source.debug,
+                bid_param_override_rule_count: demand_source.bid_param_override_rules.len(),
                 server_bidder_candidates: requirements,
             }
         })
@@ -224,7 +239,7 @@ pub(super) fn inspect(path: &Path) -> Result<Output> {
     let warnings = [
         "Local file only: confirm environment, remote configuration, and request-time overrides.",
         "Omitted fields/defaults are not expanded; empty candidate lists are not proof of no demand.",
-        "Disabled auctions, providers, and browser bundle adapters do not authorize PBS activation.",
+        "A disabled auction, a demand source [demand] modules does not select, and browser bundle adapters do not authorize PBS activation.",
         "Host secret requirements need adapter metadata verified against the selected PBS release.",
     ];
     let mut details = vec![
@@ -233,10 +248,9 @@ pub(super) fn inspect(path: &Path) -> Result<Output> {
             auction.enabled
         ),
         format!(
-            "Prebid browser section present: {prebid_present}; enabled explicitly: {:?}",
-            prebid.enabled
+            "Prebid browser section present: {prebid_present}; selected in [auction] modules: {prebid_selected}"
         ),
-        format!("Prebid Server providers: {}", server_providers.len()),
+        format!("Prebid Server demand sources: {}", server_providers.len()),
     ];
     details.extend(server_providers.iter().map(|provider| {
         let bidders = provider
@@ -246,8 +260,9 @@ pub(super) fn inspect(path: &Path) -> Result<Output> {
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            "Server provider {}: bidders: {}; endpoint configured: {}; timeout explicit: {:?}; test mode explicit: {:?}; debug explicit: {:?}; bid-parameter rules: {}; values withheld",
+            "Demand source {}: selected: {}; bidders: {}; endpoint configured: {}; timeout explicit: {:?}; test mode explicit: {:?}; debug explicit: {:?}; bid-parameter rules: {}; values withheld",
             provider.provider,
+            provider.selected,
             bidders,
             provider.endpoint_configured,
             provider.timeout_ms_explicit,
@@ -282,14 +297,14 @@ pub(super) fn inspect(path: &Path) -> Result<Output> {
         data: json!({
             "source": path,
             "source_sections": {
-                "server": ["auction.providers", "auction.bidders"],
-                "browser": "integrations.prebid"
+                "server": ["demand", "auction.bidders"],
+                "browser": "auction.prebid"
             },
             "auction_section_present": auction_present,
             "auction_enabled_explicit": auction.enabled,
             "server_providers": server_providers,
             "section_present": prebid_present,
-            "enabled_explicit": prebid.enabled,
+            "selected": prebid_selected,
             "account_id_configured": prebid.account_id.is_some(),
             "timeout_ms_explicit": prebid.timeout_ms,
             "debug_explicit": prebid.debug,
@@ -316,36 +331,38 @@ mod tests {
 [auction]
 enabled = true
 
-[auction.providers.pbs-main]
-protocol = "openrtb-2.6"
-profile = "prebid-server"
+[demand]
+modules = ["pbs_main"]
+
+[demand.pbs_main]
+implementation = "auction.prebid-server"
 endpoint = "https://user:NEVER_PRINT_ME@pbs.example.com/path?token=NEVER_PRINT_ME"
 timeout_ms = 900
 routing = "explicit"
-
-[auction.providers.pbs-main.profile_config]
 debug = false
 test_mode = true
 bid_param_override_rules = [{ when = { bidder = "serverbidder" }, set = { placementId = "NEVER_PRINT_ME" } }]
 
-[auction.bidders.serverbidder]
-provider = "pbs-main"
-
-[auction.providers.pbs-secondary]
-protocol = "openrtb-2.6"
-profile = "prebid-server"
+[demand.pbs_secondary]
+implementation = "auction.prebid-server"
 endpoint = "https://NEVER_PRINT_ME@secondary.example.com/openrtb2/auction"
 routing = "explicit"
 
-[auction.bidders.otherbidder]
-provider = "pbs-secondary"
+[demand.house]
+implementation = "auction-protocol.openrtb"
+endpoint = "https://house.example.com/openrtb2/auction"
 
-[integrations.prebid]
-enabled = false
+[auction.bidders.serverbidder]
+module = "pbs_main"
+
+[auction.bidders.otherbidder]
+module = "pbs_secondary"
+
+[auction.prebid]
 account_id = "NEVER_PRINT_ME"
 client_side_bidders = ["browserbidder"]
 
-[integrations.prebid.bundle.modules]
+[auction.prebid.bundle.modules]
 bidder = ["exampleBidAdapter"]
 user_id = ["sharedIdSystem"]
 analytics = ["exampleAnalyticsAdapter"]
@@ -354,19 +371,25 @@ analytics = ["exampleAnalyticsAdapter"]
         let report = inspect(&path).expect("should inspect config");
         assert_eq!(report.data["auction_section_present"], true);
         assert_eq!(report.data["auction_enabled_explicit"], true);
-        assert_eq!(report.data["enabled_explicit"], false);
+        assert_eq!(report.data["selected"], false);
         assert_eq!(
             report.data["server_providers"].as_array().map(Vec::len),
-            Some(2)
+            Some(2),
+            "should report the Prebid Server tables and leave the OpenRTB one out"
         );
-        assert_eq!(report.data["server_providers"][0]["provider"], "pbs-main");
+        assert_eq!(report.data["server_providers"][0]["provider"], "pbs_main");
+        assert_eq!(report.data["server_providers"][0]["selected"], true);
         assert_eq!(
             report.data["server_providers"][0]["server_bidder_candidates"][0]["bidder"],
             "serverbidder"
         );
         assert_eq!(
             report.data["server_providers"][1]["provider"],
-            "pbs-secondary"
+            "pbs_secondary"
+        );
+        assert_eq!(
+            report.data["server_providers"][1]["selected"], false,
+            "a table [demand] modules does not name is reported as not selected"
         );
         assert_eq!(
             report.data["server_providers"][1]["server_bidder_candidates"][0]["bidder"],
@@ -374,7 +397,7 @@ analytics = ["exampleAnalyticsAdapter"]
         );
         assert_eq!(
             report.data["server_providers"][0]["server_bidder_candidates"][0]["source_key"],
-            "auction.bidders.serverbidder.provider"
+            "auction.bidders.serverbidder.module"
         );
         assert_eq!(
             report.data["server_providers"][0]["endpoint_configured"],
@@ -409,7 +432,7 @@ analytics = ["exampleAnalyticsAdapter"]
             .write(false, &mut human)
             .expect("should render human report");
         let human = String::from_utf8(human).expect("should emit UTF-8");
-        assert!(human.contains("pbs-main"));
+        assert!(human.contains("pbs_main"));
         assert!(human.contains("serverbidder"));
         assert!(human.contains("Browser bundle adapters: exampleBidAdapter"));
         assert!(human.contains("Browser identity modules: sharedIdSystem"));
@@ -441,7 +464,7 @@ analytics = ["exampleAnalyticsAdapter"]
         fs::write(
             file.path(),
             r#"
-[integrations.prebid]
+[auction.prebid]
 client_side_bidders = 'examplebidder\'
 "#,
         )
@@ -469,10 +492,10 @@ client_side_bidders = 'examplebidder\'
             "'example\\u0062idder,otherbidder'",
             "{ '10' = 'otherbidder', '2' = 'examplebidder' }",
         ] {
-            let text = format!("[integrations.prebid]\nclient_side_bidders={input}\n");
+            let text = format!("[auction.prebid]\nclient_side_bidders={input}\n");
             let file = tempfile::NamedTempFile::new().expect("should create config");
             fs::write(file.path(), &text).expect("should write config");
-            let runtime: trusted_server_core::integrations::prebid::PrebidIntegrationConfig =
+            let runtime: trusted_server_auction_prebid::PrebidIntegrationConfig =
                 toml::from_str(&format!("client_side_bidders={input}"))
                     .expect("runtime should accept encoding");
             let output = inspect(file.path()).expect("inspect should accept runtime encoding");
@@ -494,11 +517,11 @@ client_side_bidders = 'examplebidder\'
             "[bundle.modules]\nuser_id = ['sharedIdSystem']",
             "[bundle.modules]\nanalytics = ['exampleAnalyticsAdapter']",
         ] {
-            let runtime: trusted_server_core::integrations::prebid::PrebidIntegrationConfig =
+            let runtime: trusted_server_auction_prebid::PrebidIntegrationConfig =
                 toml::from_str(input).expect("should parse current core bundle schema");
             let text = format!(
-                "[integrations.prebid]\n{}",
-                input.replace("[bundle", "[integrations.prebid.bundle")
+                "[auction.prebid]\n{}",
+                input.replace("[bundle", "[auction.prebid.bundle")
             );
             let file = tempfile::NamedTempFile::new().expect("should create config");
             fs::write(file.path(), &text).expect("should write config");
@@ -523,16 +546,14 @@ client_side_bidders = 'examplebidder\'
         let input =
             "[bundle]\nadapters = ['exampleBidAdapter']\nuser_id_modules = ['sharedIdSystem']";
         assert!(
-            toml::from_str::<trusted_server_core::integrations::prebid::PrebidIntegrationConfig>(
-                input
-            )
-            .is_err(),
+            toml::from_str::<trusted_server_auction_prebid::PrebidIntegrationConfig>(input)
+                .is_err(),
             "core should reject the retired bundle schema"
         );
         let file = tempfile::NamedTempFile::new().expect("should create config");
         fs::write(
             file.path(),
-            input.replace("[bundle]", "[integrations.prebid.bundle]"),
+            input.replace("[bundle]", "[auction.prebid.bundle]"),
         )
         .expect("should write config");
         // Inspection is deliberately partial, not full runtime validation.
@@ -550,7 +571,7 @@ client_side_bidders = 'examplebidder\'
                 let file = tempfile::NamedTempFile::new().expect("should create config");
                 fs::write(
                     file.path(),
-                    format!("[integrations.prebid.bundle.modules]\n{field} = {value}\n"),
+                    format!("[auction.prebid.bundle.modules]\n{field} = {value}\n"),
                 )
                 .expect("should write config");
                 let error = inspect(file.path())
@@ -568,6 +589,6 @@ client_side_bidders = 'examplebidder\'
         fs::write(&path, "").expect("should write fixture");
         let output = inspect(&path).expect("should inspect empty file");
         assert_eq!(output.data["section_present"], false);
-        assert!(output.data["enabled_explicit"].is_null());
+        assert_eq!(output.data["selected"], false);
     }
 }

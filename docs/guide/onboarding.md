@@ -30,8 +30,8 @@ path. Navigate by function name; line numbers change.
 
 | Step | Function or area                                     | Responsibility                                                                                            |
 | ---- | ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| 1    | `adapter-fastly/src/main.rs` — `main`                | Answer `/health` immediately; otherwise initialize logging and call `edgezero_main`                       |
-| 2    | `main.rs` — `edgezero_main`                          | Load runtime configuration, sanitize forwarded client data, capture TLS/device signals, and dispatch      |
+| 1    | `adapter-fastly/src/lib.rs` — `run`                  | Answer `/health` immediately; otherwise initialize logging and call `edgezero_main`                       |
+| 2    | `lib.rs` — `edgezero_main`                           | Load runtime configuration, sanitize forwarded client data, capture TLS/device signals, and dispatch      |
 | 3    | EdgeZero router                                      | Select a named Trusted Server route or the fallback handler                                               |
 | 4    | `adapter-fastly/src/app.rs` — `dispatch_fallback`    | Build EC request state, run pre-route integration filters, and distinguish asset/integration traffic      |
 | 5    | `dispatch_fallback`                                  | For an eligible publisher navigation, generate an EC ID when needed and call the shared publisher handler |
@@ -76,17 +76,19 @@ See [Architecture](/guide/architecture) for component boundaries and
 
 ## Code map
 
-| Path                                           | Responsibility                                                  |
-| ---------------------------------------------- | --------------------------------------------------------------- |
-| `crates/trusted-server-core/`                  | Runtime-neutral request, identity, consent, proxy, and ad logic |
-| `crates/trusted-server-core/src/publisher.rs`  | Publisher fallback, auction dispatch, and response processing   |
-| `crates/trusted-server-core/src/auction/`      | Auction orchestration and provider implementations              |
-| `crates/trusted-server-core/src/ec/`           | EC identity graph and administrative operations                 |
-| `crates/trusted-server-core/src/consent/`      | Consent extraction, decoding, and enforcement                   |
-| `crates/trusted-server-core/src/integrations/` | Server-side integration registry and handlers                   |
-| `crates/trusted-server-js/lib/src/`            | Browser-side TypeScript and integration modules                 |
-| `crates/trusted-server-adapter-*`              | Fastly, Axum, Cloudflare, and Spin runtime entry points         |
-| `crates/trusted-server-cli/`                   | Native `ts` operator CLI                                        |
+| Path                                           | Responsibility                                                   |
+| ---------------------------------------------- | ---------------------------------------------------------------- |
+| `crates/trusted-server-core/`                  | Runtime-neutral request, identity, consent, proxy, and ad logic  |
+| `crates/trusted-server-core/src/publisher.rs`  | Publisher fallback, auction dispatch, and response processing    |
+| `crates/trusted-server-core/src/auction/`      | Auction orchestration and provider implementations               |
+| `crates/trusted-server-core/src/ec/`           | EC identity graph and administrative operations                  |
+| `crates/trusted-server-core/src/consent/`      | Consent extraction, decoding, and enforcement                    |
+| `crates/trusted-server-core/src/integrations/` | Integration registry and the builder a module registers with     |
+| `crates/<type>/<vendor>/`                      | One module each: a page integration or an auction implementation |
+| `crates/trusted-server-modules/`               | The modules a stock build ships, in the order their hooks run    |
+| `crates/trusted-server-js/lib/src/`            | Browser-side TypeScript and integration modules                  |
+| `crates/trusted-server-adapter-*`              | Fastly, Axum, Cloudflare, and Spin runtime entry points          |
+| `crates/trusted-server-cli/`                   | Native `ts` operator CLI                                         |
 
 ## First development loop
 

@@ -29,6 +29,7 @@ reqwest = { workspace = true }
 simple_logger = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 trusted-server-core = { workspace = true }
+trusted-server-modules = { workspace = true }
 trusted-server-permission-signal-gpc = { workspace = true }
 trusted-server-permission-signal-gpp = { workspace = true }
 trusted-server-permission-signal-mtm = { workspace = true }
@@ -44,3 +45,6 @@ temp-env = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tower = { workspace = true, features = ["util"] }
+# Test fixture only. It proves the integration seam from outside core and must
+# never reach a production build, so it stays a dev-dependency.
+trusted-server-integration-seam-probe = { path = "../testing/seam-probe" }

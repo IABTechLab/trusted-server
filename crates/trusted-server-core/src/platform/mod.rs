@@ -37,14 +37,22 @@ use std::time::Duration;
 
 mod backend_naming;
 mod error;
+mod geo;
 mod http;
 mod image_optimizer;
 mod kv;
 mod policy_source;
 mod template_assembly;
 mod template_cache;
-#[cfg(test)]
-pub(crate) mod test_support;
+#[cfg(any(test, feature = "test-utils"))]
+#[allow(
+    clippy::must_use_candidate,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    clippy::new_without_default,
+    reason = "test doubles, offered to other crates' tests under the test-utils feature"
+)]
+pub mod test_support;
 mod traits;
 mod types;
 
@@ -54,6 +62,7 @@ pub use backend_naming::{
 };
 pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformKvStore};
 pub use error::PlatformError;
+pub use geo::DisabledGeo;
 pub use http::{
     PlatformCacheIntent, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
     PlatformResponse, PlatformSelectResult, UnavailableHttpClient,
@@ -84,28 +93,9 @@ pub use types::{
 /// Default first-byte timeout for platform backends.
 pub(crate) const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 
-use std::net::IpAddr;
 use std::sync::Arc;
 
-use error_stack::Report;
-
 use crate::settings::Settings;
-
-/// A geo module that resolves nothing.
-///
-/// Installed when no geo module is selected (`"none"` spells the same
-/// choice explicitly), so a client IP is never sent to any host geo service
-/// and a default deployment is not tied to any host geo capability. Every geo
-/// consumer already treats [`GeoInfo`] as optional, so a `None` result
-/// degrades gracefully (the permission baseline falls back to the top of the
-/// `permissions.yaml` rules tree, the auction omits geo, and so on).
-pub struct DisabledGeo;
-
-impl PlatformGeo for DisabledGeo {
-    fn lookup(&self, _client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
-        Ok(None)
-    }
-}
 
 /// Selects the geo module named by the `[geo] module` selector.
 ///
@@ -114,9 +104,15 @@ impl PlatformGeo for DisabledGeo {
 /// the top of the `permissions.yaml` rules tree. `module = "none"` spells the
 /// same choice explicitly. The host platform's own geo lookup is opt-in:
 /// `module = "platform"` returns `host_default`, which the adapter passes
-/// as its platform geo implementation. A selected-but-unknown module is
-/// rejected at startup by
-/// [`GeoConfig::validate_module_selection`](crate::settings::GeoConfig::validate_module_selection).
+/// as its platform geo implementation.
+///
+/// Any other value names an integration module that declares a geo module.
+/// This function returns [`DisabledGeo`] for one, because it cannot see the
+/// registry, and the adapter then replaces it with the module's module from
+/// `IntegrationRegistry::geo_module`. So the value returned here is the base
+/// the adapter starts from, not necessarily what serves the request. A selector
+/// naming a module that supplies no geo module is rejected when the registry
+/// is built, which is the only layer that can tell.
 #[must_use]
 pub fn build_geo_module(
     settings: &Settings,
@@ -218,18 +214,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn runtime_services_geo_lookup_returns_none_for_no_ip() {
+    #[tokio::test]
+    async fn runtime_services_geo_lookup_returns_none_for_no_ip() {
         let services = noop_services();
         let result = services
             .geo()
-            .lookup(services.client_info().client_ip)
+            .lookup(services.client_info().client_ip, &noop_services())
+            .await
             .expect("should not fail for noop geo with no ip");
         assert!(result.is_none(), "should return None when no IP is present");
     }
 
-    #[test]
-    fn build_geo_module_defaults_to_no_geo() {
+    #[tokio::test]
+    async fn build_geo_module_defaults_to_no_geo() {
         let settings = Settings::default();
         let host: Arc<dyn PlatformGeo> = Arc::new(test_support::NoopGeo);
         let selected = build_geo_module(&settings, Arc::clone(&host));
@@ -239,7 +236,11 @@ mod tests {
         );
         assert!(
             selected
-                .lookup(Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))))
+                .lookup(
+                    Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
+                    &noop_services()
+                )
+                .await
                 .expect("disabled geo lookup should not fail")
                 .is_none(),
             "the default geo module should resolve nothing"

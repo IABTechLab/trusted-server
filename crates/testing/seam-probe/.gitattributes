@@ -1,0 +1,5 @@
+# The crate embeds js/probe.js with `include_str!` and states its SHA-256 as a
+# literal, so the file must arrive byte identical on every platform. Without
+# this, a Windows checkout under `core.autocrlf = true` would rewrite the line
+# endings and the declared hash would no longer match its source.
+js/probe.js text eol=lf
