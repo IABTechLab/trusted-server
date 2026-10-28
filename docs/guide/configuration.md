@@ -3613,6 +3613,11 @@ that blob, so the policy a host runs is checked on that host's `/_ts/config`.
 | Any host, where the store cannot be read                    | None                      | `500`                            |
 | A host whose policy entry is missing or is another file     | The host's blob           | `500`, with the reason logged    |
 
+An instance that already holds the rules for the SHA-256 a host's blob pins
+does not read that host's policy entry, so a missing or replaced entry is
+answered with `500` only by an instance that has not loaded that SHA-256
+before.
+
 A selector is malformed when it is empty, carries whitespace, a control
 character or `{host}` more than once, carries a brace outside its `{host}`
 (such as `{Host}`), or is longer than 255 characters. Without the entry every
