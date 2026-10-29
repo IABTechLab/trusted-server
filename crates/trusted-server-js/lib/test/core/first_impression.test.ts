@@ -22,6 +22,25 @@ describe('initial render capacity and diagnostics', () => {
     document.body.replaceChildren();
   });
 
+  it.each(['__proto__', 'constructor', 'toString'])(
+    'claims a literal native ID %s without inherited records or prototype writes',
+    (id) => {
+      document.body.firstElementChild!.id = id;
+      const element = document.getElementById(id)!;
+      const ts: TsjsApi = {};
+      const claim = claimFirstImpressionForTrustedServer(ts, element)!;
+      expect(claim.owner).toBe('trusted_server');
+      expect(Object.hasOwn(ts.firstImpression!.slots, id)).toBe(true);
+      expect(Object.getPrototypeOf(ts.firstImpression!.slots)).toBeNull();
+      const token = registerPublisherFirstImpressionAuctions(ts, [id]).get(id)!;
+      expect(consumePublisherFirstImpressionDelivery(ts, token)).toBe(true);
+      expect(Object.getPrototypeOf(claim.publisherAuctions)).toBeNull();
+      expect(reservePublisherFirstImpressionFallback(ts, element)).toBe(true);
+      expect(Object.getPrototypeOf(ts.firstImpression!.fallbackSlots)).toBeNull();
+      expect(ts.firstImpression!.fallbackSlots[id]).toBe(element);
+    }
+  );
+
   it('suppresses overflow through settlement without growing the token map', () => {
     const ts: TsjsApi = {};
     const element = document.getElementById('example-slot')!;

@@ -7,6 +7,9 @@ use trusted_server_core::streaming_processor::StreamProcessor as _;
 
 fn make_config() -> HtmlProcessorConfig {
     HtmlProcessorConfig {
+        enforced_csp: false,
+        slot_reservations: Vec::new(),
+        request_path: None,
         csp_nonce_observed: None,
         origin_host: "origin.bench.example.com".to_string(),
         request_host: "proxy.bench.example.com".to_string(),

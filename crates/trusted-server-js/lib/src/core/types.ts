@@ -26,6 +26,7 @@ export interface AuctionSlot {
   gam_unit_path: string;
   div_id: string;
   formats: Array<[number, number]>;
+  initialization?: 'auto' | 'publisher_registered';
   targeting?: Record<string, string>;
 }
 
@@ -433,6 +434,79 @@ export interface FirstImpressionState {
   fallbackSlots: Record<string, HTMLElement>;
 }
 
+/** Minimum public native GPT slot accepted by the publisher registration API. */
+export interface PublisherGptSlot {
+  getSlotElementId(): string;
+  getAdUnitPath(): string;
+  setTargeting(key: string, value: string | string[]): unknown;
+  clearTargeting(key?: string): unknown;
+  getTargeting?(key: string): string[];
+}
+
+/** Publisher-owned, finite size snapshot for one initial impression. */
+export interface PublisherSlotRegistrationOptions {
+  slotId: string;
+  gptSlot: PublisherGptSlot;
+  navigationGeneration: number;
+  eligibleFormats: ReadonlyArray<Size>;
+}
+
+/** Observable registration state. A rejection is not permission for an automatic retry. */
+export type PublisherSlotRegistrationStatus =
+  | { status: 'waiting_payload' | 'waiting_delivery' | 'dispatching' | 'requested' | 'rendered' }
+  | { status: 'inactive'; reason: 'not_admitted' | 'not_registered_mode' }
+  | { status: 'publisher_owned'; reason: 'prior_claim' }
+  | {
+      status: 'cancelled';
+      reason: 'explicit' | 'navigation' | 'element_changed' | 'native_slot_missing';
+    }
+  | {
+      status: 'rejected';
+      reason:
+        | 'invalid_arguments'
+        | 'stale_generation'
+        | 'duplicate_dom_id'
+        | 'missing_element'
+        | 'native_slot_missing'
+        | 'path_mismatch'
+        | 'conflicting_registration'
+        | 'initial_load_enabled'
+        | 'initial_load_unknown';
+    }
+  | { status: 'failed_after_dispatch'; reason: 'delivery_exception' };
+
+/** Handle for the captured registration token, not a future replacement. */
+export interface PublisherSlotRegistration {
+  getStatus(): PublisherSlotRegistrationStatus;
+  cancel(): void;
+}
+
+/** Browser-local state shared by the inline bootstrap and runtime. Never serialize this. */
+export interface PublisherSlotRegistrationRecord {
+  generation: number;
+  slotId: string;
+  token: number;
+  gptSlot?: PublisherGptSlot;
+  element?: HTMLElement;
+  elementId: string;
+  adUnitPath: string;
+  eligibleFormats: Size[];
+  status: PublisherSlotRegistrationStatus;
+  consumed: boolean;
+  queued: boolean;
+  targetingKeys?: string[];
+  selectedCandidate?: AuctionBidData;
+  noCandidateReason?: 'renderer_unavailable' | 'incompatible_dimensions' | 'no_bid';
+}
+
+/** Authoritative admitted payload and logical identity for the current navigation. */
+export interface PublisherSlotRegistrationState {
+  generation: number;
+  nextToken: number;
+  records: Record<string, PublisherSlotRegistrationRecord>;
+  payload?: { generation: number; slots: AuctionSlot[]; bids: Record<string, AuctionBidData> };
+}
+
 export interface TsjsApi {
   version: string;
   que: Array<() => void>;
@@ -454,6 +528,16 @@ export interface TsjsApi {
     error(...args: unknown[]): void;
     debug(...args: unknown[]): void;
   };
+
+  /** Public publisher-registered initial-delivery protocol version. */
+  publisherSlotRegistrationVersion?: 1;
+  registerPublisherSlot?(options: PublisherSlotRegistrationOptions): PublisherSlotRegistration;
+  /** Internal browser-local protocol state shared with the inline bootstrap. */
+  publisherSlotRegistrationState?: PublisherSlotRegistrationState;
+  /** Queued callbacks resolve this current dispatcher across implementation handoff. */
+  publisherSlotRegistrationDispatch?: (readyRecord?: PublisherSlotRegistrationRecord) => void;
+  /** Installed only after the real TS creative message handler is attached. */
+  tsRenderBridgeVersion?: 1;
 
   // ── Server-side auction runtime (populated by TS edge injection) ──────────
   /** Ad slot definitions injected at <head> open. */
@@ -508,7 +592,13 @@ export interface TsjsApi {
   firstImpression?: FirstImpressionState;
   /** Guards the shared production GPT lifecycle listener installation. */
   firstImpressionListenersInstalled?: boolean;
-  /** Guards SPA pushState hook installation. */
+  /** One history observer resolves the active bootstrap/runtime navigation handler. */
+  gptNavigationBridge?: {
+    onNavigate(path: string): void;
+    /** An observed navigation still awaiting the full runtime's page-bids operation. */
+    pendingGeneration?: number;
+  };
+  /** Guards full runtime SPA hook installation, not provisional bootstrap observation. */
   spaHookInstalled?: boolean;
   /** Internal one-shot state shared by bootstrap and bundle scheduler installs. */
   initialAdInitScheduled?: boolean;

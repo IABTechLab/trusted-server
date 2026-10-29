@@ -97,6 +97,8 @@ impl HtmlEofDriver {
         );
         let mut processor = create_html_stream_processor_with_document_state(
             HtmlStreamProcessorParams {
+                request_path: &params.request_path,
+                enforced_csp: params.enforced_csp,
                 origin_host: &params.origin_host,
                 request_host: &params.request_host,
                 request_scheme: &params.request_scheme,

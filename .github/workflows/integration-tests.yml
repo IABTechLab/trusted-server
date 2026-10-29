@@ -1,4 +1,4 @@
-name: "Integration Tests"
+name: 'Integration Tests'
 
 permissions:
   contents: read
@@ -26,17 +26,54 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Read Node.js build version
+        id: build-node-version
+        run: echo "version=$(awk '$1 == "nodejs" {print $2}' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js for embedded and browser bundles
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.build-node-version.outputs.version }}
+
       - name: Set up shared integration build environment
         uses: ./.github/actions/setup-integration-test-env
         with:
           origin-port: ${{ env.ORIGIN_PORT }}
-          install-viceroy: "false"
-          build-cloudflare: "true"
+          install-viceroy: 'false'
+          build-cloudflare: 'true'
 
       - name: Generate integration Viceroy configs
         run: ./scripts/generate-integration-viceroy-configs.sh
         env:
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+
+      - name: Prepare publisher registration artifacts
+        run: |
+          mkdir -p "$(dirname "$WASM_ARTIFACT_PATH")"
+          cp target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm "$WASM_ARTIFACT_PATH"
+          (
+            cd crates/trusted-server-js/lib
+            node build-all.mjs --out-dir "$ARTIFACTS_DIR/publisher-registration-dist"
+            node build-prebid-external.mjs \
+              --modules-json '{"bidder":["rubiconBidAdapter"],"userId":["sharedIdSystem"],"analytics":[]}' \
+              --out "$ARTIFACTS_DIR/publisher-registration-prebid"
+          )
+          ./scripts/test-publisher-registration.sh --stamp-wasm \
+            --wasm "$WASM_ARTIFACT_PATH" --dist "$ARTIFACTS_DIR/publisher-registration-dist" \
+            --bundle-mode build-rs
+          ./scripts/test-publisher-registration.sh --prepare \
+            --wasm "$WASM_ARTIFACT_PATH" --dist "$ARTIFACTS_DIR/publisher-registration-dist" \
+            --bundle-mode build-rs --prebid "$ARTIFACTS_DIR/publisher-registration-prebid" \
+            --artifacts "$ARTIFACTS_DIR/publisher-registration" \
+            --out "$ARTIFACTS_DIR/publisher-registration-prep"
+
+      - name: Export production HTML for CWV contracts
+        env:
+          TSJS_PREBUILT_DIR: ${{ env.ARTIFACTS_DIR }}/publisher-registration-dist
+        run: |
+          HOST_TARGET="$(rustc -vV | awk '/^host:/ {print $2}')"
+          cargo run -p trusted-server-integration-tests --example cwv_html --target "$HOST_TARGET" -- "$ARTIFACTS_DIR/cwv/unreserved" unreserved
+          cargo run -p trusted-server-integration-tests --example cwv_html --target "$HOST_TARGET" -- "$ARTIFACTS_DIR/cwv/reserved" reserved
 
       - name: Package integration test artifacts
         run: |
@@ -44,9 +81,10 @@ jobs:
           cp target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm "$WASM_ARTIFACT_PATH"
           cp target/debug/trusted-server-axum "$AXUM_ARTIFACT_PATH"
           cp -r crates/trusted-server-adapter-cloudflare/build/. "$CF_BUILD_ARTIFACT_PATH/"
+          PUBLISHER_IMAGE="$(node -e 'const image = require(process.argv[1]); console.log((Array.isArray(image) ? image[0] : image).RepoTags[0])' "$ARTIFACTS_DIR/publisher-registration-prep/image.json")"
           docker save \
             --output "$DOCKER_ARTIFACT_PATH" \
-            test-wordpress:latest test-nextjs:latest
+            test-wordpress:latest test-nextjs:latest "$PUBLISHER_IMAGE"
 
       - name: Upload integration test artifacts
         uses: actions/upload-artifact@v4
@@ -68,10 +106,10 @@ jobs:
         uses: ./.github/actions/setup-integration-test-env
         with:
           origin-port: ${{ env.ORIGIN_PORT }}
-          install-viceroy: "true"
-          build-wasm: "false"
-          build-axum: "false"
-          build-test-images: "false"
+          install-viceroy: 'true'
+          build-wasm: 'false'
+          build-axum: 'false'
+          build-test-images: 'false'
 
       - name: Download integration test artifacts
         uses: actions/download-artifact@v4
@@ -122,9 +160,9 @@ jobs:
         uses: ./.github/actions/setup-integration-test-env
         with:
           origin-port: ${{ env.ORIGIN_PORT }}
-          install-viceroy: "true"
-          build-wasm: "false"
-          build-test-images: "false"
+          install-viceroy: 'true'
+          build-wasm: 'false'
+          build-test-images: 'false'
 
       - name: Download integration test artifacts
         uses: actions/download-artifact@v4
@@ -166,9 +204,9 @@ jobs:
         uses: ./.github/actions/setup-integration-test-env
         with:
           origin-port: ${{ env.ORIGIN_PORT }}
-          install-viceroy: "true"
-          build-wasm: "false"
-          build-test-images: "false"
+          install-viceroy: 'true'
+          build-wasm: 'false'
+          build-test-images: 'false'
 
       - name: Download integration test artifacts
         uses: actions/download-artifact@v4
@@ -200,6 +238,20 @@ jobs:
         run: |
           npm ci
           npx playwright install --with-deps chromium
+
+      - name: Test CWV metrics and production HTML contracts
+        working-directory: crates/trusted-server-integration-tests/browser
+        run: |
+          npm run test:cwv:unit
+          npm run test:cwv -- --loading "$ARTIFACTS_DIR/cwv/unreserved" --combined "$ARTIFACTS_DIR/cwv/reserved" --correctness-only --out "$RUNNER_TEMP/cwv-evidence"
+
+      - name: Upload CWV evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cwv-evidence
+          path: ${{ runner.temp }}/cwv-evidence/
+          retention-days: 7
 
       - name: Test initial render fixture escaping
         working-directory: crates/trusted-server-integration-tests/browser
@@ -263,4 +315,80 @@ jobs:
         with:
           name: playwright-traces
           path: crates/trusted-server-integration-tests/browser/test-results/
+          retention-days: 7
+
+  publisher-registration:
+    name: publisher registration contracts
+    needs: [prepare-artifacts, browser-tests]
+    if: ${{ always() && needs.prepare-artifacts.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up publisher registration runtime
+        id: shared-setup
+        uses: ./.github/actions/setup-integration-test-env
+        with:
+          origin-port: ${{ env.ORIGIN_PORT }}
+          install-viceroy: 'true'
+          build-wasm: 'false'
+          build-axum: 'false'
+          build-test-images: 'false'
+
+      - name: Download prepared integration artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: integration-test-artifacts
+          path: ${{ env.ARTIFACTS_DIR }}
+
+      - name: Load prepared fixture images
+        run: docker load --input "$DOCKER_ARTIFACT_PATH"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.shared-setup.outputs.node-version }}
+          cache: npm
+          cache-dependency-path: crates/trusted-server-integration-tests/browser/package-lock.json
+
+      - name: Install browser dependencies
+        working-directory: crates/trusted-server-integration-tests/browser
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Restore prepared TSJS bundles
+        run: |
+          mkdir -p crates/trusted-server-js/dist
+          cp "$ARTIFACTS_DIR/publisher-registration-dist/"*.js crates/trusted-server-js/dist/
+
+      - name: Test publisher registration fixture and offline contracts
+        run: |
+          npm --prefix crates/trusted-server-integration-tests/browser run test:publisher-registration:fixture
+          node crates/trusted-server-integration-tests/browser/publisher-registration/run.cjs \
+            --implementation all --prebid "$ARTIFACTS_DIR/publisher-registration-prebid" \
+            --out "$RUNNER_TEMP/publisher-registration-offline"
+
+      - name: Test actual framework injection and provider delivery
+        if: always()
+        env:
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+        run: |
+          ./scripts/test-publisher-registration.sh \
+            --wasm "$WASM_ARTIFACT_PATH" --dist "$ARTIFACTS_DIR/publisher-registration-dist" \
+            --bundle-mode build-rs --prebid "$ARTIFACTS_DIR/publisher-registration-prebid" \
+            --reuse-artifacts "$ARTIFACTS_DIR/publisher-registration" \
+            --out "$RUNNER_TEMP/publisher-registration-framework"
+
+      - name: Upload publisher registration evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: publisher-registration-evidence
+          path: |
+            ${{ runner.temp }}/publisher-registration-offline/
+            ${{ runner.temp }}/publisher-registration-framework/
+            ${{ env.ARTIFACTS_DIR }}/publisher-registration/
+            ${{ env.ARTIFACTS_DIR }}/publisher-registration-prep/
           retention-days: 7

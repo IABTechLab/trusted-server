@@ -1,4 +1,64 @@
-use trusted_server_js::{concatenated_hash, single_module_hash};
+use trusted_server_js::{concatenated_hash, module_bundle, single_module_hash};
+
+use crate::integrations::IntegrationRegistry;
+
+/// Publisher runtime tags, preserving synchronous delivery for early dependencies.
+///
+/// GPT-only pages install the real early APIs inline and defer the standalone
+/// GPT runtime. Other integrations keep their established execution order until
+/// their early dependencies have equivalent browser coverage. Enforced response
+/// CSP or active diagnostics also requires the established synchronous path.
+#[must_use]
+pub(crate) fn publisher_script_tags(
+    integrations: &IntegrationRegistry,
+    synchronous_required: bool,
+) -> String {
+    let attributes = integrations.tsjs_script_tag_attributes();
+    if !supports_deferred_gpt(&integrations.js_module_ids(), synchronous_required) {
+        return tsjs_script_tag_with_attributes(
+            &integrations.js_module_ids_immediate(),
+            &attributes,
+        );
+    }
+
+    let bootstrap = module_bundle("bootstrap").expect("should embed the early publisher bootstrap");
+    let attributes = trusted_script_attributes(&attributes);
+    format!(
+        "<script id=\"trustedserver-bootstrap\"{attributes}>{bootstrap}</script>\
+         <script src=\"{}\" id=\"trustedserver-js\"{attributes} defer></script>",
+        tsjs_single_module_script_src("gpt"),
+    )
+}
+
+fn supports_deferred_gpt(module_ids: &[&str], synchronous_required: bool) -> bool {
+    !synchronous_required
+        && module_ids.contains(&"gpt")
+        && module_ids
+            .iter()
+            .all(|id| matches!(*id, "creative" | "gpt" | "prebid"))
+}
+
+fn trusted_script_attributes(attributes: &[(&'static str, &'static str)]) -> String {
+    attributes
+        .iter()
+        .map(|(name, value)| {
+            debug_assert!(
+                !name.is_empty()
+                    && name.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    }),
+                "attribute name should contain only lowercase ASCII letters, digits, and hyphens"
+            );
+            debug_assert!(
+                !value
+                    .bytes()
+                    .any(|byte| matches!(byte, b'\"' | b'&' | b'<' | b'>')),
+                "attribute value should not contain HTML-sensitive characters"
+            );
+            format!(" {name}=\"{value}\"")
+        })
+        .collect()
+}
 
 /// `/static` URL for the tsjs bundle with cache-busting hash based on
 /// the concatenated content of the given module set.
@@ -20,25 +80,7 @@ pub fn tsjs_script_tag_with_attributes(
     module_ids: &[&str],
     attributes: &[(&'static str, &'static str)],
 ) -> String {
-    let attributes = attributes
-        .iter()
-        .map(|(name, value)| {
-            debug_assert!(
-                !name.is_empty()
-                    && name.bytes().all(|byte| {
-                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
-                    }),
-                "attribute name should contain only lowercase ASCII letters, digits, and hyphens"
-            );
-            debug_assert!(
-                !value
-                    .bytes()
-                    .any(|byte| matches!(byte, b'"' | b'&' | b'<' | b'>')),
-                "attribute value should not contain HTML-sensitive characters"
-            );
-            format!(" {name}=\"{value}\"")
-        })
-        .collect::<String>();
+    let attributes = trusted_script_attributes(attributes);
 
     format!(
         "<script src=\"{}\" id=\"trustedserver-js\"{attributes}></script>",
@@ -118,6 +160,66 @@ mod tests {
         assert!(
             value.chars().all(|ch| ch.is_ascii_hexdigit()),
             "should contain only ASCII hex digits"
+        );
+    }
+
+    #[test]
+    fn deferred_gpt_requires_a_proven_profile_without_active_diagnostics() {
+        assert!(supports_deferred_gpt(&["creative", "gpt"], false));
+        assert!(supports_deferred_gpt(&["creative", "gpt", "prebid"], false));
+        assert!(!supports_deferred_gpt(&["creative"], false));
+        assert!(!supports_deferred_gpt(&["creative", "gpt"], true));
+        for blocked in [
+            "datadome",
+            "google_tag_manager",
+            "lockr",
+            "permutive",
+            "didomi",
+            "sourcepoint",
+            "osano",
+            "testlight",
+            "future_integration",
+        ] {
+            assert!(
+                !supports_deferred_gpt(&["creative", "gpt", blocked], false),
+                "should retain synchronous loading for {blocked}",
+            );
+        }
+    }
+
+    #[test]
+    fn synchronous_loading_requirement_preserves_the_existing_publisher_tag() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config("gpt", &serde_json::json!({"enabled": true}))
+            .expect("should enable GPT");
+        let registry = IntegrationRegistry::new(&settings).expect("should build GPT registry");
+        assert_eq!(
+            publisher_script_tags(&registry, true),
+            tsjs_script_tag_with_attributes(
+                &registry.js_module_ids_immediate(),
+                &registry.tsjs_script_tag_attributes(),
+            ),
+            "should retain the exact synchronous tag instead of introducing a CSP hash requirement",
+        );
+        assert!(
+            publisher_script_tags(&registry, false).contains("id=\"trustedserver-bootstrap\""),
+            "should still defer a supported profile without a synchronous requirement"
+        );
+    }
+
+    #[test]
+    fn compiled_inline_bootstrap_cannot_terminate_its_script_element() {
+        let script =
+            module_bundle("bootstrap").expect("should embed the early publisher bootstrap");
+        assert!(
+            !script.to_ascii_lowercase().contains("</script"),
+            "should compile script-text-safe inline JavaScript",
+        );
+        assert!(
+            !script.contains("<!--"),
+            "should escape HTML comment openers"
         );
     }
 

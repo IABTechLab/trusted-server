@@ -1,0 +1,97 @@
+# Isolated fictional framework application: registered header and automatic control.
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+password = "integration_admin_password"
+
+[publisher]
+domain = "localhost"
+cookie_domain = "localhost"
+origin_url = "http://127.0.0.1:8888"
+proxy_secret = "integration_proxy_secret"
+
+[ec]
+passphrase = "integration_ec_passphrase"
+ec_store = "ec_identity_store"
+
+[request_signing]
+enabled = false
+config_store_id = "app_config"
+secret_store_id = "secrets"
+
+[proxy]
+certificate_check = true
+allowed_domains = ["localhost", "127.0.0.1", "auction.example.com", "assets.example.com", "ads.example.com"]
+
+[integrations.nextjs]
+enabled = true
+rewrite_attributes = ["href", "link", "siteBaseUrl", "siteProductionDomain", "url"]
+max_combined_payload_bytes = 10485760
+
+[integrations.gpt]
+enabled = true
+gam_attribution_enabled = false
+script_url = "https://ads.example.com/gpt.js"
+rewrite_script = false
+
+[integrations.prebid]
+enabled = true
+external_bundle_url = "https://assets.example.com/fixture-prebid.js"
+timeout_ms = 1500
+client_side_bidders = []
+
+[auction]
+enabled = true
+timeout_ms = 1500
+allowed_context_keys = []
+
+[auction.providers.fixture-pbs]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://auction.example.com/api/fixture-auction"
+timeout_ms = 1000
+routing = "explicit"
+
+[auction.providers.fixture-pbs.profile_config]
+debug = false
+test_mode = true
+consent_forwarding = "both"
+
+[auction.bidders.fixture-bidder]
+provider = "fixture-pbs"
+
+[creative_opportunities]
+enabled = true
+gam_network_id = "123456789"
+auction_timeout_ms = 1500
+assembly_mode = "inline"
+
+[[creative_opportunities.slot]]
+id = "fixture-header"
+initialization = "publisher_registered"
+div_id = "fixture-header-"
+page_patterns = ["/publisher-registration", "/publisher-registration/*"]
+formats = [{ width = 300, height = 250 }, { width = 300, height = 600 }]
+
+[creative_opportunities.slot.reservation]
+element_id = "fixture-header-space"
+min_height = 250
+
+[[creative_opportunities.slot.reservation.breakpoints]]
+min_width = 601
+min_height = 600
+
+[creative_opportunities.slot.providers.prebid.bidders.fixture-bidder]
+placement = "fixture-header"
+
+[[creative_opportunities.slot]]
+id = "fixture-auto"
+div_id = "fixture-auto-"
+page_patterns = ["/publisher-registration"]
+formats = [{ width = 300, height = 250 }]
+
+[creative_opportunities.slot.providers.prebid.bidders.fixture-bidder]
+placement = "fixture-auto"
+
+[debug]
+inject_adm_for_testing = false
