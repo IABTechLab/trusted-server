@@ -1,5 +1,7 @@
 //! Shared input policy for SDK URL ownership checks.
 
+use std::borrow::Cow;
+
 use url::Url;
 
 /// Parse an HTTP(S) SDK URL with an explicit authority, or a protocol-relative URL.
@@ -12,9 +14,12 @@ pub(super) fn parse_sdk_network_url(url: &str) -> Option<Url> {
     if url.contains('\0') {
         return None;
     }
-    let value = url
-        .trim_matches(|character| character <= '\u{20}')
-        .replace(['\t', '\n', '\r'], "");
+    let trimmed = url.trim_matches(|character| character <= '\u{20}');
+    let value = if trimmed.contains(['\t', '\n', '\r']) {
+        Cow::Owned(trimmed.replace(['\t', '\n', '\r'], ""))
+    } else {
+        Cow::Borrowed(trimmed)
+    };
     let has_authority = |value: &str| matches!(value.as_bytes(), [b'/' | b'\\', b'/' | b'\\', ..]);
     let parsed = if has_authority(&value) {
         Url::parse(&format!("https:{value}"))

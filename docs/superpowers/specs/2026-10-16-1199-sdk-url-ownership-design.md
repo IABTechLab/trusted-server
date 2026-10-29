@@ -258,25 +258,24 @@ focused JS tests. It reported no findings.
 
 The original regression tests failed against the substring matchers before the
 ownership fixes. The normalization regressions also failed before expanding the
-common preprocessing policy. The shared corpus now contains 105 cases, including
-22 normalization positives and negatives. The all-guard test expands them into
-1,376 ownership and insertion checks across both handler orders and DOM paths.
+common preprocessing policy. The shared corpus now contains 106 cases, including
+23 normalization positives and negatives. The all-guard test expands them into
+1,390 ownership and insertion checks across both handler orders and DOM paths.
 
-| Check                                                                                                         | Result                                                                      |
-| ------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| Full JS suite, `npx vitest run --maxWorkers=4`                                                                | Passed, 2,605 tests across 52 files; no reported type errors                |
-| JS `npm run lint`, `npm run format`, `npm run build`                                                          | Passed                                                                      |
-| Native Lockr and Permutive inline test modules                                                                | Passed, 11 and 9 tests, including the shared corpus and attribute rewriting |
-| `cargo test-fastly`, `cargo test-fastly-reuse`, `cargo test-axum`, `cargo test-cloudflare`, `cargo test-spin` | Passed; existing ignored tests remain ignored                               |
-| All eight target-specific clippy aliases listed in `AGENTS.md`                                                | Passed                                                                      |
-| Integration parity test                                                                                       | Passed                                                                      |
-| Native template build-digest tests and clippy                                                                 | Passed                                                                      |
-| `cargo fmt --all -- --check`, wasm clock lint                                                                 | Passed                                                                      |
-| Docs and repository Markdown formatting                                                                       | Passed                                                                      |
-| URL-host lint on added lines                                                                                  | Passed                                                                      |
-
-Default-worker JS runs hit timeouts in core, creative, and Prebid tests locally.
-The full four-worker run passed without changing test timeouts or assertions.
+| Check                                                          | Result                                                                                                                                              |
+| -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Full JS suite, `npx vitest run --maxWorkers=4`                 | Passed, 2,640 tests across 52 files; scoped Vitest type assertions pass                                                                             |
+| JS `npm run lint`, `npm run format`, `npm run build`           | Passed                                                                                                                                              |
+| Native Lockr and Permutive inline test modules                 | Passed, 11 and 9 tests, including the shared corpus and attribute rewriting                                                                         |
+| `cargo test-axum`, `cargo test-cloudflare`, `cargo test-spin`  | Passed; existing ignored tests remain ignored                                                                                                       |
+| `cargo test-fastly`, `cargo test-fastly-reuse`                 | Local reruns blocked before test execution: installed Viceroy 0.17.0 lacks `fastly_http_req::pending_req_header_insert`; the repository pins 0.21.0 |
+| Package-wide `npx tsc --noEmit -p .`                           | Still fails on pre-existing errors; comparison with the unchanged branch confirms the test-only `replaceAll` error was removed                      |
+| All eight target-specific clippy aliases listed in `AGENTS.md` | Passed                                                                                                                                              |
+| Integration parity test                                        | Passed                                                                                                                                              |
+| Native template build-digest tests and clippy                  | Passed                                                                                                                                              |
+| `cargo fmt --all -- --check`, wasm clock lint                  | Passed                                                                                                                                              |
+| Docs and repository Markdown formatting                        | Passed                                                                                                                                              |
+| URL-host lint on added lines                                   | Passed                                                                                                                                              |
 
 No live vendor SDK fetch or production deployment smoke test was performed.
 
