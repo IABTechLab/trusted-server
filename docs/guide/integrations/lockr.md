@@ -148,6 +148,18 @@ The Lockr integration is implemented in [crates/trusted-server-core/src/integrat
 - Route: `/integrations/lockr/api/*` (GET, POST) proxies Lockr API calls
 - Purpose: Keep SDK delivery and identity API traffic on the publisher origin
 
+**SDK URL Rewriting**:
+
+Server-side attribute rewriting and the browser script guard recognize only
+`aim.loc.kr` and `identity.loc.kr` URLs whose pathname contains
+`identity-lockr` and ends in `.js`, case-insensitively. Absolute HTTP(S) and
+protocol-relative URLs are supported. Other scripts on those hosts, lookalike
+hosts, and vendor names embedded in another URL's path or query are not claimed.
+
+Query strings and fragments do not prevent SDK recognition. Matching URLs use
+`/integrations/lockr/sdk`, which serves the configured `sdk_url`; the original
+query and fragment are not forwarded to upstream.
+
 **ID Mapping**:
 
 - Maps Trusted Server EC ID → Lockr unified ID

@@ -25,6 +25,9 @@ pub mod osano;
 pub mod permutive;
 pub mod prebid;
 mod registry;
+mod sdk_url;
+#[cfg(test)]
+mod sdk_url_test_support;
 pub mod sourcepoint;
 pub mod testlight;
 

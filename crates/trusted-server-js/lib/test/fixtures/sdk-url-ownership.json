@@ -1,0 +1,536 @@
+[
+  {
+    "name": "Lockr aim SDK",
+    "url": "https://aim.loc.kr/identity-lockr-trust-server.js",
+    "owner": "lockr"
+  },
+  {
+    "name": "Lockr identity SDK",
+    "url": "https://identity.loc.kr/identity-lockr-v2.0.js",
+    "owner": "lockr"
+  },
+  {
+    "name": "Lockr aim query",
+    "url": "https://aim.loc.kr/identity-lockr-trust-server.js?v=2",
+    "owner": "lockr"
+  },
+  {
+    "name": "Lockr identity query",
+    "url": "https://identity.loc.kr/identity-lockr.js?v=2",
+    "owner": "lockr"
+  },
+  {
+    "name": "Lockr aim fragment",
+    "url": "https://aim.loc.kr/identity-lockr.js#sdk",
+    "owner": "lockr"
+  },
+  {
+    "name": "Lockr identity fragment",
+    "url": "https://identity.loc.kr/identity-lockr.js#sdk",
+    "owner": "lockr"
+  },
+  {
+    "name": "Lockr protocol relative",
+    "url": "//aim.loc.kr/identity-lockr.js?v=2#sdk",
+    "owner": "lockr"
+  },
+  {
+    "name": "Lockr identity protocol relative",
+    "url": "//identity.loc.kr/identity-lockr.js",
+    "owner": "lockr"
+  },
+  {
+    "name": "Lockr uppercase",
+    "url": "HTTPS://AIM.LOC.KR/IDENTITY-LOCKR.JS",
+    "owner": "lockr"
+  },
+  {
+    "name": "Lockr HTTP port",
+    "url": "http://identity.loc.kr:8080/identity-lockr.js",
+    "owner": "lockr"
+  },
+  {
+    "name": "Lockr ASCII whitespace",
+    "url": " \t\r\n\f\u000bhttps://aim.loc.kr/identity-lockr.js \t\r\n\f\u000b",
+    "owner": "lockr"
+  },
+  {
+    "name": "Lockr nested path family",
+    "url": "https://aim.loc.kr/sdk/identity-lockr-v3.js",
+    "owner": "lockr"
+  },
+  {
+    "name": "Permutive CDN SDK",
+    "url": "https://cdn.permutive.com/abc123-web.js",
+    "owner": "permutive"
+  },
+  {
+    "name": "Permutive edge SDK",
+    "url": "https://example.edge.permutive.app/workspace-web.js",
+    "owner": "permutive"
+  },
+  {
+    "name": "Permutive CDN query",
+    "url": "https://cdn.permutive.com/abc123-web.js?v=2",
+    "owner": "permutive"
+  },
+  {
+    "name": "Permutive edge query",
+    "url": "https://example.edge.permutive.app/workspace-web.js?v=2",
+    "owner": "permutive"
+  },
+  {
+    "name": "Permutive CDN fragment",
+    "url": "https://cdn.permutive.com/abc123-web.js#sdk",
+    "owner": "permutive"
+  },
+  {
+    "name": "Permutive edge fragment",
+    "url": "https://example.edge.permutive.app/workspace-web.js#sdk",
+    "owner": "permutive"
+  },
+  {
+    "name": "Permutive protocol relative",
+    "url": "//cdn.permutive.com/abc123-web.js?v=2#sdk",
+    "owner": "permutive"
+  },
+  {
+    "name": "Permutive edge protocol relative",
+    "url": "//example.edge.permutive.app/workspace-web.js",
+    "owner": "permutive"
+  },
+  {
+    "name": "Permutive uppercase",
+    "url": "HTTPS://EXAMPLE.EDGE.PERMUTIVE.APP/ABC-WEB.JS",
+    "owner": "permutive"
+  },
+  {
+    "name": "Permutive HTTP port",
+    "url": "http://cdn.permutive.com:8080/abc123-web.js",
+    "owner": "permutive"
+  },
+  {
+    "name": "Permutive ASCII whitespace",
+    "url": " \t\r\n\f\u000b//cdn.permutive.com/abc123-web.js \t\r\n\f\u000b",
+    "owner": "permutive"
+  },
+  {
+    "name": "GPT canonical",
+    "url": "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
+    "owner": "gpt"
+  },
+  {
+    "name": "GTM canonical",
+    "url": "https://www.googletagmanager.com/gtm.js?id=GTM-TEST",
+    "owner": "google_tag_manager"
+  },
+  {
+    "name": "DataDome canonical",
+    "url": "https://js.datadome.co/tags.js",
+    "owner": "datadome"
+  },
+  {
+    "name": "Sourcepoint canonical",
+    "url": "https://cdn.privacy-mgmt.com/unified/wrapperMessagingWithoutDetection.js",
+    "owner": "sourcepoint"
+  },
+  {
+    "name": "GPT query mentions Lockr",
+    "url": "https://securepubads.g.doubleclick.net/tag/js/gpt.js?ref=aim.loc.kr",
+    "owner": "gpt"
+  },
+  {
+    "name": "GTM query mentions Lockr",
+    "url": "https://www.googletagmanager.com/gtm.js?id=GTM-TEST&ref=aim.loc.kr",
+    "owner": "google_tag_manager"
+  },
+  {
+    "name": "DataDome query mentions Lockr",
+    "url": "https://js.datadome.co/tags.js?ref=aim.loc.kr",
+    "owner": "datadome"
+  },
+  {
+    "name": "Sourcepoint query mentions Lockr",
+    "url": "https://cdn.privacy-mgmt.com/wrapper.js?ref=aim.loc.kr",
+    "owner": "sourcepoint"
+  },
+  {
+    "name": "GPT path mentions Permutive",
+    "url": "https://securepubads.g.doubleclick.net/cdn.permutive.com/app-web.js",
+    "owner": "gpt"
+  },
+  {
+    "name": "GTM query mentions Permutive",
+    "url": "https://www.googletagmanager.com/gtm.js?id=GTM-TEST&ref=cdn.permutive.com/app-web.js",
+    "owner": "google_tag_manager"
+  },
+  {
+    "name": "DataDome path mentions Permutive",
+    "url": "https://js.datadome.co/cdn.permutive.com/app-web.js",
+    "owner": "datadome"
+  },
+  {
+    "name": "Sourcepoint path mentions Permutive",
+    "url": "https://cdn.privacy-mgmt.com/cdn.permutive.com/app-web.js",
+    "owner": "sourcepoint"
+  },
+  {
+    "name": "loader query mentions Lockr",
+    "url": "https://ads.example.com/loader.js?page=https%3A%2F%2Fpublisher.example.com%2F%3Futm_source%3Daim.loc.kr",
+    "owner": null
+  },
+  {
+    "name": "Lockr prefix host",
+    "url": "https://aim.loc.kr.example.com/loader.js",
+    "owner": null
+  },
+  {
+    "name": "Lockr SDK prefix host",
+    "url": "https://aim.loc.kr.example.com/identity-lockr.js",
+    "owner": null
+  },
+  {
+    "name": "Lockr identity lookalike",
+    "url": "https://identity.loc.kr.example.com/identity-lockr.js",
+    "owner": null
+  },
+  {
+    "name": "Lockr host substring",
+    "url": "https://notaim.loc.kr.example.com/identity-lockr.js",
+    "owner": null
+  },
+  {
+    "name": "Lockr host in path",
+    "url": "https://static.example.com/aim.loc.kr/identity-lockr.js",
+    "owner": null
+  },
+  {
+    "name": "Lockr host in query",
+    "url": "https://static.example.com/identity-lockr.js?ref=aim.loc.kr",
+    "owner": null
+  },
+  {
+    "name": "Lockr other script",
+    "url": "https://aim.loc.kr/some-other-script.js",
+    "owner": null
+  },
+  {
+    "name": "Lockr other identity script",
+    "url": "https://identity.loc.kr/some-other-script.js",
+    "owner": null
+  },
+  {
+    "name": "Lockr wrong extension",
+    "url": "https://aim.loc.kr/identity-lockr.css",
+    "owner": null
+  },
+  {
+    "name": "Lockr query spoofs extension",
+    "url": "https://identity.loc.kr/identity-lockr.css?fake=.js",
+    "owner": null
+  },
+  {
+    "name": "Lockr query spoofs SDK name",
+    "url": "https://identity.loc.kr/loader.js?file=identity-lockr.js",
+    "owner": null
+  },
+  {
+    "name": "Lockr trailing path",
+    "url": "https://aim.loc.kr/identity-lockr.js/other",
+    "owner": null
+  },
+  {
+    "name": "Lockr userinfo lookalike",
+    "url": "https://aim.loc.kr@static.example.com/identity-lockr.js",
+    "owner": null
+  },
+  {
+    "name": "Lockr trailing dot",
+    "url": "https://aim.loc.kr./identity-lockr.js",
+    "owner": null
+  },
+  {
+    "name": "Lockr encoded SDK path",
+    "url": "https://aim.loc.kr/%69dentity-lockr.js",
+    "owner": null
+  },
+  {
+    "name": "Lockr encoded extension",
+    "url": "https://aim.loc.kr/identity-lockr%2ejs",
+    "owner": null
+  },
+  {
+    "name": "Permutive prefix host",
+    "url": "https://cdn.permutive.com.example.com/abc123-web.js",
+    "owner": null
+  },
+  {
+    "name": "Permutive host substring",
+    "url": "https://notcdn.permutive.com.example.com/abc123-web.js",
+    "owner": null
+  },
+  {
+    "name": "Permutive host in path",
+    "url": "https://static.example.com/mirror/cdn.permutive.com/app-web.js",
+    "owner": null
+  },
+  {
+    "name": "Permutive edge lookalike",
+    "url": "https://example.edge.permutive.app.example.com/app-web.js",
+    "owner": null
+  },
+  {
+    "name": "Permutive edge in path",
+    "url": "https://static.example.com/example.edge.permutive.app/app-web.js",
+    "owner": null
+  },
+  {
+    "name": "Permutive bare edge host",
+    "url": "https://edge.permutive.app/abc123-web.js",
+    "owner": null
+  },
+  {
+    "name": "Permutive empty edge subdomain",
+    "url": "https://.edge.permutive.app/abc123-web.js",
+    "owner": null
+  },
+  {
+    "name": "Permutive other script",
+    "url": "https://cdn.permutive.com/other.js",
+    "owner": null
+  },
+  {
+    "name": "Permutive edge other script",
+    "url": "https://example.edge.permutive.app/other.js",
+    "owner": null
+  },
+  {
+    "name": "Permutive query spoofs extension",
+    "url": "https://cdn.permutive.com/other.js?fake=-web.js",
+    "owner": null
+  },
+  {
+    "name": "Permutive userinfo lookalike",
+    "url": "https://cdn.permutive.com@static.example.com/app-web.js",
+    "owner": null
+  },
+  {
+    "name": "Permutive trailing dot",
+    "url": "https://cdn.permutive.com./app-web.js",
+    "owner": null
+  },
+  {
+    "name": "Permutive encoded extension",
+    "url": "https://cdn.permutive.com/app-web%2ejs",
+    "owner": null
+  },
+  {
+    "name": "already proxied GPT",
+    "url": "http://localhost:3000/integrations/gpt/tag/js/gpt.js?ref=aim.loc.kr",
+    "owner": null
+  },
+  {
+    "name": "relative proxied GPT",
+    "url": "/integrations/gpt/tag/js/gpt.js?ref=cdn.permutive.com/app-web.js",
+    "owner": null
+  },
+  {
+    "name": "relative path mentions Lockr",
+    "url": "/aim.loc.kr/identity-lockr.js",
+    "owner": null
+  },
+  {
+    "name": "relative SDK path",
+    "url": "identity-lockr.js",
+    "owner": null
+  },
+  {
+    "name": "bare Lockr hostname",
+    "url": "aim.loc.kr/identity-lockr.js",
+    "owner": null
+  },
+  {
+    "name": "bare Permutive hostname",
+    "url": "cdn.permutive.com/app-web.js",
+    "owner": null
+  },
+  {
+    "name": "empty input",
+    "url": "",
+    "owner": null
+  },
+  {
+    "name": "malformed Lockr authority",
+    "url": "https://[aim.loc.kr/identity-lockr.js",
+    "owner": null
+  },
+  {
+    "name": "malformed Permutive authority",
+    "url": "https://[cdn.permutive.com/app-web.js",
+    "owner": null
+  },
+  {
+    "name": "malformed URL",
+    "url": "https://[",
+    "owner": null
+  },
+  {
+    "name": "Lockr non-network scheme",
+    "url": "ftp://aim.loc.kr/identity-lockr.js",
+    "owner": null
+  },
+  {
+    "name": "Permutive non-network scheme",
+    "url": "ftp://cdn.permutive.com/app-web.js",
+    "owner": null
+  },
+  {
+    "name": "embedded URL in data",
+    "url": "data:text/plain,https://aim.loc.kr/identity-lockr.js",
+    "owner": null
+  },
+  {
+    "name": "Lockr shorthand scheme",
+    "url": "https:aim.loc.kr/identity-lockr.js",
+    "owner": null,
+    "insertionOwner": "lockr"
+  },
+  {
+    "name": "Permutive shorthand scheme",
+    "url": "https:/cdn.permutive.com/app-web.js",
+    "owner": null,
+    "insertionOwner": "permutive"
+  },
+  {
+    "name": "Lockr BOM whitespace",
+    "url": "\ufeffhttps://aim.loc.kr/identity-lockr.js",
+    "owner": null
+  },
+  {
+    "name": "Permutive NEL whitespace",
+    "url": "\u0085https://cdn.permutive.com/app-web.js",
+    "owner": null
+  },
+  {
+    "name": "unrelated script",
+    "url": "https://static.example.com/loader.js",
+    "owner": null
+  },
+  {
+    "name": "Lockr leading C0 controls",
+    "url": "\u0001\u001fhttps://aim.loc.kr/identity-lockr.js",
+    "owner": "lockr"
+  },
+  {
+    "name": "Permutive leading C0 controls",
+    "url": "\u0001\u001fhttps://cdn.permutive.com/app-web.js",
+    "owner": "permutive"
+  },
+  {
+    "name": "Lockr trailing C0 controls",
+    "url": "https://aim.loc.kr/identity-lockr.js\u0001\u001f",
+    "owner": "lockr"
+  },
+  {
+    "name": "Permutive trailing C0 controls",
+    "url": "https://cdn.permutive.com/app-web.js\u0001\u001f",
+    "owner": "permutive"
+  },
+  {
+    "name": "Lockr tabs in scheme",
+    "url": "ht\ttps://aim.loc.kr/identity-lockr.js",
+    "owner": "lockr"
+  },
+  {
+    "name": "Permutive newline in scheme",
+    "url": "ht\ntps://cdn.permutive.com/app-web.js",
+    "owner": "permutive"
+  },
+  {
+    "name": "Permutive CR in scheme",
+    "url": "ht\rtps://cdn.permutive.com/app-web.js",
+    "owner": "permutive"
+  },
+  {
+    "name": "Lockr CR between slashes",
+    "url": "https:/\r/aim.loc.kr/identity-lockr.js",
+    "owner": "lockr"
+  },
+  {
+    "name": "Permutive tab between slashes",
+    "url": "https:/\t/cdn.permutive.com/app-web.js",
+    "owner": "permutive"
+  },
+  {
+    "name": "Lockr newline after hostname",
+    "url": "https://aim.loc.kr\n/identity-lockr.js",
+    "owner": "lockr"
+  },
+  {
+    "name": "Permutive CR in pathname",
+    "url": "https://cdn.permutive.com/app-\rweb.js",
+    "owner": "permutive"
+  },
+  {
+    "name": "Lockr backslash authority",
+    "url": "https:\\\\aim.loc.kr/identity-lockr.js",
+    "owner": "lockr"
+  },
+  {
+    "name": "Permutive mixed slash authority",
+    "url": "https:/\\cdn.permutive.com/app-web.js",
+    "owner": "permutive"
+  },
+  {
+    "name": "Lockr backslash protocol relative",
+    "url": "\\\\aim.loc.kr/identity-lockr.js",
+    "owner": "lockr"
+  },
+  {
+    "name": "Permutive mixed protocol relative",
+    "url": "\\/cdn.permutive.com/app-web.js",
+    "owner": "permutive"
+  },
+  {
+    "name": "Lockr normalized userinfo lookalike",
+    "url": "ht\ttps:/\\aim.loc.kr@static.example.com/identity-lockr.js",
+    "owner": null
+  },
+  {
+    "name": "Permutive normalized lookalike",
+    "url": "ht\ntps:\\\\cdn.permutive.com.example.com/app-web.js",
+    "owner": null
+  },
+  {
+    "name": "Lockr normalized host in path",
+    "url": "ht\ttps:/\\static.example.com/aim.loc.kr/identity-lockr.js",
+    "owner": null
+  },
+  {
+    "name": "Permutive normalized host in query",
+    "url": "ht\ttps:/\\static.example.com/app-web.js?ref=cdn.permutive.com",
+    "owner": null
+  },
+  {
+    "name": "Lockr internal C0 control",
+    "url": "htt\u0001ps://aim.loc.kr/identity-lockr.js",
+    "owner": null
+  },
+  {
+    "name": "Permutive internal C0 control",
+    "url": "https://cdn.permutive.com\u001f/app-web.js",
+    "owner": null
+  },
+  {
+    "name": "Lockr leading NUL differs in HTML and URL properties",
+    "url": "\u0000https://aim.loc.kr/identity-lockr.js",
+    "owner": null,
+    "insertionOwner": "lockr"
+  },
+  {
+    "name": "Permutive trailing NUL differs in HTML and URL properties",
+    "url": "https://cdn.permutive.com/app-web.js\u0000",
+    "owner": null,
+    "insertionOwner": "permutive"
+  }
+]

@@ -15,6 +15,7 @@ use validator::Validate;
 
 use crate::constants::INTERNAL_HEADERS;
 use crate::error::TrustedServerError;
+use crate::integrations::sdk_url::parse_sdk_network_url;
 use crate::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
@@ -99,9 +100,17 @@ impl PermutiveIntegration {
 
     /// Check if a URL is a Permutive SDK URL.
     fn is_permutive_sdk_url(&self, url: &str) -> bool {
-        let lower = url.to_ascii_lowercase();
-        (lower.contains(".edge.permutive.app") || lower.contains("cdn.permutive.com"))
-            && lower.ends_with("-web.js")
+        // Keep browser/Rust cases in crates/trusted-server-js/lib/test/fixtures/sdk-url-ownership.json aligned.
+        let Some(parsed) = parse_sdk_network_url(url) else {
+            return false;
+        };
+        let host = parsed.host_str().unwrap_or_default();
+        let path = parsed.path().to_ascii_lowercase();
+        (host == "cdn.permutive.com"
+            || host
+                .strip_suffix(".edge.permutive.app")
+                .is_some_and(|subdomain| !subdomain.is_empty()))
+            && path.ends_with("-web.js")
     }
 
     /// Handle SDK serving - fetch from Permutive CDN and serve through first-party domain.
@@ -474,8 +483,45 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::integrations::sdk_url_test_support::{
+        assert_sdk_html_attribute_rewrite, assert_sdk_url_rewrite, sdk_url_cases,
+    };
     use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::test_support::tests::create_test_settings;
+
+    #[test]
+    fn sdk_url_ownership_matches_shared_corpus() {
+        let integration = PermutiveIntegration::new(PermutiveConfig {
+            enabled: true,
+            organization_id: "example".to_string(),
+            workspace_id: "workspace".to_string(),
+            project_id: String::new(),
+            api_endpoint: default_api_endpoint(),
+            secure_signals_endpoint: default_secure_signals_endpoint(),
+            cache_ttl_seconds: 3600,
+            rewrite_sdk: true,
+        });
+
+        for case in sdk_url_cases() {
+            let matches = case.owner.as_deref() == Some(PERMUTIVE_INTEGRATION_ID);
+            assert_eq!(
+                integration.is_permutive_sdk_url(&case.url),
+                matches,
+                "should match expected permutive ownership for {}: {}",
+                case.name,
+                case.url
+            );
+
+            assert_sdk_url_rewrite(integration.as_ref(), &case, "/integrations/permutive/sdk");
+            if matches {
+                assert_sdk_html_attribute_rewrite(
+                    integration.as_ref(),
+                    &case,
+                    "/integrations/permutive/sdk",
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_permutive_sdk_url_generation() {

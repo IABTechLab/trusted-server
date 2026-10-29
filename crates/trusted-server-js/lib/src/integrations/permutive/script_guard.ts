@@ -1,16 +1,20 @@
 import { createScriptGuard } from '../../shared/script_guard';
+import { parseSdkNetworkUrl } from '../../shared/sdk_url';
 
 /**
  * Check if a URL is a Permutive SDK URL.
- * Matches the logic from permutive.rs:97-101
+ * Browser/Rust ownership cases live in test/fixtures/sdk-url-ownership.json.
  */
 function isPermutiveSdkUrl(url: string): boolean {
-  if (!url) return false;
+  const parsed = parseSdkNetworkUrl(url);
+  if (!parsed) return false;
 
-  const lower = url.toLowerCase();
+  const host = parsed.hostname;
+  const edgeSuffix = '.edge.permutive.app';
   return (
-    (lower.includes('.edge.permutive.app') || lower.includes('cdn.permutive.com')) &&
-    lower.endsWith('-web.js')
+    (host === 'cdn.permutive.com' ||
+      (host.endsWith(edgeSuffix) && host.length > edgeSuffix.length)) &&
+    parsed.pathname.toLowerCase().endsWith('-web.js')
   );
 }
 

@@ -19,6 +19,7 @@ use validator::Validate;
 
 use crate::constants::INTERNAL_HEADERS;
 use crate::error::TrustedServerError;
+use crate::integrations::sdk_url::parse_sdk_network_url;
 use crate::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
@@ -98,10 +99,15 @@ impl LockrIntegration {
 
     /// Check if a URL is a Lockr SDK URL.
     fn is_lockr_sdk_url(&self, url: &str) -> bool {
-        let lower = url.to_ascii_lowercase();
-        (lower.contains("aim.loc.kr") || lower.contains("identity.loc.kr"))
-            && lower.contains("identity-lockr")
-            && lower.ends_with(".js")
+        // Keep browser/Rust cases in crates/trusted-server-js/lib/test/fixtures/sdk-url-ownership.json aligned.
+        let Some(parsed) = parse_sdk_network_url(url) else {
+            return false;
+        };
+        let host = parsed.host_str().unwrap_or_default();
+        let path = parsed.path().to_ascii_lowercase();
+        matches!(host, "aim.loc.kr" | "identity.loc.kr")
+            && path.contains("identity-lockr")
+            && path.ends_with(".js")
     }
 
     /// Handle SDK serving — fetch from Lockr CDN and serve through first-party domain.
@@ -437,6 +443,9 @@ mod tests {
     use edgezero_core::http::Method as HttpMethod;
     use serde_json::json;
 
+    use crate::integrations::sdk_url_test_support::{
+        assert_sdk_html_attribute_rewrite, assert_sdk_url_rewrite, sdk_url_cases,
+    };
     use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::test_support::tests::create_test_settings;
 
@@ -464,6 +473,31 @@ mod tests {
     }
 
     #[test]
+    fn sdk_url_ownership_matches_shared_corpus() {
+        let integration = LockrIntegration::new(test_config());
+
+        for case in sdk_url_cases() {
+            let matches = case.owner.as_deref() == Some(LOCKR_INTEGRATION_ID);
+            assert_eq!(
+                integration.is_lockr_sdk_url(&case.url),
+                matches,
+                "should match expected lockr ownership for {}: {}",
+                case.name,
+                case.url
+            );
+
+            assert_sdk_url_rewrite(integration.as_ref(), &case, "/integrations/lockr/sdk");
+            if matches {
+                assert_sdk_html_attribute_rewrite(
+                    integration.as_ref(),
+                    &case,
+                    "/integrations/lockr/sdk",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_lockr_sdk_url_detection() {
         let integration = LockrIntegration::new(test_config());
 
@@ -471,6 +505,16 @@ mod tests {
         assert!(integration.is_lockr_sdk_url("https://aim.loc.kr/identity-lockr-v1.0.js"));
         assert!(integration.is_lockr_sdk_url("https://aim.loc.kr/identity-lockr-trust-server.js"));
         assert!(integration.is_lockr_sdk_url("https://identity.loc.kr/identity-lockr-v2.0.js"));
+
+        // Hosts that only end with a Lockr SDK host are different hosts.
+        assert!(
+            !integration.is_lockr_sdk_url("https://notaim.loc.kr/identity-lockr.js"), // allow-domain: notaim.loc.kr
+            "should require an exact aim.loc.kr hostname"
+        );
+        assert!(
+            !integration.is_lockr_sdk_url("https://notidentity.loc.kr/identity-lockr.js"), // allow-domain: notidentity.loc.kr
+            "should require an exact identity.loc.kr hostname"
+        );
 
         // Should not match non-SDK resources on Lockr domains
         assert!(
