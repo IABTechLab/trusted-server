@@ -9,7 +9,7 @@
 
 use trusted_server_core::config::TrustedServerAppConfig;
 
-use crate::error::{CliResult, cli_error};
+use crate::error::{CliResult, cli_error, toml_error_location};
 
 /// Validates the candidate config text the generator is about to persist.
 ///
@@ -49,14 +49,14 @@ pub(super) fn check_candidate(candidate: &str, baseline: &str) -> CliResult<Vec<
 
 /// Validates one source config without echoing config values.
 ///
-/// Parse and schema errors report only a byte offset. Deploy validation errors
+/// Parse and schema errors report only a line and column. Deploy validation errors
 /// report only the failed phase because their messages can contain literal
 /// values, including validator parameters and invalid patterns.
 fn validate_source_config(source: &str) -> CliResult<()> {
     let config: TrustedServerAppConfig = toml::from_str(source).map_err(|error| {
-        error.span().map_or_else(
-            || "config could not be loaded".to_string(),
-            |span| format!("config could not be loaded at byte offset {}", span.start),
+        format!(
+            "config could not be loaded{}",
+            toml_error_location(source, error.span())
         )
     })?;
     TrustedServerAppConfig::new(config.into_settings())
@@ -93,10 +93,7 @@ mod tests {
             error.contains("refusing to write"),
             "should explain refusal"
         );
-        assert!(
-            error.contains("byte offset"),
-            "should retain parser location"
-        );
+        assert!(error.contains("at line "), "should retain parser location");
     }
 
     #[test]
@@ -111,7 +108,7 @@ mod tests {
             "should not disclose source bytes"
         );
         assert!(
-            warnings[0].contains("byte offset"),
+            warnings[0].contains("at line "),
             "should retain parser location"
         );
     }
@@ -158,7 +155,7 @@ mod tests {
             "should cover schema as well as syntax errors"
         );
         assert!(
-            error.contains("byte offset"),
+            error.contains("at line "),
             "should keep the parser location"
         );
     }
