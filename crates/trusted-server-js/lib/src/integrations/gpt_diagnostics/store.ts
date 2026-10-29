@@ -16,6 +16,7 @@ import type {
   GptDiagnosticsTrustedServerOpportunity,
   Size,
 } from '../../core/types';
+import { GPT_DIAGNOSTICS_CREATIVE_FAILURES } from '../../core/types';
 
 export const MAX_DIAGNOSTIC_SLOTS = 64;
 export const MAX_REQUEST_CYCLES_PER_SLOT = 10;
@@ -165,13 +166,10 @@ function isTrustedServerOpportunity(
   );
 }
 
+const CREATIVE_FAILURES: ReadonlySet<string> = new Set(GPT_DIAGNOSTICS_CREATIVE_FAILURES);
+
 function isCreativeFailure(reason: unknown): reason is GptDiagnosticsCreativeFailure {
-  return (
-    reason === 'missing_render_source' ||
-    reason === 'cache_fetch_failed' ||
-    reason === 'invalid_cache_payload' ||
-    reason === 'response_post_failed'
-  );
+  return typeof reason === 'string' && CREATIVE_FAILURES.has(reason);
 }
 
 function validDuration(start: number | undefined, end: number | undefined): number | undefined {

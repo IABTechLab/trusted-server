@@ -78,42 +78,54 @@ const APS_RENDERER_DOCUMENT: &str = r#"<!doctype html>
 var match=/^#tsaps=([A-Za-z0-9_-]{22,128})$/.exec(location.hash);
 var expected=match&&match[1];
 try{history.replaceState(null,'',location.pathname+location.search);}catch(_error){}
-if(!expected)return;
+var reported=false;
+function report(reason,nonce){
+ if(reported)return;
+ reported=true;
+ try{parent.postMessage({message:'trusted-server/aps/renderer-failed',nonce:nonce,reason:reason},'*');}catch(_error){}
+}
+if(!expected){report('bad_hash');return;}
 function keys(value,expectedKeys){
  if(!value||typeof value!=='object'||Array.isArray(value))return false;
  var actual=Object.keys(value).sort();
  return actual.length===expectedKeys.length&&actual.every(function(key,index){return key===expectedKeys[index];});
 }
-function validRenderer(renderer){
+function rendererProblem(renderer){
  if(!keys(renderer,['aaxResponse','accountId','bidId','creativeId','creativeUrl','height','tagType','type','version','width'])&&
-    !keys(renderer,['aaxResponse','accountId','bidId','creativeUrl','height','tagType','type','version','width']))return false;
- if(renderer.type!=='aps'||renderer.version!==1||typeof renderer.accountId!=='string'||!renderer.accountId||new TextEncoder().encode(renderer.accountId).length>1024)return false;
- if(typeof renderer.bidId!=='string'||!renderer.bidId||!Number.isInteger(renderer.width)||renderer.width<=0||!Number.isInteger(renderer.height)||renderer.height<=0)return false;
- if(Object.prototype.hasOwnProperty.call(renderer,'creativeId')&&(typeof renderer.creativeId!=='string'||!renderer.creativeId||new TextEncoder().encode(renderer.creativeId).length>1024))return false;
- if(renderer.tagType!=='iframe'&&renderer.tagType!=='script')return false;
- if(typeof renderer.creativeUrl!=='string'||new TextEncoder().encode(renderer.creativeUrl).length>4096)return false;
- if(typeof renderer.aaxResponse!=='string'||!renderer.aaxResponse||renderer.aaxResponse.length>349528)return false;
+    !keys(renderer,['aaxResponse','accountId','bidId','creativeUrl','height','tagType','type','version','width']))return 'descriptor_keys';
+ if(renderer.type!=='aps'||renderer.version!==1||typeof renderer.accountId!=='string'||!renderer.accountId||new TextEncoder().encode(renderer.accountId).length>1024)return 'descriptor_fields';
+ if(typeof renderer.bidId!=='string'||!renderer.bidId||!Number.isInteger(renderer.width)||renderer.width<=0||!Number.isInteger(renderer.height)||renderer.height<=0)return 'descriptor_fields';
+ if(Object.prototype.hasOwnProperty.call(renderer,'creativeId')&&(typeof renderer.creativeId!=='string'||!renderer.creativeId||new TextEncoder().encode(renderer.creativeId).length>1024))return 'descriptor_fields';
+ if(renderer.tagType!=='iframe'&&renderer.tagType!=='script')return 'descriptor_fields';
+ if(typeof renderer.creativeUrl!=='string'||new TextEncoder().encode(renderer.creativeUrl).length>4096)return 'descriptor_fields';
+ if(typeof renderer.aaxResponse!=='string'||!renderer.aaxResponse||renderer.aaxResponse.length>349528)return 'descriptor_fields';
  try{
   var url=new URL(renderer.creativeUrl);
-  if(url.protocol!=='https:'||url.username||url.password)return false;
+  if(url.protocol!=='https:'||url.username||url.password)return 'descriptor_envelope';
   var binary=atob(renderer.aaxResponse);
-  if(binary.length>262144||btoa(binary)!==renderer.aaxResponse)return false;
+  if(binary.length>262144||btoa(binary)!==renderer.aaxResponse)return 'descriptor_envelope';
   var bytes=Uint8Array.from(binary,function(character){return character.charCodeAt(0);});
   var decoded=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));
-  if(!keys(decoded,['seatbid'])||!Array.isArray(decoded.seatbid)||decoded.seatbid.length!==1)return false;
+  if(!keys(decoded,['seatbid'])||!Array.isArray(decoded.seatbid)||decoded.seatbid.length!==1)return 'descriptor_envelope';
   var seat=decoded.seatbid[0];
-  if(!keys(seat,['bid'])||!Array.isArray(seat.bid)||seat.bid.length!==1)return false;
+  if(!keys(seat,['bid'])||!Array.isArray(seat.bid)||seat.bid.length!==1)return 'descriptor_envelope';
   var bid=seat.bid[0];
-  if(!keys(bid,['ext','h','id','price','w'])||!keys(bid.ext,['creativeurl','tagtype']))return false;
-  return bid.id===renderer.bidId&&bid.w===renderer.width&&bid.h===renderer.height&&
+  if(!keys(bid,['ext','h','id','price','w'])||!keys(bid.ext,['creativeurl','tagtype']))return 'descriptor_envelope';
+  if(bid.id===renderer.bidId&&bid.w===renderer.width&&bid.h===renderer.height&&
    bid.ext.creativeurl===renderer.creativeUrl&&bid.ext.tagtype===renderer.tagType&&
-   typeof bid.price==='number'&&Number.isFinite(bid.price)&&bid.price>=0;
- }catch(_error){return false;}
+   typeof bid.price==='number'&&Number.isFinite(bid.price)&&bid.price>=0)return undefined;
+  return 'descriptor_envelope';
+ }catch(_error){return 'descriptor_envelope';}
 }
 function receive(event){
+ // The source check stays first: a frame that cannot be reached by an
+ // unrelated sender cannot have its single report consumed by one either.
  if(event.source!==parent)return;
  var message=event.data;
- if(!keys(message,['nonce','renderer'])||message.nonce!==expected||!validRenderer(message.renderer))return;
+ if(!keys(message,['nonce','renderer']))return;
+ if(message.nonce!==expected){report('nonce_mismatch',expected);return;}
+ var problem=rendererProblem(message.renderer);
+ if(problem){report(problem,message.nonce);return;}
  removeEventListener('message',receive);
  var acceptedNonce=expected;
  expected='';
@@ -128,7 +140,7 @@ function receive(event){
  var script=document.createElement('script');
  script.src='https://client.aps.amazon-adsystem.com/prebid-creative.js';
  script.onload=function(){parent.postMessage({message:'trusted-server/aps/renderer-ready',nonce:acceptedNonce},'*');};
- script.onerror=function(){parent.postMessage({message:'trusted-server/aps/renderer-failed',nonce:acceptedNonce},'*');};
+ script.onerror=function(){report('amazon_script_error',acceptedNonce);};
  document.head.appendChild(script);
 }
 addEventListener('message',receive);
@@ -3307,5 +3319,53 @@ mod tests {
         assert!(APS_RENDERER_CSP.contains("default-src 'none'"));
         assert!(APS_RENDERER_CSP.contains("sandbox allow-forms"));
         assert!(!APS_RENDERER_CSP.contains("allow-same-origin"));
+    }
+
+    /// Guards the properties of the failure report that a substring check can
+    /// actually establish.
+    ///
+    /// The browser spec evaluates the document and asserts `bad_hash`,
+    /// `nonce_mismatch`, and `descriptor_keys`; `descriptor_fields`,
+    /// `descriptor_envelope`, and `amazon_script_error` are not executed
+    /// anywhere yet. The assertions kept here are the ones that stay meaningful
+    /// against a string: that a reason is a fixed category rather than
+    /// attacker-influenced content, that reporting is one-shot, and that the
+    /// frame never answers the sender.
+    #[test]
+    fn renderer_document_reports_a_fixed_reason_category() {
+        // A reason is a literal category, never a copy of the rejected input.
+        assert!(
+            !APS_RENDERER_DOCUMENT.contains("JSON.stringify(renderer)"),
+            "should never echo the rejected descriptor"
+        );
+        assert!(
+            !APS_RENDERER_DOCUMENT.contains("reason:message"),
+            "should never echo the received message as a reason"
+        );
+
+        // Reporting is one-shot, so a sender cannot flood the parent.
+        assert!(
+            APS_RENDERER_DOCUMENT.contains("if(reported)return"),
+            "should report at most one reason per frame"
+        );
+
+        // The report goes to the parent, never back to the sender.
+        assert!(
+            !APS_RENDERER_DOCUMENT.contains("event.source.postMessage"),
+            "should never answer the sender"
+        );
+
+        // A non-parent sender is still dropped before any reporting happens, so
+        // an unrelated window cannot consume the frame's single report.
+        let source_check = APS_RENDERER_DOCUMENT
+            .find("event.source!==parent")
+            .expect("should check the sender before handling a message");
+        let nonce_report = APS_RENDERER_DOCUMENT
+            .find("report('nonce_mismatch'")
+            .expect("should report a nonce mismatch");
+        assert!(
+            source_check < nonce_report,
+            "should check the sender before reporting anything"
+        );
     }
 }

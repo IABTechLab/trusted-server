@@ -17,7 +17,7 @@ use clap::{Args, Subcommand};
 use crate::app_config::AppConfigArgs;
 use crate::commands::audit::collector::{BrowserOpts, GenerateBrowserOpts};
 use crate::commands::audit::page::PageAuditArgs;
-use crate::error::{CliResult, cli_error};
+use crate::error::{CliResult, cli_error, toml_error_location};
 use crate::run::RunOutcome;
 
 /// Parses and validates an `http`/`https` URL, rejecting all other schemes.
@@ -427,10 +427,7 @@ fn creative_config(
     // Parser messages can quote literal secrets from the operator's config.
     // Keep the path and location, but never include the source or error text.
     let value = toml::from_str::<toml::Value>(document).map_err(|error| {
-        let location = error
-            .span()
-            .map(|span| format!(" at byte offset {}", span.start))
-            .unwrap_or_default();
+        let location = toml_error_location(document, error.span());
         format!(
             "failed to parse {}{location} before generating slots; fix the TOML syntax and re-run",
             path.display()
@@ -527,10 +524,7 @@ mod tests {
             error.contains("fix the TOML syntax and re-run"),
             "should retain repair guidance, got {error}"
         );
-        assert!(
-            error.contains("byte offset"),
-            "should retain parser location"
-        );
+        assert!(error.contains("at line "), "should retain parser location");
         assert!(!error.contains('\n'), "should not include a source excerpt");
     }
 
