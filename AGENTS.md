@@ -375,6 +375,7 @@ Every PR must pass:
 11. Documentation proposal scripts: `shellcheck scripts/docs-proposal/*.sh && node --test scripts/docs-proposal/hunks.test.mjs && scripts/docs-proposal/test.sh`
 12. URL-host linter on lines the PR adds (`lint-domains` job, PRs only); run it locally with `cargo run --manifest-path crates/trusted-server-cli/Cargo.toml --target <host-triple> --bin ts -- dev lint domains --changed-vs origin/main`, using the PR's base branch in place of `main` when it targets another branch
 13. CI Node pin guard: `node --test scripts/check-ci-node-pin.test.mjs && node scripts/check-ci-node-pin.mjs` with the `.tool-versions` Node (every CI job that compiles Rust sets up the `.tool-versions` Node before its first cargo step)
+14. Release producer checks: `node --test scripts/release/phase1.test.mjs && shellcheck scripts/release/phase1-build.sh`
 
 CI also runs these HTML EOF checks. Run them locally only when changing EOF
 finalization, publisher or HTML-processor code:

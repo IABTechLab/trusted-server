@@ -1,4 +1,5 @@
 use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
+use edgezero_core::addr::resolve_bind_addr;
 use edgezero_core::app::Hooks as _;
 use log::LevelFilter;
 use trusted_server_adapter_axum::app::TrustedServerApp;
@@ -26,15 +27,20 @@ fn main() {
         eprintln!("warning: logger init failed: {e}");
     }
 
-    let config = match port_from_env() {
-        // When PORT is set, bind to a specific address so integration tests
-        // can allocate a fresh OS port each run and avoid TIME_WAIT flakiness.
-        Some(port) => AxumDevServerConfig {
-            addr: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-            enable_ctrl_c: true,
-        },
-        // Normal development path: read bind address from axum.toml.
-        None => AxumDevServerConfig::default(),
+    // The default is loopback; runtime overrides are passed directly to EdgeZero.
+    let host = std::env::var_os("EDGEZERO__ADAPTER__HOST");
+    let port = std::env::var_os("PORT");
+    let adapter_port = std::env::var_os("EDGEZERO__ADAPTER__PORT");
+    let addr = parse_bind_address(host.as_deref(), port.as_deref(), adapter_port.as_deref())
+        .unwrap_or_else(|error| {
+            // Write directly so the refusal stays visible when `RUST_LOG=off`
+            // or logger initialization failed.
+            eprintln!("error: invalid runtime bind address: {error}");
+            std::process::exit(1);
+        });
+    let config = AxumDevServerConfig {
+        addr,
+        enable_ctrl_c: true,
     };
 
     log::info!("Listening on http://{}", config.addr);
@@ -65,26 +71,72 @@ fn parse_log_level(configured: Option<&str>) -> Result<LevelFilter, &str> {
     }
 }
 
-/// Read a port number from the `PORT` environment variable.
+/// Resolve runtime binding using `EdgeZero` without embedding deployment configuration.
 ///
-/// Returns `None` when the variable is unset. Exits non-zero if the value
-/// is set but cannot be parsed — silently falling back to a different port
-/// would surprise tooling that expects the server at the requested address.
-#[allow(clippy::print_stderr)]
-fn port_from_env() -> Option<u16> {
-    let raw = std::env::var("PORT").ok()?;
-    match raw.parse() {
-        Ok(port) => Some(port),
-        Err(e) => {
-            eprintln!("error: PORT env var '{raw}' is not a valid u16: {e}");
-            std::process::exit(1);
+/// `EDGEZERO__ADAPTER__PORT` is primary; legacy `PORT` must agree when both
+/// are set. Ports must be 1–65535; the default is loopback port 8787.
+///
+/// # Errors
+///
+/// Rejects non-Unicode values, conflicting ports and every `EdgeZero` resolver
+/// warning, including malformed addresses and port zero, rather than falling back.
+fn parse_bind_address(
+    host: Option<&std::ffi::OsStr>,
+    port: Option<&std::ffi::OsStr>,
+    adapter_port: Option<&std::ffi::OsStr>,
+) -> Result<std::net::SocketAddr, String> {
+    let [host, port, adapter_port] = [
+        ("EDGEZERO__ADAPTER__HOST", host),
+        ("PORT", port),
+        ("EDGEZERO__ADAPTER__PORT", adapter_port),
+    ]
+    .map(|(name, value)| {
+        value
+            .map(|value| {
+                value
+                    .to_str()
+                    .ok_or_else(|| format!("{name} must be Unicode; startup refused"))
+            })
+            .transpose()
+    });
+    let host = host?;
+    let port = port?;
+    let adapter_port = adapter_port?;
+    for (name, value) in [("PORT", port), ("EDGEZERO__ADAPTER__PORT", adapter_port)] {
+        if let Some(value) = value
+            && !resolve_bind_addr(None, Some(value), None, None)
+                .warnings
+                .is_empty()
+        {
+            return Err(format!(
+                "{name}={value:?} must be a port in 1–65535; startup refused"
+            ));
         }
     }
+    let primary = resolve_bind_addr(host, adapter_port.or(port), None, None);
+    if !primary.warnings.is_empty() {
+        return Err(format!(
+            "EDGEZERO__ADAPTER__HOST={:?} must be a valid IP address; startup refused",
+            host.unwrap_or_default()
+        ));
+    }
+    if let Some(port) = port {
+        let legacy = resolve_bind_addr(None, Some(port), None, None);
+        if legacy.addr.port() != primary.addr.port() {
+            return Err(
+                "PORT and EDGEZERO__ADAPTER__PORT must agree when both are set; startup refused"
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(primary.addr)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt as _;
 
     #[test]
     fn crate_compiles() {}
@@ -144,5 +196,174 @@ mod tests {
             Err("verbose"),
             "should reject an unknown level name and return it trimmed"
         );
+    }
+
+    #[test]
+    fn adapter_port_alias_is_validated_alongside_port() {
+        let port = std::ffi::OsStr::new("8080");
+        for (legacy, adapter) in [
+            (None, Some(port)),
+            (Some(port), None),
+            (Some(port), Some(port)),
+        ] {
+            assert_eq!(
+                parse_bind_address(None, legacy, adapter)
+                    .expect("should accept matching runtime ports")
+                    .port(),
+                8080,
+                "should resolve either runtime port name"
+            );
+        }
+        assert!(
+            parse_bind_address(None, Some(port), Some(std::ffi::OsStr::new("8081"))).is_err(),
+            "should reject conflicting port names"
+        );
+        for invalid in ["0", "", " ", " 80", "invalid", "65536"] {
+            let invalid = std::ffi::OsStr::new(invalid);
+            assert!(
+                parse_bind_address(None, Some(port), Some(invalid)).is_err(),
+                "should reject invalid adapter port even with valid PORT"
+            );
+            assert!(
+                parse_bind_address(None, Some(invalid), Some(port)).is_err(),
+                "should reject invalid PORT even with valid adapter port"
+            );
+        }
+        #[cfg(unix)]
+        assert!(
+            parse_bind_address(None, Some(port), Some(std::ffi::OsStr::from_bytes(b"\xff")))
+                .is_err(),
+            "should reject non-Unicode adapter port"
+        );
+    }
+
+    #[test]
+    fn bind_address_errors_identify_the_input_and_refuse_startup() {
+        for invalid in ["0", "invalid", "65536"] {
+            let invalid = std::ffi::OsStr::new(invalid);
+            let valid = std::ffi::OsStr::new("8080");
+            for (legacy, adapter, variable) in [
+                (Some(invalid), None, "PORT"),
+                (None, Some(invalid), "EDGEZERO__ADAPTER__PORT"),
+                (Some(invalid), Some(valid), "PORT"),
+                (Some(valid), Some(invalid), "EDGEZERO__ADAPTER__PORT"),
+            ] {
+                let error = parse_bind_address(None, legacy, adapter)
+                    .expect_err("should refuse invalid ports");
+                assert!(
+                    error.contains(&format!("{variable}=")),
+                    "should identify the invalid input: {error}"
+                );
+                if variable == "PORT" {
+                    assert!(
+                        !error.contains("EDGEZERO__ADAPTER__PORT"),
+                        "should not attribute legacy PORT to the adapter variable: {error}"
+                    );
+                }
+                assert!(
+                    error.contains("startup refused"),
+                    "should state refusal: {error}"
+                );
+                assert!(
+                    !error.contains("falling back"),
+                    "should not promise fallback: {error}"
+                );
+            }
+        }
+        let error = parse_bind_address(Some(std::ffi::OsStr::new("localhost")), None, None)
+            .expect_err("should refuse a hostname");
+        assert!(
+            error.contains("EDGEZERO__ADAPTER__HOST="),
+            "should identify the host input"
+        );
+        assert!(
+            error.contains("startup refused"),
+            "should state host refusal"
+        );
+        assert!(
+            !error.contains("falling back"),
+            "should not promise host fallback"
+        );
+    }
+
+    #[test]
+    fn bind_address_rejects_zero_and_accepts_port_boundaries() {
+        let zero = std::ffi::OsStr::new("0");
+        assert!(
+            parse_bind_address(None, Some(zero), None).is_err(),
+            "should reject legacy port zero"
+        );
+        assert!(
+            parse_bind_address(None, None, Some(zero)).is_err(),
+            "should reject primary port zero"
+        );
+        for value in ["1", "65535"] {
+            let port = std::ffi::OsStr::new(value);
+            assert!(
+                parse_bind_address(None, Some(port), Some(port)).is_ok(),
+                "should accept port bounds"
+            );
+        }
+    }
+
+    #[test]
+    fn bind_address_defaults_and_runtime_overrides() {
+        assert_eq!(
+            parse_bind_address(None, None, None).expect("should default"),
+            "127.0.0.1:8787".parse().expect("should parse fixture"),
+            "should retain loopback default"
+        );
+        assert_eq!(
+            parse_bind_address(
+                Some(std::ffi::OsStr::new("0.0.0.0")),
+                Some(std::ffi::OsStr::new("8080")),
+                None
+            )
+            .expect("should override")
+            .to_string(),
+            "0.0.0.0:8080",
+            "should bind all interfaces at runtime"
+        );
+        assert_eq!(
+            parse_bind_address(Some(std::ffi::OsStr::new("::1")), None, None)
+                .expect("should accept IPv6")
+                .to_string(),
+            "[::1]:8787",
+            "should accept IPv6"
+        );
+        assert_eq!(
+            parse_bind_address(None, Some(std::ffi::OsStr::new("9000")), None)
+                .expect("should preserve PORT")
+                .port(),
+            9000,
+            "should honor existing port setting"
+        );
+    }
+
+    #[test]
+    fn bind_address_rejects_invalid_explicit_values() {
+        for host in ["", "localhost", "0.0.0.0:8080", " 0.0.0.0"] {
+            assert!(
+                parse_bind_address(Some(std::ffi::OsStr::new(host)), None, None).is_err(),
+                "should reject invalid host"
+            );
+        }
+        for port in ["", "invalid", "65536", " 80"] {
+            assert!(
+                parse_bind_address(None, Some(std::ffi::OsStr::new(port)), None).is_err(),
+                "should reject invalid port"
+            );
+        }
+        #[cfg(unix)]
+        {
+            assert!(
+                parse_bind_address(Some(std::ffi::OsStr::from_bytes(b"\xff")), None, None).is_err(),
+                "should reject non-Unicode host"
+            );
+            assert!(
+                parse_bind_address(None, Some(std::ffi::OsStr::from_bytes(b"\xff")), None).is_err(),
+                "should reject non-Unicode port"
+            );
+        }
     }
 }

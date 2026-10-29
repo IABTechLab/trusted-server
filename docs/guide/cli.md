@@ -1,5 +1,7 @@
 # Trusted Server CLI
 
+Prebuilt release binaries must pass the [release verification procedure](/guide/release-verification) before execution or deployment. That guide lists the Linux/macOS baselines and the manual Fastly route that preserves verified wasm bytes.
+
 The Trusted Server CLI binary is `ts`. It is a host-target operator tool for
 configuration, page audits, and EdgeZero-backed lifecycle commands.
 
@@ -56,6 +58,13 @@ commands are shown explicitly.
 | `ts serve`                       | Linux + macOS | Serve the project locally through a target adapter                                               | `ts serve --adapter <ADAPTER>`                                                                                 |
 
 ## Install from source
+
+`cargo install-cli` builds `ts` from source. The resulting local binary is not
+covered by the release attestation. Operators who need an attested CLI should
+download the matching `ts-<target>` release asset, verify it with the documented
+`gh attestation verify` and `gh release verify-asset` commands in the
+[release verification guide](/guide/release-verification), and install that
+verified file.
 
 From the repository root, install the `ts` binary with the workspace Cargo alias:
 

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use edgezero_core::manifest::ManifestLoader;
-use git_version::{Candidates, is_usable, resolve_git_version};
+use git_version::{Candidates, is_usable, resolve_build_source, resolve_git_version};
 use sha2::{Digest as _, Sha256};
 
 /// Crate-relative build inputs that are both watched and hashed besides `src/`.
@@ -160,24 +160,29 @@ fn main() {
 fn emit_git_version() {
     println!("cargo:rerun-if-env-changed={OVERRIDE_ENV}");
 
-    let override_value = std::env::var(OVERRIDE_ENV).ok();
-    let resolved = match override_value.as_deref() {
-        Some(value) if is_usable(value) => resolve_git_version(&Candidates {
-            override_value: Some(value),
-            exact_tag: None,
-            branch: None,
-            commit: None,
-        }),
-        Some(value) => {
-            if !value.trim().is_empty() {
-                println!(
-                    "cargo:warning={OVERRIDE_ENV}={value:?} is not visible ASCII; \
-                     falling back to local git for x-ts-version"
-                );
-            }
-            resolve_from_local_git()
+    println!("cargo:rerun-if-env-changed=TRUSTED_SERVER__RELEASE_BUILD");
+    let control = env::var_os("TRUSTED_SERVER__RELEASE_BUILD");
+    let source = env::var_os(OVERRIDE_ENV);
+    if control.is_none()
+        && let Some(value) = source.as_deref().and_then(std::ffi::OsStr::to_str)
+        && !is_usable(value)
+        && !value.trim().is_empty()
+    {
+        println!(
+            "cargo:warning={OVERRIDE_ENV}={value:?} is not visible ASCII; \
+             falling back to local git for x-ts-version"
+        );
+    }
+    let resolved = match resolve_build_source(
+        control.as_deref(),
+        source.as_deref(),
+        resolve_from_local_git,
+    ) {
+        Ok(source) => source,
+        Err(message) => {
+            println!("cargo::error={message}");
+            std::process::exit(1);
         }
-        None => resolve_from_local_git(),
     };
 
     // Always emitted, even when empty, so the raw pipeline value never reaches

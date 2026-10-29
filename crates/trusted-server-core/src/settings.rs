@@ -32,10 +32,13 @@ pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
 pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
 /// Build inputs that share the settings prefix but are not settings.
 ///
-/// The core build script exports these with `cargo:rustc-env`, and Cargo sets
-/// them on every `cargo test` run of this crate.
+/// Cargo sets the source version through `cargo:rustc-env`; release controls
+/// may also be inherited by test processes. Neither is runtime configuration.
 #[cfg(test)]
-const BUILD_ENVIRONMENT_VARIABLES: [&str; 1] = ["TRUSTED_SERVER__GIT_VERSION"];
+const BUILD_ENVIRONMENT_VARIABLES: [&str; 2] = [
+    "TRUSTED_SERVER__GIT_VERSION",
+    "TRUSTED_SERVER__RELEASE_BUILD",
+];
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
@@ -6641,19 +6644,21 @@ source_domain = "partner.example.com"
     }
 
     #[test]
-    fn legacy_env_loader_ignores_build_time_git_version() {
+    fn legacy_env_loader_ignores_build_time_inputs() {
         let toml_str = crate_test_settings_str();
 
         for key in [
             "TRUSTED_SERVER__GIT_VERSION",
             "trusted_server__git_version",
             "Trusted_Server__Git_Version",
+            "TRUSTED_SERVER__RELEASE_BUILD",
+            "trusted_server__release_build",
+            "Trusted_Server__Release_Build",
         ] {
-            for value in ["v0.0.0-example", ""] {
+            for value in ["v0.0.0-example", "1", ""] {
                 temp_env::with_var(key, Some(value), || {
-                    Settings::from_toml_and_env(&toml_str).expect(
-                        "should ignore the build-time git version input regardless of case",
-                    );
+                    Settings::from_toml_and_env(&toml_str)
+                        .expect("should ignore build-time inputs regardless of case");
                 });
             }
         }

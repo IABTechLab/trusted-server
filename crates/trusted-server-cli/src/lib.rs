@@ -16,7 +16,7 @@ mod tls;
 mod url_guard;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use run::{RunOutcome, run_from_env};
+pub use run::{BUILD_INFO, RunOutcome, run_from_env};
 
 // Every `ts` subcommand's implementation lives under `commands/<name>`. The
 // `ts dev` group is available on every host target; `ts dev lint` and

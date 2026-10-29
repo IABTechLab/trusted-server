@@ -1,0 +1,291 @@
+name: Binary attestations
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - '.github/workflows/release*.yml'
+      - 'scripts/release/phase1*'
+      - 'scripts/release/release-cohort.json'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.tool-versions'
+      - '.cargo/**'
+      - 'edgezero.toml'
+      - 'crates/trusted-server-core/src/**'
+      - 'crates/trusted-server-core/build_support/**'
+      - 'crates/trusted-server-core/build.rs'
+      - 'crates/trusted-server-core/Cargo.toml'
+      - 'crates/trusted-server-cli/**'
+      - 'crates/trusted-server-js/**'
+      - 'crates/trusted-server-adapter-fastly/**'
+      - 'crates/trusted-server-adapter-axum/**'
+      - 'crates/trusted-server-openrtb*/**'
+permissions:
+  contents: read
+concurrency:
+  group: binary-attestations-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  build:
+    uses: ./.github/workflows/release-build.yml
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.RELEASE_PUBLICATION_ENABLED == 'true'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-trusted-server-fastly.wasm
+          path: build/trusted-server-fastly.wasm
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: signed-trusted-server-fastly.wasm
+          path: signed/trusted-server-fastly.wasm
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-ts-aarch64-apple-darwin
+          path: build/ts-aarch64-apple-darwin
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: signed-ts-aarch64-apple-darwin
+          path: signed/ts-aarch64-apple-darwin
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-ts-x86_64-apple-darwin
+          path: build/ts-x86_64-apple-darwin
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: signed-ts-x86_64-apple-darwin
+          path: signed/ts-x86_64-apple-darwin
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-ts-x86_64-unknown-linux-gnu
+          path: build/ts-x86_64-unknown-linux-gnu
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: signed-ts-x86_64-unknown-linux-gnu
+          path: signed/ts-x86_64-unknown-linux-gnu
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-trusted-server-axum-x86_64-unknown-linux-gnu
+          path: build/trusted-server-axum-x86_64-unknown-linux-gnu
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: signed-trusted-server-axum-x86_64-unknown-linux-gnu
+          path: signed/trusted-server-axum-x86_64-unknown-linux-gnu
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-trusted-server-axum-x86_64-unknown-linux-musl
+          path: build/trusted-server-axum-x86_64-unknown-linux-musl
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: signed-trusted-server-axum-x86_64-unknown-linux-musl
+          path: signed/trusted-server-axum-x86_64-unknown-linux-musl
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-trusted-server-axum-aarch64-unknown-linux-gnu
+          path: build/trusted-server-axum-aarch64-unknown-linux-gnu
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: signed-trusted-server-axum-aarch64-unknown-linux-gnu
+          path: signed/trusted-server-axum-aarch64-unknown-linux-gnu
+      - name: Verify handoff, create once, publish by release ID and verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          RELEASE_PUBLICATION_ENABLED: ${{ vars.RELEASE_PUBLICATION_ENABLED }}
+        run: |
+          set -euo pipefail
+          gh --version
+          node <<'NODE'
+          ;(async () => {
+          // BEGIN PUBLICATION
+          const fs = require('node:fs');
+          const { createHash } = require('node:crypto');
+          const { execFileSync } = require('node:child_process');
+          const { isDeepStrictEqual } = require('node:util');
+          const { GH_REPO: repo, RELEASE_TAG: tag, GH_TOKEN: token, SOURCE_COMMIT: source } = process.env;
+          if (!/^[\w-]+\/[\w.-]+$/.test(repo) || !/^v[\w.+-]+$/.test(tag)) throw Error('Invalid repository or tag');
+          if (process.env.RELEASE_PUBLICATION_ENABLED !== 'true') throw Error('Release publication is not enabled by maintainers');
+          const prerelease = tag.includes('-'), make_latest = prerelease ? 'false' : 'legacy';
+          const names = ['trusted-server-axum-x86_64-unknown-linux-gnu', 'trusted-server-axum-x86_64-unknown-linux-musl', 'trusted-server-axum-aarch64-unknown-linux-gnu', 'trusted-server-fastly.wasm', 'ts-aarch64-apple-darwin', 'ts-x86_64-apple-darwin', 'ts-x86_64-unknown-linux-gnu'];
+          const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+          const regular = path => { const stat = fs.lstatSync(path); if (!stat.isFile() || stat.size === 0) throw Error(`Invalid file: ${path}`); return fs.readFileSync(path); };
+          const exact = (dir, expected) => { if (JSON.stringify(fs.readdirSync(dir).sort()) !== JSON.stringify([...expected].sort())) throw Error(`Unexpected artifact contents: ${dir}`); };
+          fs.mkdirSync('release-assets');
+          const files = [];
+          for (const name of names) {
+            const build = `build/${name}`, signed = `signed/${name}`;
+            const inputs = [name, `${name}.spdx.json`], bundles = [`${name}.provenance.sigstore.json`, `${name}.sbom.sigstore.json`];
+            exact(build, inputs); exact(signed, [...bundles, 'SHA256SUMS']);
+            const receipt = [...inputs.map(file => [build, file]), ...bundles.map(file => [signed, file])].map(([dir, file]) => {
+              const bytes = regular(`${dir}/${file}`);
+              fs.writeFileSync(`release-assets/${file}`, bytes); files.push(file);
+              return `${hash(bytes)}  ${file}\n`;
+            }).join('');
+            if (regular(`${signed}/SHA256SUMS`).toString() !== receipt) throw Error('Signing handoff digest mismatch');
+          }
+          fs.writeFileSync('release-assets/SHA256SUMS', files.map(file => `${hash(regular(`release-assets/${file}`))}  ${file}\n`).join(''));
+          files.push('SHA256SUMS');
+          // Close API connections before synchronous gh checks can leave pooled sockets idle.
+          // Every read is time-bounded. Mutations are single-shot and rely on the job timeout:
+          // a client-side abort cannot cancel a create, upload or publish GitHub already accepted.
+          const api = async (path, method = 'GET', body, timeout = 10000) => {
+            const response = await fetch(`https://api.github.com/repos/${repo}/${path}`, {method, headers:{Connection:'close', Authorization:`Bearer ${token}`, Accept:'application/vnd.github+json', 'Content-Type':'application/json'}, ...(method === 'GET' ? {signal:AbortSignal.timeout(timeout)} : {}), ...(body ? {body:JSON.stringify(body)} : {})}); // allow-domain: api.github.com
+            if (!response.ok || path.startsWith('attestations/') && response.status !== 200) throw Object.assign(Error(`GitHub API failed: ${method} ${path} ${response.status}`), {status:response.status, retryAfter:response.headers.get('retry-after')});
+            return response.json();
+          };
+          // Phase 1 uses the commit digest for both provenance and release membership.
+          // Annotated tags have a distinct tag-object digest, so reject them before
+          // creating a draft or uploading/publishing any release assets.
+          const tagRef = await api(`git/ref/tags/${encodeURIComponent(tag)}`);
+          if (tagRef.object?.type !== 'commit' || tagRef.object.sha !== source) {
+            throw Error('Phase 1 requires a lightweight tag at SOURCE_COMMIT');
+          }
+          // List releases, including drafts. Never resume, overwrite or delete a matching tag.
+          for (let page = 1; ; page++) {
+            if (page > 1000) throw Error('Release listing exceeded bound');
+            const releases = await api(`releases?per_page=100&page=${page}`);
+            if (!Array.isArray(releases)) throw Error('Invalid release listing');
+            if (releases.some(release => release.tag_name === tag)) throw Error('Release or draft already exists');
+            if (releases.length < 100) break;
+          }
+          const body = [
+            `[Verification guide](https://github.com/${repo}/blob/${tag}/docs/guide/release-verification.md)`, '', '```bash', 'set -euo pipefail',
+            `REPO=${repo}`, `TAG=${tag}`, `COMMIT=${source}`, `ASSETS=(${names.join(' ')})`,
+            'gh release download "$TAG" --repo "$REPO" --dir .', 'test "$(gh api "repos/$REPO/releases/tags/$TAG" --jq .immutable)" = true', 'gh release verify "$TAG" --repo "$REPO"',
+            'for asset in "${ASSETS[@]}"; do',
+            '  for suffix in "" .spdx.json .provenance.sigstore.json .sbom.sigstore.json; do gh release verify-asset "$TAG" "$asset$suffix" --repo "$REPO"; done',
+            '  for kind in provenance sbom; do',
+            '    predicate=https://slsa.dev/provenance/v1; if [[ "$kind" == sbom ]]; then predicate=https://spdx.dev/Document/v2.3; fi',
+            '    checks=(--repo "$REPO" --bundle "$asset.$kind.sigstore.json" --source-ref "refs/tags/$TAG" --source-digest "$COMMIT" --signer-digest "$COMMIT" --deny-self-hosted-runners --predicate-type "$predicate")',
+            '    gh attestation verify "$asset" "${checks[@]}" --signer-workflow "$REPO/.github/workflows/release-build.yml" --format json > "$asset.$kind.verified.json"',
+            `    if [[ "$kind" == sbom ]]; then jq -e --slurpfile sbom "$asset.spdx.json" '[.[].verificationResult.statement.predicate] | length == 1 and .[0] == $sbom[0]' "$asset.$kind.verified.json"; fi`,
+            '    gh attestation verify "$asset" "${checks[@]}" --cert-identity "https://github.com/$REPO/.github/workflows/release-build.yml@refs/tags/$TAG"',
+            '  done', 'done', 'gh release verify-asset "$TAG" SHA256SUMS --repo "$REPO"', 'shasum -a 256 --check SHA256SUMS', '```',
+          ].join('\n');
+          const created = await api('releases', 'POST', {tag_name:tag, target_commitish:source, name:tag, draft:true, prerelease, make_latest, body});
+          if (!Number.isSafeInteger(created.id) || created.id <= 0 || created.tag_name !== tag || created.draft !== true || created.prerelease !== prerelease) throw Error('Invalid created release identity');
+          const id = created.id;
+          console.log(`Created release ID: ${id}`);
+          for (const file of files) {
+            const bytes = regular(`release-assets/${file}`);
+            const response = await fetch(`https://uploads.github.com/repos/${repo}/releases/${id}/assets?name=${encodeURIComponent(file)}`, {method:'POST', headers:{Authorization:`Bearer ${token}`, 'Content-Type':'application/octet-stream'}, body:bytes}); // allow-domain: uploads.github.com
+            if (!response.ok) throw Error(`Asset upload failed: ${file}`);
+            const asset = await response.json();
+            if (asset.name !== file || asset.state !== 'uploaded' || asset.size !== bytes.length || asset.digest !== `sha256:${hash(bytes)}`) throw Error(`Upload mismatch: ${file}`);
+          }
+          const published = await api(`releases/${id}`, 'PATCH', {draft:false, prerelease, make_latest});
+          // BEGIN READ RETRIES
+          const retryDeadline = Date.now() + 180000;
+          const retryRead = async (operation, deadline = retryDeadline) => {
+            for (let attempt = 1; ; attempt++) try {
+              if (Date.now() >= deadline) throw Error('Post-publish verification window exhausted');
+              const result = await operation();
+              if (Date.now() >= deadline) throw Error('Post-publish verification window exhausted');
+              return result;
+            } catch (error) {
+              const stderr = error.stderr?.toString().trim() ?? '';
+              const transient = !error.stdout?.length && (error.name === 'TimeoutError' || error.status === 429 || error.status >= 500 && error.status <= 599 || /^(ECONNRESET|ETIMEDOUT|EAI_AGAIN|UND_ERR_SOCKET|UND_ERR_CONNECT_TIMEOUT|UND_ERR_HEADERS_TIMEOUT|UND_ERR_BODY_TIMEOUT)$/.test(error.cause?.code ?? error.code) || /^HTTP (429|5\d\d): [^\r\n]+$/.test(stderr));
+              if (!transient || attempt === 3) throw error;
+              const after = Number(error.retryAfter) * 1000 || Date.parse(error.retryAfter) - Date.now();
+              const delay = Math.min(10000, Math.max([2000, 5000][attempt - 1], Number.isFinite(after) ? after : 0));
+              if (Date.now() + delay >= deadline) throw Error('Post-publish retry window exhausted');
+              console.warn(`Post-publish read retry: attempt ${attempt + 1}/3, transient ${error.status ?? 'transport/CLI'} failure, wait ${delay}ms`);
+              await new Promise(resolve => setTimeout(resolve, delay));
+            }
+          };
+          // END READ RETRIES
+          const verifyIdentity = async () => {
+            const release = await retryRead(() => api(`releases/${id}`, 'GET', undefined, Math.max(1, Math.min(10000, retryDeadline - Date.now()))));
+            if (published.id !== id || release.id !== id || release.tag_name !== tag || release.draft !== false || release.immutable !== true || release.prerelease !== prerelease) throw Error('Published release identity or immutability mismatch');
+            if (!Array.isArray(release.assets) || release.assets.length !== files.length || new Set(release.assets.map(asset => asset.name)).size !== files.length) throw Error('Published asset set mismatch');
+            for (const asset of release.assets) {
+              if (!files.includes(asset.name)) throw Error('Unexpected published asset');
+              const bytes = regular(`release-assets/${asset.name}`);
+              if (asset.size !== bytes.length || asset.digest !== `sha256:${hash(bytes)}`) throw Error('Published asset digest mismatch');
+            }
+            if ((await retryRead(() => api(`releases/tags/${encodeURIComponent(tag)}`, 'GET', undefined, Math.max(1, Math.min(10000, retryDeadline - Date.now()))))).id !== id) throw Error('Published tag identity mismatch');
+          };
+          await verifyIdentity();
+          // The release attestation can be created after the immutable release becomes visible.
+          const availabilityDeadline = Math.min(retryDeadline, Date.now() + 60000);
+          const verifyBundle = async (record) => {
+            if (Date.now() >= retryDeadline) throw Error('Post-publish verification window exhausted');
+            const proof = JSON.parse(execFileSync('gh', ['release','verify','--repo',repo,'--format','json','--',record.statement.predicate.tag], {timeout:Math.max(1, Math.min(10000, retryDeadline - Date.now())), stdio:'pipe'}));
+            if (Date.now() >= retryDeadline) throw Error('Post-publish verification window exhausted');
+            if (!isDeepStrictEqual(proof.attestation?.bundle, record.bundle)) throw Error('Verified release attestation bundle mismatch');
+          };
+          for (let attempt = 1; ; attempt++) {
+            if (Date.now() >= availabilityDeadline) throw Error('Release attestation availability window exhausted');
+            // Only this endpoint maps HTTP 404 to an unavailable record. Other statuses fail.
+            let page, missing = false;
+            try { page = await api(`attestations/sha1:${source}?per_page=100&predicate_type=release`, 'GET', undefined, Math.min(4000, availabilityDeadline - Date.now())); }
+            catch (error) { if (error.status !== 404) throw error; page = {attestations:[]}; missing = true; }
+            if (!Array.isArray(page.attestations) || page.attestations.length >= 100) throw Error('Invalid or truncated release attestation response');
+            const records = [];
+            for (const record of page.attestations) {
+              if (!record || typeof record.initiator !== 'string') throw Error('Malformed release attestation record');
+              if (record.initiator !== 'github') continue;
+              const envelope = record.bundle?.dsseEnvelope;
+              if (envelope?.payloadType !== 'application/vnd.in-toto+json' || typeof envelope.payload !== 'string' || !envelope.payload || !Array.isArray(envelope.signatures) || !envelope.signatures.length) throw Error('Malformed release attestation bundle');
+              const bytes = Buffer.from(envelope.payload, 'base64');
+              if (bytes.toString('base64') !== envelope.payload) throw Error('Malformed release attestation payload');
+              const statement = JSON.parse(bytes.toString());
+              const predicate = statement.predicate;
+              if (statement._type !== 'https://in-toto.io/Statement/v1' || statement.predicateType !== 'https://in-toto.io/attestation/release/v0.2' || predicate?.repository !== repo || typeof predicate.tag !== 'string' || !predicate.tag || !/^[1-9][0-9]*$/.test(predicate.databaseId) || !Array.isArray(statement.subject)) throw Error('Malformed release attestation statement');
+              const sources = statement.subject.filter(subject => subject.uri === `pkg:github/${repo}@${predicate.tag}`);
+              const subjects = statement.subject.filter(subject => !sources.includes(subject));
+              if (sources.length !== 1 || sources[0].digest?.sha1 !== source || Object.keys(sources[0].digest).length !== 1 || !subjects.length || subjects.some(subject => typeof subject.name !== 'string' || !subject.name || !/^[a-f0-9]{64}$/.test(subject.digest?.sha256) || Object.keys(subject.digest).length !== 1) || new Set(subjects.map(subject => subject.name)).size !== subjects.length) throw Error('Invalid release attestation subjects');
+              records.push({...record, statement, subjects});
+            }
+            const current = records.filter(record => record.statement.predicate.tag === tag);
+            if (current.length > 1) throw Error('Multiple release attestations for current tag');
+            if (current.length && (current[0].statement.predicate.databaseId !== String(id) || current[0].subjects.length !== files.length || current[0].subjects.some(subject => !files.includes(subject.name) || subject.digest.sha256 !== hash(regular(`release-assets/${subject.name}`))))) throw Error('Current release attestation identity or assets mismatch');
+            // Another tag's release (for example an earlier prerelease on this commit) can be
+            // ignored by this availability check. GitHub CLI may still fetch its bundle
+            // before filtering by tag during the cryptographic checks below.
+            for (const record of records.filter(record => record.statement.predicate.tag !== tag)) {
+              console.log('Ignored release attestation for other tag:', JSON.stringify(record.statement.predicate.tag));
+            }
+            if (current.length) {
+              await verifyBundle(current[0]);
+              console.log(attempt === 1 ? 'Release attestation available on first check' : `Release attestation available on check ${attempt}/5`);
+              console.log('Verified release:', tag, 'signature and exact attestation bundle match');
+              break;
+            }
+            if (attempt === 5) throw Error('Release already published and immutable; release attestation unavailable after five checks');
+            const delay = [2000, 5000, 10000, 20000][attempt - 1];
+            if (Date.now() + delay >= availabilityDeadline) throw Error('Release attestation availability window exhausted');
+            console.warn(`Release attestation availability: attempt ${attempt + 1}/5, ${missing ? 'HTTP 404' : 'HTTP 200, no current-tag record'}, wait ${delay}ms`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+          }
+          for (const file of files) console.log('Verified asset:', file, (await retryRead(() => execFileSync('gh', ['release','verify-asset',tag,`release-assets/${file}`,'--repo',repo], {timeout:Math.max(1, Math.min(10000, retryDeadline - Date.now()))}))).toString());
+          // Re-download into a fresh directory on every transport retry; verify bytes outside retries.
+          let download;
+          try {
+            await retryRead(() => {
+              if (download) fs.rmSync(download, {recursive:true, force:true});
+              download = fs.mkdtempSync('published-download-');
+              return execFileSync('gh', ['release','download',tag,'--repo',repo,'--dir',download], {timeout:Math.max(1, Math.min(60000, retryDeadline - Date.now())), stdio:'pipe'});
+            });
+            exact(download, files);
+            if (!regular(`${download}/SHA256SUMS`).equals(regular('release-assets/SHA256SUMS'))) throw Error('Downloaded SHA256SUMS mismatch');
+            for (const file of files) if (!regular(`${download}/${file}`).equals(regular(`release-assets/${file}`))) throw Error(`Downloaded asset mismatch: ${file}`);
+            console.log('Verified post-publish re-download: all', files.length, 'assets byte-identical to signed checksums and handoff');
+          } finally { if (download) fs.rmSync(download, {recursive:true, force:true}); }
+          await verifyIdentity();
+          // END PUBLICATION
+          })().catch(error => { console.error(error); process.exitCode = 1; });
+          NODE

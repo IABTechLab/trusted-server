@@ -345,6 +345,17 @@ jobs:
         run: |
           cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')"
 
+      # Release builds take their facts from these inputs; check that the
+      # actual CLI binary embeds them unchanged. The fictional commit differs
+      # from the checkout, so a fallback to local git cannot pass.
+      - name: cargo test (release build facts)
+        if: runner.os == 'Linux'
+        env:
+          TRUSTED_SERVER__RELEASE_BUILD: "1"
+          TRUSTED_SERVER__GIT_VERSION: abcdef0123456789abcdef0123456789abcdef01
+        run: |
+          cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --test release_build_facts
+
       - name: cargo test (browser fixtures)
         if: runner.os == 'macOS'
         run: ./scripts/test-cli.sh
