@@ -7908,10 +7908,15 @@ mod tests {
             ..marker_only
         }));
     }
+    use crate::auction::test_support::canonical_parity_auction_request;
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
     use crate::consent::ConsentContext;
+    use crate::consent::jurisdiction::Jurisdiction;
+    use crate::cookies::parse_cookies_to_jar;
+    use crate::ec::EcKvSnapshot;
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
     use crate::ec::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteOutcome};
+    use crate::ec::kv_types::{KvEntry, KvPartnerId};
     use crate::integrations::IntegrationRegistry;
     use crate::platform::test_support::{
         NoopSecretStore, StubHttpClient, build_services_with_http_client,
@@ -7919,6 +7924,7 @@ mod tests {
         noop_services_with_telemetry_sink,
     };
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use edgezero_core::body::Body as EdgeBody;
     use http::{Method, Request as HttpRequest, StatusCode, header};
     use std::sync::Arc;
@@ -8304,6 +8310,80 @@ mod tests {
             pull_sync_rate_limit: crate::settings::EcPartner::default_pull_sync_rate_limit(),
             ts_pull_token: Some(crate::redacted::Redacted::new("pull-token".to_owned())),
         }
+    }
+
+    #[test]
+    fn body_less_auction_eids_put_cookie_entries_first_and_kv_only_sources_after() {
+        let ec_id = format!("{}.navmrg", "a".repeat(64));
+        let registry = PartnerRegistry::from_config(&[
+            marker_partner("ids.example.com"),
+            marker_partner("other.example.com"),
+        ])
+        .expect("should build partner registry");
+        let mut entry = KvEntry::minimal("ids.example.com", "kv-stale", 1000);
+        entry.ids.insert(
+            "other.example.com".to_owned(),
+            KvPartnerId {
+                uid: "kv-other".to_owned(),
+            },
+        );
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(entry),
+            generation: None,
+        };
+        let ec_context = EcContext::new_for_test(
+            Some(ec_id.clone()),
+            ConsentContext {
+                jurisdiction: Jurisdiction::NonRegulated,
+                ..ConsentContext::default()
+            },
+        );
+        let cookie_entries = serde_json::json!([{
+            "source": "ids.example.com",
+            "inserter": "inserter-1.example.com",
+            "mm": 1,
+            "uids": [{ "id": "browser-fresh", "atype": 1 }]
+        }]);
+        let cookie =
+            BASE64.encode(serde_json::to_vec(&cookie_entries).expect("should serialize cookie"));
+        let jar = parse_cookies_to_jar(&format!("{COOKIE_TS_EIDS}={cookie}"));
+        let services = noop_services();
+        let mut auction_request = canonical_parity_auction_request();
+        // No TCF signal and no GDPR, so the consent gate passes the merged set.
+        auction_request.user.consent = None;
+        auction_request.user.eids = None;
+
+        apply_auction_eids_and_device(
+            &mut auction_request,
+            &AuctionEidTargeting {
+                cookie_jar: Some(&jar),
+                ec_id: Some(ec_id.as_str()),
+                kv_snapshot: &snapshot,
+                partner_registry: Some(&registry),
+                ec_context: &ec_context,
+                services: &services,
+                geo: None,
+                path_label: "Test",
+            },
+        );
+
+        assert_eq!(
+            serde_json::to_value(&auction_request.user.eids).expect("should serialize EIDs"),
+            serde_json::json!([
+                {
+                    "source": "ids.example.com",
+                    "inserter": "inserter-1.example.com",
+                    "mm": 1,
+                    "uids": [{ "id": "browser-fresh", "atype": 1 }]
+                },
+                {
+                    "source": "other.example.com",
+                    "uids": [{ "id": "kv-other", "atype": crate::settings::EcPartner::default_openrtb_atype() }]
+                }
+            ]),
+            "navigation and page-bids auctions should forward the cookie entry as sent, then KV-only sources"
+        );
     }
 
     async fn run_marker_lookup_probe(

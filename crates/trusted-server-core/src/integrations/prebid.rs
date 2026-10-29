@@ -3590,6 +3590,7 @@ mod tests {
     use crate::auction::test_support::{
         canonical_parity_auction_request,
         create_test_auction_context as shared_test_auction_context,
+        repeated_source_provenance_eids, repeated_source_provenance_eids_json,
     };
     use crate::auction::types::{
         AdFormat, AdSlot, AuctionContext, AuctionRequest, DeviceInfo, PublisherInfo, UserInfo,
@@ -6860,34 +6861,58 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
+    fn to_openrtb_forwards_eid_provenance_fields_and_repeated_sources() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        auction_request.user.eids = Some(repeated_source_provenance_eids());
+        let settings = make_settings();
+        let request = build_test_request();
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
+
+        let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
+        assert_eq!(
+            serialized["user"]["ext"]["eids"],
+            repeated_source_provenance_eids_json(),
+            "Prebid Server should receive both entries with their own EID-level fields"
+        );
+    }
+
+    #[test]
     fn to_openrtb_includes_eids_from_auction_request() {
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
         auction_request.user.eids = Some(vec![
-            crate::openrtb::Eid {
-                source: "liveramp.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+            crate::openrtb::Eid::new(
+                "liveramp.com".to_owned(),
+                vec![crate::openrtb::Uid {
                     id: "LR_xyz".to_owned(),
                     atype: Some(3),
                     ext: None,
                 }],
-            },
-            crate::openrtb::Eid {
-                source: "id5-sync.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+            ),
+            crate::openrtb::Eid::new(
+                "id5-sync.com".to_owned(),
+                vec![crate::openrtb::Uid {
                     id: "ID5_abc".to_owned(),
                     atype: Some(1),
                     ext: None,
                 }],
-            },
-            crate::openrtb::Eid {
-                source: "google.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+            ),
+            crate::openrtb::Eid::new(
+                "google.com".to_owned(),
+                vec![crate::openrtb::Uid {
                     id: "pair-id".to_owned(),
                     atype: Some(571187),
                     ext: None,
                 }],
-            },
+            ),
         ]);
 
         let settings = make_settings();

@@ -65,17 +65,62 @@ pub struct ConsentedProvidersSettings {
 }
 
 /// An Extended User ID entry from an identity provider.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Mirrors `OpenRTB` 2.6 §3.2.27. Browser entries keep the EID-level fields
+/// Prebid set; KV-resolved entries leave them empty.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Eid {
     /// Identity provider domain (e.g. `"id5-sync.com"`).
     pub source: String,
     /// One or more user IDs from this provider.
     pub uids: Vec<Uid>,
+    /// Entity that inserted the IDs into the request (`eid.inserter`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inserter: Option<String>,
+    /// Entity that matched the IDs (`eid.matcher`). Absent means `source`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<String>,
+    /// Match method (`eid.mm`). Vendor values from 500 up are passed through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm: Option<i32>,
+    /// Provider-specific extension data, e.g. `LiveIntent` `segments`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext: Option<Value>,
+}
+
+impl Eid {
+    /// Builds an [`Eid`] without EID-level fields.
+    ///
+    /// Use this for EIDs that never carry provenance, such as KV-resolved
+    /// partner IDs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::openrtb::{Eid, Uid};
+    ///
+    /// let eid = Eid::new(
+    ///     "ids.example.com".to_owned(),
+    ///     vec![Uid { id: "uid-1".to_owned(), atype: Some(1), ext: None }],
+    /// );
+    /// assert_eq!(eid.inserter, None);
+    /// ```
+    #[must_use]
+    pub fn new(source: String, uids: Vec<Uid>) -> Self {
+        Self {
+            source,
+            uids,
+            inserter: None,
+            matcher: None,
+            mm: None,
+            ext: None,
+        }
+    }
 }
 
 /// A single user identifier within an [`Eid`] entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Uid {
     /// The identifier value.
@@ -194,6 +239,87 @@ impl ToExt for ResponseExt {}
 mod tests {
     use super::*;
     use crate::auction::types::OrchestratorExt;
+    use serde_json::json;
+
+    #[test]
+    fn eid_serializes_openrtb_provenance_fields_when_present() {
+        let eid = Eid {
+            source: "ids.example.com".to_owned(),
+            uids: vec![Uid {
+                id: "uid-1".to_owned(),
+                atype: Some(1),
+                ext: Some(json!({ "rtiPartner": "TDID" })),
+            }],
+            inserter: Some("inserter.example.com".to_owned()),
+            matcher: Some("matcher.example.com".to_owned()),
+            mm: Some(4),
+            ext: Some(json!({ "segments": ["s1"] })),
+        };
+
+        let serialized = serde_json::to_value(&eid).expect("should serialize EID");
+
+        assert_eq!(
+            serialized,
+            json!({
+                "source": "ids.example.com",
+                "uids": [{ "id": "uid-1", "atype": 1, "ext": { "rtiPartner": "TDID" } }],
+                "inserter": "inserter.example.com",
+                "matcher": "matcher.example.com",
+                "mm": 4,
+                "ext": { "segments": ["s1"] }
+            }),
+            "should serialize every EID-level field"
+        );
+    }
+
+    #[test]
+    fn eid_without_provenance_fields_serializes_as_before() {
+        let eid = Eid::new(
+            "ids.example.com".to_owned(),
+            vec![Uid {
+                id: "uid-1".to_owned(),
+                atype: Some(1),
+                ext: None,
+            }],
+        );
+
+        let serialized = serde_json::to_string(&eid).expect("should serialize EID");
+
+        assert_eq!(
+            serialized, r#"{"source":"ids.example.com","uids":[{"id":"uid-1","atype":1}]}"#,
+            "an EID without EID-level fields should serialize byte-identically to before"
+        );
+    }
+
+    #[test]
+    fn eid_deserializes_provenance_fields_and_keeps_rejecting_unknown_keys() {
+        let parsed: Eid = serde_json::from_str(
+            r#"{"source":"ids.example.com","uids":[{"id":"uid-1"}],"inserter":"inserter.example.com","matcher":"matcher.example.com","mm":3,"ext":{"k":"v"}}"#,
+        )
+        .expect("should deserialize EID-level fields");
+
+        assert_eq!(
+            parsed,
+            Eid {
+                source: "ids.example.com".to_owned(),
+                uids: vec![Uid {
+                    id: "uid-1".to_owned(),
+                    atype: None,
+                    ext: None,
+                }],
+                inserter: Some("inserter.example.com".to_owned()),
+                matcher: Some("matcher.example.com".to_owned()),
+                mm: Some(3),
+                ext: Some(json!({ "k": "v" })),
+            },
+            "should read every EID-level field"
+        );
+        assert!(
+            serde_json::from_str::<Eid>(r#"{"source":"ids.example.com","uids":[],"unknown":1}"#)
+                .is_err(),
+            "should keep deny_unknown_fields"
+        );
+    }
 
     #[test]
     fn openrtb_response_round_trips_with_struct_literals() {
@@ -393,14 +519,14 @@ mod tests {
 
     #[test]
     fn eid_serializes_correctly() {
-        let eid = Eid {
-            source: "id5-sync.com".to_owned(),
-            uids: vec![Uid {
+        let eid = Eid::new(
+            "id5-sync.com".to_owned(),
+            vec![Uid {
                 id: "ID5-abc123".to_owned(),
                 atype: Some(1),
                 ext: None,
             }],
-        };
+        );
 
         let serialized = serde_json::to_value(&eid).expect("should serialize");
         assert_eq!(serialized["source"], "id5-sync.com", "source should match");
@@ -417,14 +543,14 @@ mod tests {
 
     #[test]
     fn eid_serializes_vendor_specific_atype() {
-        let eid = Eid {
-            source: "google.com".to_owned(),
-            uids: vec![Uid {
+        let eid = Eid::new(
+            "google.com".to_owned(),
+            vec![Uid {
                 id: "pair-id".to_owned(),
                 atype: Some(571187),
                 ext: None,
             }],
-        };
+        );
 
         let serialized = serde_json::to_value(&eid).expect("should serialize");
 

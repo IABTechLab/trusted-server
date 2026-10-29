@@ -2304,6 +2304,38 @@ mod tests {
     }
 
     #[test]
+    fn auction_route_carries_the_raw_ts_eids_cookie_to_finalization() {
+        let router = test_router();
+        let eids_cookie = base64::engine::general_purpose::STANDARD.encode(
+            serde_json::json!([{ "source": "ids.example.com", "uids": [{ "id": "example-uid" }] }])
+                .to_string(),
+        );
+        let mut request = browser_request(Method::POST, "/auction", "empty");
+        request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("ts-eids={eids_cookie}"))
+                .expect("should build cookie header"),
+        );
+
+        let response = route(&router, request);
+
+        let state = response
+            .extensions()
+            .get::<super::EcFinalizeState>()
+            .expect("auction responses should carry EC finalization state");
+        assert_eq!(
+            state.eids_cookie.as_deref(),
+            Some(eids_cookie.as_str()),
+            "the adapter should hand finalization the raw ts-eids cookie"
+        );
+        assert_eq!(
+            state.ec_context.eid_sync_source(),
+            Some(EidSyncSource::Auction),
+            "finalization should know this was an /auction request"
+        );
+    }
+
+    #[test]
     fn dispatch_limits_returning_user_eid_sync_to_eligible_routes() {
         let router = test_router();
 

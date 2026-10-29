@@ -33,6 +33,7 @@ mod auth;
 
 pub mod admin;
 pub mod batch_sync;
+pub(crate) mod client_eids;
 pub mod consent;
 pub mod cookies;
 pub mod device;

@@ -1,11 +1,11 @@
 //! HTTP endpoint handlers for auction requests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::{Request, Response, StatusCode, header};
-use serde_json::Value as JsonValue;
+use serde_json::value::RawValue;
 
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
@@ -14,13 +14,14 @@ use crate::constants::COOKIE_TS_EIDS;
 use crate::cookies::extract_cookie_value;
 use crate::ec::EcContext;
 use crate::ec::EcKvSnapshot;
+use crate::ec::client_eids::parse_client_eids;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
 use crate::ec::kv::KvIdentityGraph;
-use crate::ec::kv_types::MAX_UID_LENGTH;
+use crate::ec::partner::normalize_partner_source_domain;
 use crate::ec::prebid_eids::parse_prebid_eids_cookie;
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
-use crate::openrtb::{Eid, Uid};
+use crate::openrtb::Eid;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
@@ -34,10 +35,6 @@ use super::telemetry::{
     emit_auction_events_best_effort_lazy,
 };
 use super::types::AuctionContext;
-
-const MAX_CLIENT_EID_SOURCES: usize = 64;
-const MAX_CLIENT_UIDS_PER_SOURCE: usize = 32;
-const MAX_CLIENT_EID_SOURCE_BYTES: usize = 255;
 
 /// Maximum accepted JSON body size for `/auction`. Picked to comfortably fit
 /// the largest realistic Prebid-derived auction request (hundreds of ad units
@@ -296,7 +293,7 @@ pub async fn handle_auction(
     // `ec_id.is_some()`.
     let client_eids = if ec_id.is_some() {
         resolve_client_auction_eids(
-            body.eids.as_ref(),
+            body.eids.as_deref(),
             extract_cookie_value(&http_req, COOKIE_TS_EIDS).as_deref(),
         )
     } else {
@@ -346,8 +343,8 @@ pub async fn handle_auction(
         geo,
     )?;
 
-    // Merge current-request client EIDs with KV-resolved EIDs, then apply
-    // consent gating before attaching them to the auction request.
+    // Forward the browser entries as sent, append KV entries for registered
+    // sources the browser did not send, then apply consent gating.
     let merged_eids = merge_auction_eids(client_eids, eids);
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
     auction_request.user.eids =
@@ -473,11 +470,18 @@ pub(crate) fn resolve_auction_eids(
     Some(to_eids(&resolved))
 }
 
+/// Resolves the request's browser EIDs: the `/auction` body when it has a
+/// valid entry, else the `ts-eids` cookie.
+///
+/// Both go through the shared client EID parser, so the same rules and caps
+/// apply to each, and a malformed entry costs only itself.
 pub(crate) fn resolve_client_auction_eids(
-    raw: Option<&JsonValue>,
+    raw: Option<&RawValue>,
     cookie_value: Option<&str>,
 ) -> Option<Vec<Eid>> {
-    parse_client_auction_eids(raw).or_else(|| parse_cookie_auction_eids(cookie_value))
+    raw.map(parse_client_eids)
+        .filter(|eids| !eids.is_empty())
+        .or_else(|| parse_cookie_auction_eids(cookie_value))
 }
 
 fn parse_cookie_auction_eids(cookie_value: Option<&str>) -> Option<Vec<Eid>> {
@@ -492,131 +496,40 @@ fn parse_cookie_auction_eids(cookie_value: Option<&str>) -> Option<Vec<Eid>> {
     }
 }
 
-fn parse_client_auction_eids(raw: Option<&JsonValue>) -> Option<Vec<Eid>> {
-    let Some(JsonValue::Array(entries)) = raw else {
-        return None;
-    };
-
-    let mut eids = Vec::new();
-
-    for entry in entries {
-        if eids.len() >= MAX_CLIENT_EID_SOURCES {
-            log::debug!(
-                "Auction EIDs: reached max client EID source count ({MAX_CLIENT_EID_SOURCES})"
-            );
-            break;
-        }
-        let JsonValue::Object(entry) = entry else {
-            log::debug!("Auction EIDs: dropping malformed client EID entry");
-            continue;
-        };
-
-        let Some(source) = entry
-            .get("source")
-            .and_then(JsonValue::as_str)
-            .filter(|source| !source.trim().is_empty())
-            .filter(|source| source.len() <= MAX_CLIENT_EID_SOURCE_BYTES)
-            .map(str::to_owned)
-        else {
-            continue;
-        };
-
-        let Some(JsonValue::Array(raw_uids)) = entry.get("uids") else {
-            continue;
-        };
-
-        let uids: Vec<_> = raw_uids
-            .iter()
-            .filter_map(parse_client_auction_uid)
-            .take(MAX_CLIENT_UIDS_PER_SOURCE)
-            .collect();
-        if uids.is_empty() {
-            continue;
-        }
-
-        eids.push(Eid { source, uids });
-    }
-
-    if eids.is_empty() { None } else { Some(eids) }
-}
-
-fn parse_client_auction_uid(raw: &JsonValue) -> Option<Uid> {
-    let JsonValue::Object(uid) = raw else {
-        return None;
-    };
-
-    let id = uid
-        .get("id")
-        .and_then(JsonValue::as_str)
-        .filter(|id| !id.trim().is_empty())
-        .filter(|id| id.len() <= MAX_UID_LENGTH)?
-        .to_owned();
-
-    let atype = uid
-        .get("atype")
-        .and_then(JsonValue::as_u64)
-        .and_then(|atype| i32::try_from(atype).ok());
-
-    let ext = match uid.get("ext") {
-        Some(JsonValue::Object(_)) => uid.get("ext").cloned(),
-        _ => None,
-    };
-
-    Some(Uid { id, atype, ext })
-}
-
+/// Merges the request's browser EIDs with KV-resolved partner EIDs.
+///
+/// Browser entries are forwarded as parsed, in wire order, never altered or
+/// combined: they are what Prebid sent the `trustedServer` adapter, and a
+/// source may repeat with different EID-level fields. KV entries are appended
+/// after them, only for registered sources no browser entry carries. Sources
+/// are compared as the partner registry normalizes them (lowercase, trailing
+/// dot removed). For a source the browser sends, KV's UIDs, `atype` and `ext`
+/// are not used: KV keeps the first value it stored, so it is the staler copy.
+/// Entries without UIDs are dropped.
 pub(crate) fn merge_auction_eids(
     client_eids: Option<Vec<Eid>>,
     resolved_eids: Option<Vec<Eid>>,
 ) -> Option<Vec<Eid>> {
-    let mut merged = Vec::new();
-
-    for eid in resolved_eids
+    let mut merged: Vec<Eid> = client_eids
         .into_iter()
         .flatten()
-        .chain(client_eids.into_iter().flatten())
-    {
-        if eid.source.is_empty() {
+        .filter(|eid| !eid.uids.is_empty())
+        .collect();
+    let browser_sources: HashSet<String> = merged
+        .iter()
+        .filter_map(|eid| normalize_partner_source_domain(&eid.source).ok())
+        .collect();
+
+    for eid in resolved_eids.into_iter().flatten() {
+        if eid.uids.is_empty() {
             continue;
         }
-
-        let source_index = match merged
-            .iter()
-            .position(|existing: &Eid| existing.source == eid.source)
-        {
-            Some(index) => index,
-            None => {
-                merged.push(Eid {
-                    source: eid.source.clone(),
-                    uids: Vec::new(),
-                });
-                merged.len() - 1
-            }
-        };
-
-        for uid in eid.uids {
-            if uid.id.trim().is_empty() || uid.id.len() > MAX_UID_LENGTH {
-                continue;
-            }
-
-            if let Some(existing_uid) = merged[source_index]
-                .uids
-                .iter_mut()
-                .find(|existing| existing.id == uid.id)
-            {
-                if existing_uid.atype.is_none() {
-                    existing_uid.atype = uid.atype;
-                }
-                if existing_uid.ext.is_none() {
-                    existing_uid.ext = uid.ext;
-                }
-            } else {
-                merged[source_index].uids.push(uid);
-            }
+        let carried_by_browser = normalize_partner_source_domain(&eid.source)
+            .is_ok_and(|source| browser_sources.contains(&source));
+        if !carried_by_browser {
+            merged.push(eid);
         }
     }
-
-    merged.retain(|eid| !eid.uids.is_empty());
 
     if merged.is_empty() {
         None
@@ -634,6 +547,7 @@ mod tests {
     use crate::auction::types::{AuctionRequest, AuctionResponse};
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
+    use crate::ec::kv_types::MAX_UID_LENGTH;
     use crate::error::IntoHttpResponse as _;
     use crate::openrtb::Uid;
     use crate::platform::test_support::{
@@ -644,6 +558,7 @@ mod tests {
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
+    use serde_json::Value as JsonValue;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -804,6 +719,183 @@ mod tests {
             stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
             Some("shared-cookie-id"),
             "the sharedId update must still be ingested from the shared snapshot"
+        );
+    }
+
+    const COOKIE_ONLY_SOURCE: &str = "cookie-only.example.com";
+
+    fn ingestion_registry(extra_source: &str) -> PartnerRegistry {
+        PartnerRegistry::from_config(&[
+            counting_test_partner(COOKIE_ONLY_SOURCE),
+            counting_test_partner(extra_source),
+        ])
+        .expect("should build partner registry")
+    }
+
+    fn cookie_only_ts_eids() -> String {
+        BASE64.encode(
+            serde_json::to_vec(&json!([
+                { "source": COOKIE_ONLY_SOURCE, "uids": [{ "id": "cookie-uid" }] }
+            ]))
+            .expect("should serialize cookie"),
+        )
+    }
+
+    fn seeded_graph(ec_id: &str) -> KvIdentityGraph {
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
+        live.consent.ok = true;
+        graph.create(ec_id, &live).expect("should seed live row");
+        graph
+    }
+
+    fn stored_ids(graph: &KvIdentityGraph, ec_id: &str) -> Vec<(String, String)> {
+        let (stored, _) = graph
+            .get(ec_id)
+            .expect("should read store")
+            .expect("row should exist");
+        stored
+            .ids
+            .iter()
+            .map(|(source, id)| (source.clone(), id.uid.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn auction_ingests_its_body_eids_and_not_a_cookie_only_source() {
+        let settings = create_test_settings();
+        let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+            enabled: true,
+            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        });
+        orchestrator.register_provider(Arc::new(EidCapturingProvider {
+            had_eids: Arc::new(std::sync::Mutex::new(None)),
+        }));
+        let registry = ingestion_registry("body.example.com");
+        let ec_id = format!("{}.ingbdy", "a".repeat(64));
+        let graph = seeded_graph(&ec_id);
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        ec_context.set_eid_sync_source(crate::ec::EidSyncSource::Auction);
+        let cookie = cookie_only_ts_eids();
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.com/auction")
+            .header(header::COOKIE, format!("{COOKIE_TS_EIDS}={cookie}"))
+            .body(EdgeBody::from(
+                serde_json::to_vec(&json!({
+                    "adUnits": [{ "code": "div-gpt-ad-1", "mediaTypes": { "banner": { "sizes": [[300, 250]] } } }],
+                    "eids": [{ "source": "body.example.com", "uids": [{ "id": "body-uid" }] }]
+                }))
+                .expect("should serialize body"),
+            ))
+            .expect("should build auction request");
+
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            Some(&graph),
+            Some(&registry),
+            &mut ec_context,
+            &noop_services(),
+            req,
+        )
+        .await;
+        let mut response = http::Response::new(EdgeBody::empty());
+        crate::ec::finalize::ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            Some(&cookie),
+            None,
+            &mut response,
+        );
+
+        assert_eq!(
+            stored_ids(&graph, &ec_id),
+            vec![("body.example.com".to_owned(), "body-uid".to_owned())],
+            "KV should learn the body's source and not the cookie-only source"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_auction_ingests_nothing_from_the_cookie_but_keeps_shared_id() {
+        let settings = create_test_settings();
+        let orchestrator = AuctionOrchestrator::new(AuctionConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let registry = ingestion_registry("sharedid.org");
+        let ec_id = format!("{}.ingdis", "a".repeat(64));
+        let graph = seeded_graph(&ec_id);
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        ec_context.set_eid_sync_source(crate::ec::EidSyncSource::Auction);
+        let cookie = cookie_only_ts_eids();
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.com/auction")
+            .header(header::COOKIE, format!("{COOKIE_TS_EIDS}={cookie}"))
+            .body(EdgeBody::from(ad_units_only_body()))
+            .expect("should build auction request");
+
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            Some(&graph),
+            Some(&registry),
+            &mut ec_context,
+            &noop_services(),
+            req,
+        )
+        .await;
+        let mut response = http::Response::new(EdgeBody::empty());
+        crate::ec::finalize::ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            Some(&cookie),
+            Some("shared-cookie-id"),
+            &mut response,
+        );
+
+        assert_eq!(
+            stored_ids(&graph, &ec_id),
+            vec![("sharedid.org".to_owned(), "shared-cookie-id".to_owned())],
+            "an /auction that resolved no client set should ingest only the sharedId cookie"
+        );
+    }
+
+    #[test]
+    fn navigation_ingests_the_cookie_only_source() {
+        // Control for the two tests above: the registry does match the
+        // cookie-only source when the route reads the cookie.
+        let settings = create_test_settings();
+        let registry = ingestion_registry("body.example.com");
+        let ec_id = format!("{}.ingnav", "a".repeat(64));
+        let graph = seeded_graph(&ec_id);
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        ec_context.set_eid_sync_source(crate::ec::EidSyncSource::Navigation);
+        let cookie = cookie_only_ts_eids();
+        let mut response = http::Response::new(EdgeBody::empty());
+
+        crate::ec::finalize::ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            Some(&cookie),
+            None,
+            &mut response,
+        );
+
+        assert_eq!(
+            stored_ids(&graph, &ec_id),
+            vec![(COOKIE_ONLY_SOURCE.to_owned(), "cookie-uid".to_owned())],
+            "a navigation should ingest the cookie's registered source"
         );
     }
 
@@ -1299,6 +1391,197 @@ mod tests {
         }
     }
 
+    const AUCTION_BODY_FIXTURE: &str =
+        include_str!("../../../trusted-server-js/lib/test/fixtures/auction-body-eids.txt");
+    const TS_EIDS_COOKIE_FIXTURE: &str =
+        include_str!("../../../trusted-server-js/lib/test/fixtures/ts-eids-cookie.txt");
+
+    /// Provider that records the full EID set its auction request carried,
+    /// then fails its launch so no real transport handle is needed.
+    struct EidRecordingProvider {
+        eids: Arc<Mutex<Option<JsonValue>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for EidRecordingProvider {
+        fn provider_name(&self) -> &str {
+            "eid_recording_provider"
+        }
+
+        async fn request_bids(
+            &self,
+            request: &AuctionRequest,
+            _context: &AuctionContext<'_>,
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+            *self.eids.lock().expect("should lock recorded eids") = Some(
+                serde_json::to_value(&request.user.eids).expect("should serialize recorded eids"),
+            );
+            Err(Report::new(TrustedServerError::Auction {
+                message: "record only".to_string(),
+            }))
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            _response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            panic!("parse_response must not run when the launch fails");
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            100
+        }
+
+        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
+            Some("record-backend".to_string())
+        }
+    }
+
+    /// Runs `/auction` with an allowed EC and returns the EIDs the provider
+    /// received: `None` when no provider was called (the request was
+    /// rejected), `Some(Value::Null)` when it carried no EIDs.
+    async fn recorded_auction_eids(
+        body: Vec<u8>,
+        ts_eids_cookie: Option<&str>,
+    ) -> Option<JsonValue> {
+        let settings = create_test_settings();
+        let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+            enabled: true,
+            providers: AuctionConfig::legacy_provider_map(&["eid_recording_provider"]),
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        });
+        let recorded = Arc::new(Mutex::new(None));
+        orchestrator.register_provider(Arc::new(EidRecordingProvider {
+            eids: Arc::clone(&recorded),
+        }));
+        let ec_id = format!("{}.fixtur", "a".repeat(64));
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.com/auction");
+        if let Some(cookie) = ts_eids_cookie {
+            builder = builder.header(header::COOKIE, format!("{COOKIE_TS_EIDS}={cookie}"));
+        }
+        let req = builder
+            .body(EdgeBody::from(body))
+            .expect("should build auction request");
+
+        // The recording provider fails its launch; the assertion is on what
+        // it received, not on the auction result.
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &mut ec_context,
+            &noop_services(),
+            req,
+        )
+        .await;
+
+        recorded.lock().expect("should lock recorded eids").clone()
+    }
+
+    /// The two parsable entries of the fixture input, as providers receive
+    /// them. The cookie copy has no EID-level `ext` on the last entry.
+    fn fixture_good_entries(with_eid_ext: bool) -> JsonValue {
+        let mut last = json!({
+            "source": "last.example.com",
+            "uids": [{ "id": "last-uid", "atype": 3 }]
+        });
+        if with_eid_ext {
+            last["ext"] = json!({ "segments": ["s1"] });
+        }
+        json!([
+            {
+                "source": "first.example.com",
+                "inserter": "inserter-€.example.com",
+                "matcher": "first.example.com",
+                "mm": 3,
+                "uids": [{ "id": "first-uid", "atype": 1, "ext": { "label": "日本" } }]
+            },
+            last
+        ])
+    }
+
+    #[tokio::test]
+    async fn tsjs_auction_body_fixture_drops_only_the_unparsable_entry() {
+        let recorded =
+            recorded_auction_eids(AUCTION_BODY_FIXTURE.trim_end().as_bytes().to_vec(), None).await;
+
+        assert_eq!(
+            recorded,
+            Some(fixture_good_entries(true)),
+            "the request should be accepted and carry the two good entries unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn tsjs_cookie_fixture_drops_only_the_unparsable_entry() {
+        let recorded = recorded_auction_eids(
+            ad_units_only_body(),
+            Some(TS_EIDS_COOKIE_FIXTURE.trim_end()),
+        )
+        .await;
+
+        assert_eq!(
+            recorded,
+            Some(fixture_good_entries(false)),
+            "the cookie's good entries should reach the provider without the bad one"
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_body_eid_level_fields_reach_the_auction_request() {
+        let eids = json!([{
+            "source": "adserver.org",
+            "inserter": "adserver.org",
+            "matcher": "adserver.org",
+            "mm": 4,
+            "uids": [{ "id": "fictional-tdid", "atype": 1, "ext": { "rtiPartner": "TDID" } }]
+        }]);
+        let body = serde_json::to_vec(&json!({
+            "adUnits": [{ "code": "div-gpt-1", "mediaTypes": { "banner": { "sizes": [[300, 250]] } } }],
+            "eids": eids
+        }))
+        .expect("should serialize body");
+
+        assert_eq!(
+            recorded_auction_eids(body, None).await,
+            Some(eids),
+            "EID-level fields from the body should reach the provider unchanged"
+        );
+    }
+
+    fn ad_units_only_body() -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "adUnits": [{ "code": "div-gpt-1", "mediaTypes": { "banner": { "sizes": [[300, 250]] } } }]
+        }))
+        .expect("should serialize body")
+    }
+
+    #[tokio::test]
+    async fn auction_uses_the_cookie_when_no_body_entry_is_valid() {
+        let cookie_entries =
+            json!([{ "source": "cookie.example.com", "uids": [{ "id": "cookie-uid" }] }]);
+        let cookie =
+            BASE64.encode(serde_json::to_vec(&cookie_entries).expect("should serialize cookie"));
+        let body = serde_json::to_vec(&json!({
+            "adUnits": [{ "code": "div-gpt-1", "mediaTypes": { "banner": { "sizes": [[300, 250]] } } }],
+            "eids": [{ "source": "", "uids": [{ "id": "body-uid" }] }]
+        }))
+        .expect("should serialize body");
+
+        assert_eq!(
+            recorded_auction_eids(body, Some(&cookie)).await,
+            Some(cookie_entries),
+            "a body whose entries are all invalid should count as absent"
+        );
+    }
+
     #[tokio::test]
     async fn auction_strips_client_eids_when_ec_identity_denied() {
         // US-state opt-out via GPC: the server-side auction consent gate still
@@ -1486,12 +1769,13 @@ mod tests {
 
     #[test]
     fn resolve_client_auction_eids_prefers_request_body_over_cookie() {
-        let raw = json!([
+        let raw = serde_json::value::to_raw_value(&json!([
             {
                 "source": "id5-sync.com",
                 "uids": [{ "id": "body_uid", "atype": 1 }]
             }
-        ]);
+        ]))
+        .expect("should capture raw EIDs");
         let cookie_payload = json!([
             {
                 "source": "sharedid.org",
@@ -1501,258 +1785,303 @@ mod tests {
         let encoded = BASE64
             .encode(serde_json::to_vec(&cookie_payload).expect("should serialize cookie payload"));
 
-        let resolved = resolve_client_auction_eids(Some(&raw), Some(&encoded))
+        let resolved = resolve_client_auction_eids(Some(raw.as_ref()), Some(&encoded))
             .expect("should prefer request body EIDs");
 
-        assert_eq!(resolved.len(), 1, "should use request body when present");
-        assert_eq!(resolved[0].source, "id5-sync.com");
-        assert_eq!(resolved[0].uids[0].id, "body_uid");
-    }
-
-    #[test]
-    fn parse_client_auction_eids_ignores_malformed_entries() {
-        let raw = json!([
-            {
-                "source": "id5-sync.com",
-                "uids": [{ "id": "ID5_abc", "atype": 1 }]
-            },
-            {
-                "source": "broken.example",
-                "uids": "not-an-array"
-            },
-            {
-                "source": "sharedid.org",
-                "uids": [{ "id": "shared_123" }, { "id": "" }]
-            }
-        ]);
-
-        let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse valid EIDs");
-
-        assert_eq!(parsed.len(), 2, "should keep only valid EID entries");
-        assert_eq!(parsed[0].source, "id5-sync.com");
-        assert_eq!(parsed[0].uids.len(), 1, "should keep valid UID");
-        assert_eq!(parsed[1].source, "sharedid.org");
-        assert_eq!(parsed[1].uids.len(), 1, "should drop empty UID values");
-    }
-
-    #[test]
-    fn parse_client_auction_eids_caps_sources_and_uids() {
-        let entries: Vec<_> = (0..(MAX_CLIENT_EID_SOURCES + 5))
-            .map(|source_index| {
-                let uids: Vec<_> = (0..(MAX_CLIENT_UIDS_PER_SOURCE + 5))
-                    .map(|uid_index| json!({ "id": format!("uid-{source_index}-{uid_index}") }))
-                    .collect();
-                json!({
-                    "source": format!("source-{source_index}.example.com"),
-                    "uids": uids,
-                })
-            })
-            .collect();
-        let raw = JsonValue::Array(entries);
-
-        let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse capped EIDs");
-
         assert_eq!(
-            parsed.len(),
-            MAX_CLIENT_EID_SOURCES,
-            "should cap client EID sources"
-        );
-        assert!(
-            parsed
-                .iter()
-                .all(|eid| eid.uids.len() == MAX_CLIENT_UIDS_PER_SOURCE),
-            "should cap UIDs per source"
+            serde_json::to_value(&resolved).expect("should serialize resolved EIDs"),
+            json!([{ "source": "id5-sync.com", "uids": [{ "id": "body_uid", "atype": 1 }] }]),
+            "should use the request body when it has valid entries"
         );
     }
 
-    #[test]
-    fn parse_client_auction_eids_drops_whitespace_and_oversized_uids() {
-        let raw = json!([
-            {
-                "source": "id5-sync.com",
-                "uids": [
-                    { "id": "   " },
-                    { "id": "x".repeat(MAX_UID_LENGTH + 1) },
-                    { "id": "valid" }
-                ]
-            }
-        ]);
+    const SOURCE_S: &str = "ids.example.com";
+    const SOURCE_T: &str = "other.example.com";
 
-        let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse valid UID");
+    fn kv_eid(source: &str, id: &str, atype: i32) -> Eid {
+        Eid::new(
+            source.to_owned(),
+            vec![Uid {
+                id: id.to_owned(),
+                atype: Some(atype),
+                ext: None,
+            }],
+        )
+    }
 
-        assert_eq!(parsed.len(), 1, "should retain source with valid UID");
-        assert_eq!(parsed[0].uids.len(), 1, "should drop invalid UIDs");
-        assert_eq!(parsed[0].uids[0].id, "valid", "should keep valid UID");
+    /// A browser entry, every field spelled out (spec 7.1 rule 9).
+    fn browser_eid(
+        source: &str,
+        id: &str,
+        atype: Option<i32>,
+        inserter: Option<&str>,
+        mm: Option<i32>,
+    ) -> Eid {
+        Eid {
+            source: source.to_owned(),
+            uids: vec![Uid {
+                id: id.to_owned(),
+                atype,
+                ext: None,
+            }],
+            inserter: inserter.map(str::to_owned),
+            matcher: None,
+            mm,
+            ext: None,
+        }
+    }
+
+    fn merged_json(client: Option<Vec<Eid>>, kv: Option<Vec<Eid>>) -> JsonValue {
+        serde_json::to_value(merge_auction_eids(client, kv)).expect("should serialize merged EIDs")
     }
 
     #[test]
-    fn parse_client_auction_eids_preserves_pair_atype() {
-        let raw = json!([
-            {
-                "source": "google.com",
-                "uids": [{ "id": "pair-id", "atype": 571187 }]
-            }
-        ]);
-
-        let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse PAIR EID");
+    fn merge_case_1_forwards_a_browser_entry_with_its_fields() {
+        let merged = merged_json(
+            Some(vec![browser_eid(
+                SOURCE_S,
+                "u1",
+                None,
+                Some("inserter-1.example.com"),
+                Some(1),
+            )]),
+            None,
+        );
 
         assert_eq!(
-            parsed[0].uids[0].atype,
-            Some(571187),
-            "should preserve PAIR's vendor-specific atype"
+            merged,
+            json!([{ "source": SOURCE_S, "inserter": "inserter-1.example.com", "mm": 1, "uids": [{ "id": "u1" }] }]),
+            "a browser entry should go out with its EID-level fields"
         );
     }
 
     #[test]
-    fn parse_client_auction_eids_preserves_uid_ext_and_sanitizes_invalid_atype() {
-        let raw = json!([
-            {
-                "source": "adserver.org",
-                "uids": [
-                    {
-                        "id": "uid-with-ext",
-                        "atype": 1,
-                        "ext": { "provider": "liveintent.com", "rtiPartner": "TDID" }
-                    },
-                    {
-                        "id": "uid-bad-atype",
-                        "atype": 2_147_483_648_u64,
-                        "ext": { "keep": true }
-                    },
-                    {
-                        "id": "uid-float-atype",
-                        "atype": 1.5
-                    }
-                ]
-            }
-        ]);
+    fn merge_case_2_keeps_the_browser_atype_for_a_shared_uid() {
+        let merged = merged_json(
+            Some(vec![browser_eid(
+                SOURCE_S,
+                "u1",
+                Some(1),
+                Some("inserter-1.example.com"),
+                Some(1),
+            )]),
+            Some(vec![kv_eid(SOURCE_S, "u1", 3)]),
+        );
 
-        let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse valid EIDs");
+        assert_eq!(
+            merged,
+            json!([{ "source": SOURCE_S, "inserter": "inserter-1.example.com", "mm": 1, "uids": [{ "id": "u1", "atype": 1 }] }]),
+            "KV's operator-configured atype should not override the browser's"
+        );
+    }
 
-        assert_eq!(parsed.len(), 1, "should keep valid source");
-        assert_eq!(parsed[0].uids.len(), 3, "should keep valid UIDs");
-        assert_eq!(
-            parsed[0].uids[0].atype,
-            Some(1),
-            "should preserve valid atype"
+    #[test]
+    fn merge_case_3_drops_the_stale_kv_uid_for_a_browser_source() {
+        let merged = merged_json(
+            Some(vec![browser_eid(
+                SOURCE_S,
+                "u1",
+                None,
+                Some("inserter-1.example.com"),
+                Some(1),
+            )]),
+            Some(vec![kv_eid(SOURCE_S, "u0", 3)]),
         );
+
         assert_eq!(
-            parsed[0].uids[0].ext,
-            Some(json!({ "provider": "liveintent.com", "rtiPartner": "TDID" })),
-            "should preserve uid ext"
+            merged,
+            json!([{ "source": SOURCE_S, "inserter": "inserter-1.example.com", "mm": 1, "uids": [{ "id": "u1" }] }]),
+            "KV's value for a source the browser sends should not be forwarded"
         );
-        assert_eq!(
-            parsed[0].uids[1].atype, None,
-            "should drop out-of-range atype without dropping uid"
+    }
+
+    #[test]
+    fn merge_case_4_appends_kv_sources_the_browser_did_not_send() {
+        let merged = merged_json(
+            Some(vec![browser_eid(SOURCE_S, "u1", None, None, None)]),
+            Some(vec![kv_eid(SOURCE_T, "t1", 3)]),
         );
+
         assert_eq!(
-            parsed[0].uids[1].ext,
-            Some(json!({ "keep": true })),
-            "should preserve ext when atype is invalid"
+            merged,
+            json!([
+                { "source": SOURCE_S, "uids": [{ "id": "u1" }] },
+                { "source": SOURCE_T, "uids": [{ "id": "t1", "atype": 3 }] }
+            ]),
+            "browser entries should come first and KV-only sources after"
         );
+    }
+
+    #[test]
+    fn invalid_legacy_cookie_uids_neither_reach_providers_nor_displace_kv() {
+        for (case, invalid_id) in [
+            ("whitespace-only", "   ".to_owned()),
+            ("oversized", "x".repeat(MAX_UID_LENGTH + 1)),
+        ] {
+            let cookie_payload = json!([{ "source": SOURCE_S, "id": invalid_id, "atype": 1 }]);
+            let encoded = BASE64.encode(
+                serde_json::to_vec(&cookie_payload).expect("should serialize legacy cookie"),
+            );
+
+            let client = resolve_client_auction_eids(None, Some(&encoded));
+            let merged = merged_json(client.clone(), Some(vec![kv_eid(SOURCE_S, "kv-uid", 3)]));
+
+            assert_eq!(client, None, "should drop the {case} legacy cookie UID");
+            assert_eq!(
+                merged,
+                json!([{ "source": SOURCE_S, "uids": [{ "id": "kv-uid", "atype": 3 }] }]),
+                "should keep the KV identity when the {case} legacy UID is dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_case_5_keeps_same_source_entries_with_different_fields_apart() {
+        let merged = merged_json(
+            Some(vec![
+                browser_eid(
+                    SOURCE_S,
+                    "u1",
+                    None,
+                    Some("inserter-1.example.com"),
+                    Some(1),
+                ),
+                browser_eid(
+                    SOURCE_S,
+                    "u1",
+                    None,
+                    Some("inserter-2.example.com"),
+                    Some(2),
+                ),
+            ]),
+            None,
+        );
+
         assert_eq!(
-            parsed[0].uids[2].atype, None,
-            "should drop non-integer atype without dropping uid"
+            merged,
+            json!([
+                { "source": SOURCE_S, "inserter": "inserter-1.example.com", "mm": 1, "uids": [{ "id": "u1" }] },
+                { "source": SOURCE_S, "inserter": "inserter-2.example.com", "mm": 2, "uids": [{ "id": "u1" }] }
+            ]),
+            "two browser entries for one source should stay two entries"
+        );
+    }
+
+    #[test]
+    fn merge_case_6_matches_sources_as_the_registry_normalizes_them() {
+        let merged = merged_json(
+            Some(vec![browser_eid(
+                "IDS.Example.com.",
+                "u1",
+                None,
+                None,
+                None,
+            )]),
+            Some(vec![kv_eid(SOURCE_S, "u0", 3)]),
+        );
+
+        assert_eq!(
+            merged,
+            json!([{ "source": "IDS.Example.com.", "uids": [{ "id": "u1" }] }]),
+            "a browser source differing only in case or a trailing dot should suppress KV's"
+        );
+    }
+
+    #[test]
+    fn merge_case_7_forwards_kv_entries_when_the_browser_sent_none() {
+        let merged = merged_json(
+            None,
+            Some(vec![kv_eid(SOURCE_S, "u0", 3), kv_eid(SOURCE_T, "t1", 3)]),
+        );
+
+        assert_eq!(
+            merged,
+            json!([
+                { "source": SOURCE_S, "uids": [{ "id": "u0", "atype": 3 }] },
+                { "source": SOURCE_T, "uids": [{ "id": "t1", "atype": 3 }] }
+            ]),
+            "KV entries should be forwarded unchanged without browser EIDs"
+        );
+    }
+
+    #[test]
+    fn merge_drops_entries_without_uids() {
+        let empty_browser = Eid::new(SOURCE_S.to_owned(), Vec::new());
+        let empty_kv = Eid::new(SOURCE_T.to_owned(), Vec::new());
+
+        assert_eq!(
+            merged_json(Some(vec![empty_browser]), Some(vec![empty_kv])),
+            JsonValue::Null,
+            "entries without UIDs should be dropped, leaving no EIDs"
         );
     }
 
     #[test]
     fn merge_auction_eids_deduplicates_client_and_resolved_ids() {
-        let client_eids = Some(vec![Eid {
-            source: "id5-sync.com".to_string(),
-            uids: vec![Uid {
-                id: "ID5_abc".to_string(),
-                atype: Some(1),
-                ext: None,
-            }],
-        }]);
-        let resolved_eids = Some(vec![
-            Eid {
-                source: "id5-sync.com".to_string(),
-                uids: vec![Uid {
-                    id: "ID5_abc".to_string(),
-                    atype: Some(1),
-                    ext: None,
-                }],
-            },
-            Eid {
-                source: "liveramp.com".to_string(),
-                uids: vec![Uid {
-                    id: "LR_xyz".to_string(),
-                    atype: Some(3),
-                    ext: None,
-                }],
-            },
-        ]);
+        let merged = merged_json(
+            Some(vec![kv_eid("id5-sync.com", "ID5_abc", 1)]),
+            Some(vec![
+                kv_eid("id5-sync.com", "ID5_abc", 1),
+                kv_eid("liveramp.com", "LR_xyz", 3),
+            ]),
+        );
 
-        let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
-
-        assert_eq!(merged.len(), 2, "should retain distinct EID sources");
-        assert_eq!(merged[0].source, "id5-sync.com");
-        assert_eq!(merged[0].uids.len(), 1, "should deduplicate matching UIDs");
-        assert_eq!(merged[1].source, "liveramp.com");
-        assert_eq!(merged[1].uids[0].id, "LR_xyz");
+        assert_eq!(
+            merged,
+            json!([
+                { "source": "id5-sync.com", "uids": [{ "id": "ID5_abc", "atype": 1 }] },
+                { "source": "liveramp.com", "uids": [{ "id": "LR_xyz", "atype": 3 }] }
+            ]),
+            "the browser's id5 entry should go out once, followed by KV's liveramp"
+        );
     }
 
     #[test]
-    fn merge_auction_eids_preserves_multiple_uids_per_source() {
-        let client_eids = Some(vec![Eid {
-            source: "sharedid.org".to_string(),
-            uids: vec![Uid {
-                id: "shared_client".to_string(),
-                atype: None,
-                ext: None,
-            }],
-        }]);
-        let resolved_eids = Some(vec![Eid {
-            source: "sharedid.org".to_string(),
-            uids: vec![Uid {
-                id: "shared_server".to_string(),
-                atype: Some(3),
-                ext: None,
-            }],
-        }]);
+    fn merge_auction_eids_does_not_union_kv_uids_into_a_browser_source() {
+        let merged = merged_json(
+            Some(vec![browser_eid(
+                "sharedid.org",
+                "shared_client",
+                None,
+                None,
+                None,
+            )]),
+            Some(vec![kv_eid("sharedid.org", "shared_server", 3)]),
+        );
 
-        let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
-
-        assert_eq!(merged.len(), 1, "should merge same-source entries");
-        assert_eq!(merged[0].uids.len(), 2, "should preserve distinct UIDs");
-        assert_eq!(merged[0].uids[0].id, "shared_server");
-        assert_eq!(merged[0].uids[1].id, "shared_client");
+        assert_eq!(
+            merged,
+            json!([{ "source": "sharedid.org", "uids": [{ "id": "shared_client" }] }]),
+            "KV's UID for a source the browser sends should not be added to it"
+        );
     }
 
     #[test]
-    fn merge_auction_eids_prefers_server_resolved_metadata_on_conflict() {
-        let client_eids = Some(vec![Eid {
-            source: "adserver.org".to_string(),
-            uids: vec![Uid {
-                id: "shared_uid".to_string(),
+    fn merge_auction_eids_keeps_browser_metadata_on_conflict() {
+        let client = Eid::new(
+            "adserver.org".to_owned(),
+            vec![Uid {
+                id: "shared_uid".to_owned(),
                 atype: Some(1),
                 ext: Some(json!({ "provider": "client" })),
             }],
-        }]);
-        let resolved_eids = Some(vec![Eid {
-            source: "adserver.org".to_string(),
-            uids: vec![Uid {
-                id: "shared_uid".to_string(),
+        );
+        let resolved = Eid::new(
+            "adserver.org".to_owned(),
+            vec![Uid {
+                id: "shared_uid".to_owned(),
                 atype: Some(3),
                 ext: Some(json!({ "provider": "server" })),
             }],
-        }]);
-
-        let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
-
-        assert_eq!(merged.len(), 1, "should merge duplicate source");
-        assert_eq!(merged[0].uids.len(), 1, "should deduplicate duplicate uid");
-        assert_eq!(
-            merged[0].uids[0].atype,
-            Some(3),
-            "should prefer resolved atype"
         );
+
         assert_eq!(
-            merged[0].uids[0].ext,
-            Some(json!({ "provider": "server" })),
-            "should prefer resolved ext"
+            merged_json(Some(vec![client]), Some(vec![resolved])),
+            json!([{
+                "source": "adserver.org",
+                "uids": [{ "id": "shared_uid", "atype": 1, "ext": { "provider": "client" } }]
+            }]),
+            "the browser's atype and ext should win over KV's"
         );
     }
 

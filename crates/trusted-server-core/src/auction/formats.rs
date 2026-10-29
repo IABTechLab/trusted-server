@@ -9,6 +9,7 @@ use error_stack::{Report, ResultExt, ensure};
 use http::{HeaderValue, Request, Response, StatusCode, header};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
+use serde_json::value::RawValue;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use url::Url;
 use uuid::Uuid;
@@ -43,7 +44,10 @@ use super::types::{
 pub struct AdRequest {
     pub ad_units: Vec<AdUnit>,
     pub config: Option<JsonValue>,
-    pub eids: Option<JsonValue>,
+    /// Browser EIDs, captured as raw JSON so a malformed entry (for example a
+    /// lone surrogate escape) cannot fail the whole body. Each entry is
+    /// validated on its own by the shared client EID parser.
+    pub eids: Option<Box<RawValue>>,
 }
 
 /// A single ad placement in an [`AdRequest`].
@@ -562,12 +566,16 @@ mod tests {
         AuctionPlan, AuctionPlanConfig, NotificationConfig, ProviderConfig, ProviderId, RoutingMode,
     };
     use crate::auction::routing::route_auction;
+    use crate::auction::test_support::{
+        repeated_source_provenance_eids, repeated_source_provenance_eids_json,
+    };
     use crate::auction::types::{
         ApsRendererV1, ApsTagType, AuctionResponse, Bid, BidRenderer, BidStatus,
     };
     use crate::openrtb::{Eid, Uid};
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use http::Method;
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -815,16 +823,43 @@ mod tests {
     }
 
     #[test]
+    fn eid_header_carries_provenance_fields_and_repeated_sources() {
+        let mut request = make_auction_request();
+        request.user.eids = Some(repeated_source_provenance_eids());
+
+        let response =
+            convert_to_openrtb_response(&make_empty_result(), &make_settings(), &request, true)
+                .expect("should build response");
+
+        let header = response
+            .headers()
+            .get(&HEADER_X_TS_EIDS)
+            .and_then(|value| value.to_str().ok())
+            .expect("should include x-ts-eids");
+        let decoded: serde_json::Value = serde_json::from_slice(
+            &BASE64
+                .decode(header)
+                .expect("should decode x-ts-eids base64"),
+        )
+        .expect("should parse x-ts-eids JSON");
+        assert_eq!(
+            decoded,
+            repeated_source_provenance_eids_json(),
+            "x-ts-eids should show both entries with their own EID-level fields"
+        );
+    }
+
+    #[test]
     fn response_includes_eid_headers_when_eids_present() {
         let mut request = make_auction_request();
-        request.user.eids = Some(vec![Eid {
-            source: "ssp.com".to_owned(),
-            uids: vec![Uid {
+        request.user.eids = Some(vec![Eid::new(
+            "ssp.com".to_owned(),
+            vec![Uid {
                 id: "uid-1".to_owned(),
                 atype: Some(3),
                 ext: None,
             }],
-        }]);
+        )]);
 
         let settings = make_settings();
         let result = make_empty_result();

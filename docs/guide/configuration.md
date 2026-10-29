@@ -709,6 +709,11 @@ be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.
 :::
 
+`openrtb_atype` sets the `atype` of EIDs that Trusted Server builds from KV.
+It applies only where KV supplies a source the browser did not send; for a
+source in the browser's EIDs, the browser's own entry and `atype` are
+forwarded instead.
+
 `api_token` is optional. Set it to a key in `trusted_server_secrets` only when
 the partner calls the inbound identify or batch-sync APIs. A partner without
 `api_token` remains available for source-domain lookup, bidstream EIDs, and
