@@ -153,6 +153,17 @@ impl Default for Publisher {
 }
 
 impl Publisher {
+    pub(crate) fn normalize(&mut self) -> Result<(), Report<TrustedServerError>> {
+        if let Some(origin) = &mut self.public_origin {
+            let parsed =
+                parse_public_origin(origin).change_context(TrustedServerError::Configuration {
+                    message: "Invalid publisher.public_origin".to_string(),
+                })?;
+            *origin = parsed.origin().ascii_serialization();
+        }
+        Ok(())
+    }
+
     /// Known placeholder values that must not be used in production.
     pub const PROXY_SECRET_PLACEHOLDERS: &[&str] = &[
         "change-me-proxy-secret",
@@ -3251,8 +3262,10 @@ impl Settings {
     ///
     /// # Errors
     ///
-    /// Returns a configuration error if image optimizer keys collide after trimming.
+    /// Returns a configuration error if the public origin is invalid or image
+    /// optimizer keys collide after trimming.
     pub(crate) fn normalize_deserialized(&mut self) -> Result<(), Report<TrustedServerError>> {
+        self.publisher.normalize()?;
         self.cache.normalize();
         self.proxy.normalize();
         self.rewrite.normalize();
@@ -3799,6 +3812,10 @@ fn validate_no_trailing_slash(value: &str) -> Result<(), ValidationError> {
 }
 
 fn validate_public_origin(value: &str) -> Result<(), ValidationError> {
+    parse_public_origin(value).map(|_| ())
+}
+
+fn parse_public_origin(value: &str) -> Result<Url, ValidationError> {
     if value.chars().any(char::is_whitespace) || value.chars().any(char::is_control) {
         let mut err = ValidationError::new("public_origin_has_whitespace");
         err.add_param("value".into(), &value);
@@ -3841,7 +3858,7 @@ fn validate_public_origin(value: &str) -> Result<(), ValidationError> {
         return Err(ValidationError::new("public_origin_has_fragment"));
     }
 
-    Ok(())
+    Ok(parsed)
 }
 
 fn validate_host_header_override(value: &str) -> Result<(), ValidationError> {
@@ -5835,8 +5852,8 @@ mod tests {
             .expect("should parse settings without public origin");
         assert_eq!(
             fallback.publisher.effective_public_origin(),
-            "https://test-publisher.com",
-            "should use the publisher domain for the compatibility fallback"
+            format!("https://{}", fallback.publisher.domain),
+            "should use HTTPS and the publisher domain when the field is omitted"
         );
         let fallback_json = serde_json::to_value(&fallback).expect("should serialize settings");
         assert!(
@@ -5846,15 +5863,14 @@ mod tests {
 
         for origin in ["https://ads.example.com", "http://localhost:8080"] {
             let settings = Settings::from_toml(&crate_test_settings_str().replace(
-                r#"origin_url = "https://origin.test-publisher.com""#,
-                &format!(
-                    "origin_url = \"https://origin.test-publisher.com\"\npublic_origin = \"{origin}\""
-                ),
+                "[publisher]",
+                &format!("[publisher]\npublic_origin = \"{origin}\""),
             ))
             .expect("should accept an HTTP(S) origin without a trailing slash");
             assert_eq!(settings.publisher.effective_public_origin(), origin);
         }
 
+        let with_newline = "https://ads.example.com".replacen('.', "\n", 1);
         for origin in [
             "ftp://ads.example.com",
             "https://user@ads.example.com",
@@ -5864,13 +5880,11 @@ mod tests {
             "https://ads.example.com/",
             " https://ads.example.com",
             "https://ads.example.com ",
-            "https://ads.exa\nmple.com",
+            with_newline.as_str(),
         ] {
             let result = Settings::from_toml(&crate_test_settings_str().replace(
-                r#"origin_url = "https://origin.test-publisher.com""#,
-                &format!(
-                    "origin_url = \"https://origin.test-publisher.com\"\npublic_origin = \"{origin}\""
-                ),
+                "[publisher]",
+                &format!("[publisher]\npublic_origin = \"{origin}\""),
             ));
             assert!(
                 result.is_err(),
@@ -5878,7 +5892,7 @@ mod tests {
             );
         }
 
-        for origin in [" https://ads.example.com", "https://ads.exa\nmple.com"] {
+        for origin in [" https://ads.example.com", with_newline.as_str()] {
             let mut json = serde_json::to_value(&fallback).expect("should serialize settings");
             json["publisher"]["public_origin"] = serde_json::json!(origin);
             assert!(
@@ -5889,10 +5903,62 @@ mod tests {
     }
 
     #[test]
+    fn publisher_public_origin_normalizes_before_generating_urls() {
+        let foreign = Url::parse("https://foreign.example/creative")
+            .expect("should parse the foreign document URL");
+        for (raw, expected) in [
+            ("https:ads.example.com", "https://ads.example.com"),
+            ("https:/ads.example.com", "https://ads.example.com"),
+            ("HTTPS://ADS.EXAMPLE.COM:443", "https://ads.example.com"),
+            ("http://localhost:7676", "http://localhost:7676"),
+            ("http://[::1]:7676", "http://[::1]:7676"),
+        ] {
+            let toml = crate_test_settings_str().replace(
+                "[publisher]",
+                &format!("[publisher]\npublic_origin = \"{raw}\""),
+            );
+            let from_toml = Settings::from_toml(&toml)
+                .expect("should load and normalize a valid public origin");
+            let mut json = serde_json::to_value(&from_toml)
+                .expect("should serialize settings for JSON loading");
+            json["publisher"]["public_origin"] = serde_json::json!(raw);
+            let from_json = Settings::from_json_value(json)
+                .expect("should normalize the public origin from a config blob");
+
+            for settings in [from_toml, from_json] {
+                assert_eq!(
+                    settings.publisher.public_origin.as_deref(),
+                    Some(expected),
+                    "should store the normalized public origin for {raw}"
+                );
+                let generated = crate::creative::build_proxy_url(
+                    &settings,
+                    "https://cdn.example.com/ad.png",
+                    "",
+                );
+                let resolved = foreign
+                    .join(&generated)
+                    .expect("should resolve generated output in a foreign document");
+                assert_eq!(
+                    resolved.origin().ascii_serialization(),
+                    expected,
+                    "should retain the public authority for {raw}"
+                );
+                let serialized =
+                    serde_json::to_value(&settings).expect("should serialize normalized settings");
+                assert_eq!(
+                    serialized["publisher"]["public_origin"], expected,
+                    "should persist the normalized origin for {raw}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn publisher_public_origin_round_trips_through_json() {
         let settings = Settings::from_toml(&crate_test_settings_str().replace(
-            r#"origin_url = "https://origin.test-publisher.com""#,
-            "origin_url = \"https://origin.test-publisher.com\"\npublic_origin = \"https://ads.example.com:8443\"",
+            "[publisher]",
+            "[publisher]\npublic_origin = \"https://ads.example.com:8443\"",
         ))
         .expect("should parse an explicit public origin");
         let json = serde_json::to_value(&settings).expect("should serialize settings");

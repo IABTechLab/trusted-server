@@ -3,8 +3,6 @@ import { log } from '../../core/log';
 import type { TsCreativeConfig, CreativeWindow, TsCreativeApi } from '../../shared/globals';
 import { creativeGlobal, resolveWindow } from '../../shared/globals';
 
-import './first_party';
-
 import { installClickGuard } from './click';
 import { installDynamicImageProxy } from './image';
 import { installDynamicIframeProxy } from './iframe';

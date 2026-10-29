@@ -25,8 +25,13 @@ describe('creative/proxy_sign.ts', () => {
     expect(shouldProxyExternalUrl('https://foreign.example/first-party/proxy?foo=1')).toBe(true);
   });
 
-  it('trusts only the captured origin and exact proxy endpoint', async () => {
+  it('uses the captured endpoint rather than a different parent stamp for signing', async () => {
     const descriptor = Object.getOwnPropertyDescriptor(document, 'currentScript');
+    const stampDescriptor = Object.getOwnPropertyDescriptor(window, '__tsCreativeOrigin');
+    Object.defineProperty(window, '__tsCreativeOrigin', {
+      configurable: true,
+      value: 'https://publisher.example',
+    });
     const script = Object.assign(document.createElement('script'), {
       src: 'https://ads.example.com/static/tsjs=tsjs-unified.min.js?v=hash',
     });
@@ -34,14 +39,30 @@ describe('creative/proxy_sign.ts', () => {
     vi.resetModules();
 
     try {
-      const { shouldProxyExternalUrl: shouldProxy } =
+      const { shouldProxyExternalUrl: shouldProxy, signProxyUrl: sign } =
         await import('../../../src/integrations/creative/proxy_sign');
       expect(shouldProxy('https://ads.example.com/first-party/proxy?token=1')).toBe(false);
       expect(shouldProxy('https://ads.example.com/first-party/proxy-extra?token=1')).toBe(true);
       expect(shouldProxy('https://foreign.example/first-party/proxy?token=1')).toBe(true);
+      const signed = 'https://ads.example.com/first-party/proxy?token=1';
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ href: signed }),
+      });
+      global.fetch = fetchMock as unknown as typeof fetch;
+      expect(await sign('https://cdn.example/asset.js')).toEqual({
+        outcome: 'signed',
+        href: signed,
+      });
+      expect(fetchMock).toHaveBeenCalledWith(
+        'https://ads.example.com/first-party/sign',
+        expect.objectContaining({ method: 'POST', credentials: 'same-origin' })
+      );
     } finally {
       if (descriptor) Object.defineProperty(document, 'currentScript', descriptor);
       else Reflect.deleteProperty(document, 'currentScript');
+      if (stampDescriptor) Object.defineProperty(window, '__tsCreativeOrigin', stampDescriptor);
+      else Reflect.deleteProperty(window, '__tsCreativeOrigin');
     }
   });
 

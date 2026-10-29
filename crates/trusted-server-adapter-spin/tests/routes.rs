@@ -809,10 +809,10 @@ async fn first_party_proxy_round_trip_through_spin_router() {
         json_string_field(&sign_body, "href").expect("sign response must include a signed href");
     let (_, authority_and_path) = href
         .split_once("://")
-        .expect("signed href should be absolute");
+        .expect("should return an absolute signed href");
     let (_, path_and_query) = authority_and_path
         .split_once('/')
-        .expect("signed href should include a path");
+        .expect("should include a path in the signed href");
     let href_path_and_query = format!("/{path_and_query}");
     assert!(
         href_path_and_query.starts_with("/first-party/proxy?"),

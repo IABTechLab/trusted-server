@@ -362,19 +362,6 @@ function navigate(a: AnchorLike, url: string, isMiddle: boolean): void {
 // compare against — is only updated when the value is itself a signed
 // /first-party/click URL. Writing the GET proxy-rebuild fallback there would
 // make every later canonicalization fail and lose subsequent mutations.
-// Root-relative form of a first-party URL — the shape the server-side rewriter
-// emits and the shape `data-tsclick` must keep. `href` is absolutized so it
-// resolves inside the srcdoc frame, but the canonical attribute has to stay in
-// the server's format: it is echoed back as the rebuild payload's `tsclick`.
-function canonicalClickValue(resolved: string): string {
-  try {
-    const url = new URL(resolved, TRUSTED_BASE_URL);
-    return `${url.pathname}${url.search}`;
-  } catch {
-    return resolved;
-  }
-}
-
 function persistRebuiltClick(anchor: AnchorLike, finalUrl: string): void {
   // Persist the validated, absolutized URL — never the raw input. Beyond
   // enforcing the http(s) allowlist, an absolute URL keeps the anchor's
@@ -395,7 +382,10 @@ function persistRebuiltClick(anchor: AnchorLike, finalUrl: string): void {
   try {
     const el = anchor as Element;
     if (canonFromFirstPartyClick(resolved)) {
-      el.setAttribute('data-tsclick', canonicalClickValue(resolved));
+      // The server accepts absolute and legacy relative clicks. Keep the
+      // rebuilt authority so later navigation cannot switch to the document
+      // or stamped origin when it differs from the public endpoint.
+      el.setAttribute('data-tsclick', resolved);
     }
     el.setAttribute('href', resolved);
   } catch (err) {

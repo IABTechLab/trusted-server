@@ -2001,7 +2001,7 @@ mod tests {
 
     // Keep the policy matrix's byte-for-byte baseline, changing only the general
     // auction output to absolute endpoints. The inline origin and signatures stay unchanged.
-    const MATRIX_DEFAULT_AUCTION_OUTPUT: &str = r#"<html><head><style>.b{background:url("https://test-publisher.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fbg.png&tstoken=xi0bmg4Ik6UU7KsG5z_quFeN5BGt_G8bt4oxgD3HiH8")}</style></head><body><script src="https://test-publisher.com/static/tsjs=tsjs-unified.min.js" id="trustedserver-js"></script><img src="https://test-publisher.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fad.png&tstoken=FU5VJC5ElXC43PfbzzR-TBVu0h4TFKH82LkDw5NP4to" srcset="https://test-publisher.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fad-2x.png&tstoken=2WEq5obXUSJyIHjXhx_MatPqzMJtU1_tb_ZMZTKU1m8 2x"><div style="background:url(&quot;https://test-publisher.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Finline.png&tstoken=eV8lwVA2y6dcTtIC8RopnFTYnb1R9VZ9fqxbMaolCBY&quot;)"></div><a href="https://test-publisher.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Fpage&tstoken=DxWOVjz0AiVAcRSPJO7I69TLT0fc8RaA7E7R0H7SmCY" data-tsclick="https://test-publisher.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Fpage&tstoken=DxWOVjz0AiVAcRSPJO7I69TLT0fc8RaA7E7R0H7SmCY">Ad</a><map><area href="https://test-publisher.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Farea&tstoken=n0VAVAbY32ikTeYoKdkeb-GvNxbiepF_ul97VakLqUE" data-tsclick="https://test-publisher.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Farea&tstoken=n0VAVAbY32ikTeYoKdkeb-GvNxbiepF_ul97VakLqUE"></map><a href="https://excluded.example.com/page">Excluded</a><a href="mailto:ads@example.com">Mail</a></body></html>"#;
+    const MATRIX_DEFAULT_AUCTION_OUTPUT: &str = r#"<html><head><style>.b{background:url("/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fbg.png&tstoken=xi0bmg4Ik6UU7KsG5z_quFeN5BGt_G8bt4oxgD3HiH8")}</style></head><body><script src="/static/tsjs=tsjs-unified.min.js" id="trustedserver-js"></script><img src="/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fad.png&tstoken=FU5VJC5ElXC43PfbzzR-TBVu0h4TFKH82LkDw5NP4to" srcset="/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fad-2x.png&tstoken=2WEq5obXUSJyIHjXhx_MatPqzMJtU1_tb_ZMZTKU1m8 2x"><div style="background:url(&quot;/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Finline.png&tstoken=eV8lwVA2y6dcTtIC8RopnFTYnb1R9VZ9fqxbMaolCBY&quot;)"></div><a href="/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Fpage&tstoken=DxWOVjz0AiVAcRSPJO7I69TLT0fc8RaA7E7R0H7SmCY" data-tsclick="/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Fpage&tstoken=DxWOVjz0AiVAcRSPJO7I69TLT0fc8RaA7E7R0H7SmCY">Ad</a><map><area href="/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Farea&tstoken=n0VAVAbY32ikTeYoKdkeb-GvNxbiepF_ul97VakLqUE" data-tsclick="/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Farea&tstoken=n0VAVAbY32ikTeYoKdkeb-GvNxbiepF_ul97VakLqUE"></map><a href="https://excluded.example.com/page">Excluded</a><a href="mailto:ads@example.com">Mail</a></body></html>"#;
     const MATRIX_DEFAULT_INLINE_OUTPUT: &str = r#"<html><head><style>.b{background:url("https://www.example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fbg.png&tstoken=xi0bmg4Ik6UU7KsG5z_quFeN5BGt_G8bt4oxgD3HiH8")}</style></head><body><img src="https://www.example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fad.png&tstoken=FU5VJC5ElXC43PfbzzR-TBVu0h4TFKH82LkDw5NP4to" srcset="https://www.example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fad-2x.png&tstoken=2WEq5obXUSJyIHjXhx_MatPqzMJtU1_tb_ZMZTKU1m8 2x"><div style="background:url(&quot;https://www.example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Finline.png&tstoken=eV8lwVA2y6dcTtIC8RopnFTYnb1R9VZ9fqxbMaolCBY&quot;)"></div><a href="https://www.example.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Fpage&tstoken=DxWOVjz0AiVAcRSPJO7I69TLT0fc8RaA7E7R0H7SmCY" data-tsclick="https://www.example.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Fpage&tstoken=DxWOVjz0AiVAcRSPJO7I69TLT0fc8RaA7E7R0H7SmCY">Ad</a><map><area href="https://www.example.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Farea&tstoken=n0VAVAbY32ikTeYoKdkeb-GvNxbiepF_ul97VakLqUE" data-tsclick="https://www.example.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Farea&tstoken=n0VAVAbY32ikTeYoKdkeb-GvNxbiepF_ul97VakLqUE"></map><a href="https://excluded.example.com/page">Excluded</a><a href="mailto:ads@example.com">Mail</a></body></html>"#;
 
     #[test]
@@ -2044,15 +2044,24 @@ mod tests {
     #[test]
     fn default_settings_rewrite_matrix_fixture_byte_for_byte_as_before() {
         let settings = matrix_settings(true, None);
+        let auction_expected = MATRIX_DEFAULT_AUCTION_OUTPUT
+            .replace(
+                "/first-party/",
+                &format!("https://{}/first-party/", settings.publisher.domain),
+            )
+            .replace(
+                "/static/tsjs=",
+                &format!("https://{}/static/tsjs=", settings.publisher.domain),
+            );
 
         for (path, expected) in [
-            (CreativePath::Auction, MATRIX_DEFAULT_AUCTION_OUTPUT),
+            (CreativePath::Auction, auction_expected.as_str()),
             (CreativePath::Inline, MATRIX_DEFAULT_INLINE_OUTPUT),
         ] {
             assert_eq!(
                 process_for_path(&settings, path, MATRIX_FIXTURE_WITH_BODY),
                 expected,
-                "{path:?}: default settings should match the pre-rewrite_clicks output exactly"
+                "{path:?}: should preserve the policy baseline with absolute generated endpoints"
             );
         }
     }
@@ -3786,7 +3795,10 @@ b{background:url(\"https://cdn.example/c.png\")}";
           <img data-srcset="https://cdn.example/img-1x.png 1x, //cdn.example/img-2x.png 2x, /local/img.png 1x">
         "#;
         let out = rewrite_creative_html(&settings, html);
-        assert!(out.contains("data-src=\"https://test-publisher.com/first-party/proxy?tsurl="));
+        assert!(out.contains(&format!(
+            "data-src=\"{}/first-party/proxy?tsurl=",
+            settings.publisher.effective_public_origin()
+        )));
         assert!(out.matches("/first-party/proxy?tsurl=").count() >= 1);
         // relative candidate remains
         assert!(out.contains("/local/img.png 1x"));
@@ -4226,7 +4238,10 @@ b{background:url(\"https://cdn.example/c.png\")}";
         // Non-excluded should be rewritten and SHOULD have data-tsclick
         assert!(out.contains("/first-party/click?tsurl="));
         assert!(out.contains("advertiser.example.com"));
-        assert!(out.contains("data-tsclick=\"https://test-publisher.com/first-party/click"));
+        assert!(out.contains(&format!(
+            "data-tsclick=\"{}/first-party/click",
+            settings.publisher.effective_public_origin()
+        )));
     }
 
     #[test]
@@ -4257,8 +4272,11 @@ b{background:url(\"https://cdn.example/c.png\")}";
             "should qualify resource, srcset, and CSS rewrites"
         );
         assert!(out.contains("https://ads.publisher.example:8443/static/tsjs="));
-        assert!(!out.contains("origin.test-publisher.com"));
-        assert!(!out.contains("https://test-publisher.com/first-party"));
+        assert!(!out.contains(&settings.publisher.origin_url));
+        assert!(!out.contains(&format!(
+            "https://{}/first-party",
+            settings.publisher.domain
+        )));
 
         let fragment = rewrite_creative_html(&settings, "<p>Body-less creative</p>");
         assert_eq!(
@@ -4274,7 +4292,10 @@ b{background:url(\"https://cdn.example/c.png\")}";
     fn generated_first_party_urls_fall_back_to_publisher_domain() {
         let settings = crate::test_support::tests::create_test_settings();
         let proxy = build_proxy_url(&settings, "https://cdn.example.com/ad.png", "");
-        assert!(proxy.starts_with("https://test-publisher.com/first-party/proxy?"));
+        assert!(proxy.starts_with(&format!(
+            "https://{}/first-party/proxy?",
+            settings.publisher.domain
+        )));
     }
 
     // ── sanitize_creative_html tests ────────────────────────────────────────

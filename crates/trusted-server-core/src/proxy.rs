@@ -1928,15 +1928,17 @@ pub async fn handle_first_party_proxy_rebuild(
         rebuild_request_from_pairs(url::form_urlencoded::parse(req_query.as_bytes()))?
     };
 
-    let qualified_tsclick =
-        if payload.tsclick.starts_with('/') && !payload.tsclick.starts_with("//") {
-            first_party_url(settings, &payload.tsclick)
-        } else {
-            payload.tsclick.clone()
-        };
-    let c_url = url::Url::parse(&qualified_tsclick).change_context(TrustedServerError::Proxy {
-        message: "invalid tsclick".to_string(),
-    })?;
+    // Input parsing is independent of the configured output origin. Accept old
+    // root-relative clicks and absolute clicks without changing their signatures.
+    if payload.tsclick.starts_with("//") {
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: "invalid tsclick".to_string(),
+        }));
+    }
+    let c_url =
+        parse_request_target(&payload.tsclick).change_context(TrustedServerError::Proxy {
+            message: "invalid tsclick".to_string(),
+        })?;
     if !matches!(c_url.scheme(), "http" | "https") || c_url.path() != "/first-party/click" {
         return Err(Report::new(TrustedServerError::Proxy {
             message: "invalid tsclick path".to_string(),
@@ -1945,7 +1947,7 @@ pub async fn handle_first_party_proxy_rebuild(
     // Validate the tstoken on the original click URL before applying any changes.
     // Without this, an attacker could submit an unsigned tsclick and mint valid
     // click redirects to arbitrary URLs.
-    reconstruct_and_validate_signed_target(settings, &qualified_tsclick)?;
+    reconstruct_and_validate_signed_target(settings, c_url.as_str())?;
 
     // Extract tsurl and original params (exclude tstoken if present)
     let mut tsurl: Option<String> = None;
