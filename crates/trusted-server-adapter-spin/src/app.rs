@@ -1158,7 +1158,8 @@ mod tests {
     fn normalize_spin_request_rejects_invalid_last_runtime_origin() {
         for value in [
             "ftp://publisher.example.com/article",
-            "https://publisher.example.com:invalid/article",
+            // Deliberately malformed port exercises runtime-origin rejection.
+            "https://publisher.example.com:invalid/article", // allow-domain: publisher.example.com:invalid
         ] {
             let mut req = request_with(&[
                 (

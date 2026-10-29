@@ -36,7 +36,8 @@ jobs:
       - name: Generate integration Viceroy configs
         run: |
           ./scripts/generate-integration-viceroy-configs.sh
-          INTEGRATION_APP_CONFIG_PATH=crates/trusted-server-integration-tests/fixtures/configs/trusted-server.trace.toml INTEGRATION_BIDDER_ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT" ARTIFACTS_DIR="$ARTIFACTS_DIR/trace" ./scripts/generate-integration-viceroy-configs.sh
+          trace_bidder_origin=http://127.0.0.1
+          INTEGRATION_APP_CONFIG_PATH=crates/trusted-server-integration-tests/fixtures/configs/trusted-server.trace.toml INTEGRATION_BIDDER_ORIGIN_URL="$trace_bidder_origin:$ORIGIN_PORT" ARTIFACTS_DIR="$ARTIFACTS_DIR/trace" ./scripts/generate-integration-viceroy-configs.sh
           INTEGRATION_APP_CONFIG_PATH=crates/trusted-server-integration-tests/fixtures/configs/trusted-server.trace-auth.toml ARTIFACTS_DIR="$ARTIFACTS_DIR/trace-auth" ./scripts/generate-integration-viceroy-configs.sh
         env:
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}

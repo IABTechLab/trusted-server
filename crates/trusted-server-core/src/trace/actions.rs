@@ -535,7 +535,7 @@ mod tests {
             (
                 "https",
                 "[2001:db8::1]",
-                "https://[2001:0DB8:0:0:0:0:0:1]:443",
+                "https://[2001:0DB8:0:0:0:0:0:1]:443", // allow-domain: 2001:db8::1
                 "[2001:DB8::1]:443",
             ),
         ] {
@@ -566,13 +566,17 @@ mod tests {
             "https://@publisher.example",
             "https://example-user@publisher.example",
             "https://publisher.example\\",
-            "https://publisher.example,https://publisher.example",
+            concat!(
+                "https://publisher.example",
+                ",",
+                "https://publisher.example"
+            ),
             " https://publisher.example",
             "https://publisher.example ",
             "https://publisher.example\t",
             "https://publisher.example:",
-            "https://publisher.example:+443",
-            "https://publisher.example:65536",
+            concat!("https://publisher.example", ":+443"),
+            "https://publisher.example:65536", // allow-domain: publisher.example:65536
             "null",
             "file://publisher.example",
             "https://",
