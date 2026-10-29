@@ -3955,6 +3955,75 @@ describe('installTsRenderBridge', () => {
     }
   });
 
+  it('rejects a server-side APS failure relayed by a replacement frame in the same slot', async () => {
+    const renderer = apsRenderer();
+    const store = new GptDiagnosticsStore({ defer: () => undefined });
+    (window as TestWindow).tsjs.gptDiagnosticsRecorder = store as never;
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: renderer.bidId,
+      hb_bidder: 'aps',
+      hb_pb: '1.23',
+      renderer,
+    };
+
+    try {
+      const bridgeListener = await captureBridgeListener();
+      const slotElement = document.createElement('div');
+      slotElement.id = 'div-header';
+      document.body.appendChild(slotElement);
+      const servedFrame = document.createElement('iframe');
+      slotElement.appendChild(servedFrame);
+      const servedSource = servedFrame.contentWindow!;
+
+      const slot = {
+        getSlotElementId: () => 'div-header',
+        getAdUnitPath: () => '/example/div-header',
+      };
+      (window as TestWindow).tsjs.divToSlotId = { 'div-header': 'homepage_header' };
+      store.recordTrustedServerOpportunity(slot, 'homepage_header', 'renderable_candidate');
+      store.recordSlotRequested(slot);
+
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
+          ports: [{ postMessage: () => {} }],
+          source: servedSource,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+
+      // The publisher refreshes the slot and Ad Manager places a different
+      // creative in it, starting a new cycle. The old ad ID is public targeting,
+      // so the replacement frame can name it.
+      servedFrame.remove();
+      const replacementFrame = document.createElement('iframe');
+      slotElement.appendChild(replacementFrame);
+      store.recordSlotRequested(slot);
+
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: {
+            message: APS_RENDER_FAILED_MESSAGE,
+            adId: renderer.bidId,
+            reason: 'nonce_mismatch',
+          },
+          source: replacementFrame.contentWindow,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+
+      const cycles = store.snapshot().slots[0].requests;
+      for (const [index, cycle] of cycles.entries()) {
+        expect(
+          cycle.trustedServerCreativeFailures,
+          `should not record a failure on cycle ${index + 1}`
+        ).toBeUndefined();
+      }
+    } finally {
+      delete (window as TestWindow).tsjs.gptDiagnosticsRecorder;
+    }
+  });
+
   it('records a relayed APS render failure for a server-side APS winner', async () => {
     const renderer = apsRenderer();
     const store = new GptDiagnosticsStore({ defer: () => undefined });

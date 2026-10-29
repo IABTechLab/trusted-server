@@ -1918,6 +1918,20 @@ interface ApsConsumedTombstone {
   iframe: HTMLIFrameElement;
 }
 
+/**
+ * A consumed server-side APS capability, tracked per slot.
+ *
+ * `iframe` is the frame the capability was served to, for the same reason the
+ * Prebid tombstone keeps one: the slot outlives the frame. A refresh can place
+ * a different creative in the slot, and the ad ID is public targeting, so
+ * authenticating only against the slot would let that later frame record a
+ * reason against a cycle Trusted Server never served.
+ */
+interface ApsConsumedServerCapability {
+  adId: string;
+  iframe: HTMLIFrameElement;
+}
+
 /** Maximum number of consumed APS Prebid IDs retained as security tombstones. */
 const MAX_CONSUMED_PREBID_APS_IDS = 256;
 
@@ -1991,7 +2005,7 @@ export function installTsRenderBridge(): void {
   const consumedPrebidApsIds = new Map<string, ApsConsumedTombstone>();
   // One consumed APS ad ID per slot is sufficient: a newer bid replaces the
   // slot's old ad ID in `window.tsjs.bids`, so the ownership guard rejects it.
-  const consumedServerApsBySlot = new Map<string, string>();
+  const consumedServerApsBySlot = new Map<string, ApsConsumedServerCapability>();
 
   window.addEventListener('message', (e: MessageEvent) => {
     let data: Record<string, unknown>;
@@ -2028,10 +2042,19 @@ export function installTsRenderBridge(): void {
           }
         } else {
           // Server-side APS winners are served the same renderer and emit the
-          // same relay, but are tracked per slot. `hb_adid` is not unique per
-          // slot, so require the sender to sit in the slot that consumed it.
-          for (const [slotId, consumedAdId] of consumedServerApsBySlot) {
-            if (consumedAdId === failedAdId && sourceFrameForSlotId(e.source, slotId)) {
+          // same relay, but are tracked per slot. Bind the report to the frame
+          // the capability was served to, as the Prebid path does: the slot
+          // outlives the frame, so a replacement creative in the same slot could
+          // otherwise name the old ad ID and record against a cycle Trusted
+          // Server never served. The slot check stays so the frame must also
+          // still be the live one for that slot.
+          for (const [slotId, consumed] of consumedServerApsBySlot) {
+            if (
+              consumed.adId === failedAdId &&
+              e.source &&
+              consumed.iframe.contentWindow === e.source &&
+              sourceFrameForSlotId(e.source, slotId)
+            ) {
               failedSlotId = slotId;
               break;
             }
@@ -2161,10 +2184,10 @@ export function installTsRenderBridge(): void {
       // This slot and ad ID belong to TS, so fail closed before validating the
       // descriptor and never let native Prebid answer a rejected or replayed request.
       e.stopImmediatePropagation();
-      if (consumedServerApsBySlot.get(slotId) === adId) return;
+      if (consumedServerApsBySlot.get(slotId)?.adId === adId) return;
       const renderer = validateApsRenderer(matchedBid.renderer);
       if (!renderer) return;
-      consumedServerApsBySlot.set(slotId, adId);
+      consumedServerApsBySlot.set(slotId, { adId, iframe: sourceSlotFrame.iframe });
       void Promise.resolve(
         dispatchApsRendering({
           slotId,
