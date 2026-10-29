@@ -19,3 +19,8 @@ updates:
     directory: "docs/" # Location of package manifests
     schedule:
       interval: "weekly"
+
+  - package-ecosystem: "docker" # See documentation for possible values
+    directory: "crates/trusted-server-integration-tests/fixtures/frameworks/wordpress/" # Location of package manifests
+    schedule:
+      interval: "weekly"

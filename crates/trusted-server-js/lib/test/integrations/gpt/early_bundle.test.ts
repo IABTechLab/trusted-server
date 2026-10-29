@@ -173,6 +173,22 @@ describe('compiled early GPT entry', () => {
     };
   }
 
+  function apsCandidate(f: ReturnType<typeof fixture>) {
+    candidate(f);
+    const bid = envelope.seatbid[0].bid[0];
+    f.ts.bids!.header.renderer = {
+      type: 'aps',
+      version: 1,
+      accountId: 'example-account-id',
+      bidId: bid.id,
+      tagType: bid.ext.tagtype as 'iframe',
+      creativeUrl: bid.ext.creativeurl,
+      aaxResponse: Buffer.from(JSON.stringify(envelope)).toString('base64'),
+      width: bid.w,
+      height: bid.h,
+    };
+  }
+
   it('installs real rendering before core flushes publisher callbacks', () => {
     const f = fixture();
     candidate(f);
@@ -284,19 +300,7 @@ describe('compiled early GPT entry', () => {
 
   it('captures publisher-native APS mode before either runtime or publisher script runs', async () => {
     const f = fixture({ 'data-ts-aps-rendering-mode': 'publisher_native' });
-    candidate(f);
-    const bid = envelope.seatbid[0].bid[0];
-    f.ts.bids!.header.renderer = {
-      type: 'aps',
-      version: 1,
-      accountId: 'example-account-id',
-      bidId: bid.id,
-      tagType: bid.ext.tagtype as 'iframe',
-      creativeUrl: bid.ext.creativeurl,
-      aaxResponse: Buffer.from(JSON.stringify(envelope)).toString('base64'),
-      width: bid.w,
-      height: bid.h,
-    };
+    apsCandidate(f);
     f.installEarly();
     f.register();
     f.ts.scheduleInitialAdInit!(f.ts.bids, [configured]);
@@ -306,9 +310,55 @@ describe('compiled early GPT entry', () => {
     expect(runner).toBeDefined();
     expect(runner.getAttribute('sandbox')).toBeNull();
     const script = runner.contentDocument!.querySelector('script')!;
-    expect(script.src).toBe('https://client.aps.amazon-adsystem.com/prebid-creative.js');
+    // Match the actual SDK URL selected by the native APS renderer.
+    expect(script.src).toBe('https://client.aps.amazon-adsystem.com/prebid-creative.js'); // allow-domain: client.aps.amazon-adsystem.com
     script.dispatchEvent(new f.win.Event('error'));
     await Promise.resolve();
+  });
+
+  it('preserves frame-bound APS failure relays across the deferred runtime takeover', () => {
+    const f = fixture();
+    apsCandidate(f);
+    const recordRequest = vi.fn(() => 7);
+    const recordFailure = vi.fn();
+    f.ts.gptDiagnosticsRecorder = {
+      recordTrustedServerOpportunity: vi.fn(),
+      recordTrustedServerCreativeRequest: recordRequest,
+      recordTrustedServerCreativeFailure: recordFailure,
+    } as unknown as TsjsApi['gptDiagnosticsRecorder'];
+    f.installEarly();
+    f.register();
+    f.ts.scheduleInitialAdInit!(f.ts.bids, [configured]);
+    f.flushFrames();
+    const served = f.requestCreative();
+    const source = served.iframe.contentWindow;
+    expect(served.port.postMessage).toHaveBeenCalledOnce();
+    const relay = (sender: typeof source, reason = 'frame_timeout') =>
+      f.win.dispatchEvent(
+        new f.win.MessageEvent('message', {
+          data: { message: 'trusted-server/aps/render-failed', adId: 'early-ad', reason },
+          source: sender,
+        })
+      );
+    relay(source);
+    expect(recordRequest).toHaveBeenCalledExactlyOnceWith('header');
+    expect(recordFailure).toHaveBeenCalledExactlyOnceWith(7, 'aps_frame_timeout');
+
+    const addListener = vi.spyOn(f.win, 'addEventListener');
+    f.win.eval(runtimeSource);
+    expect(addListener.mock.calls.filter(([name]) => name === 'message')).toHaveLength(0);
+    relay(source);
+    expect(recordFailure).toHaveBeenCalledTimes(2);
+    expect(f.nativeRefresh).toHaveBeenCalledOnce();
+
+    relay(source, '__proto__');
+    const foreign = f.win.document.createElement('iframe');
+    f.win.document.getElementById('header-final')!.appendChild(foreign);
+    relay(foreign.contentWindow);
+    served.iframe.remove();
+    relay(source);
+    expect(recordFailure).toHaveBeenCalledTimes(2);
+    expect(recordRequest).toHaveBeenCalledTimes(2);
   });
 
   it('adopts a pre-runtime navigation without replaying the SSR payload or changing its generation', async () => {

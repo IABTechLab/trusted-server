@@ -12,6 +12,7 @@ smoke_require_command curl
 smoke_require_command python3
 smoke_require_command spin
 smoke_require_command pgrep
+smoke_require_spin_version
 
 WORKSPACE=$(smoke_make_workspace spin)
 ORIGIN_PORT=${SPIN_SMOKE_ORIGIN_PORT:-19189}

@@ -56,10 +56,10 @@ domains, identifiers, targeting values, or raw browser captures belong in Git.
   `refresh([slot])` request. This also allows selection of an SRA batch without
   requesting unrelated defined slots.
 
-References: [GPT reference](https://developers.google.com/publisher-tag/reference),
-[loading and refresh](https://developers.google.com/publisher-tag/guides/control-ad-loading),
-[React integration guidance](https://developers.google.com/publisher-tag/samples/integrations/react),
-and [SRA batching](https://developers.google.com/publisher-tag/samples/control-sra-batching).
+References: [GPT reference](https://developers.google.com/publisher-tag/reference), <!-- allow-domain: developers.google.com -->
+[loading and refresh](https://developers.google.com/publisher-tag/guides/control-ad-loading), <!-- allow-domain: developers.google.com -->
+[React integration guidance](https://developers.google.com/publisher-tag/samples/integrations/react), <!-- allow-domain: developers.google.com -->
+and [SRA batching](https://developers.google.com/publisher-tag/samples/control-sra-batching). <!-- allow-domain: developers.google.com -->
 
 ## 2. Outcome and scope
 

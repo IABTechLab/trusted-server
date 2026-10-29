@@ -1,7 +1,8 @@
 //! Simplified HTML processor that combines URL replacement and integration injection
 //!
 //! This module provides a `StreamProcessor` implementation for HTML content.
-use std::cell::Cell;
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -25,25 +26,50 @@ use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
 use crate::tsjs;
 
-struct HtmlWithStreamingProcessors {
+pub(crate) mod finish;
+
+use finish::HtmlProcessorStage;
+
+pub(crate) struct HtmlWithStreamingProcessors {
     inner: Box<dyn StreamProcessor>,
-    processors: Vec<Box<dyn StreamProcessor>>,
+    stages: Vec<HtmlProcessorStage>,
+    finish_index: Option<usize>,
+    finish_marker: Option<Vec<u8>>,
 }
 
+// This composite uses begin_finish/finish_next rather than the leaf async_finish
+// callback so each completed stage can release output before the next one awaits.
 impl StreamProcessor for HtmlWithStreamingProcessors {
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
+        self.validate_capabilities()?;
+        if is_last && self.requires_async_finish() {
+            return Err(io::Error::other(
+                "HTML processors require asynchronous EOF completion",
+            ));
+        }
         let mut output = self.inner.process_chunk(chunk, is_last)?;
-        for processor in &mut self.processors {
-            output = processor.process_chunk(&output, is_last)?;
+        for stage in &mut self.stages {
+            output = stage.process(
+                &output,
+                is_last,
+                self.finish_marker.as_ref().map_or(0, Vec::len),
+            )?;
         }
         Ok(output)
     }
 
     fn reset(&mut self) {
         self.inner.reset();
-        for processor in &mut self.processors {
-            processor.reset();
+        for stage in &mut self.stages {
+            stage.reset();
         }
+        self.finish_index = None;
+    }
+
+    fn requires_async_finish(&self) -> bool {
+        self.stages
+            .iter()
+            .any(HtmlProcessorStage::requires_async_finish)
     }
 }
 
@@ -242,8 +268,19 @@ impl HtmlProcessorConfig {
     reason = "the returned processor owns request configuration captured by its handlers"
 )]
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
+    create_html_processor_with_document_state(config, &IntegrationDocumentState::default())
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "static parser callbacks capture owned request configuration"
+)]
+pub(crate) fn create_html_processor_with_document_state(
+    config: HtmlProcessorConfig,
+    document_state: &IntegrationDocumentState,
+) -> HtmlWithStreamingProcessors {
     let stream_processor_factories = config.integrations.html_stream_processor_factories();
-    let document_state = IntegrationDocumentState::default();
+
     if config.suppress_datadome_client_side_tag {
         document_state.get_or_insert_with(DATADOME_INTEGRATION_ID, || DataDomeClientTagSuppressed);
     }
@@ -718,36 +755,65 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         }));
     }
 
-    for script_rewriter in script_rewriters {
-        let selector = script_rewriter.selector();
-        let rewriter = script_rewriter.clone();
-        let patterns = patterns.clone();
-        let document_state = document_state.clone();
-        element_content_handlers.push(text!(selector, {
-            let rewriter = rewriter.clone();
-            let patterns = patterns.clone();
-            let document_state = document_state.clone();
-            move |text| {
+    // Selector callbacks retain lol_html's CSS matching; only the composed text
+    // callback mutates a fragment. Start each script with fresh match state.
+    // Match flags are flat: nested SVG scripts do not restore an outer script's
+    // flags when the inner script ends.
+    // Without script rewriters, skip script text capture entirely.
+    if !script_rewriters.is_empty() {
+        let script_matches = Rc::new(RefCell::new(vec![false; script_rewriters.len()]));
+        let reset_matches = script_matches.clone();
+        element_content_handlers.push(element!("script", move |_el| {
+            reset_matches.borrow_mut().fill(false);
+            Ok(())
+        }));
+        for (index, rewriter) in script_rewriters.iter().enumerate() {
+            let matches = script_matches.clone();
+            element_content_handlers.push(element!(rewriter.selector(), move |_el| {
+                matches.borrow_mut()[index] = true;
+                Ok(())
+            }));
+        }
+        let script_patterns = patterns.clone();
+        let script_document_state = document_state.clone();
+        element_content_handlers.push(text!("script", move |text| {
+            let mut working = Cow::Borrowed(text.as_str());
+            let mut changed = false;
+            for (rewriter, matched) in script_rewriters.iter().zip(script_matches.borrow().iter()) {
+                if !matched {
+                    continue;
+                }
                 let ctx = IntegrationScriptContext {
-                    selector,
-                    request_host: &patterns.request_host,
-                    request_scheme: &patterns.request_scheme,
-                    origin_host: &patterns.origin_host,
+                    selector: rewriter.selector(),
+                    request_host: &script_patterns.request_host,
+                    request_scheme: &script_patterns.request_scheme,
+                    origin_host: &script_patterns.origin_host,
                     is_last_in_text_node: text.last_in_text_node(),
                     max_buffered_script_bytes: config.max_buffered_body_bytes,
-                    document_state: &document_state,
+                    document_state: &script_document_state,
                 };
-                match rewriter.rewrite(text.as_str(), &ctx) {
+                match rewriter.rewrite(&working, &ctx) {
                     ScriptRewriteAction::Keep => {}
                     ScriptRewriteAction::Replace(rewritten) => {
-                        text.replace(&rewritten, ContentType::Text);
+                        working = Cow::Owned(rewritten);
+                        changed = true;
                     }
                     ScriptRewriteAction::RemoveNode => {
-                        text.remove();
+                        working = Cow::Borrowed("");
+                        changed = true;
                     }
                 }
-                Ok(())
             }
+            if changed {
+                if working.is_empty() {
+                    text.remove();
+                } else if let Cow::Owned(rewritten) = working {
+                    // Script is raw text: HTML entities would change JS/JSON data.
+                    // Emit composed source verbatim rather than escaping it again.
+                    text.replace(&rewritten, ContentType::Html);
+                }
+            }
+            Ok(())
         }));
     }
 
@@ -765,14 +831,19 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         origin_host: config.origin_host.clone(),
         document_state: document_state.clone(),
     };
-    let processors = stream_processor_factories
+    let stages = stream_processor_factories
         .into_iter()
-        .map(|factory| factory.create(stream_context.clone()))
+        .map(|factory| {
+            HtmlProcessorStage::new(
+                factory.integration_id(),
+                factory.create(stream_context.clone()),
+                factory.requires_async_finish(),
+                factory.buffer_output_until_eof(),
+                config.max_buffered_body_bytes,
+            )
+        })
         .collect();
-    HtmlWithStreamingProcessors {
-        inner: Box::new(inner),
-        processors,
-    }
+    HtmlWithStreamingProcessors::from_stages(Box::new(inner), stages)
 }
 
 #[cfg(test)]
@@ -780,7 +851,7 @@ mod tests {
     use super::*;
     use crate::integrations::{
         AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-        IntegrationHeadInjector, IntegrationHtmlContext,
+        IntegrationHeadInjector, IntegrationHtmlContext, IntegrationScriptRewriter,
     };
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::create_test_settings;
@@ -1020,6 +1091,47 @@ mod tests {
         }
     }
 
+    struct SuppressingScript;
+    impl IntegrationScriptRewriter for SuppressingScript {
+        fn integration_id(&self) -> &'static str {
+            "suppress"
+        }
+        fn selector(&self) -> &'static str {
+            "script[data-suppress='yes']"
+        }
+        fn rewrite(&self, _text: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
+            assert_eq!(
+                ctx.selector,
+                self.selector(),
+                "should pass the registered selector to the suppressing stage"
+            );
+            ScriptRewriteAction::RemoveNode
+        }
+    }
+
+    struct FlushingScript;
+    impl IntegrationScriptRewriter for FlushingScript {
+        fn integration_id(&self) -> &'static str {
+            "flush"
+        }
+        fn selector(&self) -> &'static str {
+            "script#flush"
+        }
+        fn rewrite(&self, text: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
+            assert_eq!(
+                ctx.selector,
+                self.selector(),
+                "should pass the registered selector to the flushing stage"
+            );
+            assert!(text.is_empty(), "should see upstream suppression");
+            if ctx.is_last_in_text_node {
+                ScriptRewriteAction::Replace("flushed-once".into())
+            } else {
+                ScriptRewriteAction::Keep
+            }
+        }
+    }
+
     #[test]
     fn supported_gpt_profile_emits_early_bootstrap_and_deferred_runtime() {
         let mut settings = create_test_settings();
@@ -1079,6 +1191,86 @@ mod tests {
             runtime < prebid,
             "should keep deferred runtime before Prebid"
         );
+    }
+
+    #[test]
+    fn script_actions_compose_with_selector_reset_and_empty_final_flush() {
+        let mut config = create_test_config();
+        config.integrations = IntegrationRegistry::from_rewriters(
+            Vec::new(),
+            vec![Arc::new(SuppressingScript), Arc::new(FlushingScript)],
+        );
+        let mut processor = create_html_processor(config);
+        let mut output = processor
+            .process_chunk(b"<script id='flush' data-suppress='yes'>first_", false)
+            .expect("should accept first fragment");
+        output.extend(
+            processor
+                .process_chunk(b"second</script><script>ordinary_</script>", true)
+                .expect("should finalize all matching stages"),
+        );
+        let output = String::from_utf8(output).expect("should emit UTF-8");
+        assert!(
+            output.contains("<script id='flush' data-suppress='yes'>flushed-once</script>"),
+            "should flush downstream even on suppressed final: {output}"
+        );
+        assert!(
+            output.contains("<script>ordinary_</script>"),
+            "should reset CSS match state between scripts"
+        );
+        assert_eq!(
+            output.matches("flushed-once").count(),
+            1,
+            "should emit the flushed fragment exactly once"
+        );
+    }
+
+    #[test]
+    fn terminal_document_state_exposes_parser_observations() {
+        struct ArticleObserver;
+        impl IntegrationScriptRewriter for ArticleObserver {
+            fn integration_id(&self) -> &'static str {
+                "example_article"
+            }
+            fn selector(&self) -> &'static str {
+                "script[type='text/plain']"
+            }
+            fn rewrite(
+                &self,
+                content: &str,
+                context: &IntegrationScriptContext<'_>,
+            ) -> ScriptRewriteAction {
+                context
+                    .document_state
+                    .get_or_insert_with("example_article", || content.to_string());
+                ScriptRewriteAction::Keep
+            }
+        }
+        for text in ["Example first article", "Example second article"] {
+            let state = IntegrationDocumentState::default();
+            let mut config = create_test_config();
+            config.integrations =
+                IntegrationRegistry::from_rewriters(Vec::new(), vec![Arc::new(ArticleObserver)]);
+            let mut processor = create_html_processor_with_document_state(config, &state);
+            let _ = processor
+                .process_chunk(
+                    format!("<html><body><script type='text/plain'>{text}</script></body></html>")
+                        .as_bytes(),
+                    false,
+                )
+                .expect("should process article HTML");
+            let _ = processor
+                .process_chunk(&[], true)
+                .expect("should close the synchronous parser");
+            let article = state
+                .get::<String>("example_article")
+                .expect("should expose parser state to the terminal phase");
+            assert_eq!(
+                article.as_str(),
+                text,
+                "should expose the text observed by this document's parser"
+            );
+        }
     }
 
     #[test]
@@ -1840,22 +2032,34 @@ mod tests {
         let inner_final_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let first_final_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let second_final_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut processor = HtmlWithStreamingProcessors {
-            inner: Box::new(DecoratingProcessor {
+        let mut processor = HtmlWithStreamingProcessors::from_stages(
+            Box::new(DecoratingProcessor {
                 prefix: b'I',
                 final_calls: Arc::clone(&inner_final_calls),
             }),
-            processors: vec![
-                Box::new(DecoratingProcessor {
-                    prefix: b'A',
-                    final_calls: Arc::clone(&first_final_calls),
-                }),
-                Box::new(DecoratingProcessor {
-                    prefix: b'B',
-                    final_calls: Arc::clone(&second_final_calls),
-                }),
+            vec![
+                HtmlProcessorStage::new(
+                    "A",
+                    Box::new(DecoratingProcessor {
+                        prefix: b'A',
+                        final_calls: Arc::clone(&first_final_calls),
+                    }),
+                    false,
+                    false,
+                    64,
+                ),
+                HtmlProcessorStage::new(
+                    "B",
+                    Box::new(DecoratingProcessor {
+                        prefix: b'B',
+                        final_calls: Arc::clone(&second_final_calls),
+                    }),
+                    false,
+                    false,
+                    64,
+                ),
             ],
-        };
+        );
 
         assert_eq!(
             processor

@@ -73,7 +73,10 @@ fn generate(app_config: &str, loopback_origin: &str) -> Result<(String, Value), 
         || !origin.username().is_empty()
         || origin.password().is_some()
     {
-        return Err("fixture origin must be http://127.0.0.1:PORT without a path prefix".into());
+        return Err(
+            "fixture origin must be a loopback HTTP URL with an explicit port and no path prefix"
+                .into(),
+        );
     }
     let app: TrustedServerAppConfig = toml::from_str(app_config)?;
     let app = TrustedServerAppConfig::new(app.into_settings())?;

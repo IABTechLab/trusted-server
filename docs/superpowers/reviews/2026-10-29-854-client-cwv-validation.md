@@ -1,8 +1,82 @@
 # Issue 854 client CWV validation
 
-Status: Implementation and local validation complete. Hosted checks pending after push. No deployment or production activation performed.
+Status: Merge integration behavior checks complete. The merged-tree URL-lint preflight passes; the committed-branch check and final evidence update follow the merge commit. Hosted checks require the push. No deployment or production activation performed.
 
 [Spec](../specs/2026-10-29-854-client-cwv-completion-design.md) · [Plan](../plans/2026-10-29-854-client-cwv-completion-plan.md)
+
+## Validation after merging main
+
+The first implementation push was `0235533c7bac92716a05e6c6e7ec91a9048d9fe7`. PR1460 then conflicted with newer main. The merged source combines that commit with `21f43aa0138498023455789f152f5a864bbefe24`. The records below validate the combined checkout, not just the earlier branch. All later sections retain the earlier evidence separately.
+
+The merged checkout pins Node 24.20.0, Rust 1.98.1 and Viceroy 0.21.0. Browser tests still use Chromium 145.0.7632.6. Fresh JS dependencies came from the merged lockfile. One coordinator owns Cargo with `CARGO_TARGET_DIR=$HOME/.cache/trusted-server-854-merged-target`, four build jobs, zero dev/test debug info and incremental compilation disabled. The new evidence directory is `/tmp/ts-854-cwv/merge/`.
+
+Conflict resolution preserves upstream asynchronous HTML EOF processing, origin response-header rewriting, response status and range ownership. It retains this PR's actual request path, conservative CSP capture and reservation policy. The new EOF driver receives the actual path and CSP decision. The shared GPT render bridge includes upstream APS failure-reason validation, iframe-bound consumed-capability records and timeout-derived retention. Early/runtime installation and registration admission guards remain intact.
+
+### Updated checks and artifacts
+
+| Check                           | Result                                                                                   | Evidence under `merge/`                             |
+| ------------------------------- | ---------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| Full JS suite                   | 1,519 tests across 52 files passed; full lint and format passed                          | `js-final-{full,lint,format}.log`                   |
+| Focused GPT/APS suite           | 671 tests across nine files passed, including early/runtime APS failure relay            | `gpt-focused.log`                                   |
+| Native core                     | Unmodified Cargo invocation passed 3,197 core tests plus two ten-test integration suites | `evidence/gates/core-native.log`                    |
+| Fixture, launcher and CWV units | All 21 passed                                                                            | `evidence/browser-units.log`                        |
+| Updated lab                     | All 61 passed, including 40 repeated measurements                                        | `evidence/cwv/`                                     |
+| Offline registration            | All 109 passed                                                                           | `evidence/offline-registration/`                    |
+| Actual Rust/Next.js             | All 40 passed, 20 inline and 20 shared-template                                          | `evidence/framework/`                               |
+| Real APS Universal Creative     | All six passed, no skips or flaky cases                                                  | `standard/results.json`                             |
+| Node pin guard                  | All 30 tests passed; all 27 jobs pin Node before compiling Rust                          | Coordinator output                                  |
+| Documentation proposal scripts  | All 20 Node tests, shell tests and ShellCheck passed                                     | Coordinator output and `evidence/docs-proposal.log` |
+| Changed integration workflow    | actionlint passed                                                                        | `evidence/actionlint.log`                           |
+| Publisher-registration launcher | ShellCheck passed                                                                        | `evidence/shellcheck-publisher.log`                 |
+
+With `TSJS_PREBUILT_DIR` unset, the fresh release build passed in 1m56s. All 14 complete JS module strings match the independent distribution and occur byte-for-byte in the frozen WASM. WASM SHA-256 is `dad40087f6123d73b8465d774bd3212e7b25b4d6c8ce3051579f263e0d117f23`.
+
+The new Next.js image is `test-nextjs:publisher-registration-b78c3cc44c54194e`. It uses Node 24.20.0 and a new source label because `.tool-versions` contributes to the image fingerprint. The older image was not reused. The two actual framework runs passed in 13.4 s and 14.2 s.
+
+The lab, offline suite and framework cases use freshly generated Prebid 10.26.0 with Rubicon and SharedId, SHA-256 `32a7f07131047948134510d57c7f4eeb832e1ae0c75d8b61d6fd38aab2be780c`. The APS suite separately uses the exact ordinary CI build request, Rubicon with the builder's default user-ID modules. That artifact is 314,643 bytes, SHA-256 `166d18ff74d4e9d023a01468ee433d4f5b75b9fd7c7ab60639f0396a74d9072b`. These profiles are not interchangeable evidence. All 14 runtime hashes and tracked source files stayed unchanged during the APS run.
+
+### Updated controlled measurements
+
+The unchanged `c36c82df43c2f62a59444290f863f736b579ed33` archive remains the baseline. Current exports include upstream main, newer Node/Rust and build-dependency changes. This comparison does not isolate the effect of this PR from those changes. The 750 ms runtime hold, five alternating samples per group, viewport sizes, fictional transport and session-window CLS calculation are unchanged. The host is unthrottled and shared; these are not field CWV results.
+
+| Viewport    | Arm              | FCP/LCP median and range, ms | CLS median | Native request median, ms | Visible estimate median, ms |
+| ----------- | ---------------- | ---------------------------- | ---------- | ------------------------- | --------------------------- |
+| 390 × 844   | Baseline         | 792, 784 to 792              | 0.207065   | 808                       | 1006.2                      |
+| 390 × 844   | Loading only     | 32, 28 to 36                 | 0.207065   | 778                       | 972.3                       |
+| 390 × 844   | Reservation only | 784, 784 to 792              | 0          | 804                       | 1002.3                      |
+| 390 × 844   | Combined         | 36, 32 to 40                 | 0          | 780                       | 978.1                       |
+| 1280 × 1000 | Baseline         | 792, 788 to 800              | 0.111133   | 810                       | 1008.4                      |
+| 1280 × 1000 | Loading only     | 44, 40 to 52                 | 0.111133   | 775                       | 973.8                       |
+| 1280 × 1000 | Reservation only | 792, 792 to 800              | 0          | 800                       | 993.0                       |
+| 1280 × 1000 | Combined         | 44, 44 to 52                 | 0          | 780                       | 979.7                       |
+
+The reservation-only arm still adds only the exact current Rust-generated CSS to baseline HTML. The request/visible differences are local fixture observations, not proof of production ad-startup improvements. Full ranges and observer data are in `evidence/measurement-summary.json` and `evidence/cwv/`.
+
+Transfer cost remains a tradeoff. Raw inline JS is 57,550 bytes in baseline and 114,153 in current output. The retained raw bootstrap is 56,429 bytes; the compiled early entry adds 56,602 bytes. Fetched runtime is 91,321 bytes in baseline and 58,251 in current. Estimated combined HTML/runtime gzip grows from 42,104 to 50,583 bytes, an increase of 8,479. Brotli grows from 35,452 to 44,459 bytes. The increase includes upstream and build-dependency changes; it is not a size-reduction claim.
+
+Frozen export manifest hashes are `209171eda4cedf472ef6b372bcc05bdf354cb90000970d61ea7c965a774a814f` for loading, `ccfc8084527da2e851f6dfea9272d5c44135a55448b0dd1d34159ba02e157006` for combined and the unchanged `e903286285cab8ca79d0b334e6012a136f7d76975a813dc00eeb76d54664b5fe` for baseline. Final samples hash is `31abb8fd74e77bd195c523385bf5a1c4ceac10685861005d1002fff348bf284b`.
+
+### Retained failures and limits in the merged checkout
+
+Initial browser attempts failed or stalled, including a Chromium SIGTRAP and later GPU-process/Mojo failures. Failed outputs and `evidence/chromium-crash-analysis.md` remain available. Serial retries passed the same 61 and 109 cases without source changes, weaker assertions or different browser flags. The crash cause is unproven; the evidence does not establish OOM, a process limit or an application defect.
+
+One WASM-copy attempt hit the temporary-file quota and produced an incomplete copy. It was not accepted as a validated artifact. Moving only this session's old 7.1 GB Cargo cache to `$HOME/.cache/trusted-server-854-premerge-target` restored room. A symlink preserves its old `/tmp/ts-854-cwv/target` paths. The copy retry matched the source binary, passed all 14 embedded-module checks and then passed the actual framework gate.
+
+Standalone `tsc --noEmit` still fails, with 393 output lines and 320 primary diagnostics. A same-lock main archive also fails, with 385 lines and 318 diagnostics. Every current file/code/message signature occurs in either that main archive or the earlier branch baseline; no new merge signature appears. There are no diagnostics in the extracted GPT helpers or early-bundle test. Comparison: `tsc-comparison.json`. The older Cargo-injected native Settings failure is historical; the ordinary merged Cargo invocation now passes.
+
+Whole-repository actionlint still reports unchanged upstream workflow issues, including unquoted output variables and unsupported new workflow keys/permissions. The changed integration workflow passes separately. These extra whole-repository diagnostics are not represented as a clean result or fixed outside this PR's scope.
+
+All 26 backend, native, Clippy, docs, clock and EOF commands other than the committed-branch URL check passed. This includes actual Axum and Fastly auction/EOF controls with disabled, successful and hung finalizers. Their exact commands and timings are retained in `evidence/gates/results.tsv`.
+
+The URL linter reads committed trees. Its first invocation still examined the earlier branch HEAD and reported seven older URLs. Fixes retain official documentation/source references and the actual APS SDK assertion with reviewed per-line exceptions, without adding global allowlist entries. The fixture's symbolic-port error text no longer contains an invalid URL. Three helper tests, helper Clippy, eight early-bundle tests and scoped JS lint/format pass. Explicit-file lint and an exact merged-tree commit snapshot pass. Staged mode also reports unrelated upstream documentation because the merge index includes main's changes; those are outside the resulting PR diff and were not modified. The committed-branch check follows the merge commit.
+
+Independent merge correctness and architecture reviews found no defects. They compared moved APS functions and the complete EOF driver against exact main-parent code, and verified actual path/CSP/status/range/header ownership. The original reviewed fingerprint was `0a0130289e0a8e2f090bc323f604349182bf4030b64d0a6b113227b41e3a3cb2`. The final lint-only cleanup changes a fixture error message, one test comment and historical reference comments; production runtime sources remain unchanged. The new code fingerprint is `9df748852ddce84d766bab2b8241bebf3a46f31a720f62f9a0e52a70d533b270`.
+
+Hosted CI remains pending the merge push. Real GPT/GAM, customer pages, production activation and field CWV remain unverified and require separate approval.
+
+## Historical premerge validation
+
+Everything below describes the earlier `0235533c7bac92716a05e6c6e7ec91a9048d9fe7` implementation, before merging main. Its older tool pins, measurements, cache path, failures and 21-gate results do not describe the merged checkout above.
 
 ## Baseline and environment
 

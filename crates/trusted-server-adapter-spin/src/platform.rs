@@ -727,7 +727,7 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
     #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
     let secret_store: Arc<dyn PlatformSecretStore> = Arc::new(NoopSecretStore);
 
-    RuntimeServices::builder()
+    let builder = RuntimeServices::builder()
         .config_store(config_store)
         .secret_store(secret_store)
         .kv_store(kv_store)
@@ -744,8 +744,13 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
             h2_fingerprint: None,
             server_hostname: None,
             server_region: None,
-        })
-        .build()
+        });
+    #[cfg(all(feature = "spin", target_arch = "wasm32"))]
+    static TIMER: std::sync::OnceLock<Arc<dyn trusted_server_core::platform::PlatformTimer>> =
+        std::sync::OnceLock::new();
+    #[cfg(all(feature = "spin", target_arch = "wasm32"))]
+    let builder = builder.timer(Arc::clone(TIMER.get_or_init(|| Arc::new(SpinTimer))));
+    builder.build()
 }
 
 // ---------------------------------------------------------------------------
@@ -776,6 +781,18 @@ impl PlatformGeo for NullGeo {
 fn extract_client_ip(ctx: &edgezero_core::context::RequestContext) -> Option<IpAddr> {
     edgezero_adapter_spin::context::SpinRequestContext::get(ctx.request())
         .and_then(|c| c.client_addr)
+}
+
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+struct SpinTimer;
+
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+impl trusted_server_core::platform::PlatformTimer for SpinTimer {
+    fn delay(&self, duration: std::time::Duration) -> futures::future::LocalBoxFuture<'static, ()> {
+        Box::pin(async move {
+            spin_sdk::time::sleep(duration).await;
+        })
+    }
 }
 
 #[cfg(test)]

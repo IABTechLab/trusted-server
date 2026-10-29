@@ -97,7 +97,7 @@ Other inspection used `read`, `fffind`, `ffgrep` and narrow `rg` queries. `wc -l
 Pinned public upstream retrieval, all successful, used this command separately for each of `src/session.rs`, `src/wiggle_abi/req_impl.rs`, `src/error.rs`, `src/upstream.rs`, `src/config/backends.rs`:
 
 ```sh
-curl -fsSL --max-time 30 https://raw.githubusercontent.com/fastly/Viceroy/v0.17.0/<path>
+curl -fsSL --max-time 30 https://raw.githubusercontent.com/fastly/Viceroy/v0.17.0/<path> # allow-domain: raw.githubusercontent.com
 ```
 
 No requests went to an ad provider. Initial source discovery tried a nonexistent `platform/backend.rs` and a nonexistent local Viceroy registry source directory; corrected to `platform/backend_naming.rs` and the public pinned upstream. Those were lookup misses, not behavioral check failures.
