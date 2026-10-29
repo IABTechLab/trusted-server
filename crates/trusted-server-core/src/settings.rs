@@ -23,6 +23,7 @@ use crate::creative_opportunities::CreativeOpportunitiesConfig;
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
+use crate::proxy::{is_host_allowed, is_host_permitted};
 use crate::redacted::Redacted;
 
 #[cfg(test)]
@@ -679,37 +680,140 @@ impl Ec {
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct Rewrite {
-    /// List of domains to exclude from rewriting. Supports wildcards (e.g., "*.example.com").
-    /// URLs from these domains will not be proxied through first-party endpoints.
+    /// Hosts never rewritten, for assets and click-through links.
+    ///
+    /// Each entry is an exact host or `*.example.com`, which matches the apex
+    /// and any subdomain. Matching is case-insensitive. Wins over
+    /// [`Self::include_domains`].
     #[serde(default)]
     pub exclude_domains: Vec<String>,
+    /// When non-empty, the only hosts whose asset URLs are rewritten to
+    /// `/first-party/proxy`.
+    ///
+    /// Same pattern syntax as [`Self::exclude_domains`]. Empty (the default)
+    /// proxies every eligible asset URL. Never applies to click-through links.
+    /// The default is omitted from serialized config so older binaries, which
+    /// reject unknown fields, can still read it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[validate(custom(function = validate_include_domains))]
+    pub include_domains: Vec<String>,
 }
 
 impl Rewrite {
-    /// Checks if a URL should be excluded from rewriting based on domain matching
-    #[allow(dead_code)]
+    /// Returns `true` when an asset URL on `host` should be rewritten to
+    /// `/first-party/proxy`.
+    ///
+    /// The host must not match [`Self::exclude_domains`], and must match
+    /// [`Self::include_domains`] when that list is non-empty. Matching is
+    /// case-insensitive; see `crate::proxy::is_host_allowed` for the pattern rules.
     #[must_use]
-    pub fn is_excluded(&self, url: &str) -> bool {
-        // Parse URL to extract host
-        let Ok(parsed) = url::Url::parse(url) else {
-            return false;
-        };
+    pub fn should_proxy_asset(&self, host: &str) -> bool {
+        !self.is_excluded_host(host) && is_host_permitted(&self.include_domains, host)
+    }
 
-        let host = parsed.host_str().unwrap_or("");
+    /// Returns `true` when a click-through URL on `host` should be wrapped in
+    /// `/first-party/click`.
+    ///
+    /// Only [`Self::exclude_domains`] applies to click-through links.
+    #[must_use]
+    pub fn should_wrap_click(&self, host: &str) -> bool {
+        !self.is_excluded_host(host)
+    }
 
-        // Check exact domain matches (with wildcard support)
-        for domain in &self.exclude_domains {
-            if let Some(suffix) = domain.strip_prefix("*.") {
-                // Wildcard: *.example.com matches both example.com and sub.example.com
-                if host == suffix || host.ends_with(&format!(".{}", suffix)) {
-                    return true;
-                }
-            } else if host == domain {
-                return true;
-            }
+    fn is_excluded_host(&self, host: &str) -> bool {
+        self.exclude_domains
+            .iter()
+            .any(|pattern| is_host_allowed(host, pattern))
+    }
+
+    /// Trims and lowercases host patterns in place.
+    ///
+    /// Empty and bare `*` entries in `exclude_domains` are dropped with a
+    /// warning: neither can match a host, so dropping them changes no behavior.
+    /// Other entries that no URL host can match are kept and reported by
+    /// position, counted before that drop; see
+    /// [`Self::inert_exclude_domain_warnings`]. `ts config push` stores the
+    /// normalized list, so positions logged at the edge can sit lower than the
+    /// ones `ts config validate` prints when empty or `*` entries came first.
+    fn normalize(&mut self) {
+        let (exclude_domains, warnings) = Self::normalized_exclude_domains(&self.exclude_domains);
+        self.exclude_domains = exclude_domains;
+        self.include_domains = self
+            .include_domains
+            .iter()
+            .map(|pattern| pattern.trim().to_ascii_lowercase())
+            .collect();
+        for warning in &warnings {
+            log::warn!("{warning}");
         }
+    }
 
-        false
+    /// Returns the trimmed, lowercased `exclude_domains` entries without empty
+    /// and bare `*` entries, plus the warnings [`Self::normalize`] logs.
+    ///
+    /// Inert-entry warnings are built from `patterns` before the drop, so
+    /// their positions match the configured list.
+    fn normalized_exclude_domains(patterns: &[String]) -> (Vec<String>, Vec<String>) {
+        // An `exclude_domains` entry that can never equal a URL host keeps its
+        // host proxied and receiving `ts-ec`. Rejecting it would stop existing
+        // blobs from loading, so warn once per entry and keep it.
+        let mut warnings = Self::inert_exclude_domain_warnings(patterns);
+        let normalized: Vec<String> = patterns
+            .iter()
+            .map(|pattern| pattern.trim().to_ascii_lowercase())
+            .filter(|pattern| !pattern.is_empty() && pattern != "*")
+            .collect();
+        if normalized.len() < patterns.len() {
+            warnings.insert(
+                0,
+                "rewrite.exclude_domains: removed empty or bare \"*\" entries, which never match a host"
+                    .to_owned(),
+            );
+        }
+        (normalized, warnings)
+    }
+
+    /// Returns one warning per `exclude_domains` entry that never matches a URL
+    /// host.
+    ///
+    /// Each warning names the entry by its index in `patterns` and gives a
+    /// static reason. It never includes the raw value, which may be a pasted URL
+    /// carrying credentials or control characters. Empty and bare `*` entries
+    /// are skipped because [`Self::normalize`] drops them with its own warning.
+    fn inert_exclude_domain_warnings(patterns: &[String]) -> Vec<String> {
+        patterns
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pattern)| {
+                let pattern = pattern.trim().to_ascii_lowercase();
+                if pattern.is_empty() || pattern == "*" {
+                    return None;
+                }
+                Self::check_exclude_domain(&pattern).err().map(|reason| {
+                    format!(
+                        "rewrite.exclude_domains[{index}] never matches a URL host ({reason}); the entry is kept"
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Checks one normalized `exclude_domains` entry, returning why no fetched
+    /// URL can match it.
+    ///
+    /// Looser than the `include_domains` grammar on purpose: a trailing `.`, a
+    /// `_` and a wildcard IP address all still match a URL host, and a
+    /// trailing-dot entry is the only way to exclude `blocked.example.com.`.
+    fn check_exclude_domain(pattern: &str) -> Result<(), &'static str> {
+        let host = pattern.strip_prefix("*.").unwrap_or(pattern);
+        let labels = host.strip_suffix('.').unwrap_or(host);
+        if host.contains('*') {
+            Err("`*` other than a leading `*.`")
+        } else if labels.split('.').any(str::is_empty) {
+            Err("leading `.` or empty label")
+        } else {
+            check_host_round_trip(host)
+        }
     }
 }
 
@@ -3134,6 +3238,7 @@ impl Settings {
     pub(crate) fn normalize_deserialized(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.cache.normalize();
         self.proxy.normalize();
+        self.rewrite.normalize();
         self.image_optimizer.normalize()?;
         self.debug.auction_html_comment_options.normalize();
         self.tinybird.normalize();
@@ -3526,6 +3631,105 @@ impl Settings {
     {
         self.integrations.get_typed(integration_id)
     }
+}
+
+/// Rejects `rewrite.include_domains` entries that can never equal a URL host.
+///
+/// Runs after [`Rewrite::normalize`], so entries are already trimmed and
+/// lowercased. Entries are matched against [`Url::host_str`], so each one must
+/// be:
+///
+/// - a DNS name, optionally prefixed with `*.`: one or more `.`-separated,
+///   non-empty labels of ASCII `a-z`, `0-9`, `-` and `_`;
+/// - an IPv4 address in dotted-quad form, such as `192.0.2.1`; or
+/// - an IPv6 address in brackets and compressed form, such as `[2001:db8::1]`.
+///
+/// A scheme, port, path, space, leading or trailing `.`, empty label, wildcard
+/// IP address or unbracketed IPv6 address is rejected with
+/// `invalid_rewrite_include_domain`. A non-ASCII (IDN) name is rejected with
+/// `non_ascii_rewrite_include_domain`; write it in punycode (`xn--`) form.
+///
+/// Errors name the entry by its index, never its raw value, which may be a
+/// pasted URL carrying credentials. [`Rewrite::normalize`] drops no
+/// `include_domains` entries, so the index matches the operator's TOML.
+fn validate_include_domains(patterns: &[String]) -> Result<(), ValidationError> {
+    for (index, pattern) in patterns.iter().enumerate() {
+        if !pattern.is_ascii() {
+            let mut err = ValidationError::new("non_ascii_rewrite_include_domain");
+            err.add_param("index".into(), &index);
+            err.message = Some(
+                format!(
+                    "rewrite.include_domains[{index}] is not ASCII; write internationalized domain names in punycode (xn--) form"
+                )
+                .into(),
+            );
+            return Err(err);
+        }
+        if let Err(reason) = check_include_domain(pattern) {
+            let mut err = ValidationError::new("invalid_rewrite_include_domain");
+            err.add_param("index".into(), &index);
+            err.add_param("reason".into(), &reason);
+            err.message = Some(
+                format!(
+                    "rewrite.include_domains[{index}] must be a host name with an optional leading `*.`, a dotted-quad IPv4 address or a bracketed IPv6 address ({reason})"
+                )
+                .into(),
+            );
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// Checks one normalized ASCII `include_domains` entry, returning why it can
+/// never equal a URL host.
+fn check_include_domain(pattern: &str) -> Result<(), &'static str> {
+    if let Some(bracketed) = pattern.strip_prefix('[') {
+        bracketed
+            .strip_suffix(']')
+            .and_then(|inner| inner.parse::<std::net::Ipv6Addr>().ok())
+            .ok_or("not a bracketed IPv6 address")?;
+        return check_host_round_trip(pattern);
+    }
+    if pattern.parse::<std::net::Ipv6Addr>().is_ok() {
+        return Err("IPv6 address without brackets");
+    }
+
+    let name = pattern.strip_prefix("*.").unwrap_or(pattern);
+    if name.is_empty() {
+        return Err("no host");
+    }
+    if !name.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.' | b'_')
+    }) {
+        return Err("character outside a-z, 0-9, `-`, `_` and `.`");
+    }
+    if name.split('.').any(str::is_empty) {
+        return Err("leading or trailing `.` or empty label");
+    }
+
+    // A URL host whose last label is numeric is parsed as an IPv4 address, so
+    // such an entry only matches as an exact dotted-quad address.
+    let last_label = name.rsplit('.').next().unwrap_or(name);
+    let numeric_last_label = last_label.bytes().all(|byte| byte.is_ascii_digit());
+    if numeric_last_label
+        && (name.len() != pattern.len() || name.parse::<std::net::Ipv4Addr>().is_err())
+    {
+        return Err("numeric host that is not a dotted-quad IPv4 address");
+    }
+    check_host_round_trip(name)
+}
+
+/// Parses `host` with the parser behind [`Url::host_str`] and requires the
+/// rendered form to equal the input, so an entry that `url` rewrites (an
+/// IPv4-mapped IPv6 address in dotted form, an invalid `xn--` label) or rejects
+/// can never load and then silently fail to match.
+fn check_host_round_trip(host: &str) -> Result<(), &'static str> {
+    let parsed = url::Host::parse(host).map_err(|_| "not a valid URL host")?;
+    if parsed.to_string() != host {
+        return Err("not in the form Url::host_str() renders");
+    }
+    Ok(())
 }
 
 fn validate_publisher_domain(value: &str) -> Result<(), ValidationError> {
@@ -6840,29 +7044,366 @@ source_domain = "partner.example.com"
     }
 
     #[test]
-    fn test_rewrite_is_excluded() {
-        let rewrite = Rewrite {
-            exclude_domains: vec!["cdn.example.com".to_string(), "*.example2.com".to_string()],
-        };
+    fn rewrite_policy_matches_exclude_patterns_case_insensitively() {
+        let mut rewrite = Rewrite::default();
+        rewrite
+            .exclude_domains
+            .extend(["cdn.example.com", "*.example.org"].map(str::to_owned));
 
-        // Exact domain match
-        assert!(rewrite.is_excluded("http://cdn.example.com/image.png"));
+        for (host, expected) in [
+            ("cdn.example.com", false),
+            ("CDN.EXAMPLE.COM", false),
+            ("example.org", false),
+            ("a.b.example.org", false),
+            ("evil-example.org", true),
+            ("example.org.evil.example.net", true),
+            ("sub.cdn.example.com", true),
+            ("other.example.com", true),
+        ] {
+            assert_eq!(
+                rewrite.should_proxy_asset(host),
+                expected,
+                "should_proxy_asset(`{host}`) should be {expected}"
+            );
+            assert_eq!(
+                rewrite.should_wrap_click(host),
+                expected,
+                "should_wrap_click(`{host}`) should be {expected}"
+            );
+        }
+    }
 
-        // Wildcard match - base domain
-        assert!(rewrite.is_excluded("https://example2.com/cdn.js"));
-        // Wildcard match - subdomains
-        assert!(rewrite.is_excluded("https://cdnjs.example2.com/lib.js"));
-        assert!(rewrite.is_excluded("https://sub.domain.example2.com/asset.js"));
+    #[test]
+    fn rewrite_normalize_trims_lowercases_and_drops_inert_exclude_entries() {
+        let mut rewrite = Rewrite::default();
+        rewrite
+            .exclude_domains
+            .extend(["  CDN.Example.com ", "", "*", "*.Example.ORG"].map(str::to_owned));
 
-        // Should NOT match
-        assert!(!rewrite.is_excluded("https://other.example.com/asset.js"));
-        assert!(!rewrite.is_excluded("https://sub.cdn.example.com/asset.js"));
-        assert!(!rewrite.is_excluded("https://example2.com.fake.com/asset.js"));
-        assert!(!rewrite.is_excluded("https://notexample.com/asset.js"));
+        rewrite.normalize();
 
-        // Invalid URLs should not crash and should return false
-        assert!(!rewrite.is_excluded("not a url"));
-        assert!(!rewrite.is_excluded(""));
+        assert_eq!(
+            rewrite.exclude_domains,
+            vec!["cdn.example.com".to_owned(), "*.example.org".to_owned()],
+            "should trim, lowercase, and drop empty and bare `*` entries"
+        );
+    }
+
+    #[test]
+    fn rewrite_exclude_domains_match_mixed_case_entries_from_toml() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [rewrite]
+            exclude_domains = ["CDN.Example.com"]
+            "#;
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+
+        assert!(
+            !settings.rewrite.should_proxy_asset("cdn.example.com"),
+            "should exclude a host whose config entry was written in mixed case"
+        );
+    }
+
+    #[test]
+    fn settings_load_normalizes_rewrite_exclude_domains() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [rewrite]
+            exclude_domains = ["  CDN.Example.com ", "*", ""]
+            "#;
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+
+        assert_eq!(
+            settings.rewrite.exclude_domains,
+            vec!["cdn.example.com".to_owned()],
+            "should trim, lowercase, and drop inert entries when settings load"
+        );
+    }
+
+    #[test]
+    fn rewrite_should_proxy_asset_honors_include_list() {
+        let mut rewrite = Rewrite::default();
+        rewrite
+            .include_domains
+            .extend(["*.example.com", "img.example.net", "*.UPPER.Example.org"].map(str::to_owned));
+        rewrite
+            .exclude_domains
+            .push("blocked.example.com".to_owned());
+
+        for (host, expected) in [
+            ("example.com", true),
+            ("a.b.example.com", true),
+            ("img.example.net", true),
+            ("IMG.EXAMPLE.NET", true),
+            ("cdn.upper.example.org", true),
+            ("evil-example.com", false),
+            ("cdn.example.org", false),
+            ("blocked.example.com", false),
+        ] {
+            assert_eq!(
+                rewrite.should_proxy_asset(host),
+                expected,
+                "should_proxy_asset(`{host}`) should be {expected}"
+            );
+        }
+        for host in ["cdn.example.org", "evil-example.com", "example.com"] {
+            assert!(
+                rewrite.should_wrap_click(host),
+                "should wrap click for `{host}` regardless of include_domains"
+            );
+        }
+        assert!(
+            !rewrite.should_wrap_click("blocked.example.com"),
+            "should not wrap a click to an excluded host"
+        );
+    }
+
+    #[test]
+    fn rewrite_exclude_domains_keep_entries_that_never_match() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [rewrite]
+            exclude_domains = ["https://cdn.example.com", "cdn.example.com:443", "[2001:0db8::1]"]
+            "#;
+
+        let settings = Settings::from_toml(&toml_str)
+            .expect("should load inert exclude_domains entries with a warning");
+
+        assert_eq!(
+            settings.rewrite.exclude_domains,
+            vec![
+                "https://cdn.example.com".to_owned(),
+                "cdn.example.com:443".to_owned(),
+                "[2001:0db8::1]".to_owned(),
+            ],
+            "should keep inert exclude_domains entries unchanged"
+        );
+    }
+
+    #[test]
+    fn rewrite_exclude_domains_warnings_omit_raw_values() {
+        let sentinel = "example-secret-sentinel";
+        let malformed = format!("https://example-user:{sentinel}@ads.example.com/path\u{7}");
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [rewrite]
+            exclude_domains = ["", "cdn.example.com", "https://example-user:example-secret-sentinel@ads.example.com/path\u0007"]
+            "#;
+        let configured: Vec<String> = vec![
+            String::new(),
+            "cdn.example.com".to_owned(),
+            malformed.clone(),
+        ];
+
+        let (normalized, warnings) = Rewrite::normalized_exclude_domains(&configured);
+        let settings = Settings::from_toml(&toml_str)
+            .expect("should load a malformed exclude_domains entry with a warning");
+
+        assert_eq!(
+            warnings,
+            vec![
+                "rewrite.exclude_domains: removed empty or bare \"*\" entries, which never match a host"
+                    .to_owned(),
+                "rewrite.exclude_domains[2] never matches a URL host (not a valid URL host); the entry is kept"
+                    .to_owned(),
+            ],
+            "should name the malformed entry by its index counted before the empty entry is dropped"
+        );
+        assert_eq!(
+            normalized,
+            vec!["cdn.example.com".to_owned(), malformed.to_ascii_lowercase()],
+            "should drop the empty entry and keep the malformed one"
+        );
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.contains(sentinel) && !warning.contains("ads.example.com")),
+            "should omit the credential sentinel and raw value from warnings"
+        );
+        assert_eq!(
+            settings.rewrite.exclude_domains,
+            vec!["cdn.example.com".to_owned(), malformed.to_ascii_lowercase()],
+            "should keep the malformed entry as an inert pattern"
+        );
+    }
+
+    #[test]
+    fn rewrite_exclude_domains_flag_only_entries_that_never_match() {
+        for entry in [
+            "https://cdn.example.com",
+            "cdn.example.com:443",
+            "[2001:0db8::1]",
+            "cdn.*.example.com",
+            ".example.com",
+            "bücher.example",
+        ] {
+            assert!(
+                Rewrite::check_exclude_domain(entry).is_err(),
+                "should flag `{entry}`, which never matches a URL host"
+            );
+        }
+        for entry in [
+            "blocked.example.com.",
+            "ads_cdn.example.com",
+            "*.192.0.2.1",
+            "*.example.com",
+            "[::1]",
+        ] {
+            assert!(
+                Rewrite::check_exclude_domain(entry).is_ok(),
+                "should not flag `{entry}`, which matches a URL host"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_include_domains_report_the_bad_entry_and_reason() {
+        let err = validate_include_domains(&[
+            "assets.example.com".to_owned(),
+            "https://example-user:example-secret@cdn.example.com/path".to_owned(),
+        ])
+        .expect_err("should reject an entry with a scheme and credentials");
+
+        let params = format!("{:?}", err.params);
+        let message = err.message.expect("should set a message").into_owned();
+        assert!(
+            message.contains("rewrite.include_domains[1]") && message.contains("character outside"),
+            "should name the bad entry by index and give the reason: {message}"
+        );
+        assert!(
+            !message.contains("example-secret") && !params.contains("example-secret"),
+            "should keep the raw value out of the message and params: {message} {params}"
+        );
+    }
+
+    #[test]
+    fn rewrite_include_domains_report_non_ascii_entries_by_index() {
+        let err = validate_include_domains(&[
+            "assets.example.com".to_owned(),
+            "bücher.example".to_owned(),
+        ])
+        .expect_err("should reject a non-ASCII entry");
+
+        let params = format!("{:?}", err.params);
+        let message = err.message.expect("should set a message").into_owned();
+        assert!(
+            message.contains("rewrite.include_domains[1] is not ASCII"),
+            "should name the non-ASCII entry by index: {message}"
+        );
+        assert!(
+            !message.contains("bücher") && !params.contains("bücher"),
+            "should keep the raw value out of the message and params: {message} {params}"
+        );
+    }
+
+    #[test]
+    fn rewrite_include_domains_are_normalized_from_toml() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [rewrite]
+            include_domains = ["*.CDN.Example.com", "  img.example.net "]
+            "#;
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+
+        assert_eq!(
+            settings.rewrite.include_domains,
+            vec!["*.cdn.example.com".to_owned(), "img.example.net".to_owned()],
+            "should trim and lowercase include_domains entries"
+        );
+    }
+
+    fn include_domains_toml(entry: &str) -> String {
+        crate_test_settings_str() + &format!("\n[rewrite]\ninclude_domains = [\"{entry}\"]\n")
+    }
+
+    #[test]
+    fn rewrite_include_domains_reject_malformed_entries() {
+        for entry in [
+            "",
+            "   ",
+            "*",
+            "*.",
+            "cdn.*.example.com",
+            "**.example.com",
+            "https://cdn.example.com",
+            "cdn.example.com:443",
+            "cdn.example.com/x",
+            ".example.com",
+            "example.com.",
+            "cdn..example.com",
+            "cdn example.com",
+            "0xc0000201",
+            "::1",
+            "[::1",
+            "[2001:0db8::1]",
+            "[::ffff:192.0.2.1]",
+            "xn--zz.example",
+            "*.192.0.2.1",
+            "192.0.2",
+            "256.0.2.1",
+        ] {
+            let result = Settings::from_toml(&include_domains_toml(entry));
+
+            let err = result.expect_err(&format!("should reject include_domains entry `{entry}`"));
+            assert!(
+                format!("{err:?}").contains("invalid_rewrite_include_domain"),
+                "should report `{entry}` as an invalid include_domains entry: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_include_domains_reject_non_ascii_entries_with_a_punycode_hint() {
+        for entry in ["bücher.example", "*.bücher.example"] {
+            let result = Settings::from_toml(&include_domains_toml(entry));
+
+            let err = result.expect_err(&format!("should reject non-ASCII entry `{entry}`"));
+            assert!(
+                format!("{err:?}").contains("non_ascii_rewrite_include_domain"),
+                "should report `{entry}` as non-ASCII: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_include_domains_accept_hosts_and_ip_literals() {
+        for entry in [
+            "cdn.example.com",
+            "*.example.com",
+            "xn--bcher-kva.example",
+            "cdn_assets.example.com",
+            "0xproxy",
+            "*.0xproxy",
+            "a.0xcdn",
+            "192.0.2.1",
+            "[2001:db8::1]",
+            "[::1]",
+            "[::ffff:c000:201]",
+        ] {
+            let settings =
+                Settings::from_toml(&include_domains_toml(entry)).unwrap_or_else(|err| {
+                    panic!("should accept include_domains entry `{entry}`: {err:?}")
+                });
+
+            assert_eq!(
+                settings.rewrite.include_domains,
+                vec![entry.to_owned()],
+                "should keep accepted entry `{entry}` as written"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_include_domains_default_to_empty() {
+        let settings = create_test_settings();
+
+        assert!(
+            settings.rewrite.include_domains.is_empty(),
+            "should default include_domains to an empty list"
+        );
     }
 
     #[test]
@@ -6883,6 +7424,32 @@ source_domain = "partner.example.com"
             !settings.auction.sanitize_creatives,
             "creative sanitization is opt-in when the setting is omitted"
         );
+        assert_eq!(
+            settings.auction.rewrite_clicks, None,
+            "click rewriting stays unset when the setting is omitted"
+        );
+    }
+
+    #[test]
+    fn test_auction_rewrite_clicks_accepts_explicit_values() {
+        for value in [true, false] {
+            let toml_str = crate_test_settings_str()
+                + &format!(
+                    r#"
+            [auction]
+            enabled = true
+            rewrite_clicks = {value}
+            "#
+                );
+
+            let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+
+            assert_eq!(
+                settings.auction.rewrite_clicks,
+                Some(value),
+                "should parse explicit rewrite_clicks = {value}"
+            );
+        }
     }
 
     #[test]

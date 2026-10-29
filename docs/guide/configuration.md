@@ -1120,13 +1120,14 @@ before pushing the config.
 
 ## URL Rewrite Configuration
 
-Control which domains are excluded from first-party rewriting.
+Control which hosts first-party rewriting covers.
 
 ### `[rewrite]`
 
-| Field             | Type          | Required         | Description               |
-| ----------------- | ------------- | ---------------- | ------------------------- |
-| `exclude_domains` | Array[String] | No (default: []) | Domains to skip rewriting |
+| Field             | Type          | Required         | Description                                                                                         |
+| ----------------- | ------------- | ---------------- | --------------------------------------------------------------------------------------------------- |
+| `exclude_domains` | Array[String] | No (default: []) | Hosts never rewritten, for assets and click-through links                                           |
+| `include_domains` | Array[String] | No (default: []) | When non-empty, the only hosts whose asset URLs are proxied. Does not apply to click-through links. |
 
 **Example**:
 
@@ -1137,12 +1138,14 @@ exclude_domains = [
     "first-party.publisher.com",  # Exact match
     "localhost",                  # Development
 ]
+include_domains = ["assets.example.com", "*.img.example.com"]
 ```
 
 **Environment Override**:
 
-EdgeZero v0.0.4 cannot replace this array or address its elements by index. Edit
-`exclude_domains` in TOML, then validate and push the file again.
+EdgeZero v0.0.4 cannot replace these arrays or address their elements by index.
+Edit `exclude_domains` and `include_domains` in TOML, then validate and push the
+file again.
 
 ### Pattern Matching
 
@@ -1170,6 +1173,55 @@ Matches:
 - ✅ `api.example.com`
 - ❌ `www.api.example.com`
 - ❌ `api.example.com.evil.com`
+
+**Normalization and precedence**:
+
+- Both lists are trimmed and lowercased at load, so matching is case-insensitive.
+- `exclude_domains` wins when a host matches both lists.
+- Each `include_domains` entry must be able to equal a URL host. After
+  lowercasing, an entry must be one of:
+  - a host name of ASCII letters, digits, `-`, `_` and `.`, optionally prefixed with
+    `*.`, with no leading or trailing `.` and no empty label;
+  - an IPv4 address in dotted-quad form, such as `192.0.2.1`;
+  - an IPv6 address in brackets, written the way URL hosts render it, such as
+    `[2001:db8::1]` or `[::ffff:c000:201]` (not `[::ffff:192.0.2.1]`).
+- Settings load and `ts config validate` reject any other `include_domains`
+  entry: an empty entry, a bare `*`, a `*` other than a leading `*.`, a scheme
+  (`https://`), a port, a path, spaces, an unbracketed IPv6 address, or any
+  entry a URL parser would rewrite or reject, such as an invalid `xn--` label.
+  Non-ASCII (internationalized) names are rejected too; write them in punycode,
+  such as `xn--bcher-kva.example`.
+- Empty and bare `*` entries in `exclude_domains` are dropped with a warning,
+  because they never match a host. Other `exclude_domains` entries that can
+  never match a host (for example `https://cdn.example.com` or
+  `cdn.example.com:443`) are kept but logged with a warning at load; fix them,
+  or their hosts stay proxied. This check is looser than the `include_domains`
+  grammar: a trailing `.` (such as `blocked.example.com.`), a `_` and a
+  wildcard IP address all match real URL hosts and are not flagged.
+- `include_domains` controls which asset URLs are newly rewritten or signed. It
+  is not enforced when a proxy URL is fetched: a proxy URL issued before a host
+  was removed from the list (for example, in a cached creative) still forwards
+  the EC ID to that host, subject only to `proxy.allowed_domains`.
+
+::: tip
+When both `include_domains` and `proxy.allowed_domains` are set, keep every
+`include_domains` host inside `proxy.allowed_domains`. Otherwise a listed asset
+is rewritten to a proxy URL that then fails with `403`.
+:::
+
+::: warning Upgrade sequencing and rollback for `include_domains`
+An empty `include_domains` is omitted from stored JSON. A non-empty list is
+serialized, and older binaries reject a blob that carries it because `[rewrite]`
+uses `deny_unknown_fields`.
+
+**Upgrading:** deploy the binary **first**, then add `include_domains` to
+`trusted-server.toml`, run `ts config validate`, and push.
+
+**Rolling back:** remove `include_domains` from the TOML, run
+`ts config validate`, push the resulting blob, and only then roll back the
+binary. Rolling back the binary also restores case-sensitive `exclude_domains`
+matching.
+:::
 
 ### Use Cases
 
@@ -2080,15 +2132,16 @@ provider or bidder route.
 
 ### `[auction]`
 
-| Field                  | Type    | Default            | Description                                                    |
-| ---------------------- | ------- | ------------------ | -------------------------------------------------------------- |
-| `enabled`              | Boolean | `false`            | Enable the auction orchestrator                                |
-| `sanitize_creatives`   | Boolean | `false`            | Strip executable markup from winning-bid `adm` before delivery |
-| `rewrite_creatives`    | Boolean | `true`             | Rewrite winning-bid `adm` through first-party endpoints        |
-| `timeout_ms`           | Integer | `2000`             | Logical auction budget in milliseconds                         |
-| `mediator`             | String  | `None`             | Optional separate `adserver_mock` mediator                     |
-| `creative_store`       | String  | `"creative_store"` | Deprecated; creatives are delivered inline                     |
-| `allowed_context_keys` | Array   | `[]`               | Request context keys admitted into the auction                 |
+| Field                  | Type    | Default            | Description                                                                                                  |
+| ---------------------- | ------- | ------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `enabled`              | Boolean | `false`            | Enable the auction orchestrator                                                                              |
+| `sanitize_creatives`   | Boolean | `false`            | Strip executable markup from winning-bid `adm` before delivery                                               |
+| `rewrite_creatives`    | Boolean | `true`             | Rewrite winning-bid asset URLs through first-party endpoints                                                 |
+| `rewrite_clicks`       | Boolean | unset              | Wrap creative links in `/first-party/click`; unset follows `rewrite_creatives` (proxied HTML keeps wrapping) |
+| `timeout_ms`           | Integer | `2000`             | Logical auction budget in milliseconds                                                                       |
+| `mediator`             | String  | `None`             | Optional separate `adserver_mock` mediator                                                                   |
+| `creative_store`       | String  | `"creative_store"` | Deprecated; creatives are delivered inline                                                                   |
+| `allowed_context_keys` | Array   | `[]`               | Request context keys admitted into the auction                                                               |
 
 Creative markup delivered by `POST /auction` and the publisher SSAT/page-bids
 path is processed by two independent passes. With `sanitize_creatives = true`
@@ -2096,23 +2149,32 @@ path is processed by two independent passes. With `sanitize_creatives = true`
 and event handlers) is stripped together with its inner content. This blanks
 script-based creatives, so enable it only when creatives render in a context
 that shares the publisher's origin. With `rewrite_creatives = true` (the
-default), eligible absolute or protocol-relative resource and click URLs not
-excluded by rewrite configuration are converted to signed first-party
-endpoints, and any bidder-supplied `<base>` element is removed. The
-`POST /auction` path emits root-relative endpoints and injects the creative TSJS
-runtime exactly once, whether or not the bidder supplied a `<body>`, since bare
+default), eligible absolute or protocol-relative asset URLs not excluded by
+rewrite configuration are converted to signed `/first-party/proxy` endpoints.
+`rewrite_clicks` controls click-through links (`<a href>`, `<area href>`)
+separately: when it is unset, it follows `rewrite_creatives`, so existing
+configs keep their asset and link behavior. One change applies to existing
+configs too: whenever either setting is on, a bidder-supplied `<base>` element
+loses its `href`; it keeps a `target` and is removed when it has none (before
+this release the whole element was removed). With `sanitize_creatives = true`,
+the sanitizer removes `<base>` entirely before the rewrite pass. The `POST /auction` path emits
+root-relative endpoints and, when either setting is on, injects the creative
+TSJS runtime exactly once, whether or not the bidder supplied a `<body>`, since bare
 fragments are the common `adm` shape. The foreign-origin SSAT renderer emits
-absolute endpoints and does not inject that bundle. With both disabled, `adm`
-ships exactly as the bidder returned it, except that a creative larger than the
+absolute endpoints and does not inject that bundle. With all three disabled,
+`adm` ships exactly as the bidder returned it, except that a creative larger than the
 1 MiB per-creative cap is rejected in every mode and its `adm` is dropped.
-Accepted external URLs are not host allowlisted by the sanitizer. Neither
-setting affects HTML or CSS fetched through `/first-party/proxy`. See
+Accepted external URLs are not host allowlisted by the sanitizer.
+`rewrite_creatives` and `sanitize_creatives` do not affect HTML or CSS fetched
+through `/first-party/proxy`. An explicitly set `rewrite_clicks` does apply to
+links in proxied HTML; unset, proxied HTML keeps wrapping links. See
 [Creative Processing](/guide/creative-processing#auction-rewrite-control).
 
 ::: warning Existing configs, upgrade sequencing, and rollback
 Default values are omitted from stored JSON; non-default values
-(`sanitize_creatives = true`, `rewrite_creatives = false`) are serialized, and
-older `AuctionConfig` schemas reject unknown fields.
+(`sanitize_creatives = true`, `rewrite_creatives = false`, and any explicit
+`rewrite_clicks`) are serialized, and older `AuctionConfig` schemas reject
+unknown fields.
 
 **Upgrading:** binaries that predate `sanitize_creatives` reject a blob that
 carries it, so in a rolling deployment upgrade the binary **first**, then push
@@ -2126,14 +2188,26 @@ on new code, while an explicit `true` fails startup on old code.
 **Rolling back:** before reverting to a binary that does not know a field,
 remove that field's non-default value (and any environment override), run
 `ts config validate`, push the resulting default-compatible blob, and only then
-roll back the binary.
+roll back the binary. Older binaries tie click wrapping to `rewrite_creatives`
+in both directions: rolling back from `rewrite_creatives = true` with
+`rewrite_clicks = false` turns click wrapping back on, and rolling back from
+`rewrite_creatives = false` with `rewrite_clicks = true` turns it off. Rolling
+back from any `rewrite_clicks = false` also turns click wrapping back on in HTML
+fetched through `/first-party/proxy`.
 
 **Environment overlays:** The pinned EdgeZero loader cannot create missing TOML
 leaves. Existing configs must add **both** leaves under `[auction]`
 (`rewrite_creatives` and `sanitize_creatives`) before
 `TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES` /
 `TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES` can take effect. An override for a
-missing leaf is silently ignored.
+missing leaf is silently ignored. `rewrite_clicks` is unset by default and so
+cannot appear as a TOML leaf until you set it; add `rewrite_clicks = true` or
+`false` under `[auction]` before relying on
+`TRUSTED_SERVER__AUCTION__REWRITE_CLICKS`. The leaf only preserves today's
+behavior when it matches what unset resolves to: with `rewrite_creatives =
+true`, `rewrite_clicks = true` does, but with `rewrite_creatives = false` no
+value does (`true` wraps auction links, `false` stops wrapping links in HTML
+fetched through `/first-party/proxy`).
 :::
 
 ### Provider map
@@ -2321,8 +2395,9 @@ finishes local decision and delivery. An auction can therefore exceed its
 configured wall-clock timeout.
 
 Creative sanitization is opt-in. `sanitize_creatives = true` strips executable
-markup before delivery. `rewrite_creatives = false` skips first-party URL
-rewriting and creative TSJS injection. See
+markup before delivery. `rewrite_creatives = false` leaves asset URLs
+direct; links are wrapped, and creative TSJS injected on `POST /auction`,
+only when `rewrite_clicks = true`. See
 [Creative Processing](/guide/creative-processing#auction-rewrite-control).
 
 **Environment overrides** replace map leaves that already exist in TOML:
