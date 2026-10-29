@@ -1820,16 +1820,32 @@ Each `[[integrations.js_asset_proxy.assets]]` entry:
 
 **Section**: `[integrations.lockr]`
 
-| Field               | Type            | Default                                             | Contract                             |
-| ------------------- | --------------- | --------------------------------------------------- | ------------------------------------ |
-| `enabled`           | Boolean         | `true`                                              | Enable lockr when the section exists |
-| `app_id`            | String          | Required                                            | Nonempty lockr application ID        |
-| `api_endpoint`      | URL             | `https://identity.loc.kr`                           | API origin                           |
-| `sdk_url`           | URL             | `https://aim.loc.kr/identity-lockr-trust-server.js` | SDK source                           |
-| `cache_ttl_seconds` | Integer         | `3600`                                              | `60..=86400` seconds                 |
-| `rewrite_sdk`       | Boolean         | `true`                                              | Rewrite matching lockr SDK URLs      |
-| `rewrite_sdk_host`  | Boolean or null | `null`                                              | Deprecated compatibility input       |
-| `origin_override`   | URL or null     | `null`                                              | Optional upstream `Origin` override  |
+| Field               | Type            | Default                                             | Contract                                 |
+| ------------------- | --------------- | --------------------------------------------------- | ---------------------------------------- |
+| `enabled`           | Boolean         | `true`                                              | Enable lockr when the section exists     |
+| `app_id`            | String          | Required                                            | Nonempty lockr application ID            |
+| `api_endpoint`      | URL             | `https://identity.loc.kr`                           | API origin                               |
+| `sdk_url`           | URL             | `https://aim.loc.kr/identity-lockr-trust-server.js` | SDK source                               |
+| `cache_ttl_seconds` | Integer         | `3600`                                              | `60..=86400` seconds                     |
+| `rewrite_sdk`       | Boolean         | `true`                                              | Rewrite matching SDK URLs in static HTML |
+| `rewrite_sdk_host`  | Boolean or null | `null`                                              | Deprecated and ignored                   |
+| `origin_override`   | URL or null     | `null`                                              | Optional upstream `Origin` override      |
+
+The dedicated trust-server SDK uses the relative API prefix `/integrations/lockr/api`.
+A browser guard resolves root-relative Lockr XHR API URLs against the page origin,
+independently of any `<base href>`. It does not intercept `fetch` or `sendBeacon`,
+or reroute arbitrary absolute third-party URLs. Matching static SDK URLs are
+rewritten to an absolute first-party URL using the request scheme and host, so
+an external `<base href>` does not change the SDK destination either.
+
+::: warning SDK migration
+Trusted Server no longer mutates private SDK host fields or polls for SDK
+initialization. Custom `sdk_url` builds must route their own API requests through
+the first-party proxy; builds that depended on the removed SDK-host shim need
+migration. Unreplaced legacy SDKs also need their own proxy routing. In particular,
+`rewrite_sdk = false` leaves static HTML SDK tags unchanged, but matching dynamic
+SDK insertions remain intercepted by the browser module regardless of that flag.
+:::
 
 See [lockr](/guide/integrations/lockr).
 

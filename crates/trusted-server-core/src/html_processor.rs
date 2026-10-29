@@ -1283,6 +1283,61 @@ mod tests {
     }
 
     #[test]
+    fn lockr_static_sdk_rewriting_preserves_page_origin_with_external_base() {
+        for rewrite_sdk in [true, false] {
+            let mut settings = create_test_settings();
+            settings
+                .integrations
+                .insert_config(
+                    "lockr",
+                    &json!({
+                        "enabled": true,
+                        "app_id": "example-lockr-app",
+                        "rewrite_sdk": rewrite_sdk,
+                    }),
+                )
+                .expect("should configure Lockr integration");
+            let registry = IntegrationRegistry::new(&settings)
+                .expect("should create integration registry with Lockr");
+            let config = HtmlProcessorConfig::from_settings(
+                &settings,
+                &registry,
+                "origin.example.com",
+                "publisher.example:8080",
+                "http",
+            );
+            let mut processor = create_html_processor(config);
+            let output = processor
+                .process_chunk(
+                    br#"<html><head>
+                        <base href="https://external-base.example/assets/">
+                        <link rel="preload" as="script" href="https://aim.loc.kr/identity-lockr-trust-server.js">
+                        <script src="https://aim.loc.kr/identity-lockr-trust-server.js"></script>
+                    </head><body></body></html>"#,
+                    true,
+                )
+                .expect("should process Lockr HTML with external base");
+            let html = String::from_utf8(output).expect("should produce UTF-8 HTML");
+            let expected = if rewrite_sdk {
+                "http://publisher.example:8080/integrations/lockr/sdk"
+            } else {
+                "https://aim.loc.kr/identity-lockr-trust-server.js"
+            };
+
+            for attribute in ["src", "href"] {
+                assert!(
+                    html.contains(&format!("{attribute}=\"{expected}\"")),
+                    "should rewrite SDK scripts and preloads only when enabled"
+                );
+            }
+            assert!(
+                html.contains(r#"href="https://external-base.example/assets/""#),
+                "should preserve the publisher's external base URL"
+            );
+        }
+    }
+
+    #[test]
     fn suppressed_datadome_tag_preserves_and_rewrites_publisher_tag() {
         let mut settings = create_test_settings();
         settings
