@@ -1,6 +1,6 @@
 # Client CWV and initial-delivery completion for issue 854
 
-Status: Implemented and locally validated. The user authorized specification, measurement, implementation, validation and pushing the existing PR on 2026-10-29. Hosted CI and real-GPT/field validation are separate checks; see the validation record.
+Status: Implemented and locally validated after merging main in code commit `7b83a8ce87e773e2234a6dde7380a123f36e7d1f`. The user authorized specification, measurement, implementation, validation and pushing the existing PR on 2026-10-29. Hosted CI and real-GPT/field validation are separate checks; see the validation record.
 Issue: https://github.com/IABTechLab/trusted-server/issues/854
 PR: https://github.com/IABTechLab/trusted-server/pull/1460
 Baseline: `c36c82df43c2f62a59444290f863f736b579ed33`.

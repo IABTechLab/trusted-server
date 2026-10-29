@@ -1,6 +1,6 @@
 # Issue 854 client CWV validation
 
-Status: Merge integration behavior checks complete. The merged-tree URL-lint preflight passes; the committed-branch check and final evidence update follow the merge commit. Hosted checks require the push. No deployment or production activation performed.
+Status: Implementation and merge integration validated locally at `7b83a8ce87e773e2234a6dde7380a123f36e7d1f`. All required local gates pass. Hosted checks are tracked separately on PR1460. No deployment or production activation performed.
 
 [Spec](../specs/2026-10-29-854-client-cwv-completion-design.md) · [Plan](../plans/2026-10-29-854-client-cwv-completion-plan.md)
 
@@ -14,20 +14,21 @@ Conflict resolution preserves upstream asynchronous HTML EOF processing, origin 
 
 ### Updated checks and artifacts
 
-| Check                           | Result                                                                                   | Evidence under `merge/`                             |
-| ------------------------------- | ---------------------------------------------------------------------------------------- | --------------------------------------------------- |
-| Full JS suite                   | 1,519 tests across 52 files passed; full lint and format passed                          | `js-final-{full,lint,format}.log`                   |
-| Focused GPT/APS suite           | 671 tests across nine files passed, including early/runtime APS failure relay            | `gpt-focused.log`                                   |
-| Native core                     | Unmodified Cargo invocation passed 3,197 core tests plus two ten-test integration suites | `evidence/gates/core-native.log`                    |
-| Fixture, launcher and CWV units | All 21 passed                                                                            | `evidence/browser-units.log`                        |
-| Updated lab                     | All 61 passed, including 40 repeated measurements                                        | `evidence/cwv/`                                     |
-| Offline registration            | All 109 passed                                                                           | `evidence/offline-registration/`                    |
-| Actual Rust/Next.js             | All 40 passed, 20 inline and 20 shared-template                                          | `evidence/framework/`                               |
-| Real APS Universal Creative     | All six passed, no skips or flaky cases                                                  | `standard/results.json`                             |
-| Node pin guard                  | All 30 tests passed; all 27 jobs pin Node before compiling Rust                          | Coordinator output                                  |
-| Documentation proposal scripts  | All 20 Node tests, shell tests and ShellCheck passed                                     | Coordinator output and `evidence/docs-proposal.log` |
-| Changed integration workflow    | actionlint passed                                                                        | `evidence/actionlint.log`                           |
-| Publisher-registration launcher | ShellCheck passed                                                                        | `evidence/shellcheck-publisher.log`                 |
+| Check                             | Result                                                                                   | Evidence under `merge/`                             |
+| --------------------------------- | ---------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| Full JS suite                     | 1,519 tests across 52 files passed; full lint and format passed                          | `js-final-{full,lint,format}.log`                   |
+| Focused GPT/APS suite             | 671 tests across nine files passed, including early/runtime APS failure relay            | `gpt-focused.log`                                   |
+| Native core                       | Unmodified Cargo invocation passed 3,197 core tests plus two ten-test integration suites | `evidence/gates/core-native.log`                    |
+| Fixture, launcher and CWV units   | All 21 passed                                                                            | `evidence/browser-units.log`                        |
+| Updated lab                       | All 61 passed, including 40 repeated measurements                                        | `evidence/cwv/`                                     |
+| Offline registration              | All 109 passed                                                                           | `evidence/offline-registration/`                    |
+| Actual Rust/Next.js               | All 40 passed, 20 inline and 20 shared-template                                          | `evidence/framework/`                               |
+| Initial-render overlap regression | All ten passed against current bundles and the explicit Rubicon/SharedId artifact        | `evidence/initial-render/`                          |
+| Real APS Universal Creative       | All six passed, no skips or flaky cases                                                  | `standard/results.json`                             |
+| Node pin guard                    | All 30 tests passed; all 27 jobs pin Node before compiling Rust                          | Coordinator output                                  |
+| Documentation proposal scripts    | All 20 Node tests, shell tests and ShellCheck passed                                     | Coordinator output and `evidence/docs-proposal.log` |
+| Changed integration workflow      | actionlint passed                                                                        | `evidence/actionlint.log`                           |
+| Publisher-registration launcher   | ShellCheck passed                                                                        | `evidence/shellcheck-publisher.log`                 |
 
 With `TSJS_PREBUILT_DIR` unset, the fresh release build passed in 1m56s. All 14 complete JS module strings match the independent distribution and occur byte-for-byte in the frozen WASM. WASM SHA-256 is `dad40087f6123d73b8465d774bd3212e7b25b4d6c8ce3051579f263e0d117f23`.
 
@@ -66,13 +67,47 @@ Standalone `tsc --noEmit` still fails, with 393 output lines and 320 primary dia
 
 Whole-repository actionlint still reports unchanged upstream workflow issues, including unquoted output variables and unsupported new workflow keys/permissions. The changed integration workflow passes separately. These extra whole-repository diagnostics are not represented as a clean result or fixed outside this PR's scope.
 
-All 26 backend, native, Clippy, docs, clock and EOF commands other than the committed-branch URL check passed. This includes actual Axum and Fastly auction/EOF controls with disabled, successful and hung finalizers. Their exact commands and timings are retained in `evidence/gates/results.tsv`.
+### Backend and EOF results
 
-The URL linter reads committed trees. Its first invocation still examined the earlier branch HEAD and reported seven older URLs. Fixes retain official documentation/source references and the actual APS SDK assertion with reviewed per-line exceptions, without adding global allowlist entries. The fixture's symbolic-port error text no longer contains an invalid URL. Three helper tests, helper Clippy, eight early-bundle tests and scoped JS lint/format pass. Explicit-file lint and an exact merged-tree commit snapshot pass. Staged mode also reports unrelated upstream documentation because the merge index includes main's changes; those are outside the resulting PR diff and were not modified. The committed-branch check follows the merge commit.
+All 27 commands pass after the URL-lint cleanup and committed-tree retry. This includes actual Axum and Fastly auction/EOF controls with disabled, successful and hung finalizers. The original first-pass ledger, including the older-HEAD URL failure, remains in `evidence/gates/results.tsv`; the successful committed-branch check is in `evidence/domain-committed.log`.
+
+| Gate                                 | Result                            | Seconds | Command                                                                                                                                                                                |
+| ------------------------------------ | --------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| core-native                          | Passed                            | 56      | `cargo test -p trusted-server-core --target x86_64-unknown-linux-gnu`                                                                                                                  |
+| test-fastly                          | Passed                            | 152     | `cargo test-fastly`                                                                                                                                                                    |
+| test-fastly-reuse                    | Passed                            | 26      | `cargo test-fastly-reuse`                                                                                                                                                              |
+| test-axum                            | Passed                            | 42      | `cargo test-axum`                                                                                                                                                                      |
+| test-cloudflare                      | Passed                            | 21      | `cargo test-cloudflare`                                                                                                                                                                |
+| test-spin                            | Passed                            | 2       | `cargo test-spin`                                                                                                                                                                      |
+| parity                               | Passed                            | 16      | `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --target x86_64-unknown-linux-gnu --test parity`                                                        |
+| test-cli                             | Passed                            | 99      | `cargo test --package trusted-server-cli --target x86_64-unknown-linux-gnu`                                                                                                            |
+| template-build-digest                | Passed                            | 15      | `cargo test -p trusted-server-core --target x86_64-unknown-linux-gnu --test template_build_digest`                                                                                     |
+| clippy-fastly                        | Passed                            | 34      | `cargo clippy-fastly`                                                                                                                                                                  |
+| clippy-axum                          | Passed                            | 25      | `cargo clippy-axum`                                                                                                                                                                    |
+| clippy-cloudflare                    | Passed                            | 14      | `cargo clippy-cloudflare`                                                                                                                                                              |
+| clippy-cloudflare-wasm               | Passed                            | 30      | `cargo clippy-cloudflare-wasm`                                                                                                                                                         |
+| clippy-spin-native                   | Passed                            | 1       | `cargo clippy-spin-native`                                                                                                                                                             |
+| clippy-spin-wasm                     | Passed                            | 17      | `cargo clippy-spin-wasm`                                                                                                                                                               |
+| clippy-cli                           | Passed                            | 51      | `cargo clippy-cli`                                                                                                                                                                     |
+| clippy-codegen                       | Passed                            | 5       | `cargo clippy-codegen`                                                                                                                                                                 |
+| clippy-template-build-digest         | Passed                            | 25      | `cargo clippy -p trusted-server-core --target x86_64-unknown-linux-gnu --test template_build_digest -- -D warnings`                                                                    |
+| clippy-cwv-example                   | Passed                            | 23      | `cargo clippy -p trusted-server-integration-tests --target x86_64-unknown-linux-gnu --example cwv_html -- -D warnings`                                                                 |
+| clippy-publisher-registration-helper | Passed                            | 1       | `cargo clippy -p trusted-server-integration-tests --target x86_64-unknown-linux-gnu --example publisher_registration_backends -- -D warnings`                                          |
+| doc-core-js                          | Passed                            | 9       | `cargo doc -p trusted-server-core -p trusted-server-js --target x86_64-unknown-linux-gnu --all-features --no-deps`                                                                     |
+| wasm-clock                           | Passed                            | 12      | `scripts/lint-wasm-clock.sh`                                                                                                                                                           |
+| eof-native                           | Passed                            | 21      | `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --target x86_64-unknown-linux-gnu --features html-eof-runtime --test html_eof_runtime`                  |
+| eof-clippy                           | Passed                            | 7       | `cargo clippy --manifest-path crates/trusted-server-integration-tests/Cargo.toml --target x86_64-unknown-linux-gnu --features html-eof-runtime --test html_eof_runtime -- -D warnings` |
+| lint-domains                         | Passed after committed-tree retry | <1      | `ts dev lint domains --changed-vs origin/main`                                                                                                                                         |
+| eof-axum-auction                     | Passed                            | 74      | `./scripts/async-html-finalization-local-test.sh axum --auction`                                                                                                                       |
+| eof-fastly-auction                   | Passed                            | 44      | `./scripts/async-html-finalization-local-test.sh fastly --release --auction`                                                                                                           |
+
+Full Rust formatting, docs lint/format and Markdown formatting outside docs also pass. VitePress builds successfully, retaining its existing VCL-highlighting and chunk-size warnings. Whole-workflow actionlint and standalone TypeScript limitations remain as described above.
+
+The URL linter reads committed trees. Its first invocation still examined the earlier branch HEAD and reported seven older URLs. Fixes retain official documentation/source references and the actual APS SDK assertion with reviewed per-line exceptions, without adding global allowlist entries. The fixture's symbolic-port error text no longer contains an invalid URL. Three helper tests, helper Clippy, eight early-bundle tests and scoped JS lint/format pass. Explicit-file lint and an exact merged-tree commit snapshot pass. Staged mode also reports unrelated upstream documentation because the merge index includes main's changes; those are outside the resulting PR diff and were not modified. The actual committed branch passes `ts dev lint domains --changed-vs origin/main` after merge commit `7b83a8ce87e773e2234a6dde7380a123f36e7d1f`.
 
 Independent merge correctness and architecture reviews found no defects. They compared moved APS functions and the complete EOF driver against exact main-parent code, and verified actual path/CSP/status/range/header ownership. The original reviewed fingerprint was `0a0130289e0a8e2f090bc323f604349182bf4030b64d0a6b113227b41e3a3cb2`. The final lint-only cleanup changes a fixture error message, one test comment and historical reference comments; production runtime sources remain unchanged. The new code fingerprint is `9df748852ddce84d766bab2b8241bebf3a46f31a720f62f9a0e52a70d533b270`.
 
-Hosted CI remains pending the merge push. Real GPT/GAM, customer pages, production activation and field CWV remain unverified and require separate approval.
+Hosted CI is tracked separately on PR1460; local results do not establish its outcome. Real GPT/GAM, customer pages, production activation and field CWV remain unverified and require separate approval.
 
 ## Historical premerge validation
 

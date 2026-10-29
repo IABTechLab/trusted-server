@@ -1,6 +1,6 @@
 # Issue 854 measurement, implementation and validation plan
 
-Status: Implementation and local verification complete. Authorized 2026-10-29. Baseline `c36c82df43c2f62a59444290f863f736b579ed33`.
+Status: Implementation and merged-main local verification complete. Code commit `7b83a8ce87e773e2234a6dde7380a123f36e7d1f`. Hosted CI remains separate. Authorized 2026-10-29. Baseline `c36c82df43c2f62a59444290f863f736b579ed33`.
 Spec: [Client CWV completion](../specs/2026-10-29-854-client-cwv-completion-design.md).
 
 ## Ownership and evidence
@@ -56,7 +56,15 @@ Original CI failure is a launcher literal requiring Viceroy 0.17.0 while the PR 
 
 The first four-lane review reproduced a default loading regression under an old-hash-plus-same-origin CSP and found that the framework renderer-absence control intercepted only the old bundle URL. Fixes add conservative enforced-response-CSP fallback, true deliberate renderer removal and a distinct failed-runtime case retaining early rendering. Six focused Rust CSP checks and three focused actual-browser regressions passed. The final exporter produces byte-identical ordinary HTML/assets to the 58-case timing snapshot, so those passing measurements remain applicable. The stable post-fix checkpoint passed all 21 backend gates, 40 actual Rust/Next.js cases, 61 lab cases and 109 offline contracts. Exact commands, fingerprints and baseline limitations are in the validation record. Hosted CI remains pending after push; real GPT/GAM staging and field CWV remain unverified.
 
-Measured transfer cost is an explicit tradeoff: combined HTML/runtime gzip estimate grew by 7,513 bytes while the controlled parser wait and compatible ad-induced shift were removed. A runtime-only entry was evaluated and deferred because it adds another lifecycle contract; no total-byte reduction is claimed.
+Premerge transfer cost was an explicit tradeoff: combined HTML/runtime gzip estimate grew by 7,513 bytes. After merging main, the corresponding increase is 8,479 bytes and includes upstream/build-dependency changes. A runtime-only entry was evaluated and deferred because it adds another lifecycle contract; no total-byte reduction is claimed.
+
+## Main integration checkpoint
+
+Merged main `21f43aa0138498023455789f152f5a864bbefe24` into the implementation in commit `7b83a8ce87e773e2234a6dde7380a123f36e7d1f`. Preserved upstream APS failure relay, iframe/timeout ownership, asynchronous HTML EOF and origin-header rewriting. Threaded actual path/CSP through the new EOF driver.
+
+Fresh Node 24.20.0/Rust 1.98.1/Viceroy 0.21.0 checks passed 1,519 JS tests, 3,197 native core tests plus 20 native integrations, 61 lab cases, 109 offline contracts, 40 actual Next.js cases, six real-PUC APS cases and all 27 backend/EOF/URL gates. The new Node-labelled image and all 14 actual embedded JS module strings were verified. Independent merge correctness/architecture reviews accepted the resolutions and narrow host-lint exceptions. Standalone TypeScript and unrelated whole-workflow actionlint failures remain disclosed. Hosted CI and real GPT/GAM/field validation are not inferred from these local results.
+
+The unchanged baseline archive and all failed browser/quota/lint attempts remain distinct from successful post-merge runs. The validation record contains final measurements, hashes, commands and evidence limits.
 
 ## 4. Stable combined verification
 
