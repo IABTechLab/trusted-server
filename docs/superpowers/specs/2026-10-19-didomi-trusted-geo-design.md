@@ -24,6 +24,9 @@ or extending loader canonicalization to unrelated assets.
   and enforce terminal `no-store, private`, including removal of validators and
   independent CDN cache directives. Keep SDK CORS behavior.
 - API requests retain cache bypass, private responses, and no geo lookup/headers.
+- `ts audit generate` leaves detected Didomi disabled and lists it for manual
+  review, because the audit cannot pick an adapter-specific geo and
+  loader-caching mode.
 
 ## Tradeoffs and compatibility
 

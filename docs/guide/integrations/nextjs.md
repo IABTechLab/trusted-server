@@ -115,6 +115,10 @@ Targets the Next.js data script for rewriting.
 - Retains only an unresolved cross-script `T` chunk group
 - Rewrites URLs and recalculates `T` chunk byte lengths before releasing a complete group
 - Restores invalid, incomplete, or over-limit groups unchanged
+- Some unsafe cases disable Flight rewriting for the rest of the document: an uncaptured channel-1 data head, a binary channel-3 or other unsupported push, or a payload, script, or held-output size limit
+- Document-wide fallback restores queued payloads that have not yet streamed to their original bytes; already-streamed complete groups cannot be restored
+- The conservative raw-head guard also applies to inert `self.__next_f.push([1,` text in strings, comments, or JSON-LD, so later origin rewrites can be lost even with only `nextjs` enabled
+- The first placeholder-stage fallback logs a reason-bearing warning without including source text
 - Applies `max_combined_payload_bytes` independently to captured payloads and held output
 - Preserves script order and React hydration data
 

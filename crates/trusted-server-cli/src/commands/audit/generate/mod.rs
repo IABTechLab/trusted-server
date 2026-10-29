@@ -28,51 +28,13 @@ use crate::commands::audit::generate::slot_toml::{
     render_slots, replace_key_in_section, resolve_network_id, splice_creative_slots, toml_string,
 };
 use crate::commands::config::init::EXAMPLE_CONFIG;
-use crate::error::{CliResult, cli_error, report_error};
+use crate::error::{CliResult, cli_error, report_error, toml_error_location};
+use crate::fs_util::write_file_atomically;
 
 use analyzer::{analyze_collected_page, extract_gtm_container_id};
 
 pub(crate) use browser_collector::DeviceProfile;
 pub(crate) use crawl_plan::CrawlBudget;
-
-/// Writes `contents` to `path` atomically: a same-directory temp file is
-/// written and fsynced, then renamed over the target, then the directory entry
-/// is fsynced.
-///
-/// A plain `fs::write` truncates the destination before writing, so a full disk
-/// or an interrupted run would leave an operator's `trusted-server.toml` empty
-/// or half-written. `rename` within a directory is atomic, so a reader sees
-/// either the old file or the complete new one.
-///
-/// The target's existing permissions are carried onto the replacement, since
-/// the temp file is created 0600 and the config may intentionally be broader.
-///
-/// # Errors
-///
-/// Returns the underlying I/O error when the temp file cannot be created,
-/// written, synced, or renamed over `path`.
-fn write_file_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
-    let directory = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-
-    let mut temp = tempfile::Builder::new()
-        .prefix(".ts-audit-")
-        .tempfile_in(directory)?;
-    temp.write_all(contents.as_bytes())?;
-    temp.as_file().sync_all()?;
-    if let Ok(metadata) = fs::metadata(path) {
-        temp.as_file().set_permissions(metadata.permissions())?;
-    }
-    temp.persist(path).map_err(|error| error.error)?;
-
-    // Best-effort durability for the rename itself. Opening a directory handle
-    // is not portable (Windows rejects it), and the content is already safely
-    // on disk either way, so a failure here is not worth failing the command.
-    let _ = fs::File::open(directory).and_then(|handle| handle.sync_all());
-    Ok(())
-}
 
 /// Arguments for `ts audit generate <url>` — bootstraps draft Trusted Server
 /// config and JavaScript asset audit files from a live page (issue #800).
@@ -1191,7 +1153,10 @@ pub(crate) fn run_update_slots(
 /// unrelated operator configuration from dry-run output.
 fn managed_creative_projection(document: &str) -> CliResult<String> {
     let value = toml::from_str::<toml::Value>(document).map_err(|error| {
-        report_error(format!("failed to parse config for dry-run diff: {error}"))
+        report_error(format!(
+            "failed to parse config for dry-run diff{}",
+            toml_error_location(document, error.span())
+        ))
     })?;
     let creative = value
         .get("creative_opportunities")
@@ -4409,6 +4374,22 @@ mod tests {
             fs::read_to_string(&config_path).expect("should re-read config"),
             replacement,
             "the concurrent edit must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn managed_creative_projection_parse_error_does_not_echo_config_source() {
+        let source = "[publisher]\norigin_url = \"https://origin-private.example.com/internal\n";
+
+        let error = managed_creative_projection(source).expect_err("should reject invalid TOML");
+
+        assert!(
+            !error.contains("origin-private.example.com"),
+            "should not echo config source text: {error}"
+        );
+        assert!(
+            error.contains("at line 2, column "),
+            "should report the error location: {error}"
         );
     }
 }
