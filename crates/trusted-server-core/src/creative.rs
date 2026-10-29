@@ -16,7 +16,7 @@
 //!   - `<input type="image" src>`
 //!   - SVG: `<image href|xlink:href>`, `<use href|xlink:href>`
 //!   - `<iframe src>`
-//!   - `<link rel~="stylesheet|preload|prefetch" href>` and `imagesrcset`
+//!   - `<link rel~="stylesheet|preload|prefetch" href>`
 //!   - Inline styles (`[style]`) and `<style>` blocks: url(...) values are rewritten
 //! - Click-through links (`<a href>`, `<area href>`) are wrapped in
 //!   `/first-party/click?tsurl=<base-url>&<original-query-params>&tstoken=<sig>`,
@@ -30,6 +30,8 @@
 //! - Relative URLs (e.g., `/path`, `../path`, `local/file`) remain unchanged.
 //! - Non-network schemes are ignored: `data:`, `javascript:`, `mailto:`, `tel:`,
 //!   `blob:`, `about:`.
+//! - When `[rewrite] include_domains` is non-empty, only asset URLs on listed
+//!   hosts are proxied. Links ignore it.
 //!
 //! Switches:
 //! - Auction creatives (`POST /auction` and inline SSAT/page-bids) rewrite asset
@@ -1331,25 +1333,22 @@ fn rewrite_creative_html_impl(
                 }
                 Ok(())
             }),
-            // Stylesheets and preloads
+            // Stylesheets and preloads. `imagesrcset` is left to the
+            // `[imagesrcset]` handler, which also runs on this element;
+            // rewriting it here too would proxy the inline path's absolute
+            // proxy URLs a second time.
             element!("link[href]", |el| {
                 let rel = el
                     .get_attribute("rel")
                     .unwrap_or_default()
                     .to_ascii_lowercase();
-                if rel.contains("stylesheet") || rel.contains("preload") || rel.contains("prefetch")
-                {
-                    if let Some(p) =
+                if (rel.contains("stylesheet")
+                    || rel.contains("preload")
+                    || rel.contains("prefetch"))
+                    && let Some(p) =
                         proxied_attr_value(settings, el.get_attribute("href"), base_origin)
-                    {
-                        let _ = el.set_attribute("href", &p);
-                    }
-                    if let Some(srcset) = el.get_attribute("imagesrcset") {
-                        let rewritten = rewrite_srcset(settings, &srcset, base_origin);
-                        if rewritten != srcset {
-                            let _ = el.set_attribute("imagesrcset", &rewritten);
-                        }
-                    }
+                {
+                    let _ = el.set_attribute("href", &p);
                 }
                 Ok(())
             }),
@@ -1633,8 +1632,9 @@ impl StreamProcessor for CreativeCssProcessor<'_> {
 mod tests {
     use super::{
         CreativeCssProcessor, StreamProcessor as _, normalize_creative_url,
-        process_auction_creative, proxy_if_abs, rewrite_creative_html,
-        rewrite_inline_creative_html, rewrite_srcset, rewrite_style_urls, sanitize_creative_html,
+        process_auction_creative, proxy_if_abs, rewrite_creative_html, rewrite_css_body,
+        rewrite_inline_creative_html, rewrite_proxied_html, rewrite_srcset, rewrite_style_urls,
+        sanitize_creative_html,
     };
 
     use crate::settings::Settings;
@@ -3852,6 +3852,258 @@ b{background:url(\"https://cdn.example/c.png\")}";
             out.contains(r#"<img src="https://cdn.example.com/ad.png">"#),
             "should leave an asset raw when its host matches a mixed-case entry: {out}"
         );
+    }
+
+    const ALLOWLIST_LISTED: &[&str] = &[
+        "https://assets.example.com/a.css",
+        "https://assets.example.com/p1.png",
+        "https://assets.example.com/p1-2x.png",
+        "https://assets.example.com/a.js",
+        "https://assets.example.com/i.css",
+        "https://assets.example.com/bg.png",
+        "https://assets.example.com/set.png",
+        "https://assets.example.com/img.png",
+        "https://assets.example.com/lazy.png",
+        "https://assets.example.com/s1.png",
+        "https://assets.example.com/v.mp4",
+        "https://assets.example.com/o.swf",
+        "https://assets.example.com/e.swf",
+        "https://assets.example.com/btn.png",
+        "https://assets.example.com/icon.svg",
+        "https://assets.example.com/sprite.svg",
+        "https://assets.example.com/frame.html",
+        "https://assets.example.com/inline.png",
+    ];
+
+    const ALLOWLIST_OFF_LIST: &[&str] = &[
+        "https://cdn.example.net/a.css",
+        "https://cdn.example.net/p2.png",
+        "https://cdn.example.net/a.js",
+        "https://cdn.example.net/i.css",
+        "https://cdn.example.net/bg.png",
+        "https://cdn.example.net/set.png",
+        "https://cdn.example.net/img.png",
+        "https://cdn.example.net/lazy.png",
+        "https://cdn.example.net/s2.png",
+        "https://cdn.example.net/v.mp4",
+        "https://cdn.example.net/o.swf",
+        "https://cdn.example.net/e.swf",
+        "https://cdn.example.net/btn.png",
+        "https://cdn.example.net/icon.svg",
+        "https://cdn.example.net/sprite.svg",
+        "https://cdn.example.net/frame.html",
+        "https://cdn.example.net/inline.png",
+    ];
+
+    const ALLOWLIST_CREATIVE: &str = r#"<html><head>
+<link rel="stylesheet" href="https://assets.example.com/a.css">
+<link rel="stylesheet" href="https://cdn.example.net/a.css">
+<link rel="preload" as="image" href="https://assets.example.com/p1.png" imagesrcset="https://cdn.example.net/p2.png 1x, https://assets.example.com/p1-2x.png 2x">
+<script src="https://assets.example.com/a.js"></script>
+<script src="https://cdn.example.net/a.js"></script>
+<style>
+@import "https://assets.example.com/i.css";
+@import "https://cdn.example.net/i.css";
+.a { background: url(https://assets.example.com/bg.png); }
+.b { background: url(https://cdn.example.net/bg.png); }
+.c { background-image: image-set("https://assets.example.com/set.png" 1x, "https://cdn.example.net/set.png" 2x); }
+</style>
+</head><body>
+<img src="https://assets.example.com/img.png" data-src="https://assets.example.com/lazy.png" srcset="https://assets.example.com/s1.png 1x, https://cdn.example.net/s2.png 2x">
+<img src="https://cdn.example.net/img.png" data-src="https://cdn.example.net/lazy.png">
+<video src="https://assets.example.com/v.mp4"></video>
+<video src="https://cdn.example.net/v.mp4"></video>
+<object data="https://assets.example.com/o.swf"></object>
+<object data="https://cdn.example.net/o.swf"></object>
+<embed src="https://assets.example.com/e.swf">
+<embed src="https://cdn.example.net/e.swf">
+<input type="image" src="https://assets.example.com/btn.png">
+<input type="image" src="https://cdn.example.net/btn.png">
+<svg><image href="https://assets.example.com/icon.svg"></image><use xlink:href="https://assets.example.com/sprite.svg"></use></svg>
+<svg><image href="https://cdn.example.net/icon.svg"></image><use xlink:href="https://cdn.example.net/sprite.svg"></use></svg>
+<iframe src="https://assets.example.com/frame.html"></iframe>
+<iframe src="https://cdn.example.net/frame.html"></iframe>
+<div style="background: url(https://assets.example.com/inline.png)"></div>
+<div style="background: url(https://cdn.example.net/inline.png)"></div>
+<a href="https://landing.example.net/offer">Offer</a>
+<map><area href="https://landing.example.org/area" alt="Area"></map>
+</body></html>"#;
+
+    fn encoded_tsurl(url: &str) -> String {
+        format!(
+            "tsurl={}",
+            url::form_urlencoded::byte_serialize(url.as_bytes()).collect::<String>()
+        )
+    }
+
+    fn allowlist_settings() -> crate::settings::Settings {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.rewrite.include_domains = vec!["*.example.com".to_owned()];
+        settings
+    }
+
+    fn assert_allowlist_applied(label: &str, out: &str) {
+        for listed in ALLOWLIST_LISTED {
+            assert!(
+                out.contains(&encoded_tsurl(listed)),
+                "{label}: should proxy listed URL `{listed}`: {out}"
+            );
+        }
+        for off_list in ALLOWLIST_OFF_LIST {
+            assert!(
+                !out.contains(&encoded_tsurl(off_list)),
+                "{label}: should not proxy off-list URL `{off_list}`: {out}"
+            );
+            assert!(
+                out.contains(off_list),
+                "{label}: should keep off-list URL `{off_list}` raw: {out}"
+            );
+        }
+        for landing in [
+            "https://landing.example.net/offer",
+            "https://landing.example.org/area",
+        ] {
+            assert!(
+                out.contains(&format!("/first-party/click?{}", encoded_tsurl(landing))),
+                "{label}: should wrap click `{landing}` regardless of include_domains: {out}"
+            );
+        }
+        assert_eq!(
+            out.matches("data-tsclick=").count(),
+            2,
+            "{label}: should mark both click-through links"
+        );
+    }
+
+    #[test]
+    fn include_domains_limit_asset_rewriting_on_every_html_path() {
+        let settings = allowlist_settings();
+
+        assert_allowlist_applied(
+            "auction",
+            &rewrite_creative_html(&settings, ALLOWLIST_CREATIVE),
+        );
+        assert_allowlist_applied(
+            "inline",
+            &rewrite_inline_creative_html(&settings, "https://www.example.com", ALLOWLIST_CREATIVE),
+        );
+        assert_allowlist_applied(
+            "proxied",
+            &rewrite_proxied_html(&settings, ALLOWLIST_CREATIVE),
+        );
+    }
+
+    #[test]
+    fn include_domains_limit_css_body_rewriting() {
+        let settings = allowlist_settings();
+        let css = r#"@import "https://assets.example.com/i.css";
+@import "https://cdn.example.net/i.css";
+.a { background: url(https://assets.example.com/bg.png); }
+.b { background: url(https://cdn.example.net/bg.png); }"#;
+
+        let out = rewrite_css_body(&settings, css).expect("should rewrite CSS body");
+
+        for listed in [
+            "https://assets.example.com/i.css",
+            "https://assets.example.com/bg.png",
+        ] {
+            assert!(
+                out.contains(&encoded_tsurl(listed)),
+                "should proxy listed CSS URL `{listed}`: {out}"
+            );
+        }
+        for off_list in [
+            "https://cdn.example.net/i.css",
+            "https://cdn.example.net/bg.png",
+        ] {
+            assert!(
+                out.contains(off_list) && !out.contains(&encoded_tsurl(off_list)),
+                "should keep off-list CSS URL `{off_list}` raw: {out}"
+            );
+        }
+    }
+
+    // `imagesrcset` is rewritten only by the `[imagesrcset]` handler. When the
+    // `link[href]` handler also rewrote it, the inline path's absolute proxy
+    // URLs were proxied a second time.
+    #[test]
+    fn inline_link_imagesrcset_is_proxied_once() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let html = r#"<link rel="preload" as="image" href="https://assets.example.com/p.png" imagesrcset="https://assets.example.com/p.png 1x">"#;
+
+        let out = rewrite_inline_creative_html(&settings, "https://publisher.example.com", html);
+
+        let imagesrcset = out
+            .split("imagesrcset=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("should keep an imagesrcset attribute");
+        assert_eq!(
+            imagesrcset.matches("tsurl=").count(),
+            1,
+            "should proxy the imagesrcset candidate exactly once: {imagesrcset}"
+        );
+    }
+
+    #[test]
+    fn root_relative_link_imagesrcset_is_proxied_once() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let html = r#"<link rel="preload" as="image" href="https://assets.example.com/p.png" imagesrcset="https://assets.example.com/p.png 1x">"#;
+
+        for (label, out) in [
+            ("auction", rewrite_creative_html(&settings, html)),
+            ("proxied", rewrite_proxied_html(&settings, html)),
+        ] {
+            let imagesrcset = out
+                .split("imagesrcset=\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .expect("should keep an imagesrcset attribute");
+            assert_eq!(
+                imagesrcset.matches("tsurl=").count(),
+                1,
+                "{label}: should proxy the imagesrcset candidate exactly once: {imagesrcset}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_in_both_lists_is_left_alone() {
+        let mut settings = allowlist_settings();
+        settings.rewrite.exclude_domains = vec!["assets.example.com".to_owned()];
+        let html = ALLOWLIST_CREATIVE.replace(
+            "</body>",
+            r#"<a href="https://assets.example.com/landing">Excluded</a></body>"#,
+        );
+
+        for (label, out) in [
+            ("auction", rewrite_creative_html(&settings, &html)),
+            (
+                "inline",
+                rewrite_inline_creative_html(&settings, "https://www.example.com", &html),
+            ),
+            ("proxied", rewrite_proxied_html(&settings, &html)),
+        ] {
+            assert!(
+                !out.contains("tsurl=https%3A%2F%2Fassets.example.com"),
+                "{label}: should not rewrite any URL on a host in both lists: {out}"
+            );
+            for listed in ALLOWLIST_LISTED {
+                assert!(
+                    out.contains(listed),
+                    "{label}: should keep `{listed}` raw when its host is also excluded: {out}"
+                );
+            }
+            assert!(
+                out.contains(r#"<a href="https://assets.example.com/landing">Excluded</a>"#),
+                "{label}: should leave an excluded click-through link raw: {out}"
+            );
+            assert_eq!(
+                out.matches("data-tsclick=").count(),
+                2,
+                "{label}: should wrap only the two links on hosts that are not excluded: {out}"
+            );
+        }
     }
 
     #[test]

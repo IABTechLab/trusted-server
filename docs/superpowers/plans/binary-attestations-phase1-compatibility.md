@@ -4,6 +4,17 @@
 
 **Conclusion:** the original Phase 1 signer path and CycloneDX public format would have required a later breaking policy replacement. Fix those now. Phase 1 is the first implementation slice of the existing contract: retain its public names, signer/caller distinction, SPDX semantics and original policy files. Introduce no competing release-index schema or weakened consumer policy.
 
+**Current review corrections (2026-10-29):** the publisher now requires a raw
+lightweight-tag reference at the expected source commit before release creation,
+upload or publication. SPDX completion normalizes fractional creation timestamps
+to whole-second UTC before signing. The earlier tag-validation deferrals in the
+audit table describe its recorded baseline; strict SemVer validation remains
+later work. Rehearsal `.15` remains evidence for `68eef902a8bddd9024676cc3806fa5377ed67fee`
+only. These release-helper corrections and the later merge of main are not
+covered by that rehearsal; fresh reviewed-source release qualification remains
+pending. Other-tag bundle availability remains a GitHub CLI dependency limit,
+as described in the [operator guide](../../guide/release-verification.md).
+
 Frozen source references below mean:
 
 - [Spec](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/docs/superpowers/specs/2026-10-09-1235-release-attestation-design.md), especially R-COHORT/R-PLATFORM/R-SOURCE/R-SIGN/R-PUBLISH/R-INDEX/R-EVIDENCE.
@@ -303,7 +314,7 @@ clean inherited environments provide additional checks, not hermeticity.
 
 Rehearsal `.6` at `39a769c3e3d6476395fa7a215bd0a5e74a760f3e` failed after immutable publication at the release-attestation lookup. [Independent verification](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6360012578) passed for all seven binaries / 29 assets, online and offline checks, SPDX equality and the manual Fastly pack/validate/inspect/cmp route; this does not turn the failed workflow green. Fresh `.8` subsequently passed at `7a05940e2f7b10c459bdd2d3949f265b755ce42c`; see the [full transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6362236955).
 
-The failed publisher check ran at 07:19:53.744 UTC; the independently verified release attestation has a trusted timestamp of 07:19:58 UTC. The pinned CLI hides underlying lookup errors, so the original HTTP status is unknown. The immutable prerelease and its 29 assets remain unchanged. Before cryptographic release verification, the availability check makes at most five release-attestation GETs, with 2s/5s/10s/20s backoff (37s total waiting). Only this endpoint treats HTTP 404 as no record yet; a valid HTTP 200 with no current-tag record may also wait. Each GET times out after at most 4s, and a separate 60s deadline bounds availability checking within the shared three-minute scheduling window. Every other non-200 status fails immediately. Malformed records, duplicate current-tag records, identity/source/asset mismatches and definitive cryptographic failures stop immediately. Well-formed records for other tags, such as an earlier prerelease of the same commit, are logged and ignored without cryptographic verification: their state does not affect this release, and a deleted or slow earlier release must not fail an already published one. Current-tag cryptographic verification is single-shot. Logs show every wait or availability on the first check. No mutation is retried.
+The failed publisher check ran at 07:19:53.744 UTC; the independently verified release attestation has a trusted timestamp of 07:19:58 UTC. The pinned CLI hides underlying lookup errors, so the original HTTP status is unknown. The immutable prerelease and its 29 assets remain unchanged. Before cryptographic release verification, the availability check makes at most five release-attestation GETs, with 2s/5s/10s/20s backoff (37s total waiting). Only this endpoint treats HTTP 404 as no record yet; a valid HTTP 200 with no current-tag record may also wait. Each GET times out after at most 4s, and a separate 60s deadline bounds availability checking within the shared three-minute scheduling window. Every other non-200 status fails immediately. Malformed records, duplicate current-tag records, identity/source/asset mismatches and definitive cryptographic failures stop immediately. Other-tag records are logged and ignored by the publisher's own availability check. GitHub CLI still fetches all returned bundle URLs before filtering by tag, so an unavailable older bundle can fail current-release verification. Preserve the immutable release and use read-only recovery. An upstream filter-before-fetch fix and qualification of a CLI that supplies it remain pending. Current-tag cryptographic verification is single-shot. Logs show every wait or availability on the first check. No mutation is retried.
 
 ### Corrective batch publication checks
 

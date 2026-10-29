@@ -157,6 +157,10 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'success',
     'idle-socket',
     'stable',
+    'annotated-tag',
+    'wrong-tag-commit',
+    'missing-tag',
+    'malformed-tag',
     'download-corrupt',
     'download-missing',
     'download-extra',
@@ -316,6 +320,20 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
               : JSON.stringify(body),
             { status }
           )
+        if (u.pathname.includes('/git/ref/tags/')) {
+          assert.equal(method, 'GET')
+          assert.equal(u.pathname.split('/').at(-1), release(false).tag_name)
+          if (mode === 'missing-tag') return response({}, 404)
+          if (mode === 'malformed-tag') return response({})
+          return response({
+            object: {
+              type: mode === 'annotated-tag' ? 'tag' : 'commit',
+              sha: ['annotated-tag', 'wrong-tag-commit'].includes(mode)
+                ? 'b'.repeat(40)
+                : 'a'.repeat(40),
+            },
+          })
+        }
         if (u.pathname.includes('/attestations/')) {
           polls++
           assert.equal(method, 'GET')
@@ -410,9 +428,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         URL,
         console: {
           log: (...args) => {
-            if (
-              args[0] === 'Ignored release attestation for other tag:'
-            )
+            if (args[0] === 'Ignored release attestation for other tag:')
               ignored.push(args[1])
           },
           warn: () => {},
@@ -536,6 +552,10 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
       if (
         [
           'draft',
+          'annotated-tag',
+          'wrong-tag-commit',
+          'missing-tag',
+          'malformed-tag',
           'publication-disabled',
           'api-error',
           'missing',
@@ -544,9 +564,12 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           'empty-bundle',
         ].includes(mode)
       )
-        assert.ok(!calls.some(([method]) => method === 'POST'), mode)
+        assert.ok(
+          !calls.some(([method]) => ['POST', 'PATCH'].includes(method)),
+          mode
+        )
       if (mode === 'api-error' || mode === 'upload-error')
-        assert.equal(calls.length, mode === 'api-error' ? 1 : 3)
+        assert.equal(calls.length, mode === 'api-error' ? 2 : 4)
       if (['upload-error'].includes(mode))
         assert.ok(!calls.some(([method]) => method === 'PATCH'), mode)
       if (successful) {
@@ -1061,4 +1084,145 @@ test('post-publish reads cannot succeed after the shared deadline', async () => 
       }),
     /window exhausted/
   )
+})
+
+test('SPDX creation timestamps use whole-second UTC without changing the instant second', () => {
+  for (const created of [
+    '2026-01-01T12:34:56.9290415Z',
+    '2026-01-01T12:34:56.000Z',
+    '2026-01-01T12:34:56Z',
+  ]) {
+    const { document, original } = spdxFixture()
+    document.documentDescribes = []
+    document.relationships = []
+    document.packages = document.packages.filter(
+      (p) => p.SPDXID !== 'SPDXRef-Root'
+    )
+    document.creationInfo = { created, creators: ['Tool: example-converter'] }
+    const output = completeSpdx(document, binary, original)
+    assert.equal(output.creationInfo.created, '2026-01-01T12:34:56Z')
+    assert.ok(output.creationInfo.creators.includes('Tool: example-converter'))
+  }
+})
+
+test('release build cleans owned config and inventory on success and failure', () => {
+  for (const mode of [
+    'success',
+    'config-write-failure',
+    'build-failure',
+    'generator-failure',
+    'converter-failure',
+    'existing-config',
+    'existing-inventory',
+    'inventory-symlink',
+    'config-symlink',
+  ]) {
+    const root = mkdtempSync(join(tmpdir(), 'phase1-cleanup-'))
+    const bin = join(root, 'bin')
+    const inventory = join(root, 'crates/trusted-server-cli/phase1.json')
+    const config = join(root, 'trusted-server.toml')
+    try {
+      mkdirSync(bin)
+      mkdirSync(join(root, 'crates/trusted-server-cli'), { recursive: true })
+      const script = join(root, 'build.sh')
+      fs.copyFileSync('scripts/release/phase1-build.sh', script)
+      const stub = (name, body) =>
+        writeFileSync(join(bin, name), '#!/bin/bash\nset -eu\n' + body + '\n', {
+          mode: 0o755,
+        })
+      stub(
+        'git',
+        'if [[ "$1" == rev-parse ]]; then printf "%s\\n" "$SOURCE_COMMIT"; fi'
+      )
+      stub('node', 'exit 0')
+      stub('npm', 'echo "{}"')
+      stub('shasum', 'exit 0')
+      stub('tar', 'exit 0')
+      stub(
+        'cat',
+        'if [[ "$FIXTURE_MODE" == config-write-failure ]]; then printf partial; exit 97; fi; exec /bin/cat "$@"'
+      )
+      stub(
+        'cargo',
+        `case "$1" in
+        build)
+          [[ "$FIXTURE_MODE" != build-failure ]] || exit 97
+          mkdir -p "$CARGO_TARGET_DIR/aarch64-apple-darwin/release"
+          printf binary > "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/ts" ;;
+        install)
+          mkdir -p "$RUNNER_TEMP/phase1-cyclonedx/install/bin"
+          printf '%s\\n' '#!/bin/bash' 'printf "{}" > crates/trusted-server-cli/phase1.json' 'if [[ "$FIXTURE_MODE" == generator-failure ]]; then exit 98; fi' > "$RUNNER_TEMP/phase1-cyclonedx/install/bin/cargo-cyclonedx"
+          chmod +x "$RUNNER_TEMP/phase1-cyclonedx/install/bin/cargo-cyclonedx" ;;
+        metadata) echo '{}' ;;
+        *) exit 96 ;;
+      esac`
+      )
+      stub(
+        'curl',
+        `while [[ "$1" != --output ]]; do shift; done
+        printf '%s\\n' '#!/bin/bash' 'if [[ "$FIXTURE_MODE" == converter-failure ]]; then exit 99; fi' > "$2"`
+      )
+      if (mode === 'existing-config') writeFileSync(config, 'operator config')
+      if (mode === 'config-symlink')
+        fs.symlinkSync('missing-user-config', config)
+      if (mode === 'existing-inventory')
+        writeFileSync(inventory, 'operator inventory')
+      if (mode === 'inventory-symlink')
+        fs.symlinkSync('missing-user-file', inventory)
+      let error
+      try {
+        execFileSync(
+          '/bin/bash',
+          [
+            script,
+            'trusted-server-cli',
+            'aarch64-apple-darwin',
+            'ts-aarch64-apple-darwin',
+          ],
+          {
+            cwd: root,
+            stdio: 'pipe',
+            env: {
+              PATH: `${bin}:/usr/bin:/bin`,
+              RUNNER_TEMP: root,
+              SOURCE_COMMIT: 'a'.repeat(40),
+              FIXTURE_MODE: mode,
+            },
+          }
+        )
+      } catch (failure) {
+        error = failure
+      }
+      const expectedStatus =
+        {
+          success: undefined,
+          'config-write-failure': 97,
+          'build-failure': 97,
+          'generator-failure': 98,
+          'converter-failure': 99,
+        }[mode] ?? (mode === 'success' ? undefined : 1)
+      assert.equal(error?.status, expectedStatus, mode)
+      if (mode === 'config-symlink')
+        assert.equal(fs.readlinkSync(config), 'missing-user-config')
+      assert.equal(
+        fs.existsSync(config),
+        mode === 'existing-config',
+        `${mode}: config cleanup`
+      )
+      if (mode === 'existing-config')
+        assert.equal(readFileSync(config, 'utf8'), 'operator config')
+      if (mode === 'existing-inventory')
+        assert.equal(readFileSync(inventory, 'utf8'), 'operator inventory')
+      else if (mode === 'inventory-symlink')
+        assert.equal(fs.readlinkSync(inventory), 'missing-user-file')
+      else
+        assert.equal(
+          fs.existsSync(inventory),
+          false,
+          `${mode}: inventory cleanup`
+        )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  }
 })

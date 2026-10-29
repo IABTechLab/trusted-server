@@ -70,8 +70,8 @@ Use an independently trusted GitHub CLI installation with `gh attestation verify
 recorded in the release job log. The SBOM comparison below also uses `jq`.
 Verification needs GitHub network access. Obtain the approved tag
 and its 40-character source commit through an independent source-review process.
-The retained strict SemVer/lightweight-tag validation is deferred; use a
-separately approved tag and its peeled source commit. A checksum or commit supplied only with
+Phase 1 requires a lightweight tag pointing directly to that source commit.
+The retained strict SemVer validation remains deferred; use a separately approved tag. A checksum or commit supplied only with
 an untrusted download is not source approval.
 
 Run this in a new private directory, using Bash. Replace the fictional tag and
@@ -217,7 +217,9 @@ EDGEZERO__ADAPTER__PORT=8080 ./trusted-server-axum-x86_64-unknown-linux-gnu
 ```
 
 With `EDGEZERO__ADAPTER__HOST` unset, either port setting retains loopback
-(`127.0.0.1`); use your reviewed reverse proxy and
+(`127.0.0.1`). Setting `EDGEZERO__ADAPTER__HOST` to a non-loopback address
+(such as `0.0.0.0`) is an explicit operator choice that exposes the listener
+on that interface. Use your reviewed reverse proxy and
 TLS configuration for public traffic. Axum has no help/version or dry-run mode.
 Its build smoke starts an isolated server with a fictional external config
 envelope and requires `/health` to return `200` and `ok`, distinguishing a
@@ -359,7 +361,7 @@ single-shot. Every API read, including that listing, times out after 10s. Mutati
 have no client-side timeout and are bounded by the 15-minute job limit: aborting a
 create, upload or publish cannot cancel a change GitHub already accepted.
 
-Before cryptographic release verification, the availability check makes at most five release-attestation GETs, with 2s/5s/10s/20s backoff (37s total waiting). Only this endpoint treats HTTP 404 as no record yet; a valid HTTP 200 with no current-tag record may also wait. Each GET times out after at most 4s, and a separate 60s deadline bounds availability checking within the shared three-minute scheduling window. Every other non-200 status fails immediately. Malformed records, duplicate current-tag records, identity/source/asset mismatches and definitive cryptographic failures stop immediately. Well-formed records for other tags, such as an earlier prerelease of the same commit, are logged and ignored without cryptographic verification: their state does not affect this release, and a deleted or slow earlier release must not fail an already published one. Current-tag cryptographic verification is single-shot. Logs show every wait or availability on the first check. No mutation is retried.
+Before cryptographic release verification, the availability check makes at most five release-attestation GETs, with 2s/5s/10s/20s backoff (37s total waiting). Only this endpoint treats HTTP 404 as no record yet; a valid HTTP 200 with no current-tag record may also wait. Each GET times out after at most 4s, and a separate 60s deadline bounds availability checking within the shared three-minute scheduling window. Every other non-200 status fails immediately. Malformed records, duplicate current-tag records, identity/source/asset mismatches and definitive cryptographic failures stop immediately. Other-tag records are logged and ignored by the publisher's own availability check, but GitHub CLI still fetches all returned bundle URLs before filtering by tag. An unavailable older bundle can therefore fail the current release's read-only verification. Preserve the immutable release and follow the read-only recovery procedure below. Filter-before-fetch behavior remains a dependency follow-up: track it upstream and qualify a GitHub CLI version that supplies it before claiming isolation from other tags. Current-tag cryptographic verification is single-shot. Logs show every wait or availability on the first check. No mutation is retried.
 
 The publisher re-downloads all 29 assets into a fresh temporary directory, checks the exact file set and byte-compares them with the validated signed handoff, including identical SHA256SUMS. Only transport download failures may retry; any missing, extra or different file fails immediately. Temporary downloads are removed after each attempt.
 
@@ -400,6 +402,10 @@ all matching drafts read-only. Do not rerun uploads, delete a release, or reuse
 the tag without an independently approved recovery decision. Published immutable
 releases are never overwritten. A fresh release needs a fresh approved tag;
 Phase 2's full reconciliation and incident owner remains deferred.
+
+Phase 1 accepts only lightweight tags whose raw tag reference points directly
+to the expected source commit. Annotated tags have a separate tag-object identity
+and are rejected before release creation, upload or publication.
 
 Before the first production release, rehearse the reviewed commit in a separate
 public repository with Actions and immutable releases enabled. Use a fresh,

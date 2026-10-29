@@ -30,7 +30,15 @@ export TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=phase1-secret-canary-32-character
 export EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=phase1-physical-store-canary
 export FASTLY_SERVICE_ID=phase1-service-account-canary
 export MACOSX_DEPLOYMENT_TARGET=13.0
-[[ ! -e trusted-server.toml ]]
+inventory="crates/$build_package/phase1.json"
+# Refuse existing paths, including dangling symlinks, before claiming cleanup ownership.
+for owned_path in trusted-server.toml "$inventory"; do
+  if [[ -e "$owned_path" || -L "$owned_path" ]]; then
+    echo "Refusing existing release temporary path: $owned_path" >&2
+    exit 1
+  fi
+done
+trap 'rm -f trusted-server.toml "$inventory"; if [[ -n "${build_container:-}" ]]; then docker rm -f "$build_container" >/dev/null 2>&1 || true; fi' EXIT
 cat > trusted-server.toml <<'CONFIG'
 # Fictional config must never become a build input.
 [publisher]
@@ -39,7 +47,6 @@ proxy_secret = "phase1-secret-canary-32-characters"
 [permissions]
 policy = "phase1-permission-policy-canary"
 CONFIG
-trap 'rm -f trusted-server.toml; if [[ -n "${build_container:-}" ]]; then docker rm -f "$build_container" >/dev/null 2>&1 || true; fi' EXIT
 export CARGO_TARGET_DIR="$RUNNER_TEMP/phase1-target"
 [[ ! -e "$CARGO_TARGET_DIR" ]]
 mkdir -p release-assets
@@ -111,7 +118,7 @@ CARGO_NET_OFFLINE=true "$tool_root/install/bin/cargo-cyclonedx" cyclonedx \
   --format json --spec-version 1.5 --override-filename phase1
 npm --prefix crates/trusted-server-js/lib sbom --sbom-format cyclonedx > "$tool_root/npm.cdx.json"
 node scripts/release/phase1.mjs merge \
-  "crates/$build_package/phase1.json" "$tool_root/npm.cdx.json" \
+  "$inventory" "$tool_root/npm.cdx.json" \
   "release-assets/$release_asset" "$tool_root/combined.cdx.json"
 # Convert the internal dependency graph into real SPDX 2.3 before publication.
 case "$build_target" in

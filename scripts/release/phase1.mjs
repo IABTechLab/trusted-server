@@ -75,6 +75,11 @@ export function completeSpdx(document, binary, original) {
   )
     throw new Error('Unexpected converter root or relationships')
   document.creationInfo ??= {}
+  if (typeof document.creationInfo.created === 'string')
+    document.creationInfo.created = document.creationInfo.created.replace(
+      /\.\d+Z$/,
+      'Z'
+    )
   document.creationInfo.creators = [
     ...new Set([
       ...(document.creationInfo.creators ?? []),

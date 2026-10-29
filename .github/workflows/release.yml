@@ -146,6 +146,13 @@ jobs:
             if (!response.ok || path.startsWith('attestations/') && response.status !== 200) throw Object.assign(Error(`GitHub API failed: ${method} ${path} ${response.status}`), {status:response.status, retryAfter:response.headers.get('retry-after')});
             return response.json();
           };
+          // Phase 1 uses the commit digest for both provenance and release membership.
+          // Annotated tags have a distinct tag-object digest, so reject them before
+          // creating a draft or uploading/publishing any release assets.
+          const tagRef = await api(`git/ref/tags/${encodeURIComponent(tag)}`);
+          if (tagRef.object?.type !== 'commit' || tagRef.object.sha !== source) {
+            throw Error('Phase 1 requires a lightweight tag at SOURCE_COMMIT');
+          }
           // List releases, including drafts. Never resume, overwrite or delete a matching tag.
           for (let page = 1; ; page++) {
             if (page > 1000) throw Error('Release listing exceeded bound');
@@ -247,7 +254,8 @@ jobs:
             if (current.length > 1) throw Error('Multiple release attestations for current tag');
             if (current.length && (current[0].statement.predicate.databaseId !== String(id) || current[0].subjects.length !== files.length || current[0].subjects.some(subject => !files.includes(subject.name) || subject.digest.sha256 !== hash(regular(`release-assets/${subject.name}`))))) throw Error('Current release attestation identity or assets mismatch');
             // Another tag's release (for example an earlier prerelease on this commit) can be
-            // deleted or slow to verify; it says nothing about this release, so it is not verified.
+            // ignored by this availability check. GitHub CLI may still fetch its bundle
+            // before filtering by tag during the cryptographic checks below.
             for (const record of records.filter(record => record.statement.predicate.tag !== tag)) {
               console.log('Ignored release attestation for other tag:', JSON.stringify(record.statement.predicate.tag));
             }
