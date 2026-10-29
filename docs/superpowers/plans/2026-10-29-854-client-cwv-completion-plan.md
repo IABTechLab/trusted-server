@@ -64,7 +64,7 @@ Merged main `21f43aa0138498023455789f152f5a864bbefe24` into the implementation i
 
 Fresh Node 24.20.0/Rust 1.98.1/Viceroy 0.21.0 checks passed 1,519 JS tests, 3,197 native core tests plus 20 native integrations, 61 lab cases, 109 offline contracts, 40 actual Next.js cases, six real-PUC APS cases and all 27 backend/EOF/URL gates. The new Node-labelled image and all 14 actual embedded JS module strings were verified. Independent merge correctness/architecture reviews accepted the resolutions and narrow host-lint exceptions. Standalone TypeScript and unrelated whole-workflow actionlint failures remain disclosed. Hosted CI and real GPT/GAM/field validation are not inferred from these local results.
 
-The unchanged baseline archive and all failed browser/quota/lint attempts remain distinct from successful post-merge runs. The validation record contains final measurements, hashes, commands and evidence limits.
+The unchanged baseline archive and all failed browser/quota/lint attempts remain distinct from successful post-merge runs. The first hosted run then flagged four fixture HTML-regex operations. A parser/source-range follow-up replaces them without changing production assets or measured HTML bytes. It passes 31 Node units, actual framework and focused browser checks; independent review accepts the source-order, overlap and EOF handling. Hosted scanning must assess that pushed fix separately. The validation record contains final measurements, hashes, commands and evidence limits.
 
 ## 4. Stable combined verification
 

@@ -14,21 +14,21 @@ Conflict resolution preserves upstream asynchronous HTML EOF processing, origin 
 
 ### Updated checks and artifacts
 
-| Check                             | Result                                                                                   | Evidence under `merge/`                             |
-| --------------------------------- | ---------------------------------------------------------------------------------------- | --------------------------------------------------- |
-| Full JS suite                     | 1,519 tests across 52 files passed; full lint and format passed                          | `js-final-{full,lint,format}.log`                   |
-| Focused GPT/APS suite             | 671 tests across nine files passed, including early/runtime APS failure relay            | `gpt-focused.log`                                   |
-| Native core                       | Unmodified Cargo invocation passed 3,197 core tests plus two ten-test integration suites | `evidence/gates/core-native.log`                    |
-| Fixture, launcher and CWV units   | All 21 passed                                                                            | `evidence/browser-units.log`                        |
-| Updated lab                       | All 61 passed, including 40 repeated measurements                                        | `evidence/cwv/`                                     |
-| Offline registration              | All 109 passed                                                                           | `evidence/offline-registration/`                    |
-| Actual Rust/Next.js               | All 40 passed, 20 inline and 20 shared-template                                          | `evidence/framework/`                               |
-| Initial-render overlap regression | All ten passed against current bundles and the explicit Rubicon/SharedId artifact        | `evidence/initial-render/`                          |
-| Real APS Universal Creative       | All six passed, no skips or flaky cases                                                  | `standard/results.json`                             |
-| Node pin guard                    | All 30 tests passed; all 27 jobs pin Node before compiling Rust                          | Coordinator output                                  |
-| Documentation proposal scripts    | All 20 Node tests, shell tests and ShellCheck passed                                     | Coordinator output and `evidence/docs-proposal.log` |
-| Changed integration workflow      | actionlint passed                                                                        | `evidence/actionlint.log`                           |
-| Publisher-registration launcher   | ShellCheck passed                                                                        | `evidence/shellcheck-publisher.log`                 |
+| Check                                         | Result                                                                                   | Evidence under `merge/`                             |
+| --------------------------------------------- | ---------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| Full JS suite                                 | 1,519 tests across 52 files passed; full lint and format passed                          | `js-final-{full,lint,format}.log`                   |
+| Focused GPT/APS suite                         | 671 tests across nine files passed, including early/runtime APS failure relay            | `gpt-focused.log`                                   |
+| Native core                                   | Unmodified Cargo invocation passed 3,197 core tests plus two ten-test integration suites | `evidence/gates/core-native.log`                    |
+| Fixture, launcher, CWV and initial-page units | All 31 passed after the parser follow-up                                                 | `evidence/codeql-units.log`                         |
+| Updated lab                                   | All 61 passed, including 40 repeated measurements                                        | `evidence/cwv/`                                     |
+| Offline registration                          | All 109 passed                                                                           | `evidence/offline-registration/`                    |
+| Actual Rust/Next.js                           | All 40 passed, 20 inline and 20 shared-template                                          | `evidence/framework/`                               |
+| Initial-render overlap regression             | All ten passed against current bundles and the explicit Rubicon/SharedId artifact        | `evidence/initial-render/`                          |
+| Real APS Universal Creative                   | All six passed, no skips or flaky cases                                                  | `standard/results.json`                             |
+| Node pin guard                                | All 30 tests passed; all 27 jobs pin Node before compiling Rust                          | Coordinator output                                  |
+| Documentation proposal scripts                | All 20 Node tests, shell tests and ShellCheck passed                                     | Coordinator output and `evidence/docs-proposal.log` |
+| Changed integration workflow                  | actionlint passed                                                                        | `evidence/actionlint.log`                           |
+| Publisher-registration launcher               | ShellCheck passed                                                                        | `evidence/shellcheck-publisher.log`                 |
 
 With `TSJS_PREBUILT_DIR` unset, the fresh release build passed in 1m56s. All 14 complete JS module strings match the independent distribution and occur byte-for-byte in the frozen WASM. WASM SHA-256 is `dad40087f6123d73b8465d774bd3212e7b25b4d6c8ce3051579f263e0d117f23`.
 
@@ -106,6 +106,18 @@ Full Rust formatting, docs lint/format and Markdown formatting outside docs also
 The URL linter reads committed trees. Its first invocation still examined the earlier branch HEAD and reported seven older URLs. Fixes retain official documentation/source references and the actual APS SDK assertion with reviewed per-line exceptions, without adding global allowlist entries. The fixture's symbolic-port error text no longer contains an invalid URL. Three helper tests, helper Clippy, eight early-bundle tests and scoped JS lint/format pass. Explicit-file lint and an exact merged-tree commit snapshot pass. Staged mode also reports unrelated upstream documentation because the merge index includes main's changes; those are outside the resulting PR diff and were not modified. The actual committed branch passes `ts dev lint domains --changed-vs origin/main` after merge commit `7b83a8ce87e773e2234a6dde7380a123f36e7d1f`.
 
 Independent merge correctness and architecture reviews found no defects. They compared moved APS functions and the complete EOF driver against exact main-parent code, and verified actual path/CSP/status/range/header ownership. The original reviewed fingerprint was `0a0130289e0a8e2f090bc323f604349182bf4030b64d0a6b113227b41e3a3cb2`. The final lint-only cleanup changes a fixture error message, one test comment and historical reference comments; production runtime sources remain unchanged. The new code fingerprint is `9df748852ddce84d766bab2b8241bebf3a46f31a720f62f9a0e52a70d533b270`.
+
+### Hosted CodeQL fixture follow-up
+
+The first full hosted run after the merge exposed four test-fixture HTML-regex findings. The earlier case-insensitivity fix did not cover all HTML parser cases. The affected helpers now identify actual script elements with the existing jsdom dependency and source locations. They remove selected source ranges without DOM reserialization. Raw bootstrap hashes also use parsed source ranges instead of a script-end regex.
+
+The implementation preserves exact original text, sorts ranges by source offset and removes overlapping ranges as a union. Tests cover HTML parser reordering inside tables, nested SVG scripts, valid self-closing SVG bounds, EOF-terminated scripts, case-sensitive ID values, uppercase tags/attributes, quoted `>` characters, raw CRLF and Unicode offsets, and inert script-looking text. jsdom does not execute the input scripts or load their resources.
+
+All 31 combined Node tests pass, including 15 CWV units. The actual Rust/Next.js suite passed all 40 cases again with fresh configuration artifacts. An attempted reuse correctly rejected the older helper fingerprint; no verification was bypassed. Three focused CSP/renderer-absence/runtime-failure browser regressions also pass. Evidence is in `evidence/codeql-units.log`, `evidence/framework-codeql-final/` and `evidence/codeql-html-fix/`.
+
+An external comparison checked 86 frozen HTML files with 430 old/new comparisons. Every relevant derivative and raw-script result is byte-identical, and all 13 recorded interventions from the successful 61-case lab still match their exact hashes. Thus the existing timing/CLS results remain evidence for unchanged browser inputs; they are not presented as a newly timed 61-case execution. Production sources, all 14 runtime assets and Rust behavior did not change. Their passing checks remain applicable.
+
+Independent correctness review found no remaining parser-helper issues after reproducing and testing the range-order, overlap and EOF cases. The reviewed follow-up code fingerprint is `2e8faabdeb72b06e0221ac552c2c241cde5978ef2b8599654a7d6bf5d1597b34`. The earlier failed units and browser/config attempts remain separate from successful results. Hosted CodeQL must assess the pushed fix; local tests are not a claim that hosted scanning passed.
 
 Hosted CI is tracked separately on PR1460; local results do not establish its outcome. Real GPT/GAM, customer pages, production activation and field CWV remain unverified and require separate approval.
 

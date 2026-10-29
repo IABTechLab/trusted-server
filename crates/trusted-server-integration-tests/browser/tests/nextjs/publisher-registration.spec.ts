@@ -12,7 +12,11 @@ import { runtimeUrl } from "../../helpers/state.js";
 import type { PublisherController } from "../../../fixtures/frameworks/nextjs/app/publisher-registration/RegisteredSlot";
 
 const { creative, pucPage } = require("../../publisher-registration/pages.cjs");
-const { withoutEarlyRenderer, rendererAsset } = require("../../cwv/html.cjs");
+const {
+  scriptBlocks,
+  withoutEarlyRenderer,
+  rendererAsset,
+} = require("../../cwv/html.cjs");
 const enabled = process.env.PUBLISHER_REGISTRATION_RUN === "1";
 test.skip(
   !enabled,
@@ -525,10 +529,9 @@ async function saveEvidence(page: Page, info: TestInfo) {
         bootstrapSha256: session.html
           .map(
             (html) =>
-              [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi)].find(
-                (script) =>
-                  script[1].includes("publisherSlotRegistrationVersion"),
-              )?.[1],
+              scriptBlocks(html).find((script: { content: string }) =>
+                script.content.includes("publisherSlotRegistrationVersion"),
+              )?.content,
           )
           .map((bootstrap) => (bootstrap ? sha256(bootstrap) : null)),
         payloads: session.payloads,

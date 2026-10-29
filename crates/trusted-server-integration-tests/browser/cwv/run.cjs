@@ -11,6 +11,7 @@ const { sessionCls, distribution, observePage } = require("./metrics.cjs");
 const {
   reservationStyles,
   withoutEarlyRenderer,
+  withoutScripts,
   rendererAsset,
 } = require("./html.cjs");
 
@@ -381,9 +382,8 @@ async function sample(
       "Renderer absence must remove the real compiled early entry",
     );
     // This fixture-only probe calls core APIs deliberately absent in this case.
-    active.html = active.html.replace(
-      /<script\b[^>]*>\s*window\.fixtureEarly=[\s\S]*?<\/script>/i,
-      "",
+    active.html = withoutScripts(active.html, (script) =>
+      script.content.trimStart().startsWith("window.fixtureEarly="),
     );
     assert(
       active.html.includes("publisherSlotRegistrationVersion"),
@@ -397,9 +397,9 @@ async function sample(
     });
   }
   if (mode === "absent") {
-    active.html = input.html.replace(
-      /<script\b[^>]*id="trustedserver-js"[^>]*><\/script>/i,
-      "",
+    active.html = withoutScripts(
+      input.html,
+      (script) => script.id === "trustedserver-js",
     );
     assert.notEqual(
       active.html,
