@@ -6265,6 +6265,8 @@ mod tests {
                     ),
                     (None, None),
                 ] {
+                    let unreadable_cookie =
+                        cookie.as_ref().is_some_and(|value| value.to_str().is_err());
                     let http = Arc::new(StubHttpClient::new());
                     http.push_response(204, Vec::new());
                     let services = build_services_with_http_client(Arc::clone(&http) as Arc<_>);
@@ -6334,6 +6336,7 @@ mod tests {
                         serde_json::from_slice(&bodies[0]).expect("should parse PBS body");
                     let includes_body =
                         forwards_body || source == crate::consent::ConsentSource::PolicyDefault;
+                    let includes_fallback = !includes_body && unreadable_cookie;
                     for (pointer, value) in [
                         ("/user/consent", serde_json::json!("fictional-tcf")),
                         ("/user/ext/consent", serde_json::json!("fictional-tcf")),
@@ -6352,7 +6355,10 @@ mod tests {
                     ] {
                         assert_eq!(
                             body.pointer(pointer),
-                            includes_body.then_some(&value),
+                            (includes_body
+                                || (includes_fallback
+                                    && pointer != "/user/ext/ConsentedProvidersSettings/consented_providers"))
+                                .then_some(&value),
                             "should preserve {mode} body policy at {pointer} for {source:?}"
                         );
                     }

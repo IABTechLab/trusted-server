@@ -2116,6 +2116,9 @@ impl PrebidConsentCookies {
             unsafe_us_privacy: false,
         };
         let Some(header) = header.and_then(|value| value.to_str().ok()) else {
+            result.unsafe_tc = header.is_some();
+            result.unsafe_gpp = header.is_some();
+            result.unsafe_us_privacy = header.is_some();
             return result;
         };
         let jar = parse_cookies_to_jar(header);
@@ -2131,7 +2134,14 @@ impl PrebidConsentCookies {
                     COOKIE_EUCONSENT_V2 => result.unsafe_tc = true,
                     COOKIE_GPP | COOKIE_GPP_SID => result.unsafe_gpp = true,
                     COOKIE_US_PRIVACY => result.unsafe_us_privacy = true,
-                    _ => unreachable!("should inspect only allowlisted consent names"),
+                    _ => {
+                        log::warn!(
+                            "Preserves body consent for unrecognized allowlisted cookie {name}"
+                        );
+                        result.unsafe_tc = true;
+                        result.unsafe_gpp = true;
+                        result.unsafe_us_privacy = true;
+                    }
                 }
             }
         }
