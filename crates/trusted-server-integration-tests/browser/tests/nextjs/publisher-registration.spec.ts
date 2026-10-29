@@ -12,6 +12,7 @@ import { runtimeUrl } from "../../helpers/state.js";
 import type { PublisherController } from "../../../fixtures/frameworks/nextjs/app/publisher-registration/RegisteredSlot";
 
 const { creative, pucPage } = require("../../publisher-registration/pages.cjs");
+const { withoutEarlyRenderer, rendererAsset } = require("../../cwv/html.cjs");
 const enabled = process.env.PUBLISHER_REGISTRATION_RUN === "1";
 test.skip(
   !enabled,
@@ -69,6 +70,12 @@ interface Session {
   external: string[];
   auctions: string[];
   mainBundle?: string;
+  blockedRuntime: string[];
+  rendererInterventions: Array<{
+    originalSha256: string;
+    servedSha256: string;
+    removedEarly: boolean;
+  }>;
   pending: Promise<void>[];
   held: Route[];
   expectedHydrationFailure?: boolean;
@@ -100,6 +107,7 @@ async function install(
   options: {
     holdFrames?: boolean;
     blockRenderer?: boolean;
+    blockRuntime?: boolean;
     failHydration?: boolean;
     holdHydration?: boolean;
   } = {},
@@ -111,6 +119,8 @@ async function install(
     consoleErrors: [],
     external: [],
     auctions: [],
+    blockedRuntime: [],
+    rendererInterventions: [],
     pending: [],
     held: [],
     expectedHydrationFailure: options.failHydration,
@@ -266,27 +276,45 @@ async function install(
       session.held.push(route);
       return;
     }
-    if (options.blockRenderer && url.pathname.includes("tsjs-unified.min.js")) {
+    if (
+      (options.blockRenderer || options.blockRuntime) &&
+      rendererAsset(url.pathname)
+    ) {
       const response = await route.fetch();
       session.mainBundle = await response.text();
+      session.blockedRuntime.push(url.pathname);
       return route.fulfill({ response, body: "" });
     }
     if (url.pathname === "/auction")
       session.auctions.push(route.request().postData() || "");
     if (
-      process.env.PUBLISHER_REGISTRATION_ASSEMBLY === "shared" &&
+      (process.env.PUBLISHER_REGISTRATION_ASSEMBLY === "shared" ||
+        options.blockRenderer) &&
       route.request().resourceType() === "document"
     ) {
       // Request interception adds browser no-cache semantics. Exercise an
       // ordinary reload through the actual Rust interface instead, preserving
       // its complete response and per-reader admitted slots/bids unchanged.
       const headers = await route.request().allHeaders();
-      delete headers.pragma;
-      headers["cache-control"] = "max-age=0";
+      if (process.env.PUBLISHER_REGISTRATION_ASSEMBLY === "shared") {
+        delete headers.pragma;
+        headers["cache-control"] = "max-age=0";
+      }
       const response = await route.fetch({ headers });
-      expect(response.headers()["x-ts-template-cache"]).not.toBe(
-        "bypass-request",
-      );
+      if (process.env.PUBLISHER_REGISTRATION_ASSEMBLY === "shared")
+        expect(response.headers()["x-ts-template-cache"]).not.toBe(
+          "bypass-request",
+        );
+      if (options.blockRenderer) {
+        const original = await response.text();
+        const body = withoutEarlyRenderer(original);
+        session.rendererInterventions.push({
+          originalSha256: sha256(original),
+          servedSha256: sha256(body),
+          removedEarly: original !== body,
+        });
+        return route.fulfill({ response, body });
+      }
       return route.fulfill({ response });
     }
     return route.continue();
@@ -497,7 +525,7 @@ async function saveEvidence(page: Page, info: TestInfo) {
         bootstrapSha256: session.html
           .map(
             (html) =>
-              [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)].find(
+              [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi)].find(
                 (script) =>
                   script[1].includes("publisherSlotRegistrationVersion"),
               )?.[1],
@@ -519,6 +547,8 @@ async function saveEvidence(page: Page, info: TestInfo) {
         consoleErrors: session.consoleErrors,
         external: session.external,
         auctions: session.auctions,
+        blockedRuntime: session.blockedRuntime,
+        rendererInterventions: session.rendererInterventions,
         expectedHydrationFailure: session.expectedHydrationFailure,
       },
       null,
@@ -913,6 +943,11 @@ test("bootstrap-only ordinary fill survives late renderer installation without r
   await assertIdentity(page, initial);
   await render(page, initial, "Publisher result");
   const session = sessions.get(page)!;
+  expect(session.rendererInterventions).toHaveLength(1);
+  expect(session.rendererInterventions[0].removedEarly).toBe(true);
+  expect(
+    session.blockedRuntime.some((url) => url.includes("tsjs-gpt.min.js")),
+  ).toBe(true);
   expect(session.mainBundle).toBeTruthy();
   await page.addScriptTag({ content: session.mainBundle! });
   await page.waitForFunction(
@@ -943,6 +978,100 @@ test("bootstrap-only ordinary fill survives late renderer installation without r
     page.frameLocator("#publisher-final-header > iframe").locator(".marker"),
   ).toHaveText("Publisher result");
 });
+
+test("failed deferred runtime retains the early renderer and server candidate", async ({
+  page,
+}) => {
+  await install(page, { blockRuntime: true });
+  await page.goto(runtimeUrl("/publisher-registration/registered-only"));
+  await ready(page);
+  expect(sessions.get(page)!.blockedRuntime).toContain(
+    "/static/tsjs=tsjs-gpt.min.js",
+  );
+  expect(sessions.get(page)!.rendererInterventions).toEqual([]);
+  await expect(page.locator("#trustedserver-bootstrap")).toHaveCount(1);
+  await mount(page);
+  const initial = await delivered(page);
+  expect(initial.targeting.hb_adid).toEqual(["fixture-win-fixture-header"]);
+  await assertIdentity(page, initial);
+  await render(page, initial, "Fixture publisher registration winner");
+  expect(await headerRequests(page)).toHaveLength(1);
+});
+
+for (const { width, noFill } of [
+  { width: 500, noFill: false },
+  { width: 600, noFill: false },
+  { width: 601, noFill: false },
+  { width: 1200, noFill: false },
+  { width: 500, noFill: true },
+  { width: 1200, noFill: true },
+])
+  test(`Rust reservation precedes real Next hydration at ${width}px, ${noFill ? "no-fill" : "fill"}`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 1100 });
+    await install(page, { holdHydration: true });
+    await page.goto(runtimeUrl("/publisher-registration/registered-only"), {
+      waitUntil: "domcontentloaded",
+    });
+    const wrapper = page.getByTestId("reserved-space");
+    await expect(page.getByTestId("ssr-placeholder")).toBeVisible();
+    const expected = width <= 600 ? 250 : 600;
+    expect(
+      await wrapper.evaluate((element) => getComputedStyle(element).minHeight),
+    ).toBe(`${expected}px`);
+    expect(await wrapper.getAttribute("style")).toBeNull();
+    expect(
+      await page.evaluate(
+        () =>
+          !!(window as unknown as FixtureWindow).publisherRegistrationFixture,
+      ),
+    ).toBe(false);
+    const original = await wrapper.elementHandle();
+    const before = await wrapper.boundingBox();
+    expect(before!.height).toBe(expected);
+    await sessions.get(page)!.releaseHydration!();
+    await ready(page);
+    await mount(page);
+    const initial = await delivered(page);
+    await assertIdentity(page, initial);
+    expect(
+      await original!.evaluate(
+        (element) =>
+          element === document.getElementById("fixture-header-space"),
+      ),
+    ).toBe(true);
+    expect(
+      await page
+        .getByTestId("final-placement")
+        .evaluate((element) => element.style.minHeight),
+    ).toBe("");
+    const beforeFill = await wrapper.boundingBox();
+    const flowBefore = await page
+      .getByTestId("automatic-placement")
+      .evaluate((element) => element.getBoundingClientRect().top);
+    if (noFill) {
+      await page.evaluate(
+        (index) =>
+          (window as unknown as FixtureWindow).fixture.render(index, {
+            noFill: true,
+          }),
+        initial.index,
+      );
+      await expect(
+        page.getByTestId("final-placement").locator("iframe"),
+      ).toHaveCount(0);
+    } else await render(page, initial, "Fixture publisher registration winner");
+    const afterFill = await wrapper.boundingBox();
+    expect(afterFill!.height).toBe(expected);
+    expect(afterFill).toEqual(beforeFill);
+    expect(
+      await page
+        .getByTestId("automatic-placement")
+        .evaluate((element) => element.getBoundingClientRect().top),
+    ).toBe(flowBefore);
+    expect(await headerRequests(page)).toHaveLength(1);
+  });
 
 test("delayed real Next hydration cannot trigger a guessed registered delivery", async ({
   page,

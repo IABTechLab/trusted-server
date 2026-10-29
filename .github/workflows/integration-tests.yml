@@ -67,6 +67,14 @@ jobs:
             --artifacts "$ARTIFACTS_DIR/publisher-registration" \
             --out "$ARTIFACTS_DIR/publisher-registration-prep"
 
+      - name: Export production HTML for CWV contracts
+        env:
+          TSJS_PREBUILT_DIR: ${{ env.ARTIFACTS_DIR }}/publisher-registration-dist
+        run: |
+          HOST_TARGET="$(rustc -vV | awk '/^host:/ {print $2}')"
+          cargo run -p trusted-server-integration-tests --example cwv_html --target "$HOST_TARGET" -- "$ARTIFACTS_DIR/cwv/unreserved" unreserved
+          cargo run -p trusted-server-integration-tests --example cwv_html --target "$HOST_TARGET" -- "$ARTIFACTS_DIR/cwv/reserved" reserved
+
       - name: Package integration test artifacts
         run: |
           mkdir -p "$(dirname "$WASM_ARTIFACT_PATH")" "$(dirname "$AXUM_ARTIFACT_PATH")" "$(dirname "$DOCKER_ARTIFACT_PATH")" "$CF_BUILD_ARTIFACT_PATH"
@@ -230,6 +238,20 @@ jobs:
           npm ci
           npx playwright install --with-deps chromium
 
+      - name: Test CWV metrics and production HTML contracts
+        working-directory: crates/trusted-server-integration-tests/browser
+        run: |
+          npm run test:cwv:unit
+          npm run test:cwv -- --loading "$ARTIFACTS_DIR/cwv/unreserved" --combined "$ARTIFACTS_DIR/cwv/reserved" --correctness-only --out "$RUNNER_TEMP/cwv-evidence"
+
+      - name: Upload CWV evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cwv-evidence
+          path: ${{ runner.temp }}/cwv-evidence/
+          retention-days: 7
+
       - name: Test initial render fixture escaping
         working-directory: crates/trusted-server-integration-tests/browser
         run: node --test initial-render/pages.test.cjs
@@ -342,7 +364,7 @@ jobs:
 
       - name: Test publisher registration fixture and offline contracts
         run: |
-          node --test crates/trusted-server-integration-tests/browser/publisher-registration/pages.test.cjs
+          npm --prefix crates/trusted-server-integration-tests/browser run test:publisher-registration:fixture
           node crates/trusted-server-integration-tests/browser/publisher-registration/run.cjs \
             --implementation all --prebid "$ARTIFACTS_DIR/publisher-registration-prebid" \
             --out "$RUNNER_TEMP/publisher-registration-offline"

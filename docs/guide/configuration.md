@@ -2298,6 +2298,76 @@ new setting. Older servers reject unknown slot fields, including an explicit
 predates it, as part of a compatible configuration and publisher release. Do not
 switch ownership inside already-open documents.
 
+### Explicit slot-space reservation
+
+Each slot may reserve minimum space on an initial document for an exact,
+stable publisher element ID. This is opt-in layout policy, not an inferred
+maximum from `formats` or a selected bid.
+
+```toml
+[[creative_opportunities.slot]]
+id = "header"
+page_patterns = ["/news/*"]
+formats = [{ width = 300, height = 250 }, { width = 300, height = 600 }]
+
+[creative_opportunities.slot.reservation]
+element_id = "header-ad-space"
+min_height = 250
+
+[[creative_opportunities.slot.reservation.breakpoints]]
+min_width = 1024
+min_height = 600
+```
+
+The publisher supplies the element in its initial HTML. Prefer a stable wrapper
+around the GPT div so hydration can replace the child without removing the
+reservation:
+
+```html
+<div id="header-ad-space">
+  <div id="publisher-gpt-runtime-id"></div>
+</div>
+```
+
+`element_id` must be nonempty and contain no NUL. `min_height` and breakpoint
+heights are nonnegative integer CSS pixels. Breakpoint `min_width` values must
+be positive integers in strictly increasing order. Zero-width breakpoints are
+redundant with the base height and are rejected. At a breakpoint's exact width,
+its height applies; the widest matching breakpoint wins. A zero height is an
+explicit choice to reserve no minimum in that viewport range.
+
+Trusted Server emits escaped exact-ID `min-height` CSS at head-open, before
+scripts, only when `creative_opportunities.enabled = true` and the document's
+pathname matches the slot's existing `page_patterns`. Query strings do not enter
+pathname matching. If several matching slots reserve the same element ID, the
+first matching slot in configuration order owns the complete reservation policy.
+Later same-ID policies are ignored, including their breakpoints. Slots on disjoint
+routes may use the same wrapper ID with different policies.
+
+The CSS is identical for readers of the same path and configuration, including
+shared-template readers. Consent, bot classification, auction enablement, bids,
+no-fill and registration readiness do not change it or authorize an ad request.
+No matching element means no layout change; Trusted Server does not create a
+wrapper or resolve a runtime GPT ID or prefix. Omitted reservation leaves the
+existing layout unchanged and serializes as absent.
+
+The minimum remains after no-fill. There is no automatic collapse, forced width,
+fixed height, clipping, resize listener or DOM mutation. Publishers choose the
+whitespace tradeoff. Fluid or unknown-height creatives can exceed an explicit
+minimum, so reservation alone cannot guarantee zero layout shift. Include the
+child's complete layout footprint when choosing a minimum. Trusted Server does
+not remove iframe borders, inline baseline spacing, margins or publisher padding.
+
+This policy covers the initial document only. A client-only navigation to a newly
+matched route does not install new reservation CSS. Reserve those routes in the
+publisher stylesheet or use full-document navigation. Existing Content Security
+Policy restrictions still apply: a strict `style-src` policy that rejects inline
+styles also rejects this generated style unless the publisher permits it through
+its policy. Trusted Server does not weaken CSP or add a nonce system.
+
+Older servers reject the new `reservation` field. Remove it from configuration
+before rolling back to a release that predates support.
+
 ### Shared template assembly (`assembly_mode = "esi"`)
 
 `inline` remains the default. `esi` is opt-in per deployment, covered by the

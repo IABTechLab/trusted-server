@@ -263,6 +263,9 @@
       const frame = document.createElement("iframe");
       frame.width = "300";
       frame.height = "250";
+      // Model the creative box, not the browser\'s default iframe border and baseline gap.
+      frame.style.display = "block";
+      frame.style.border = "0";
       frame.dataset.request = String(index);
       frame.src = adId
         ? "https://creative.example.com/fixture-puc?adId=" +

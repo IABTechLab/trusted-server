@@ -6,7 +6,9 @@
     "test": "npx playwright test",
     "test:nextjs": "TEST_FRAMEWORK=nextjs npx playwright test",
     "test:wordpress": "TEST_FRAMEWORK=wordpress npx playwright test",
-    "test:publisher-registration:fixture": "node --test publisher-registration/pages.test.cjs",
+    "test:publisher-registration:fixture": "node --test publisher-registration/*.test.cjs",
+    "test:cwv:unit": "node --test cwv/*.test.cjs",
+    "test:cwv": "node cwv/run.cjs",
     "test:publisher-registration": "node publisher-registration/run.cjs --implementation all",
     "test:publisher-registration:framework": "../../../scripts/test-publisher-registration.sh"
   },

@@ -8,6 +8,9 @@ export function moduleBuildOptions({ name, entryPath, outDir }) {
   return {
     configFile: false,
     root: libDir,
+    // The publisher bootstrap is embedded in HTML script text. Keep escaping
+    // enabled explicitly for strings such as </script> and <!-- in templates.
+    esbuild: { supported: { 'inline-script': true } },
     build: {
       emptyOutDir: false,
       outDir,

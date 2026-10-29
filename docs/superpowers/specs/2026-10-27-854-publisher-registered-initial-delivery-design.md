@@ -6,8 +6,12 @@ Issue: [#854](https://github.com/IABTechLab/trusted-server/issues/854).
 
 Base: `5bc38862512c5c71085b5052bc3e528ee9b9987d`.
 
-This specifies one correctness change within #854. Bundle deferral and automatic
-slot-height injection remain separate work. It supplements the existing
+This specifies the publisher-registration portion of #854. The user expanded
+PR #1460 on 2026-10-29 to include dependency-safe runtime deferral, explicit
+responsive reservation and before/after lab measurements. See the
+[CWV completion design](2026-10-29-854-client-cwv-completion-design.md) for that
+scope. The original exclusions below describe this registration design, not the
+expanded PR. It supplements the existing
 [slot handoff design](2026-07-24-prevent-duplicate-gpt-slot-requests-design.md)
 without replacing its default automatic mode.
 

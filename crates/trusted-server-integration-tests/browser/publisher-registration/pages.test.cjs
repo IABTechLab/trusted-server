@@ -2,6 +2,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
 const test = require("node:test");
+const { JSDOM } = require("jsdom");
 const {
   inlineJson,
   documentPage,
@@ -45,24 +46,33 @@ test("inline JSON cannot terminate its script, including line separators", () =>
   };
   assert.deepEqual(JSON.parse(inlineJson(input)), input);
   assert(!/[<>&\u2028\u2029]/u.test(inlineJson(input)));
-  const html = documentPage(input);
-  assert.equal((html.match(/<script>/g) ?? []).length, 1);
-  assert.equal((html.match(/<\/script>/g) ?? []).length, 1);
+  for (const id of [
+    input.id,
+    '</SCRIPT><SCRIPT>throw new Error("injected")</SCRIPT>',
+  ]) {
+    const html = documentPage({ id });
+    assert.equal((html.match(/<script>/gi) ?? []).length, 1);
+    assert.equal((html.match(/<\/script>/gi) ?? []).length, 1);
+  }
 });
 
 test("creative labels remain text instead of inserting inline markup", () => {
-  const html = creative('</div><script>throw new Error("injected")</script>&');
-  assert(html.includes("&lt;/div&gt;&lt;script&gt;"));
-  assert.equal((html.match(/<script>/g) ?? []).length, 1);
-  assert.equal((html.match(/<\/script>/g) ?? []).length, 1);
+  for (const tag of ["script", "SCRIPT"]) {
+    const html = creative(
+      `</div><${tag}>throw new Error("injected")</${tag}>&`,
+    );
+    assert(html.includes(`&lt;/div&gt;&lt;${tag}&gt;`));
+    assert.equal((html.match(/<script>/gi) ?? []).length, 1);
+    assert.equal((html.match(/<\/script>/gi) ?? []).length, 1);
+  }
 });
 
 test("Universal Creative uses the supplied publisher origin without inline injection", () => {
   const origin =
     "http://publisher.example.com:8000/</script><script>injected</script>&";
   const html = pucPage(origin);
-  assert.equal((html.match(/<script/g) ?? []).length, 2);
-  assert.equal((html.match(/<\/script>/g) ?? []).length, 2);
+  assert.equal((html.match(/<script/gi) ?? []).length, 2);
+  assert.equal((html.match(/<\/script>/gi) ?? []).length, 2);
   assert(html.includes(inlineJson(origin)));
   assert(pucPage().includes('"https://publisher.example.com"'));
 });
@@ -97,6 +107,34 @@ test("nested Universal Creative marker sources map to the final publisher elemen
     window.fixture.elements[window.fixture.creatives[0].element],
     element,
   );
+});
+
+test("native creative iframe excludes default browser border and inline baseline space", () => {
+  const dom = new JSDOM('<div id="example-header-final"></div>');
+  const { window } = dom;
+  window.publisherFixtureOptions = { initialLoad: "disabled" };
+  vm.runInNewContext(source, {
+    window,
+    document: window.document,
+    performance: window.performance,
+  });
+  const g = window.googletag;
+  const slot = g
+    .defineSlot("/123/example-placement", [[300, 250]], "example-header-final")
+    .addService(g.pubads());
+  g.display("example-header-final");
+  g.pubads().refresh([slot]);
+  window.fixture.render(0);
+  const frame = window.document.querySelector("#example-header-final > iframe");
+  assert.equal(frame.width, "300");
+  assert.equal(frame.height, "250");
+  assert.equal(window.getComputedStyle(frame).display, "block");
+  assert.equal(
+    Number.parseFloat(window.getComputedStyle(frame).borderTopWidth),
+    0,
+  );
+  assert.equal(window.fixture.requests.length, 1);
+  dom.window.close();
 });
 
 test("payload is fictional offline data with explicit mode and candidate dimensions", () => {

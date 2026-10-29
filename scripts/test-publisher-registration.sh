@@ -133,7 +133,12 @@ if [[ "$MODE" == stamp ]]; then
     exit 0
 fi
 if [[ "$MODE" != prepare ]]; then
-    [[ "$(viceroy --version)" == 'viceroy 0.17.0' ]] || { echo 'Pinned Viceroy 0.17.0 required'; exit 1; }
+    PINNED_VICEROY="$(awk '$1 == "viceroy" { print $2 }' "$ROOT/.tool-versions")"
+    ACTUAL_VICEROY="$(viceroy --version)"
+    [[ "$ACTUAL_VICEROY" == "viceroy $PINNED_VICEROY" ]] || {
+        echo "Pinned Viceroy $PINNED_VICEROY required; found $ACTUAL_VICEROY" >&2
+        exit 1
+    }
 fi
 { git rev-parse HEAD; git status --short; rustc -Vv; cargo --version; if command -v viceroy >/dev/null; then viceroy --version; else echo 'Viceroy not installed in artifact-preparation job'; fi; node --version; docker version --format '{{.Server.Version}}'; df -h / /tmp; } > "$OUT/environment.txt"
 if [[ -n "$WASM" ]]; then

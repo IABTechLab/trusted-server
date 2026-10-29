@@ -200,7 +200,7 @@ function RegisteredSlot({
       id={id}
       ref={elementRef}
       data-testid="final-placement"
-      style={{ width: 300, minHeight: 250 }}
+      style={{ width: 300 }}
     />
   );
 }
@@ -297,18 +297,20 @@ export default function RegisteredPublisher() {
       <button onClick={() => controller.current!.refresh()}>
         Later publisher refresh
       </button>
-      {mounted ? (
-        <RegisteredSlot
-          key={pathname}
-          id={finalId}
-          controller={controller.current}
-          ready={ready}
-        />
-      ) : (
-        <div id="fixture-header-placeholder" data-testid="ssr-placeholder">
-          Publisher has not registered
-        </div>
-      )}
+      <div id="fixture-header-space" data-testid="reserved-space">
+        {mounted ? (
+          <RegisteredSlot
+            key={pathname}
+            id={finalId}
+            controller={controller.current}
+            ready={ready}
+          />
+        ) : (
+          <div id="fixture-header-placeholder" data-testid="ssr-placeholder">
+            Publisher has not registered
+          </div>
+        )}
+      </div>
       <div id="fixture-auto-placement" data-testid="automatic-placement" />
       <div id="publisher-unrelated" data-testid="unrelated-placement" />
     </main>

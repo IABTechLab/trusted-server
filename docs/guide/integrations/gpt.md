@@ -93,7 +93,47 @@ Successful proxy responses include the `X-GPT-Proxy: true` header for debugging.
 
 ## Client-Side Shim
 
-The GPT integration includes a TypeScript module bundled into the unified TSJS bundle. It provides two capabilities:
+The GPT integration shares early interception and rendering code with its deferred runtime. Other integration combinations retain the synchronous unified TSJS bundle.
+
+### Loading order
+
+For pages without an enforced response Content Security Policy, GPT with core, creative and optionally the separately deferred Prebid integration uses this order:
+
+```mermaid
+flowchart TD
+    A[Integration configuration and existing inline GPT bootstrap] --> B[Compiled inline GPT guard, attribution and render bridge]
+    B --> C[Real core APIs and creative guards]
+    C --> D[Publisher scripts continue parsing]
+    D --> E[Deferred standalone GPT runtime]
+    E --> F[Deferred Prebid shim]
+```
+
+The early entry runs inline, without another synchronous external fetch. It installs the real render bridge before core flushes queued callbacks or publisher scripts can request an eligible creative. Core's direct methods and immediate queue behavior remain available before the runtime arrives. The deferred GPT entry does not initialize core again, so early configuration and registered ad units survive takeover.
+
+Any enforced `Content-Security-Policy` response header selects the original synchronous unified bundle instead of the new inline compiled entry. This includes headers from the actual origin response or `Settings.response_headers`, matched case-insensitively, even when empty, permissive or repeated. An origin response without CSP cannot cancel a configured policy. `Content-Security-Policy-Report-Only` alone does not select this fallback. Publishers with unchanged enforced response CSP therefore need no new compiled-script hash for this loading change: they keep the existing loading path. Policies that might permit deferral still use synchronous loading until separately evaluated.
+
+Shared templates retain the loading choice and policy headers selected on the cold response and replay them on warm hits. Settings and core fingerprints invalidate older templates. This fallback checks response headers only; no meta-policy fallback is promised. It does not weaken CSP, add nonce handling or introduce an operator flag.
+
+The existing inline GPT bootstrap remains responsible for provisional `adInit`, initial scheduling, publisher registration and navigation generations. The deferred runtime installs the richer initializer, publisher-slot handoff, SPA page-bids fetching and slim-Prebid loader. Both entries share the same guard and rendering implementations. A delayed or failed runtime does not remove the installed early renderer or authorize another initial request.
+
+This still executes synchronous JavaScript. The raw GPT bootstrap alone is 56,429 source bytes, before the compiled early entry. Compare parser/paint timing and ad-startup timing with repeatable measurements; deferral is not a guarantee of better field Core Web Vitals.
+
+The following combinations keep the original synchronous unified bundle. Unknown browser integrations also fall back rather than being silently deferred.
+
+| Integration            | Early dependency retained by synchronous fallback                       |
+| ---------------------- | ----------------------------------------------------------------------- |
+| DataDome               | Dynamic SDK script and preload interception                             |
+| Google Tag Manager     | Script interception plus fetch and beacon rewriting                     |
+| Lockr                  | SDK interception and live API-host rewriting                            |
+| Permutive              | SDK interception, endpoint rewriting and auction context registration   |
+| Didomi                 | `didomiConfig.sdkPath` before the SDK reads it                          |
+| Sourcepoint            | SDK interception, runtime configuration rewriting and consent mirroring |
+| Osano                  | Initial consent mirroring and consent-event listeners                   |
+| Testlight              | Immediate publisher queue behavior                                      |
+| Active GPT diagnostics | GPT observation before publisher scripts                                |
+| Enforced response CSP  | Existing script permissions and synchronous loading                     |
+
+Rust-only integrations do not add browser modules to this list. Pages without GPT keep synchronous unified loading. Prebid's external bundle and shim retain their existing deferred execution order. Trusted GAM attribution and APS rendering-mode attributes stay on both executing entries, including the inline early tag.
 
 ### Script Guard
 
@@ -372,9 +412,11 @@ finite positive dimensions match both configured and declared eligible formats.
 Missing, unknown-size or incompatible bids still permit one ordinary GAM request.
 An empty finite eligibility list permits GAM delivery without TS demand.
 
-The inline bootstrap has no creative renderer. Without an installed renderer,
-registered delivery omits TS candidate targeting and correlation and makes the
-single ordinary GAM request. GAM can fill it with a publisher creative or return
+The raw inline GPT bootstrap has no creative renderer on its own. Supported
+profiles also install the compiled early renderer before publisher scripts, so
+registration can select eligible TS demand without waiting for the deferred
+runtime. If no renderer was installed, registered delivery omits TS candidate
+targeting and correlation and makes the single ordinary GAM request. GAM can fill it with a publisher creative or return
 no-fill. TS fill is deliberately unavailable on that path. A later runtime load
 does not add the excluded candidate, replace the ad or request it again.
 

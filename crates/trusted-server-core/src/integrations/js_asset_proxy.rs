@@ -629,6 +629,9 @@ mod tests {
 
     fn process_html_with_registry(html: &str, integrations: IntegrationRegistry) -> String {
         let processor = create_html_processor(HtmlProcessorConfig {
+            enforced_csp: false,
+            slot_reservations: Vec::new(),
+            request_path: None,
             csp_nonce_observed: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),

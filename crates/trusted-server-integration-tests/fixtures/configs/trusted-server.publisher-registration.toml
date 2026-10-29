@@ -73,6 +73,14 @@ div_id = "fixture-header-"
 page_patterns = ["/publisher-registration", "/publisher-registration/*"]
 formats = [{ width = 300, height = 250 }, { width = 300, height = 600 }]
 
+[creative_opportunities.slot.reservation]
+element_id = "fixture-header-space"
+min_height = 250
+
+[[creative_opportunities.slot.reservation.breakpoints]]
+min_width = 601
+min_height = 600
+
 [creative_opportunities.slot.providers.prebid.bidders.fixture-bidder]
 placement = "fixture-header"
 
