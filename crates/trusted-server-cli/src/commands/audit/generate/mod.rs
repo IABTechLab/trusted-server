@@ -425,9 +425,6 @@ fn build_draft_config_with_generator(
     if detected.contains("gpt") {
         draft = replace_key_in_section(&draft, "integrations.gpt", "enabled", "enabled = true")?;
     }
-    if detected.contains("didomi") {
-        draft = replace_key_in_section(&draft, "integrations.didomi", "enabled", "enabled = true")?;
-    }
     if detected.contains("datadome") {
         draft =
             replace_key_in_section(&draft, "integrations.datadome", "enabled", "enabled = true")?;
@@ -457,10 +454,7 @@ fn build_draft_config_with_generator(
     }
 
     for integration in detected {
-        if !matches!(
-            integration,
-            "gpt" | "didomi" | "datadome" | "google_tag_manager"
-        ) {
+        if !matches!(integration, "gpt" | "datadome" | "google_tag_manager") {
             manual_review.push(integration);
         }
     }
@@ -2661,6 +2655,47 @@ mod tests {
         assert!(draft.contains("container_id = \"GTM-ABC123\""));
         assert!(draft.contains("Detected prebid"));
         toml::from_str::<toml::Value>(&draft).expect("draft should parse as TOML");
+    }
+
+    #[test]
+    fn build_draft_config_requires_manual_review_for_didomi() {
+        let url = Url::parse("https://publisher.example.com").expect("should parse URL");
+        let artifact = AuditArtifact {
+            audited_url: url.to_string(),
+            page_title: None,
+            js_asset_count: 0,
+            third_party_asset_count: 0,
+            detected_integrations: ["didomi", "gpt", "datadome"]
+                .into_iter()
+                .map(|id| DetectedIntegration {
+                    id: id.to_string(),
+                    evidence: format!("detected {id} in page"),
+                })
+                .collect(),
+            assets: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        let draft = build_draft_config(&url, &artifact, &gpt_slots::DiscoveredSlots::default())
+            .expect("should build draft config");
+        let config = toml::from_str::<toml::Value>(&draft).expect("should parse draft config");
+
+        assert_eq!(
+            config["integrations"]["didomi"]["enabled"].as_bool(),
+            Some(false),
+            "should keep Didomi disabled until its deployment requirements are reviewed"
+        );
+        assert!(
+            draft.contains("# - Detected didomi; review the corresponding [integrations.didomi] section before enabling it."),
+            "should flag detected Didomi for manual review"
+        );
+        for integration in ["gpt", "datadome"] {
+            assert_eq!(
+                config["integrations"][integration]["enabled"].as_bool(),
+                Some(true),
+                "should preserve automatic enablement for {integration}"
+            );
+        }
     }
 
     #[test]
