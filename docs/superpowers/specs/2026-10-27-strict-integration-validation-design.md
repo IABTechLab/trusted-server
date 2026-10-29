@@ -33,15 +33,19 @@ registered builders alone are insufficient because Prebid and APS use separate
 registration paths.
 
 Add serde strictness only to the ten integration config structs that lack it,
-and the two additional settings structs. Include serde error details in both
-branches of `IntegrationSettings::get_typed`.
+and the two additional settings structs. Include unknown/missing-field details in
+both branches of `IntegrationSettings::get_typed`; retain other serde error details
+only in the report's cause chain so the outer message does not echo invalid values.
 
 ## Compatibility and alternatives
 
 Known tables with unknown fields will fail runtime startup with the new binary.
 Before deploying, run the new CLI's `ts config validate`, correct the reported
-settings, push the cleaned config, and then deploy the binary. Removing previously
-ignored keys is safe for the old binary. Unknown IDs only warn at runtime.
+settings, and push the cleaned config while the old binary is still running. On
+Fastly, wait for the config-store propagation window to elapse before activating
+the new binary; a successful push does not mean every point of presence (POP) has
+the new config. Removing previously ignored keys is safe for the old binary.
+Unknown IDs only warn at runtime.
 
 A warn-first release for unknown fields would avoid this startup break but needs
 additional parsing machinery. The approved choice is the issue's smaller strict

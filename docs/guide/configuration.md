@@ -189,11 +189,16 @@ Runtime startup rejects unknown fields in known tables. For compatibility with
 previously stored configurations, an unknown integration ID only logs a warning
 and its table is ignored at runtime.
 
+This warning is emitted each time runtime settings are loaded. On Fastly without
+reusable sandboxes, that means every request; remove unknown IDs before the next
+config push to avoid repeated warnings.
+
 Before upgrading, use the new CLI to run `ts config validate` against the current
 config, correct the reported settings, and push the cleaned config while the old
-binary is still running. Then deploy the new binary. Otherwise a stored unknown
-field can prevent startup and cause the service to return its startup-error
-response.
+binary is still running. On Fastly, wait for the config-store propagation window
+to elapse before activating the new binary; a successful push does not mean every
+point of presence (POP) has the new config. Otherwise a stored unknown field can
+prevent startup and cause the service to return its startup-error response.
 
 ## Configuration Files
 
