@@ -6560,10 +6560,13 @@ dependencies = [
  "error-stack",
  "futures",
  "log",
+ "rcgen",
  "reqwest 0.12.28",
+ "rustls",
  "simple_logger",
  "temp-env",
  "tokio",
+ "tokio-rustls",
  "tower 0.4.13",
  "trusted-server-core",
 ]

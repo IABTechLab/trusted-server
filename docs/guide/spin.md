@@ -21,7 +21,7 @@ Spin 4.1.0 or newer, pinned as `spin` in `.tool-versions`. This branch temporari
 uses `spin-sdk` 6 to match the unreleased EdgeZero secret-provisioning APIs;
 the runtime minimum remains unchanged. `spin-sdk` 7 imports
 `wasi:http/types@0.3.0`, which Spin 4.0.x does not provide. Install or upgrade
-from the [Spin install guide](https://spinframework.dev/install).
+from the [Spin releases](https://github.com/spinframework/spin/releases).
 
 asdf has no first-party Spin plugin, so `asdf install` does not provide this
 one; install it directly, or add a community plugin if you want asdf to manage
@@ -82,10 +82,12 @@ available. Forwarded client-IP headers are sanitized, and Spin derives its
 runtime authority, scheme, and client-address headers in the innermost
 normalization layer.
 
-Spin is not installed in the integration CI environment. The recurring manual
-smoke therefore needs a named owner, tested commit, exact tool versions, and an
-expiry; those details are recorded with each run in the documentation-refresh
-evidence ledger.
+CI installs the pinned Spin runtime for `scripts/secret-bindings-runtime.sh spin`.
+This native contract check uses a `test-utils` integration to invoke the shared
+credential exporter, because Spin does not currently dispatch S3 asset routes.
+It verifies real variable reads, HTTPS, and no-follow behavior, not shipping
+S3 routing or provider IAM. Keep the complete config-push handoff smoke and
+deployment rehearsals separate; track release evidence in [#1479](https://github.com/IABTechLab/trusted-server/issues/1479).
 
 Compare the [Fastly](./fastly), [Cloudflare](./cloudflare), and
 [Axum](./axum-dev) adapter journeys.

@@ -61,7 +61,14 @@ Direct `ts secrets set` and native presence `check` are unsupported for this
 adapter; `check` reports unsupported and exits nonzero. Inspect provider
 name inventory and verify fresh-state requests separately. A config-only
 publisher must not hold Worker deployment/secret permissions. Native binding,
-HTTPS/no-follow, and IAM rehearsals remain release gates.
+HTTPS/no-follow, and IAM deployment rehearsals remain release gates tracked in
+[#1479](https://github.com/IABTechLab/trusted-server/issues/1479).
+
+CI runs `scripts/secret-bindings-runtime.sh cloudflare` under local workerd with
+fictional native bindings. Cloudflare does not currently dispatch S3 asset routes,
+so a `test-utils` integration invokes the shared exporter for this native contract
+check. It verifies real native lookups, HTTPS, and no-follow behavior, not shipping
+S3 routing or deployed Worker permissions.
 
 A successful `ts config push` alone does not configure this runtime: the
 Worker currently does not open `TRUSTED_SERVER_KV` during startup. Request-time

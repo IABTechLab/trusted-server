@@ -6,7 +6,7 @@ This is a breaking config migration. Credentials remain raw native values, but a
 Restoring the old binary restores the config-only secret-substitution and mutable-destination attack. Prefer rolling forward or disabling affected exporters. Rollback requires the old binary's compatible config snapshot and retained legacy bindings, not just an old package.
 :::
 
-Native reads, TLS/no-follow tests, secure Fastly replacement, provider permissions, four-adapter walkthroughs, and migration/rollback rehearsals remain release gates. These instructions are not a claim that those environments have been verified.
+Local native lookup and HTTPS regression tests do not certify a production rollout. Secure Fastly replacement, provider permissions and propagation, four-adapter operator walkthroughs, and migration/rollback rehearsals remain deployment gates tracked in [#1479](https://github.com/IABTechLab/trusted-server/issues/1479). These instructions are not a claim that those environments have been verified.
 
 ## Removed properties
 

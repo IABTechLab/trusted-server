@@ -157,10 +157,21 @@ fn install_shadow(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::platform::{PlatformError, StoreId};
+    use crate::consent::jurisdiction::Jurisdiction;
+    use crate::consent::types::ConsentContext;
+    use crate::ec::EcContext;
+    use crate::ec::kv::KvIdentityGraph;
+    use crate::ec::kv_types::KvEntry;
+    use crate::ec::pull_sync::{build_pull_sync_context, dispatch_pull_sync};
+    use crate::ec::rate_limiter::RateLimiter;
+    use crate::ec::registry::PartnerRegistry;
+    use crate::platform::test_support::{
+        NoopConfigStore, NoopGeo, NoopSecretStore, RecordingBackend, StubHttpClient,
+    };
+    use crate::platform::{ClientInfo, PlatformError, RuntimeServices, StoreId};
     use crate::secret_bindings::compile_bindings;
     use crate::test_support::tests::crate_test_settings_str;
 
@@ -427,6 +438,201 @@ mod tests {
         }
     }
 
+    struct AllowPull;
+
+    impl RateLimiter for AllowPull {
+        fn exceeded(&self, _: &str, _: u32) -> Result<bool, Report<TrustedServerError>> {
+            Ok(false)
+        }
+    }
+
+    fn dispatch_loaded_pull(
+        loaded: &LoadedConfig,
+        backend: Arc<RecordingBackend>,
+        http: Arc<StubHttpClient>,
+    ) -> Result<(), Report<TrustedServerError>> {
+        let registry = PartnerRegistry::from_settings(loaded)?;
+        let graph = KvIdentityGraph::in_memory("binding-attack-fixture");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut entry = KvEntry::tombstone(1_000);
+        entry.consent.ok = true;
+        graph.create(&ec_id, &entry)?;
+        let mut context = EcContext::new_for_test(
+            Some(ec_id.clone()),
+            ConsentContext {
+                jurisdiction: Jurisdiction::NonRegulated,
+                ..ConsentContext::default()
+            },
+        );
+        context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+        let pull = build_pull_sync_context(&context, &registry)
+            .expect("should make the positive fixture eligible for pull sync");
+        let services = RuntimeServices::builder()
+            .config_store(Arc::new(NoopConfigStore))
+            .secret_store(Arc::new(NoopSecretStore))
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+            .backend(backend)
+            .http_client(http)
+            .geo(Arc::new(NoopGeo))
+            .client_info(ClientInfo::default())
+            .build();
+        dispatch_pull_sync(loaded, &graph, &registry, &AllowPull, &pull, &services);
+        Ok(())
+    }
+
+    fn load_and_dispatch_pull(
+        data: serde_json::Value,
+        store: &Store,
+        backend: Arc<RecordingBackend>,
+        http: Arc<StubHttpClient>,
+    ) -> Result<(), Report<TrustedServerError>> {
+        let loaded =
+            settings_from_config_blob(&envelope(data), store, &DEFAULT_SECRET_STORE_ID.into())?;
+        dispatch_loaded_pull(&loaded, backend, http)
+    }
+
+    #[test]
+    fn secret_scoping_attacker_pull_reconstruction_rejects_before_backend_and_http() {
+        let (data, store) = all_roles_fixture();
+        let backend = Arc::new(RecordingBackend::default());
+        let http = Arc::new(StubHttpClient::new());
+        http.push_response(200, br#"{"uid":"fictional-partner-uid"}"#.to_vec());
+        load_and_dispatch_pull(data, &store, backend.clone(), http.clone())
+            .expect("should dispatch the unchanged production-loaded config");
+        assert_eq!(backend.specs().len(), 1, "should exercise backend creation");
+        assert_eq!(
+            http.recorded_request_uris().len(),
+            1,
+            "should exercise dispatch"
+        );
+        assert!(http.recorded_request_uris()[0].starts_with("https://sync.example.com/pull?"));
+
+        for mutation in 0..8 {
+            let (mut data, store) = all_roles_fixture();
+            let config: TrustedServerAppConfig =
+                serde_json::from_value(data.clone()).expect("should parse the authorized config");
+            let plan =
+                compile_bindings(config.settings()).expect("should compile authorized roles");
+            let key_for = |role| {
+                plan.entries()
+                    .iter()
+                    .find(|binding| binding.descriptor_id() == role)
+                    .expect("should find the selected authorized role")
+                    .key()
+            };
+            let pull_key = key_for("ec.pull");
+            let partner = &mut data["ec"]["partners"][0];
+            match mutation {
+                0 => {
+                    partner["pull_sync_url"] =
+                        serde_json::json!("https://attacker.example.com/pull");
+                    partner["pull_sync_allowed_domains"] =
+                        serde_json::json!(["attacker.example.com"]);
+                }
+                1 => {
+                    partner["pull_sync_url"] =
+                        serde_json::json!("https://sync.example.com:8443/pull")
+                }
+                2 => partner["pull_sync_url"] = serde_json::json!("https://sync.example.com/other"),
+                3 => partner["ts_pull_token"] = serde_json::json!(key_for("publisher.proxy")),
+                4 => partner["ts_pull_token"] = serde_json::json!(key_for("ec.inbound")),
+                5 => partner["ts_pull_token"] = serde_json::json!(key_for("handler.password")),
+                6 => partner["pull_sync_url"] = serde_json::json!("http://sync.example.com/pull"),
+                _ => {
+                    partner["pull_sync_url"] =
+                        serde_json::json!("https://sync.example.com/pull?export=1")
+                }
+            }
+            data["proxy"]["certificate_check"] = serde_json::json!(false);
+            let backend = Arc::new(RecordingBackend::default());
+            let http = Arc::new(StubHttpClient::new());
+            let _ = load_and_dispatch_pull(data, &store, backend.clone(), http.clone())
+                .expect_err("should reject a valid-checksum config-only attack before dispatch");
+            assert!(
+                !store
+                    .reads
+                    .lock()
+                    .expect("should lock reads")
+                    .iter()
+                    .any(|key| key == pull_key),
+                "should never retrieve the original pull credential for the modified context"
+            );
+            assert!(
+                backend.specs().is_empty(),
+                "should create no backend for the attack"
+            );
+            assert!(
+                http.recorded_request_uris().is_empty(),
+                "should send no request for the attack"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_scoping_rotation_and_retirement_require_snapshot_reconstruction() {
+        let (data, mut store) = all_roles_fixture();
+        let original = settings_from_config_blob(
+            &envelope(data.clone()),
+            &store,
+            &DEFAULT_SECRET_STORE_ID.into(),
+        )
+        .expect("should load the original authorized snapshot");
+        let pull_key = original
+            .resolved_bindings
+            .entries()
+            .iter()
+            .find(|binding| binding.compiled().descriptor_id() == "ec.pull")
+            .expect("should find the loaded pull capability")
+            .compiled()
+            .key()
+            .to_owned();
+        let old_value = String::from_utf8(store.values[&pull_key].clone())
+            .expect("should decode the fictional original credential");
+        let rotated_value = "fictional-rotated-pull-credential-32-bytes";
+        store
+            .values
+            .insert(pull_key.clone(), rotated_value.as_bytes().to_vec());
+        let refreshed = settings_from_config_blob(
+            &envelope(data.clone()),
+            &store,
+            &DEFAULT_SECRET_STORE_ID.into(),
+        )
+        .expect("should reconstruct a snapshot after same-context replacement");
+
+        for (snapshot, value) in [(&original, old_value.as_str()), (&refreshed, rotated_value)] {
+            let http = Arc::new(StubHttpClient::new());
+            http.push_response(200, br#"{"uid":"fictional-partner-uid"}"#.to_vec());
+            dispatch_loaded_pull(
+                snapshot,
+                Arc::new(RecordingBackend::default()),
+                http.clone(),
+            )
+            .expect("should dispatch the snapshot's own authorized credential");
+            assert_eq!(http.recorded_request_uris().len(), 1);
+            assert!(
+                http.recorded_request_headers()[0]
+                    .iter()
+                    .any(|(name, header)| name == "authorization"
+                        && header == &format!("Bearer {value}")),
+                "should preserve the credential captured by this snapshot, not reread native storage"
+            );
+        }
+
+        store.values.remove(&pull_key);
+        let backend = Arc::new(RecordingBackend::default());
+        let http = Arc::new(StubHttpClient::new());
+        let _ = load_and_dispatch_pull(data, &store, backend.clone(), http.clone())
+            .expect_err("should reject valid-checksum replay after the binding is retired");
+        assert!(
+            backend.specs().is_empty(),
+            "should not create a replay backend"
+        );
+        assert!(
+            http.recorded_request_uris().is_empty(),
+            "should not export a retired credential on fresh state"
+        );
+    }
+
     #[test]
     fn legacy_blob_without_rewrite_creatives_preserves_rewriting() {
         let (data, store) = fixture();
@@ -450,8 +656,7 @@ mod tests {
 
     #[test]
     fn legacy_blob_without_rewrite_include_domains_loads_with_empty_list() {
-        let data =
-            serde_json::to_value(test_settings()).expect("should serialize settings to JSON");
+        let (data, store) = fixture();
         let rewrite = data
             .get("rewrite")
             .and_then(serde_json::Value::as_object)
@@ -461,8 +666,9 @@ mod tests {
             "should omit the default include list from the payload"
         );
 
-        let reconstructed = load_settings(&envelope_json(&test_settings()))
-            .expect("should reconstruct settings without include_domains");
+        let reconstructed =
+            settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
+                .expect("should reconstruct settings without include_domains");
 
         assert!(
             reconstructed.rewrite.include_domains.is_empty(),
@@ -472,11 +678,12 @@ mod tests {
 
     #[test]
     fn rewrite_include_domains_survive_blob_round_trip() {
-        let mut original = test_settings();
-        original.rewrite.include_domains = vec!["*.cdn.example.com".to_owned()];
+        let (mut data, store) = fixture();
+        data["rewrite"]["include_domains"] = serde_json::json!(["*.cdn.example.com"]);
 
-        let reconstructed = load_settings(&envelope_json(&original))
-            .expect("should reconstruct settings with include_domains");
+        let reconstructed =
+            settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
+                .expect("should reconstruct settings with include_domains");
 
         assert_eq!(
             reconstructed.rewrite.include_domains,

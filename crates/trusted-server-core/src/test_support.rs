@@ -600,3 +600,6 @@ pub mod nextjs_auction {
 
 #[cfg(feature = "test-utils")]
 pub(crate) mod async_html_finalization;
+
+#[cfg(feature = "test-utils")]
+pub(crate) mod secret_binding_runtime;

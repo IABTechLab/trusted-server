@@ -43,6 +43,8 @@ const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
 const DEPLOY_VALIDATED_INTEGRATION_IDS: &[&str] = &[
     #[cfg(feature = "test-utils")]
     crate::test_support::async_html_finalization::ID,
+    #[cfg(feature = "test-utils")]
+    crate::test_support::secret_binding_runtime::ID,
     "prebid",
     "aps",
     "adserver_mock",
@@ -273,6 +275,11 @@ fn validate_enabled_integrations(
     validate_integration::<crate::test_support::async_html_finalization::FixtureConfig>(
         settings,
         crate::test_support::async_html_finalization::ID,
+    )?;
+    #[cfg(feature = "test-utils")]
+    validate_integration::<crate::test_support::secret_binding_runtime::FixtureConfig>(
+        settings,
+        crate::test_support::secret_binding_runtime::ID,
     )?;
     validate_integration::<TestlightConfig>(settings, "testlight")?;
     validate_integration::<NextJsIntegrationConfig>(settings, "nextjs")?;

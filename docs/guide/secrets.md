@@ -2,8 +2,8 @@
 
 App config contains feature settings, identities, and destinations. It contains no credential values or secret key names. Trusted Server derives a native key from each active purpose, identity, and approved destination or route policy. Provisioning that key authorizes that use.
 
-::: warning Release gate
-The interfaces below describe the implementation in this branch. They are not evidence of a completed security release. Shipping Rust tests, isolated Fastly replacement/read-through tests, native reads and HTTPS/no-follow tests on all four runtimes, operator rehearsals, and config-writer IAM separation remain release gates. Do not migrate production based on documentation or a presence check alone.
+::: warning Verify the deployment before migration
+The implementation binds app credentials to their approved contexts. Application regression tests and local native-runtime checks do not certify a production deployment. Before rollout, verify isolated provider replacement/read-through, propagation and limits, config-writer IAM separation, protected provisioning CI, and the coordinated migration. Do not migrate production based on documentation or a presence check alone. Track deployment evidence in [#1479](https://github.com/IABTechLab/trusted-server/issues/1479).
 :::
 
 ## Before provisioning
@@ -13,6 +13,22 @@ The interfaces below describe the implementation in this branch. They are not ev
 - Select an isolated deployment through the [existing deployment inputs](./secrets-ci#deployment-inputs). Keep one logical app-credential store, `trusted_server_secrets`.
 - Obtain credentials outside TS. TS does not mint Tinybird tokens, partner tokens, DataDome keys, or AWS credentials. Do not reuse a credential value across purposes.
 - Disable shell tracing and terminal/session recording before credential input. Never put values in command arguments, tracked files, plan files, or artifacts.
+
+## Verify the config-only permission boundary
+
+Use an isolated deployment and fictional credentials to test the actual config-publisher principal, not an administrator account. Record the principal, provider resources, operation, and allowed or denied result without recording credential bytes.
+
+| Operation as the config publisher                                                 | Expected result |
+| --------------------------------------------------------------------------------- | --------------- |
+| Publish an ordinary app-config blob                                               | Allowed         |
+| Read or replace native credential values                                          | Denied          |
+| Add a credential binding or change its physical mapping                           | Denied          |
+| Deploy a different executable or change component secret declarations             | Denied          |
+| Execute or modify code with provisioning credentials without independent approval | Denied          |
+
+A valid-checksum config edit must not grant any of the denied capabilities. In particular, never auto-approve or auto-provision a newly generated plan from the mutable live blob. An independently reviewed plan is required to authorize a changed destination.
+
+These are deployment checks, not permissions enforced by the config checksum or the TS binary. If one principal has both config and secret/deployment administration, it is outside the config-only attacker model. Separate those permissions before relying on this boundary.
 
 ## Purpose, identity, and target
 

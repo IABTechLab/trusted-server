@@ -300,6 +300,11 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
             id: crate::test_support::async_html_finalization::ID,
             build: crate::test_support::async_html_finalization::register,
         },
+        #[cfg(feature = "test-utils")]
+        IntegrationBuilder {
+            id: crate::test_support::secret_binding_runtime::ID,
+            build: crate::test_support::secret_binding_runtime::register,
+        },
         IntegrationBuilder {
             id: "testlight",
             build: testlight::register,

@@ -285,16 +285,20 @@ impl AxumPlatformHttpClient {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(5))
-                .timeout(Duration::from_secs(30))
-                // Disable automatic redirects: core proxy code enforces redirect
-                // limits and allowed_domains checks itself. Without this, reqwest
-                // would follow Location headers internally and bypass those checks.
-                .redirect(reqwest::redirect::Policy::none())
+            client: Self::client_builder()
                 .build()
                 .expect("should build reqwest client"),
         }
+    }
+
+    fn client_builder() -> reqwest::ClientBuilder {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))
+            // Disable automatic redirects: core proxy code enforces redirect
+            // limits and allowed_domains checks itself. Without this, reqwest
+            // would follow Location headers internally and bypass those checks.
+            .redirect(reqwest::redirect::Policy::none())
     }
 
     /// Drain `body` to a `Vec<u8>`.
@@ -594,6 +598,10 @@ impl trusted_server_core::platform::PlatformTimer for AxumTimer {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "platform_https_tests.rs"]
+mod https_tests;
 
 #[cfg(test)]
 mod tests {
