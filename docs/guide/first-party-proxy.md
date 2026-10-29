@@ -170,6 +170,8 @@ POST /first-party/sign
 | `href` | Complete signed proxy URL ready to use |
 | `base` | Original base URL (without query parameters) |
 
+A host excluded by `rewrite.exclude_domains`, or outside a non-empty `rewrite.include_domains`, returns `502`. The creative runtime treats it as a non-policy failure and loads the URL directly. These checks run before `proxy.allowed_domains`.
+
 A valid host outside a non-empty allowlist returns `403 Forbidden`. The creative runtime treats this response as a policy rejection and does not assign the attempted raw image or iframe URL. Network failures, malformed success responses, and non-403 errors keep the existing direct-load fallback. An empty allowlist permits every valid host.
 
 This blocked-assignment behavior applies when the runtime intercepts a `src` setter or `setAttribute` call before native assignment. Markup inserted through `innerHTML` or `document.write` may begin a native load before the `MutationObserver` requests a signature. A later `403` does not retract that existing attribute.
@@ -506,7 +508,7 @@ allowed_domains = [
 
 :::
 
-### URL Rewrite Exclusions
+### URL Rewrite Host Lists
 
 Exclude specific domains from rewriting:
 
@@ -519,6 +521,17 @@ exclude_domains = [
 ```
 
 URLs matching these patterns will NOT be rewritten to `/first-party/proxy`.
+
+Limit asset rewriting to listed hosts:
+
+```toml
+[rewrite]
+include_domains = ["assets.example.com", "*.img.example.com"]
+```
+
+When `include_domains` is non-empty, only asset URLs on matching hosts are
+rewritten. `exclude_domains` wins when a host matches both lists, and
+click-through links ignore `include_domains`.
 
 ### Streaming vs Buffered
 
