@@ -302,6 +302,27 @@ mod tests {
     }
 
     #[test]
+    fn legacy_blob_without_public_origin_uses_domain_fallback() {
+        let mut original = test_settings();
+        original.publisher.public_origin = Some("https://ads.example.com:8443".to_string());
+        let mut data = serde_json::to_value(&original).expect("should serialize settings to JSON");
+        data["publisher"]
+            .as_object_mut()
+            .expect("should serialize publisher as an object")
+            .remove("public_origin");
+        let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_string());
+        let json = serde_json::to_string(&envelope).expect("should serialize legacy envelope");
+
+        let reconstructed =
+            load_settings(&json).expect("should reconstruct settings without public_origin");
+        assert_eq!(
+            reconstructed.publisher.effective_public_origin(),
+            format!("https://{}", original.publisher.domain),
+            "should fall back to the publisher domain"
+        );
+    }
+
+    #[test]
     fn didomi_geo_query_parameters_survive_blob_round_trip() {
         let mut original = test_settings();
         original

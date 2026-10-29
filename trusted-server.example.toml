@@ -59,6 +59,15 @@ domain = "example.com"
 cookie_domain = ".example.com"
 # Upstream origin to proxy publisher content from. No trailing slash.
 origin_url = "https://origin.example.com"
+# Actual browser-facing Trusted Server endpoint for rewritten creative URLs.
+# Use HTTPS in deployments, or e.g. http://localhost:8080 for direct local dev.
+# Optional for old-config deserialization. Omission uses https://{domain}, NOT
+# the serving page's scheme, host, or port. This active leaf allows env overlays.
+# Upgrade binary before pushing this field; old binaries reject it. Coordinate
+# binary/config activation if https://{domain} cannot serve the fallback traffic.
+# Rollback: remove this field and its env override, validate and push, then roll
+# back the binary. Coordinate both if the fallback endpoint cannot serve traffic.
+public_origin = "https://ads.example.com"
 # Secret Store key for the HMAC secret used to sign first-party proxy URLs.
 proxy_secret = "publisher_proxy_secret"
 # Optional: override the outbound Host header sent to origin_url.

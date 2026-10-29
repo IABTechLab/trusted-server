@@ -30,6 +30,7 @@ ids = ["trusted_server_secrets"]
 const REWRITE_ENV: &str = "TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES";
 const SANITIZE_ENV: &str = "TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES";
 const CLICKS_ENV: &str = "TRUSTED_SERVER__AUCTION__REWRITE_CLICKS";
+const PUBLIC_ORIGIN_ENV: &str = "TRUSTED_SERVER__PUBLISHER__PUBLIC_ORIGIN";
 const GAM_ATTRIBUTION_ENV: &str = "TRUSTED_SERVER__INTEGRATIONS__GPT__GAM_ATTRIBUTION_ENABLED";
 const AD_TEMPLATES_ENABLED_ENV: &str = "TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED";
 const PROVIDER_ENDPOINT_ENV: &str = "TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__ENDPOINT";
@@ -88,6 +89,14 @@ fn pushed_auction_with_env(
     key: &str,
     raw_value: &str,
 ) -> serde_json::Value {
+    pushed_config_with_env(project, key, raw_value)["auction"].clone()
+}
+
+fn pushed_config_with_env(
+    project: &MigratedProject,
+    key: &str,
+    raw_value: &str,
+) -> serde_json::Value {
     let output = Command::new(env!("CARGO_BIN_EXE_ts"))
         .args(["config", "push", "--adapter", "axum", "--manifest"])
         .arg(&project.manifest_path)
@@ -119,7 +128,37 @@ fn pushed_auction_with_env(
         .expect("should contain a blob envelope");
     let envelope: serde_json::Value =
         serde_json::from_str(envelope_json).expect("should parse blob envelope");
-    envelope["data"]["auction"].clone()
+    envelope["data"].clone()
+}
+
+#[test]
+fn public_origin_environment_override_applies_and_normalizes_when_leaf_present() {
+    let project = migrated_project();
+    let mut document = fs::read_to_string(&project.config_path)
+        .expect("should read migrated config")
+        .parse::<DocumentMut>()
+        .expect("should parse migrated config");
+    document["publisher"]["public_origin"] = value("https://ads.example.com");
+    fs::write(&project.config_path, document.to_string()).expect("should write config");
+
+    let config = pushed_config_with_env(&project, PUBLIC_ORIGIN_ENV, "http:localhost:7676");
+
+    assert_eq!(
+        config["publisher"]["public_origin"], "http://localhost:7676",
+        "should push the normalized public origin from the existing-leaf override"
+    );
+}
+
+#[test]
+fn public_origin_environment_override_is_ignored_without_leaf() {
+    let project = migrated_project();
+
+    let config = pushed_config_with_env(&project, PUBLIC_ORIGIN_ENV, "http://localhost:7676");
+
+    assert!(
+        config["publisher"].get("public_origin").is_none(),
+        "should retain the omitted public origin when the TOML leaf is absent"
+    );
 }
 
 #[test]

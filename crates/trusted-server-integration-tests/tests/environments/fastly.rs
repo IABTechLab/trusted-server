@@ -1,3 +1,4 @@
+use crate::common::config::viceroy_config_with_public_origin;
 use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult,
 };
@@ -20,6 +21,7 @@ impl RuntimeEnvironment for FastlyViceroy {
 
     fn spawn(&self, wasm_path: &Path) -> TestResult<RuntimeProcess> {
         let port = super::find_available_port()?;
+        let base_url = format!("http://127.0.0.1:{port}");
 
         let viceroy_config = self.viceroy_config_path();
         if !viceroy_config.exists() {
@@ -29,10 +31,24 @@ impl RuntimeEnvironment for FastlyViceroy {
             )));
         }
 
+        let config =
+            std::fs::read_to_string(&viceroy_config).change_context(TestError::ConfigGeneration)?;
+        let config = viceroy_config_with_public_origin(&config, &base_url)?;
+        // Keep relative resource paths anchored beside the supplied config.
+        let runtime_config = tempfile::NamedTempFile::new_in(
+            viceroy_config
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
+        )
+        .change_context(TestError::ConfigGeneration)?;
+        std::fs::write(runtime_config.path(), config)
+            .change_context(TestError::ConfigGeneration)?;
+
         let mut child = Command::new("viceroy")
             .arg(wasm_path)
             .arg("-C")
-            .arg(&viceroy_config)
+            .arg(runtime_config.path())
             .arg("--addr")
             .arg(format!("127.0.0.1:{port}"))
             .stdout(Stdio::null())
@@ -53,8 +69,10 @@ impl RuntimeEnvironment for FastlyViceroy {
         }
 
         // Wrap immediately so Drop::drop kills the process if readiness check fails
-        let handle = ViceroyHandle { child };
-        let base_url = format!("http://127.0.0.1:{port}");
+        let handle = ViceroyHandle {
+            child,
+            _runtime_config: runtime_config,
+        };
 
         // Fastly exposes a dedicated `/health` route, so root fallback only
         // adds redundant requests while the runtime is still starting up.
@@ -94,6 +112,7 @@ impl FastlyViceroy {
 /// preventing orphaned Viceroy processes.
 struct ViceroyHandle {
     child: Child,
+    _runtime_config: tempfile::NamedTempFile,
 }
 
 impl RuntimeProcessHandle for ViceroyHandle {}

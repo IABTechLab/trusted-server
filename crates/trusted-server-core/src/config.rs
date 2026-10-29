@@ -73,7 +73,8 @@ impl TrustedServerAppConfig {
     ///
     /// Returns [`TrustedServerError::Configuration`] when push-safe validation
     /// fails.
-    pub fn new(settings: Settings) -> Result<Self, Report<TrustedServerError>> {
+    pub fn new(mut settings: Settings) -> Result<Self, Report<TrustedServerError>> {
+        settings.publisher.normalize()?;
         let app_config = Self { settings };
         edgezero_core::app_config::validate_excluding_secrets(&app_config).map_err(|errors| {
             Report::new(TrustedServerError::Configuration {
@@ -584,6 +585,31 @@ formats = [{ width = 300, height = 250 }]
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
         settings
+    }
+
+    #[test]
+    fn app_config_normalizes_public_origin_before_serializing() {
+        for origin in ["https:ads.example.com", "HTTPS://ADS.EXAMPLE.COM:443"] {
+            let mut settings = valid_settings();
+            settings.publisher.public_origin = Some(origin.to_owned());
+            let constructed = TrustedServerAppConfig::new(settings)
+                .expect("should normalize the public origin in constructed config");
+            let mut data =
+                serde_json::to_value(&constructed).expect("should serialize constructed config");
+            assert_eq!(
+                data["publisher"]["public_origin"], "https://ads.example.com",
+                "should serialize a normalized origin from the constructor"
+            );
+
+            data["publisher"]["public_origin"] = serde_json::json!(origin);
+            let deserialized: TrustedServerAppConfig = serde_json::from_value(data)
+                .expect("should normalize the public origin in deserialized config");
+            assert_eq!(
+                deserialized.settings().publisher.effective_public_origin(),
+                "https://ads.example.com",
+                "should normalize the public origin on both config boundaries"
+            );
+        }
     }
 
     #[test]

@@ -16,7 +16,7 @@ describe('creative/iframe.ts', () => {
 
   it('proxies iframe src via signer endpoint', async () => {
     const signed =
-      '/first-party/proxy?tsurl=https%3A%2F%2Fframe.example%2Fwidget.html&tstoken=iframe&tsexp=1';
+      'https://ads.example.com/first-party/proxy?tsurl=https%3A%2F%2Fframe.example%2Fwidget.html&tstoken=iframe&tsexp=1';
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({ href: signed }),
@@ -33,7 +33,7 @@ describe('creative/iframe.ts', () => {
         expect.stringContaining('/first-party/sign'),
         expect.objectContaining({ method: 'POST' })
       );
-      expect(iframe.src).toContain('/first-party/proxy?');
+      expect(iframe.src).toContain('https://ads.example.com/first-party/proxy?');
       expect(iframe.src).toContain('tsexp=');
     });
   });
