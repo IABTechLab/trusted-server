@@ -2,6 +2,10 @@ let uninstall: (() => void) | undefined;
 
 /**
  * Keep root-relative Lockr API requests on the page origin, even with an external base URL.
+ *
+ * The dedicated trust-server SDK currently makes its API calls through XMLHttpRequest.
+ * Only XMLHttpRequest.open is guarded. Requests made with fetch or navigator.sendBeacon
+ * still resolve relative URLs against the document base URL.
  */
 export function installLockrApiGuard(): void {
   if (uninstall || typeof window === 'undefined' || typeof window.XMLHttpRequest === 'undefined') {

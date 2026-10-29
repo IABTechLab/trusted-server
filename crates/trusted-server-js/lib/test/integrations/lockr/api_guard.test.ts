@@ -79,7 +79,7 @@ describe('Lockr API origin guard', () => {
       'user',
       'password'
     );
-    expect(open.mock.contexts).toEqual([request]);
+    expect(open.mock.contexts[0]).toBe(request);
   });
 
   it('preserves explicitly undefined optional arguments', () => {
