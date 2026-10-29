@@ -54,6 +54,30 @@ jobs:
             exit 1
           fi
 
+  check-ci-node-pin:
+    name: CI Node pin guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The guard's tests check the tree before the guard landed; fetch only
+      # that commit instead of the full history.
+      - name: Fetch the pre-guard commit
+        run: git fetch --no-tags --depth=1 origin 7a0ecb4cbfa39af3d83f7e1ed2733d7eabdc4cb1
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+
+      - name: Test the guard
+        run: node --test scripts/check-ci-node-pin.test.mjs
+
+      # Every job that compiles trusted-server-core also runs the TSJS build, so
+      # it must set up the `.tool-versions` Node first (see issue #1204).
+      - name: Verify jobs pin Node before compiling Rust
+        run: node scripts/check-ci-node-pin.mjs
+
   format-rust:
     name: cargo fmt
     runs-on: ubuntu-latest
@@ -124,6 +148,15 @@ jobs:
           target: wasm32-wasip1,wasm32-unknown-unknown
           components: "clippy, rustfmt"
           cache-key: cargo-clippy
+
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
 
       - name: Run cargo fmt
         uses: actions-rust-lang/rustfmt@v1
