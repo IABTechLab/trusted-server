@@ -3450,7 +3450,7 @@ mod tests {
             context
                 .services
                 .http_client()
-                .send_async(req)
+                .send_async(req.with_cache_bypass())
                 .await
                 .change_context(TrustedServerError::Auction {
                     message: "stub launch failed".to_string(),
@@ -3525,7 +3525,7 @@ mod tests {
             context
                 .services
                 .http_client()
-                .send_async(request)
+                .send_async(request.with_cache_bypass())
                 .await
                 .change_context(TrustedServerError::Auction {
                     message: "deadline test provider launch failed".to_string(),
@@ -3585,7 +3585,7 @@ mod tests {
             context
                 .services
                 .http_client()
-                .send_async(request)
+                .send_async(request.with_cache_bypass())
                 .await
                 .change_context(TrustedServerError::Auction {
                     message: "pending mediator launch failed".to_string(),
@@ -3741,7 +3741,7 @@ mod tests {
             context
                 .services
                 .http_client()
-                .send_async(request)
+                .send_async(request.with_cache_bypass())
                 .await
                 .change_context(TrustedServerError::Auction {
                     message: "recording launch failed".to_string(),
@@ -3802,7 +3802,7 @@ mod tests {
             context
                 .services
                 .http_client()
-                .send_async(request)
+                .send_async(request.with_cache_bypass())
                 .await
                 .change_context(TrustedServerError::Auction {
                     message: "divergent launch failed".to_string(),
@@ -3967,7 +3967,7 @@ mod tests {
             context
                 .services
                 .http_client()
-                .send_async(req)
+                .send_async(req.with_cache_bypass())
                 .await
                 .change_context(TrustedServerError::Auction {
                     message: "mediator launch failed".to_string(),
@@ -4208,7 +4208,7 @@ mod tests {
             services: &services,
         };
 
-        if split {
+        let result = if split {
             let DispatchAuctionOutcome::Dispatched(dispatched) =
                 orchestrator.dispatch_auction(&request, &context).await
             else {
@@ -4222,7 +4222,13 @@ mod tests {
                 .run_auction(&request, &context)
                 .await
                 .expect("deadline test auction should complete")
-        }
+        };
+        assert_eq!(
+            stub.recorded_select_count(),
+            0,
+            "should skip the delayed unbounded collection path"
+        );
+        result
     }
 
     #[tokio::test]
@@ -4240,11 +4246,6 @@ mod tests {
                         && response.metadata["error_type"] == ERROR_TYPE_TIMEOUT
                 }),
                 "should time out outstanding providers on every adapter"
-            );
-            assert!(
-                result.total_time_ms < 150,
-                "should stop before the delayed provider completes: {}ms",
-                result.total_time_ms
             );
             assert!(
                 result.winning_bids.is_empty(),
@@ -4285,7 +4286,7 @@ mod tests {
             services: &services,
         };
 
-        if split {
+        let result = if split {
             let DispatchAuctionOutcome::Dispatched(dispatched) =
                 orchestrator.dispatch_auction(&request, &context).await
             else {
@@ -4299,7 +4300,13 @@ mod tests {
                 .run_auction(&request, &context)
                 .await
                 .expect("deadline test auction should complete")
-        }
+        };
+        assert_eq!(
+            stub.recorded_wait_count(),
+            0,
+            "should skip the delayed unbounded collection path"
+        );
+        result
     }
 
     #[tokio::test]
@@ -4313,10 +4320,6 @@ mod tests {
             assert_eq!(
                 result.winning_bids["slot-1"].bidder, "local",
                 "should retain provider winner"
-            );
-            assert!(
-                result.total_time_ms < 150,
-                "should not wait for the delayed mediator"
             );
         }
     }
@@ -6215,10 +6218,16 @@ mod tests {
             services: &services,
         };
 
-        orchestrator
+        let result = orchestrator
             .run_auction(&request, &context)
             .await
-            .expect("should execute planned pending mediator")
+            .expect("should execute planned pending mediator");
+        assert_eq!(
+            http.recorded_wait_count(),
+            0,
+            "should skip the delayed unbounded mediator wait"
+        );
+        result
     }
 
     #[tokio::test]
@@ -6234,10 +6243,6 @@ mod tests {
             Some("provider"),
             "should preserve on-time provider bids"
         );
-        assert!(
-            result.total_time_ms < 150,
-            "should bound full mediator response wait"
-        );
     }
 
     #[tokio::test]
@@ -6252,10 +6257,6 @@ mod tests {
             result.winning_bids["fictional-slot"].bid_id.as_deref(),
             Some("provider"),
             "should preserve on-time provider bids"
-        );
-        assert!(
-            result.total_time_ms < 150,
-            "should avoid waiting for the rounded transport timeout"
         );
     }
 

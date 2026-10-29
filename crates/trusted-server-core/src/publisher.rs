@@ -10796,7 +10796,7 @@ mod tests {
                 context
                     .services
                     .http_client()
-                    .send_async(request)
+                    .send_async(request.with_cache_bypass())
                     .await
                     .change_context(TrustedServerError::Auction {
                         message: "stub bid launch failed".to_string(),
@@ -17621,7 +17621,7 @@ mod tests {
                 context
                     .services
                     .http_client()
-                    .send_async(request)
+                    .send_async(request.with_cache_bypass())
                     .await
                     .change_context(TrustedServerError::Auction {
                         message: "test provider launch failed".to_string(),
@@ -24019,13 +24019,16 @@ mod tests {
             context
                 .services
                 .http_client()
-                .send_async(crate::platform::PlatformHttpRequest::new(
-                    Request::builder()
-                        .uri("https://bidder.example.com/bid")
-                        .body(EdgeBody::empty())
-                        .expect("should build test bid request"),
-                    "seam-test",
-                ))
+                .send_async(
+                    crate::platform::PlatformHttpRequest::new(
+                        Request::builder()
+                            .uri("https://bidder.example.com/bid")
+                            .body(EdgeBody::empty())
+                            .expect("should build test bid request"),
+                        "seam-test",
+                    )
+                    .with_cache_bypass(),
+                )
                 .await
                 .change_context(TrustedServerError::Auction {
                     message: "Failed to dispatch test auction".to_string(),
@@ -26684,7 +26687,7 @@ mod tests {
                 context
                     .services
                     .http_client()
-                    .send_async(request)
+                    .send_async(request.with_cache_bypass())
                     .await
                     .change_context(TrustedServerError::Auction {
                         message: "test bidder launch failed".to_string(),

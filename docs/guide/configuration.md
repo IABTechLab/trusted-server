@@ -2301,7 +2301,9 @@ dispatch, including headers and complete response bodies. One nonblocking snapsh
 retains complete available responses after a slow origin; unfinished providers
 become timeouts and mediation cannot start with an exhausted budget. Backend
 timeout rounding does not extend network waiting.
-Provider bids complete at the final nonblocking snapshot remain eligible even after `tmax`; mediation starts only with remaining budget and rejects responses collected after its cutoff.
+Provider bids that are already complete at the final nonblocking snapshot remain
+eligible even after `tmax`; mediation starts only with remaining budget and
+rejects responses collected after its cutoff.
 
 Fastly abandons pending requests; Axum, Cloudflare, and Spin cancel outstanding
 operations where supported. Local processing and delivery can finish after the

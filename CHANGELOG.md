@@ -13,7 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   measured from dispatch, including delayed headers and trickling bodies on all
   adapters. Complete available responses survive a slow publisher origin;
   unfinished providers time out and mediation is skipped after budget exhaustion.
-  Provider bids complete at the final nonblocking snapshot remain eligible even after `tmax`; mediation starts only with remaining budget and rejects responses collected after its cutoff.
+  Provider bids that are already complete at the final nonblocking snapshot remain
+  eligible even after `tmax`; mediation starts only with remaining budget and
+  rejects responses collected after its cutoff.
   Fastly abandons unfinished requests; Axum, Cloudflare, and Spin cancel owned work.
 
 - **Breaking:** `x-ts-version` now reports the deployed git version — the release tag, else the branch, else the first 6 characters of the commit — compiled in from the build-time `TRUSTED_SERVER__GIT_VERSION` (set by the deploy pipeline) or local git, and is sent by every adapter, including on the Fastly `GET /health` probe. The Fastly service version it previously carried is now `x-ts-fastly-version`; update dashboards, monitors, and scripts that read `x-ts-version` as the Fastly version number. Builds with neither the override nor git omit the header.

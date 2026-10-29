@@ -146,6 +146,14 @@ link it in the description, and mark it ready for review again.
 - Update the canonical guide or crate README when a user-visible contract
   changes; do not copy volatile matrices into multiple documents.
 
+## Fastly dependency updates
+
+Update the workspace `fastly` and `fastly-sys` dependencies together. The
+Fastly deadline collector uses raw asynchronous I/O readiness calls from
+`fastly-sys` with handles created by `fastly`, so both must use a compatible
+SDK ABI. Check the resolved versions in `Cargo.lock` and run the Fastly
+adapter tests, including the real deadline network fixture, after an SDK update.
+
 ## Verify
 
 Run the target-matched checks in [AGENTS.md](AGENTS.md#ci-gates), the

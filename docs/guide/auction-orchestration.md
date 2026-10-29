@@ -824,12 +824,13 @@ not bid eligibility based on an exact server-side arrival time. A mediator start
 only with remaining budget and uses the earlier of the auction cutoff and its own
 logical timeout.
 
-Provider bids complete at the final nonblocking snapshot remain eligible even after `tmax`; mediation starts only with remaining budget and rejects responses collected after its cutoff.
+Provider bids that are already complete at the final nonblocking snapshot remain
+eligible even after `tmax`; mediation starts only with remaining budget and
+rejects responses collected after its cutoff.
 
 Personalized auction and mediator requests explicitly bypass intermediary caches.
 Fastly uses the SDK's direct pending-request handles and body readiness handles in
-a timed wait; it neither polls headers every millisecond nor waits on an empty
-handle list. Retained partial payloads share a 10 MiB budget. Under memory pressure,
+a timed wait. Retained partial payloads share a 10 MiB budget. Under memory pressure,
 the largest partial response is rejected with its own backend attribution so a
 large stalled provider cannot make a small healthy sibling take the failure.
 Completed payloads move directly into the platform body without a host-buffer

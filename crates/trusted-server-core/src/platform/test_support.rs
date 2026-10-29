@@ -206,6 +206,7 @@ impl PlatformBackend for StubBackend {
 /// and resolved by [`StubHttpClient::select`].
 struct StubPendingResponse {
     backend_name: String,
+    cache_intent: PlatformCacheIntent,
     status: u16,
     body: Vec<u8>,
     headers: Vec<(String, String)>,
@@ -245,6 +246,8 @@ pub(crate) struct StubHttpClient {
     pending_backend_name_overrides: Mutex<VecDeque<Option<String>>>,
     // Test-only wall-clock delays applied before each select result is returned.
     select_delays: Mutex<VecDeque<Duration>>,
+    select_count: std::sync::atomic::AtomicUsize,
+    wait_count: std::sync::atomic::AtomicUsize,
     // Reported by supports_concurrent_fanout(); set false to emulate
     // platforms whose collection contract permits only a single provider.
     concurrent_fanout: std::sync::atomic::AtomicBool,
@@ -269,6 +272,16 @@ struct StubHttpResponse {
 }
 
 impl StubHttpClient {
+    /// Number of calls to the unbounded selection method.
+    pub(crate) fn recorded_select_count(&self) -> usize {
+        self.select_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Number of calls to the unbounded single-request wait method.
+    pub(crate) fn recorded_wait_count(&self) -> usize {
+        self.wait_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn new() -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
@@ -280,6 +293,8 @@ impl StubHttpClient {
             wait_delays: Mutex::new(VecDeque::new()),
             pending_backend_name_overrides: Mutex::new(VecDeque::new()),
             select_delays: Mutex::new(VecDeque::new()),
+            select_count: std::sync::atomic::AtomicUsize::new(0),
+            wait_count: std::sync::atomic::AtomicUsize::new(0),
             concurrent_fanout: std::sync::atomic::AtomicBool::new(true),
             streaming_responses_supported: std::sync::atomic::AtomicBool::new(false),
             pending_streaming_responses_supported: std::sync::atomic::AtomicBool::new(false),
@@ -583,6 +598,7 @@ impl PlatformHttpClient for StubHttpClient {
         let edge_response = build_stub_pending_response(
             StubPendingResponse {
                 backend_name: request.backend_name,
+                cache_intent: request.cache_intent,
                 status: response.status,
                 body: response.body,
                 headers: response.headers,
@@ -686,6 +702,7 @@ impl PlatformHttpClient for StubHttpClient {
 
         let pending = StubPendingResponse {
             backend_name: backend_name.clone(),
+            cache_intent: request.cache_intent,
             status: response.status,
             body: response.body,
             headers: response.headers,
@@ -706,9 +723,26 @@ impl PlatformHttpClient for StubHttpClient {
 
     async fn select_until(
         &self,
-        pending_requests: Vec<PlatformPendingRequest>,
+        mut pending_requests: Vec<PlatformPendingRequest>,
         deadline: Instant,
     ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
+        // Match Fastly's per-provider rejection before waiting on network work.
+        let mut unchecked = pending_requests.into_iter();
+        let mut checked = Vec::with_capacity(unchecked.len());
+        while let Some(pending) = unchecked.next() {
+            match validate_deadline_cache_bypass(pending) {
+                Ok(pending) => checked.push(pending),
+                Err((backend_name, error)) => {
+                    checked.extend(unchecked);
+                    return Ok(Some(PlatformSelectResult {
+                        ready: Err(error),
+                        remaining: checked,
+                        failed_backend_name: backend_name,
+                    }));
+                }
+            }
+        }
+        pending_requests = checked;
         let remaining = deadline.saturating_duration_since(Instant::now());
         let delay = self
             .select_delays
@@ -740,6 +774,7 @@ impl PlatformHttpClient for StubHttpClient {
         pending: PlatformPendingRequest,
         deadline: Instant,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
+        let pending = validate_deadline_cache_bypass(pending).map_err(|(_, error)| error)?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         let delay = self
             .wait_delays
@@ -776,6 +811,8 @@ impl PlatformHttpClient for StubHttpClient {
         &self,
         mut pending_requests: Vec<PlatformPendingRequest>,
     ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+        self.select_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if pending_requests.is_empty() {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("select called with empty pending_requests list"));
@@ -851,6 +888,8 @@ impl PlatformHttpClient for StubHttpClient {
         &self,
         pending: PlatformPendingRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
+        self.wait_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let delay = self
             .wait_delays
             .lock()
@@ -881,6 +920,37 @@ impl PlatformHttpClient for StubHttpClient {
         let response = build_stub_pending_response(stub, stream_response, request_is_head)?;
         Ok(PlatformResponse::new(response).with_backend_name(backend_name))
     }
+}
+
+// Require the same request marker as Fastly while retaining wrapper metadata.
+fn validate_deadline_cache_bypass(
+    pending: PlatformPendingRequest,
+) -> Result<PlatformPendingRequest, (Option<String>, Report<PlatformError>)> {
+    let backend_name = pending.backend_name().map(str::to_owned);
+    let stream_response = pending.stream_response();
+    let request_method = pending.request_method().cloned();
+    let stub = pending.downcast::<StubPendingResponse>().map_err(|_| {
+        (
+            backend_name.clone(),
+            Report::new(PlatformError::HttpClient)
+                .attach("unexpected pending type in bounded stub collection"),
+        )
+    })?;
+    if !stub.cache_intent.is_bypass() {
+        return Err((
+            Some(stub.backend_name),
+            Report::new(PlatformError::Unsupported)
+                .attach("deadline collection requires a cache-bypass request"),
+        ));
+    }
+    let mut pending = PlatformPendingRequest::new(stub);
+    if let Some(name) = backend_name {
+        pending = pending.with_backend_name(name);
+    }
+    if let Some(method) = request_method {
+        pending = pending.with_response_handling(stream_response, method);
+    }
+    Ok(pending)
 }
 
 fn build_stub_pending_response(
@@ -1139,18 +1209,112 @@ mod tests {
 
     use super::*;
 
+    fn dispatch_cache_test_request(
+        stub: &StubHttpClient,
+        backend: &str,
+        bypass: bool,
+    ) -> PlatformPendingRequest {
+        stub.push_response(200, b"ready".to_vec());
+        let mut request = PlatformHttpRequest::new(
+            request_builder()
+                .uri("https://example.com/bid")
+                .body(Body::empty())
+                .expect("should build request"),
+            backend,
+        );
+        if bypass {
+            request = request.with_cache_bypass();
+        }
+        futures::executor::block_on(stub.send_async(request)).expect("should dispatch request")
+    }
+
+    #[test]
+    fn bounded_stub_collection_rejects_missing_bypass_without_losing_siblings() {
+        for unsupported_first in [false, true] {
+            let stub = StubHttpClient::new();
+            let unsupported = dispatch_cache_test_request(&stub, "unsupported", false);
+            let healthy = dispatch_cache_test_request(&stub, "healthy", true);
+            let selected = futures::executor::block_on(stub.select_until(
+                if unsupported_first {
+                    vec![unsupported, healthy]
+                } else {
+                    vec![healthy, unsupported]
+                },
+                Instant::now(),
+            ))
+            .expect("should attribute unsupported request")
+            .expect("should return unsupported result");
+            assert!(
+                matches!(
+                    selected
+                        .ready
+                        .expect_err("should reject missing bypass")
+                        .current_context(),
+                    PlatformError::Unsupported
+                ),
+                "should match Fastly's cache bypass requirement"
+            );
+            assert_eq!(
+                selected.failed_backend_name.as_deref(),
+                Some("unsupported"),
+                "should identify unsupported provider"
+            );
+            let selected =
+                futures::executor::block_on(stub.select_until(selected.remaining, Instant::now()))
+                    .expect("should collect sibling")
+                    .expect("should retain ready sibling");
+            assert_eq!(
+                selected
+                    .ready
+                    .expect("should accept bypassed request")
+                    .backend_name
+                    .as_deref(),
+                Some("healthy"),
+                "should preserve healthy provider"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_stub_wait_rejects_missing_bypass() {
+        let stub = StubHttpClient::new();
+        let pending = dispatch_cache_test_request(&stub, "unsupported", false);
+        let error = futures::executor::block_on(stub.wait_until(pending, Instant::now()))
+            .expect_err("should reject missing bypass");
+        assert!(
+            matches!(error.current_context(), PlatformError::Unsupported),
+            "should reject unsupported deadline wait"
+        );
+    }
+
+    #[test]
+    fn unbounded_stub_wait_accepts_default_cache_intent() {
+        let stub = StubHttpClient::new();
+        let pending = dispatch_cache_test_request(&stub, "ordinary", false);
+        let response = futures::executor::block_on(stub.wait(pending))
+            .expect("should preserve ordinary waits");
+        assert_eq!(
+            response.backend_name.as_deref(),
+            Some("ordinary"),
+            "should preserve backend"
+        );
+    }
+
     #[test]
     fn bounded_stub_wait_preserves_an_already_ready_response_after_expiry() {
         let stub = StubHttpClient::new();
         stub.push_response(200, b"ready".to_vec());
         let pending = futures::executor::block_on(
-            stub.send_async(PlatformHttpRequest::new(
-                request_builder()
-                    .uri("https://example.com/ready")
-                    .body(Body::empty())
-                    .expect("should build request"),
-                "ready-backend",
-            )),
+            stub.send_async(
+                PlatformHttpRequest::new(
+                    request_builder()
+                        .uri("https://example.com/ready")
+                        .body(Body::empty())
+                        .expect("should build request"),
+                    "ready-backend",
+                )
+                .with_cache_bypass(),
+            ),
         )
         .expect("should dispatch ready response");
         let response = futures::executor::block_on(stub.wait_until(pending, Instant::now()))

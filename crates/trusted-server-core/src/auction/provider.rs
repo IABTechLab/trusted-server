@@ -93,6 +93,9 @@ pub trait AuctionProvider: Send + Sync {
     /// Implementations normally return a pending upstream request, but may return
     /// an immediate response for a legitimate outcome that requires no HTTP call.
     /// The orchestrator handles waiting for and parsing pending responses.
+    /// Outbound auction and mediator requests must use
+    /// [`PlatformHttpRequest::with_cache_bypass`]: they carry personalized data,
+    /// and Fastly requires this marker for deadline-bounded collection.
     ///
     /// # Errors
     ///
