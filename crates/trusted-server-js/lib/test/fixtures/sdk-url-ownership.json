@@ -447,6 +447,11 @@
     "owner": "permutive"
   },
   {
+    "name": "Permutive CR in scheme",
+    "url": "ht\rtps://cdn.permutive.com/app-web.js",
+    "owner": "permutive"
+  },
+  {
     "name": "Lockr CR between slashes",
     "url": "https:/\r/aim.loc.kr/identity-lockr.js",
     "owner": "lockr"

@@ -41,7 +41,7 @@ describe.each(['http:', 'https:'])('SDK shorthand with an %s document base', (ba
     const template = document.createElement('template');
     template.innerHTML = `<script src="${raw}"></script>`;
     const script = template.content.querySelector('script')!;
-    const attribute = raw.replaceAll('\0', '\ufffd');
+    const attribute = raw.split('\0').join('\ufffd');
     expect(script.getAttribute('src')).toBe(attribute);
 
     container.appendChild(script);
