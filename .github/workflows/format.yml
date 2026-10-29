@@ -1,4 +1,4 @@
-name: "Run Format"
+name: 'Run Format'
 
 on:
   push:
@@ -61,7 +61,7 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           target: wasm32-wasip1,wasm32-unknown-unknown
-          components: "clippy, rustfmt"
+          components: 'clippy, rustfmt'
           cache-key: cargo-clippy
 
       - name: Run cargo fmt
@@ -91,6 +91,12 @@ jobs:
       - name: Run host-target CLI clippy
         run: cargo clippy --package trusted-server-cli --target x86_64-unknown-linux-gnu --all-targets --all-features -- -D warnings
 
+      - name: Run host-target release producer clippy
+        run: cargo clippy --package trusted-server-release --target x86_64-unknown-linux-gnu --all-targets --all-features --locked -- -D warnings
+
+      - name: Lint native JS release build fixtures
+        run: cargo clippy --package trusted-server-js --target x86_64-unknown-linux-gnu --all-targets --all-features --locked -- -D warnings
+
       # The codegen crate is a workspace member but is not a default member and
       # is not covered by any adapter-scoped alias, so lint it explicitly.
       - name: Run host-target OpenRTB codegen clippy
@@ -113,14 +119,14 @@ jobs:
       - name: Retrieve Node.js version
         id: node-version
         working-directory: .
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Use Node.js
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
-          cache: "npm"
+          cache: 'npm'
           cache-dependency-path: crates/trusted-server-js/lib/package.json
 
       - name: Install dependencies
@@ -144,14 +150,14 @@ jobs:
       - name: Retrieve Node.js version
         id: node-version
         working-directory: .
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Use Node.js
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
-          cache: "npm"
+          cache: 'npm'
           cache-dependency-path: docs/package.json
 
       - name: Install dependencies
@@ -180,7 +186,7 @@ jobs:
 
       - name: Retrieve Node.js version
         id: node-version
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Use Node.js
@@ -189,7 +195,7 @@ jobs:
           node-version: ${{ steps.node-version.outputs.node-version }}
 
       - name: Run shellcheck
-        run: shellcheck scripts/docs-proposal/*.sh scripts/release/phase1-build.sh
+        run: shellcheck scripts/docs-proposal/*.sh scripts/release/phase1-build.sh scripts/release/bootstrap.sh scripts/release/build.sh scripts/release/build-js.sh
 
       - name: Test hunk review builder
         run: node --test scripts/docs-proposal/hunks.test.mjs

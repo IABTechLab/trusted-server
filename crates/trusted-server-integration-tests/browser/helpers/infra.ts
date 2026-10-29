@@ -32,8 +32,8 @@ export async function findAvailablePort(): Promise<number> {
  * Start a Docker container for the given framework.
  *
  * Uses `docker run -d` (detached) with `--rm` for auto-cleanup on stop.
- * The container is mapped to the fixed origin port so the WASM binary
- * (which has this port baked in) can proxy to it.
+ * The container is mapped to the fixed origin port expected by the runtime
+ * application configuration so the server can proxy to it.
  *
  * @returns The container ID.
  */

@@ -233,6 +233,16 @@ and a build outside a git checkout omits the header. The value is public on
 every response, so pass a neutral value such as the commit hash when a branch
 name is sensitive.
 
+This is the source-build development path. Canonical attested release builds
+use `TRUSTED_SERVER__RELEASE_BUILD=1` with an approved full 40-character source
+commit and no Git display fallback. Their `x-ts-version` is that source identity;
+the external release tag is recorded separately in immutable release metadata.
+The header is not a binary checksum or attestation verification.
+
+For canonical Fastly bytes, use the separate
+[manual verified-byte production procedure](/guide/release-verification#deploy-the-verified-fastly-wasm).
+The source-build commands above do not establish canonical release provenance.
+
 ## Next Steps
 
 - Learn about [Edge Cookies](/guide/edge-cookies)

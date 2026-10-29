@@ -319,3 +319,95 @@ existing defaults, accepted values and conflict rejection are preserved.
 This correction and the current-main integration changed the binary inputs.
 Rehearsal `.9` remains evidence for its recorded implementation only; `.12` and
 the fresh main-merge rehearsal `.15` are attributed separately above.
+
+## Approved Phase 2 rebuild-check compatibility
+
+Gate 1's ordinary-release Fastly adapter was approved on 2026-10-26; implementation follows a separately reviewed concrete plan. The asset name `trusted-server-fastly.wasm.rebuild-check.json` stays fixed. Its version-1 `ordinary-release-fastly-byte-equality-v1` profile proves only the documented ordinary A/B comparison, with `release_qualification:false`. Consumers must check `profile`; matching digests do not imply controlled-recipe qualification.
+
+The approved build-side normalization amendment maps both actual checkout roots to `/trusted-server` and both target roots to `/cargo-target`, passing the identical four-map target-scoped Cargo argument pair to each build. Filesystem roots still differ; normalized compiler source-path identity deliberately does not. The exact argument pair is retained before compilation, checked against both observations and kept out of the public receipt and semantic recipe identity. The recipe identity includes the stable normalization policy. Complete final bytes retain their debug/name sections and must contain no physical root. Comparison excludes and rewrites no bytes; controlled tool/material/path closure and alternate-user coverage remain unqualified. A remaining real mismatch stops the attempt.
+
+Phase 3 will index and digest this same companion. Later controlled-recipe evidence may supersede the ordinary profile in the same filename using a distinct profile value while preserving compatible version-1 source, outcome and digest joins. Incompatible informational changes need an explicit reviewed version change; neither a filename change nor silently stronger interpretation is allowed.
+
+The Fastly provenance attestation adds the rebuild-check subject while retaining the existing reusable signer identity and bundle name. Rehearsal must prove that existing binary verification commands pass unchanged and separately verify the rebuild-check's provenance, release membership and checksum. Merging Phase 2 activates the gate on the next real tag, adding a second Fastly build and comparison before signing. A mismatch prevents release; retain bounded diagnostics and ask for a decision without exclusions or weaker comparison.
+
+### Manual Fastly package directory headers
+
+[CI at `a8f8bcb81`](https://github.com/IABTechLab/trusted-server/actions/runs/40469201263/job/122071972950) confirmed that the pinned Fastly CLI emits exactly two zero-sized type-5 directory headers named `example-app` and `example-app/bin`, without trailing slashes. The other two headers are the regular wasm and manifest files; prefixes and link names are empty, and no hidden nonzero padding or metadata headers were present.
+
+The private read-only package inspector accepts those two known directory names with or without one trailing slash, only with type 5 and size zero. It deduplicates their logical identities, so mixing the two spellings cannot bypass duplicate rejection. File names/types, links, prefixes, metadata rejection, four-member requirement, expansion/trailer bounds and independent manifest/wasm hashes remain unchanged. Other path aliases remain rejected. This transport compatibility correction grants no recipe, runtime, official-release or deployment qualification.
+
+### Phase 2 ordinary metadata and closed destination policy
+
+Phase 2 validates all seven current ordinary cohort rows strictly. The retained controlled recipes, consumer policy and index schema still cover four destination artifacts. Projection uses those four source-owned names in fixed order; the three ordinary Axum rows grant no controlled recipe or seven-asset index authority. The separate Phase 3 index amendment remains required. No carried cohort, tools, consumer-policy or schema bytes are changed by this split.
+
+The carried tools and consumer policy name GitHub CLI 2.97.0 as a destination pin. Current operator instructions use 2.102.0, and the ordinary publisher records the installed version. Qualification pins, controlled reproducibility profiles and the destination GitHub CLI pin are not enforced by the ordinary producer. Its existing publication, signing and verification checks remain in force.
+
+### Controlled JS observer gap
+
+Controlled JS preparation does not support the current npm lock: the frozen observer admits esbuild 0.27.3, while the lock selects 0.28.2. The observer is ported unchanged. Ordinary release builds and the Gate 1 Fastly A/B adapter do not use it. Adapting the observer belongs to the gated controlled-recipe work and requires its own review of the esbuild change.
+
+The full collector test stays ported with an explicit skipped reason naming both versions; no CI job claims it passes. A cheap configuration guard rejects `TRUSTED_SERVER__RELEASE_JS_TESTS=1` against an unsupported lock, and a pure regression test checks that refusal. Existing observer fixture tests and the ordinary/checked-prebuilt build fixtures remain separate.
+
+Unlike the frozen controlled producer, ordinary release mode may select neither prebuilt input and build fresh private bundles with npm. Explicit prebuilt release selection still requires both the absolute bundle directory and inventory, with source/hash, strict-copy and race checks unchanged. Phase 1 continues to refuse all prebuilt overrides. The build-input audit allows the inventory metadata name only in the exact JS build script, never in other build scripts or compile-time application reads.
+
+### Online SBOM records after a signing rerun
+
+Reruns or retries of the signing workflow can leave more than one valid SBOM attestation for the same binary digest, in no guaranteed order. In rehearsal `.10` at `3ccfe29715a073bd37010ea86037b9c8f89801c7`, the second attempt passed archive binding and equality, then refused the existing immutable release. Both signing attempts remain visible online; their SPDX creation timestamps and document namespaces differ, while the published release and its assets remain unchanged.
+
+Online consumers keep every repository, workflow/certificate, tag/ref, source/signer digest and predicate pin. Only after `gh attestation verify` succeeds may `jq -e --slurpfile document <asset>.spdx.json` require `any(.[]; .verificationResult.statement.predicate == $document[0])`. The document must first pass authenticated release/asset verification. This selects a predicate exactly equal to the published SPDX without choosing the first/newest record. An empty result or no equal predicate evaluates false and exits non-zero. Published-bundle checks retain their strict single-result comparison; no workflow or signing behavior changes.
+
+### Exact-head rehearsal evidence
+
+| Phase | Tag   | Implementation source                      | Evidence                                                                                                                                                                                                                                                                                              |
+| ----- | ----- | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | `.12` | `ab6e5493636fd3d1db4b22a071189070f90a189a` | [Passed: 29 immutable prerelease files and full independent verification](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6440880360)                                                                                                                                             |
+| 2     | `.10` | `3ccfe29715a073bd37010ea86037b9c8f89801c7` | [Passed: 30 files, unchanged binary verification and real companion](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6438603951); [rerun-all transfer passed, existing immutable release refused](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6439423827) |
+| 2     | `.13` | `770a425df4b28caaaef68dfd930bceabd9928046` | [Passed: full 30-file publication and independent verification of the merged implementation](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6441704601)                                                                                                                          |
+
+Phase 1 `.11` failed at the single draft-create POST with HTTP 403; no release or draft existed. Fresh `.12` placed the same reviewed source at the fork Phase 1 branch head as well as a new lightweight tag and passed, without source, settings or token-permission changes. The failure log did not retain the response body, so the exact permission cause remains unconfirmed. The [failed attempt](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6439851715) remains recorded and its tag was not reused. Phase 1's bundle-based single-result examples remain unchanged.
+
+The Phase 2 `.10` reproduction job took 293 seconds and comparison 91 seconds, overlapping native builds. Its [online-SBOM positive and one-byte-negative checks](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6439619901) passed against fully verified pinned results. The negative copy remained valid JSON, changed exactly one byte, and returned false with `jq -e` exit 1; the authenticated published document remained untouched. The merged head's `.13` reproduction took 378 seconds and comparison 116 seconds, also overlapping native builds. These records identify their exact implementation SHAs; the completion commit `2ed1b941a212aeb27e08f8d1e27cb8353f40f535` was docs-only since rehearsed `770a425df4b28caaaef68dfd930bceabd9928046`.
+
+### Phase 2 merge after rehearsal .13
+
+This merge joins Phase 2 parent `2ed1b941a212aeb27e08f8d1e27cb8353f40f535` with updated Phase 1 parent `20152315c01dd5fddcfc84b969f8e9993b0bfc69`. Phase 1 carries the main integration rehearsed in `.15` at `68eef902a8bddd9024676cc3806fa5377ed67fee`, followed by its docs-only evidence update.
+
+The source-changing Phase 2 integration is `81020c0929bdc29ee4102e6516b7a75cc2cfe810`, a **no-release-machinery merge**: application code from main changes binary inputs, while release workflows, producer scripts, build facts, manifests/lock and tool pins retain their Phase 2 values. No new Phase 2 rehearsal is performed, as requested. `.13` stays attributed exclusively to `770a425df4b28caaaef68dfd930bceabd9928046`; its release is not evidence for binaries from this new merge head. Gate 1 activation and all closed qualification/design gates remain unchanged.
+
+This follow-up records only the exact merge SHA and is docs-only after `81020c0929bdc29ee4102e6516b7a75cc2cfe810`. The application changes since rehearsed `770a425df` remain unrehearsed.
+
+### Newer stack trunk integration
+
+After main advanced, GitHub's stack CI evaluated Phase 2 against the newer trunk and found a conflict in `prebid_bundle.rs`. Integration `7d551777daeaee09e24bce9bf4f96edac6e5e0df` merged main `054c7b777ce67db34744cb1f4100b14e59c4bc5a` into Phase 2 parent `3ae0e191f321ed1d796af0106b9043804d7af452` only. The resolution retains both the upstream Unix permissions-test import and Phase 2's resource-discovery tests; upstream security fixes remain intact.
+
+Phase 1 stays at docs head `20152315c01dd5fddcfc84b969f8e9993b0bfc69`, with `.15` still attributed to `68eef902a8bddd9024676cc3806fa5377ed67fee`. The additional Phase 2 integration changes application inputs, with no release-machinery changes and no new Phase 2 rehearsal. `.13` remains exclusively at `770a425df4b28caaaef68dfd930bceabd9928046`.
+
+This exact-SHA record is docs-only after `7d551777daeaee09e24bce9bf4f96edac6e5e0df`; the later application inputs remain unrehearsed.
+
+## Phase 2 final review follow-up (2026-10-28)
+
+The parent tracking issue is #1235; the earlier separate-issue draft is historical. Phase 2 now has its own [spec and review log](../specs/2026-10-28-1235-binary-attestations-phase2-design.md), distinct from the Phase 1 review rounds. Current readiness work does not expand historical `.13` attribution. Fresh rehearsal `.16` subsequently passed at `5fa3843364f247fdc261c438ab9257323637a42c`, as recorded below.
+
+The structured failure diagnostic completion preserves all release contracts: canonical JSON is capped at 4,096 bytes, classified at actual typed checks and retained only as `ordinary-diagnostics/ordinary-comparison-diagnostic.json` in the failed comparison CI artifact, alongside bounded stderr. Unobserved facts are explicitly `unavailable`. A failure writes no matched companion; a diagnostic-writer error remains a failed job. These diagnostics are never signed or published. The existing companion filename, profile and exact-byte comparison are unchanged.
+
+The final risk-based security review also identified a dormant limitation in macOS survivor enumeration: a saturated PID buffer can be treated as a complete snapshot, and failed per-process identity queries become nonmatches. This is not part of the ordinary Fastly release path; it must be addressed before any later macOS containment qualification opens. Darwin startup currently provides scrubbed/supervised host execution, not filesystem/network confinement. Qualified selectors remain uninhabited; this batch does not enable or modify that dormant path.
+
+## Phase 2 historical rehearsal .16
+
+Rehearsal `.16` passed at `5fa3843364f247fdc261c438ab9257323637a42c` with all 18 jobs successful. It covers the later application inputs and structured-diagnostic completion; the historical `.13` remains exclusively at `770a425df4b28caaaef68dfd930bceabd9928046`. The subsequent `fb4843355` completion record was docs-only since that exact rehearsed implementation; the later process-supervision correction is a separate source change.
+
+The [full transcript](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6467368408) records 30 immutable prerelease assets, not Latest; 29 checksum entries; all seven binaries' SLSA/SPDX verification with reusable workflow and exact certificate/source/tag pins, online and offline; 14 SPDX equalities plus an exact one-byte negative; the genuine companion's provenance, source-owned recipe/lock hashes and all four upload/API/job joins; release download, membership and byte readback; macOS 13.0 metadata, CLI full commit, Axum non-loopback smoke and pinned Fastly pack/validate/inspect/cmp without deployment. Reproduction took 4m29s; comparison 1m26s, overlapping native builds.
+
+An initial independent download hit a connection timeout. The 28 complete local files were checked against API sizes/digests; the two missing files were recovered from the same immutable release with bounded read-only retries. The workflow, release and lightweight tag were not reused or changed. Hosted source tests also passed the real negative comparator's structured `mismatched` / `bytes` assertions and later-stage sentinel refusal.
+
+## Phase 2 review follow-up and current-source rehearsal
+
+**Current verification:** Rehearsal `.20` passed at exact reviewed source `5163241b947b1aa335987bd832b9205e4364e4bb`: [all 18 jobs](https://github.com/prk-Jr/trusted-server/actions/runs/40812416995) succeeded, publishing 30 immutable prerelease assets, not Latest. Independent [transcript parts 1](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6487647974), [2](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6487649518) and [3](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6487649861) verify all release memberships and checksums, both predicates and reusable signer identities online/offline for all seven binaries, 14 SPDX equalities and negative controls, companion joins, native smoke and pinned Fastly packaging. The exact published Wasm also passed the local Viceroy 0.21.0 publisher/JS/source-header/logging check, with zero build-fact lines and owned-listener cleanup. Current-source CI passed 29 checks with four expected skips. This completion record is docs-only since rehearsed `5163241b9`; its subsequent hosted checks are assessed separately. Keep #1449 draft, without reviewers.
+
+The [`.16` runtime supplement](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6471330921) closes the original missing execution evidence for unchanged published bytes at `5fa384336`: three actual publisher responses and the injected JS route returned 200 with that full source header under pinned Viceroy 0.21.0. Actual request/response logs were visible and contained zero build-facts lines. Wrong-source and log-detector controls passed, the binary digest stayed unchanged, and owned listeners stopped. This is local Viceroy evidence, not deployed Fastly/browser qualification. The packaging inspector's `runtime_validated:false` still correctly describes that inspector; the separate execution check does not rewrite its output or any immutable asset.
+
+The optional process finding was confirmed and corrected in `927109fa1`: initial group killing occurs while the unreaped leader pins its identity, and all post-reap confirmation uses read-only signal zero. Numeric reuse can cause a bounded false cleanup failure but cannot receive another destructive signal. Five pure regressions and real hosted Linux/macOS process tests pass. Shared metadata consistently identifies Phase 3 draft #1463.
+
+Fresh `.17` and `.18` preserve the seven-binary cohort and reviewed source `36454c526`, but their ARM64 macOS jobs never acquired runners. This is external scheduling evidence, not an established code failure and not a successful publication rehearsal. Both tags are preserved. Existing `.16` signed/publication proof stays attributed only to its original source. No approval or implementation for later qualified, SPDX/index or consumer gates follows from these corrections.
+
+Fresh `.20` closes the post-correction rehearsal gate at `5163241b947b1aa335987bd832b9205e4364e4bb`. Its Wasm SHA-256 is `4fe7204f17df07a392f4e4b64f31eebf3b02179e57abee689ab0094990d0a572`. Reproduction took 282 seconds; comparison 122 seconds. Attempt `.19` at that same source had the same ARM64 runner-acquisition cancellation, with no release ([failure record](https://github.com/IABTechLab/trusted-server/pull/1449#issuecomment-6487087085)); it is not claimed as successful. Historical `.16`, `.17` and `.18` retain their existing source/result attribution. No later production/qualified or SPDX/index/consumer gate is opened.

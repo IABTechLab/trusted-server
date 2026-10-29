@@ -221,9 +221,8 @@ mod tests {
     }
 
     fn settings_with_response_headers(headers: Vec<(&str, &str)>) -> Settings {
-        // Build from explicit test settings: the settings baked into the
-        // binary contain placeholder secrets that `get_settings()` rejects
-        // by design.
+        // Build explicit, deterministic test settings without external runtime
+        // configuration or secret-store bindings.
         let mut s = Settings::from_toml(
             r#"
                 [[handlers]]

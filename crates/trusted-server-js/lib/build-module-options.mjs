@@ -1,12 +1,17 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { compositionPlugin, releaseBuild } from './release-composition.mjs';
+
 const libDir = path.dirname(fileURLToPath(import.meta.url));
 
 /** Production Vite options for one independently bundled tsjs IIFE. */
-export function moduleBuildOptions({ name, entryPath, outDir }) {
+export function moduleBuildOptions({ name, entryPath, outDir, composition }) {
+  const release = releaseBuild();
   return {
     configFile: false,
+    ...(release ? { mode: 'production', envDir: false } : {}),
+    ...(composition ? { plugins: [compositionPlugin({ name, ...composition })] } : {}),
     root: libDir,
     build: {
       emptyOutDir: false,

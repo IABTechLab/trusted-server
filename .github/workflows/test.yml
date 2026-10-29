@@ -1,4 +1,4 @@
-name: "Run Tests"
+name: 'Run Tests'
 
 permissions:
   contents: read
@@ -117,6 +117,8 @@ jobs:
   test-axum:
     name: cargo test (axum native)
     runs-on: ubuntu-latest
+    outputs:
+      comparison-succeeded: ${{ steps.producer-tests.outputs.comparison-succeeded }}
     steps:
       - uses: actions/checkout@v4
 
@@ -174,6 +176,25 @@ jobs:
 
       - name: Run host-target CLI tests
         run: ./scripts/test-cli.sh
+
+      - name: Run release producer primitive and process tests
+        id: producer-tests
+        run: |
+          set -euo pipefail
+          cargo test --package trusted-server-release --target x86_64-unknown-linux-gnu --locked --test commands -- --list > "$RUNNER_TEMP/ordinary-command-tests.txt"
+          grep -Fx 'ordinary_comparison_failure_prevents_signing_and_publication_sentinels: test' "$RUNNER_TEMP/ordinary-command-tests.txt"
+          cargo test --package trusted-server-release --target x86_64-unknown-linux-gnu --locked
+          cargo test --package trusted-server-release --target x86_64-unknown-linux-gnu --locked --test commands ordinary_comparison_failure_prevents_signing_and_publication_sentinels -- --exact > "$RUNNER_TEMP/ordinary-negative-result.txt"
+          cat "$RUNNER_TEMP/ordinary-negative-result.txt"
+          grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/ordinary-negative-result.txt"
+          echo 'comparison-succeeded=false' >> "$GITHUB_OUTPUT"
+
+      - name: Run checked and ordinary JS release build fixtures
+        shell: bash
+        run: |
+          cargo test --package trusted-server-js --target x86_64-unknown-linux-gnu --locked --test release_prebuilt -- --list > "$RUNNER_TEMP/js-release-tests.txt"
+          grep -Fx 'ordinary_release_without_prebuilt_builds_private_bundles: test' "$RUNNER_TEMP/js-release-tests.txt"
+          cargo test --package trusted-server-js --target x86_64-unknown-linux-gnu --locked --test release_prebuilt
 
       # The codegen crate is not a default member and no adapter alias builds it,
       # so its tests only run if invoked explicitly on the host target.
@@ -240,7 +261,7 @@ jobs:
           TRUSTED_SERVER__PUBLISHER__ORIGIN_URL: http://127.0.0.1:8080
           TRUSTED_SERVER__PUBLISHER__PROXY_SECRET: integration-test-proxy-secret
           TRUSTED_SERVER__EC__PASSPHRASE: integration-test-ec-secret-padded-32
-          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
+          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: 'false'
         run: cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
 
       - name: Run Spin adapter tests (native host)
@@ -280,7 +301,7 @@ jobs:
       - name: Set up Rust toolchain
         uses: ./.github/actions/setup-rust
         with:
-          components: "clippy, rustfmt"
+          components: 'clippy, rustfmt'
           cache-key: cargo-cli
 
       - name: Read pinned Node.js version for CLI fixtures
@@ -299,6 +320,11 @@ jobs:
       - name: cargo clippy
         run: |
           cargo clippy --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --all-targets -- -D warnings
+
+      - name: Run producer process supervision on macOS
+        if: runner.os == 'macOS'
+        run: |
+          cargo test --package trusted-server-release --target "$(rustc -vV | sed -n 's/host: //p')" --locked --bin trusted-server-release process::
 
       - name: Set up Chrome for browser fixture tests
         if: runner.os == 'macOS'
@@ -365,7 +391,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
-          cache: "npm"
+          cache: 'npm'
           cache-dependency-path: crates/trusted-server-js/lib/package.json
 
       - name: Install dependencies
@@ -376,3 +402,45 @@ jobs:
 
       - name: Run unit tests
         run: npm test -- --run
+
+  ordinary-negative-sign:
+    name: Ordinary negative signing canary
+    needs: test-axum
+    if: needs.test-axum.outputs.comparison-succeeded == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - run: exit 1
+
+  ordinary-negative-publish:
+    name: Ordinary negative publication canary
+    needs: test-axum
+    if: needs.test-axum.outputs.comparison-succeeded == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - run: exit 1
+
+  ordinary-negative-audit:
+    name: Audit ordinary negative stages
+    needs: [test-axum, ordinary-negative-sign, ordinary-negative-publish]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Require the failed-comparison fixture and both skipped canaries
+        env:
+          NATIVE_RESULT: ${{ needs.test-axum.result }}
+          SIGN_RESULT: ${{ needs.ordinary-negative-sign.result }}
+          PUBLISH_RESULT: ${{ needs.ordinary-negative-publish.result }}
+          COMPARISON_SUCCEEDED: ${{ needs.test-axum.outputs.comparison-succeeded }}
+        run: |
+          set -euo pipefail
+          test "$NATIVE_RESULT" = success
+          test "$COMPARISON_SUCCEEDED" = false
+          test "$SIGN_RESULT" = skipped
+          test "$PUBLISH_RESULT" = skipped
+          echo 'SUCCESS: real negative comparison rejected; read-only signing/publication canaries skipped'

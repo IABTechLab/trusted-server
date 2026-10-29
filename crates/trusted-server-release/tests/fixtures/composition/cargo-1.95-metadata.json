@@ -1,0 +1,270 @@
+{
+  "packages": [
+    {
+      "name": "build-direct",
+      "version": "0.1.0",
+      "id": "path+file:///build/source/crates/build-direct#0.1.0",
+      "license": null,
+      "license_file": null,
+      "description": null,
+      "source": null,
+      "dependencies": [],
+      "targets": [
+        {
+          "kind": [
+            "bin"
+          ],
+          "crate_types": [
+            "bin"
+          ],
+          "name": "build-direct",
+          "src_path": "/build/source/crates/build-direct/src/main.rs",
+          "edition": "2024",
+          "doc": true,
+          "doctest": false,
+          "test": true
+        },
+        {
+          "kind": [
+            "custom-build"
+          ],
+          "crate_types": [
+            "bin"
+          ],
+          "name": "build-script-build",
+          "src_path": "/build/source/crates/build-direct/build.rs",
+          "edition": "2024",
+          "doc": false,
+          "doctest": false,
+          "test": false
+        }
+      ],
+      "features": {},
+      "manifest_path": "/build/source/crates/build-direct/Cargo.toml",
+      "metadata": null,
+      "publish": [],
+      "authors": [],
+      "categories": [],
+      "keywords": [],
+      "readme": null,
+      "repository": null,
+      "homepage": null,
+      "documentation": null,
+      "edition": "2024",
+      "links": null,
+      "default_run": null,
+      "rust_version": null
+    },
+    {
+      "name": "build-grandchild",
+      "version": "0.1.0",
+      "id": "path+file:///build/source/crates/build-grandchild#0.1.0",
+      "license": null,
+      "license_file": null,
+      "description": null,
+      "source": null,
+      "dependencies": [],
+      "targets": [
+        {
+          "kind": [
+            "bin"
+          ],
+          "crate_types": [
+            "bin"
+          ],
+          "name": "build-grandchild",
+          "src_path": "/build/source/crates/build-grandchild/src/main.rs",
+          "edition": "2024",
+          "doc": true,
+          "doctest": false,
+          "test": true
+        },
+        {
+          "kind": [
+            "custom-build"
+          ],
+          "crate_types": [
+            "bin"
+          ],
+          "name": "build-script-build",
+          "src_path": "/build/source/crates/build-grandchild/build.rs",
+          "edition": "2024",
+          "doc": false,
+          "doctest": false,
+          "test": false
+        }
+      ],
+      "features": {},
+      "manifest_path": "/build/source/crates/build-grandchild/Cargo.toml",
+      "metadata": null,
+      "publish": [],
+      "authors": [],
+      "categories": [],
+      "keywords": [],
+      "readme": null,
+      "repository": null,
+      "homepage": null,
+      "documentation": null,
+      "edition": "2024",
+      "links": null,
+      "default_run": null,
+      "rust_version": null
+    },
+    {
+      "name": "control",
+      "version": "0.1.0",
+      "id": "path+file:///build/source/crates/control#0.1.0",
+      "license": null,
+      "license_file": null,
+      "description": null,
+      "source": null,
+      "dependencies": [],
+      "targets": [
+        {
+          "kind": [
+            "bin"
+          ],
+          "crate_types": [
+            "bin"
+          ],
+          "name": "control",
+          "src_path": "/build/source/crates/control/src/main.rs",
+          "edition": "2024",
+          "doc": true,
+          "doctest": false,
+          "test": true
+        },
+        {
+          "kind": [
+            "custom-build"
+          ],
+          "crate_types": [
+            "bin"
+          ],
+          "name": "build-script-build",
+          "src_path": "/build/source/crates/control/build.rs",
+          "edition": "2024",
+          "doc": false,
+          "doctest": false,
+          "test": false
+        }
+      ],
+      "features": {},
+      "manifest_path": "/build/source/crates/control/Cargo.toml",
+      "metadata": null,
+      "publish": [],
+      "authors": [],
+      "categories": [],
+      "keywords": [],
+      "readme": null,
+      "repository": null,
+      "homepage": null,
+      "documentation": null,
+      "edition": "2024",
+      "links": null,
+      "default_run": null,
+      "rust_version": null
+    },
+    {
+      "name": "macro-attempt",
+      "version": "0.1.0",
+      "id": "path+file:///build/source/crates/macro-attempt#0.1.0",
+      "license": null,
+      "license_file": null,
+      "description": null,
+      "source": null,
+      "dependencies": [],
+      "targets": [
+        {
+          "kind": [
+            "proc-macro"
+          ],
+          "crate_types": [
+            "proc-macro"
+          ],
+          "name": "macro_attempt",
+          "src_path": "/build/source/crates/macro-attempt/src/lib.rs",
+          "edition": "2024",
+          "doc": true,
+          "doctest": true,
+          "test": true
+        },
+        {
+          "kind": [
+            "bin"
+          ],
+          "crate_types": [
+            "bin"
+          ],
+          "name": "macro-attempt",
+          "src_path": "/build/source/crates/macro-attempt/src/main.rs",
+          "edition": "2024",
+          "doc": true,
+          "doctest": false,
+          "test": true
+        }
+      ],
+      "features": {},
+      "manifest_path": "/build/source/crates/macro-attempt/Cargo.toml",
+      "metadata": null,
+      "publish": [],
+      "authors": [],
+      "categories": [],
+      "keywords": [],
+      "readme": null,
+      "repository": null,
+      "homepage": null,
+      "documentation": null,
+      "edition": "2024",
+      "links": null,
+      "default_run": null,
+      "rust_version": null
+    }
+  ],
+  "workspace_members": [
+    "path+file:///build/source/crates/build-direct#0.1.0",
+    "path+file:///build/source/crates/build-grandchild#0.1.0",
+    "path+file:///build/source/crates/control#0.1.0",
+    "path+file:///build/source/crates/macro-attempt#0.1.0"
+  ],
+  "workspace_default_members": [
+    "path+file:///build/source/crates/build-direct#0.1.0",
+    "path+file:///build/source/crates/build-grandchild#0.1.0",
+    "path+file:///build/source/crates/control#0.1.0",
+    "path+file:///build/source/crates/macro-attempt#0.1.0"
+  ],
+  "resolve": {
+    "nodes": [
+      {
+        "id": "path+file:///build/source/crates/build-direct#0.1.0",
+        "dependencies": [],
+        "deps": [],
+        "features": []
+      },
+      {
+        "id": "path+file:///build/source/crates/build-grandchild#0.1.0",
+        "dependencies": [],
+        "deps": [],
+        "features": []
+      },
+      {
+        "id": "path+file:///build/source/crates/control#0.1.0",
+        "dependencies": [],
+        "deps": [],
+        "features": []
+      },
+      {
+        "id": "path+file:///build/source/crates/macro-attempt#0.1.0",
+        "dependencies": [],
+        "deps": [],
+        "features": []
+      }
+    ],
+    "root": null
+  },
+  "target_directory": "/build/target",
+  "build_directory": "/build/target",
+  "version": 1,
+  "workspace_root": "/build/source",
+  "metadata": null
+}

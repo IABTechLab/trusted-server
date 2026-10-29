@@ -13,6 +13,7 @@ members = [
     # Manual protobuf codegen tool — a member so it shares workspace settings,
     # but no default member or alias builds it. Run it explicitly with `-p`.
     "crates/trusted-server-openrtb-codegen",
+    "crates/trusted-server-release",
 ]
 
 # Viceroy (cargo test-fastly runner) calls `cargo run --bin trusted-server-adapter-fastly`

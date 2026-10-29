@@ -567,8 +567,8 @@ impl TrustedServerApp {
     /// Build the full application router from explicit settings.
     ///
     /// Testing seam: cross-adapter parity tests use this to drive the router
-    /// with known-good settings instead of the baked `get_settings()` result,
-    /// whose embedded placeholder secrets fail validation by design.
+    /// with known-good settings without external runtime configuration or
+    /// secret-store bindings.
     ///
     /// # Errors
     ///

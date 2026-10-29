@@ -14,9 +14,9 @@ use trusted_server_core::settings::Settings;
 
 /// Build the full application router from explicit test settings.
 ///
-/// The settings baked into the binary contain placeholder secrets that
-/// `get_settings()` rejects by design, which would turn every route into a
-/// startup error page (and its route table into the fallback-only set).
+/// Explicit settings exercise the full route table without external runtime
+/// configuration or secret-store bindings. Missing runtime settings would
+/// otherwise select the startup error router.
 /// The handler regex is the production-shaped `^/_ts/admin`, matching
 /// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
 /// `/_ts/admin/keys/*` routes are auth-gated exactly as in production.

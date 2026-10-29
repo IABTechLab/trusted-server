@@ -12,8 +12,8 @@
     "test:watch": "vitest",
     "lint": "eslint . --max-warnings=0",
     "lint:fix": "eslint --fix . --max-warnings=0",
-    "format": "prettier --check \"**/*.{ts,tsx,js,json,css,md}\"",
-    "format:write": "prettier --write \"**/*.{ts,tsx,js,json,css,md}\""
+    "format": "prettier --check \"**/*.{ts,tsx,js,mjs,json,css,md}\"",
+    "format:write": "prettier --write \"**/*.{ts,tsx,js,mjs,json,css,md}\""
   },
   "dependencies": {
     "prebid.js": "^10.26.0"

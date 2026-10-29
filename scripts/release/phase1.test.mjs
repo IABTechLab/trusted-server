@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { gzipSync, gunzipSync } from 'node:zlib'
 import { execFileSync } from 'node:child_process'
 import { completeSpdx, validateSpdx, checkReleaseFormat } from './phase1.mjs'
 import { test } from 'node:test'
@@ -16,6 +17,435 @@ import * as fs from 'node:fs'
 import vm from 'node:vm'
 import { isDeepStrictEqual } from 'node:util'
 import { checkBinary, checkSource, mergeSboms, sentinels } from './phase1.mjs'
+import {
+  ordinaryApi,
+  ordinaryDownload,
+  acquireOrdinaryTransfers,
+} from './phase1.mjs'
+
+test('ordinary transport preserves raw metadata and uses only the fixed authenticated GET', async () => {
+  const calls = []
+  const bytes = '{"total_count":0,"jobs":[],"same":1,"same":2}'
+  const fetched = await ordinaryApi(
+    '/repos/example/release/actions/runs/17/attempts/2/jobs?per_page=100',
+    'fictional-token',
+    async (url, options) => {
+      calls.push({ url, options })
+      return new Response(bytes)
+    }
+  )
+  assert.equal(fetched.toString(), bytes)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].options.method, 'GET')
+  assert.equal(calls[0].options.redirect, 'manual')
+  assert.equal(calls[0].options.headers.Authorization, 'Bearer fictional-token')
+  // Assert the fixed metadata origin without permitting arbitrary destinations.
+  assert.equal(new URL(calls[0].url).origin, 'https://api.github.com') // allow-domain: api.github.com
+})
+
+test('ordinary transport rejects metadata failures and oversized responses without leaking details', async () => {
+  let discarded = 0
+  await assert.rejects(
+    ordinaryApi(
+      '/repos/example/release/actions/runs/17/artifacts?per_page=100',
+      'fictional-token',
+      async () =>
+        new Response(
+          new ReadableStream({
+            cancel() {
+              discarded++
+            },
+          }),
+          { status: 403 }
+        )
+    )
+  )
+  assert.equal(discarded, 1)
+  for (const response of [
+    new Response('fictional-sensitive-body', { status: 403 }),
+    new Response('fictional-sensitive-body', {
+      status: 302,
+      headers: { location: 'https://example.com/fictional-secret' },
+    }),
+    new Response(Buffer.alloc(1024 * 1024 + 1)),
+  ])
+    await assert.rejects(
+      ordinaryApi(
+        '/repos/example/release/actions/runs/17/artifacts?per_page=100',
+        'fictional-token',
+        async () => response
+      ),
+      (error) =>
+        !/fictional-sensitive|fictional-secret|fictional-token/.test(
+          error.message
+        )
+    )
+  let called = false
+  await assert.rejects(
+    ordinaryApi(
+      '/repos/example/release/releases',
+      'fictional-token',
+      async () => {
+        called = true
+      }
+    )
+  )
+  assert.equal(called, false)
+  for (const path of [
+    '/repos/../release/actions/runs/17/artifacts?per_page=100',
+    '/repos/example/../actions/runs/17/artifacts?per_page=100',
+  ]) {
+    await assert.rejects(
+      ordinaryApi(path, 'fictional-token', async () => {
+        called = true
+      })
+    )
+    assert.equal(called, false)
+  }
+  await assert.rejects(
+    ordinaryApi(
+      '/repos/example/release/actions/runs/17/artifacts?per_page=100',
+      'fictional-token',
+      async () => {
+        throw Error('https://example.com/fictional-secret fictional-token')
+      }
+    ),
+    (error) => !/fictional-secret|fictional-token/.test(error.message)
+  )
+})
+
+test('ordinary transport downloads exact archive bytes without forwarding the API token', async () => {
+  const directory = fs.realpathSync(
+    mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
+  )
+  const bytes = Buffer.from('fictional archive bytes')
+  const archive = {
+    id: 41,
+    size: bytes.length,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    file: 'canonical.zip',
+  }
+  const calls = []
+  try {
+    await ordinaryDownload(
+      {
+        repository: 'example/release',
+        archive,
+        token: 'fictional-token',
+        directory,
+      },
+      async (url, options) => {
+        calls.push({ url, options })
+        return calls.length === 1
+          ? new Response(null, {
+              status: 302,
+              headers: {
+                location: 'https://example.com/archive?fictional-secret',
+              },
+            })
+          : new Response(bytes)
+      }
+    )
+    assert.deepEqual(readFileSync(join(directory, archive.file)), bytes)
+    assert.equal(calls.length, 2)
+    assert.match(calls[0].url, /\/actions\/artifacts\/41\/zip$/)
+    assert.equal(
+      calls[0].options.headers.Authorization,
+      'Bearer fictional-token'
+    )
+    assert.equal(calls[1].options.headers?.Authorization, undefined)
+    assert.equal(calls[1].options.redirect, 'error')
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('ordinary transport rejects wrong archive hashes and reused output paths', async () => {
+  const directory = fs.realpathSync(
+    mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
+  )
+  const archive = {
+    id: 41,
+    size: 3,
+    sha256: 'a'.repeat(64),
+    file: 'canonical-observation.zip',
+  }
+  let calls = 0
+  const fetcher = async () =>
+    ++calls % 2 === 1
+      ? new Response(null, {
+          status: 302,
+          headers: { location: 'https://example.com/archive?fictional-secret' },
+        })
+      : new Response('bad')
+  try {
+    await assert.rejects(
+      ordinaryDownload(
+        {
+          repository: 'example/release',
+          archive,
+          token: 'fictional-token',
+          directory,
+        },
+        fetcher
+      ),
+      /archive/
+    )
+    writeFileSync(join(directory, archive.file), 'retained')
+    await assert.rejects(
+      ordinaryDownload(
+        {
+          repository: 'example/release',
+          archive,
+          token: 'fictional-token',
+          directory,
+        },
+        fetcher
+      )
+    )
+    assert.equal(
+      readFileSync(join(directory, archive.file), 'utf8'),
+      'retained'
+    )
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('ordinary transport stops before ZIP requests when current-run binding fails', async () => {
+  const root = fs.realpathSync(
+    mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
+  )
+  const input = join(root, 'input')
+  mkdirSync(input)
+  const calls = []
+  try {
+    await assert.rejects(
+      acquireOrdinaryTransfers(
+        {
+          producer: '/fictional/producer',
+          input,
+          archives: join(root, 'archives'),
+          repository: 'example/release',
+          runId: '17',
+          attempt: '2',
+          token: 'fictional-token',
+        },
+        async (url) => {
+          calls.push(url)
+          return new Response('{"total_count":0}')
+        },
+        () => {
+          assert.equal(
+            readFileSync(join(input, 'jobs.json'), 'utf8'),
+            '{"total_count":0}'
+          )
+          assert.equal(
+            readFileSync(join(input, 'artifacts.json'), 'utf8'),
+            '{"total_count":0}'
+          )
+          throw Error('rejected current-run metadata')
+        }
+      ),
+      /current-run/
+    )
+    assert.equal(calls.length, 2)
+    assert.ok(calls.every((url) => !url.endsWith('/zip')))
+    assert.equal(fs.existsSync(join(root, 'archives')), false)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('ordinary transport rejects unsafe redirects before any blob request', async () => {
+  for (const location of [
+    'http://example.com/archive',
+    'https://user:fictional-secret@example.com/archive',
+    'https://example.com:444/archive',
+    'not-a-url',
+  ]) {
+    const root = fs.realpathSync(
+      mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
+    )
+    let calls = 0
+    try {
+      await assert.rejects(
+        ordinaryDownload(
+          {
+            repository: 'example/release',
+            token: 'fictional-token',
+            directory: root,
+            archive: {
+              id: 41,
+              file: 'canonical.zip',
+              size: 1,
+              sha256: 'a'.repeat(64),
+            },
+          },
+          async () => {
+            calls++
+            return new Response(null, { status: 302, headers: { location } })
+          }
+        ),
+        (error) => !error.message.includes('fictional-secret')
+      )
+      assert.equal(calls, 1)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  }
+})
+
+test('ordinary transport enforces observation and body bounds and aborts before fetching', async () => {
+  let oversizedCalled = false
+  await assert.rejects(
+    ordinaryDownload(
+      {
+        repository: 'example/release',
+        token: 'fictional-token',
+        directory: '/unused',
+        archive: {
+          id: 41,
+          file: 'canonical-observation.zip',
+          size: 2 * 1024 * 1024 + 1,
+          sha256: 'a'.repeat(64),
+        },
+      },
+      async () => {
+        oversizedCalled = true
+      }
+    )
+  )
+  assert.equal(oversizedCalled, false)
+  for (const body of ['short', 'longer-than-the-bound']) {
+    const root = fs.realpathSync(
+      mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
+    )
+    let calls = 0
+    try {
+      await assert.rejects(
+        ordinaryDownload(
+          {
+            repository: 'example/release',
+            token: 'fictional-token',
+            directory: root,
+            archive: {
+              id: 41,
+              file: 'canonical-observation.zip',
+              size: 8,
+              sha256: 'a'.repeat(64),
+            },
+          },
+          async () =>
+            ++calls === 1
+              ? new Response(null, {
+                  status: 302,
+                  headers: { location: 'https://example.com/archive' },
+                })
+              : new Response(body)
+        )
+      )
+      assert.equal(calls, 2)
+      assert.ok(fs.statSync(join(root, 'canonical-observation.zip')).size <= 8)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  }
+  let called = false
+  await assert.rejects(
+    ordinaryApi(
+      '/repos/example/release/actions/runs/17/artifacts?per_page=100',
+      'fictional-token',
+      async () => {
+        called = true
+      },
+      AbortSignal.abort()
+    )
+  )
+  assert.equal(called, false)
+})
+
+test('ordinary transport acquires exactly the four Rust-bound archives in fixed order', async () => {
+  const root = fs.realpathSync(
+    mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
+  )
+  const input = join(root, 'input'),
+    archives = join(root, 'archives')
+  mkdirSync(input)
+  const bytes = Buffer.from('fictional bound ZIP bytes')
+  const names = [
+    'canonical.zip',
+    'canonical-observation.zip',
+    'reproduction.zip',
+    'reproduction-observation.zip',
+  ]
+  let planned = false,
+    calls = 0
+  try {
+    await acquireOrdinaryTransfers(
+      {
+        producer: '/fictional/producer',
+        input,
+        archives,
+        repository: 'example/release',
+        runId: '17',
+        attempt: '2',
+        token: 'fictional-token',
+      },
+      async (url, options) => {
+        calls++
+        assert.equal(options.method, 'GET')
+        if (url.endsWith('per_page=100'))
+          return new Response('{"total_count":0}')
+        assert.equal(planned, true)
+        // The mock distinguishes the fixed authenticated API from blob reads.
+        const apiOrigin = 'https://api.github.com/' // allow-domain: api.github.com
+        if (url.startsWith(apiOrigin))
+          return new Response(null, {
+            status: 302,
+            headers: { location: 'https://example.com/archive' },
+          })
+        assert.equal(options.headers?.Authorization, undefined)
+        return new Response(bytes)
+      },
+      (producer, metadataRoot) => {
+        assert.equal(producer, '/fictional/producer')
+        assert.equal(metadataRoot, input)
+        assert.equal(fs.existsSync(join(input, 'artifacts.json')), true)
+        planned = true
+        return {
+          version: 1,
+          archives: names.map((file, index) => ({
+            file,
+            id: index + 41,
+            size: bytes.length,
+            sha256: createHash('sha256').update(bytes).digest('hex'),
+          })),
+        }
+      }
+    )
+    assert.equal(calls, 10)
+    assert.deepEqual(fs.readdirSync(archives).sort(), [...names].sort())
+    for (const name of names)
+      assert.deepEqual(readFileSync(join(archives, name)), bytes)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('checked JS inventory metadata is confined to its exact build script', () => {
+  const source = 'option_env!("TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY")'
+  assert.doesNotThrow(() =>
+    checkSource('crates/trusted-server-js/build.rs', source)
+  )
+  for (const file of [
+    'crates/example/build.rs',
+    'crates/trusted-server-js/src/lib.rs',
+    'crates/trusted-server-js-other/build.rs',
+    'other/crates/trusted-server-js/build.rs',
+  ])
+    assert.throws(() => checkSource(file, source), /compile-time/)
+})
 test('rejects every planted operator value, including inside binary data', () => {
   for (const marker of sentinels) {
     assert.throws(
@@ -137,6 +567,173 @@ const assets = [
   'ts-x86_64-unknown-linux-gnu',
 ]
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex')
+
+test('isolated signing accepts only bound 3/2 input sets and retains exact provenance subjects', () => {
+  const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const match = workflow.match(
+    /          \/\/ BEGIN SIGNING INPUTS\n([\s\S]*?)          \/\/ END SIGNING INPUTS/
+  )
+  assert.ok(match, 'should exercise the actual inline signer validation')
+  const script = match[1]
+    .split('\n')
+    .map((line) => line.slice(10))
+    .join('\n')
+  const canonical = (value) =>
+    Array.isArray(value)
+      ? value.map(canonical)
+      : value && typeof value === 'object'
+        ? Object.fromEntries(
+            Object.keys(value)
+              .sort()
+              .map((key) => [key, canonical(value[key])])
+          )
+        : value
+  for (const asset of assets)
+    for (const mode of asset === 'trusted-server-fastly.wasm'
+      ? [
+          'success',
+          'missing',
+          'extra',
+          'source',
+          'run',
+          'attempt',
+          'failed',
+          'profile',
+          'qualified',
+          'binary',
+          'spdx',
+          'duplicate-key',
+        ]
+      : ['success', 'extra']) {
+      const root = mkdtempSync(join(tmpdir(), 'ordinary-sign-'))
+      try {
+        mkdirSync(join(root, 'release-assets'))
+        const binary = Buffer.from(`fixture ${asset}`),
+          spdx = Buffer.from('{}')
+        writeFileSync(join(root, 'release-assets', asset), binary)
+        writeFileSync(join(root, 'release-assets', `${asset}.spdx.json`), spdx)
+        if (asset === 'trusted-server-fastly.wasm') {
+          mkdirSync(join(root, 'comparison'))
+          const receipt = {
+            version: 1,
+            profile: 'ordinary-release-fastly-byte-equality-v1',
+            release_qualification: false,
+            source_commit: 'a'.repeat(40),
+            asset,
+            target: 'wasm32-wasip1',
+            variant: 'default',
+            outcome: 'matched',
+            canonical_sha256: hash(binary),
+            reproduction_sha256: hash(binary),
+            canonical: {
+              run_id: 17,
+              run_attempt: 2,
+              job_id: 101,
+              size: binary.length,
+              sha256: hash(binary),
+              spdx_sha256: hash(spdx),
+            },
+            reproduction: {
+              run_id: 17,
+              run_attempt: 2,
+              job_id: 102,
+              size: binary.length,
+              sha256: hash(binary),
+            },
+          }
+          if (mode === 'source') receipt.source_commit = 'b'.repeat(40)
+          if (mode === 'run') receipt.canonical.run_id = 18
+          if (mode === 'attempt') receipt.reproduction.run_attempt = 1
+          if (mode === 'failed') receipt.outcome = 'mismatched'
+          if (mode === 'profile') receipt.profile = 'controlled-recipe'
+          if (mode === 'qualified') receipt.release_qualification = true
+          if (mode === 'binary') receipt.canonical_sha256 = '0'.repeat(64)
+          if (mode === 'spdx') receipt.canonical.spdx_sha256 = '0'.repeat(64)
+          let text = JSON.stringify(canonical(receipt)) + '\n'
+          if (mode === 'duplicate-key') {
+            assert.ok(text.startsWith('{'))
+            text = '{"version":0,' + text.slice(1)
+          }
+          if (mode !== 'missing')
+            writeFileSync(
+              join(root, 'comparison', `${asset}.rebuild-check.json`),
+              text
+            )
+          if (mode === 'extra')
+            writeFileSync(join(root, 'comparison', 'unexpected'), 'extra')
+        } else if (mode === 'extra')
+          writeFileSync(join(root, 'release-assets', 'unexpected'), 'extra')
+        const local = (path) => join(root, path)
+        const context = {
+          Buffer,
+          process: {
+            env: {
+              ASSET: asset,
+              SOURCE_COMMIT: 'a'.repeat(40),
+              GITHUB_RUN_ID: '17',
+              GITHUB_RUN_ATTEMPT: '2',
+              GITHUB_OUTPUT: 'outputs',
+            },
+          },
+          require(name) {
+            if (name === 'node:crypto') return { createHash }
+            if (name === 'node:fs')
+              return {
+                readdirSync: (path) => fs.readdirSync(local(path)),
+                lstatSync: (path) => fs.lstatSync(local(path)),
+                readFileSync: (path) => fs.readFileSync(local(path)),
+                writeFileSync: (path, ...args) =>
+                  fs.writeFileSync(local(path), ...args),
+                appendFileSync: (path, ...args) =>
+                  fs.appendFileSync(local(path), ...args),
+              }
+            throw Error(`Unexpected signing module: ${name}`)
+          },
+        }
+        const execute = () => vm.runInNewContext(script, context)
+        if (mode !== 'success') {
+          assert.throws(execute, undefined, `${asset}: ${mode}`)
+          assert.equal(
+            fs.existsSync(join(root, 'inputs.sha256')),
+            false,
+            'should not seal failed inputs'
+          )
+          continue
+        }
+        execute()
+        const files = [
+          asset,
+          `${asset}.spdx.json`,
+          ...(asset === 'trusted-server-fastly.wasm'
+            ? [`${asset}.rebuild-check.json`]
+            : []),
+        ]
+        assert.equal(
+          readFileSync(join(root, 'inputs.sha256'), 'utf8'),
+          files
+            .map(
+              (file) =>
+                `${hash(readFileSync(join(root, 'release-assets', file)))}  ${file}\n`
+            )
+            .join('')
+        )
+        const output = readFileSync(join(root, 'outputs'), 'utf8')
+        for (const file of files)
+          assert.ok(
+            output.includes(`release-assets/${file}\n`),
+            'should attest every sealed input'
+          )
+        assert.equal(
+          readFileSync(join(root, 'inputs.sha256'), 'utf8').trim().split('\n')
+            .length,
+          files.length
+        )
+      } finally {
+        rmSync(root, { recursive: true, force: true })
+      }
+    }
+})
+
 function publicationScript() {
   const workflow = readFileSync('.github/workflows/release.yml', 'utf8')
   const match = workflow.match(
@@ -151,6 +748,19 @@ function publicationScript() {
     .map((line) => line.slice(10))
     .join('\n')
 }
+
+test('release verification commands parse in Bash (CI only)', () => {
+  const guide = readFileSync(
+    'docs/guide/release-verification.md',
+    'utf8'
+  ).match(/<!-- release-verification:start -->\s*```bash\n([\s\S]*?)\n```/)
+  assert.ok(
+    guide,
+    'should syntax-check the commands matched by the publisher test'
+  )
+  execFileSync('bash', ['-n'], { input: guide[1] })
+})
+
 test('publication binds exact signing handoffs and refuses drafts, corruption and partial uploads', async () => {
   const script = publicationScript()
   for (const mode of [
@@ -172,6 +782,10 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'extra',
     'changed',
     'empty-bundle',
+    'missing-companion',
+    'changed-companion',
+    'extra-companion',
+    'unsigned-companion',
     'upload-error',
     'mutable',
     'wrong-id',
@@ -226,6 +840,19 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             bytes
           )
           entries.push(`${hash(bytes)}  ${asset}${suffix}\n`)
+        }
+        if (asset === 'trusted-server-fastly.wasm') {
+          const companion = `${asset}.rebuild-check.json`,
+            bytes = Buffer.from('fixture signed ordinary rebuild check')
+          writeFileSync(join(signed, companion), bytes)
+          if (mode !== 'unsigned-companion')
+            entries.splice(2, 0, `${hash(bytes)}  ${companion}\n`)
+          if (mode === 'changed-companion')
+            writeFileSync(join(signed, companion), 'changed')
+          if (mode === 'missing-companion')
+            fs.unlinkSync(join(signed, companion))
+          if (mode === 'extra-companion')
+            writeFileSync(join(signed, 'unexpected'), 'extra')
         }
         writeFileSync(join(signed, 'SHA256SUMS'), entries.join(''))
       }
@@ -373,9 +1000,6 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             normalize(guide[1]),
             'release commands should match the guide'
           )
-          execFileSync('bash', ['-n'], {
-            input: body.match(/```bash\n([\s\S]*?)\n```/)[1],
-          })
           return response(release(true), 201)
         }
         if (u.pathname.endsWith('/assets') && method === 'POST') {
@@ -410,9 +1034,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         URL,
         console: {
           log: (...args) => {
-            if (
-              args[0] === 'Ignored release attestation for other tag:'
-            )
+            if (args[0] === 'Ignored release attestation for other tag:')
               ignored.push(args[1])
           },
           warn: () => {},
@@ -542,6 +1164,10 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           'extra',
           'changed',
           'empty-bundle',
+          'missing-companion',
+          'changed-companion',
+          'extra-companion',
+          'unsigned-companion',
         ].includes(mode)
       )
         assert.ok(!calls.some(([method]) => method === 'POST'), mode)
@@ -550,12 +1176,12 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
       if (['upload-error'].includes(mode))
         assert.ok(!calls.some(([method]) => method === 'PATCH'), mode)
       if (successful) {
-        assert.equal(uploaded.length, 29)
+        assert.equal(uploaded.length, 30)
         assert.equal(
           calls.filter(
             ([method, args]) => method === 'gh' && args[1][1] !== 'download'
           ).length,
-          30
+          31
         )
         assert.ok(
           !calls.some(
@@ -613,7 +1239,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           calls.filter(
             ([method, path]) => method === 'POST' && path.endsWith('/assets')
           ).length,
-          29,
+          30,
           mode
         )
         assert.equal(
@@ -881,12 +1507,36 @@ test('workflows select exactly the descriptive cohort and restrict actual build 
   const names = cohort.artifacts.map((a) => a.name).sort()
   const build = readFileSync('.github/workflows/release-build.yml', 'utf8')
   const release = readFileSync('.github/workflows/release.yml', 'utf8')
+  const canonical = build
+    .split('\n  fastly-canonical:')[1]
+    ?.split(/\n  [a-z][\w-]*:\n/)[0]
+  const fastly = canonical?.match(/^          RELEASE_ASSET: (\S+)/m)?.[1]
   assert.deepEqual(
-    [...build.matchAll(/^            asset: (\S+)/gm)].map((m) => m[1]).sort(),
+    [...build.matchAll(/^            asset: (\S+)/gm)]
+      .map((m) => m[1])
+      .concat(fastly ? [fastly] : [])
+      .sort(),
     names
   )
   const sign = build.split('\n  sign:')[1]
-  for (const name of names) assert.equal(sign.split(name).length - 1, 1)
+  const matrix = sign
+    .split('\n    steps:')[0]
+    .match(/\n        asset:\s*\[([\s\S]*?)\]/)[1]
+  assert.deepEqual(
+    matrix
+      .split(',')
+      .map((name) => name.trim())
+      .filter(Boolean)
+      .sort(),
+    names,
+    'should sign precisely the cohort'
+  )
+  const allowed = sign.match(/const names = (\[[^;]+\]);/)[1]
+  assert.deepEqual(
+    Array.from(vm.runInNewContext(allowed)).sort(),
+    names,
+    'should validate the same exact input cohort'
+  )
   const published = publicationScript().match(/const names = (\[[^;]+\]);/)[1]
   assert.deepEqual(Array.from(vm.runInNewContext(published)).sort(), names)
   for (const prefix of ['release-', 'signed-'])
@@ -915,6 +1565,241 @@ test('workflows select exactly the descriptive cohort and restrict actual build 
     'should gate signing on a v* tag push and enablement'
   )
 })
+
+test('ordinary Fastly gate binds dedicated A and B uploads before isolated signing', () => {
+  const build = readFileSync('scripts/release/phase1-build.sh', 'utf8')
+  assert.match(build, /ordinary-rustflags/)
+  assert.match(build, /cargo --config "\$ordinary_rustflags" build/)
+  assert.ok(
+    build.indexOf('ordinary-rustflags') < build.indexOf('npm --prefix'),
+    'should seal arguments before dependency preparation and compilation'
+  )
+  assert.match(build, /rustflags: env\.ORDINARY_RUSTFLAGS/)
+  const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const caller = readFileSync('.github/workflows/release.yml', 'utf8')
+  const job = (name) =>
+    workflow.split(`\n  ${name}:`)[1]?.split(/\n  [a-z][\w-]*:\n/)[0]
+  const canonical = job('fastly-canonical'),
+    reproduction = job('fastly-reproduction'),
+    comparison = job('fastly-comparison')
+  assert.ok(
+    canonical && reproduction && comparison,
+    'should run two dedicated builds and a comparison'
+  )
+  assert.match(canonical, /name: Build trusted-server-fastly\.wasm/)
+  assert.match(reproduction, /name: Reproduce trusted-server-fastly\.wasm/)
+  assert.match(reproduction, /needs:.*fastly-canonical/)
+  for (const [role, body] of [
+    ['canonical', canonical],
+    ['reproduction', reproduction],
+  ]) {
+    assert.doesNotMatch(body, /id-token|attestations:|contents: write/)
+    assert.match(body, new RegExp(`path: ordinary-${role}-source`))
+    assert.match(body, new RegExp(`Upload ${role} release artifact`))
+    assert.match(body, new RegExp(`Upload ${role} observation`))
+    for (const output of [
+      'artifact-id',
+      'artifact-digest',
+      'observation-id',
+      'observation-digest',
+    ])
+      assert.match(body, new RegExp(`      ${output}:`))
+  }
+  assert.match(comparison, /needs: \[fastly-canonical, fastly-reproduction\]/)
+  assert.match(comparison, /actions: read/)
+  assert.match(
+    comparison,
+    /ref: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}/
+  )
+  assert.match(
+    comparison,
+    /test "\$\(git rev-parse HEAD\)" = "\$SOURCE_COMMIT"/
+  )
+  assert.doesNotMatch(comparison, /id-token|attestations:|contents: write/)
+  assert.match(comparison, /ordinary-fetch/)
+  assert.match(comparison, /ordinary-compare/)
+  assert.match(comparison, /id: comparison/)
+  assert.match(
+    comparison,
+    /if:.*success\(\).*steps\.comparison\.outcome == 'success'/
+  )
+  assert.match(comparison, /if ! env -i/)
+  assert.doesNotMatch(
+    comparison,
+    /(?:test -[ef]|existsSync).*rebuild-check\.json/
+  )
+  for (const role of ['canonical', 'reproduction'])
+    for (const output of [
+      'artifact-id',
+      'artifact-digest',
+      'observation-id',
+      'observation-digest',
+    ])
+      assert.ok(
+        comparison.includes(`needs.fastly-${role}.outputs.${output}`),
+        'should carry every direct upload output'
+      )
+  assert.match(job('sign'), /needs: \[build, fastly-comparison\]/)
+  assert.match(caller.split('\n  release:')[0], /actions: read/)
+})
+
+test('canonical Fastly route verifies the pinned tool offline without credentials or deployment', () => {
+  const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const canonical = workflow
+    .split('\n  fastly-canonical:')[1]
+    .split('\n  fastly-reproduction:')[0]
+  const route = canonical
+    .split('- name: Verify the pinned manual Fastly route offline')[1]
+    ?.split('      - name: Upload canonical release artifact')[0]
+  assert.ok(route, 'should check the actual canonical binary before upload')
+  assert.match(route, /\.tool-versions/)
+  assert.match(route, /test "\$fastly_version" = 16\.0\.0/)
+  assert.match(
+    route,
+    /b1b89112f1f1291ff275393779ffdacba8724ac64091bda0fa6000ae06308459/
+  )
+  assert.match(route, /sha256sum --check/)
+  assert.ok(
+    route.indexOf('sha256sum --check') < route.indexOf('unshare --net'),
+    'should authenticate the downloaded CLI before any execution'
+  )
+  assert.match(route, /unshare --net -- setpriv/)
+  assert.match(route, /--bounding-set=-all --no-new-privs/)
+  assert.match(route, /env -i/)
+  assert.match(route, /guest_network=\$\(readlink \/proc\/self\/ns\/net\)/)
+  assert.match(route, /active_interfaces=\$\(ip -o link show up\)/)
+  assert.doesNotMatch(route, /test[^\n]*\$\((?:ip|readlink) /)
+  assert.match(route, /XDG_CONFIG_HOME="\$route\/config"/)
+  assert.doesNotMatch(
+    route,
+    /(?:^|\s)HOME=|--token|FASTLY_API_TOKEN|fastly compute deploy|contents: write|id-token/m
+  )
+  for (const command of [
+    'fastly compute pack --wasm-binary ./trusted-server-fastly.wasm',
+    'fastly compute validate --package ./pkg/example-app.tar.gz',
+    'tar -tzf ./pkg/example-app.tar.gz',
+    'cmp trusted-server-fastly.wasm packaged.wasm',
+    'cmp fastly.toml packaged.toml',
+    'inspect-fastly-package',
+  ])
+    assert.ok(route.includes(command), `should execute ${command}`)
+  assert.match(route, /set -euxo pipefail/)
+  assert.match(route, /SUCCESS: pinned Fastly route/)
+  assert.doesNotMatch(
+    canonical.split('    steps:')[0],
+    /write|id-token|attestations:/
+  )
+})
+
+test('Fastly route diagnostics preserve literal directory headers and reject malformed size fields', () => {
+  const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const match = workflow.match(
+    /          timeout 15 "\$6" --input-type=commonjs <<'HEADERS'\n([\s\S]*?)          HEADERS/
+  )
+  assert.ok(match, 'should inspect the actual bounded diagnostic program')
+  const script = match[1]
+    .split('\n')
+    .map((line) => line.slice(10))
+    .join('\n')
+  const bytes = Buffer.alloc(3 * 512)
+  for (const [index, path] of ['example-app', 'example-app/bin'].entries()) {
+    const header = bytes.subarray(index * 512, (index + 1) * 512)
+    header.write(path)
+    header.write('00000000000\0', 124)
+    header[156] = 53
+  }
+  const records = []
+  let compressed = gzipSync(bytes)
+  const context = {
+    console: {
+      log: (label, data) => {
+        assert.equal(label, 'Fastly raw TAR header:')
+        records.push(JSON.parse(data))
+      },
+    },
+    require(name) {
+      if (name === 'node:fs')
+        return {
+          lstatSync: () => ({ isFile: () => true, size: compressed.length }),
+          readFileSync: () => compressed,
+        }
+      if (name === 'node:zlib') return { gunzipSync }
+      throw Error(`Unexpected diagnostic module: ${name}`)
+    },
+  }
+  vm.runInNewContext(script, { ...context })
+  assert.deepEqual(
+    records,
+    ['example-app', 'example-app/bin'].map((path) => ({
+      path,
+      type: '5',
+      size: 0,
+      prefix: '',
+      link: '',
+      nonzero_padding: false,
+    }))
+  )
+  bytes[64] = 1
+  compressed = gzipSync(bytes)
+  vm.runInNewContext(script, { ...context })
+  assert.equal(
+    records.at(-2).nonzero_padding,
+    true,
+    'should expose hidden nonzero name padding'
+  )
+  bytes[64] = 0
+  bytes.write('invalid-size', 124)
+  compressed = gzipSync(bytes)
+  assert.throws(
+    () => vm.runInNewContext(script, { ...context }),
+    /Unsupported diagnostic size encoding/
+  )
+  assert.ok(
+    workflow.indexOf('Fastly raw TAR header:') <
+      workflow.indexOf('timeout 30 "$2" inspect-fastly-package'),
+    'should log literal headers before the unchanged strict inspector'
+  )
+})
+
+test('negative comparator proof keeps canaries read-only and audits both skipped stages', () => {
+  const workflow = readFileSync('.github/workflows/test.yml', 'utf8')
+  const job = (name) =>
+    workflow.split(`\n  ${name}:`)[1]?.split(/\n  [a-z][\w-]*:\n/)[0]
+  const native = job('test-axum')
+  assert.match(native, /id: producer-tests/)
+  assert.match(native, /comparison-succeeded=false/)
+  assert.match(
+    native,
+    /ordinary_comparison_failure_prevents_signing_and_publication_sentinels -- --exact/
+  )
+  assert.match(native, /1 passed; 0 failed; 0 ignored;/)
+  const fixture = readFileSync(
+    'crates/trusted-server-release/tests/commands.rs',
+    'utf8'
+  )
+  assert.match(
+    fixture,
+    /fn ordinary_comparison_failure_prevents_signing_and_publication_sentinels\(/
+  )
+  assert.match(
+    fixture,
+    /stderr\(&result\)\.contains\("ordinary final-byte mismatch"\)/
+  )
+  for (const name of ['ordinary-negative-sign', 'ordinary-negative-publish']) {
+    const canary = job(name)
+    assert.match(canary, /needs: test-axum/)
+    assert.match(canary, /if:.*outputs\.comparison-succeeded == 'true'/)
+    assert.match(canary, /contents: read/)
+    assert.match(canary, /exit 1/)
+    assert.doesNotMatch(canary, /uses:|write|gh |cargo |npm |secrets/)
+  }
+  const audit = job('ordinary-negative-audit')
+  assert.match(audit, /if: always\(\)/)
+  assert.match(audit, /test "\$NATIVE_RESULT" = success/)
+  assert.match(audit, /test "\$SIGN_RESULT" = skipped/)
+  assert.match(audit, /test "\$PUBLISH_RESULT" = skipped/)
+})
+
 test('release preflight rejects inherited controls in an isolated script fixture', () => {
   const root = mkdtempSync(join(tmpdir(), 'phase1-preflight-'))
   const script = join(root, 'scripts/release/phase1-build.sh')
@@ -1061,4 +1946,69 @@ test('post-publish reads cannot succeed after the shared deadline', async () => 
       }),
     /window exhausted/
   )
+})
+
+test('unavailable ordinary diagnostic has fixed bounded canonical facts and cannot overwrite evidence', async () => {
+  const helper = await import('./phase1.mjs')
+  assert.equal(typeof helper.unavailableOrdinaryDiagnostic, 'function')
+  const root = mkdtempSync(join(tmpdir(), 'ordinary-diagnostic-'))
+  try {
+    const directory = join(root, 'ordinary-diagnostics')
+    helper.unavailableOrdinaryDiagnostic(directory)
+    const file = join(directory, 'ordinary-comparison-diagnostic.json')
+    const bytes = readFileSync(file)
+    const value = JSON.parse(bytes)
+    assert.ok(bytes.length <= 4096)
+    assert.equal(value.outcome, 'unavailable')
+    assert.equal(value.stage, 'transfer')
+    assert.equal(value.code, 'transfer_unavailable')
+    assert.ok(
+      Object.values(value.facts).every((fact) => fact === 'unavailable')
+    )
+    assert.equal(value.profile, undefined)
+    assert.equal(bytes.toString(), JSON.stringify(value) + '\n')
+    assert.deepEqual(Object.keys(value), Object.keys(value).sort())
+    assert.deepEqual(Object.keys(value.facts), Object.keys(value.facts).sort())
+    assert.throws(() => helper.unavailableOrdinaryDiagnostic(directory))
+    assert.deepEqual(readFileSync(file), bytes)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('ordinary diagnostic remains a failure-only CI artifact outside signing and publication', () => {
+  const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const comparison = workflow
+    .split('\n  fastly-comparison:')[1]
+    .split('\n  sign:')[0]
+  const sign = workflow.split('\n  sign:')[1]
+  const release = readFileSync('.github/workflows/release.yml', 'utf8')
+  assert.match(
+    comparison,
+    /Retain bounded nonpublishable comparison diagnostics\n\s+if: failure\(\)/
+  )
+  assert.match(
+    comparison,
+    /ordinary-diagnostics\/ordinary-comparison-diagnostic\.json/
+  )
+  assert.match(
+    comparison,
+    /ordinary-diagnostic "\$RUNNER_TEMP\/ordinary-diagnostics"/
+  )
+  assert.match(comparison, /outcome=failed: ordinary diagnostic writer failed/)
+  assert.match(comparison, /head -c 16384/)
+  assert.doesNotMatch(
+    sign,
+    /ordinary-diagnostics|ordinary-comparison-diagnostic/
+  )
+  assert.doesNotMatch(
+    release,
+    /ordinary-diagnostics|ordinary-comparison-diagnostic/
+  )
+  const fixture = readFileSync(
+    'crates/trusted-server-release/tests/commands.rs',
+    'utf8'
+  )
+  assert.match(fixture, /diagnostic\["outcome"\],\s*"mismatched"/)
+  assert.match(fixture, /diagnostic\["stage"\],\s*"bytes"/)
 })

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 1 ordinary hosted build; no reproducibility or complete composition claim.
+# Ordinary hosted release build; controlled-recipe qualification remains closed.
 set -euo pipefail
 build_package=${1:?package required}
 build_target=${2:?target required}
@@ -20,6 +20,27 @@ for variable in TSJS_SKIP_BUILD TSJS_PREBUILT_DIR TSJS_TEST; do
     exit 1
   fi
 done
+ordinary_role=${4:-}
+if [[ "$build_target" == wasm32-wasip1 ]]; then
+  case "$ordinary_role" in
+    canonical) ordinary_jobs=4; umask 022 ;;
+    reproduction) ordinary_jobs=2; umask 027 ;;
+    *) echo 'Fastly requires its fixed ordinary build role' >&2; exit 1 ;;
+  esac
+  : "${ORDINARY_RELEASE_PRODUCER:?}"
+  [[ -x "$ORDINARY_RELEASE_PRODUCER" ]]
+  [[ "$(pwd -P)" == "$PWD" ]]
+  export LC_ALL=C TZ=UTC CARGO_BUILD_JOBS="$ordinary_jobs"
+  ordinary_started_at=$(date +%s)
+  ordinary_umask=$(umask)
+  ordinary_rustc=$(rustup which rustc)
+  ordinary_node=$(node -p 'require("node:fs").realpathSync(process.execPath)')
+  ordinary_messages="$RUNNER_TEMP/ordinary-cargo.jsonl"
+  [[ ! -e "$ordinary_messages" ]]
+elif [[ -n "$ordinary_role" ]]; then
+  echo 'Ordinary equality roles are Fastly-only' >&2
+  exit 1
+fi
 node scripts/release/phase1.mjs audit
 # No operator values enter through inherited environment; these fictional canaries
 # additionally catch known config embedding regressions in the final executable.
@@ -41,7 +62,16 @@ policy = "phase1-permission-policy-canary"
 CONFIG
 trap 'rm -f trusted-server.toml; if [[ -n "${build_container:-}" ]]; then docker rm -f "$build_container" >/dev/null 2>&1 || true; fi' EXIT
 export CARGO_TARGET_DIR="$RUNNER_TEMP/phase1-target"
+if [[ "$build_target" == wasm32-wasip1 ]]; then
+  export CARGO_TARGET_DIR="$RUNNER_TEMP/ordinary-fastly-$ordinary_role-target"
+fi
 [[ ! -e "$CARGO_TARGET_DIR" ]]
+if [[ "$build_target" == wasm32-wasip1 ]]; then
+  mkdir "$CARGO_TARGET_DIR"
+  ordinary_rustflags=$("$ORDINARY_RELEASE_PRODUCER" ordinary-rustflags \
+    --checkout "$PWD" --target "$CARGO_TARGET_DIR" --role "$ordinary_role" \
+    --output "$RUNNER_TEMP/ordinary-rustflags")
+fi
 mkdir -p release-assets
 [[ -z "$(ls -A release-assets)" ]]
 # The pinned Node distribution includes npm. npm verifies lockfile integrity for
@@ -84,7 +114,12 @@ else
     export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS='-C target-feature=+crt-static'
     musl-gcc -dumpfullversion
   fi
-  cargo build --package "$build_package" --release --target "$build_target" --locked
+  if [[ "$build_target" == wasm32-wasip1 ]]; then
+    cargo --config "$ordinary_rustflags" build --package "$build_package" --release --target "$build_target" --locked \
+      --message-format=json-render-diagnostics | tee "$ordinary_messages"
+  else
+    cargo build --package "$build_package" --release --target "$build_target" --locked
+  fi
 fi
 cp "$CARGO_TARGET_DIR/$build_target/release/$executable" "release-assets/$release_asset"
 shasum -a 256 "release-assets/$release_asset" > "$RUNNER_TEMP/binary.sha256"
@@ -141,3 +176,36 @@ node scripts/release/phase1.mjs validate-spdx \
   "$tool_root/combined.cdx.json"
 shasum -a 256 --check "$RUNNER_TEMP/binary.sha256"
 git diff --exit-code -- Cargo.lock crates/trusted-server-js/lib/package-lock.json edgezero.toml
+if [[ "$build_target" == wasm32-wasip1 ]]; then
+  ORDINARY_ROLE="$ordinary_role" ORDINARY_STARTED_AT="$ordinary_started_at" \
+    ORDINARY_UMASK="$ordinary_umask" ORDINARY_RUSTC="$ordinary_rustc" \
+    ORDINARY_NODE="$ordinary_node" ORDINARY_MESSAGES="$ordinary_messages" \
+    ORDINARY_METADATA="$tool_root/cargo-metadata.json" \
+    ORDINARY_RUSTFLAGS="$RUNNER_TEMP/ordinary-rustflags/rustflags.json" \
+    node - "$RUNNER_TEMP/ordinary-capture.json" <<'JAVASCRIPT'
+const fs = require('node:fs')
+const env = process.env
+const capture = {
+  role: env.ORDINARY_ROLE,
+  source_commit: env.SOURCE_COMMIT,
+  environment: {
+    checkout_root: fs.realpathSync(process.cwd()),
+    target_root: fs.realpathSync(env.CARGO_TARGET_DIR),
+    started_at_seconds: Number(env.ORDINARY_STARTED_AT),
+    umask: parseInt(env.ORDINARY_UMASK, 8),
+    jobs: Number(env.CARGO_BUILD_JOBS),
+    locale: env.LC_ALL, timezone: env.TZ, uid: process.getuid(),
+  },
+  rustc: env.ORDINARY_RUSTC, node: env.ORDINARY_NODE,
+  cargo_messages: env.ORDINARY_MESSAGES, cargo_metadata: env.ORDINARY_METADATA,
+  rustflags: env.ORDINARY_RUSTFLAGS,
+}
+if (capture.environment.target_root !== env.CARGO_TARGET_DIR)
+  throw Error('Compiler-visible ordinary target root must be canonical')
+fs.writeFileSync(process.argv[2], JSON.stringify(capture) + '\n', { flag: 'wx', mode: 0o600 })
+JAVASCRIPT
+  "$ORDINARY_RELEASE_PRODUCER" ordinary-measure \
+    --request "$RUNNER_TEMP/ordinary-capture.json" \
+    --output "$RUNNER_TEMP/fastly-observation"
+  shasum -a 256 --check "$RUNNER_TEMP/binary.sha256"
+fi

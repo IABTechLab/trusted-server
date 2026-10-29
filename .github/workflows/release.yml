@@ -18,6 +18,7 @@ on:
       - 'crates/trusted-server-core/build.rs'
       - 'crates/trusted-server-core/Cargo.toml'
       - 'crates/trusted-server-cli/**'
+      - 'crates/trusted-server-release/**'
       - 'crates/trusted-server-js/**'
       - 'crates/trusted-server-adapter-fastly/**'
       - 'crates/trusted-server-adapter-axum/**'
@@ -32,6 +33,7 @@ jobs:
     uses: ./.github/workflows/release-build.yml
     permissions:
       contents: read
+      actions: read
       id-token: write
       attestations: write
   release:
@@ -128,8 +130,9 @@ jobs:
           for (const name of names) {
             const build = `build/${name}`, signed = `signed/${name}`;
             const inputs = [name, `${name}.spdx.json`], bundles = [`${name}.provenance.sigstore.json`, `${name}.sbom.sigstore.json`];
-            exact(build, inputs); exact(signed, [...bundles, 'SHA256SUMS']);
-            const receipt = [...inputs.map(file => [build, file]), ...bundles.map(file => [signed, file])].map(([dir, file]) => {
+            const companions = name === 'trusted-server-fastly.wasm' ? [`${name}.rebuild-check.json`] : [];
+            exact(build, inputs); exact(signed, [...companions, ...bundles, 'SHA256SUMS']);
+            const receipt = [...inputs.map(file => [build, file]), ...companions.map(file => [signed, file]), ...bundles.map(file => [signed, file])].map(([dir, file]) => {
               const bytes = regular(`${dir}/${file}`);
               fs.writeFileSync(`release-assets/${file}`, bytes); files.push(file);
               return `${hash(bytes)}  ${file}\n`;
@@ -166,7 +169,15 @@ jobs:
             '    gh attestation verify "$asset" "${checks[@]}" --signer-workflow "$REPO/.github/workflows/release-build.yml" --format json > "$asset.$kind.verified.json"',
             `    if [[ "$kind" == sbom ]]; then jq -e --slurpfile sbom "$asset.spdx.json" '[.[].verificationResult.statement.predicate] | length == 1 and .[0] == $sbom[0]' "$asset.$kind.verified.json"; fi`,
             '    gh attestation verify "$asset" "${checks[@]}" --cert-identity "https://github.com/$REPO/.github/workflows/release-build.yml@refs/tags/$TAG"',
-            '  done', 'done', 'gh release verify-asset "$TAG" SHA256SUMS --repo "$REPO"', 'shasum -a 256 --check SHA256SUMS', '```',
+            '  done', 'done',
+            'CHECK=trusted-server-fastly.wasm.rebuild-check.json',
+            'gh release verify-asset "$TAG" "$CHECK" --repo "$REPO"',
+            'checks=(--repo "$REPO" --bundle trusted-server-fastly.wasm.provenance.sigstore.json --source-ref "refs/tags/$TAG" --source-digest "$COMMIT" --signer-digest "$COMMIT" --deny-self-hosted-runners --predicate-type https://slsa.dev/provenance/v1)',
+            'gh attestation verify "$CHECK" "${checks[@]}" --signer-workflow "$REPO/.github/workflows/release-build.yml"',
+            'gh attestation verify "$CHECK" "${checks[@]}" --cert-identity "https://github.com/$REPO/.github/workflows/release-build.yml@refs/tags/$TAG"',
+            `binary_sha=$(shasum -a 256 trusted-server-fastly.wasm | awk '{print $1}')`,
+            `jq -e --arg source "$COMMIT" --arg digest "$binary_sha" '.version == 1 and .profile == "ordinary-release-fastly-byte-equality-v1" and .release_qualification == false and .outcome == "matched" and .source_commit == $source and .asset == "trusted-server-fastly.wasm" and .canonical_sha256 == $digest and .reproduction_sha256 == $digest' "$CHECK"`,
+            'gh release verify-asset "$TAG" SHA256SUMS --repo "$REPO"', 'shasum -a 256 --check SHA256SUMS', '```',
           ].join('\n');
           const created = await api('releases', 'POST', {tag_name:tag, target_commitish:source, name:tag, draft:true, prerelease, make_latest, body});
           if (!Number.isSafeInteger(created.id) || created.id <= 0 || created.tag_name !== tag || created.draft !== true || created.prerelease !== prerelease) throw Error('Invalid created release identity');

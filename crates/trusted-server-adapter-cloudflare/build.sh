@@ -25,6 +25,9 @@ cd "$SCRIPT_DIR"
 # — a flag the CLI matching the pinned wasm-bindgen (0.2.123, via worker 0.8.4)
 # does not understand. Tracking the locked worker version keeps the toolchain in
 # lockstep, and the pin advances automatically when the lockfile bumps.
+# `--locked` installs with worker-build's own published Cargo.lock: a fresh
+# resolution fails once its dependencies yank every compatible release (for
+# example every `zip` 2.x needed by its `binary-install` dependency).
 WORKER_VERSION="$(
   grep -A1 '^name = "worker"$' "$SCRIPT_DIR/../../Cargo.lock" |
     sed -nE 's/^version = "(.*)"/\1/p' | head -1
@@ -33,7 +36,4 @@ if [ -z "$WORKER_VERSION" ]; then
   echo "error: could not determine the worker crate version from Cargo.lock" >&2
   exit 1
 fi
-# --locked builds from worker-build's published Cargo.lock. Without it, cargo
-# re-resolves dependencies, and a yanked transitive release (zip 2.x) fails the
-# install.
-cargo install -q --force --locked --version "=$WORKER_VERSION" worker-build && worker-build --release
+cargo install -q --locked --force --version "=$WORKER_VERSION" worker-build && worker-build --release
