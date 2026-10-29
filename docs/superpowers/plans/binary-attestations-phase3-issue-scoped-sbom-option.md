@@ -1,20 +1,22 @@
 # Gate 2 option: build-derived Cargo/npm SBOMs for all seven binaries
 
-**Status:** Proposed scope amendment for the user and maintainers, requested on 2026-10-28. Docs only; not approved or implemented. The approved strict Gate 2 remains the governing contract until this amendment is accepted. The target-specific rollout recommendation has not been accepted. Gate 3 Steps 2–5 remain held. Draft #1463 stays draft, without reviewers.
+**Status:** Endorsed by the user in principle; awaiting maintainer decision; not adopted; no implementation. The proposed all-seven `issue-cargo-npm-build-v1` target would replace strict Gate 2 only after maintainer agreement. Strict closure remains a tracked future enhancement; this endorsement does not amend the governing contract or authorize work. Phase 3 is frozen at completed Step 1; Gate 3 Steps 2–5 remain held. Draft #1463 stays draft, without reviewers.
 
 **Issue:** [#1235](https://github.com/IABTechLab/trusted-server/issues/1235). **Source baseline:** Phase 3 `4741ab712365efa9f578a9b461f9a26a48bb9c5d`; frozen port source `122b78664b1235c717e9208fd200f9a9b0c335df`. No implementation, resources, acquisition, workflow/signing changes or rehearsal tags follow from this proposal.
 
-## Decision and recommended claim
+## Maintainer decision and recommended claim
+
+The user considers this a precision upgrade over Phase 1’s labelled conservative inventory, whose publication and predicate verification already satisfy the SBOM verification item in #1235’s Done-when. Maintainers must decide whether this upgrade belongs inside #1235 or a follow-up; no issue-closure or scope decision is claimed here.
 
 Adopt, if approved, an **issue-scoped build-derived Cargo/npm SBOM** for every existing release binary, together with artifact-bound logical runtime requirements. Keep all seven assets in one admission/publication cohort. This aligns the next SBOM milestone with #1235's release-build Cargo/npm requirement; it explicitly amends the broader strict-composition scope rather than claiming its native/platform gaps are solved.
 
 Recommended public document name: **Build-derived Cargo/npm SBOM**. Recommended design title after approval: **Gate 2: build-derived Cargo/npm SBOMs and runtime requirements**. Use **admitted under the issue-scoped build profile**, never “complete SBOM,” “complete composition,” “fully covered,” or “qualified build.” Keep SPDX 2.3, `https://spdx.dev/Document/v2.3`, `<asset>.spdx.json`, all bundle names, source pins and signer identity unchanged. Renaming or superseding the existing `complete-spdx` planning documents would be a later documentation migration; this proposal renames no existing file or release asset.
 
-| Direction                                                  | Coverage and cohort                                                                                                  | Decision status                                               |
-| ---------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
-| **Issue-scoped all-seven — recommended for this decision** | Actual Cargo/npm build evidence, declared licences and logical runtime requirements; explicit native/platform limits | Proposed amendment in this document                           |
-| Strict all-seven                                           | Also requires retained native/tool/sysroot/SDK input closure and corresponding licence evidence                      | Previously approved Gate 2; expensive unresolved cells remain |
-| Target-specific strict rollout                             | Changes when individual targets could activate                                                                       | Not approved; not used by this option                         |
+| Direction                                                  | Coverage and cohort                                                                                                  | Decision status                                                  |
+| ---------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| **Issue-scoped all-seven — recommended for this decision** | Actual Cargo/npm build evidence, declared licences and logical runtime requirements; explicit native/platform limits | Endorsed in principle; awaiting maintainer decision; not adopted |
+| Strict all-seven                                           | Also requires retained native/tool/sysroot/SDK input closure and corresponding licence evidence                      | Previously approved Gate 2; expensive unresolved cells remain    |
+| Target-specific strict rollout                             | Changes when individual targets could activate                                                                       | Not approved; not used by this option                            |
 
 The previous [80–136 person-day estimate](binary-attestations-phase3-full-cohort-feasibility.md) prices unresolved strict native/platform/licence closure. It explicitly excludes Cargo/JS/runtime capture and generator integration. It is not the cost of satisfying the issue-scoped Cargo/npm requirement, and cannot be reduced to this option by subtracting an arbitrary percentage.
 
