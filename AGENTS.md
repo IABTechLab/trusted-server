@@ -373,6 +373,15 @@ Every PR must pass:
 9. Native core build-digest test and lint (`cargo test -p trusted-server-core --test template_build_digest` and `cargo clippy -p trusted-server-core --test template_build_digest -- -D warnings`)
 10. Wasm clock lint: `scripts/lint-wasm-clock.sh` (crates built into the Cloudflare Worker must use `web_time`, not the `std::time::{Instant,SystemTime}` `now`/`elapsed` methods, which panic there)
 11. Documentation proposal scripts: `shellcheck scripts/docs-proposal/*.sh && node --test scripts/docs-proposal/hunks.test.mjs && scripts/docs-proposal/test.sh`
+12. URL-host linter on lines the PR adds (`lint-domains` job, PRs only); run it locally with `cargo run --manifest-path crates/trusted-server-cli/Cargo.toml --target <host-triple> --bin ts -- dev lint domains --changed-vs origin/main`, using the PR's base branch in place of `main` when it targets another branch
+13. CI Node pin guard: `node --test scripts/check-ci-node-pin.test.mjs && node scripts/check-ci-node-pin.mjs` with the `.tool-versions` Node (every CI job that compiles Rust sets up the `.tool-versions` Node before its first cargo step)
+
+CI also runs these HTML EOF checks. Run them locally only when changing EOF
+finalization, publisher or HTML-processor code:
+
+- Native Rust HTML EOF harness configuration, timing and cleanup: `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --features html-eof-runtime --test html_eof_runtime` and `cargo clippy --manifest-path crates/trusted-server-integration-tests/Cargo.toml --features html-eof-runtime --test html_eof_runtime -- -D warnings`
+- Actual Axum EOF/auction controls: `./scripts/async-html-finalization-local-test.sh axum --auction`
+- Actual Fastly EOF/auction controls with repository-pinned Viceroy (the fixture requires 0.19+): `./scripts/async-html-finalization-local-test.sh fastly --release --auction`. The auction control checks empty-bid assembly with a deliberately unreachable bidder. See `scripts/README.md` for retained diagnostics and other runtimes.
 
 ---
 

@@ -19,6 +19,8 @@
 //! streaming interface. See `crate::platform` module doc for the
 //! authoritative note.
 
+pub mod finish;
+
 use std::cell::{Cell, RefCell};
 use std::io::{self, Read, Write};
 use std::rc::Rc;
@@ -29,6 +31,9 @@ use brotli::enc::writer::CompressorWriter;
 use error_stack::{Report, ResultExt as _};
 use flate2::read::ZlibDecoder;
 use flate2::write::{GzEncoder, ZlibEncoder};
+use futures::future::LocalBoxFuture;
+
+use finish::{StreamFinish, StreamFinishError, StreamFinishInput};
 
 use crate::error::TrustedServerError;
 
@@ -47,6 +52,34 @@ pub trait StreamProcessor {
     ///
     /// Returns an error if processing fails (e.g., I/O errors, encoding issues).
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error>;
+
+    /// Report whether this processor requires an asynchronous EOF driver.
+    ///
+    /// Must return the same value for the processor's lifetime and match the
+    /// creating factory's `requires_async_finish`; drivers validate the pair
+    /// on every chunk and fail the response on a mismatch. To skip optional
+    /// work for one document, return `None` from [`Self::async_finish`]
+    /// instead. Synchronous drivers reject this capability before consuming
+    /// input.
+    fn requires_async_finish(&self) -> bool {
+        false
+    }
+
+    /// Return optional borrowing EOF work after synchronous stage completion.
+    ///
+    /// The driver retains fallback output outside the future. Implementations
+    /// return promptly and perform I/O inside the future. The default creates
+    /// no future. Returned output reaches downstream stages before their EOF.
+    ///
+    /// # Errors
+    ///
+    /// Callback errors discard the candidate and preserve synchronous output.
+    fn async_finish<'a>(
+        &'a mut self,
+        _input: StreamFinishInput<'a>,
+    ) -> Option<LocalBoxFuture<'a, Result<StreamFinish, Report<StreamFinishError>>>> {
+        None
+    }
 
     /// Reset the processor state (useful for reuse)
     fn reset(&mut self) {}
@@ -164,6 +197,11 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
         input: R,
         output: W,
     ) -> Result<(), Report<TrustedServerError>> {
+        if self.processor.requires_async_finish() {
+            return Err(Report::new(TrustedServerError::Proxy {
+                message: "Processor requires asynchronous EOF completion".to_string(),
+            }));
+        }
         match (
             self.config.input_compression,
             self.config.output_compression,
@@ -2318,6 +2356,140 @@ mod tests {
         assert!(
             !result.contains("example.com"),
             "should not contain original URL after gzip HTML pipeline"
+        );
+    }
+}
+
+#[cfg(test)]
+mod async_eof_contract_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use futures::executor::block_on;
+    use futures::future::LocalBoxFuture;
+    use http::StatusCode;
+
+    use super::*;
+    use crate::platform::test_support::noop_services;
+    use crate::streaming_processor::finish::{
+        StreamFinish, StreamFinishDeadline, StreamFinishError, StreamFinishInput,
+        StreamOutputWriter,
+    };
+
+    struct OptionalProcessor {
+        calls: Rc<Cell<usize>>,
+    }
+
+    impl StreamProcessor for OptionalProcessor {
+        fn process_chunk(&mut self, chunk: &[u8], _: bool) -> io::Result<Vec<u8>> {
+            Ok(chunk.to_vec())
+        }
+
+        fn requires_async_finish(&self) -> bool {
+            true
+        }
+
+        fn async_finish<'a>(
+            &'a mut self,
+            input: StreamFinishInput<'a>,
+        ) -> Option<LocalBoxFuture<'a, Result<StreamFinish, Report<StreamFinishError>>>> {
+            Some(Box::pin(async move {
+                self.calls.set(self.calls.get() + 1);
+                input.replacement.append(input.output)?;
+                input.replacement.append(b"!")?;
+                Ok(StreamFinish::Replace)
+            }))
+        }
+    }
+
+    struct ObservedReader(Rc<Cell<usize>>);
+
+    impl Read for ObservedReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            self.0.set(self.0.get() + 1);
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn async_eof_synchronous_pipeline_rejects_before_reading() {
+        let reads = Rc::new(Cell::new(0));
+        let calls = Rc::new(Cell::new(0));
+        let mut pipeline = StreamingPipeline::new(
+            PipelineConfig::default(),
+            OptionalProcessor {
+                calls: Rc::clone(&calls),
+            },
+        );
+        let mut output = Vec::new();
+        let error = pipeline
+            .process(ObservedReader(Rc::clone(&reads)), &mut output)
+            .expect_err("should reject an async-capable processor before input effects");
+        assert!(
+            format!("{error:?}").contains("async"),
+            "should explain async requirement"
+        );
+        assert_eq!(reads.get(), 0, "should not consume the reader");
+        assert_eq!(calls.get(), 0, "should not start the callback");
+        assert!(output.is_empty(), "should not write output");
+    }
+
+    #[test]
+    fn async_eof_callback_borrows_non_send_state_and_driver_output() {
+        let calls = Rc::new(Cell::new(0));
+        let mut processor = OptionalProcessor {
+            calls: Rc::clone(&calls),
+        };
+        let services = noop_services();
+        let deadline = StreamFinishDeadline::new(Duration::from_secs(1), false);
+        let mut replacement = StreamOutputWriter::new(8);
+        let outcome = block_on(
+            processor
+                .async_finish(StreamFinishInput {
+                    response_status: StatusCode::OK,
+                    output: b"tail",
+                    replacement: &mut replacement,
+                    services: &services,
+                    deadline: &deadline,
+                })
+                .expect("should provide optional EOF work"),
+        )
+        .expect("should complete borrowed callback");
+        assert_eq!(
+            outcome,
+            StreamFinish::Replace,
+            "should accept the candidate"
+        );
+        assert_eq!(
+            replacement.into_bytes(),
+            b"tail!",
+            "should append to un-emitted output"
+        );
+        assert_eq!(calls.get(), 1, "should call the finish once");
+    }
+
+    #[test]
+    fn async_eof_ordinary_processor_creates_no_future() {
+        let mut processor = StreamingReplacer::new(Vec::new());
+        let services = noop_services();
+        let deadline = StreamFinishDeadline::new(Duration::from_secs(1), false);
+        let mut replacement = StreamOutputWriter::new(8);
+        assert!(
+            !processor.requires_async_finish(),
+            "should default to synchronous processing"
+        );
+        assert!(
+            processor
+                .async_finish(StreamFinishInput {
+                    response_status: StatusCode::OK,
+                    output: b"tail",
+                    replacement: &mut replacement,
+                    services: &services,
+                    deadline: &deadline,
+                })
+                .is_none(),
+            "should create no future by default"
         );
     }
 }

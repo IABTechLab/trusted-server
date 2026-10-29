@@ -203,6 +203,208 @@ Streaming support is an adapter capability. Request
 checked `supports_streaming_responses()`; unsupported adapters must reject
 the request instead of silently buffering it.
 
+## Asynchronous HTML processor completion
+
+An integration can register an HTML stream processor that optionally awaits HTTP,
+KV or other request services after its synchronous EOF call. Use the existing
+`IntegrationHtmlStreamProcessorFactory` and `.with_html_stream_processor(...)`.
+Article signing is only one possible consumer; core implements the processor
+lifecycle, not a signing protocol or background job system.
+
+Factories declare `requires_async_finish()`. Sessions implement the matching
+`StreamProcessor::requires_async_finish()` and optional `async_finish(...)`.
+The default callback returns `None`, creating no future. Factory metadata is
+available before template lookup, so requested EOF work cannot be skipped by a
+processed cache hit. The factory and session share request-local
+`IntegrationDocumentState` with the existing parser hooks.
+
+A non-retaining session can make a KV lookup at EOF and append a fixed footer.
+
+::: warning Do not copy the KV lookup to Fastly
+The generic KV interface has no hard timeout, and Fastly installs no cooperative
+timer, so an unbounded KV call can hold the response indefinitely. The example
+skips the lookup when `input.deadline.has_cooperative_timer()` is false. On
+Fastly, use an HTTP lookup whose transport timeouts are capped with
+`input.deadline.remaining()` instead.
+:::
+
+<!-- documentation-snippet:html-eof:start -->
+
+```rust
+use error_stack::Report;
+use futures::future::LocalBoxFuture;
+use std::io;
+use trusted_server_core::integrations::{
+    IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory,
+};
+use trusted_server_core::streaming_processor::StreamProcessor;
+use trusted_server_core::streaming_processor::finish::{
+    StreamFinish, StreamFinishError, StreamFinishInput,
+};
+
+/// Append a fixed footer when an example KV key is present.
+pub struct ExampleFooterProcessor;
+
+/// Create a request-local footer processor with matching EOF capability.
+pub struct ExampleFooterFactory;
+
+impl IntegrationHtmlStreamProcessorFactory for ExampleFooterFactory {
+    fn integration_id(&self) -> &'static str {
+        "example_footer"
+    }
+
+    fn requires_async_finish(&self) -> bool {
+        true
+    }
+
+    fn create(&self, _context: IntegrationHtmlStreamContext) -> Box<dyn StreamProcessor> {
+        Box::new(ExampleFooterProcessor)
+    }
+}
+
+impl StreamProcessor for ExampleFooterProcessor {
+    fn process_chunk(&mut self, bytes: &[u8], _is_last: bool) -> io::Result<Vec<u8>> {
+        Ok(bytes.to_vec())
+    }
+
+    fn requires_async_finish(&self) -> bool {
+        true
+    }
+
+    fn async_finish<'a>(
+        &'a mut self,
+        input: StreamFinishInput<'a>,
+    ) -> Option<LocalBoxFuture<'a, Result<StreamFinish, Report<StreamFinishError>>>> {
+        Some(Box::pin(async move {
+            if !input.deadline.has_cooperative_timer() {
+                return Ok(StreamFinish::Unchanged);
+            }
+            let enabled = input
+                .services
+                .kv_store()
+                .get_bytes("example:footer")
+                .await
+                .map_err(|_| Report::new(StreamFinishError::Unavailable))?
+                .is_some();
+            if !enabled {
+                return Ok(StreamFinish::Unchanged);
+            }
+            input.replacement.append(input.output)?;
+            input.replacement.append(b"<!--example-footer-->")?;
+            Ok(StreamFinish::Replace)
+        }))
+    }
+}
+```
+
+<!-- documentation-snippet:html-eof:end -->
+
+The factory and session both return `true` from `requires_async_finish()` for
+their entire lifetimes. Their capabilities must match; a mismatch fails the request.
+Leave `buffer_output_until_eof()` at its default `false` for this append
+operation. KV must be available on the runtime; unavailable lookup falls back to
+the synchronous tail. Fastly consumers must use host operations with independently
+bounded latency and cap configurable transport timeouts with `input.deadline.remaining()`;
+this generic KV interface does not provide a hard timeout. Checking the remaining
+budget alone cannot interrupt a blocking KV call.
+
+Operators must explicitly accept the possible delivery cost:
+
+```toml
+[publisher]
+allow_async_html_finish = true
+html_finalization_timeout_ms = 5000
+```
+
+Permission defaults to false. Enabling an integration requiring async completion
+without permission produces a configuration error naming the integration and the
+setting. Work is not silently omitted. Permission alone, with no async factories,
+keeps ordinary processing unchanged.
+
+Chunk callbacks remain synchronous. At EOF, core validates/drains the decoder and
+finishes the HTML parser, sending ready bytes through downstream processors as
+ordinary chunks. It then completes each processor in registration order: synchronous
+EOF, optional awaited finish, accepted output passed downstream, then downstream EOF.
+The auction and encoder finish afterward. Ready bytes are released before optional
+I/O; a callback is never run inside a parser handler.
+
+`StreamFinishInput` supplies actual `response_status`, borrowed `output`, `services`,
+`deadline` and a separate bounded `replacement` writer. The output is the un-emitted
+synchronous tail of this stage. It is the complete retained output only when the
+factory explicitly requests `buffer_output_until_eof()`. Return `StreamFinish::Unchanged`
+to retain it, or write a complete candidate and return `Replace`. To append a tail,
+write the existing `output` followed by the new bytes. Empty replacement is intentional.
+The session and future may be non-`Send`; start I/O inside the returned future.
+
+Core buffers a stage's output only when its factory explicitly requests retention.
+The holder and replacement candidate each use `max_buffered_body_bytes` as their cap.
+These caps apply per holder; simultaneous holders and codec/adapter buffers can
+use more memory in total. On collection overflow, core releases prefix/crossing/later output exactly once and
+skips that stage's optional I/O, while still completing its synchronous EOF. It cannot
+bound arbitrary private allocations inside an integration. Streaming stages cannot
+replace bytes already delivered; EOF append does not imply safe insertion into an
+already emitted head or before an earlier body close.
+
+Callback errors, poisoned candidates, invalid assembly-marker multiplicity and timeout
+discard the candidate and retain current stage output. Previously accepted stages stay
+accepted. One absolute deadline covers every callback, starting after decoder/parser
+EOF. On expiry, core drops the callback, skips later optional I/O, and still completes
+all downstream synchronous EOF calls. Origin, parser, synchronous processing, codec and
+sink errors remain fatal. Callback panics propagate. Cancellation does not undo remote
+writes or guarantee that transport work is cancelled.
+
+Axum, Workers and Spin provide cooperative timers. Fastly has none because its host
+calls block; bound those calls with `deadline.remaining()` and transport timeouts.
+A timer cannot preempt CPU work or blocking host calls. Avoid logging HTML, lookup URLs
+or external response contents.
+
+The latency contract depends on the adapter and the stage:
+
+- Without async factories, delivery and auction timing keep their existing path.
+- On Fastly, a non-retaining stage releases ready HTML before optional EOF I/O.
+  With an auction seam, the body-close and following tail wait for all hooks before
+  auction assembly; initial bytes can arrive promptly while page completion waits.
+- A retaining stage delays first HTML delivery until EOF or overflow release.
+- Axum, Workers and Spin currently buffer publisher responses. Enabled EOF I/O can
+  add to TTFB there even without stage retention. This feature does not add streaming
+  support to those adapters.
+
+Use `stream_publisher_body_async`, `buffer_publisher_response_async`, or
+`publisher_response_into_streaming_response` for opted-in HTML. The synchronous
+pipeline and `stream_publisher_body` reject async processing before input/output
+effects. The raw partial-HTML copy path performs no callback; the synchronous helper
+leaves pending auction ownership with its caller, so pending auctions still require
+an async entry point. Async cancellation retains the auction guard's warning; error
+paths that can await emit abandonment telemetry.
+
+Opted-in HTML bypasses shared-template reads/reservations/stores and receives
+`Cache-Control: no-store, private`, including unchanged, failed and overflow-bypassed
+work. Raw-origin readthrough remains independent. Cacheable asynchronous output needs
+separate rules for output identity, external-data freshness, expiry, invalidation,
+failure caching and callback execution on hits; this is tracked in
+[#1397](https://github.com/IABTechLab/trusted-server/issues/1397).
+
+When async factories are registered, HTML with 206 or any `Content-Range` bypasses
+rewriting and EOF I/O while preserving encoded bytes, framing, validators and origin
+cache policy. Independent cookie/diagnostics privacy still applies. HEAD, bodiless,
+non-HTML and unsupported encodings run no callbacks. Complete error HTML is eligible;
+inspect `response_status` to decide whether the integration applies. Without async
+factories, existing partial-response handling continues.
+
+Callers of `handle_publisher_request` supply the same enabled registry in
+`AuctionDispatch::integration_registry` and response processing. This required field
+allows cache admission to see async capabilities before lookup.
+
+Replacement output passes through later stream processors, but is not parsed again.
+Preserve CSP, Next.js/RSC semantics and opaque assembly markers. Core checks marker
+multiplicity including split boundaries, not HTML structure. Each real consumer must
+verify winning-auction placement after its changes and preserve the structural body
+end; neighboring bytes alone cannot establish a marker's parsing context.
+
+A fictional HTTP processor is available only with `test-utils`. See
+[HTML EOF runtime checks](/guide/testing#html-eof-runtime-checks) for the runtime
+harness, runtime/tooling prerequisites and CI coverage.
+
 ## Browser and script guards
 
 Add a browser module only when browser state is required. Immediate modules

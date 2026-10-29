@@ -5320,9 +5320,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.41"
+version = "0.23.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
+checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -6576,7 +6576,6 @@ dependencies = [
  "tokio",
  "toml",
  "trusted-server-core",
- "trusted-server-js",
  "worker",
 ]
 
@@ -6625,7 +6624,6 @@ dependencies = [
  "spin-sdk",
  "tokio",
  "trusted-server-core",
- "trusted-server-js",
 ]
 
 [[package]]
@@ -6738,12 +6736,14 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64",
  "bytes",
  "derive_more",
  "edgezero-adapter-axum",
  "edgezero-core",
  "env_logger",
  "error-stack",
+ "futures",
  "http",
  "http-body-util",
  "libc",
@@ -6751,6 +6751,7 @@ dependencies = [
  "reqwest 0.12.28",
  "scraper",
  "serde_json",
+ "tempfile",
  "testcontainers",
  "tokio",
  "toml",
