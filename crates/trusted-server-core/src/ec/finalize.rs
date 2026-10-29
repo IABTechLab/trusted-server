@@ -9,6 +9,7 @@ use edgezero_core::body::Body as EdgeBody;
 use http::Response;
 
 use super::consent::{ec_consent_granted, ec_consent_withdrawn};
+use crate::consent::{ConsentContext, allows_eid_persistence};
 use crate::settings::Settings;
 
 use super::EcContext;
@@ -19,7 +20,7 @@ use super::kv::{
     apply_partner_id_updates,
 };
 use super::kv_types::KvEntry;
-use super::prebid_eids::collect_eid_cookie_updates;
+use super::prebid_eids::collect_eid_updates;
 use super::pull_sync_marker::{expire_marker, reconcile_marker};
 use super::registry::PartnerRegistry;
 use super::{EcKvSnapshot, EidSyncSource, current_timestamp, log_id};
@@ -78,10 +79,37 @@ pub fn ec_finalize_response(
     if ec_context.ec_was_present() && !ec_context.ec_generated() && consent_allows_ec {
         if let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value().map(str::to_owned)) {
             let source = ec_context.eid_sync_source();
-            let updates = source
-                .map(|_| collect_eid_cookie_updates(eids_cookie, sharedid_cookie, registry))
+            let collected = source
+                .map(|_| {
+                    collect_eid_updates(
+                        eids_cookie,
+                        sharedid_cookie,
+                        ec_context.client_eids(),
+                        registry,
+                    )
+                })
                 .unwrap_or_default();
-            if let Some(source) = source {
+            let had_eid_updates = !collected.is_empty();
+            let updates = gate_eid_updates_by_consent(collected, ec_context.consent());
+            // `sync_eid_cookie_updates` early-returns without refreshing the
+            // snapshot when `updates` is empty, which is correct when there
+            // was never anything to write (an unconfigured registry, no sync
+            // source, or no EID cookies/body this request — the case
+            // `finalize_not_read_snapshot_does_not_rotate` covers). But when
+            // consent gating (e.g. TCF Purpose 4 denial) is what emptied
+            // `updates`, the request *did* have EID data, and orphan recovery
+            // below still needs an actual `Missing` read to detect an
+            // orphaned cookie. An unread `NotRead` snapshot proves nothing, so
+            // consent gating must not also skip that one read on a
+            // recovery-eligible request.
+            if updates.is_empty()
+                && had_eid_updates
+                && ec_context.recovery_eligible()
+                && matches!(ec_context.kv_snapshot(), EcKvSnapshot::NotRead)
+            {
+                let snapshot = graph.load_snapshot(&ec_id);
+                ec_context.set_kv_snapshot(snapshot);
+            } else if let Some(source) = source {
                 sync_eid_cookie_updates(graph, ec_context, &ec_id, &updates, source);
             }
             if matches!(ec_context.kv_snapshot(), EcKvSnapshot::Missing { .. })
@@ -110,7 +138,15 @@ pub fn ec_finalize_response(
             return;
         };
 
-        let updates = collect_eid_cookie_updates(eids_cookie, sharedid_cookie, registry);
+        let updates = gate_eid_updates_by_consent(
+            collect_eid_updates(
+                eids_cookie,
+                sharedid_cookie,
+                ec_context.client_eids(),
+                registry,
+            ),
+            ec_context.consent(),
+        );
         sync_eid_cookie_updates(graph, ec_context, &ec_id, &updates, EidSyncSource::NewEc);
         if ec_context.kv_snapshot().entry_for(&ec_id).is_some() {
             set_ec_cookie_on_response(settings, ec_context, response);
@@ -204,6 +240,32 @@ fn reconcile_pull_sync_marker(
         ec_context.pull_sync_marker_mut(),
         response,
     );
+}
+
+/// Withholds EID-derived KV updates when consent does not allow EID
+/// persistence, on top of the Purpose 1 (EC) gate `ec_finalize_response`
+/// already enforces before reaching this point.
+///
+/// `consent_allows_ec` only requires Purpose 1 (device storage), but EIDs
+/// additionally require Purpose 4 (personalized ads) — the same rule
+/// [`gate_eids_by_consent`](crate::consent::gate_eids_by_consent) applies to
+/// the outbound `/auction` bid request, evaluated here through
+/// [`allows_eid_persistence`]. Without this, a user who denies Purpose 4
+/// would have their EIDs correctly stripped from the bid request but still
+/// written to the identity graph from the `ts-eids`/`sharedId` cookies or the
+/// `/auction` request body.
+fn gate_eid_updates_by_consent(
+    updates: Vec<super::kv::PartnerIdUpdate>,
+    consent: &ConsentContext,
+) -> Vec<super::kv::PartnerIdUpdate> {
+    if updates.is_empty() || allows_eid_persistence(consent) {
+        return updates;
+    }
+    log::debug!(
+        "EC KV: withholding {} EID updates, EID consent (TCF Purpose 1 + 4) missing",
+        updates.len()
+    );
+    Vec::new()
 }
 
 fn recover_orphaned_ec(
@@ -464,12 +526,15 @@ where
 mod tests {
     use http::HeaderValue;
 
+    use base64::Engine as _;
+
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
+    use crate::openrtb::{Eid, Uid};
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{create_test_settings, purpose_one_only_consent};
 
     fn empty_response() -> Response<EdgeBody> {
         Response::builder()
@@ -1028,6 +1093,70 @@ mod tests {
     }
 
     #[test]
+    fn finalize_recovers_orphaned_ec_when_purpose_four_denial_empties_updates() {
+        // Regression test: this request has real EID data (a configured
+        // partner and a captured client EID), but TCF Purpose 4 denial gates
+        // it away, emptying the update list. That must not also suppress the
+        // snapshot refresh that orphan recovery depends on. Without a
+        // preloaded snapshot (a non-GET publisher navigation never calls
+        // `should_preload_ec_snapshot`), the context starts at `NotRead`; only
+        // an actual KV read can prove the row is missing and let recovery run.
+        //
+        // This is distinct from `finalize_not_read_snapshot_does_not_rotate`,
+        // which covers a request with no EID data at all (nothing gated it
+        // away) and must still not rotate.
+        let settings = create_test_settings();
+        let orphaned_ec = sample_ec_id("orphn2");
+        let purpose1_only_consent = purpose_one_only_consent();
+        let mut ec_context = EcContext::new_for_test_with_ip(
+            Some(orphaned_ec.clone()),
+            purpose1_only_consent,
+            Some("192.0.2.11".to_owned()),
+        );
+        ec_context.set_recovery_eligible(true);
+        ec_context.set_eid_sync_source(EidSyncSource::Navigation);
+        ec_context.set_client_eids(vec![Eid {
+            source: "id5-sync.com".to_owned(),
+            uids: vec![Uid {
+                id: "ID5_should_not_persist".to_owned(),
+                atype: Some(1),
+                ext: None,
+            }],
+        }]);
+        let partners = vec![make_partner("id5-sync.com")];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            None,
+            &mut response,
+        );
+
+        let replacement = ec_context.ec_value().expect(
+            "should rotate the orphan even though Purpose 4 denial emptied the gated update list",
+        );
+        assert_ne!(replacement, &orphaned_ec);
+        let (stored, _) = graph
+            .get(replacement)
+            .expect("should read replacement")
+            .expect("replacement cookie should have a backing row");
+        assert!(
+            get_header(&response, "set-cookie").is_some(),
+            "should emit replacement cookie after persistence"
+        );
+        assert!(
+            !stored.ids.contains_key("id5-sync.com"),
+            "denied Purpose 4 EID must not be persisted even on the recovered row"
+        );
+    }
+
+    #[test]
     fn valid_marker_with_unread_snapshot_defers_orphan_recovery() {
         let settings = create_test_settings();
         let orphaned_ec = sample_ec_id("orphn2");
@@ -1349,6 +1478,153 @@ mod tests {
             stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
             Some("shared-cookie-id"),
             "a stale endpoint miss must not suppress EID persistence"
+        );
+    }
+
+    #[test]
+    fn finalize_persists_every_configured_partner_from_client_eids_over_a_trimmed_cookie() {
+        // Regression test for #1184: the `ts-eids` cookie only carries what
+        // the browser could fit under its size cap, but `/auction` also
+        // hands finalization the full EID set from the request body via
+        // `EcContext::set_client_eids`. That full set must land in KV even
+        // when the cookie alone would have dropped a configured partner.
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("cleids1");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let live = KvEntry::new(
+            &granting_consent(),
+            None,
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        graph
+            .create(&ec_id, &live)
+            .expect("should seed the live row this request updates");
+        let mut ec_context = returning_user_context(
+            &ec_id,
+            EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            },
+            false,
+        );
+        ec_context.set_eid_sync_source(EidSyncSource::Auction);
+        // Only `id5-sync.com` "fit" in the (simulated) trimmed cookie;
+        // `liveramp.com` was dropped by the browser's size cap.
+        let eids_cookie = base64::engine::general_purpose::STANDARD.encode(
+            serde_json::to_vec(&serde_json::json!([
+                {"source": "id5-sync.com", "uids": [{"id": "ID5_from_cookie", "atype": 1}]}
+            ]))
+            .expect("should serialize test cookie payload"),
+        );
+        ec_context.set_client_eids(vec![
+            Eid {
+                source: "id5-sync.com".to_owned(),
+                uids: vec![Uid {
+                    id: "ID5_from_body".to_owned(),
+                    atype: Some(1),
+                    ext: None,
+                }],
+            },
+            Eid {
+                source: "liveramp.com".to_owned(),
+                uids: vec![Uid {
+                    id: "LR_from_body".to_owned(),
+                    atype: Some(3),
+                    ext: None,
+                }],
+            },
+        ]);
+        let partners = vec![make_partner("id5-sync.com"), make_partner("liveramp.com")];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            Some(&eids_cookie),
+            None,
+            &mut response,
+        );
+
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("row should exist after ingestion");
+        assert_eq!(
+            stored.ids.get("id5-sync.com").map(|id| id.uid.as_str()),
+            Some("ID5_from_body"),
+            "the request body's EID should win over the cookie's stale value"
+        );
+        assert_eq!(
+            stored.ids.get("liveramp.com").map(|id| id.uid.as_str()),
+            Some("LR_from_body"),
+            "a partner the cookie trimmed must still be ingested from the body"
+        );
+    }
+
+    #[test]
+    fn finalize_withholds_eid_kv_writes_when_purpose_four_is_denied() {
+        // A GDPR user can grant TCF Purpose 1 (storage/EC) while denying
+        // Purpose 4 (personalized ads). `gate_eids_by_consent` already strips
+        // EIDs from the outbound /auction bid request in that case; the KV
+        // write path must apply the same Purpose 4 check, or a user's opt-out
+        // is silently ignored for what gets persisted to the identity graph.
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("purp4x");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let purpose1_only_consent = purpose_one_only_consent();
+        let live = KvEntry::new(
+            &purpose1_only_consent,
+            None,
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        graph
+            .create(&ec_id, &live)
+            .expect("should seed the live row this request updates");
+        let mut ec_context = EcContext::new_for_test_with_cookie(
+            Some(ec_id.clone()),
+            Some(ec_id.clone()),
+            true,
+            false,
+            purpose1_only_consent,
+        );
+        ec_context.set_kv_snapshot(EcKvSnapshot::Missing {
+            ec_id: ec_id.clone(),
+        });
+        ec_context.set_eid_sync_source(EidSyncSource::Auction);
+        ec_context.set_client_eids(vec![Eid {
+            source: "id5-sync.com".to_owned(),
+            uids: vec![Uid {
+                id: "ID5_should_not_persist".to_owned(),
+                atype: Some(1),
+                ext: None,
+            }],
+        }]);
+        let partners = vec![make_partner("id5-sync.com")];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            None,
+            &mut response,
+        );
+
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("row should remain");
+        assert!(
+            !stored.ids.contains_key("id5-sync.com"),
+            "denying TCF Purpose 4 must keep the EID out of KV even though Purpose 1 \
+             (EC) consent is granted"
         );
     }
 

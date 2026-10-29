@@ -8,9 +8,12 @@ use std::process::{Command, Stdio};
 use serde::{Deserialize, Deserializer, Serialize};
 use toml_edit::{DocumentMut, Item, table, value};
 
+use crate::error::toml_error_location;
+use crate::fs_util::write_file_atomically;
+
 pub(crate) type CliResult<T> = Result<T, String>;
 
-const NODE_MODULES_MISSING_HELP: &str = "Prebid bundling dependencies are missing. Run `cd crates/trusted-server-js/lib && npm ci`, then retry `ts prebid bundle`.";
+const NODE_MODULES_MISSING_HELP: &str = "Prebid bundling dependencies are missing. Run `cd crates/trusted-server-js/lib && npm ci`, then retry `ts prebid client`.";
 const USER_ID_REGISTRY_RELATIVE_PATH: &str = "src/integrations/prebid/user_id_modules.json";
 
 #[derive(Debug, clap::Args)]
@@ -326,7 +329,7 @@ fn validate_managed_user_id_modules(
             .any(|module| module == &requirement.module_name)
         {
             return cli_error(format!(
-                "{} configures managed User ID {:?}, which requires Prebid module {:?}, but the generated manifest omits it; add {:?} to integrations.prebid.bundle.modules.user_id and rerun `ts prebid bundle`",
+                "{} configures managed User ID {:?}, which requires Prebid module {:?}, but the generated manifest omits it; add {:?} to integrations.prebid.bundle.modules.user_id and rerun `ts prebid client`",
                 config_path.display(),
                 requirement.config_name,
                 requirement.module_name,
@@ -480,8 +483,9 @@ pub(crate) fn load_bundle_config(config_path: &Path) -> CliResult<PrebidBundleCo
     })?;
     let root: toml::Value = toml::from_str(&contents).map_err(|error| {
         report_error(format!(
-            "invalid TOML in {}: {error}",
-            config_path.display()
+            "invalid TOML in {}{}",
+            config_path.display(),
+            toml_error_location(&contents, error.span())
         ))
     })?;
 
@@ -525,6 +529,9 @@ pub(crate) fn load_bundle_config(config_path: &Path) -> CliResult<PrebidBundleCo
         }
     }
 
+    // Unlike the parse errors above, this message is safe to echo: the section
+    // denies unknown fields and holds only public Prebid module names, and the
+    // detail is what tells the operator which module stem or type is wrong.
     let section: PrebidBundleSection = bundle.clone().try_into().map_err(|error| {
         report_error(format!(
             "{} has invalid integrations.prebid.bundle configuration: {error}",
@@ -641,7 +648,7 @@ fn find_js_lib_dir(start: &Path) -> CliResult<PathBuf> {
     }
 
     cli_error(
-        "failed to locate crates/trusted-server-js/lib; run `ts prebid bundle` from the Trusted Server repository",
+        "failed to locate crates/trusted-server-js/lib; run `ts prebid client` from the Trusted Server repository",
     )
 }
 
@@ -749,8 +756,9 @@ fn patch_config_metadata(config_path: &Path, sha256: &str, sri: &str) -> CliResu
     })?;
     let mut document = contents.parse::<DocumentMut>().map_err(|error| {
         report_error(format!(
-            "failed to parse config {} for metadata update: {error}",
-            config_path.display()
+            "failed to parse config {}{} for metadata update",
+            config_path.display(),
+            toml_error_location(&contents, error.span())
         ))
     })?;
 
@@ -779,7 +787,12 @@ fn patch_config_metadata(config_path: &Path, sha256: &str, sri: &str) -> CliResu
     prebid.insert("external_bundle_sha256", value(sha256));
     prebid.insert("external_bundle_sri", value(sri));
 
-    write_atomic(config_path, &document.to_string())
+    write_file_atomically(config_path, &document.to_string()).map_err(|error| {
+        report_error(format!(
+            "failed to write config {}: {error}",
+            config_path.display()
+        ))
+    })
 }
 
 fn table_like_mut<'a>(
@@ -795,45 +808,12 @@ fn table_like_mut<'a>(
     })
 }
 
-fn write_atomic(path: &Path, contents: &str) -> CliResult<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|error| {
-        report_error(format!(
-            "failed to create config parent directory {}: {error}",
-            parent.display()
-        ))
-    })?;
-
-    let filename = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("trusted-server.toml");
-    let tmp_path = parent.join(format!(".{filename}.tmp-{}", std::process::id()));
-
-    fs::write(&tmp_path, contents).map_err(|error| {
-        report_error(format!(
-            "failed to write temporary config {}: {error}",
-            tmp_path.display()
-        ))
-    })?;
-    fs::rename(&tmp_path, path).map_err(|error| {
-        let _ = fs::remove_file(&tmp_path);
-        report_error(format!(
-            "failed to replace config {} with {}: {error}",
-            path.display(),
-            tmp_path.display()
-        ))
-    })?;
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
 
     fn managed_config(managed: &str, user_id: &str) -> String {
         format!(
@@ -1878,6 +1858,88 @@ real_time_data = ["exampleRtdProvider"]
         assert!(
             error.to_string().contains("npm ci"),
             "error should instruct npm ci: {error:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_config_metadata_preserves_config_permissions() {
+        // The temp file is created 0600, so 0640 is what proves the target's mode
+        // is copied onto the replacement rather than the temp file's default kept.
+        for mode in [0o600, 0o640] {
+            let (_temp, path) = write_config(&valid_config());
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+                .expect("should set config permissions");
+
+            patch_config_metadata(&path, &"a".repeat(64), "sha384-abc")
+                .expect("should patch config metadata");
+
+            let patched = fs::metadata(&path)
+                .expect("should stat patched config")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                patched, mode,
+                "should keep the operator's config permissions {mode:o}"
+            );
+        }
+    }
+
+    // Success path only; the failed-rename cleanup is covered by
+    // `fs_util::tests::write_file_atomically_removes_temp_file_when_rename_fails`.
+    #[test]
+    fn patch_config_metadata_leaves_only_config_on_success() {
+        let (temp, path) = write_config(&valid_config());
+
+        patch_config_metadata(&path, &"a".repeat(64), "sha384-abc")
+            .expect("should patch config metadata");
+
+        let entries: Vec<_> = fs::read_dir(temp.path())
+            .expect("should list config directory")
+            .map(|entry| entry.expect("should read entry").file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("trusted-server.toml")],
+            "should leave only the config file behind"
+        );
+    }
+
+    #[test]
+    fn load_bundle_config_parse_error_does_not_echo_config_source() {
+        let (_temp, path) = write_config(
+            "[publisher]\norigin_url = \"https://origin-private.example.com/internal\n",
+        );
+
+        let error = load_bundle_config(&path).expect_err("should reject invalid TOML");
+
+        assert!(
+            !error.contains("origin-private.example.com"),
+            "should not echo config source text: {error}"
+        );
+        assert!(
+            error.contains("at line 2, column "),
+            "should report the error location: {error}"
+        );
+    }
+
+    #[test]
+    fn patch_config_metadata_parse_error_does_not_echo_config_source() {
+        let (_temp, path) = write_config(
+            "[publisher]\norigin_url = \"https://origin-private.example.com/internal\n",
+        );
+
+        let error = patch_config_metadata(&path, &"a".repeat(64), "sha384-abc")
+            .expect_err("should reject invalid TOML");
+
+        assert!(
+            !error.contains("origin-private.example.com"),
+            "should not echo config source text: {error}"
+        );
+        assert!(
+            error.contains("at line 2, column "),
+            "should report the error location: {error}"
         );
     }
 }

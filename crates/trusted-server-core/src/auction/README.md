@@ -108,12 +108,23 @@ as `pbs-main`.
 response.
 
 - `sanitize_creatives = true` strips executable markup. It is opt-in.
-- `rewrite_creatives = true` rewrites eligible URLs through absolute first-party
-  routes on `publisher.public_origin`, falling back to `https://{publisher.domain}`,
-  and removes bidder `<base>` elements. It is enabled by default.
-- The publisher inline delivery path uses absolute first-party URLs without
-  injecting the direct endpoint's creative runtime.
+- `rewrite_creatives = true` rewrites eligible asset URLs through absolute first-party
+  routes on `publisher.public_origin`, falling back to `https://{publisher.domain}`. It is enabled by default.
+- `rewrite_clicks` wraps creative links in `/first-party/click`. Unset, it
+  follows `rewrite_creatives`. When either is on, a bidder `<base>` loses its
+  `href` (a `target` is kept) and `POST /auction` creatives get the TSJS
+  runtime.
+- The publisher inline delivery path retains its request-origin override for
+  absolute first-party URLs without injecting the direct endpoint's creative
+  runtime.
 - Creatives over the configured hard cap are rejected.
+
+`public_origin` is optional for old-config deserialization, but its fallback does
+not preserve the serving page's scheme, host, or port. Configure the actual
+browser endpoint, such as `https://ads.publisher.example` or
+`http://localhost:8080`. Existing root-relative signed inputs remain accepted.
+See [publisher configuration](../../../../docs/guide/configuration.md#publisher-configuration)
+for binary/config upgrade and rollback sequencing.
 
 ## Example plan
 

@@ -50,6 +50,11 @@ const MAX_EVIDENCE_ENTRIES: usize = 128;
 const MAX_EVIDENCE_PAYLOAD_BYTES: usize = 1024 * 1024;
 /// Hard cap on browser teardown so a wedged Chrome cannot hang the audit.
 const BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Hard cap on Chrome startup until it reports its debugging websocket URL.
+///
+/// Replaces chromiumoxide's 20s default, which a cold start on a loaded CI
+/// runner or a slow operator machine can exceed.
+const BROWSER_LAUNCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Page-settle timing thresholds.
 #[derive(Debug, Clone, Copy)]
@@ -151,7 +156,8 @@ pub(crate) fn build_browser_config(
 ) -> Result<BrowserConfig, String> {
     let mut builder = BrowserConfig::builder()
         .chrome_executable(options.chrome)
-        .user_data_dir(options.profile_dir);
+        .user_data_dir(options.profile_dir)
+        .launch_timeout(BROWSER_LAUNCH_TIMEOUT);
     if !options.accept_invalid_certs {
         builder = builder.respect_https_errors();
     }

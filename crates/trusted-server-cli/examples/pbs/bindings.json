@@ -1,0 +1,21 @@
+{
+  "examplebidder": {
+    "verified_image": "registry.example.com/pbs@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "source": "https://example.com/adapter-reference",
+    "secrets": {
+      "us-east-1": "arn:aws:secretsmanager:us-east-1:123456789012:secret:pbs/example-AbCdEf"
+    },
+    "keys": {
+      "api_key": {
+        "env": "PBS_ADAPTERS_EXAMPLEBIDDER_API_KEY",
+        "pbs_path": ["adapters", "examplebidder", "api_key"],
+        "required": true
+      },
+      "optional_token": {
+        "env": "PBS_ADAPTERS_EXAMPLEBIDDER_OPTIONAL_TOKEN",
+        "pbs_path": ["adapters", "examplebidder", "optional_token"],
+        "required": false
+      }
+    }
+  }
+}

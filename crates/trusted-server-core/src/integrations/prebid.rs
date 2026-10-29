@@ -495,12 +495,12 @@ impl IntegrationConfig for LegacyPrebidServerConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrebidBundleBuildConfig {
-    /// Typed Prebid.js module selections consumed by `ts prebid bundle`.
+    /// Typed Prebid.js module selections consumed by `ts prebid client`.
     #[serde(default)]
     pub modules: PrebidBundleModulesConfig,
 }
 
-/// Exact Prebid.js module stems selected by `ts prebid bundle`.
+/// Exact Prebid.js module stems selected by `ts prebid client`.
 ///
 /// The CLI validates these values. The runtime only parses them so app config
 /// carrying build inputs remains loadable.
@@ -3964,6 +3964,7 @@ mod tests {
 
     fn make_request_info(context: &AuctionContext<'_>) -> RequestInfo {
         RequestInfo::from_request(context.request, context.services.client_info())
+            .expect("should extract valid test request info")
     }
 
     fn config_from_settings(

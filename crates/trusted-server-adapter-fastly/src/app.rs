@@ -90,10 +90,8 @@ use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::context::FastlyRequestContext;
-use edgezero_adapter_fastly::runtime_env_config;
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
-use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
     HandlerFuture, HeaderValue, Method, Request, Response, StatusCode, header,
@@ -162,19 +160,29 @@ pub(crate) struct RuntimeStoreConfig {
 }
 
 impl RuntimeStoreConfig {
-    pub(crate) fn from_env(env: &EnvConfig) -> Self {
+    /// Store bindings for the Fastly runtime.
+    ///
+    /// Store selection is a deploy-time input; no store selector reaches the
+    /// Fastly runtime. `EdgeZero` links each selected physical store to the
+    /// service version under its logical ID, so the runtime opens stores by
+    /// logical ID and reads the config entry under that same ID for every
+    /// publication target. Staging isolation comes from linking a different
+    /// physical store, never from a different key.
+    pub(crate) fn logical() -> Self {
         Self {
-            config_store_name: StoreName::from(env.store_name("config", DEFAULT_CONFIG_STORE_ID)),
-            config_key: env.store_key("config", DEFAULT_CONFIG_STORE_ID),
-            secret_store_name: StoreName::from(env.store_name("secrets", DEFAULT_SECRET_STORE_ID)),
+            config_store_name: StoreName::from(DEFAULT_CONFIG_STORE_ID),
+            config_key: DEFAULT_CONFIG_STORE_ID.to_owned(),
+            secret_store_name: StoreName::from(DEFAULT_SECRET_STORE_ID),
         }
     }
 }
 
 /// Application state built once per Wasm instance and shared for its lifetime.
 ///
-/// In Fastly Compute each request spawns a new Wasm instance, so this struct is
-/// effectively per-request. It holds pre-parsed settings and all service handles.
+/// By default Fastly serves one request per instance. With the opt-in reusable
+/// sandbox feature and complete runtime bounds, a successful application build
+/// retains this state across requests until the sandbox retires. Settings and
+/// shared services live here; request-specific state must remain request-local.
 pub(crate) struct AppState {
     pub(crate) settings: Arc<Settings>,
     pub(crate) orchestrator: Arc<AuctionOrchestrator>,
@@ -253,6 +261,8 @@ fn warn_if_certificate_check_disabled(settings: &Settings) {
 /// continues to rely on the trusted `fastly-ssl` header injected by
 /// `edgezero_main` after sanitization.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
+    // No cooperative timer is installed: Fastly host calls block. EOF consumers
+    // must bound their own transport calls using the remaining finish budget.
     let client_info = ctx
         .request()
         .extensions()
@@ -694,6 +704,7 @@ async fn run_named_route(
                 Some(&partner_registry)
             };
             let auction = AuctionDispatch {
+                integration_registry: &state.registry,
                 orchestrator: &state.orchestrator,
                 slots: state.settings.creative_opportunity_slots(),
                 registry: registry_ref,
@@ -858,6 +869,7 @@ async fn dispatch_fallback(
         match PartnerRegistry::from_config(&state.settings.ec.partners) {
             Ok(partner_registry) => {
                 let auction = AuctionDispatch {
+                    integration_registry: &state.registry,
                     orchestrator: &state.orchestrator,
                     slots,
                     registry: Some(&partner_registry),
@@ -1332,8 +1344,7 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> RouterService {
-        let runtime_env = runtime_env_config(Self::stores());
-        let stores = RuntimeStoreConfig::from_env(&runtime_env);
+        let stores = RuntimeStoreConfig::logical();
         Self::router_with_state(&stores).0
     }
 
@@ -1374,7 +1385,6 @@ mod tests {
     use edgezero_core::app::Hooks as _;
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
-    use edgezero_core::env_config::EnvConfig;
     use edgezero_core::http::{
         HeaderValue, Method, Request, Response, StatusCode, header, request_builder,
     };
@@ -1384,6 +1394,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use error_stack::Report;
+    use futures::StreamExt as _;
     use futures::executor::block_on;
     use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
     use trusted_server_core::ec::device::DeviceSignals;
@@ -1400,6 +1411,7 @@ mod tests {
         TemplateCacheMiss, TemplateCacheReservation, TemplateEntry, TemplateMetadata,
     };
     use trusted_server_core::settings::Settings;
+    use trusted_server_core::test_support::nextjs_auction;
 
     #[test]
     fn hooks_store_metadata_matches_edgezero_manifest() {
@@ -1445,32 +1457,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_store_config_maps_logical_store_names_and_config_key() {
-        let env = EnvConfig::from_vars([
-            (
-                "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME",
-                "physical_config",
-            ),
-            (
-                "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY",
-                "active_config",
-            ),
-            (
-                "EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME",
-                "ts_secrets",
-            ),
-        ]);
-
-        let stores = RuntimeStoreConfig::from_env(&env);
-
-        assert_eq!(stores.config_store_name.as_ref(), "physical_config");
-        assert_eq!(stores.config_key, "active_config");
-        assert_eq!(stores.secret_store_name.as_ref(), "ts_secrets");
-    }
-
-    #[test]
-    fn runtime_store_config_uses_logical_defaults_without_overrides() {
-        let stores = RuntimeStoreConfig::from_env(&EnvConfig::default());
+    fn runtime_store_config_opens_logical_store_ids_and_key() {
+        let stores = RuntimeStoreConfig::logical();
 
         assert_eq!(stores.config_store_name.as_ref(), "trusted_server_config");
         assert_eq!(stores.config_key, "trusted_server_config");
@@ -2239,8 +2227,9 @@ mod tests {
             .to_str()
             .expect("should render set-cookie as utf-8");
         assert_eq!(
-            set_cookie, "ts-tester=true; Domain=.test-publisher.com; Path=/; Secure; SameSite=Lax",
-            "tester cookie should use publisher.cookie_domain"
+            set_cookie,
+            "ts-tester=true; Domain=.test-publisher.com; Path=/; Secure; SameSite=Lax; Max-Age=2592000",
+            "tester cookie should use publisher.cookie_domain and persist across browser restarts"
         );
     }
 
@@ -3041,6 +3030,7 @@ mod tests {
                         None,
                         &mut ec_context,
                         AuctionDispatch {
+                            integration_registry: &registry,
                             orchestrator: &orchestrator,
                             slots: settings.creative_opportunity_slots(),
                             registry: None,
@@ -3176,6 +3166,58 @@ mod tests {
             matches!(response.body(), Body::Stream(_)),
             "EdgeZero asset dispatch must stream the origin body, not buffer it"
         );
+    }
+
+    #[test]
+    fn dispatch_fallback_nextjs_gtm_response_is_complete() {
+        for gzip in [false, true] {
+            let state = build_state_from_settings(nextjs_auction::script_composition_settings())
+                .expect("should build mixed state");
+            let origin = Arc::new(nextjs_auction::NextJsAuctionOrigin::with_html_response(
+                &nextjs_auction::script_composition_html(),
+                gzip,
+                true,
+            ));
+            let services = nextjs_auction::services(origin);
+            let request = request_builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "https://{}/article",
+                    nextjs_auction::PUBLISHER_HOST
+                ))
+                .header("host", nextjs_auction::PUBLISHER_HOST)
+                .header("accept", "text/html")
+                .body(Body::empty())
+                .expect("should build navigation");
+            let response = block_on(super::dispatch_fallback(&state, &services, request));
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "should return a successful composed publisher response"
+            );
+            assert!(
+                !response.headers().contains_key(header::CONTENT_LENGTH),
+                "should drop the stale content length after streaming rewrites"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_ENCODING)
+                    .map(|value| value.to_str().expect("should have ASCII coding")),
+                gzip.then_some("gzip"),
+                "should retain the requested response compression"
+            );
+            let Body::Stream(mut stream) = response.into_body() else {
+                panic!("should retain lazy Fastly body");
+            };
+            let mut bytes = Vec::new();
+            block_on(async {
+                while let Some(chunk) = stream.next().await {
+                    bytes.extend_from_slice(&chunk.expect("should process every stream item"));
+                }
+            });
+            nextjs_auction::assert_script_composition_response(&bytes, gzip);
+        }
     }
 
     #[test]

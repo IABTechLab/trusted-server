@@ -27,13 +27,13 @@ The agent resolves the input into exactly one of three **modes** before
 starting any fetch. Modes determine the per-invocation variables defined in
 step 1; later steps reference those variables and don't restate mode logic.
 
-| Input | Mode (after resolution) |
-|---|---|
-| A PR number (e.g. `#165`) | **PR** |
-| A branch name, and PR lookup returns exactly one matching PR | **PR** (via lookup) |
-| A branch name, no PR exists | **BRANCH-REMOTE** — always. No probe on the current checkout. |
-| User explicitly says "review my local working tree" | **BRANCH-LOCAL** — current checkout only. If the user also names a branch, the agent verifies it matches `git branch --show-current`; otherwise it stops and asks the user to either check out that branch first or drop the name. The agent does **not** silently review whatever HEAD happens to be. |
-| No input | Run the PR lookup probe with `$(git branch --show-current)`. If it returns a PR → PR mode. Otherwise apply the no-input rule below. |
+| Input                                                        | Mode (after resolution)                                                                                                                                                                                                                                                                                |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| A PR number (e.g. `#165`)                                    | **PR**                                                                                                                                                                                                                                                                                                 |
+| A branch name, and PR lookup returns exactly one matching PR | **PR** (via lookup)                                                                                                                                                                                                                                                                                    |
+| A branch name, no PR exists                                  | **BRANCH-REMOTE** — always. No probe on the current checkout.                                                                                                                                                                                                                                          |
+| User explicitly says "review my local working tree"          | **BRANCH-LOCAL** — current checkout only. If the user also names a branch, the agent verifies it matches `git branch --show-current`; otherwise it stops and asks the user to either check out that branch first or drop the name. The agent does **not** silently review whatever HEAD happens to be. |
+| No input                                                     | Run the PR lookup probe with `$(git branch --show-current)`. If it returns a PR → PR mode. Otherwise apply the no-input rule below.                                                                                                                                                                    |
 
 **Branch-to-PR lookup rule.** `gh pr list --head <branch>` does not support
 `<owner>:<branch>` syntax, so fork PRs with the same branch name can collide.
@@ -52,7 +52,7 @@ matches=$(gh pr list --head "$REQUESTED_HEAD" \
 - `>1` matches → stop and ask the user which PR number to review; do not pick
   the first row.
 
-**No-input / no-PR rule** (the only place an inferred BRANCH-* mode happens
+**No-input / no-PR rule** (the only place an inferred BRANCH-\* mode happens
 — a named branch never triggers this probe; the user said the name, the
 agent honours it):
 
@@ -60,7 +60,7 @@ agent honours it):
   configured **and** `git rev-list --left-right --count "@{upstream}...HEAD"`
   returns `0	0` → resolve to **BRANCH-REMOTE**, with `<head>` bound to the
   branch name the upstream points at, not to the local branch name. The
-  probe approves the *upstream* state; the agent must fetch that exact
+  probe approves the _upstream_ state; the agent must fetch that exact
   branch, not `origin/$(git branch --show-current)` which could be a
   different ref (the local branch might track `origin/main-fork`). Because
   BRANCH-REMOTE fetches from `origin`, this inference only applies when the
@@ -87,6 +87,7 @@ agent honours it):
   When `$REQUESTED_HEAD` is bound, BRANCH-REMOTE proceeds with that name.
   When it's not bound (upstream on a non-`origin` remote), the agent asks
   the user instead.
+
 - Anything else → **ask the user** which mode they want. The probe uses only
   `git status` / `git rev-parse` on existing local refs — it does **not**
   fetch, so the choice is made before any network or worktree side effect.
@@ -283,7 +284,7 @@ fi
 
 This block adds the worktree **at most once** per invocation, and reuses the
 one from a prior invocation rather than adding a second. The decision keys off
-git's worktree *registry* — the source of truth — not just the directory's
+git's worktree _registry_ — the source of truth — not just the directory's
 existence, because the two can disagree (a registered worktree whose directory
 was manually `rm -rf`'d, or a leftover directory git never registered). Keying
 off the directory alone would send a dangling-but-registered path into
@@ -345,9 +346,9 @@ After this step every later step uses `${WT:-.}` for cwd (so BRANCH-LOCAL
 implicitly runs from the project root) and `$DIFF_RANGE` for diffs. There
 are no more per-mode forks until step 7e (which checks `[ -n "$WT" ]` for
 scratch verification) and step 8, where only **step 8b (the GitHub review
-submission)** is skipped for BRANCH-* modes — no PR to submit a review to.
+submission)** is skipped for BRANCH-\* modes — no PR to submit a review to.
 Step 8a still runs in every mode to compose the review artifact and, in
-BRANCH-* modes, render the would-have-been verdict and findings into chat.
+BRANCH-\* modes, render the would-have-been verdict and findings into chat.
 
 Stash the `HEAD_OID_EXPECTED` value — step 8 re-checks it immediately
 before submission and pins it into the review payload as `commit_id`.
@@ -449,7 +450,7 @@ fi
 If the PR has passing CI checks, report them as PASS in the review. Only run
 CI locally if checks haven't run yet or if you need to verify a specific
 failure. Note any CI failures in the review but continue with the code review
-regardless. (This governs CI *status reporting* only — the suggestion
+regardless. (This governs CI _status reporting_ only — the suggestion
 scratch-verification in step 7e is independent and runs regardless of what
 GitHub's checks say.)
 
@@ -647,7 +648,7 @@ numbers it covers; pick `line` (and `start_line` when multi-line) from inside
 the same hunk; don't span hunk boundaries.
 
 **Deleted lines and base-side context.** Findings about something the PR
-*removed* don't live on the RIGHT side at all — there are no new-file lines
+_removed_ don't live on the RIGHT side at all — there are no new-file lines
 to anchor to. Two options:
 
 - Anchor the inline comment on the LEFT side: `"side": "LEFT"` (and
@@ -662,7 +663,7 @@ to anchor to. Two options:
   see step 1's "base-side reads" note.)
 
 Same rule for renamed files: the file's new path can carry a `suggestion`
-block normally; comments about content the rename *also dropped* anchor on
+block normally; comments about content the rename _also dropped_ anchor on
 the old path with `side: "LEFT"`.
 
 Use a `suggestion` block when:
@@ -693,12 +694,12 @@ fenced code block when:
   cleanly revised.
 
 In all of those cases, give the proposed code in a plain fenced block (e.g.
-```` ```rust ````) and end with a short "Apply manually — can't be auto-applied
+` ```rust `) and end with a short "Apply manually — can't be auto-applied
 as a suggestion because …" sentence.
 
 ##### Fence length when the replacement itself contains backticks
 
-The default `` ```suggestion `` fence is three backticks. If the replacement
+The default ` ```suggestion ` fence is three backticks. If the replacement
 bytes contain a line that is itself a run of three-or-more backticks — common
 for Markdown/docs suggestions that include a nested code fence — that inner run
 closes the outer `suggestion` block early, and the rendered one-click
@@ -706,14 +707,14 @@ suggestion is truncated or malformed rather than matching the bytes the user
 approved. Before displaying or submitting any suggestion:
 
 1. Scan the replacement for the longest run of consecutive backticks, `N`.
-2. If `N < 3`, use the normal three-backtick `` ```suggestion `` fence.
+2. If `N < 3`, use the normal three-backtick ` ```suggestion ` fence.
 3. If `N >= 3`, open and close the block with a fence of `N + 1` backticks
-   (e.g. ` ````suggestion ` for an inner ```` ``` ````), so the outer fence is
+   (e.g. ` ````suggestion ` for an inner ` ``` `), so the outer fence is
    strictly longer than any inner run — GitHub follows the CommonMark rule that
    a fence closes only on a run of **at least** as many backticks. This rule is
    deterministic; whether GitHub renders the widened fence as a one-click
    suggestion is a server-side property that cannot be checked locally (7e's
-   scratch pass verifies replacement *bytes*, not rendering). When in doubt —
+   scratch pass verifies replacement _bytes_, not rendering). When in doubt —
    e.g. an unusually exotic replacement — **demote the finding to prose-only**
    (a plain fenced block plus the "Apply manually …" sentence) rather than
    risk posting a malformed suggestion.
@@ -753,7 +754,7 @@ For a multi-line suggestion, add `start_line` and `start_side`:
 **Indentation matters**: the block replaces the original lines verbatim, so
 leading whitespace must match exactly what the file expects after the fix.
 
-**Fence length matters too**: the `` ```suggestion `` fences above use three
+**Fence length matters too**: the ` ```suggestion ` fences above use three
 backticks, which only holds when the replacement contains no three-or-more
 backtick run of its own. When it does (e.g. a docs suggestion with a nested
 code fence), widen the outer fence per step 7a's fence-length rule or demote
@@ -776,7 +777,7 @@ the comment body and tell the author it has to be applied manually:
 
 #### 7c-bis. Inline comment on a removed (LEFT-side) line
 
-A finding about a line the PR *removed* has no RIGHT-side anchor — pin it
+A finding about a line the PR _removed_ has no RIGHT-side anchor — pin it
 on the LEFT (base) side instead. `suggestion` blocks aren't applicable
 (GitHub only commits suggestions from the RIGHT side), so the body uses a
 plain code block:
@@ -805,8 +806,8 @@ can't straddle sides.
 - The total number of inline comments has a soft cap of ~30. If you would
   exceed that, consolidate the lowest-severity findings into the review body
   with file/line references but no inline comment.
-- A given inline comment may contain at most one ```` ```suggestion ```` block.
-  Prose context blocks (e.g. ```` ```rust ````) are fine alongside it.
+- A given inline comment may contain at most one ` ```suggestion ` block.
+  Prose context blocks (e.g. ` ```rust `) are fine alongside it.
 - If the user changed an emoji tag during triage, the comment uses the new tag.
 - Don't post suggestions on lines outside the RIGHT side of the diff — they'll
   fail GitHub's "position could not be resolved" check. Comments about
@@ -838,7 +839,7 @@ suggestion A only compiles because suggestion B was also applied, the
 agent has labelled A as verified but A-alone can break the build. So the
 inner loop tests each suggestion against a clean worktree first; a final
 batch pass (all approved suggestions applied together) is a nice-to-have to
-catch *interactions*, but the per-suggestion runs are the real gate:
+catch _interactions_, but the per-suggestion runs are the real gate:
 
 ```bash
 # Confirm clean starting state at $WT (HEAD = $HEAD_REF, status empty).
@@ -931,8 +932,9 @@ gate when **any** of these is true:
 - The suggestion touches a `#[cfg(test)]` module, a test, or a feature gate.
 - The finding is 🔧 wrench (blocking) — release-blocking fixes must clear the
   release gate.
-- The touched code is shared (`crates/trusted-server-core/src/{auction,ec,
-  http_util,publisher,html_processor,settings,constants}` and similar).
+- The touched code is shared
+  (`crates/trusted-server-core/src/{auction,ec,http_util,publisher,html_processor,settings,constants}`
+  and similar).
 - The suggestion changes program behaviour and the agent prefers to ship it
   **without** the compile-verified-only disclaimer.
 
@@ -967,11 +969,11 @@ at build time. Run the build whenever the suggestion touches files under
 
 **Post-verify drift check (snapshot the approved patch, hard-fail on any
 deviation).** Filename-level comparison isn't enough — a formatter or
-codegen step can change a different range *inside* an approved file, while
+codegen step can change a different range _inside_ an approved file, while
 the posted GitHub suggestion still contains only the originally-approved
 range. The correct check is byte-exact: snapshot the full patch immediately
 after applying the approved suggestions but **before** running any
-verification command, then compare with the patch *after* verification. Any
+verification command, then compare with the patch _after_ verification. Any
 delta — different range in the same file, an extra tracked file, a
 whitespace change in `Cargo.toml` from a build script — means verification
 mutated the tree beyond what the agent approved, and the suggestion as
@@ -1060,7 +1062,7 @@ After cleanup, the worktree's HEAD must be at `$HEAD_REF`
 
 Step 8 splits into two halves. **8a** is mode-agnostic: determine the verdict
 and compose the review body + inline comments. **8b** is PR-only: post the
-review to GitHub. BRANCH-* modes still produce the artifact in 8a (so step 10
+review to GitHub. BRANCH-\* modes still produce the artifact in 8a (so step 10
 has a "would-have-been verdict" to report) but skip 8b — the artifact is
 rendered into the chat instead.
 
@@ -1164,14 +1166,14 @@ inline comment", not "this finding is out of scope".
 
 Omit any section that has no findings — don't include empty headings.
 
-In BRANCH-* modes (`[ -z "$NUMBER" ]`) the artifact is now complete: render it
+In BRANCH-\* modes (`[ -z "$NUMBER" ]`) the artifact is now complete: render it
 into the chat exactly as the GitHub UI would have shown it (body markdown
 followed by each inline comment, labelled with the file:line it would have
 anchored to). Stop after rendering — there is no review to submit.
 
 #### 8b. Submit the GitHub review (PR mode only — `[ -n "$NUMBER" ]`)
 
-Skip this entire sub-step in BRANCH-* modes.
+Skip this entire sub-step in BRANCH-\* modes.
 
 ##### Re-check the PR head before submission
 
@@ -1197,7 +1199,7 @@ fi
 
 If `SKIP_SUBMISSION` is set, the agent **must skip every command in the
 "Submit the review" sub-section below**, render the artifact in chat (the
-same way BRANCH-* mode would in 8a), and report `submission skipped:
+same way BRANCH-\* mode would in 8a), and report `submission skipped:
 $SKIP_REASON` as the stop reason in step 10. The agent does not restart
 inside the same invocation — single-invocation = single pass; the user
 re-invokes if they want another pass against the new head.
@@ -1218,7 +1220,7 @@ fi
 ```
 
 When `STOP_SUBMISSION=1`, render the composed artifact into chat exactly the
-way BRANCH-* mode does in 8a, report `submission skipped: $SKIP_REASON` per
+way BRANCH-\* mode does in 8a, report `submission skipped: $SKIP_REASON` per
 step 10, and do not run any of the `gh api` submit/delete commands below.
 
 Use the GitHub API to submit. Handle these known issues:
@@ -1307,7 +1309,7 @@ Use the GitHub API to submit. Handle these known issues:
    fallthrough, no `exit 1`.
 
    **Re-gate after the pending-review check.** The `SKIP_SUBMISSION` guard
-   at the top of "Submit the review" runs *before* the pending-review check,
+   at the top of "Submit the review" runs _before_ the pending-review check,
    so a `keep` decision must be caught by a second gate immediately after
    the case block — otherwise the JSON-assembly / `gh api … -X POST` below
    would still run:
@@ -1349,7 +1351,7 @@ head-recheck above.
 
 **Invariant — never heredoc-interpolate user content into the payload.**
 Inline-comment bodies routinely contain `$`, backticks, backslashes,
-quoted code, and the literal `` ```suggestion `` fence. A `cat <<EOF`
+quoted code, and the literal ` ```suggestion ` fence. A `cat <<EOF`
 heredoc shell-expands or mangles those before they reach GitHub. Build
 `review.json` with a structured serializer that reads body and
 comment-body strings as **raw values**, never interpolated into a shell

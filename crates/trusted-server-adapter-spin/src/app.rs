@@ -713,6 +713,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 }
                 let mut ec_context = build_ec_context(&s.settings, &services, &req);
                 let auction = AuctionDispatch {
+                    integration_registry: &s.registry,
                     orchestrator: &s.orchestrator,
                     slots: s.settings.creative_opportunity_slots(),
                     registry: None,
@@ -836,6 +837,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             } else {
                 let mut ec_context = build_ec_context(&state.settings, &services, &req);
                 let auction = AuctionDispatch {
+                    integration_registry: &state.registry,
                     orchestrator: &state.orchestrator,
                     slots: state.settings.creative_opportunity_slots(),
                     registry: None,
@@ -1392,6 +1394,13 @@ mod tests {
             resp.status().as_u16(),
             200,
             "GET /health must return 200 from the startup fallback"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-ts-version")
+                .and_then(|v| v.to_str().ok()),
+            trusted_server_core::constants::TS_GIT_VERSION,
+            "startup-fallback /health should report the compiled-in git version"
         );
         let body = resp.into_body().into_bytes().unwrap_or_default();
         assert_eq!(

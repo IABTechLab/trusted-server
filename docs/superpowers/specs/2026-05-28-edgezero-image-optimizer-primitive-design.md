@@ -9,7 +9,7 @@
 ## Goal
 
 Make the Image Optimizer support introduced for asset routes easy to extract
-into `~/Projects/stackpop/edgezero` without moving Trusted Server-specific asset
+into the EdgeZero repository (`IABTechLab/edgezero`) without moving Trusted Server-specific asset
 routing, S3 authentication, or profile-table behavior.
 
 The extraction should let a Trusted Server asset route produce a closed image

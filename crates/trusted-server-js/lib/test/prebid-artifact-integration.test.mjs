@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { JSDOM, requestInterceptor } from 'jsdom';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
+import { moduleBuildOptions } from '../build-module-options.mjs';
 import { main, verifyPrebidPackageVersion } from '../build-prebid-external.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -54,29 +55,13 @@ beforeAll(async () => {
   });
 
   const { build } = await import('vite');
-  await build({
-    configFile: false,
-    root: libDir,
-    build: {
-      emptyOutDir: false,
+  await build(
+    moduleBuildOptions({
+      name: 'prebid',
+      entryPath: path.join(libDir, 'src', 'integrations', 'prebid', 'index.ts'),
       outDir: outputDirectory,
-      assetsDir: '.',
-      sourcemap: false,
-      minify: 'esbuild',
-      rollupOptions: {
-        input: path.join(libDir, 'src', 'integrations', 'prebid', 'index.ts'),
-        output: {
-          format: 'iife',
-          dir: outputDirectory,
-          entryFileNames: 'tsjs-prebid.js',
-          inlineDynamicImports: true,
-          extend: false,
-          name: 'tsjs_prebid',
-        },
-      },
-    },
-    logLevel: 'warn',
-  });
+    })
+  );
   shimCode = fs.readFileSync(path.join(outputDirectory, 'tsjs-prebid.js'), 'utf8');
 }, 240_000);
 

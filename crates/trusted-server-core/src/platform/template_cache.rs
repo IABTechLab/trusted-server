@@ -24,11 +24,14 @@ use std::collections::HashSet;
 
 use crate::creative_opportunities::AssemblyMode;
 
-/// Version of the transform that produced a cached template.
+/// Version of the cached entry format and assembly contract.
 ///
-/// Bump on **any** change to what the transform emits. Without it a deploy reads
-/// yesterday's template shape and assembles against markers that moved, which fails
-/// as a rendering bug far from its cause rather than as a cache miss.
+/// The build digest in the template fingerprint already isolates every core change,
+/// including the metadata encoding, the seam marker, and Rust-inlined head programs,
+/// so those need no bump. Bump this only when code outside that digest changes
+/// template compatibility, such as entry storage in
+/// `trusted-server-adapter-fastly/src/template_cache.rs` or the Rust side of
+/// `trusted-server-js`, unless another fingerprint input already isolates the change.
 ///
 /// | Version | Transform |
 /// | ------- | --------- |
@@ -78,8 +81,9 @@ pub struct TemplateCacheKey {
     pub vary_values: Vec<VaryHeaderValues>,
     /// Bounded cookie variants, sorted by exact case-sensitive name. Never reader IDs.
     pub cookie_values: Vec<TemplateCookieValue>,
-    /// Digest of every setting that can shape the transformed template plus the tsjs
-    /// bundle. Over-invalidating is safe; omitting a shaping input cross-serves bytes.
+    /// Digest of every setting that can shape the transformed template, the tsjs
+    /// bundles, and the core build inputs. Over-invalidating is safe; omitting a
+    /// shaping input cross-serves bytes.
     pub template_fingerprint: String,
     /// See [`TEMPLATE_SCHEMA_VERSION`].
     pub schema_version: u32,

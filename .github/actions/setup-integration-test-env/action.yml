@@ -34,15 +34,22 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Retrieve Rust version
-      id: rust-version
-      shell: bash
-      run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
-
     - name: Retrieve Node.js version
       id: node-version
       shell: bash
       run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+    # Pin Node before anything compiles trusted-server-core: its dependency on
+    # trusted-server-js runs the TSJS build with the `npm` on PATH. That covers
+    # the Rust builds below and the callers' later cargo steps, and callers use
+    # this Node directly too (e.g. `npm install -g wrangler`), so keep the step
+    # unconditional.
+    - name: Use Node.js for the TSJS build
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ steps.node-version.outputs.node-version }}
+        cache: npm
+        cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
 
     - name: Retrieve Viceroy version
       id: viceroy-version
@@ -52,11 +59,15 @@ runs:
       run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
     - name: Set up Rust toolchain
-      uses: actions-rust-lang/setup-rust-toolchain@v1
+      uses: ./.github/actions/setup-rust
       with:
-        toolchain: ${{ steps.rust-version.outputs.rust-version }}
         target: wasm32-wasip1
-        cache-shared-key: cargo-${{ runner.os }}
+        # Restore the axum job's main cache: it builds the same axum debug and
+        # Fastly release WASM artifacts. Restore only: test-axum owns this key,
+        # and rust-cache never replaces an exact-match key, so a partial cache
+        # saved by a workflow_dispatch run on main would stick.
+        cache-key: cargo-axum
+        save-cache: "false"
 
     - name: Cache Viceroy binary
       if: ${{ inputs.install-viceroy == 'true' }}

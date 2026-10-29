@@ -72,7 +72,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 command -v viceroy >/dev/null || {
-  echo "viceroy not found. Install: cargo install viceroy --version 0.17.0 --locked" >&2
+  echo "viceroy not found. Install: cargo install viceroy --version 0.21.0 --locked" >&2
   exit 1
 }
 command -v node >/dev/null || {
@@ -396,15 +396,15 @@ import sys
 
 with open(sys.argv[1], "a") as manifest:
     manifest.write('''
-[[local_server.secret_stores.ts_secrets]]
+[[local_server.secret_stores.trusted_server_secrets]]
 key = "publisher_proxy_secret"
 data = "fictional-local-publisher-proxy-secret-value"
 
-[[local_server.secret_stores.ts_secrets]]
+[[local_server.secret_stores.trusted_server_secrets]]
 key = "ec_passphrase"
 data = "fictional-local-ec-passphrase-secret-value"
 
-[[local_server.secret_stores.ts_secrets]]
+[[local_server.secret_stores.trusted_server_secrets]]
 key = "handler_password"
 data = "fictional-local-handler-password-secret-value"
 ''')
@@ -569,7 +569,7 @@ else
       GPT_BUNDLE="$candidate"
     fi
   done < <(find "$REPO_ROOT/target/wasm32-wasip1/debug/build" \
-    -path '*/out/tsjs-gpt.js' -type f -print0)
+    -path '*/out/tsjs-dist/tsjs-gpt.js' -type f -print0)
   if [ -z "$GPT_BUNDLE" ] || [ ! -s "$GPT_BUNDLE" ]; then
     bad "the generated GPT module cannot be found"
   else

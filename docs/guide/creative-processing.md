@@ -18,41 +18,34 @@ publisher's first-party domain. This provides:
 
 ## Browser-facing first-party origin
 
-Set `[publisher].public_origin` to the browser-reachable Trusted Server origin, for example `https://ads.publisher.example`. Rewritten proxy, click, CSS, `srcset`, and injected creative TSJS URLs are absolute on that origin. When it is omitted, Trusted Server uses `https://{publisher.domain}` for compatibility. Relative creative source URLs and excluded third-party URLs remain unchanged. The publisher SSAT/page-bids path retains its explicit request-origin override and does not inject the creative bundle.
+Set `[publisher].public_origin` to the actual browser-facing Trusted Server
+endpoint, for example `https://ads.publisher.example` or
+`http://localhost:8080` for direct local development. Rewritten proxy, click,
+CSS, `srcset`, and injected creative TSJS URLs are absolute on that origin.
+Omission keeps old config files deserializable but changes output to
+`https://{publisher.domain}`. Unlike root-relative output, this default does
+not preserve the serving page's scheme, host, or port. Relative creative source
+URLs and excluded third-party URLs remain unchanged. The publisher
+SSAT/page-bids path retains its explicit request-origin override and does not
+inject the creative bundle. See [Publisher configuration](/guide/configuration#publisher-configuration)
+for binary/config upgrade and rollback sequencing.
 
 ## How It Works
 
-```
-┌──────────────────────────────────────────────────────┐
-│  Original Creative HTML                              │
-│  <img src="https://tracker.com/pixel.gif">          │
-│  <iframe src="https://cdn.com/ad.html">             │
-│  <style> .bg { background: url(cdn.com/bg.jpg); }   │
-└──────────────────────────────────────────────────────┘
-                        ↓
-┌──────────────────────────────────────────────────────┐
-│  Trusted Server Processing (rewrite-enabled)         │
-│  1. Sanitize POST /auction adm when opted in         │
-│  2. Parse HTML with streaming processor              │
-│  3. Detect absolute/protocol-relative URLs           │
-│  4. Generate signed proxy URLs                       │
-│  5. Rewrite in-place and inject TSJS                  │
-└──────────────────────────────────────────────────────┘
-                        ↓
-┌──────────────────────────────────────────────────────┐
-│  Rewritten Creative HTML                             │
-│  <img src="https://ads.publisher.example/first-party/proxy?tsurl=...&tstoken=sig">│
-│  <iframe src="https://ads.publisher.example/first-party/proxy?tsurl=...&token=sig">│
-│  <style> .bg { background: url(https://ads.publisher.example/first-party/proxy...) }│
-└──────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+  original["Original creative HTML<br/>External image, iframe, and CSS URLs"]
+  processing["Trusted Server processing<br/>Optionally sanitize auction adm<br/>Parse HTML and detect eligible URLs<br/>Sign proxy and click URLs<br/>Rewrite and inject creative TSJS"]
+  rewritten["Rewritten creative HTML<br/>Absolute proxy, click, and TSJS URLs on<br/>https://ads.publisher.example"]
+  original --> processing --> rewritten
 ```
 
 ## Processing Triggers
 
 The creative rewriters are invoked by independent delivery paths:
 
-1. **Auction `adm`**: Winning-bid HTML returned by `POST /auction` is optionally sanitized (`[auction].sanitize_creatives`, opt-in, default `false`) and rewritten (`[auction].rewrite_creatives`, default `true`).
-2. **First-party proxy**: Non-streaming `text/html` and `text/css` responses fetched through `/first-party/proxy` are rewritten independently of the auction setting.
+1. **Auction `adm`**: Winning-bid HTML returned by `POST /auction` is optionally sanitized (`[auction].sanitize_creatives`, opt-in, default `false`) and rewritten (`[auction].rewrite_creatives`, default `true`). Click-through links are wrapped according to `[auction].rewrite_clicks`, which follows `rewrite_creatives` when unset.
+2. **First-party proxy**: Non-streaming `text/html` and `text/css` responses fetched through `/first-party/proxy` are rewritten independently of the auction setting. An explicitly set `[auction].rewrite_clicks` also applies to links in proxied HTML.
 3. **Integration processing**: Publisher HTML integrations use their own registration and configuration controls.
 
 ::: info Streaming Mode
@@ -61,15 +54,17 @@ When `with_streaming()` is enabled in `ProxyRequestConfig`, proxied HTML/CSS pro
 
 ## Auction Rewrite Control
 
-Two independent auction settings control the processing applied to winning-bid
-`adm` returned by `POST /auction` and delivered through the publisher
-SSAT/page-bids path. Sanitization is opt-in (default `false`); rewriting is
-enabled by default:
+Three auction settings control the processing applied to winning-bid `adm`
+returned by `POST /auction` and delivered through the publisher SSAT/page-bids
+path. Sanitization is opt-in (default `false`) and asset rewriting is enabled
+by default. Click wrapping is controlled by `rewrite_clicks`, which follows
+`rewrite_creatives` when unset; see [Assets and clicks](#assets-and-clicks).
 
 ```toml
 [auction]
 sanitize_creatives = false
 rewrite_creatives = true
+# rewrite_clicks unset: follows rewrite_creatives
 ```
 
 Regardless of mode, a creative larger than the 1 MiB per-creative cap is
@@ -77,9 +72,9 @@ rejected and its `adm` is dropped.
 
 | `sanitize_creatives` | `rewrite_creatives` | Auction winning-bid `adm` behavior                                                                                                                                                                                                                                                                               |
 | -------------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `false` (default)    | `false`             | Deliver the creative exactly as the bidder returned it (subject to the size cap).                                                                                                                                                                                                                                |
-| `true`               | `false`             | Strip executable markup (`script`/`object`/`embed`/`form`, event handlers) with its inner content, then deliver without rewriting. Sanitizer-accepted external resource, click, and inline CSS URLs remain direct.                                                                                               |
-| `false`              | `true` (default)    | Rewrite eligible resource/CSS and click URLs in the raw bidder markup to signed first-party endpoints, removing any bidder `<base>` element. Executable markup is preserved.                                                                                                                                     |
+| `false` (default)    | `false`             | Asset URLs stay direct. With `rewrite_clicks` unset or `false`, deliver the creative exactly as the bidder returned it (subject to the size cap); with `rewrite_clicks = true`, wrap links as described in [Assets and clicks](#assets-and-clicks).                                                              |
+| `true`               | `false`             | Strip executable markup (`script`/`object`/`embed`/`form`, event handlers) with its inner content, then deliver without asset rewriting. Sanitizer-accepted external resource and inline CSS URLs remain direct; links follow `rewrite_clicks` and stay direct when it is unset or `false`.                      |
+| `false`              | `true` (default)    | Rewrite eligible resource/CSS URLs in the raw bidder markup to signed first-party endpoints, dropping any bidder `<base>` URL. Links are wrapped unless `rewrite_clicks = false`. Executable markup is preserved.                                                                                                |
 | `true`               | `true`              | Sanitize first, then rewrite. `POST /auction` emits absolute endpoints on the configured public origin and injects creative TSJS exactly once, whether or not the bidder supplied a `<body>`; SSAT/page-bids retains its request-origin override for its foreign-origin renderer and does not inject the bundle. |
 
 ::: warning Sanitization blanks script-based creatives
@@ -93,6 +88,67 @@ publisher origin. Sanitizer acceptance is not a host allowlist; ordinary
 accepted HTTP(S) URLs may cause the browser to contact external creative hosts
 directly.
 :::
+
+### Assets and clicks
+
+`rewrite_creatives` governs asset URLs. `rewrite_clicks` governs click-through
+links and follows `rewrite_creatives` when unset:
+
+```toml
+[auction]
+rewrite_creatives = true
+# Unset: follows rewrite_creatives. Set false to keep landing links direct.
+# rewrite_clicks = false
+```
+
+| Assets (`rewrite_creatives`) | Clicks (`rewrite_clicks`) | Asset URLs           | Links                                 | `<base>`       | TSJS on `POST /auction` |
+| ---------------------------- | ------------------------- | -------------------- | ------------------------------------- | -------------- | ----------------------- |
+| `true`                       | `true` or unset           | `/first-party/proxy` | `/first-party/click` + `data-tsclick` | `href` dropped | injected                |
+| `true`                       | `false`                   | `/first-party/proxy` | direct                                | `href` dropped | injected                |
+| `false`                      | `true`                    | direct               | `/first-party/click` + `data-tsclick` | `href` dropped | injected                |
+| `false`                      | `false` or unset          | direct               | direct                                | kept           | not injected            |
+
+The endpoint paths in this table are emitted as absolute URLs on
+`publisher.public_origin`, falling back to `https://{publisher.domain}`.
+SSAT/page-bids follows the same table with its request-origin override and
+never injects TSJS.
+The `<base>` column assumes `sanitize_creatives = false`; the sanitizer removes
+`<base>` entirely before the rewrite pass.
+`exclude_domains` applies to both assets and links.
+
+The client-side `tsCreativeConfig.clickGuard` flag is separate. `rewrite_clicks`
+decides whether the server emits signed click URLs; `clickGuard` decides whether
+the creative runtime re-signs them after creative script changes their query
+parameters. With `rewrite_clicks` off and `rewrite_creatives` on, the injected
+guard installs its listeners but never acts, because no link carries
+`data-tsclick`.
+
+Both switches also decide where the visitor's EC ID goes. `/first-party/click`
+appends the request's `ts-ec` value to the landing URL and logs the click with
+it, and `/first-party/proxy` appends it to proxied asset requests. With
+`rewrite_clicks = false`, creative links stop forwarding it on every path; with
+`rewrite_clicks = true` and `rewrite_creatives = false`, landing pages receive
+it while assets load direct. Neither switch is a consent control: EC issuance
+is consent-gated, and both endpoints forward whatever EC ID the request
+carries.
+
+With `rewrite_creatives = false` and `rewrite_clicks = true`, `POST /auction`
+still injects TSJS, but this does not reopen asset proxying in practice:
+`/auction` creatives render in a sandbox without `allow-same-origin`, so the
+render guard skips `/first-party/sign` and script-inserted assets load direct.
+`/first-party/sign` itself is not gated by `rewrite_creatives`.
+
+Whenever either switch is on, a bidder `<base>` loses its `href` and keeps
+`target`; a `<base>` without `target` is removed. With `rewrite_creatives =
+false` and `rewrite_clicks = true`, relative asset URLs therefore no longer
+resolve against the bidder base, so bidders should use absolute asset URLs.
+With `sanitize_creatives = true` the sanitizer removes `<base>` entirely first.
+
+On `POST /auction` and in HTML fetched through `/first-party/proxy`, the
+injected click guard navigates a `data-tsclick` link
+using only the link's own `target`, not a kept `<base target>`. A creative that
+relies on `<base target="_blank">` can therefore open wrapped links in the frame
+and unwrapped links in a new tab; give links an explicit `target` to avoid this.
 
 ::: info Runtime protections inside the sandboxed creative iframe
 Creatives rendered by Trusted Server's own path run in a sandboxed iframe
@@ -134,9 +190,10 @@ ships without them, so a processed or refused creative can never be re-fetched
 raw.
 :::
 
-Neither setting affects HTML/CSS response rewriting under
-`/first-party/proxy`. The publisher SSAT/page-bids path is a production creative
-path and follows both settings. `[debug].inject_adm_for_testing` controls only the
+`rewrite_creatives` and `sanitize_creatives` do not affect HTML/CSS rewriting
+under `/first-party/proxy`; an explicit `rewrite_clicks` does apply to links
+there. The publisher SSAT/page-bids path is a production creative path and
+follows all three settings. `[debug].inject_adm_for_testing` controls only the
 additional `debug_bid` diagnostic blob and testing-only direct GAM replacement;
 it does not control whether the processed `adm` is present.
 
@@ -190,7 +247,7 @@ it does not control whether the processed `adm` is present.
 <script src="https://cdn.example.com/tracker.js"></script>
 
 <!-- Rewritten -->
-<script src="/first-party/proxy?tsurl=https://cdn.example.com/tracker.js&tstoken=sig"></script>
+<script src="https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/tracker.js&tstoken=sig"></script>
 ```
 
 ### Media Elements
@@ -212,7 +269,7 @@ it does not control whether the processed `adm` is present.
 <!-- Rewritten -->
 <video>
   <source
-    src="/first-party/proxy?tsurl=https://cdn.example.com/video.mp4&tstoken=sig"
+    src="https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/video.mp4&tstoken=sig"
     type="video/mp4"
   />
 </video>
@@ -236,10 +293,10 @@ it does not control whether the processed `adm` is present.
 
 <!-- Rewritten -->
 <object
-  data="/first-party/proxy?tsurl=https://example.com/flash.swf&tstoken=sig"
+  data="https://ads.publisher.example/first-party/proxy?tsurl=https://example.com/flash.swf&tstoken=sig"
 ></object>
 <embed
-  src="/first-party/proxy?tsurl=https://example.com/media.swf&tstoken=sig"
+  src="https://ads.publisher.example/first-party/proxy?tsurl=https://example.com/media.swf&tstoken=sig"
 />
 ```
 
@@ -259,7 +316,7 @@ it does not control whether the processed `adm` is present.
 
 <!-- Rewritten -->
 <iframe
-  src="/first-party/proxy?tsurl=https://advertiser.com/creative.html&tstoken=sig"
+  src="https://ads.publisher.example/first-party/proxy?tsurl=https://advertiser.com/creative.html&tstoken=sig"
 ></iframe>
 ```
 
@@ -292,11 +349,11 @@ If the iframe content itself contains HTML, it will be processed recursively. Ea
 <!-- Rewritten -->
 <link
   rel="stylesheet"
-  href="/first-party/proxy?tsurl=https://cdn.example.com/styles.css&tstoken=sig"
+  href="https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/styles.css&tstoken=sig"
 />
 <link
   rel="preload"
-  href="/first-party/proxy?tsurl=https://cdn.example.com/font.woff2&tstoken=sig"
+  href="https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/font.woff2&tstoken=sig"
   as="font"
 />
 ```
@@ -311,15 +368,18 @@ If the iframe content itself contains HTML, it will be processed recursively. Ea
 
 **Rewrite Mode**: Uses `/first-party/click` for direct redirects
 
+**Controlled by**: `[auction].rewrite_clicks` (follows `rewrite_creatives` when unset; HTML fetched through `/first-party/proxy` keeps wrapping links when unset)
+
 **Example**:
 
 ```html
 <!-- Original -->
-<a href="https://advertiser.com/product?id=123">Buy Now</a>
+<a href="https://advertiser.example.com/product?id=123">Buy Now</a>
 
 <!-- Rewritten -->
 <a
-  href="/first-party/click?tsurl=https://advertiser.com/product&id=123&tstoken=sig"
+  href="https://ads.publisher.example/first-party/click?tsurl=https://advertiser.example.com/product&id=123&tstoken=sig"
+  data-tsclick="https://ads.publisher.example/first-party/click?tsurl=https://advertiser.example.com/product&id=123&tstoken=sig"
   >Buy Now</a
 >
 ```
@@ -349,10 +409,10 @@ Anchors (`<a>`) use `/first-party/click` for 302 redirects, avoiding content dow
 <!-- Rewritten -->
 <svg>
   <image
-    href="/first-party/proxy?tsurl=https://cdn.example.com/icon.svg&tstoken=sig"
+    href="https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/icon.svg&tstoken=sig"
   />
   <use
-    xlink:href="/first-party/proxy?tsurl=https://cdn.example.com/sprite.svg&tstoken=sig#icon"
+    xlink:href="https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/sprite.svg&tstoken=sig#icon"
   />
 </svg>
 ```
@@ -370,7 +430,7 @@ Anchors (`<a>`) use `/first-party/click` for 302 redirects, avoiding content dow
 <div style="background: url(https://cdn.example.com/bg.png) no-repeat;">
   <!-- Rewritten -->
   <div
-    style="background: url(/first-party/proxy?tsurl=https://cdn.example.com/bg.png&tstoken=sig) no-repeat;"
+    style="background: url(https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/bg.png&tstoken=sig) no-repeat;"
   ></div>
 </div>
 ```
@@ -397,10 +457,10 @@ Anchors (`<a>`) use `/first-party/click` for 302 redirects, avoiding content dow
 <!-- Rewritten -->
 <style>
   .header {
-    background-image: url(/first-party/proxy?tsurl=https://cdn.example.com/header.jpg&tstoken=sig);
+    background-image: url(https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/header.jpg&tstoken=sig);
   }
   .logo {
-    background: url('/first-party/proxy?tsurl=https://cdn.example.com/logo.png&tstoken=sig');
+    background: url('https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/logo.png&tstoken=sig');
   }
 </style>
 ```
@@ -433,7 +493,7 @@ Anchors (`<a>`) use `/first-party/click` for 302 redirects, avoiding content dow
 ```
 Original: //cdn.example.com/script.js
 Normalized: https://cdn.example.com/script.js
-Rewritten: /first-party/proxy?tsurl=https://cdn.example.com/script.js&tstoken=sig
+Rewritten: https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/script.js&tstoken=sig
 ```
 
 ### Relative URLs
@@ -621,8 +681,10 @@ Properties can have multiple `url()` values:
 /* Rewritten */
 .element {
   background:
-    url(/first-party/proxy?tsurl=https://cdn.com/top.png&tstoken=sig1) top,
-    url(/first-party/proxy?tsurl=https://cdn.com/bottom.png&tstoken=sig2) bottom;
+    url(https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.com/top.png&tstoken=sig1)
+      top,
+    url(https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.com/bottom.png&tstoken=sig2)
+      bottom;
 }
 ```
 
@@ -635,7 +697,7 @@ CSS `@import` with URLs:
 @import url(https://fonts.googleapis.com/css?family=Roboto);
 
 /* Rewritten */
-@import url(/first-party/proxy?tsurl=https://fonts.googleapis.com/css?family=Roboto&tstoken=sig);
+@import url(https://ads.publisher.example/first-party/proxy?tsurl=https://fonts.googleapis.com/css?family=Roboto&tstoken=sig);
 ```
 
 ## Exclude Domains
@@ -655,16 +717,20 @@ exclude_domains = [
 
 ### Pattern Matching
 
-**Wildcard Patterns**: `*` matches any subdomain
+Matching is case-insensitive. Entries are trimmed and lowercased at load.
+
+**Wildcard Patterns**: `*.` matches the base domain and any subdomain
 
 ```
 Pattern: *.cdn.example.com
 Matches:
   ✅ assets.cdn.example.com
   ✅ images.cdn.example.com
-  ❌ cdn.example.com (no subdomain)
+  ✅ cdn.example.com (apex also matches)
   ❌ cdn.example.com.evil.com (different domain)
 ```
+
+Matching is case-insensitive.
 
 **Exact Patterns**: No `*` requires exact host match
 
@@ -701,6 +767,34 @@ exclude_domains = ["assets.publisher.com"]
 ```
 
 Skip resources already on your domain.
+
+## Include Domains
+
+Limit asset rewriting to hosts you list:
+
+```toml
+[rewrite]
+include_domains = ["assets.example.com", "*.img.example.com"]
+```
+
+- When `include_domains` is empty (the default), every eligible asset URL is
+  proxied.
+- When it is non-empty, only asset URLs whose host matches an entry are
+  rewritten to `/first-party/proxy`. Other assets keep their original URL, load
+  directly, and do not receive the EC ID that proxied fetches append.
+- `exclude_domains` wins when a host matches both lists.
+- Click-through links (`<a href>`, `<area href>`) are not affected. Whether
+  they are wrapped in `/first-party/click` depends only on `rewrite_clicks`
+  (which follows `rewrite_creatives` on the auction paths when unset) and
+  `exclude_domains`.
+- HTML and CSS fetched through `/first-party/proxy` go through the same rewrite
+  pass and follow the same list.
+- `/first-party/sign` declines off-list hosts with a non-`403` error, so the
+  creative runtime loads them directly.
+
+Patterns use the same syntax as `exclude_domains`. Entries that can never
+equal a URL host, such as ones with a scheme, port, path or non-ASCII name, fail
+validation; see [Pattern Matching](/guide/configuration#pattern-matching).
 
 ## Integration Hooks
 
@@ -751,9 +845,16 @@ impl IntegrationScriptRewriter for NextJsIntegration {
 
 **Actions**:
 
-- `keep()` - Leave script unchanged
-- `replace(content)` - Replace script content
-- `remove_node()` - Delete script element
+- `keep()` - Preserve the current working text fragment
+- `replace(content)` - Pass replacement text to subsequent matching stages
+- `remove_node()` - Suppress this text fragment, not the `<script>` element
+
+Matching script rewriters compose in registration order. Each receives the
+previous stage's output, including empty suppressed text, with the original
+final-fragment flag. Downstream stages still run after `remove_node()` and may
+flush buffered text. Only the composed result is applied to the parser fragment;
+script replacements are emitted as raw source, not HTML-entity-escaped text.
+Selectors must match `<script>` elements; non-script text hooks are unsupported.
 
 ### Head Injectors
 
@@ -802,6 +903,11 @@ The Trusted Server JavaScript (TSJS) library is automatically injected:
 
 **Timing**: Injected **once per HTML response** before any other scripts.
 
+The tag above illustrates publisher HTML injection. Creative HTML injection
+uses an absolute URL such as
+`https://ads.publisher.example/static/tsjs=tsjs-unified.min.js?v=<hash>`.
+Changing the URL authority does not change the selected modules or hash.
+
 ### Integration bundles
 
 The integration registry selects TSJS modules by enabled integration ID. A
@@ -816,14 +922,17 @@ accept an arbitrary asset name from an integration registration.
 
 ### Bundle Types
 
-Each integration is built as a separate IIFE at compile time (`crates/trusted-server-js/dist/`):
+Each integration is built as a separate IIFE at compile time (into Cargo's `OUT_DIR`; `npm run build` writes the same files to `crates/trusted-server-js/dist/`):
 
 - `tsjs-core.js` — Core API (always included)
 - `tsjs-creative.js` — Creative click-guard and tracking
 - Prebid is built externally with `build-prebid-external.mjs` and served through `/integrations/prebid/bundle.js`
 - `tsjs-lockr.js`, `tsjs-permutive.js`, `tsjs-didomi.js`, `tsjs-datadome.js`, `tsjs-testlight.js` — Other integrations
 
-At runtime, the server concatenates `tsjs-core.js` + the modules for enabled integrations. The URL stays `/static/tsjs=tsjs-unified.min.js?v=<hash>` for backward compatibility.
+At runtime, the server concatenates `tsjs-core.js` + the modules for enabled integrations.
+The path stays `/static/tsjs=tsjs-unified.min.js?v=<hash>`. Injected creative
+script URLs prefix that path with the configured public origin. Bundle
+selection and hash calculation are unchanged.
 
 ## Performance Optimization
 
@@ -927,8 +1036,8 @@ fn test_image_src_rewrite() {
 
 **Relative URLs Not Working**:
 
-- Ensure origin response includes proper `<base>` tag
-- Or convert to absolute URLs before rewriting
+- The rewriter drops a `<base>` `href`, so relative URLs do not resolve against it
+- Convert relative URLs to absolute URLs before rewriting
 
 **Data URIs Being Rewritten**:
 

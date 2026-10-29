@@ -16,29 +16,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
-        shell: bash
-
       - name: Retrieve Viceroy version
         id: viceroy-version
         # `.tool-versions` is the single source of truth so this workflow and
         # `.github/actions/setup-integration-test-env/action.yml` can't drift.
-        run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Retrieve Node.js version
         id: node-version
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-wasip1
-          cache-shared-key: cargo-${{ runner.os }}
+          cache-key: cargo-fastly
 
       - name: Cache Viceroy binary
         id: cache-viceroy
@@ -51,13 +45,18 @@ jobs:
         if: steps.cache-viceroy.outputs.cache-hit != 'true'
         run: cargo install viceroy --version "${{ steps.viceroy-version.outputs.viceroy-version }}" --locked --force
 
-      - name: Use Node.js for the served-seam contract
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build and the served-seam contract
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
 
       - name: Run tests
         run: cargo test-fastly
+
+      - name: Run tests (reusable-sandbox feature)
+        run: cargo test-fastly-reuse
 
       - name: Run template cache ESI local harness
         run: BID_DELAY=3 ./scripts/template-cache-local-test.sh esi
@@ -68,31 +67,111 @@ jobs:
       - name: Run cache purge harness
         run: BID_DELAY=3 ./scripts/template-cache-local-test.sh purge
 
+  test-fastly-eof:
+    name: HTML EOF runtime (Fastly)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pinned build tool versions
+        id: versions
+        shell: bash
+        run: |
+          echo "viceroy=$(awk '$1 == "viceroy" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+          echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          target: wasm32-wasip1
+          cache-key: cargo-fastly-eof
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.versions.outputs.node }}
+
+      - name: Cache Viceroy binary
+        id: cache-viceroy
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/viceroy
+          key: viceroy-${{ runner.os }}-v${{ steps.versions.outputs.viceroy }}
+
+      - name: Install Viceroy
+        if: steps.cache-viceroy.outputs.cache-hit != 'true'
+        run: cargo install viceroy --version "${{ steps.versions.outputs.viceroy }}" --locked --force
+
+      - name: Verify actual Fastly HTML EOF completion and empty-bid assembly
+        timeout-minutes: 15
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          TMPDIR: ${{ runner.temp }}
+        run: ./scripts/async-html-finalization-local-test.sh fastly --release --auction
+
+      - name: Upload EOF runtime diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastly-html-eof-diagnostics
+          path: ${{ runner.temp }}/trusted-server-finalize-fastly-*/
+          if-no-files-found: ignore
+
   test-axum:
     name: cargo test (axum native)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
-        shell: bash
-
       - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
           # wasm32-wasip1 is required by the "Verify Fastly WASM release
           # build" step below; the axum build and tests are native.
           target: wasm32-wasip1
-          cache-shared-key: cargo-${{ runner.os }}
+          components: clippy
+          cache-key: cargo-axum
+
+      - name: Read pinned Node.js version
+        id: node-version
+        shell: bash
+        run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build and the CLI fixtures
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node-version.outputs.version }}
 
       - name: Build Axum adapter
         run: cargo build -p trusted-server-adapter-axum
 
       - name: Run Axum adapter tests
         run: cargo test-axum
+
+      - name: Verify finalization harness process cleanup
+        run: cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --target x86_64-unknown-linux-gnu --features html-eof-runtime --test html_eof_runtime
+
+      - name: Lint native finalization harness
+        run: cargo clippy --manifest-path crates/trusted-server-integration-tests/Cargo.toml --target x86_64-unknown-linux-gnu --features html-eof-runtime --test html_eof_runtime -- -D warnings
+
+      - name: Verify actual Axum HTML finalization and empty-bid assembly
+        timeout-minutes: 10
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          TMPDIR: ${{ runner.temp }}
+        run: ./scripts/async-html-finalization-local-test.sh axum --auction
+
+      - name: Upload finalization runtime diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: axum-html-finalization-diagnostics
+          path: ${{ runner.temp }}/trusted-server-finalize-axum-*/
+          if-no-files-found: ignore
+
+      - name: Test template build digest inputs (native)
+        run: cargo test -p trusted-server-core --test template_build_digest
 
       - name: Run HTML processor benchmarks (smoke)
         # -- --test runs each benchmark as a regular test (no timing harness) so CI stays fast
@@ -116,23 +195,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
-        shell: bash
-
       - name: Set up Rust toolchain (native + wasm32-unknown-unknown)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-unknown-unknown
-          cache-shared-key: cargo-${{ runner.os }}
+          components: clippy
+          cache-key: cargo-cloudflare
+
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
 
       - name: Check Cloudflare adapter (native host)
         run: cargo check -p trusted-server-adapter-cloudflare
 
       - name: Check Cloudflare adapter (wasm32-unknown-unknown)
         run: cargo check -p trusted-server-adapter-cloudflare --target wasm32-unknown-unknown --features cloudflare
+
+      - name: Lint Cloudflare EOF fixture (WASM)
+        run: cargo clippy -p trusted-server-adapter-cloudflare --target wasm32-unknown-unknown --features cloudflare,test-utils --lib -- -D warnings
 
       - name: Run Cloudflare adapter tests (native host)
         run: cargo test-cloudflare
@@ -143,23 +229,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
-        shell: bash
-
       - name: Set up Rust toolchain (native + wasm32-wasip1)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-wasip1
-          cache-shared-key: cargo-${{ runner.os }}
+          components: clippy
+          cache-key: cargo-spin
+
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
 
       - name: Check Spin adapter (native host)
         run: cargo check -p trusted-server-adapter-spin
 
       - name: Check Spin adapter (wasm32-wasip1)
         run: cargo check-spin
+
+      - name: Lint Spin EOF fixture (WASM)
+        run: cargo clippy -p trusted-server-adapter-spin --target wasm32-wasip1 --features spin,test-utils --lib -- -D warnings
 
       - name: Build Spin adapter release WASM
         # Mirror the Fastly release-build overrides so the artifact embeds usable
@@ -182,17 +275,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
-        shell: bash
-
       - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
           components: clippy, rustfmt
-          cache-shared-key: cargo-${{ runner.os }}
+          cache-key: cargo-parity
+
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
 
       - name: Format check (parity test crate)
         run: cargo fmt --manifest-path crates/trusted-server-integration-tests/Cargo.toml -- --check
@@ -204,44 +300,114 @@ jobs:
         run: cargo clippy --manifest-path crates/trusted-server-integration-tests/Cargo.toml --all-targets -- -D warnings
 
   test-cli:
-    # `trusted-server-cli` is a workspace member, but the workspace default target
-    # is wasm32-wasip1 (see .cargo/config.toml), where the crate is an empty shell
-    # — so the wasm workspace jobs do not exercise its real code. `ts dev proxy` is
-    # a macOS tool (Safari/keychain/networksetup), so validate the crate on macOS
-    # with an explicit native --target that overrides the wasm default.
     name: cargo test (ts CLI, native)
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
-        shell: bash
-
       - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
           components: "clippy, rustfmt"
-          cache-shared-key: cargo-cli-${{ runner.os }}
+          cache-key: cargo-cli
+
+      - name: Read pinned Node.js version
+        id: node-version
+        shell: bash
+        run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build and the CLI fixtures
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node-version.outputs.version }}
 
       # No separate `cargo fmt` here: `trusted-server-cli` is a workspace member,
       # so the main `cargo fmt --all` job already formats it. Clippy still needs a
       # native run — the workspace clippy jobs are wasm/adapter-scoped and never
-      # lint the CLI's host-only code (macOS dev proxy vs Linux audit differ by cfg).
+      # lint the CLI's host-only code, including platform-specific trust operations.
       - name: cargo clippy
         run: |
           cargo clippy --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --all-targets -- -D warnings
 
       - name: Set up Chrome for browser fixture tests
+        if: runner.os == 'macOS'
         id: setup-chrome
         uses: browser-actions/setup-chrome@v1
 
       - name: cargo test
+        if: runner.os == 'Linux'
+        run: |
+          cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')"
+
+      - name: cargo test (browser fixtures)
+        if: runner.os == 'macOS'
         run: ./scripts/test-cli.sh
         env:
           CHROME: ${{ steps.setup-chrome.outputs.chrome-path }}
+
+      - name: Install tools for real NSS trust tests
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes libnss3-tools openssl
+
+      - name: cargo test (real NSS trust)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET="$(rustc -vV | sed -n 's/host: //p')"
+          COUNT="$(cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$TARGET" \
+            --test proxy_trust_linux -- --ignored --list | awk '/: test$/ { count += 1 } END { print count + 0 }')"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No ignored real-NSS tests matched --test proxy_trust_linux" >&2
+            exit 1
+          fi
+          cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$TARGET" \
+            --test proxy_trust_linux -- --ignored
+
+  lint-domains:
+    # Server-side counterpart to the `ts dev install-hooks` pre-commit hook,
+    # which `--no-verify` skips and fresh clones never install: fail the PR
+    # when an added line introduces a non-allowlisted URL host. PR-only, so
+    # direct pushes to main are not linted.
+    name: ts dev lint domains (changed lines)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      # A PR checkout is GitHub's merge commit; depth 2 also fetches its
+      # parents, so `HEAD^1` is the exact base commit the PR merges into.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Set up Rust toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          # Restore `test-cli`'s cache read-only. The action only saves on
+          # main and this job only runs on PRs; `save-cache` keeps it
+          # restore-only if either changes.
+          cache-key: cargo-cli
+          save-cache: "false"
+
+      # Building `ts` compiles trusted-server-core, whose trusted-server-js
+      # build script runs the TSJS build with the `npm` on PATH, so pin Node
+      # first (see #1204).
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+
+      # The `ts` CLI is host-target only; the workspace default is wasm32-wasip1.
+      - name: Lint URL hosts on lines added by this PR
+        run: |
+          cargo run --manifest-path crates/trusted-server-cli/Cargo.toml \
+            --target "$(rustc -vV | sed -n 's/host: //p')" --bin ts -- \
+            dev lint domains --changed-vs HEAD^1 --verbose
 
   test-typescript:
     name: vitest
@@ -255,7 +421,7 @@ jobs:
       - name: Retrieve Node.js version
         id: node-version
         working-directory: .
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Use Node.js
