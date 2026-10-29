@@ -266,7 +266,7 @@ This endpoint is designed for advanced scenarios like A/B testing where you need
 
 ## URL Signing & Validation
 
-Trusted Server signs proxy and click URLs using the publisher `proxy_secret`. Signed URLs include a `tstoken` and may include `tsexp` for expiration.
+Trusted Server signs proxy and click URLs using the implicit `publisher.proxy` credential. Signed URLs include a `tstoken` and may include `tsexp` for expiration.
 
 For the detailed signing algorithm, validation steps, and security notes, see [Proxy Signing](/guide/proxy-signing).
 
@@ -442,14 +442,14 @@ Configure proxy behavior in `trusted-server.toml`:
 
 ```toml
 [publisher]
-domain = "publisher.com"
-cookie_domain = ".publisher.com"
-origin_url = "https://origin.publisher.com"
-proxy_secret = "publisher_proxy_secret"
+domain = "example.com"
+cookie_domain = ".example.com"
+origin_url = "https://origin.example.com"
 ```
 
-`proxy_secret` is the key name in the Trusted Server secret store. Provision a
-high-entropy value of at least 32 characters under `publisher_proxy_secret`.
+Provision the implicit `publisher.proxy` binding through a [reviewed plan](./secrets).
+No credential-name property belongs in TOML. Use a high-entropy value of at
+least 32 bytes, keep it confidential, and recreate state after replacement.
 
 ### Asset Routes
 
@@ -621,7 +621,7 @@ tstoken validation failed: signature mismatch
 
 **Solutions**:
 
-- Verify `proxy_secret` matches signing configuration
+- Verify the loaded `publisher.proxy` binding belongs to the intended deployment
 - Check URL reconstruction includes all parameters in correct order
 - Ensure no URL encoding issues
 
@@ -671,13 +671,13 @@ Response: Returns last redirect response (302/307/308) without following.
 ### Token Security
 
 **Do**:
-✅ Use cryptographically strong `proxy_secret` (32+ bytes random)  
+✅ Use a cryptographically strong proxy credential, at least 32 random bytes
 ✅ Rotate secrets periodically  
 ✅ Validate expiration on all requests  
 ✅ Use constant-time comparison for signatures
 
 **Don't**:
-❌ Expose `proxy_secret` in client-side code  
+❌ Expose the proxy credential in client-side code
 ❌ Reuse secrets across environments  
 ❌ Accept unsigned URLs  
 ❌ Skip validation for "trusted" domains

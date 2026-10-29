@@ -464,7 +464,7 @@ Redirects are followed for 301/302/303/307/308, with at most four hops. Cache
 and CORS are derived from the sanitized upstream response and response
 finalization; there is no endpoint CORS grant or rate limiter. This endpoint
 validates an existing signature—it does not mint one. Signing depends on
-`publisher.proxy_secret`; server-side fetches also enforce
+the loaded `publisher.proxy` binding; server-side fetches also enforce
 `proxy.allowed_domains`.
 
 **Example:**
@@ -534,7 +534,7 @@ returns `403`, an oversized POST returns `413`, and malformed/unsupported URLs
 or JSON use the current shared error mapping. The endpoint sets JSON content
 type but no dedicated cache or CORS policy and has no rate limiter. It mints a
 new proxy signature; it does not validate a caller-supplied `tstoken`.
-Signing depends on `publisher.proxy_secret` and checks
+Signing depends on the loaded `publisher.proxy` binding and checks
 `proxy.allowed_domains` before minting.
 
 **Request Methods:** GET or POST
@@ -593,7 +593,7 @@ attempt to overwrite an existing query parameter uses the shared error
 mapping; oversized bodies return `413`. There is no dedicated CORS grant or
 rate limiter. Rebuild validates the old signature before minting its
 replacement and never permits `tsurl`, `tstoken`, or `tsexp` mutation.
-Validation and re-signing depend on `publisher.proxy_secret`.
+Validation and re-signing depend on the loaded `publisher.proxy` binding.
 
 **Request Body:**
 
@@ -1244,16 +1244,16 @@ Endpoints under protected paths require HTTP Basic Authentication:
 [[handlers]]
 path = "^/_ts/admin"
 username = "admin"
-password = "admin_password"
 ```
 
-`password` is a key in the Trusted Server secret store. Provision the actual
-Basic Authentication password under `admin_password`.
+Provision the generated `handler.password` binding for this exact regex and
+username from a [reviewed plan](./secrets). No password property belongs in TOML.
 
 **Usage:**
 
 ```bash
-curl -u 'admin:<resolved-admin-password>' https://edge.example.com/_ts/admin/keys/rotate
+curl -u admin https://edge.example.com/_ts/admin/keys/rotate
+# curl prompts for the password without placing it on argv.
 ```
 
 **Protected Endpoints:**

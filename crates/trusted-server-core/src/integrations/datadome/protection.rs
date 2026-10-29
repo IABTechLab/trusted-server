@@ -14,14 +14,14 @@ use crate::integrations::{
     HeaderMutation, RequestFilterDecision, RequestFilterEffects, RequestFilterInput,
 };
 use crate::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
+#[cfg(test)]
 use crate::redacted::Redacted;
 
-use super::DataDomeIntegration;
 use super::protection_scope::{
     ProtectionRequestFacts, ProtectionScopeDecision, ProtectionSkipReason,
 };
+use super::{DataDomeIntegration, ResolvedBinding};
 
-const VALIDATE_REQUEST_PATH: &str = "/validate-request";
 const REQUEST_MODULE_NAME: &str = "Trusted-Server-Rust";
 const MODULE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const HEADER_DATADOME_RESPONSE: &str = "x-datadomeresponse";
@@ -79,9 +79,8 @@ impl DataDomeIntegration {
         &self,
         input: RequestFilterInput<'_>,
     ) -> Result<RequestFilterDecision, ProtectionRequestError> {
-        let api_url = self.protection_validate_url();
-        let backend_name = self
-            .ensure_protection_backend(input.services, &api_url)
+        let api_url = self
+            .protection_validate_url()
             .map_err(ProtectionRequestError::Setup)?;
         let server_side_key = self
             .server_side_key()
@@ -91,7 +90,7 @@ impl DataDomeIntegration {
 
         let mut builder = request_builder()
             .method(Method::POST.as_str())
-            .uri(api_url.as_str())
+            .uri(api_url)
             .header(
                 header::CONTENT_TYPE.as_str(),
                 "application/x-www-form-urlencoded",
@@ -107,17 +106,23 @@ impl DataDomeIntegration {
 
         let request = builder
             .body(EdgeBody::from(encoded_body))
-            .change_context(Self::error(
-                "Failed to build DataDome Protection API request",
-            ))
+            .map_err(|_| {
+                Report::new(Self::error(
+                    "Failed to build DataDome Protection API request",
+                ))
+            })
             .map_err(ProtectionRequestError::Runtime)?;
 
+        // Build and encode every credential-bearing representation before a backend exists.
+        let backend_name = self
+            .ensure_protection_backend(input.services, api_url)
+            .map_err(ProtectionRequestError::Setup)?;
         let platform_response = input
             .services
             .http_client()
             .send(PlatformHttpRequest::new(request, backend_name))
             .await
-            .change_context(Self::error("Failed to call DataDome Protection API"))
+            .map_err(|_| Report::new(Self::error("Failed to call DataDome Protection API")))
             .map_err(ProtectionRequestError::Runtime)?;
 
         let status = platform_response.response.status();
@@ -183,7 +188,7 @@ impl DataDomeIntegration {
         if supplied_values.is_empty() {
             return false;
         }
-        let Some(bypass) = self.active_protection_test_bypass() else {
+        let Some(_bypass) = self.active_protection_test_bypass() else {
             return false;
         };
         if supplied_values.len() != 1 {
@@ -193,13 +198,17 @@ impl DataDomeIntegration {
             return false;
         }
 
-        let Some(credential) = bypass.credential_secret_name.as_ref() else {
+        let Some(credential) = self
+            .bypass_binding
+            .as_ref()
+            .map(ResolvedBinding::credential)
+        else {
             log::warn!(
                 "[datadome] DataDome test bypass credential is unavailable; ignoring bypass header"
             );
             return false;
         };
-        if credential.expose().len() < super::MIN_TEST_BYPASS_CREDENTIAL_BYTES {
+        if credential.len() < super::MIN_TEST_BYPASS_CREDENTIAL_BYTES {
             log::warn!(
                 "[datadome] DataDome test bypass credential does not meet security requirements; ignoring bypass header"
             );
@@ -207,16 +216,19 @@ impl DataDomeIntegration {
         }
 
         let actual = Sha256::digest(supplied_values[0].as_bytes());
-        let expected = Sha256::digest(credential.expose().as_bytes());
+        let expected = Sha256::digest(credential.as_bytes());
         bool::from(actual.ct_eq(&expected))
     }
 
-    fn protection_validate_url(&self) -> String {
-        format!(
-            "{}{}",
-            self.config.protection_api_origin.trim_end_matches('/'),
-            VALIDATE_REQUEST_PATH
-        )
+    fn protection_validate_url(&self) -> Result<&str, Report<TrustedServerError>> {
+        self.protection_binding
+            .as_ref()
+            .and_then(|binding| binding.endpoint())
+            .ok_or_else(|| {
+                Report::new(Self::error(
+                    "DataDome loaded credential binding unavailable",
+                ))
+            })
     }
 
     fn ensure_protection_backend(
@@ -240,18 +252,20 @@ impl DataDomeIntegration {
             discriminator: None,
         };
 
-        services.backend().ensure(&spec).change_context(Self::error(
-            "Failed to register DataDome Protection API backend",
-        ))
+        services.backend().ensure(&spec).map_err(|_| {
+            Report::new(Self::error(
+                "Failed to register DataDome Protection API backend",
+            ))
+        })
     }
 
-    fn server_side_key(&self) -> Result<&Redacted<String>, Report<TrustedServerError>> {
-        self.config
-            .server_side_key_secret_name
+    fn server_side_key(&self) -> Result<&str, Report<TrustedServerError>> {
+        self.protection_binding
             .as_ref()
+            .map(ResolvedBinding::credential)
             .ok_or_else(|| {
                 Report::new(Self::error(
-                    "DataDome server-side key is unavailable after secret resolution",
+                    "DataDome loaded credential binding unavailable",
                 ))
             })
     }
@@ -259,7 +273,7 @@ impl DataDomeIntegration {
     fn build_protection_payload(
         &self,
         input: &RequestFilterInput<'_>,
-        server_side_key: &Redacted<String>,
+        server_side_key: &str,
     ) -> ProtectionPayload {
         let req = &*input.request;
         let client_info = input.services.client_info();
@@ -273,7 +287,8 @@ impl DataDomeIntegration {
             header_client_id.clone()
         };
 
-        push_field(&mut fields, "Key", server_side_key.expose());
+        // Credentials are not subject to field truncation.
+        fields.push(("Key".to_owned(), server_side_key.to_owned()));
         push_field(
             &mut fields,
             "IP",
@@ -840,7 +855,8 @@ mod tests {
     }
 
     fn protection_integration() -> Arc<DataDomeIntegration> {
-        DataDomeIntegration::try_new(protection_config()).expect("should create integration")
+        DataDomeIntegration::with_test_bindings(protection_config())
+            .expect("should create integration")
     }
 
     fn request_for_filter() -> Request<EdgeBody> {
@@ -892,8 +908,8 @@ mod tests {
         geo_info: Option<&GeoInfo>,
         uri: &str,
     ) -> Request<EdgeBody> {
-        let integration =
-            DataDomeIntegration::try_new(config).expect("should create DataDome integration");
+        let integration = DataDomeIntegration::with_test_bindings(config)
+            .expect("should create DataDome integration");
         let settings = Settings::default();
         let mut request = request_builder()
             .method(Method::GET.as_str())
@@ -924,6 +940,67 @@ mod tests {
     }
 
     #[test]
+    fn protection_secret_bindings_never_follow_redirects_or_reinterpret_shadow_target() {
+        for status in [301, 302, 303, 307, 308] {
+            let config = DataDomeConfig {
+                protection_api_origin: "https://protection.example.com".to_owned(),
+                ..protection_config()
+            };
+            let mut integration = DataDomeIntegration::with_test_bindings(config)
+                .expect("should create fictional protection integration");
+            Arc::get_mut(&mut integration)
+                .expect("should own integration")
+                .config
+                .protection_api_origin = "https://unapproved.example".to_owned();
+            let http = Arc::new(StubHttpClient::new());
+            http.push_response_with_headers(
+                status,
+                Vec::new(),
+                vec![("location", "https://unapproved.example/stolen")],
+            );
+            let services =
+                build_services_with_secret_and_http_client(NoopSecretStore, http.clone());
+            let settings = Settings::default();
+            let mut request = request_for_filter();
+            let decision = futures::executor::block_on(integration.filter_protection_request(
+                RequestFilterInput {
+                    settings: &settings,
+                    services: &services,
+                    request: &mut request,
+                    geo_info: None,
+                    is_integration_route: false,
+                },
+            ));
+            assert!(matches!(decision, RequestFilterDecision::Continue(_)));
+            assert_eq!(
+                http.recorded_request_uris(),
+                vec!["https://protection.example.com/validate-request"]
+            );
+        }
+    }
+
+    #[test]
+    fn protection_settings_only_constructor_cannot_export() {
+        let integration =
+            DataDomeIntegration::try_new(protection_config()).expect("should validate structure");
+        let http = Arc::new(StubHttpClient::new());
+        let services = build_services_with_secret_and_http_client(NoopSecretStore, http.clone());
+        let settings = Settings::default();
+        let mut request = request_for_filter();
+        let decision = futures::executor::block_on(integration.filter_protection_request(
+            RequestFilterInput {
+                settings: &settings,
+                services: &services,
+                request: &mut request,
+                geo_info: None,
+                is_integration_route: false,
+            },
+        ));
+        assert!(matches!(decision, RequestFilterDecision::Continue(_)));
+        assert!(http.recorded_backend_names().is_empty());
+    }
+
+    #[test]
     fn protection_test_bypass_skips_api_suppresses_tag_and_strips_header() {
         let config = DataDomeConfig {
             enabled: true,
@@ -937,7 +1014,8 @@ mod tests {
             }),
             ..protection_config()
         };
-        let integration = DataDomeIntegration::try_new(config).expect("should create integration");
+        let integration =
+            DataDomeIntegration::with_test_bindings(config).expect("should create integration");
         let mut secrets = HashMap::new();
         secrets.insert(
             "datadome_test_bypass".to_string(),
@@ -997,7 +1075,7 @@ mod tests {
                 ..protection_config()
             };
             let integration =
-                DataDomeIntegration::try_new(config).expect("should create integration");
+                DataDomeIntegration::with_test_bindings(config).expect("should create integration");
             let mut secrets = HashMap::new();
             secrets.insert(
                 "datadome_server_side_key".to_string(),
@@ -1059,7 +1137,8 @@ mod tests {
             }),
             ..protection_config()
         };
-        let integration = DataDomeIntegration::try_new(config).expect("should create integration");
+        let integration =
+            DataDomeIntegration::with_test_bindings(config).expect("should create integration");
         let mut secrets = HashMap::new();
         secrets.insert(
             "datadome_server_side_key".to_string(),
@@ -1149,7 +1228,8 @@ mod tests {
             }),
             ..protection_config()
         };
-        let integration = DataDomeIntegration::try_new(config).expect("should create integration");
+        let integration =
+            DataDomeIntegration::with_test_bindings(config).expect("should create integration");
         let mut secrets = HashMap::new();
         secrets.insert(
             "datadome_test_bypass".to_string(),
@@ -1197,7 +1277,8 @@ mod tests {
             }),
             ..protection_config()
         };
-        let integration = DataDomeIntegration::try_new(config).expect("should create integration");
+        let integration =
+            DataDomeIntegration::with_test_bindings(config).expect("should create integration");
         let mut secrets = HashMap::new();
         secrets.insert(
             "datadome_server_side_key".to_string(),
@@ -1262,7 +1343,8 @@ mod tests {
             }),
             ..protection_config()
         };
-        let integration = DataDomeIntegration::try_new(config).expect("should create integration");
+        let integration =
+            DataDomeIntegration::with_test_bindings(config).expect("should create integration");
         let mut secrets = HashMap::new();
         secrets.insert(
             "datadome_server_side_key".to_string(),
@@ -1309,7 +1391,7 @@ mod tests {
     }
 
     #[test]
-    fn short_test_bypass_credential_is_ignored_without_failing_startup() {
+    fn short_test_bypass_credential_is_rejected_during_loading() {
         let config = DataDomeConfig {
             protection_test_bypass: Some(ProtectionTestBypassConfig {
                 enabled: true,
@@ -1318,39 +1400,7 @@ mod tests {
             }),
             ..protection_config()
         };
-        let integration =
-            DataDomeIntegration::try_new(config).expect("should accept short bypass credential");
-        let http_client = Arc::new(StubHttpClient::new());
-        http_client.push_response_with_headers(
-            200,
-            Vec::new(),
-            vec![(HEADER_DATADOME_RESPONSE, "200")],
-        );
-        let services =
-            build_services_with_secret_and_http_client(NoopSecretStore, http_client.clone());
-        let settings = Settings::default();
-        let mut request = request_for_filter();
-        request.headers_mut().insert(
-            super::super::HEADER_DATADOME_TEST_BYPASS,
-            edgezero_core::http::HeaderValue::from_static("short"),
-        );
-
-        let decision = filter_with_staging(&integration, &settings, &services, &mut request);
-
-        assert!(matches!(decision, RequestFilterDecision::Continue(_)));
-        assert!(
-            request
-                .headers()
-                .get(super::super::HEADER_DATADOME_TEST_BYPASS)
-                .is_none(),
-            "the invalid bypass credential should not reach the publisher origin"
-        );
-        assert!(!has_client_tag_suppression_marker(&request));
-        assert_eq!(
-            http_client.recorded_backend_names().len(),
-            1,
-            "a short credential should not bypass the Protection API"
-        );
+        assert!(DataDomeIntegration::with_test_bindings(config).is_err());
     }
 
     #[test]
@@ -1601,6 +1651,33 @@ mod tests {
     }
 
     #[test]
+    fn server_side_key_preserves_form_characters_and_whitespace() {
+        let config = DataDomeConfig {
+            server_side_key_secret_name: Some(Redacted::new(
+                " key&with=syntax+and spaces ".to_owned(),
+            )),
+            ..protection_config()
+        };
+        let integration =
+            DataDomeIntegration::with_test_bindings(config).expect("should load exact bytes");
+        assert_eq!(
+            integration.server_side_key().expect("should have key"),
+            " key&with=syntax+and spaces "
+        );
+        let encoded = form_encode(&[(
+            "Key".to_owned(),
+            integration
+                .server_side_key()
+                .expect("should have key")
+                .to_owned(),
+        )]);
+        let decoded = url::form_urlencoded::parse(encoded.as_bytes()).collect::<Vec<_>>();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].0, "Key");
+        assert_eq!(decoded[0].1, " key&with=syntax+and spaces ");
+    }
+
+    #[test]
     fn server_side_key_uses_resolved_config_value() {
         let integration = protection_integration();
 
@@ -1608,7 +1685,7 @@ mod tests {
             .server_side_key()
             .expect("should contain resolved server-side key");
 
-        assert_eq!(key.expose(), "server-side-key");
+        assert_eq!(key, "server-side-key");
     }
 
     #[test]
@@ -1619,7 +1696,7 @@ mod tests {
         };
 
         assert!(
-            DataDomeIntegration::try_new(config).is_err(),
+            DataDomeIntegration::with_test_bindings(config).is_err(),
             "should reject a missing resolved server-side key"
         );
     }

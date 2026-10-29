@@ -833,6 +833,21 @@ impl IntegrationRegistry {
         settings: &Settings,
         plan: Arc<AuctionPlan>,
     ) -> Result<Self, Report<TrustedServerError>> {
+        // State construction must reject enabled exporters even on adapters that
+        // do not currently emit that feature's traffic.
+        let bindings = crate::secret_bindings::compile_bindings(settings)?;
+        for binding in bindings.entries() {
+            if !matches!(
+                binding.target(),
+                crate::secret_bindings::CompiledTarget::None
+            ) {
+                settings.resolved_bindings.require_for_plan(
+                    &bindings,
+                    binding.descriptor_id(),
+                    binding.field_path(),
+                )?;
+            }
+        }
         let mut inner = IntegrationRegistryInner::default();
         let mut registrations = Vec::new();
         if let Some(registration) = crate::integrations::prebid::register_for_plan(settings, &plan)?

@@ -8,7 +8,9 @@
 
 use std::borrow::Cow;
 
-use edgezero_core::app_config::{SecretField, SecretKind, SecretPathSegment};
+use edgezero_core::app_config::SecretField;
+#[cfg(test)]
+use edgezero_core::app_config::SecretPathSegment;
 use error_stack::Report;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use validator::{Validate, ValidationError, ValidationErrors};
@@ -32,13 +34,17 @@ use crate::integrations::{
     sourcepoint::SourcepointConfig,
     testlight::TestlightConfig,
 };
-use crate::settings::{AssetOriginAuth, IntegrationConfig, Settings};
+#[cfg(test)]
+use crate::settings::AssetOriginAuth;
+use crate::settings::{IntegrationConfig, Settings};
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
 #[cfg(test)]
 const DEPLOY_VALIDATED_INTEGRATION_IDS: &[&str] = &[
     #[cfg(feature = "test-utils")]
     crate::test_support::async_html_finalization::ID,
+    #[cfg(feature = "test-utils")]
+    crate::test_support::secret_binding_runtime::ID,
     "prebid",
     "aps",
     "adserver_mock",
@@ -101,7 +107,9 @@ impl Serialize for TrustedServerAppConfig {
     where
         S: Serializer,
     {
-        self.settings.serialize(serializer)
+        unresolved_settings_value(&self.settings)
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
     }
 }
 
@@ -110,10 +118,24 @@ impl<'de> Deserialize<'de> for TrustedServerAppConfig {
     where
         D: Deserializer<'de>,
     {
-        let mut settings = Settings::deserialize(deserializer)?;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value
+            .pointer("/auction/providers")
+            .is_some_and(serde_json::Value::is_array)
+        {
+            return Err(serde::de::Error::custom(
+                "auction.providers: removed list schema; see CHANGELOG.md for migration guidance",
+            ));
+        }
+        crate::secret_bindings::reject_removed_references(&value)
+            .and_then(|()| crate::secret_bindings::validate_original_endpoints(&value))
+            .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        let mut settings: Settings = serde_json::from_value(value).map_err(|_| {
+            serde::de::Error::custom("invalid Trusted Server configuration structure")
+        })?;
         settings
             .normalize_deserialized()
-            .map_err(serde::de::Error::custom)?;
+            .map_err(|_| serde::de::Error::custom("invalid Trusted Server configuration"))?;
         Ok(Self { settings })
     }
 }
@@ -137,119 +159,58 @@ impl Validate for TrustedServerAppConfig {
 
 impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
     fn secret_fields() -> Vec<SecretField> {
-        let field = |path: Vec<SecretPathSegment>, optional| SecretField {
-            kind: SecretKind::KeyInDefault,
-            optional,
-            path,
-        };
-        let object = |name: &'static str| SecretPathSegment::Field(Cow::Borrowed(name));
-        let optional_object =
-            |name: &'static str| SecretPathSegment::OptionalField(Cow::Borrowed(name));
+        crate::secret_bindings::secret_fields()
+    }
 
-        vec![
-            field(vec![object("publisher"), object("proxy_secret")], false),
-            field(vec![object("ec"), object("passphrase")], false),
-            field(
-                vec![
-                    object("ec"),
-                    optional_object("partners"),
-                    SecretPathSegment::ArrayEach,
-                    object("api_token"),
-                ],
-                true,
-            ),
-            field(
-                vec![
-                    object("ec"),
-                    optional_object("partners"),
-                    SecretPathSegment::ArrayEach,
-                    object("ts_pull_token"),
-                ],
-                true,
-            ),
-            field(
-                vec![
-                    object("handlers"),
-                    SecretPathSegment::ArrayEach,
-                    object("password"),
-                ],
-                false,
-            ),
-            field(
-                vec![
-                    optional_object("trusted_client_ip"),
-                    object("shared_secret"),
-                ],
-                false,
-            ),
-            field(
-                vec![optional_object("tinybird"), object("auction_token_secret")],
-                true,
-            ),
-            field(
-                vec![
-                    optional_object("integrations"),
-                    optional_object("datadome"),
-                    object("server_side_key_secret_name"),
-                ],
-                true,
-            ),
-            field(
-                vec![
-                    optional_object("integrations"),
-                    optional_object("datadome"),
-                    optional_object("protection_test_bypass"),
-                    object("credential_secret_name"),
-                ],
-                true,
-            ),
-            field(
-                vec![
-                    optional_object("proxy"),
-                    optional_object("asset_routes"),
-                    SecretPathSegment::ArrayEach,
-                    optional_object("auth"),
-                    object("access_key_id"),
-                ],
-                true,
-            ),
-            field(
-                vec![
-                    optional_object("proxy"),
-                    optional_object("asset_routes"),
-                    SecretPathSegment::ArrayEach,
-                    optional_object("auth"),
-                    object("secret_access_key"),
-                ],
-                true,
-            ),
-            field(
-                vec![
-                    optional_object("proxy"),
-                    optional_object("asset_routes"),
-                    SecretPathSegment::ArrayEach,
-                    optional_object("auth"),
-                    object("session_token"),
-                ],
-                true,
-            ),
-        ]
+    fn implicit_secret_lookups(
+        &self,
+    ) -> Result<Option<Vec<edgezero_core::app_config::ImplicitSecretLookup>>, String> {
+        let plan = crate::secret_bindings::compile_bindings(&self.settings)
+            .map_err(|error| error.to_string())?;
+        Ok(Some(
+            plan.entries()
+                .iter()
+                .map(|entry| edgezero_core::app_config::ImplicitSecretLookup {
+                    descriptor_id: entry.descriptor_id().to_owned(),
+                    field_path: entry.field_path().to_owned(),
+                    store_id: crate::secret_bindings::SECRET_STORE_ID.to_owned(),
+                    key: entry.key().to_owned(),
+                })
+                .collect(),
+        ))
+    }
+
+    fn render_implicit_secret_name(
+        &self,
+        adapter: &str,
+        lookup: &edgezero_core::app_config::ImplicitSecretLookup,
+        environment: &edgezero_core::env_config::EnvConfig,
+    ) -> Result<String, String> {
+        let mapped_store = environment.store_name("secrets", &lookup.store_id);
+        crate::secret_bindings::render_native_with_mapping(
+            adapter,
+            &lookup.store_id,
+            &lookup.key,
+            &mapped_store,
+        )
+        .map(|binding| binding.native_name)
+        .map_err(|error| error.to_string())
     }
 }
 
 /// Runs Trusted Server push-time validation for app config.
 ///
-/// Secret fields contain secret-store key names at this stage, so this function
-/// deliberately excludes checks that require resolved values. The `EdgeZero` CLI
-/// additionally calls [`edgezero_core::app_config::validate_excluding_secrets`]
-/// to remove validators attached to those leaves.
+/// Feature configuration implies credential roles, but contains no references or
+/// values. This function compiles those roles and validates ordinary settings.
+/// `EdgeZero` excludes resolved-value validators using the shared descriptor
+/// metadata, then validates generated native names through the implicit hook.
 ///
 /// # Errors
 ///
-/// Returns [`TrustedServerError`] when non-secret configuration or a secret key
-/// reference is invalid.
+/// Returns [`TrustedServerError`] when ordinary configuration or an implicit
+/// credential context is invalid.
 pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
-    validate_secret_key_references(settings)?;
+    crate::secret_bindings::compile_bindings(settings)?;
     validate_non_secret_deploy_placeholders(settings)?;
     validate_js_asset_proxy_config(settings)?;
 
@@ -263,7 +224,7 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     Ok(())
 }
 
-/// Runs Trusted Server runtime validation after secret references are resolved.
+/// Runs Trusted Server runtime validation after implicit bindings are resolved.
 ///
 /// # Errors
 ///
@@ -277,7 +238,7 @@ pub fn validate_settings_for_runtime(
     settings.validate_admin_handler_passwords()?;
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, true)?;
-    PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
+    PartnerRegistry::from_settings(settings).map(|_| ())?;
     Ok(())
 }
 
@@ -314,6 +275,11 @@ fn validate_enabled_integrations(
     validate_integration::<crate::test_support::async_html_finalization::FixtureConfig>(
         settings,
         crate::test_support::async_html_finalization::ID,
+    )?;
+    #[cfg(feature = "test-utils")]
+    validate_integration::<crate::test_support::secret_binding_runtime::FixtureConfig>(
+        settings,
+        crate::test_support::secret_binding_runtime::ID,
     )?;
     validate_integration::<TestlightConfig>(settings, "testlight")?;
     validate_integration::<NextJsIntegrationConfig>(settings, "nextjs")?;
@@ -394,120 +360,31 @@ fn validate_non_secret_deploy_placeholders(
     }))
 }
 
-fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
-    validate_secret_key_reference(
-        "publisher.proxy_secret",
-        settings.publisher.proxy_secret.expose(),
-    )?;
-    validate_secret_key_reference("ec.passphrase", settings.ec.passphrase.expose())?;
-
-    for (index, partner) in settings.ec.partners.iter().enumerate() {
-        if let Some(token) = &partner.api_token {
-            validate_secret_key_reference(
-                &format!("ec.partners[{index}].api_token"),
-                token.expose(),
-            )?;
-        }
-        if let Some(token) = &partner.ts_pull_token {
-            validate_secret_key_reference(
-                &format!("ec.partners[{index}].ts_pull_token"),
-                token.expose(),
-            )?;
-        }
-    }
-
-    for (index, handler) in settings.handlers.iter().enumerate() {
-        validate_secret_key_reference(
-            &format!("handlers[{index}].password"),
-            handler.password.expose(),
-        )?;
-    }
-
-    if let Some(trusted_client_ip) = &settings.trusted_client_ip {
-        validate_secret_key_reference(
-            "trusted_client_ip.shared_secret",
-            trusted_client_ip.shared_secret.expose(),
-        )?;
-    }
-
-    if settings.tinybird.enabled {
-        let token = settings
-            .tinybird
-            .auction_token_secret
-            .as_ref()
-            .ok_or_else(|| missing_secret_key_reference("tinybird.auction_token_secret"))?;
-        validate_secret_key_reference("tinybird.auction_token_secret", token.expose())?;
-    }
-
-    if let Some(datadome) = settings.integration_config::<DataDomeConfig>("datadome")? {
-        if datadome.enable_protection {
-            let key = datadome
-                .server_side_key_secret_name
-                .as_ref()
-                .ok_or_else(|| {
-                    missing_secret_key_reference(
-                        "integrations.datadome.server_side_key_secret_name",
-                    )
-                })?;
-            validate_secret_key_reference(
-                "integrations.datadome.server_side_key_secret_name",
-                key.expose(),
-            )?;
-        }
+/// Serialize only unresolved feature configuration, never resolved credentials.
+///
+/// # Errors
+/// Returns a safe configuration error if settings cannot be represented as JSON.
+pub fn unresolved_settings_value(
+    settings: &Settings,
+) -> Result<serde_json::Value, Report<TrustedServerError>> {
+    let mut value = serde_json::to_value(settings).map_err(|_| {
+        Report::new(TrustedServerError::Configuration {
+            message: "failed to serialize unresolved configuration".to_owned(),
+        })
+    })?;
+    if let Some(datadome) = value
+        .pointer_mut("/integrations/datadome")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        datadome.remove("server_side_key_secret_name");
         if let Some(bypass) = datadome
-            .protection_test_bypass
-            .as_ref()
-            .filter(|bypass| bypass.enabled)
+            .get_mut("protection_test_bypass")
+            .and_then(serde_json::Value::as_object_mut)
         {
-            let credential = bypass.credential_secret_name.as_ref().ok_or_else(|| {
-                missing_secret_key_reference(
-                    "integrations.datadome.protection_test_bypass.credential_secret_name",
-                )
-            })?;
-            validate_secret_key_reference(
-                "integrations.datadome.protection_test_bypass.credential_secret_name",
-                credential.expose(),
-            )?;
+            bypass.remove("credential_secret_name");
         }
     }
-
-    for (index, route) in settings.proxy.asset_routes.iter().enumerate() {
-        let Some(AssetOriginAuth::S3SigV4(auth)) = route.auth.as_ref() else {
-            continue;
-        };
-        validate_secret_key_reference(
-            &format!("proxy.asset_routes[{index}].auth.access_key_id"),
-            auth.access_key_id.expose(),
-        )?;
-        validate_secret_key_reference(
-            &format!("proxy.asset_routes[{index}].auth.secret_access_key"),
-            auth.secret_access_key.expose(),
-        )?;
-        if let Some(token) = &auth.session_token {
-            validate_secret_key_reference(
-                &format!("proxy.asset_routes[{index}].auth.session_token"),
-                token.expose(),
-            )?;
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_secret_key_reference(
-    path: &str,
-    key_name: &str,
-) -> Result<(), Report<TrustedServerError>> {
-    if key_name.trim().is_empty() {
-        return Err(missing_secret_key_reference(path));
-    }
-    Ok(())
-}
-
-fn missing_secret_key_reference(path: &str) -> Report<TrustedServerError> {
-    Report::new(TrustedServerError::Configuration {
-        message: format!("secret key reference at `{path}` must not be empty"),
-    })
+    Ok(value)
 }
 
 fn report_to_validation_error(
@@ -527,7 +404,33 @@ mod tests {
     use crate::auction_config_types::{NotificationConfig, ProviderConfig, RoutingMode};
     use crate::redacted::Redacted;
     use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig};
-    use crate::test_support::tests::crate_test_settings_str;
+    use crate::test_support::tests::crate_test_settings_str as resolved_test_settings_str;
+
+    fn crate_test_settings_str() -> String {
+        let mut value: toml::Table =
+            toml::from_str(&resolved_test_settings_str()).expect("should parse resolved fixture");
+        value
+            .get_mut("publisher")
+            .and_then(toml::Value::as_table_mut)
+            .expect("should find publisher")
+            .remove("proxy_secret");
+        value
+            .get_mut("ec")
+            .and_then(toml::Value::as_table_mut)
+            .expect("should find EC")
+            .remove("passphrase");
+        for handler in value
+            .get_mut("handlers")
+            .and_then(toml::Value::as_array_mut)
+            .expect("should find handlers")
+        {
+            handler
+                .as_table_mut()
+                .expect("should find handler")
+                .remove("password");
+        }
+        toml::to_string(&value).expect("should encode feature-only fixture")
+    }
     use edgezero_core::app_config::AppConfigMeta;
     use edgezero_core::blob_envelope::BlobEnvelope;
 
@@ -581,7 +484,7 @@ formats = [{ width = 300, height = 250 }]
 
     fn valid_settings() -> Settings {
         let mut settings =
-            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+            Settings::from_toml(&resolved_test_settings_str()).expect("should parse test settings");
         settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
         settings
     }
@@ -671,22 +574,21 @@ formats = [{ width = 300, height = 250 }]
         "/../../trusted-server.example.toml"
     ));
 
-    /// Returns the template with required secret-store key references replaced
-    /// by resolved test values, so direct [`Settings`] parsing can exercise the
-    /// optional blocks this module uncomments.
+    /// Supply resolved local-comparison shadows only for direct Settings tests.
+    /// The public template itself contains no credential properties.
     fn template_with_resolved_required_secrets() -> String {
         EXAMPLE_TEMPLATE
             .replace(
-                "password = \"handler_password\"",
-                "password = \"unit-test-resolved-handler-password-0001\"",
+                "\n[[handlers]]\n",
+                "\n[[handlers]]\npassword = \"fictional-handler-password-0123456789\"\n",
             )
             .replace(
-                "proxy_secret = \"publisher_proxy_secret\"",
-                "proxy_secret = \"unit-test-resolved-publisher-proxy-secret-0001\"",
+                "\n[publisher]\n",
+                "\n[publisher]\nproxy_secret = \"fictional-publisher-secret-0123456789\"\n",
             )
             .replace(
-                "passphrase = \"ec_passphrase\"",
-                "passphrase = \"unit-test-resolved-ec-passphrase-secret-0001\"",
+                "\n[ec]\n",
+                "\n[ec]\npassphrase = \"fictional-ec-passphrase-0123456789-abcdef\"\n",
             )
     }
 
@@ -710,7 +612,18 @@ formats = [{ width = 300, height = 250 }]
                     .strip_prefix("# ")
                     .or_else(|| line.strip_prefix('#'))
                     .unwrap_or(line);
-                out.push(bare.to_owned());
+                // Explanatory comments beside the example remain comments.
+                let assignment = bare.split_once('=').is_some_and(|(key, _)| {
+                    !key.trim().is_empty()
+                        && key.trim().bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+                        })
+                });
+                if bare.trim_start().starts_with('[') || assignment {
+                    out.push(bare.to_owned());
+                } else {
+                    out.push(line.to_owned());
+                }
             } else {
                 out.push(line.to_owned());
             }
@@ -840,18 +753,9 @@ formats = [{ width = 300, height = 250 }]
                 .expect_err("should reject colliding app-config keys");
 
             for message in [toml_error.to_string(), json_error.to_string()] {
-                for expected in [
-                    "image_optimizer.profile_sets",
-                    "default_images",
-                    "collide after trimming",
-                    &format!("{first:?}"),
-                    &format!("{second:?}"),
-                ] {
-                    assert!(
-                        message.contains(expected),
-                        "should preserve collision context with {expected:?}: {message}"
-                    );
-                }
+                assert!(message.contains("invalid Trusted Server configuration"));
+                assert!(!message.contains(&format!("{first:?}")));
+                assert!(!message.contains(&format!("{second:?}")));
             }
         }
     }
@@ -879,7 +783,7 @@ formats = [{ width = 300, height = 250 }]
     }
 
     #[test]
-    fn push_validation_accepts_secret_key_names() {
+    fn push_validation_ignores_resolved_shadows_and_never_serializes_them() {
         let mut settings = valid_settings();
         settings.publisher.proxy_secret = Redacted::new("publisher_proxy".to_owned());
         settings.ec.passphrase = Redacted::new("ec_key".to_owned());
@@ -890,8 +794,9 @@ formats = [{ width = 300, height = 250 }]
 
         let serialized =
             serde_json::to_string(&app_config).expect("should serialize key-name-only app config");
-        assert!(serialized.contains("publisher_proxy"));
+        assert!(!serialized.contains("publisher_proxy"));
         assert!(!serialized.contains("unit-test-proxy-secret"));
+        assert!(!serialized.contains("proxy_secret"));
     }
 
     #[test]
@@ -957,16 +862,16 @@ formats = [{ width = 300, height = 250 }]
     }
 
     #[test]
-    fn omitted_s3_secret_references_materialize_as_defaults() {
+    fn s3_credentials_are_implicit_and_optional_session_defaults_off() {
         let auth: S3SigV4AuthConfig =
-            toml::from_str("region = \"us-east-1\"").expect("should apply S3 secret defaults");
-
-        assert_eq!(auth.access_key_id.expose(), "access_key_id");
-        assert_eq!(auth.secret_access_key.expose(), "secret_access_key");
-
+            toml::from_str("region = \"us-east-1\"").expect("should parse feature-only S3 auth");
+        assert!(auth.access_key_id.expose().is_empty());
+        assert!(auth.secret_access_key.expose().is_empty());
+        assert!(!auth.session_token_enabled);
         let serialized = serde_json::to_value(auth).expect("should serialize S3 auth");
-        assert_eq!(serialized["access_key_id"], "access_key_id");
-        assert_eq!(serialized["secret_access_key"], "secret_access_key");
+        assert!(serialized.get("access_key_id").is_none());
+        assert!(serialized.get("secret_access_key").is_none());
+        assert!(serialized.get("session_token").is_none());
     }
 
     #[test]
@@ -997,6 +902,7 @@ formats = [{ width = 300, height = 250 }]
             access_key_id: Redacted::new("s3-access-key".to_string()),
             secret_access_key: Redacted::new("s3-secret-key".to_string()),
             session_token: None,
+            session_token_enabled: false,
             origin_query: None,
         }));
         settings.proxy.asset_routes.push(route);
@@ -1124,21 +1030,25 @@ gam_network_id = "99999"
     }
 
     #[test]
-    fn app_config_new_rejects_empty_secret_key_reference() {
+    fn app_config_requires_no_secret_reference_or_value() {
         let mut settings = valid_settings();
-        settings.publisher.proxy_secret = Redacted::new(String::new());
-
-        let err = TrustedServerAppConfig::new(settings)
-            .expect_err("should reject an empty secret key reference");
-
-        assert!(
-            err.to_string().contains("publisher.proxy_secret"),
-            "error should identify the empty secret reference: {err:?}"
-        );
+        settings.publisher.proxy_secret = Redacted::default();
+        settings.ec.passphrase = Redacted::default();
+        for handler in &mut settings.handlers {
+            handler.password = Redacted::default();
+        }
+        let config = TrustedServerAppConfig::new(settings)
+            .expect("should validate unresolved implicit credentials");
+        let lookups = config
+            .implicit_secret_lookups()
+            .expect("should compile implicit lookups")
+            .expect("should opt in");
+        assert_eq!(lookups.len(), 4);
+        assert!(lookups.iter().all(|lookup| lookup.key.starts_with("ts1_")));
     }
 
     #[test]
-    fn app_config_new_accepts_trusted_client_ip_secret_key_reference() {
+    fn app_config_compiles_trusted_client_ip_credential_without_serializing_shadow() {
         let mut settings = valid_settings();
         settings.trusted_client_ip = Some(TrustedClientIpConfig {
             ip_header: "x-ts-client-ip".to_owned(),
@@ -1151,17 +1061,17 @@ gam_network_id = "99999"
     }
 
     #[test]
-    fn app_config_new_rejects_whitespace_secret_key_reference() {
-        let mut settings = valid_settings();
-        settings.publisher.proxy_secret = Redacted::new(" \t ".to_owned());
-
-        let err = TrustedServerAppConfig::new(settings)
-            .expect_err("should reject a whitespace-only secret key reference");
-
-        assert!(
-            err.to_string().contains("publisher.proxy_secret"),
-            "error should identify the whitespace-only secret reference: {err:?}"
-        );
+    fn raw_config_rejects_reference_properties_even_when_empty() {
+        let source: serde_json::Value =
+            serde_json::to_value(valid_settings()).expect("should serialize feature config");
+        for value in ["", " \t ", "fictional-native-secret-key"] {
+            let mut source = source.clone();
+            source["publisher"]["proxy_secret"] = serde_json::json!(value);
+            let error = serde_json::from_value::<TrustedServerAppConfig>(source)
+                .expect_err("should reject removed reference property");
+            assert!(error.to_string().contains("publisher.proxy_secret"));
+            assert!(!error.to_string().contains("fictional-native-secret-key"));
+        }
     }
 
     #[test]
@@ -1540,35 +1450,36 @@ password = "production-admin-password-32-bytes"
     }
 
     #[test]
-    fn deploy_validation_rejects_invalid_datadome_test_bypass() {
-        for (enable_protection, name, expected_message) in [
-            (false, "datadome_test_bypass", "requires enable_protection"),
-            (true, "", "credential_secret_name"),
-        ] {
-            let mut settings = valid_settings();
-            settings
-                .integrations
-                .insert_config(
-                    "datadome",
-                    &serde_json::json!({
-                        "enabled": true,
-                        "enable_protection": enable_protection,
-                        "server_side_key_secret_name": "datadome_server_side_key",
-                        "protection_test_bypass": {
-                            "enabled": true,
-                            "credential_secret_name": name,
-                        },
-                    }),
-                )
-                .expect("should insert DataDome config");
-
-            let err = validate_settings_for_deploy(&settings)
-                .expect_err("should reject invalid DataDome test bypass");
-            assert!(
-                format!("{err:?}").contains(expected_message),
-                "error should mention the invalid bypass setting: {err:?}"
-            );
-        }
+    fn deploy_validation_checks_bypass_activation_without_credential_references() {
+        let mut settings = valid_settings();
+        settings.integrations.insert(
+            "datadome".to_owned(),
+            serde_json::json!({
+                "enabled": true, "enable_protection": false,
+                "protection_test_bypass": {"enabled": true}
+            }),
+        );
+        let error = validate_settings_for_deploy(&settings)
+            .expect_err("should reject bypass without Protection");
+        assert!(format!("{error:?}").contains("requires enable_protection"));
+        settings
+            .integrations
+            .get_mut("datadome")
+            .expect("should find integration")["enable_protection"] = serde_json::json!(true);
+        validate_settings_for_deploy(&settings)
+            .expect("should validate implicit DataDome roles without reading credentials");
+        let plan = crate::secret_bindings::compile_bindings(&settings)
+            .expect("should compile implicit roles");
+        assert!(
+            plan.entries()
+                .iter()
+                .any(|entry| entry.descriptor_id() == "datadome.server")
+        );
+        assert!(
+            plan.entries()
+                .iter()
+                .any(|entry| entry.descriptor_id() == "datadome.bypass")
+        );
     }
 
     #[test]

@@ -48,6 +48,9 @@ enum Command {
     Rollback(RollbackArgs),
     /// Serve the project locally through a target adapter.
     Serve(ServeArgs),
+    /// Review implicit credential bindings and provision approved native secrets.
+    #[command(subcommand)]
+    Secrets(crate::commands::secrets::SecretsCommand),
     /// Local developer tools (e.g. the macOS/Linux production-hostname proxy).
     #[command(subcommand)]
     Dev(crate::commands::dev::DevCommand),
@@ -169,6 +172,7 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
         }
         Command::Rollback(args) => edgezero_cli::run_rollback(&args).map(|()| RunOutcome::Success),
         Command::Serve(args) => edgezero_cli::run_serve(&args).map(|()| RunOutcome::Success),
+        Command::Secrets(command) => crate::commands::secrets::run(&command),
         Command::Dev(command) => crate::commands::dev::run(command).map(|()| RunOutcome::Success),
         Command::Cache(command) => {
             let stdout = std::io::stdout();
@@ -193,6 +197,80 @@ mod tests {
 
     fn parse(args: &[&str]) -> Args {
         Args::try_parse_from(args).expect("should parse args")
+    }
+
+    #[test]
+    fn secrets_commands_parse_without_value_or_raw_key_overrides() {
+        for args in [
+            vec!["ts", "secrets", "plan", "--adapter", "spin"],
+            vec![
+                "ts",
+                "secrets",
+                "check",
+                "--adapter",
+                "fastly",
+                "--plan",
+                "bindings.json",
+            ],
+            vec![
+                "ts",
+                "secrets",
+                "set",
+                "tinybird.auction",
+                "--adapter",
+                "fastly",
+                "--plan",
+                "bindings.json",
+                "--stdin",
+                "--yes",
+            ],
+        ] {
+            assert!(matches!(parse(&args).command, Command::Secrets(_)));
+        }
+        for flag in ["--value", "--key", "--store", "--target", "--deployment"] {
+            assert!(
+                Args::try_parse_from([
+                    "ts",
+                    "secrets",
+                    "set",
+                    "tinybird.auction",
+                    "--adapter",
+                    "fastly",
+                    "--plan",
+                    "bindings.json",
+                    flag,
+                    "fictional-input"
+                ])
+                .is_err()
+            );
+        }
+        assert!(
+            Args::try_parse_from([
+                "ts",
+                "secrets",
+                "set",
+                "tinybird.auction",
+                "--adapter",
+                "fastly",
+                "--plan",
+                "bindings.json",
+                "--stdin"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn secrets_help_describes_existence_limits_and_secure_input() {
+        let check = Args::try_parse_from(["ts", "secrets", "check", "--help"])
+            .expect_err("should display check help")
+            .to_string();
+        assert!(check.contains("never runtime credential validity"));
+        let set = Args::try_parse_from(["ts", "secrets", "set", "--help"])
+            .expect_err("should display set help")
+            .to_string();
+        assert!(set.contains("without trimming"));
+        assert!(set.contains("Tool-generated entry ID"));
     }
 
     #[test]

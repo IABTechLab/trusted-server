@@ -1,9 +1,6 @@
-//! Runtime helpers for Trusted Server blob app-config payloads.
-//!
-//! The `ts` CLI delegates blob construction and config-store writes to
-//! `EdgeZero`'s typed config push path. Runtime loading only needs to verify the
-//! stored [`edgezero_core::blob_envelope::BlobEnvelope`] and reconstruct
-//! [`Settings`] from its data value.
+//! Verified app-config loading and atomic native credential snapshots.
+
+use std::ops::Deref;
 
 use edgezero_core::blob_envelope::BlobEnvelope;
 use error_stack::Report;
@@ -11,710 +8,634 @@ use error_stack::Report;
 use crate::config::TrustedServerAppConfig;
 use crate::error::TrustedServerError;
 use crate::platform::{PlatformSecretStore, StoreName};
-use crate::secret_resolution::resolve_secret_references;
-use crate::settings::Settings;
+use crate::redacted::Redacted;
+use crate::secret_bindings::{ResolvedBinding, resolve_bindings};
+use crate::settings::{AssetOriginAuth, Settings};
 
-/// Canonical logical secret store used by Trusted Server app-config secrets.
+/// Logical native store for app credentials. Physical mapping is deployment-owned.
 pub const DEFAULT_SECRET_STORE_ID: &str = "trusted_server_secrets";
-
-/// Default logical config-store id, from `[stores.config].default` in `edgezero.toml`.
-///
-/// Derived at build time so every adapter uses the repository manifest's default.
+/// Default logical config-store ID, derived from the portable manifest.
 pub const DEFAULT_CONFIG_STORE_ID: &str = env!("TRUSTED_SERVER_DEFAULT_CONFIG_STORE_ID");
-
-/// Default config-store key containing the Trusted Server app-config blob.
-///
-/// Intentionally matches the logical store ID: an ordinary `ts config push`
-/// writes there unless `--key` selects another key. This constant does not apply
-/// runtime overrides; use [`crate::settings_data::config_key`] with the adapter's
-/// runtime configuration, or [`crate::settings_data::default_config_key`] for
-/// process-environment overrides.
+/// Config blob entry shared by production, staging, and local logical mappings.
 pub const CONFIG_BLOB_KEY: &str = DEFAULT_CONFIG_STORE_ID;
 
-/// Reconstruct runtime [`Settings`] from a serialized config blob envelope.
+/// An atomically loaded settings and credential/target snapshot.
 ///
-/// Secret references are resolved after envelope verification and before
-/// deserialization. The envelope data itself is never mutated or rewritten.
+/// Only successful production loading constructs this type. It deliberately has
+/// no serialization or mutable access. Cloned settings retain the same private
+/// capabilities; exporters recheck their compiled identity before using them.
+#[derive(Clone, Debug)]
+pub struct LoadedConfig {
+    settings: Settings,
+}
+
+impl LoadedConfig {
+    /// Read the settings belonging to this successful snapshot.
+    #[must_use]
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+}
+
+impl Deref for LoadedConfig {
+    type Target = Settings;
+
+    fn deref(&self) -> &Self::Target {
+        &self.settings
+    }
+}
+
+fn invalid(path: &str, category: &str) -> Report<TrustedServerError> {
+    Report::new(TrustedServerError::Configuration {
+        message: format!("{path}: {category}"),
+    })
+}
+
+/// Verify feature configuration, resolve its implicit native bindings, and
+/// publish settings and compiled credential uses together.
 ///
 /// # Errors
-///
-/// Returns [`TrustedServerError::Configuration`] when the envelope cannot be
-/// parsed, fails integrity verification, secret resolution fails, or resolved
-/// settings are invalid.
+/// Rejects invalid envelopes, removed reference properties, malformed feature
+/// configuration, missing/invalid native bindings, or invalid resolved settings.
+/// Diagnostics never attach provider errors, values, or untrusted input snippets.
 pub fn settings_from_config_blob(
     envelope_json: &str,
     secret_store: &dyn PlatformSecretStore,
     default_secret_store_name: &StoreName,
-) -> Result<Settings, Report<TrustedServerError>> {
-    let envelope: BlobEnvelope = serde_json::from_str(envelope_json).map_err(|error| {
-        Report::new(TrustedServerError::Configuration {
-            message: "failed to parse Trusted Server app-config blob envelope".to_string(),
-        })
-        .attach(error.to_string())
-    })?;
-    envelope.verify().map_err(|error| {
-        Report::new(TrustedServerError::Configuration {
-            message: "Trusted Server app-config blob failed integrity verification".to_string(),
-        })
-        .attach(error.to_string())
-    })?;
+) -> Result<LoadedConfig, Report<TrustedServerError>> {
+    let envelope: BlobEnvelope = serde_json::from_str(envelope_json)
+        .map_err(|_| invalid("trusted_server", "invalid config envelope"))?;
+    envelope
+        .verify()
+        .map_err(|_| invalid("trusted_server", "config integrity verification failed"))?;
+    let config: TrustedServerAppConfig = serde_json::from_value(envelope.into_data())
+        .map_err(|error| invalid("trusted_server", &error.to_string()))?;
+    edgezero_core::app_config::validate_excluding_secrets(&config)
+        .map_err(|_| invalid("trusted_server", "invalid unresolved configuration"))?;
 
-    let mut data = envelope.into_data();
-    remove_inactive_secret_references(&mut data);
-    resolve_secret_references::<TrustedServerAppConfig>(
-        &mut data,
-        secret_store,
-        default_secret_store_name,
-    )?;
-    let settings = Settings::from_json_value(data)?;
-    crate::config::validate_settings_for_runtime(&settings)?;
-    Ok(settings)
+    let mut settings = config.into_settings();
+    let bindings = resolve_bindings(&settings, secret_store, default_secret_store_name)?;
+    for binding in bindings.entries() {
+        install_shadow(&mut settings, binding)?;
+    }
+    settings.resolved_bindings = bindings;
+    let settings = Settings::finalize_deserialized(settings, "Configuration")
+        .map_err(|_| invalid("trusted_server", "invalid resolved configuration"))?;
+    crate::config::validate_settings_for_runtime(&settings)
+        .map_err(|_| invalid("trusted_server", "invalid resolved configuration"))?;
+    Ok(LoadedConfig { settings })
 }
 
-fn remove_inactive_secret_references(data: &mut serde_json::Value) {
-    if data
-        .pointer("/tinybird/enabled")
-        .and_then(serde_json::Value::as_bool)
-        != Some(true)
-        && let Some(tinybird) = data
-            .get_mut("tinybird")
-            .and_then(serde_json::Value::as_object_mut)
-    {
-        tinybird.remove("auction_token_secret");
-        tinybird.remove("access_token_secret");
-    }
+fn index(path: &str, prefix: &str) -> Result<usize, Report<TrustedServerError>> {
+    path.strip_prefix(prefix)
+        .and_then(|suffix| suffix.split_once(']'))
+        .and_then(|(index, _)| index.parse().ok())
+        .ok_or_else(|| invalid("secret_bindings", "invalid compiled schema path"))
+}
 
-    if let Some(partners) = data
-        .pointer_mut("/ec/partners")
-        .and_then(serde_json::Value::as_array_mut)
-    {
-        for partner in partners {
-            let Some(partner) = partner.as_object_mut() else {
-                continue;
-            };
-            if !json_bool_or_string_is_true(partner.get("pull_sync_enabled")) {
-                partner.remove("ts_pull_token");
+// These shadows support existing local validators and non-exporting consumers.
+// They are never an outbound authority and cannot appear in serialized config.
+fn install_shadow(
+    settings: &mut Settings,
+    binding: &ResolvedBinding,
+) -> Result<(), Report<TrustedServerError>> {
+    let compiled = binding.compiled();
+    let value = || Redacted::new(binding.credential().to_owned());
+    match compiled.descriptor_id() {
+        "publisher.proxy" => settings.publisher.proxy_secret = value(),
+        "ec.passphrase" => settings.ec.passphrase = value(),
+        "ec.inbound" | "ec.pull" => {
+            let partner = settings
+                .ec
+                .partners
+                .get_mut(index(compiled.field_path(), "ec.partners[")?)
+                .ok_or_else(|| invalid("ec.partners", "invalid compiled identity"))?;
+            if compiled.descriptor_id() == "ec.inbound" {
+                partner.api_token = Some(value());
+            } else {
+                partner.ts_pull_token = Some(value());
             }
         }
+        "handler.password" => {
+            settings
+                .handlers
+                .get_mut(index(compiled.field_path(), "handlers[")?)
+                .ok_or_else(|| invalid("handlers", "invalid compiled identity"))?
+                .password = value();
+        }
+        "clientip.shared" => {
+            settings
+                .trusted_client_ip
+                .as_mut()
+                .ok_or_else(|| invalid("trusted_client_ip", "invalid compiled identity"))?
+                .shared_secret = value();
+        }
+        "tinybird.auction" => settings.tinybird.auction_token_secret = Some(value()),
+        // DataDome consumes private uses directly. Never copy native values into
+        // its serializable, dynamically typed integration configuration.
+        "datadome.server" | "datadome.bypass" => {}
+        "s3.access-id" | "s3.secret" | "s3.session" => {
+            let route = settings
+                .proxy
+                .asset_routes
+                .get_mut(index(compiled.field_path(), "proxy.asset_routes[")?)
+                .ok_or_else(|| invalid("proxy.asset_routes", "invalid compiled identity"))?;
+            let Some(AssetOriginAuth::S3SigV4(auth)) = route.auth.as_mut() else {
+                return Err(invalid("proxy.asset_routes", "invalid compiled identity"));
+            };
+            match compiled.descriptor_id() {
+                "s3.access-id" => auth.access_key_id = value(),
+                "s3.secret" => auth.secret_access_key = value(),
+                _ => auth.session_token = Some(value()),
+            }
+        }
+        _ => return Err(invalid("secret_bindings", "unknown compiled purpose")),
     }
-
-    let Some(datadome) = data
-        .pointer_mut("/integrations/datadome")
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return;
-    };
-    let integration_enabled =
-        datadome.get("enabled").and_then(serde_json::Value::as_bool) == Some(true);
-    let protection_enabled = integration_enabled
-        && datadome
-            .get("enable_protection")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true);
-    if !protection_enabled {
-        datadome.remove("server_side_key_secret_name");
-    }
-
-    let bypass_enabled = protection_enabled
-        && datadome
-            .get("protection_test_bypass")
-            .and_then(serde_json::Value::as_object)
-            .and_then(|bypass| bypass.get("enabled"))
-            .and_then(serde_json::Value::as_bool)
-            == Some(true);
-    if !bypass_enabled
-        && let Some(bypass) = datadome
-            .get_mut("protection_test_bypass")
-            .and_then(serde_json::Value::as_object_mut)
-    {
-        bypass.remove("credential_secret_name");
-    }
-}
-
-fn json_bool_or_string_is_true(value: Option<&serde_json::Value>) -> bool {
-    matches!(value, Some(serde_json::Value::Bool(true)))
-        || matches!(value, Some(serde_json::Value::String(value)) if value == "true")
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
     use super::*;
-    use crate::integrations::didomi::DidomiIntegrationConfig;
-    use crate::platform::{PlatformError, StoreId};
-    use crate::redacted::Redacted;
-    use crate::settings::{
-        AssetOriginAuth, EcPartner, ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig,
+    use crate::consent::jurisdiction::Jurisdiction;
+    use crate::consent::types::ConsentContext;
+    use crate::ec::EcContext;
+    use crate::ec::kv::KvIdentityGraph;
+    use crate::ec::kv_types::KvEntry;
+    use crate::ec::pull_sync::{build_pull_sync_context, dispatch_pull_sync};
+    use crate::ec::rate_limiter::RateLimiter;
+    use crate::ec::registry::PartnerRegistry;
+    use crate::platform::test_support::{
+        NoopConfigStore, NoopGeo, NoopSecretStore, RecordingBackend, StubHttpClient,
     };
+    use crate::platform::{ClientInfo, PlatformError, RuntimeServices, StoreId};
+    use crate::secret_bindings::compile_bindings;
     use crate::test_support::tests::crate_test_settings_str;
 
-    fn test_settings() -> Settings {
-        let mut settings =
-            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+    #[derive(Default)]
+    struct Store {
+        values: BTreeMap<String, Vec<u8>>,
+        reads: Mutex<Vec<String>>,
+    }
+
+    impl PlatformSecretStore for Store {
+        fn get_bytes(&self, _: &StoreName, key: &str) -> Result<Vec<u8>, Report<PlatformError>> {
+            self.reads
+                .lock()
+                .expect("should lock read spy")
+                .push(key.to_owned());
+            self.values.get(key).cloned().ok_or_else(|| {
+                Report::new(PlatformError::SecretStore)
+                    .attach("fictional-provider-diagnostic-must-not-leak")
+            })
+        }
+        fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+            unreachable!("loader never writes native credentials")
+        }
+        fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+            unreachable!("loader never deletes native credentials")
+        }
+    }
+
+    fn fixture() -> (serde_json::Value, Store) {
+        let mut settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse resolved unit settings");
         settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
-        settings
-    }
-
-    struct EchoSecretStore;
-
-    impl PlatformSecretStore for EchoSecretStore {
-        fn get_bytes(
-            &self,
-            _store_name: &StoreName,
-            key: &str,
-        ) -> Result<Vec<u8>, Report<PlatformError>> {
-            let value = match key {
-                "placeholder_proxy" => "change-me-proxy-secret",
-                "unit-test-proxy-secret" => "unit-test-proxy-secret-32-bytes-ok",
-                _ => key,
+        let data = crate::config::unresolved_settings_value(&settings)
+            .expect("should serialize feature config");
+        let mut store = Store::default();
+        for entry in compile_bindings(&settings)
+            .expect("should compile roles")
+            .entries()
+        {
+            let value = match entry.scope() {
+                "proxy" => "fictional-proxy-credential-0123456789",
+                "ecpass" => "fictional-passphrase-credential-0123456789",
+                "handler" => "fictional-handler-credential-0123456789",
+                _ => panic!("unexpected active fixture scope"),
             };
-            Ok(value.as_bytes().to_vec())
+            store
+                .values
+                .insert(entry.key().to_owned(), value.as_bytes().to_vec());
         }
-
-        fn create(
-            &self,
-            _store_id: &StoreId,
-            _name: &str,
-            _value: &str,
-        ) -> Result<(), Report<PlatformError>> {
-            Ok(())
-        }
-
-        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
-            Ok(())
-        }
+        (data, store)
     }
 
-    struct UnifiedSecretStore;
-
-    impl PlatformSecretStore for UnifiedSecretStore {
-        fn get_bytes(
-            &self,
-            store_name: &StoreName,
-            key: &str,
-        ) -> Result<Vec<u8>, Report<PlatformError>> {
-            if store_name.as_ref() != "ts_secrets" || key.starts_with("unused-") {
-                return Err(Report::new(PlatformError::SecretStore));
-            }
-            let value = match key {
-                "unit-test-proxy-secret" => "unit-test-proxy-secret-32-bytes-ok",
-                "tinybird-token-key" => "resolved-tinybird-token",
-                "datadome-server-key" => "resolved-datadome-server-key",
-                "datadome-bypass-key" => "resolved-datadome-bypass-credential-32-bytes",
-                "access_key_id" | "s3-access-key" => "AKIAIOSFODNN7EXAMPLE",
-                "secret_access_key" | "s3-secret-key" => "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
-                "s3-session-key" => "resolved-session-token",
-                "partner-api-token-key" => "resolved-partner-api-token-32-bytes-ok",
-                "partner-pull-token-key" => "resolved-partner-pull-token-32-bytes-ok",
-                "trusted-client-ip-key" => "resolved-trusted-client-ip-secret-32-bytes",
-                _ => key,
-            };
-            Ok(value.as_bytes().to_vec())
-        }
-
-        fn create(
-            &self,
-            _store_id: &StoreId,
-            _name: &str,
-            _value: &str,
-        ) -> Result<(), Report<PlatformError>> {
-            Ok(())
-        }
-
-        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
-            Ok(())
-        }
+    fn envelope(data: serde_json::Value) -> String {
+        serde_json::to_string(&BlobEnvelope::new(data, "2026-10-26T00:00:00Z".to_owned()))
+            .expect("should encode a valid-checksum envelope")
     }
 
-    fn partner_with_pull_sync(enabled: bool, token_key: &str) -> EcPartner {
-        let mut value = serde_json::json!({
-            "name": "Example Partner",
-            "source_domain": "partner.example.com",
-            "api_token": "partner-api-token-key",
-            "pull_sync_enabled": enabled,
-            "ts_pull_token": token_key,
-        });
-        if enabled {
-            value["pull_sync_url"] =
-                serde_json::Value::String("https://partner.example.com/sync".to_string());
-            value["pull_sync_allowed_domains"] = serde_json::json!(["partner.example.com"]);
+    fn all_roles_fixture() -> (serde_json::Value, Store) {
+        let mut settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse resolved unit settings");
+        settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
+        settings.ec.partners = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "Fictional partner", "source_domain": "partner.example.com",
+                "api_token_enabled": true, "pull_sync_enabled": true,
+                "pull_sync_url": "https://sync.example.com/pull",
+                "pull_sync_allowed_domains": ["sync.example.com"]
+            }))
+            .expect("should parse partner features"),
+        ];
+        settings.trusted_client_ip = Some(
+            serde_json::from_value(serde_json::json!({
+                "ip_header": "x-fictional-client-ip", "auth_header": "x-fictional-auth"
+            }))
+            .expect("should parse trusted client IP features"),
+        );
+        settings.tinybird.enabled = true;
+        settings.tinybird.api_host = "api.tinybird.example.com".to_owned();
+        settings.integrations.insert(
+            "datadome".to_owned(),
+            serde_json::json!({
+                "enabled": true, "enable_protection": true,
+                "sdk_origin": "https://sdk.example.com", "api_origin": "https://api.example.com",
+                "protection_api_origin": "https://protection.example.com",
+                "protection_test_bypass": {"enabled": true}
+            }),
+        );
+        let mut route =
+            crate::settings::ProxyAssetRoute::new("/assets/", "https://bucket.example.com");
+        route.auth = Some(AssetOriginAuth::S3SigV4(
+            serde_json::from_value(serde_json::json!({
+                "region": "us-east-1", "session_token_enabled": true
+            }))
+            .expect("should parse S3 features"),
+        ));
+        settings.proxy.asset_routes = vec![route];
+        let mut store = Store::default();
+        for entry in compile_bindings(&settings)
+            .expect("should compile all roles")
+            .entries()
+        {
+            store.values.insert(
+                entry.key().to_owned(),
+                format!("fictional-credential-{}-{}", entry.scope(), entry.key()).into_bytes(),
+            );
         }
-        serde_json::from_value(value).expect("should build pull-sync partner")
-    }
-
-    fn envelope_json(settings: &Settings) -> String {
-        let data = serde_json::to_value(settings).expect("should serialize settings to JSON");
-        let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_string());
-        serde_json::to_string(&envelope).expect("should serialize envelope")
-    }
-
-    fn load_settings(envelope_json: &str) -> Result<Settings, Report<TrustedServerError>> {
-        settings_from_config_blob(
-            envelope_json,
-            &EchoSecretStore,
-            &StoreName::from("trusted_server_secrets"),
+        (
+            crate::config::unresolved_settings_value(&settings)
+                .expect("should serialize feature config"),
+            store,
         )
     }
 
-    fn settings_with_browser_bidder_overlap(auction_enabled: bool) -> Settings {
-        let mut settings = test_settings();
-        settings.proxy.allowed_domains = vec!["*.example".to_string()];
-        settings.auction.enabled = auction_enabled;
-        settings.auction.providers = crate::auction::AuctionConfig::legacy_provider_map(&["pbs"]);
-        settings.auction.bidders.insert(
-            "exampleBidder"
-                .parse()
-                .expect("should parse server-side bidder"),
-            crate::auction::BidderRouteConfig {
-                provider: "pbs".parse().expect("should parse provider"),
+    fn feature_pointer(field_path: &str) -> String {
+        format!(
+            "/{}",
+            field_path
+                .replace('[', "/")
+                .replace(']', "")
+                .replace('.', "/")
+        )
+    }
+
+    #[test]
+    fn secret_scoping_attacker_all_twelve_roles_load_through_verified_envelope() {
+        let (data, store) = all_roles_fixture();
+        let loaded =
+            settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
+                .expect("should load every implicit role through production reconstruction");
+        let scopes: std::collections::BTreeSet<_> = loaded
+            .resolved_bindings
+            .entries()
+            .iter()
+            .map(|binding| binding.compiled().scope())
+            .collect();
+        assert_eq!(scopes.len(), 12);
+        let output = serde_json::to_string(loaded.settings())
+            .expect("should serialize feature settings without native values");
+        assert!(!output.contains("fictional-credential-"));
+        assert!(
+            store
+                .reads
+                .lock()
+                .expect("should lock spy")
+                .iter()
+                .all(|key| key.starts_with("ts1_"))
+        );
+    }
+
+    #[test]
+    fn secret_scoping_attacker_reference_injection_rejects_all_twelve_roles_before_reads() {
+        let (data, _) = all_roles_fixture();
+        let config: TrustedServerAppConfig =
+            serde_json::from_value(data.clone()).expect("should parse feature fixture");
+        let plan = compile_bindings(config.settings()).expect("should compile fixture");
+        for entry in plan.entries() {
+            let (_, store) = all_roles_fixture();
+            let mut attack = data.clone();
+            let pointer = feature_pointer(entry.field_path());
+            let (parent, field) = pointer.rsplit_once('/').expect("should split field path");
+            attack
+                .pointer_mut(parent)
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("should find role owner")
+                .insert(
+                    field.to_owned(),
+                    serde_json::json!("SENTINEL-unrelated-publisher-secret-key"),
+                );
+            let error = settings_from_config_blob(
+                &envelope(attack),
+                &store,
+                &DEFAULT_SECRET_STORE_ID.into(),
+            )
+            .expect_err("should reject config-only reference injection");
+            assert!(store.reads.lock().expect("should lock spy").is_empty());
+            assert!(!format!("{error:?}").contains("SENTINEL-unrelated-publisher"));
+        }
+    }
+
+    #[test]
+    fn secret_scoping_attacker_retargeting_never_looks_up_the_old_credential() {
+        for (pointer, value, descriptor, role_path) in [
+            (
+                "/ec/partners/0/pull_sync_url",
+                "https://attacker.example.com/pull",
+                "ec.pull",
+                "ec.partners[0].ts_pull_token",
+            ),
+            (
+                "/ec/partners/0/source_domain",
+                "other.example.com",
+                "ec.inbound",
+                "ec.partners[0].api_token",
+            ),
+            (
+                "/handlers/0/username",
+                "other-user",
+                "handler.password",
+                "handlers[0].password",
+            ),
+            (
+                "/tinybird/api_host",
+                "attacker.example.com",
+                "tinybird.auction",
+                "tinybird.auction_token_secret",
+            ),
+            (
+                "/tinybird/auction_dataset",
+                "other_dataset",
+                "tinybird.auction",
+                "tinybird.auction_token_secret",
+            ),
+            (
+                "/integrations/datadome/protection_api_origin",
+                "https://attacker.example.com",
+                "datadome.server",
+                "integrations.datadome.server_side_key_secret_name",
+            ),
+            (
+                "/proxy/asset_routes/0/origin_url",
+                "https://attacker.example.com",
+                "s3.access-id",
+                "proxy.asset_routes[0].auth.access_key_id",
+            ),
+            (
+                "/proxy/asset_routes/0/auth/region",
+                "eu-west-1",
+                "s3.access-id",
+                "proxy.asset_routes[0].auth.access_key_id",
+            ),
+        ] {
+            let (mut data, store) = all_roles_fixture();
+            let config: TrustedServerAppConfig =
+                serde_json::from_value(data.clone()).expect("should parse feature fixture");
+            let plan = compile_bindings(config.settings()).expect("should compile fixture");
+            let original_key = plan
+                .entries()
+                .iter()
+                .find(|entry| {
+                    entry.descriptor_id() == descriptor && entry.field_path() == role_path
+                })
+                .expect("should find original role")
+                .key()
+                .to_owned();
+            *data
+                .pointer_mut(pointer)
+                .expect("should find mutable feature") = serde_json::json!(value);
+            if descriptor == "ec.pull" {
+                data["ec"]["partners"][0]["pull_sync_allowed_domains"] =
+                    serde_json::json!(["attacker.example.com"]);
+            }
+            let _ =
+                settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
+                    .expect_err(
+                        "should reject new unprovisioned authorization despite valid checksum",
+                    );
+            assert!(
+                !store
+                    .reads
+                    .lock()
+                    .expect("should lock spy")
+                    .contains(&original_key)
+            );
+        }
+    }
+
+    struct AllowPull;
+
+    impl RateLimiter for AllowPull {
+        fn exceeded(&self, _: &str, _: u32) -> Result<bool, Report<TrustedServerError>> {
+            Ok(false)
+        }
+    }
+
+    fn dispatch_loaded_pull(
+        loaded: &LoadedConfig,
+        backend: Arc<RecordingBackend>,
+        http: Arc<StubHttpClient>,
+    ) -> Result<(), Report<TrustedServerError>> {
+        let registry = PartnerRegistry::from_settings(loaded)?;
+        let graph = KvIdentityGraph::in_memory("binding-attack-fixture");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut entry = KvEntry::tombstone(1_000);
+        entry.consent.ok = true;
+        graph.create(&ec_id, &entry)?;
+        let mut context = EcContext::new_for_test(
+            Some(ec_id.clone()),
+            ConsentContext {
+                jurisdiction: Jurisdiction::NonRegulated,
+                ..ConsentContext::default()
             },
         );
-        let mut prebid = settings
-            .integration_config::<crate::integrations::prebid::PrebidIntegrationConfig>("prebid")
-            .expect("should parse Prebid config")
-            .expect("should have enabled Prebid config");
-        prebid.client_side_bidders = vec!["exampleBidder".to_string()];
-        settings
-            .integrations
-            .insert_config("prebid", &prebid)
-            .expect("should replace Prebid config");
-        settings
+        context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+        let pull = build_pull_sync_context(&context, &registry)
+            .expect("should make the positive fixture eligible for pull sync");
+        let services = RuntimeServices::builder()
+            .config_store(Arc::new(NoopConfigStore))
+            .secret_store(Arc::new(NoopSecretStore))
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+            .backend(backend)
+            .http_client(http)
+            .geo(Arc::new(NoopGeo))
+            .client_info(ClientInfo::default())
+            .build();
+        dispatch_pull_sync(loaded, &graph, &registry, &AllowPull, &pull, &services);
+        Ok(())
+    }
+
+    fn load_and_dispatch_pull(
+        data: serde_json::Value,
+        store: &Store,
+        backend: Arc<RecordingBackend>,
+        http: Arc<StubHttpClient>,
+    ) -> Result<(), Report<TrustedServerError>> {
+        let loaded =
+            settings_from_config_blob(&envelope(data), store, &DEFAULT_SECRET_STORE_ID.into())?;
+        dispatch_loaded_pull(&loaded, backend, http)
     }
 
     #[test]
-    fn payload_round_trips_through_blob_envelope() {
-        let original = test_settings();
-        let reconstructed =
-            load_settings(&envelope_json(&original)).expect("should reconstruct settings");
+    fn secret_scoping_attacker_pull_reconstruction_rejects_before_backend_and_http() {
+        let (data, store) = all_roles_fixture();
+        let backend = Arc::new(RecordingBackend::default());
+        let http = Arc::new(StubHttpClient::new());
+        http.push_response(200, br#"{"uid":"fictional-partner-uid"}"#.to_vec());
+        load_and_dispatch_pull(data, &store, backend.clone(), http.clone())
+            .expect("should dispatch the unchanged production-loaded config");
+        assert_eq!(backend.specs().len(), 1, "should exercise backend creation");
+        assert_eq!(
+            http.recorded_request_uris().len(),
+            1,
+            "should exercise dispatch"
+        );
+        assert!(http.recorded_request_uris()[0].starts_with("https://sync.example.com/pull?"));
 
-        assert_eq!(
-            reconstructed.publisher.domain, original.publisher.domain,
-            "should preserve publisher domain"
-        );
-        assert_eq!(
-            reconstructed.ec.pull_sync_concurrency, original.ec.pull_sync_concurrency,
-            "should preserve numeric fields"
-        );
-        assert_eq!(
-            reconstructed.handlers.len(),
-            original.handlers.len(),
-            "should preserve arrays"
-        );
+        for mutation in 0..8 {
+            let (mut data, store) = all_roles_fixture();
+            let config: TrustedServerAppConfig =
+                serde_json::from_value(data.clone()).expect("should parse the authorized config");
+            let plan =
+                compile_bindings(config.settings()).expect("should compile authorized roles");
+            let key_for = |role| {
+                plan.entries()
+                    .iter()
+                    .find(|binding| binding.descriptor_id() == role)
+                    .expect("should find the selected authorized role")
+                    .key()
+            };
+            let pull_key = key_for("ec.pull");
+            let partner = &mut data["ec"]["partners"][0];
+            match mutation {
+                0 => {
+                    partner["pull_sync_url"] =
+                        serde_json::json!("https://attacker.example.com/pull");
+                    partner["pull_sync_allowed_domains"] =
+                        serde_json::json!(["attacker.example.com"]);
+                }
+                1 => {
+                    partner["pull_sync_url"] =
+                        serde_json::json!("https://sync.example.com:8443/pull")
+                }
+                2 => partner["pull_sync_url"] = serde_json::json!("https://sync.example.com/other"),
+                3 => partner["ts_pull_token"] = serde_json::json!(key_for("publisher.proxy")),
+                4 => partner["ts_pull_token"] = serde_json::json!(key_for("ec.inbound")),
+                5 => partner["ts_pull_token"] = serde_json::json!(key_for("handler.password")),
+                6 => partner["pull_sync_url"] = serde_json::json!("http://sync.example.com/pull"),
+                _ => {
+                    partner["pull_sync_url"] =
+                        serde_json::json!("https://sync.example.com/pull?export=1")
+                }
+            }
+            data["proxy"]["certificate_check"] = serde_json::json!(false);
+            let backend = Arc::new(RecordingBackend::default());
+            let http = Arc::new(StubHttpClient::new());
+            let _ = load_and_dispatch_pull(data, &store, backend.clone(), http.clone())
+                .expect_err("should reject a valid-checksum config-only attack before dispatch");
+            assert!(
+                !store
+                    .reads
+                    .lock()
+                    .expect("should lock reads")
+                    .iter()
+                    .any(|key| key == pull_key),
+                "should never retrieve the original pull credential for the modified context"
+            );
+            assert!(
+                backend.specs().is_empty(),
+                "should create no backend for the attack"
+            );
+            assert!(
+                http.recorded_request_uris().is_empty(),
+                "should send no request for the attack"
+            );
+        }
     }
 
     #[test]
-    fn didomi_geo_query_parameters_survive_blob_round_trip() {
-        let mut original = test_settings();
-        original
-            .integrations
-            .insert_config(
-                "didomi",
-                &DidomiIntegrationConfig {
-                    enabled: true,
-                    geo_query_parameters: true,
-                    proxy_path: None,
-                    sdk_origin: "https://sdk.example.com".to_string(),
-                    api_origin: "https://api.example.com".to_string(),
-                },
+    fn secret_scoping_rotation_and_retirement_require_snapshot_reconstruction() {
+        let (data, mut store) = all_roles_fixture();
+        let original = settings_from_config_blob(
+            &envelope(data.clone()),
+            &store,
+            &DEFAULT_SECRET_STORE_ID.into(),
+        )
+        .expect("should load the original authorized snapshot");
+        let pull_key = original
+            .resolved_bindings
+            .entries()
+            .iter()
+            .find(|binding| binding.compiled().descriptor_id() == "ec.pull")
+            .expect("should find the loaded pull capability")
+            .compiled()
+            .key()
+            .to_owned();
+        let old_value = String::from_utf8(store.values[&pull_key].clone())
+            .expect("should decode the fictional original credential");
+        let rotated_value = "fictional-rotated-pull-credential-32-bytes";
+        store
+            .values
+            .insert(pull_key.clone(), rotated_value.as_bytes().to_vec());
+        let refreshed = settings_from_config_blob(
+            &envelope(data.clone()),
+            &store,
+            &DEFAULT_SECRET_STORE_ID.into(),
+        )
+        .expect("should reconstruct a snapshot after same-context replacement");
+
+        for (snapshot, value) in [(&original, old_value.as_str()), (&refreshed, rotated_value)] {
+            let http = Arc::new(StubHttpClient::new());
+            http.push_response(200, br#"{"uid":"fictional-partner-uid"}"#.to_vec());
+            dispatch_loaded_pull(
+                snapshot,
+                Arc::new(RecordingBackend::default()),
+                http.clone(),
             )
-            .expect("should insert Didomi configuration");
+            .expect("should dispatch the snapshot's own authorized credential");
+            assert_eq!(http.recorded_request_uris().len(), 1);
+            assert!(
+                http.recorded_request_headers()[0]
+                    .iter()
+                    .any(|(name, header)| name == "authorization"
+                        && header == &format!("Bearer {value}")),
+                "should preserve the credential captured by this snapshot, not reread native storage"
+            );
+        }
 
-        let reconstructed =
-            load_settings(&envelope_json(&original)).expect("should reconstruct settings");
-        let config = reconstructed
-            .integration_config::<DidomiIntegrationConfig>("didomi")
-            .expect("should read Didomi configuration")
-            .expect("should enable Didomi");
-
+        store.values.remove(&pull_key);
+        let backend = Arc::new(RecordingBackend::default());
+        let http = Arc::new(StubHttpClient::new());
+        let _ = load_and_dispatch_pull(data, &store, backend.clone(), http.clone())
+            .expect_err("should reject valid-checksum replay after the binding is retired");
         assert!(
-            config.geo_query_parameters,
-            "should preserve Didomi geo opt-in"
-        );
-    }
-
-    #[test]
-    fn resolves_all_static_credentials_from_the_mapped_default_store() {
-        let mut original = test_settings();
-        original.tinybird.enabled = true;
-        original.tinybird.api_host = "api.example.com".to_string();
-        original.tinybird.auction_token_secret =
-            Some(Redacted::new("tinybird-token-key".to_string()));
-        original
-            .integrations
-            .insert_config(
-                "datadome",
-                &serde_json::json!({
-                    "enabled": true,
-                    "enable_protection": true,
-                    "server_side_key_secret_name": "datadome-server-key",
-                    "protection_test_bypass": {
-                        "enabled": true,
-                        "credential_secret_name": "datadome-bypass-key",
-                    },
-                }),
-            )
-            .expect("should configure DataDome references");
-        let mut route = ProxyAssetRoute::new(
-            "/assets/",
-            "https://examplebucket.s3.us-east-1.amazonaws.com",
-        );
-        route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-            region: "us-east-1".to_string(),
-            secret_store: Some("legacy-s3-store".to_string()),
-            access_key_id: Redacted::new("s3-access-key".to_string()),
-            secret_access_key: Redacted::new("s3-secret-key".to_string()),
-            session_token: Some(Redacted::new("s3-session-key".to_string())),
-            origin_query: None,
-        }));
-        original.proxy.asset_routes.push(route);
-        original
-            .ec
-            .partners
-            .push(partner_with_pull_sync(true, "partner-pull-token-key"));
-
-        let reconstructed = settings_from_config_blob(
-            &envelope_json(&original),
-            &UnifiedSecretStore,
-            &StoreName::from("ts_secrets"),
-        )
-        .expect("should resolve every static credential from the mapped store");
-
-        assert_eq!(
-            reconstructed
-                .tinybird
-                .auction_token_secret
-                .as_ref()
-                .map(Redacted::expose)
-                .map(String::as_str),
-            Some("resolved-tinybird-token")
-        );
-        let datadome = reconstructed
-            .integration_config::<crate::integrations::datadome::DataDomeConfig>("datadome")
-            .expect("should parse DataDome config")
-            .expect("should enable DataDome");
-        assert_eq!(
-            datadome
-                .server_side_key_secret_name
-                .as_ref()
-                .map(Redacted::expose)
-                .map(String::as_str),
-            Some("resolved-datadome-server-key")
-        );
-        let bypass = datadome
-            .protection_test_bypass
-            .as_ref()
-            .expect("should configure bypass");
-        assert_eq!(
-            bypass
-                .credential_secret_name
-                .as_ref()
-                .map(Redacted::expose)
-                .map(String::as_str),
-            Some("resolved-datadome-bypass-credential-32-bytes")
-        );
-        let auth = reconstructed.proxy.asset_routes[0]
-            .auth
-            .as_ref()
-            .expect("should preserve S3 auth");
-        let AssetOriginAuth::S3SigV4(auth) = auth;
-        assert_eq!(auth.access_key_id.expose(), "AKIAIOSFODNN7EXAMPLE");
-        assert_eq!(
-            auth.secret_access_key.expose(),
-            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
-        );
-        assert_eq!(
-            auth.session_token
-                .as_ref()
-                .map(Redacted::expose)
-                .map(String::as_str),
-            Some("resolved-session-token")
-        );
-        assert!(auth.secret_store.is_none());
-        assert_eq!(
-            reconstructed.ec.partners[0]
-                .api_token
-                .as_ref()
-                .map(Redacted::expose)
-                .map(String::as_str),
-            Some("resolved-partner-api-token-32-bytes-ok")
-        );
-        assert_eq!(
-            reconstructed.ec.partners[0]
-                .ts_pull_token
-                .as_ref()
-                .map(Redacted::expose)
-                .map(String::as_str),
-            Some("resolved-partner-pull-token-32-bytes-ok")
-        );
-    }
-
-    #[test]
-    fn resolves_trusted_client_ip_shared_secret_from_default_store() {
-        let mut original = test_settings();
-        original.trusted_client_ip = Some(TrustedClientIpConfig {
-            ip_header: "x-ts-client-ip".to_owned(),
-            auth_header: "x-ts-client-ip-auth".to_owned(),
-            shared_secret: Redacted::new("trusted-client-ip-key".to_owned()),
-        });
-
-        let reconstructed = settings_from_config_blob(
-            &envelope_json(&original),
-            &UnifiedSecretStore,
-            &StoreName::from("ts_secrets"),
-        )
-        .expect("should resolve the trusted client IP shared secret");
-
-        assert_eq!(
-            reconstructed
-                .trusted_client_ip
-                .as_ref()
-                .expect("should retain trusted client IP configuration")
-                .shared_secret
-                .expose(),
-            "resolved-trusted-client-ip-secret-32-bytes",
-            "should replace the key reference with the resolved shared secret"
-        );
-    }
-
-    #[test]
-    fn missing_trusted_client_ip_shared_secret_fails_resolution() {
-        let mut original = test_settings();
-        original.trusted_client_ip = Some(TrustedClientIpConfig {
-            ip_header: "x-ts-client-ip".to_owned(),
-            auth_header: "x-ts-client-ip-auth".to_owned(),
-            shared_secret: Redacted::new("unused-trusted-client-ip-key".to_owned()),
-        });
-
-        let error = settings_from_config_blob(
-            &envelope_json(&original),
-            &UnifiedSecretStore,
-            &StoreName::from("ts_secrets"),
-        )
-        .expect_err("should reject a missing trusted client IP shared secret");
-        let message = error.to_string();
-
-        assert!(
-            message.contains("trusted_client_ip.shared_secret"),
-            "should identify the unresolved secret field: {error:?}"
+            backend.specs().is_empty(),
+            "should not create a replay backend"
         );
         assert!(
-            !message.contains("unused-trusted-client-ip-key"),
-            "should not expose the secret key reference: {error:?}"
-        );
-    }
-
-    #[test]
-    fn omitted_s3_secret_references_resolve_default_store_keys() {
-        let mut original = test_settings();
-        let mut route = ProxyAssetRoute::new(
-            "/default-s3/",
-            "https://examplebucket.s3.us-east-1.amazonaws.com",
-        );
-        route.auth = Some(AssetOriginAuth::S3SigV4(
-            toml::from_str("region = \"us-east-1\"").expect("should apply S3 secret defaults"),
-        ));
-        original.proxy.asset_routes.push(route);
-
-        let reconstructed = settings_from_config_blob(
-            &envelope_json(&original),
-            &UnifiedSecretStore,
-            &StoreName::from("ts_secrets"),
-        )
-        .expect("should resolve default S3 secret keys");
-
-        let AssetOriginAuth::S3SigV4(auth) = reconstructed.proxy.asset_routes[0]
-            .auth
-            .as_ref()
-            .expect("should preserve S3 auth");
-        assert_eq!(auth.access_key_id.expose(), "AKIAIOSFODNN7EXAMPLE");
-        assert_eq!(
-            auth.secret_access_key.expose(),
-            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
-        );
-    }
-
-    #[test]
-    fn partner_without_api_token_loads_without_secret_resolution() {
-        let mut original = test_settings();
-        let partner = serde_json::from_value(serde_json::json!({
-            "name": "Example Partner",
-            "source_domain": "partner.example.com",
-            "bidstream_enabled": true,
-        }))
-        .expect("should build partner without API token");
-        original.ec.partners.push(partner);
-
-        let reconstructed = settings_from_config_blob(
-            &envelope_json(&original),
-            &UnifiedSecretStore,
-            &StoreName::from("ts_secrets"),
-        )
-        .expect("should load partner without resolving an API token");
-
-        assert!(
-            reconstructed.ec.partners[0].api_token.is_none(),
-            "should preserve omitted API token"
-        );
-    }
-
-    #[test]
-    fn string_true_pull_sync_flag_retains_and_resolves_its_token() {
-        let mut original = test_settings();
-        original
-            .ec
-            .partners
-            .push(partner_with_pull_sync(true, "partner-pull-token-key"));
-        let mut data = serde_json::to_value(original).expect("should serialize settings");
-        data["ec"]["partners"][0]["pull_sync_enabled"] =
-            serde_json::Value::String("true".to_owned());
-        let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
-        let envelope_json = serde_json::to_string(&envelope).expect("should serialize envelope");
-
-        let reconstructed = settings_from_config_blob(
-            &envelope_json,
-            &UnifiedSecretStore,
-            &StoreName::from("ts_secrets"),
-        )
-        .expect("should resolve a pull token enabled by a string boolean");
-
-        assert_eq!(
-            reconstructed.ec.partners[0]
-                .ts_pull_token
-                .as_ref()
-                .map(Redacted::expose)
-                .map(String::as_str),
-            Some("resolved-partner-pull-token-32-bytes-ok"),
-            "should retain and resolve the active pull token"
-        );
-    }
-
-    #[test]
-    fn string_false_pull_sync_flag_removes_a_stale_token() {
-        let mut original = test_settings();
-        original
-            .ec
-            .partners
-            .push(partner_with_pull_sync(false, "unused-partner-pull-token"));
-        let mut data = serde_json::to_value(original).expect("should serialize settings");
-        data["ec"]["partners"][0]["pull_sync_enabled"] =
-            serde_json::Value::String("false".to_owned());
-        let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
-        let envelope_json = serde_json::to_string(&envelope).expect("should serialize envelope");
-
-        let reconstructed = settings_from_config_blob(
-            &envelope_json,
-            &UnifiedSecretStore,
-            &StoreName::from("ts_secrets"),
-        )
-        .expect("should skip a pull token disabled by a string boolean");
-
-        assert!(
-            reconstructed.ec.partners[0].ts_pull_token.is_none(),
-            "should remove the inactive pull token"
-        );
-    }
-
-    #[test]
-    fn active_partner_pull_sync_fails_when_its_token_is_missing() {
-        let mut original = test_settings();
-        original
-            .ec
-            .partners
-            .push(partner_with_pull_sync(true, "unused-partner-pull-token"));
-
-        let error = settings_from_config_blob(
-            &envelope_json(&original),
-            &UnifiedSecretStore,
-            &StoreName::from("ts_secrets"),
-        )
-        .expect_err("should reject a missing active pull-sync token");
-
-        assert!(error.to_string().contains("ec.partners[0].ts_pull_token"));
-    }
-
-    #[test]
-    fn inactive_optional_features_do_not_resolve_stale_secret_references() {
-        let mut original = test_settings();
-        original.tinybird.auction_token_secret =
-            Some(Redacted::new("unused-tinybird-key".to_string()));
-        original
-            .integrations
-            .insert_config(
-                "datadome",
-                &serde_json::json!({
-                    "enabled": true,
-                    "enable_protection": false,
-                    "server_side_key_secret_name": "unused-datadome-key",
-                    "protection_test_bypass": {
-                        "enabled": false,
-                        "credential_secret_name": "unused-bypass-key",
-                    },
-                }),
-            )
-            .expect("should configure inactive references");
-        original
-            .ec
-            .partners
-            .push(partner_with_pull_sync(false, "unused-partner-pull-token"));
-
-        let reconstructed = settings_from_config_blob(
-            &envelope_json(&original),
-            &UnifiedSecretStore,
-            &StoreName::from("ts_secrets"),
-        )
-        .expect("should skip inactive optional feature references");
-
-        assert!(reconstructed.tinybird.auction_token_secret.is_none());
-        assert!(reconstructed.ec.partners[0].ts_pull_token.is_none());
-        let datadome = reconstructed
-            .integration_config::<crate::integrations::datadome::DataDomeConfig>("datadome")
-            .expect("should parse inactive DataDome config")
-            .expect("client-side DataDome remains enabled");
-        assert!(datadome.server_side_key_secret_name.is_none());
-        assert!(
-            datadome
-                .protection_test_bypass
-                .as_ref()
-                .is_some_and(|bypass| bypass.credential_secret_name.is_none())
-        );
-    }
-
-    #[test]
-    fn omitted_datadome_enabled_does_not_resolve_stale_protection_references() {
-        let mut original = test_settings();
-        original
-            .integrations
-            .insert_config(
-                "datadome",
-                &serde_json::json!({
-                    "enable_protection": true,
-                    "server_side_key_secret_name": "unused-datadome-key",
-                    "protection_test_bypass": {
-                        "enabled": true,
-                        "credential_secret_name": "unused-bypass-key",
-                    },
-                }),
-            )
-            .expect("should configure disabled DataDome references");
-
-        let reconstructed = settings_from_config_blob(
-            &envelope_json(&original),
-            &UnifiedSecretStore,
-            &StoreName::from("ts_secrets"),
-        )
-        .expect("should skip stale DataDome protection references");
-
-        assert!(
-            reconstructed
-                .integration_config::<crate::integrations::datadome::DataDomeConfig>("datadome")
-                .expect("should parse disabled DataDome config")
-                .is_none()
+            http.recorded_request_uris().is_empty(),
+            "should not export a retired credential on fresh state"
         );
     }
 
     #[test]
     fn legacy_blob_without_rewrite_creatives_preserves_rewriting() {
-        let data =
-            serde_json::to_value(test_settings()).expect("should serialize settings to JSON");
+        let (data, store) = fixture();
         let auction = data
             .get("auction")
             .and_then(serde_json::Value::as_object)
@@ -723,11 +644,9 @@ mod tests {
             !auction.contains_key("rewrite_creatives"),
             "should omit the default rewrite setting from the payload"
         );
-        let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_string());
-        let envelope_json = serde_json::to_string(&envelope).expect("should serialize envelope");
-
         let reconstructed =
-            load_settings(&envelope_json).expect("should reconstruct legacy settings");
+            settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
+                .expect("should reconstruct legacy settings");
 
         assert!(
             reconstructed.auction.rewrite_creatives,
@@ -737,8 +656,7 @@ mod tests {
 
     #[test]
     fn legacy_blob_without_rewrite_include_domains_loads_with_empty_list() {
-        let data =
-            serde_json::to_value(test_settings()).expect("should serialize settings to JSON");
+        let (data, store) = fixture();
         let rewrite = data
             .get("rewrite")
             .and_then(serde_json::Value::as_object)
@@ -748,8 +666,9 @@ mod tests {
             "should omit the default include list from the payload"
         );
 
-        let reconstructed = load_settings(&envelope_json(&test_settings()))
-            .expect("should reconstruct settings without include_domains");
+        let reconstructed =
+            settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
+                .expect("should reconstruct settings without include_domains");
 
         assert!(
             reconstructed.rewrite.include_domains.is_empty(),
@@ -759,11 +678,12 @@ mod tests {
 
     #[test]
     fn rewrite_include_domains_survive_blob_round_trip() {
-        let mut original = test_settings();
-        original.rewrite.include_domains = vec!["*.cdn.example.com".to_owned()];
+        let (mut data, store) = fixture();
+        data["rewrite"]["include_domains"] = serde_json::json!(["*.cdn.example.com"]);
 
-        let reconstructed = load_settings(&envelope_json(&original))
-            .expect("should reconstruct settings with include_domains");
+        let reconstructed =
+            settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
+                .expect("should reconstruct settings with include_domains");
 
         assert_eq!(
             reconstructed.rewrite.include_domains,
@@ -774,11 +694,12 @@ mod tests {
 
     #[test]
     fn disabled_rewrite_creatives_survives_blob_round_trip() {
-        let mut original = test_settings();
-        original.auction.rewrite_creatives = false;
+        let (mut data, store) = fixture();
+        data["auction"]["rewrite_creatives"] = serde_json::json!(false);
 
-        let reconstructed = load_settings(&envelope_json(&original))
-            .expect("should reconstruct disabled rewriting");
+        let reconstructed =
+            settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
+                .expect("should reconstruct disabled rewriting");
 
         assert!(
             !reconstructed.auction.rewrite_creatives,
@@ -789,16 +710,16 @@ mod tests {
     #[test]
     fn legacy_blob_without_rewrite_clicks_follows_rewrite_creatives() {
         for rewrite_creatives in [true, false] {
-            let mut original = test_settings();
-            original.auction.rewrite_creatives = rewrite_creatives;
-            let data = serde_json::to_value(&original).expect("should serialize settings to JSON");
+            let (mut data, store) = fixture();
+            data["auction"]["rewrite_creatives"] = serde_json::json!(rewrite_creatives);
             assert!(
                 data["auction"].get("rewrite_clicks").is_none(),
                 "should omit unset rewrite_clicks from the payload"
             );
 
-            let reconstructed = load_settings(&envelope_json(&original))
-                .expect("should reconstruct settings without rewrite_clicks");
+            let reconstructed =
+                settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
+                    .expect("should reconstruct settings without rewrite_clicks");
 
             assert_eq!(
                 reconstructed.auction.rewrite_clicks, None,
@@ -815,12 +736,13 @@ mod tests {
     #[test]
     fn explicit_rewrite_clicks_survives_blob_round_trip() {
         for (rewrite_creatives, rewrite_clicks) in [(true, false), (false, true)] {
-            let mut original = test_settings();
-            original.auction.rewrite_creatives = rewrite_creatives;
-            original.auction.rewrite_clicks = Some(rewrite_clicks);
+            let (mut data, store) = fixture();
+            data["auction"]["rewrite_creatives"] = serde_json::json!(rewrite_creatives);
+            data["auction"]["rewrite_clicks"] = serde_json::json!(rewrite_clicks);
 
-            let reconstructed = load_settings(&envelope_json(&original))
-                .expect("should reconstruct explicit rewrite_clicks");
+            let reconstructed =
+                settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
+                    .expect("should reconstruct explicit rewrite_clicks");
 
             assert_eq!(
                 reconstructed.auction.rewrite_clicks,
@@ -831,119 +753,109 @@ mod tests {
     }
 
     #[test]
-    fn strings_that_look_like_json_scalars_round_trip_as_strings() {
-        let mut original = test_settings();
-        original.publisher.proxy_secret =
-            Redacted::new("12345678901234567890123456789012".to_string());
-        original.ec.passphrase = Redacted::new("12345678901234567890123456789012".to_string());
-        original.handlers[0].password = Redacted::new("true".to_string());
+    fn strings_that_look_like_json_scalars_load_as_native_strings() {
+        let (data, mut store) = fixture();
+        let config: TrustedServerAppConfig =
+            serde_json::from_value(data.clone()).expect("should parse feature fixture");
+        for entry in compile_bindings(config.settings())
+            .expect("should compile fixture")
+            .entries()
+        {
+            let value = if entry.scope() == "handler" {
+                "true"
+            } else {
+                "12345678901234567890123456789012"
+            };
+            store
+                .values
+                .insert(entry.key().to_owned(), value.as_bytes().to_vec());
+        }
+        let loaded =
+            settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
+                .expect("should load scalar-looking native credentials");
+        assert_eq!(
+            loaded.publisher.proxy_secret.expose(),
+            "12345678901234567890123456789012"
+        );
+        assert_eq!(
+            loaded.ec.passphrase.expose(),
+            "12345678901234567890123456789012"
+        );
+        assert_eq!(loaded.handlers[0].password.expose(), "true");
+    }
 
-        let reconstructed =
-            load_settings(&envelope_json(&original)).expect("should reconstruct settings");
+    #[test]
+    fn implicit_bindings_publish_one_nonserializable_snapshot() {
+        let (data, store) = fixture();
+        let before = data.clone();
+        let loaded =
+            settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
+                .expect("should load implicit native bindings");
 
         assert_eq!(
-            reconstructed.publisher.proxy_secret.expose(),
-            original.publisher.proxy_secret.expose(),
-            "numeric-looking proxy secret should remain a string"
+            loaded.publisher.proxy_secret.expose(),
+            "fictional-proxy-credential-0123456789"
+        );
+        assert!(
+            store
+                .reads
+                .lock()
+                .expect("should lock read spy")
+                .iter()
+                .all(|key| key.starts_with("ts1_"))
         );
         assert_eq!(
-            reconstructed.ec.passphrase.expose(),
-            original.ec.passphrase.expose(),
-            "numeric-looking passphrase should remain a string"
+            crate::config::unresolved_settings_value(&loaded).expect("should serialize features"),
+            before
         );
-        assert_eq!(
-            reconstructed.handlers[0].password.expose(),
-            original.handlers[0].password.expose(),
-            "boolean-looking handler password should remain a string"
-        );
+        let output = serde_json::to_string(loaded.settings())
+            .expect("should serialize only feature settings");
+        assert!(!output.contains("fictional-proxy-credential"));
+        assert!(!output.contains("fictional-handler-credential"));
     }
 
     #[test]
-    fn runtime_validation_accepts_short_resolved_proxy_secret() {
-        let mut settings = test_settings();
-        settings.publisher.proxy_secret = Redacted::new("short_proxy".to_owned());
-
-        let reconstructed = load_settings(&envelope_json(&settings))
-            .expect("should accept an existing short proxy secret");
-
-        assert_eq!(
-            reconstructed.publisher.proxy_secret.expose(),
-            "short_proxy",
-            "should preserve the resolved proxy secret"
-        );
+    fn removed_references_reject_before_even_the_first_lookup() {
+        for path in ["/publisher/proxy_secret", "/ec/passphrase"] {
+            let (mut data, store) = fixture();
+            let (parent, field) = path.rsplit_once('/').expect("should split fixture path");
+            data.pointer_mut(parent)
+                .expect("should find object")
+                .as_object_mut()
+                .expect("should be object")
+                .insert(
+                    field.to_owned(),
+                    serde_json::json!("fictional-sensitive-reference"),
+                );
+            let error =
+                settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
+                    .expect_err("should reject removed reference");
+            assert!(store.reads.lock().expect("should lock read spy").is_empty());
+            assert!(!format!("{error:?}").contains("fictional-sensitive-reference"));
+        }
     }
 
     #[test]
-    fn runtime_blob_rejects_enabled_browser_bidder_ownership_conflict() {
-        let original = settings_with_browser_bidder_overlap(true);
-        let error = load_settings(&envelope_json(&original))
-            .expect_err("should reject enabled browser bidder ownership conflict");
-
-        assert!(error.to_string().contains("exampleBidder"));
-        assert!(
-            error
-                .to_string()
-                .contains("both client-side and server-side")
+    fn failed_load_does_not_fall_back_or_publish_partial_values() {
+        let (data, mut store) = fixture();
+        store.values.clear();
+        store.values.insert(
+            "publisher_proxy_secret".to_owned(),
+            b"unrelated-legacy-value".to_vec(),
         );
-    }
-
-    #[test]
-    fn runtime_validation_rejects_short_resolved_passphrase() {
-        let mut settings = test_settings();
-        settings.ec.passphrase = Redacted::new("short_key".to_owned());
-
-        let err = load_settings(&envelope_json(&settings))
-            .expect_err("should reject a short resolved passphrase");
-
+        let error =
+            settings_from_config_blob(&envelope(data), &store, &DEFAULT_SECRET_STORE_ID.into())
+                .expect_err("should reject missing generated binding");
         assert!(
-            err.to_string().contains("short_passphrase") || err.to_string().contains("validation"),
-            "error should indicate runtime validation: {err:?}"
+            store
+                .reads
+                .lock()
+                .expect("should lock read spy")
+                .iter()
+                .all(|key| key.starts_with("ts1_"))
         );
-        assert!(
-            !err.to_string().contains("short_key"),
-            "error should not expose the secret value"
-        );
-    }
-
-    #[test]
-    fn placeholder_rejection_happens_after_secret_resolution() {
-        let mut settings = test_settings();
-        settings.publisher.proxy_secret = Redacted::new("placeholder_proxy".to_owned());
-
-        let err = load_settings(&envelope_json(&settings))
-            .expect_err("should reject a placeholder resolved from the secret store");
-
-        assert!(
-            err.to_string().contains("Insecure default"),
-            "error should identify the insecure default: {err:?}"
-        );
-        assert!(
-            !err.to_string().contains("change-me-proxy-secret"),
-            "error should not expose the resolved secret value"
-        );
-    }
-
-    #[test]
-    fn runtime_blob_accepts_disabled_browser_bidder_ownership_overlap() {
-        let original = settings_with_browser_bidder_overlap(false);
-
-        load_settings(&envelope_json(&original))
-            .expect("runtime should accept disabled browser bidder ownership overlap");
-    }
-
-    #[test]
-    fn tampered_blob_hash_is_rejected() {
-        let mut envelope: BlobEnvelope =
-            serde_json::from_str(&envelope_json(&test_settings())).expect("should parse envelope");
-        envelope.sha256 = "ff".repeat(32);
-        let tampered =
-            serde_json::to_string(&envelope).expect("should serialize tampered envelope");
-
-        let err = load_settings(&tampered).expect_err("should reject hash mismatch");
-
-        assert!(
-            err.to_string().contains("integrity verification"),
-            "error should mention integrity verification"
-        );
+        let diagnostic = format!("{error:?}");
+        assert!(!diagnostic.contains("fictional-provider-diagnostic"));
+        assert!(!diagnostic.contains("unrelated-legacy-value"));
     }
 }

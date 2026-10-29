@@ -1,5 +1,77 @@
 # Testing auction orchestration
 
+## Secret-binding release evidence
+
+App config must contain no removed credential properties. Provision fictional
+generated bindings from the same compiler/renderer as runtime; direct resolved
+`Settings` unit fixtures are internal, not public TOML examples. See
+[provisioning](docs/guide/secrets.md), [CI](docs/guide/secrets-ci.md), and
+[migration](docs/guide/secret-binding-migration.md).
+
+### Issue regression coverage
+
+The config-only attacker model assumes the attacker cannot write native secrets,
+change deployment bindings, or deploy code. Provisioning a generated binding is
+an authorization decision made outside the mutable config blob. A checksum alone
+never grants that authority.
+
+Run the production-envelope-to-pull regressions and actual Axum HTTPS transport
+checks separately:
+
+```bash
+cargo test -p trusted-server-core --lib secret_scoping_
+cargo test -p trusted-server-adapter-axum --lib platform::https_tests
+```
+
+The pull regression has a successful dispatch control, then recomputes valid
+checksums after changing destinations or injecting another role's generated key.
+It asserts no original pull credential read, backend creation, or HTTP send.
+Rotation tests distinguish retained snapshots from reconstructed state; retiring
+a binding blocks replay on fresh state, not use already captured by old state.
+The Axum tests use the production client policy with a test-only CA and loopback
+DNS. They exercise synchronous and pending sends, trusted HTTPS, untrusted issuer,
+wrong hostname, and all five redirect statuses to same-origin and other-origin
+sinks. No production TLS bypass or trust configuration is added.
+
+Run native WASM checks against isolated local TLS fixtures:
+
+```bash
+./scripts/secret-bindings-runtime.sh fastly
+./scripts/secret-bindings-runtime.sh cloudflare
+./scripts/secret-bindings-runtime.sh spin
+```
+
+The harness compiles fictional native bindings through the production compiler
+and loads valid-checksum envelopes through the actual application. Fastly tests
+its shipping S3 routes. Cloudflare and Spin do not currently dispatch S3 asset
+routes; their `test-utils` builds use a test-only integration to exercise the
+same core exporter with the real native stores and HTTP clients. This proves
+the native core/adapter contract, not shipping S3 routing on those adapters.
+Cases cover GET/HEAD, redirect sinks, bad certificates, and config-only mutations
+without provisioning the mutated contexts. Runtime tools must match the repository pins.
+See [script prerequisites and coverage](scripts/README.md#secret-binding-runtime-checks).
+These local checks do not certify deployed provider permissions or propagation.
+
+### Deployment release checks
+
+Track provider and rollout evidence in [issue #1479](https://github.com/IABTechLab/trusted-server/issues/1479), separately from the config-only attacker fix in #1037.
+
+Host tests, native-name rendering, metadata presence, local runtime tests, and
+provider operations are different evidence. Before production rollout, verify
+isolated Fastly create/replace/read-through, provider propagation and limits,
+config-publisher permissions, protected provisioning CI, and coordinated
+migration/retirement/rollback. These deployment checks do not require production
+application credentials; use fictional values in isolated resources. Missing
+evidence remains a release risk, not a passing result or proof of a code defect.
+
+Rehearse all four native walkthroughs with fictional values in isolated resources.
+Test config/plan/overlay/compiler/manifest/service/store drift before input and
+with zero mutations, repeated-role selection, unsupported adapter writes,
+cancellation, invalid bytes/newlines, provider failures and uncertain outcomes.
+Inspect argv/stdin/output without printing sentinel credentials. Test same-context
+replacement, fresh versus retained states, S3 maintenance, and old-context replay
+after deletion. Do not claim Tinybird response observation or fleet-wide refresh.
+
 ## Start the local server
 
 Configure at least one reachable provider in `trusted-server.toml`, then start the

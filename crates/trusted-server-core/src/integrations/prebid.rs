@@ -7578,7 +7578,7 @@ set = { keywords = { genre = "news" } }
     }
 
     #[test]
-    fn bid_param_override_numeric_strings_survive_runtime_config_roundtrip() {
+    fn bid_param_override_numeric_strings_survive_feature_config_roundtrip() {
         let toml_str = format!(
             r#"{}
 
@@ -7602,11 +7602,16 @@ set = {{ placementId = "13579" }}
         );
         let settings = Settings::from_toml(&toml_str).expect("should parse TOML settings");
 
-        // This mirrors the typed data transition beneath `ts config push`:
-        // `BlobEnvelope` data is deserialized by `settings_from_config_blob`.
-        let serialized = serde_json::to_value(&settings).expect("should serialize settings");
-        let runtime_settings =
-            Settings::from_json_value(serialized).expect("should parse runtime JSON settings");
+        // This legacy Prebid feature-model test does not exercise the production
+        // app-config schema, which rejects its retired server_url/bidders fields.
+        // Round-trip feature data without requiring or serializing native credentials.
+        let serialized =
+            serde_json::to_value(&settings).expect("should serialize feature settings");
+        let mut runtime_settings: Settings =
+            serde_json::from_value(serialized).expect("should deserialize feature settings");
+        runtime_settings
+            .normalize_deserialized()
+            .expect("should normalize feature settings");
         let config = runtime_settings
             .integration_config::<LegacyPrebidServerConfig>(PREBID_INTEGRATION_ID)
             .expect("should parse Prebid config")

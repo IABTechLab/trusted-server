@@ -37,7 +37,7 @@ type HeaderPairs = Vec<(String, Vec<u8>)>;
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 type BufferedResponseParts = (HeaderPairs, Vec<u8>);
 
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+#[cfg(test)]
 const SPIN_VARIABLE_HEX: &[u8; 16] = b"0123456789abcdef";
 
 // ---------------------------------------------------------------------------
@@ -133,7 +133,7 @@ impl PlatformConfigStore for ConfigStoreHandleAdapter {
     }
 }
 
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+#[cfg(test)]
 fn spin_variable_name(
     key: &str,
     error_context: PlatformError,
@@ -172,7 +172,7 @@ fn spin_variable_name(
     Ok(out)
 }
 
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+#[cfg(test)]
 fn push_spin_variable_escape(out: &mut String, byte: u8) {
     out.push('_');
     out.push('x');
@@ -185,10 +185,8 @@ fn spin_secret_variable_name(
     store_name: &StoreName,
     key: &str,
 ) -> Result<String, Report<PlatformError>> {
-    let store_variable = spin_variable_name(store_name.as_ref(), PlatformError::SecretStore)?;
-    let key_variable = spin_variable_name(key, PlatformError::SecretStore)?;
-
-    Ok(format!("{store_variable}_{key_variable}"))
+    trusted_server_core::secret_bindings::spin_secret_name(store_name.as_ref(), key)
+        .change_context(PlatformError::SecretStore)
 }
 
 /// Bridges edgezero's [`KvHandle`] to [`PlatformKvStore`].

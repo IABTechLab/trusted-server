@@ -8293,6 +8293,7 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: crate::settings::EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
+            api_token_enabled: true,
             api_token: Some(crate::redacted::Redacted::new(format!(
                 "marker-{source_domain}-api-token-32-bytes-minimum"
             ))),
@@ -8302,7 +8303,9 @@ mod tests {
             pull_sync_allowed_domains: vec![format!("sync.{source_domain}")],
             pull_sync_ttl_sec: crate::settings::EcPartner::default_pull_sync_ttl_sec(),
             pull_sync_rate_limit: crate::settings::EcPartner::default_pull_sync_rate_limit(),
-            ts_pull_token: Some(crate::redacted::Redacted::new("pull-token".to_owned())),
+            ts_pull_token: Some(crate::redacted::Redacted::new(
+                "fictional-pull-token-with-32-bytes-minimum".to_owned(),
+            )),
         }
     }
 
@@ -8317,8 +8320,10 @@ mod tests {
             create_test_settings()
         };
         settings.ec.partners = vec![marker_partner("ssp.example.com")];
-        let registry = PartnerRegistry::from_config(&settings.ec.partners)
-            .expect("should build pull partner registry");
+        crate::test_support::secret_bindings::install_test_bindings(&mut settings)
+            .expect("should resolve fixture bindings");
+        let registry =
+            PartnerRegistry::from_settings(&settings).expect("should build pull partner registry");
         let http = Arc::new(StubHttpClient::new());
         http.set_concurrent_fanout(true);
         http.push_response(200, b"<html><body>ok</body></html>".to_vec());
@@ -8352,9 +8357,12 @@ mod tests {
                 )
             }
             MarkerProbe::PartnerSetMismatch => {
-                let other_registry =
-                    PartnerRegistry::from_config(&[marker_partner("other.example.com")])
-                        .expect("should build alternate registry");
+                let mut other_settings = settings.clone();
+                other_settings.ec.partners = vec![marker_partner("other.example.com")];
+                crate::test_support::secret_bindings::install_test_bindings(&mut other_settings)
+                    .expect("should resolve fixture bindings");
+                let other_registry = PartnerRegistry::from_settings(&other_settings)
+                    .expect("should build alternate registry");
                 crate::ec::pull_sync_marker::create_marker_for_test(
                     &settings,
                     &other_registry,
@@ -19184,6 +19192,8 @@ mod tests {
                 }),
             )
             .expect("should configure DataDome integration");
+        crate::test_support::secret_bindings::install_test_bindings(&mut settings)
+            .expect("should resolve fixture bindings");
         let registry = IntegrationRegistry::new(&settings)
             .expect("should create integration registry with DataDome");
         let stub = Arc::new(StubHttpClient::new());

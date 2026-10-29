@@ -32,8 +32,9 @@ value of `app_config` in a JSON object; that outer JSON is assigned to the
 `TRUSTED_SERVER_CONFIG` Worker variable. This double encoding is required by
 the current startup reader.
 
-The generated local Wrangler files define `handler_password`,
-`publisher_proxy_secret`, and `ec_passphrase` separately. The smoke launches
+The generated local Wrangler files must define the native names for
+`handler.password`, `publisher.proxy`, and `ec.passphrase` from the shared
+compiler/renderer, not legacy labels. The smoke launches
 `wrangler dev` once without the config binding and once for each omitted
 secret. Each case requires a 500 response and verifies the exact missing
 binding against Wrangler's runtime binding inventory. The positive publisher
@@ -49,10 +50,25 @@ the checked-in manifests.
 Local `[vars]` are only for the isolated smoke. For a deployed Worker, obtain
 the validated envelope from the target KV namespace, construct the same nested
 `TRUSTED_SERVER_CONFIG` JSON, and configure it in the deployment environment.
-Store the three credential values with `wrangler secret put
-handler_password`, `wrangler secret put publisher_proxy_secret`, and `wrangler
-secret put ec_passphrase`; do not commit them to a Wrangler manifest. Deploy
-only after all four bindings are present.
+Generate a reviewed `ts secrets plan --adapter cloudflare` and supply each
+raw credential with `wrangler secret put` using its generated native name.
+Follow the [complete native walkthrough](./secrets#cloudflare-native-worker-secrets),
+including the matching Wrangler manifest/environment and nested config bridge.
+Do not commit values in a Wrangler manifest. Wrangler secret writes can deploy
+a new Worker version, so coordinate migration in isolation.
+
+Direct `ts secrets set` and native presence `check` are unsupported for this
+adapter; `check` reports unsupported and exits nonzero. Inspect provider
+name inventory and verify fresh-state requests separately. A config-only
+publisher must not hold Worker deployment/secret permissions. Native binding,
+HTTPS/no-follow, and IAM deployment rehearsals remain release gates tracked in
+[#1479](https://github.com/IABTechLab/trusted-server/issues/1479).
+
+CI runs `scripts/secret-bindings-runtime.sh cloudflare` under local workerd with
+fictional native bindings. Cloudflare does not currently dispatch S3 asset routes,
+so a `test-utils` integration invokes the shared exporter for this native contract
+check. It verifies real native lookups, HTTPS, and no-follow behavior, not shipping
+S3 routing or deployed Worker permissions.
 
 A successful `ts config push` alone does not configure this runtime: the
 Worker currently does not open `TRUSTED_SERVER_KV` during startup. Request-time

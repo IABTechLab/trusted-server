@@ -35,9 +35,19 @@ misclassify them.
 
 ## Configuration
 
-Set `tinybird.enabled = true`, provide the regional API host, select the
-auction datasource, and set `auction_token_secret` to the key holding that
-datasource's APPEND token in the default app-config secret store. The default
+Set `tinybird.enabled = true`, provide the regional API DNS host with an optional
+HTTPS port in `api_host`, and select the
+auction datasource, then provision the generated `tinybird.auction` binding
+from a reviewed plan with that dataset's restricted APPEND token. TS does not
+mint the token. No token-name property belongs in app config. The exact HTTPS
+Events endpoint and dataset determine the binding. `api_host` has no scheme,
+path, userinfo, query, or fragment. Explicit port `443` normalizes away; other
+valid ports, such as `8443`, remain part of the approved endpoint. Follow the
+[interactive Fastly tutorial](./secrets#first-fastly-setup-with-tinybird),
+recreate state after writes, and verify actual rows at the approved recipient.
+All adapters validate an enabled binding, but this does not add emitters to
+other adapters. The Fastly sink never follows redirects and does not observe
+the response, so storage or app-request success does not prove delivery. The default
 datasource is `auction_events_raw`; the default body limit is 1 MiB and the
 minimum accepted limit is 1 KiB.
 
@@ -47,5 +57,5 @@ wired. `access_dataset` and `access_sample_rate` are reserved.
 enable access telemetry.
 
 The exact settings and secret-handling dispositions are in
-[Configuration](/guide/configuration#tinybird). The tracked Tinybird project is
+[Configuration](/guide/configuration#tinybird-configuration). The tracked Tinybird project is
 described in [`tinybird/README.md`](https://github.com/IABTechLab/trusted-server/blob/main/tinybird/README.md).

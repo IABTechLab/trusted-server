@@ -1573,10 +1573,17 @@ fn validate_page_patterns(patterns: &[String]) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
     use std::io;
     use std::rc::Rc;
 
+    use edgezero_core::blob_envelope::BlobEnvelope;
+    use error_stack::Report;
     use tempfile::TempDir;
+    use trusted_server_core::config::TrustedServerAppConfig;
+    use trusted_server_core::config_payload::{LoadedConfig, settings_from_config_blob};
+    use trusted_server_core::platform::{PlatformError, PlatformSecretStore, StoreId, StoreName};
+    use trusted_server_core::secret_bindings::{SECRET_STORE_ID, compile_bindings};
 
     use super::*;
     use crate::app_config::AppConfigArgs;
@@ -3795,28 +3802,74 @@ mod tests {
         toml::from_str::<toml::Value>(&written).expect("rewritten config is valid TOML");
     }
 
-    /// A config with fictional resolved secrets and non-placeholder publisher
-    /// values, so both source validation and runtime loading can be exercised.
+    /// Feature-only config with non-placeholder publisher settings.
+    /// Native credentials belong to the separate runtime fixture below.
     fn loadable_config() -> String {
         EXAMPLE_CONFIG
-            .replace(
-                "password = \"handler_password\"",
-                "password = \"test-admin-password-32-bytes-minimum\"",
-            )
-            .replace(
-                "passphrase = \"ec_passphrase\"",
-                "passphrase = \"test-ec-passphrase-32-bytes-minimum\"",
-            )
-            .replace(
-                "proxy_secret = \"publisher_proxy_secret\"",
-                "proxy_secret = \"test-proxy-secret-32-bytes-minimum\"",
-            )
             .replace("\"example.com\"", "\"publisher.example.com\"")
             .replace("\".example.com\"", "\".publisher.example.com\"")
             .replace(
                 "https://origin.example.com",
                 "https://origin.publisher.example.com",
             )
+    }
+
+    struct FixtureSecrets(BTreeMap<String, Vec<u8>>);
+
+    impl PlatformSecretStore for FixtureSecrets {
+        fn get_bytes(
+            &self,
+            store: &StoreName,
+            key: &str,
+        ) -> Result<Vec<u8>, Report<PlatformError>> {
+            if store.as_ref() != SECRET_STORE_ID {
+                return Err(Report::new(PlatformError::SecretStore));
+            }
+            self.0
+                .get(key)
+                .cloned()
+                .ok_or_else(|| Report::new(PlatformError::SecretStore))
+        }
+
+        fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::SecretStore))
+        }
+
+        fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::SecretStore))
+        }
+    }
+
+    /// Exercise the real envelope/compiler/native-read boundary without adding
+    /// credentials or former reference properties to generated config files.
+    fn load_runtime_config(source: &str) -> LoadedConfig {
+        let config: TrustedServerAppConfig =
+            toml::from_str(source).expect("should deserialize feature-only source config");
+        let config = TrustedServerAppConfig::new(config.into_settings())
+            .expect("should validate source config before native resolution");
+        let plan =
+            compile_bindings(config.settings()).expect("should compile implicit credentials");
+        let secrets = FixtureSecrets(
+            plan.entries()
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.key().to_owned(),
+                        format!("fictional-native-credential-{}", entry.key()).into_bytes(),
+                    )
+                })
+                .collect(),
+        );
+        let data = serde_json::to_value(&config).expect("should serialize feature-only config");
+        let envelope = BlobEnvelope::new(data, "2026-10-26T00:00:00Z".to_owned());
+        let text = serde_json::to_string(&envelope).expect("should serialize valid envelope");
+        let loaded = settings_from_config_blob(&text, &secrets, &StoreName::from(SECRET_STORE_ID))
+            .expect("should load generated config through actual native bindings");
+        assert_eq!(
+            loaded.resolved_bindings.entries().len(),
+            plan.entries().len()
+        );
+        loaded
     }
 
     #[test]
@@ -3905,8 +3958,7 @@ mod tests {
         );
 
         // The whole point of the gate: what was written must actually load.
-        trusted_server_core::settings::Settings::from_toml(&written)
-            .expect("generated config must load through the runtime path");
+        load_runtime_config(&written);
 
         let report = String::from_utf8(err).expect("should produce UTF-8 output");
         assert!(
@@ -4196,8 +4248,7 @@ mod tests {
         let temp = TempDir::new().expect("should create temp dir");
         let config_path = temp.path().join("trusted-server.toml");
         let baseline = loadable_config();
-        trusted_server_core::settings::Settings::from_toml(&baseline)
-            .expect("test baseline must itself be loadable or the gate is not exercised");
+        load_runtime_config(&baseline);
         fs::write(&config_path, &baseline).expect("should write config");
         let collector = FakeCollector::new(collected_page_with_header_slot());
         let mut out = Vec::new();
@@ -4221,10 +4272,10 @@ mod tests {
         .expect("should update slots");
 
         let written = fs::read_to_string(&config_path).expect("should read config");
-        let settings = trusted_server_core::settings::Settings::from_toml(&written)
-            .expect("generated config must load through the runtime path");
+        let settings = load_runtime_config(&written);
         let creative = settings
             .creative_opportunities
+            .as_ref()
             .expect("generated config should carry creative opportunities");
         assert_eq!(
             creative.slot.len(),

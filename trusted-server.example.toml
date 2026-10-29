@@ -9,7 +9,9 @@
 # Only three sections are REQUIRED for the server to start and pass validation:
 #   1. [[handlers]] covering /_ts/admin  (admin authentication)
 #   2. [publisher]                       (domain + origin)
-#   3. [ec] passphrase                   (Edge Cookie identity secret)
+#   3. [ec]                              (Edge Cookie settings)
+# Provision generated handler.password, publisher.proxy and ec.passphrase bindings
+# before startup. See docs/guide/secrets.md. No credential properties belong here.
 #
 # Everything below those is OPTIONAL. Most optional blocks are commented out —
 # uncomment and edit one to enable it — but a few integrations are kept as active
@@ -32,21 +34,17 @@
 # -----------------------------------------------------------------------------
 # HTTP Basic-auth handler(s). At least one handler whose `path` regex covers
 # the /_ts/admin endpoints is mandatory; startup fails without it. Each handler
-# needs a non-placeholder username/password (deploy validation rejects the
-# sample password below).
+# needs a non-placeholder username and its generated handler.password binding.
 [[handlers]]
 # Regex matched against the request path. This one guards the admin surface.
 path = "^/_ts/admin"
 username = "admin"
-password = "handler_password"
 
 # You can add more handlers to basic-auth-protect other path prefixes. The
-# sample password below is a known placeholder that deploy validation rejects,
-# so it forces a real secret before push:
+# generated binding includes the exact path regex and username:
 # [[handlers]]
 # path = "^/secure"
 # username = "user"
-# password = "replace-with-admin-password"
 
 
 # -----------------------------------------------------------------------------
@@ -59,8 +57,7 @@ domain = "example.com"
 cookie_domain = ".example.com"
 # Upstream origin to proxy publisher content from. No trailing slash.
 origin_url = "https://origin.example.com"
-# Secret Store key for the HMAC secret used to sign first-party proxy URLs.
-proxy_secret = "publisher_proxy_secret"
+# The publisher.proxy credential is implicit and provisioned outside this file.
 # Optional: override the outbound Host header sent to origin_url.
 # origin_host_header_override = "www.example.com"
 # Optional: max bytes buffered when a response is post-processed in full (HTML
@@ -78,8 +75,7 @@ proxy_secret = "publisher_proxy_secret"
 # REQUIRED — Edge Cookie (EC) identity
 # -----------------------------------------------------------------------------
 [ec]
-# Secret Store key for the secret used to derive EC identifiers.
-passphrase = "ec_passphrase"
+# The ec.passphrase credential is implicit. Keep its value stable for EC continuity.
 # KV store that persists EC identity state. This is the physical store name
 # bound per adapter (e.g. `ec_identity_store` in fastly.toml); edgezero.toml's
 # logical KV id is `trusted_server_kv`.
@@ -90,7 +86,7 @@ pull_sync_concurrency = 3
 # cluster_trust_threshold = 10    # entries with cluster_size <= this are individual users
 # cluster_recheck_secs = 3600     # re-evaluate cluster_size after this many seconds
 
-# Example partner configuration. Provision referenced keys in
+# Example partner configuration. Provision generated bindings in
 # trusted_server_secrets before validating/pushing.
 # [[ec.partners]]
 # name = "Example Partner"
@@ -101,9 +97,10 @@ pull_sync_concurrency = 3
 # include this partner's UIDs in auction user.eids
 # bidstream_enabled = true
 # Only for inbound identify or batch-sync API access:
-# api_token = "partner_api_token"
-# Required when pull sync is enabled:
-# ts_pull_token = "partner_ts_pull_token"
+# api_token_enabled = true
+# Enabling pull sync requires a separate ec.pull binding for the exact endpoint.
+# pull_sync_url = "https://sync.example.com/pull"
+# pull_sync_allowed_domains = ["sync.example.com"]
 # batch_rate_limit = 60      # max batch-sync requests/min (default 60)
 # pull_sync_enabled = false  # default false
 
@@ -141,12 +138,11 @@ pull_sync_concurrency = 3
 # Trust a fronting CDN's reader IP only when the same request also supplies
 # the matching shared secret. The front door must set both headers on requests
 # it sends here and remove client-supplied copies on its other routes.
-# `shared_secret` is a key in trusted_server_secrets, not the credential itself.
+# Presence requires the generated clientip.shared binding in trusted_server_secrets.
 # Fastly-only; see docs/guide/fastly.md for the required front-door setup.
 # [trusted_client_ip]
 # ip_header = "x-ts-client-ip"
 # auth_header = "x-ts-client-ip-auth"
-# shared_secret = "trusted_client_ip_shared_secret"
 
 # Tester-cookie endpoints: GET /_ts/set-tester sets ts-tester=true and
 # GET /_ts/clear-tester clears it on publisher.cookie_domain.
@@ -216,9 +212,8 @@ proxy = "enabled"
 # type = "s3_sigv4"
 # region = "us-east-1"
 # origin_query = "strip"
-# secret_store = "s3-auth"
-# access_key_id = "access_key_id"
-# secret_access_key = "secret_access_key"
+# Required s3.access-id and s3.secret bindings are generated for this route.
+# session_token_enabled = false  # true also requires s3.session
 #
 # Optional Fastly Image Optimizer for the route (references a profile_set below):
 # [proxy.asset_routes.image_optimizer]
@@ -457,12 +452,13 @@ auction_timeout_ms = 500
 #   "/reviews/y" -> /123456789/example/reviews
 
 # Direct Tinybird auction telemetry (off by default). When enabled, `api_host`
-# is required and must be a bare host (no scheme or path).
+# is a DNS host with optional HTTPS :port, no scheme/path/userinfo/query/fragment.
+# Explicit :443 normalizes away; other valid ports remain in the bound endpoint.
 # [tinybird]
 # enabled = true
-# api_host = "api.us-east.tinybird.example"   # required when enabled; host only
+# api_host = "api.tinybird.example.com"       # optionally append :8443
 # auction_dataset = "auction_events"          # Events API datasource name
-# auction_token_secret = "tinybird_auction_append_token"  # Key in trusted_server_secrets
+# The generated tinybird.auction binding binds the Events API host and dataset.
 
 # Debug endpoints (all default false — never enable in production).
 # [debug]
@@ -622,9 +618,8 @@ enabled = false
 # rewrite_sdk = true
 # Server-side Protection API validation (fails open on timeout/error):
 # enable_protection = false
-# Required when enable_protection = true. The value is a key in
-# trusted_server_secrets, not the DataDome credential itself.
-# server_side_key_secret_name = "datadome_server_side_key"
+# Enabled Protection requires the generated datadome.server binding in
+# trusted_server_secrets, provisioned separately from app config.
 # protection_api_origin = "https://api.example.com"
 # timeout_ms = 1500
 # protection_excluded_methods = ["OPTIONS"]
@@ -639,8 +634,7 @@ enabled = false
 # Never enable in production.
 # [integrations.datadome.protection_test_bypass]
 # enabled = true
-# credential_secret_store = "ts_secrets"
-# credential_secret_name = "datadome_protection_test_bypass"
+# The enabled bypass requires a separate datadome.bypass binding.
 
 # Google Publisher Tag (GPT) first-party proxy. Kept active but disabled so
 # `ts audit` can flip `enabled` to true when GPT is detected.

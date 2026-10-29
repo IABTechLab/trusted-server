@@ -1,3 +1,7 @@
+/// Fictional native credential fixtures using the production binding compiler.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod secret_bindings;
+
 #[cfg(test)]
 pub(crate) mod logging;
 
@@ -596,3 +600,6 @@ pub mod nextjs_auction {
 
 #[cfg(feature = "test-utils")]
 pub(crate) mod async_html_finalization;
+
+#[cfg(feature = "test-utils")]
+pub(crate) mod secret_binding_runtime;

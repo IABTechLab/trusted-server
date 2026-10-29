@@ -58,39 +58,44 @@ Add an auth block when the asset origin is a private S3 bucket.
 ```toml
 [[proxy.asset_routes]]
 prefix = "/.image/"
-origin_url = "https://bucket.s3.us-east-1.amazonaws.com"
+origin_url = "https://assets.example.com"
 
 [proxy.asset_routes.auth]
 type = "s3_sigv4"
 region = "us-east-1"
 origin_query = "strip"
-access_key_id = "s3_access_key_id"
-secret_access_key = "s3_secret_access_key"
-# session_token = "s3_session_token"
+session_token_enabled = false
 ```
 
 ### S3 requirements
 
 - `origin_url` must be the real S3 host that AWS validates in the SigV4 canonical request.
-- Use `https` origins for authenticated routes. `http` origins are accepted by the generic asset route validator, but they would send SigV4 headers in clear text.
+- Authenticated routes require HTTPS and certificate verification regardless of `proxy.certificate_check`. The example host is fictional; use the real approved S3 origin in private config.
 - S3 support is for `GET` and `HEAD` asset reads.
 - Signing uses header-based AWS SigV4, not presigned URLs.
 - The signer uses `x-amz-content-sha256: UNSIGNED-PAYLOAD`.
-- Credential references resolve from the logical `trusted_server_secrets` store while runtime settings are built. Signing performs no request-time secret-store reads.
+- Generated bindings resolve from the logical `trusted_server_secrets` store while runtime settings are built. Signing performs no request-time secret-store reads. The loaded credential remains paired with its compiled origin/policy across GET/HEAD and preflight paths; redirects are not followed.
 - Successful authenticated S3 responses preserve the origin `Cache-Control`; configure object cache headers intentionally.
 - Existing client `Authorization` and `x-amz-*` signing headers are replaced before signing.
 
 ### Secret store values
 
-Credential fields contain secret key references:
+S3 auth implies required `s3.access-id` and `s3.secret` bindings.
+Boolean `session_token_enabled` defaults to false; true also requires
+`s3.session`. No credential-name properties belong in public TOML.
 
-| Config field        | Default key         | Resolved value                       |
-| ------------------- | ------------------- | ------------------------------------ |
-| `access_key_id`     | `access_key_id`     | AWS access key ID                    |
-| `secret_access_key` | `secret_access_key` | AWS secret access key                |
-| `session_token`     | unset               | Optional AWS temporary session token |
+All three generated contexts include the route prefix, HTTPS origin, optional
+regex/rewrite, region, and effective query policy, with separate purposes.
+Changing those inputs requires newly reviewed provisioning, not reuse of the
+old credential under mutable config. Use [the shared plan and native instructions](./secrets).
+Do not derive keys manually.
 
-Place those values in the logical `trusted_server_secrets` store. Adapter configuration maps that logical ID to an environment-specific physical store such as Fastly `ts_secrets`. The legacy `secret_store` field is accepted for one migration release but ignored and omitted from newly pushed config.
+Adapter deployment maps `trusted_server_secrets` to the physical store.
+Deprecated `secret_store` input is ignored and omitted from new config.
+For rotation, pause affected state creation/traffic while updating the full
+required set. Native multi-key writes are not transactional. Verify the set,
+recreate state, exercise GET/HEAD and preflight, then resume. See
+[migration and retirement](./secret-binding-migration).
 
 ## Origin query policy
 

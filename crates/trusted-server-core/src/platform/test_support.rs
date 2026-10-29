@@ -198,6 +198,49 @@ impl PlatformBackend for StubBackend {
 }
 
 // ---------------------------------------------------------------------------
+// RecordingBackend
+// ---------------------------------------------------------------------------
+
+const RECORDING_BACKEND_NAME: &str = "recording-backend";
+
+/// Backend fixture that records ensured specifications and returns one fixed name.
+#[derive(Default)]
+pub(crate) struct RecordingBackend {
+    specs: Mutex<Vec<PlatformBackendSpec>>,
+}
+
+impl RecordingBackend {
+    /// Returns a snapshot of specifications captured by backend registration.
+    ///
+    /// # Panics
+    /// Panics if the recording lock is poisoned.
+    pub(crate) fn specs(&self) -> Vec<PlatformBackendSpec> {
+        self.specs
+            .lock()
+            .expect("should lock recorded backend specifications")
+            .clone()
+    }
+}
+
+impl PlatformBackend for RecordingBackend {
+    fn naming_policy(&self) -> super::BackendNamingPolicy {
+        super::BackendNamingPolicy::Axum
+    }
+
+    fn predict_name(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+        Ok(RECORDING_BACKEND_NAME.to_owned())
+    }
+
+    fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+        self.specs
+            .lock()
+            .expect("should record the ensured backend specification")
+            .push(spec.clone());
+        Ok(RECORDING_BACKEND_NAME.to_owned())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // StubHttpClient
 // ---------------------------------------------------------------------------
 
@@ -1296,6 +1339,37 @@ mod tests {
         };
         let name = stub.ensure(&spec).expect("should return a backend name");
         assert_eq!(name, "stub-backend", "should return fixed name");
+    }
+
+    #[test]
+    fn recording_backend_records_registration_but_not_name_prediction() {
+        let backend = RecordingBackend::default();
+        let spec = PlatformBackendSpec {
+            scheme: "https".to_owned(),
+            host: "backend.example.com".to_owned(),
+            port: Some(8443),
+            host_header_override: None,
+            certificate_check: true,
+            first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+            between_bytes_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+            discriminator: None,
+        };
+        let predicted = backend
+            .predict_name(&spec)
+            .expect("should predict the recording backend name");
+        assert!(
+            backend.specs().is_empty(),
+            "name prediction must not register a backend"
+        );
+        let ensured = backend
+            .ensure(&spec)
+            .expect("should record the ensured backend");
+        assert_eq!(predicted, ensured);
+        let recorded = backend.specs();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].host, "backend.example.com");
+        assert_eq!(recorded[0].port, Some(8443));
+        assert!(recorded[0].certificate_check);
     }
 
     #[test]

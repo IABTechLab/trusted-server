@@ -24,16 +24,32 @@ fi
 
 mkdir -p "$CONFIG_DIR"
 
-cargo build \
-    --manifest-path crates/trusted-server-integration-tests/Cargo.toml \
-    --target-dir "$INTEGRATION_TARGET_DIR" \
-    --target "$HOST_TARGET" \
-    --bin generate-viceroy-config
-
-GENERATOR_BIN="$INTEGRATION_TARGET_DIR/$HOST_TARGET/debug/generate-viceroy-config"
+# Cargo checks freshness for the default generator; explicit overrides are caller-owned.
+if [ -z "${GENERATOR_BIN:-}" ]; then
+    cargo build \
+        --manifest-path crates/trusted-server-integration-tests/Cargo.toml \
+        --target-dir "$INTEGRATION_TARGET_DIR" \
+        --target "$HOST_TARGET" \
+        --bin generate-viceroy-config
+fi
+GENERATOR_BIN="${GENERATOR_BIN:-$INTEGRATION_TARGET_DIR/$HOST_TARGET/debug/generate-viceroy-config}"
 if [ ! -x "$GENERATOR_BIN" ]; then
     echo "Generator binary not found or not executable at $GENERATOR_BIN" >&2
     exit 1
+fi
+
+if [ "${1:-}" = "--local-manifests" ]; then
+    "$GENERATOR_BIN" --adapter fastly --template fastly.toml \
+        --app-config trusted-server.example.toml --output fastly.toml
+    "$GENERATOR_BIN" --adapter spin \
+        --template crates/trusted-server-adapter-spin/spin.toml \
+        --app-config trusted-server.example.toml \
+        --output crates/trusted-server-adapter-spin/spin.toml
+    "$GENERATOR_BIN" --adapter cloudflare \
+        --template crates/trusted-server-adapter-cloudflare/wrangler.ci.toml \
+        --app-config "$APP_CONFIG_PATH" \
+        --output crates/trusted-server-adapter-cloudflare/wrangler.ci.toml
+    exit 0
 fi
 
 "$GENERATOR_BIN" \

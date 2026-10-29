@@ -13,18 +13,23 @@ use edgezero_core::manifest::ManifestLoader;
 use trusted_server_core::config::TrustedServerAppConfig;
 use trusted_server_core::settings::Settings;
 
-/// Shared local app-config flags accepted by every config/audit ad-template command.
+/// Shared local app-config flags for config, audit, and secret planning commands.
 #[derive(Clone, Debug, Args)]
 pub struct AppConfigArgs {
     /// Path to `trusted-server.toml`. Defaults to `<app.name>.toml` beside `edgezero.toml`.
     #[arg(long)]
     pub app_config: Option<PathBuf>,
-    /// Path to `edgezero.toml`.
-    #[arg(long, default_value = "edgezero.toml")]
+    /// Path to `edgezero.toml`. Defaults to `EDGEZERO_MANIFEST`, then `edgezero.toml`.
+    #[arg(long, default_value_os_t = default_manifest_path())]
     pub manifest: PathBuf,
     /// Skip app-config environment overlay.
     #[arg(long)]
     pub no_env: bool,
+}
+
+fn default_manifest_path() -> PathBuf {
+    std::env::var_os("EDGEZERO_MANIFEST")
+        .map_or_else(|| PathBuf::from("edgezero.toml"), PathBuf::from)
 }
 
 /// Effective settings plus the resolved app-config path they were loaded from.

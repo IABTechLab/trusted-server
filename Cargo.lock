@@ -19,6 +19,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ahash"
+version = "0.8.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
+dependencies = [
+ "cfg-if",
+ "once_cell",
+ "version_check",
+ "zerocopy",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -368,12 +380,6 @@ name = "base16ct"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c7f02d4ea65f2c1853089ffd8d2787bdbc63de2f0d29dedbcf8ccdfa0ccd4cf"
-
-[[package]]
-name = "base16ct"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd307490d624467aa6f74b0eabb77633d1f758a7b25f12bceb0b22e08d9726f6"
 
 [[package]]
 name = "base64"
@@ -1530,12 +1536,11 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.10#85d933b8044dec29fe9e4685cae194eaf0290911"
+source = "git+https://github.com/IABTechLab/edgezero?rev=4f645b1e705d295117c93f4c74db12e5692ffb34#4f645b1e705d295117c93f4c74db12e5692ffb34"
 dependencies = [
- "base16ct 1.0.0",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.10.9",
  "toml",
  "walkdir",
 ]
@@ -1543,7 +1548,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-axum"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.10#85d933b8044dec29fe9e4685cae194eaf0290911"
+source = "git+https://github.com/IABTechLab/edgezero?rev=4f645b1e705d295117c93f4c74db12e5692ffb34#4f645b1e705d295117c93f4c74db12e5692ffb34"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1571,7 +1576,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-cloudflare"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.10#85d933b8044dec29fe9e4685cae194eaf0290911"
+source = "git+https://github.com/IABTechLab/edgezero?rev=4f645b1e705d295117c93f4c74db12e5692ffb34#4f645b1e705d295117c93f4c74db12e5692ffb34"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1594,12 +1599,12 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.10#85d933b8044dec29fe9e4685cae194eaf0290911"
+source = "git+https://github.com/IABTechLab/edgezero?rev=4f645b1e705d295117c93f4c74db12e5692ffb34#4f645b1e705d295117c93f4c74db12e5692ffb34"
 dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
- "base16ct 1.0.0",
+ "base64",
  "brotli",
  "bytes",
  "chrono",
@@ -1615,7 +1620,7 @@ dependencies = [
  "log-fastly",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "toml_edit 0.25.12+spec-1.1.0",
  "walkdir",
@@ -1624,7 +1629,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-spin"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.10#85d933b8044dec29fe9e4685cae194eaf0290911"
+source = "git+https://github.com/IABTechLab/edgezero?rev=4f645b1e705d295117c93f4c74db12e5692ffb34#4f645b1e705d295117c93f4c74db12e5692ffb34"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1651,7 +1656,7 @@ dependencies = [
 [[package]]
 name = "edgezero-cli"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.10#85d933b8044dec29fe9e4685cae194eaf0290911"
+source = "git+https://github.com/IABTechLab/edgezero?rev=4f645b1e705d295117c93f4c74db12e5692ffb34#4f645b1e705d295117c93f4c74db12e5692ffb34"
 dependencies = [
  "chrono",
  "clap",
@@ -1666,7 +1671,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
- "similar 3.2.0",
+ "similar",
  "simple_logger",
  "thiserror 2.0.18",
  "toml",
@@ -1676,13 +1681,12 @@ dependencies = [
 [[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.10#85d933b8044dec29fe9e4685cae194eaf0290911"
+source = "git+https://github.com/IABTechLab/edgezero?rev=4f645b1e705d295117c93f4c74db12e5692ffb34#4f645b1e705d295117c93f4c74db12e5692ffb34"
 dependencies = [
  "anyhow",
  "async-compression",
  "async-stream",
  "async-trait",
- "base16ct 1.0.0",
  "bytes",
  "edgezero-macros",
  "futures",
@@ -1696,7 +1700,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
- "sha2 0.11.1",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "toml",
  "tower-service",
@@ -1708,7 +1712,7 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?tag=v0.0.10#85d933b8044dec29fe9e4685cae194eaf0290911"
+source = "git+https://github.com/IABTechLab/edgezero?rev=4f645b1e705d295117c93f4c74db12e5692ffb34#4f645b1e705d295117c93f4c74db12e5692ffb34"
 dependencies = [
  "log",
  "proc-macro2",
@@ -1738,7 +1742,7 @@ version = "0.13.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5e6043086bf7973472e0c7dff2142ea0b680d30e18d9cc40f267efbf222bd47"
 dependencies = [
- "base16ct 0.2.0",
+ "base16ct",
  "crypto-bigint",
  "digest 0.10.7",
  "ff",
@@ -1832,7 +1836,8 @@ dependencies = [
 [[package]]
 name = "esi"
 version = "0.7.2"
-source = "git+https://github.com/stackpop/esi?rev=75bfbb396d4cb7792610f1287cbec61675f13f38#75bfbb396d4cb7792610f1287cbec61675f13f38"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "026264c3022569f7bc5052f9452362537e923b34ecc9248b803437c2b89cdd81"
 dependencies = [
  "atoi",
  "base64",
@@ -1884,9 +1889,9 @@ dependencies = [
 
 [[package]]
 name = "fastly"
-version = "0.13.1"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c5c07c0c67d0b5826d1cb2311e563a17860b50e2ae89e1c703d6400d904d1e2"
+checksum = "531e4c3df48350d9f4fc95b4deaf87fd29820336b7926bb84bf460457c2a126b"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1897,6 +1902,7 @@ dependencies = [
  "fastly-sys",
  "http",
  "itertools 0.13.0",
+ "lazy_static",
  "mime",
  "serde",
  "serde_json",
@@ -1911,9 +1917,9 @@ dependencies = [
 
 [[package]]
 name = "fastly-macros"
-version = "0.13.1"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "698025eab5612adab20df48963a5126650893014e8505af02a0af20939ee6a05"
+checksum = "cc2aef5f9690b04c8890f9a54ddb591b12b9779ec25ee0e572d207106e52e3d8"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1922,9 +1928,9 @@ dependencies = [
 
 [[package]]
 name = "fastly-shared"
-version = "0.13.1"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "191c2cf082f5d17f4ca0685cedaa0642ad4ade949fac8d1dbdd62ff756b13500"
+checksum = "080ad138403159fd366d3e0b14bb49cb0c01dc18c25095bbbd1c85e3338f5413"
 dependencies = [
  "bitflags 1.3.2",
  "http",
@@ -1932,9 +1938,9 @@ dependencies = [
 
 [[package]]
 name = "fastly-sys"
-version = "0.13.1"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "239c77706cf9110b423a89b6b03b8011729b144390d2a7f641d95ef66b2768b8"
+checksum = "de75ef193f6c29c43d667458bede648970715aedd5db2d42c2eba3ffa3ad738b"
 dependencies = [
  "bitflags 1.3.2",
  "fastly-shared",
@@ -3160,6 +3166,9 @@ name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
+dependencies = [
+ "ahash",
+]
 
 [[package]]
 name = "hashbrown"
@@ -3181,6 +3190,15 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash",
+]
+
+[[package]]
+name = "hashlink"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
+dependencies = [
+ "hashbrown 0.14.5",
 ]
 
 [[package]]
@@ -3879,9 +3897,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.38.2"
+version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
+checksum = "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149"
 dependencies = [
  "cc",
  "pkg-config",
@@ -3935,9 +3953,9 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "log-fastly"
-version = "0.13.1"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "433713b6191ad3e1d5248db9536f3e2d99a12d7ff998afd272a98d96e6dbc2ed"
+checksum = "51dae5def13a2d557fdb63862d642f8d4641ec3773c036bb14092697b6764013"
 dependencies = [
  "fastly",
  "log",
@@ -5260,13 +5278,14 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.40.2"
+version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
+checksum = "7753b721174eb8ff87a9a0e799e2d7bc3749323e773db92e0984debb00019d6e"
 dependencies = [
  "bitflags 2.13.0",
  "fallible-iterator",
  "fallible-streaming-iterator",
+ "hashlink 0.9.1",
  "libsqlite3-sys",
  "smallvec",
 ]
@@ -5485,7 +5504,7 @@ version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3e97a565f76233a6003f9f5c54be1d9c5bdfa3eccfb189469f11ec4901c47dc"
 dependencies = [
- "base16ct 0.2.0",
+ "base16ct",
  "der",
  "generic-array",
  "subtle",
@@ -5840,15 +5859,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
-name = "similar"
-version = "3.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f66ca1f7aca2474dc10c942eb22feffc897735f54cd1db90138c2fddb490987"
-dependencies = [
- "bstr",
-]
-
-[[package]]
 name = "simple_logger"
 version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5896,9 +5906,9 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
 name = "spin-macro"
-version = "7.0.0"
+version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac8a641da857d4e7cada31a853c40180eeb10485a0f2f0282d0a7e5a2a4105d4"
+checksum = "11e483b94d5bcfac493caf0427fa875063e3e8604d0466a4ab491ec200a42857"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5907,9 +5917,9 @@ dependencies = [
 
 [[package]]
 name = "spin-sdk"
-version = "7.0.0"
+version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b7a3d9a6805ccdb4d404e91ccf7198ac5e486b6199dc9387aeebaa368272112"
+checksum = "4fd2abac3eb2ee249c2241ab87f7b1287f36172c8cc1ea815c19c85e41ede44d"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6550,10 +6560,13 @@ dependencies = [
  "error-stack",
  "futures",
  "log",
+ "rcgen",
  "reqwest 0.12.28",
+ "rustls",
  "simple_logger",
  "temp-env",
  "tokio",
+ "tokio-rustls",
  "tower 0.4.13",
  "trusted-server-core",
 ]
@@ -6661,7 +6674,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
- "similar 2.7.0",
+ "similar",
  "temp-env",
  "tempfile",
  "time",
@@ -6984,11 +6997,12 @@ dependencies = [
 
 [[package]]
 name = "validator"
-version = "0.21.0"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3d68c6633c483df6780cc5277a417c7c2d1bceee2649d06c8ab6b0fd2dd3c81"
+checksum = "43fb22e1a008ece370ce08a3e9e4447a910e92621bb49b85d6e48a45397e7cfa"
 dependencies = [
  "idna",
+ "once_cell",
  "regex",
  "serde",
  "serde_derive",
@@ -7068,9 +7082,9 @@ dependencies = [
 
 [[package]]
 name = "wasip3"
-version = "0.7.1+wasi-0.3.0"
+version = "0.6.0+wasi-0.3.0-rc-2026-03-15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75e9ed91ee5a995b6fe16c89d4511a8c12eb76967be20b57557618e02e781bcc"
+checksum = "ed83456dd6a0b8581998c0365e4651fa2997e5093b49243b7f35391afaa7a3d9"
 dependencies = [
  "bytes",
  "http",
@@ -7717,7 +7731,7 @@ checksum = "631a50d867fafb7093e709d75aaee9e0e0d5deb934021fcea25ac2fe09edc51e"
 dependencies = [
  "arraydeque",
  "encoding_rs",
- "hashlink",
+ "hashlink 0.11.1",
 ]
 
 [[package]]

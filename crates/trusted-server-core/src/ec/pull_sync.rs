@@ -109,10 +109,6 @@ pub fn build_pull_sync_context(
 /// costs no KV operation, and the fresh snapshot is reused for the write-back
 /// instead of the stale one.
 ///
-/// # Panics
-///
-/// Panics if the HTTP request builder produces an invalid request, which
-/// cannot happen with the hardcoded method and well-formed URI used here.
 pub fn dispatch_pull_sync(
     settings: &Settings,
     kv: &KvIdentityGraph,
@@ -216,11 +212,12 @@ pub fn dispatch_pull_sync(
             }
         }
 
-        let Some(token) = partner.ts_pull_token.as_ref() else {
-            log::warn!(
-                "Pull sync: partner '{}' enabled but missing ts_pull_token",
-                partner.source_domain
-            );
+        let Some(binding) = partner.pull_binding.as_ref() else {
+            log::warn!("Pull sync: loaded credential binding unavailable");
+            continue;
+        };
+        let Some(auth_header) = binding.bearer_header() else {
+            log::warn!("Pull sync: invalid credential representation");
             continue;
         };
 
@@ -229,32 +226,35 @@ pub fn dispatch_pull_sync(
         let host = request_url.host_str().unwrap_or_default().to_string();
         let port = request_url.port();
 
+        let request = match http::Request::builder()
+            .method(Method::GET)
+            .uri(request_url.as_str())
+            .header(header::AUTHORIZATION, auth_header.clone())
+            .body(EdgeBody::empty())
+        {
+            Ok(request) => request,
+            Err(_) => {
+                log::warn!("Pull sync: request preparation failed");
+                continue;
+            }
+        };
+
         let backend_name = match services.backend().ensure(&PlatformBackendSpec {
             scheme,
             host,
             port,
             host_header_override: None,
-            certificate_check: settings.proxy.certificate_check,
+            certificate_check: true,
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
             between_bytes_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
             discriminator: None,
         }) {
             Ok(name) => name,
-            Err(err) => {
-                log::warn!(
-                    "Pull sync: failed to resolve backend for partner '{}': {err:?}",
-                    partner.source_domain
-                );
+            Err(_) => {
+                log::warn!("Pull sync: backend resolution failed");
                 continue;
             }
         };
-
-        let request = http::Request::builder()
-            .method(Method::GET)
-            .uri(request_url.as_str())
-            .header("authorization", format!("Bearer {}", token.expose()))
-            .body(EdgeBody::empty())
-            .expect("should build pull sync request");
 
         let pending = match futures::executor::block_on(
             services
@@ -262,11 +262,8 @@ pub fn dispatch_pull_sync(
                 .send_async(PlatformHttpRequest::new(request, backend_name)),
         ) {
             Ok(pending) => pending,
-            Err(err) => {
-                log::warn!(
-                    "Pull sync: failed to dispatch partner '{}': {err:?}",
-                    partner.source_domain
-                );
+            Err(_) => {
+                log::warn!("Pull sync: dispatch failed");
                 continue;
             }
         };
@@ -316,53 +313,9 @@ fn is_partner_pull_eligible(partner: &PartnerConfig, kv_entry: Option<&KvEntry>)
 }
 
 fn validated_pull_sync_url(partner: &PartnerConfig) -> Option<Url> {
-    let pull_sync_url = partner.pull_sync_url.as_deref()?;
-    let parsed = match Url::parse(pull_sync_url) {
-        Ok(url) => url,
-        Err(err) => {
-            log::error!(
-                "Pull sync: partner '{}' has invalid pull_sync_url '{}': {err}",
-                partner.source_domain,
-                pull_sync_url
-            );
-            return None;
-        }
-    };
-
-    if parsed.scheme() != "https" {
-        log::error!(
-            "Pull sync: partner '{}' pull_sync_url must use HTTPS, got scheme '{}'",
-            partner.source_domain,
-            parsed.scheme()
-        );
-        return None;
-    }
-
-    let Some(hostname) = parsed.host_str() else {
-        log::error!(
-            "Pull sync: partner '{}' pull_sync_url has no hostname: {}",
-            partner.source_domain,
-            pull_sync_url
-        );
-        return None;
-    };
-
-    let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
-    if !partner.pull_sync_allowed_domains.iter().any(|domain| {
-        domain
-            .trim()
-            .trim_end_matches('.')
-            .eq_ignore_ascii_case(&hostname)
-    }) {
-        log::error!(
-            "Pull sync: partner '{}' URL host '{}' not in pull_sync_allowed_domains",
-            partner.source_domain,
-            hostname
-        );
-        return None;
-    }
-
-    Some(parsed)
+    // The registry captured this inseparable credential/target use from one load.
+    // Loose partner URLs, allowlists and token shadows are not export authority.
+    Url::parse(partner.pull_binding.as_ref()?.endpoint()?).ok()
 }
 
 fn build_pull_request_url(mut base_url: Url, ec_id: &str) -> Url {
@@ -386,11 +339,8 @@ fn drain_pull_batch(
         let response =
             match futures::executor::block_on(services.http_client().wait(pending.pending)) {
                 Ok(response) => response,
-                Err(err) => {
-                    log::warn!(
-                        "Pull sync: request failed for partner '{}': {err:?}",
-                        source_domain
-                    );
+                Err(_) => {
+                    log::warn!("Pull sync: request failed");
                     continue;
                 }
             };
@@ -481,11 +431,8 @@ fn extract_pull_uid(response: PlatformResponse, source_domain: &str) -> Option<S
     }
     let payload = match serde_json::from_slice::<PullSyncResponse>(&body) {
         Ok(payload) => payload,
-        Err(err) => {
-            log::warn!(
-                "Pull sync: partner '{}' returned invalid JSON body: {err}",
-                source_domain
-            );
+        Err(_) => {
+            log::warn!("Pull sync: invalid response representation");
             return None;
         }
     };
@@ -559,7 +506,10 @@ mod tests {
             pull_sync_allowed_domains: vec!["sync.partner.test".to_owned()],
             pull_sync_ttl_sec: ttl_sec,
             pull_sync_rate_limit: 20,
-            ts_pull_token: Some(Redacted::new("token".to_owned())),
+            ts_pull_token: Some(Redacted::new(
+                "fictional-outbound-token-with-32-bytes".to_owned(),
+            )),
+            pull_binding: None,
         }
     }
 
@@ -573,7 +523,7 @@ mod tests {
         let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
         let graph = KvIdentityGraph::in_memory("pull_store");
         ec_context.set_kv_snapshot(seed_present_snapshot(&graph, &ec_id));
-        let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
+        let registry = loaded_registry(&[pull_enabled_ec_partner("ssp.example.com")])
             .expect("should build registry");
 
         let context = build_pull_sync_context(&ec_context, &registry)
@@ -592,7 +542,7 @@ mod tests {
             ..ConsentContext::default()
         };
         let ec_context = EcContext::new_for_test(Some("invalid-ec".to_owned()), consent);
-        let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
+        let registry = loaded_registry(&[pull_enabled_ec_partner("ssp.example.com")])
             .expect("should build registry");
 
         let context = build_pull_sync_context(&ec_context, &registry);
@@ -612,7 +562,7 @@ mod tests {
         let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
         let graph = KvIdentityGraph::in_memory("pull_store");
         ec_context.set_kv_snapshot(seed_present_snapshot(&graph, &ec_id));
-        let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
+        let registry = loaded_registry(&[pull_enabled_ec_partner("ssp.example.com")])
             .expect("should build registry");
         assert!(
             ec_context.ec_allowed(),
@@ -637,7 +587,7 @@ mod tests {
         let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
         let graph = KvIdentityGraph::in_memory("pull_store");
         let mut snapshot = seed_present_snapshot(&graph, &ec_id);
-        let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
+        let registry = loaded_registry(&[pull_enabled_ec_partner("ssp.example.com")])
             .expect("should build registry");
 
         assert!(
@@ -688,7 +638,7 @@ mod tests {
 
     #[test]
     fn completeness_requires_all_pull_partner_ids() {
-        let registry = PartnerRegistry::from_config(&[
+        let registry = loaded_registry(&[
             pull_enabled_ec_partner("a.example.com"),
             pull_enabled_ec_partner("b.example.com"),
         ])
@@ -738,26 +688,31 @@ mod tests {
     }
 
     #[test]
-    fn validated_pull_sync_url_accepts_normalized_allowlist_match() {
-        let mut partner = pull_partner(3600);
-        partner.pull_sync_url = Some("https://SYNC.PARTNER.TEST./pull".to_owned());
-        partner.pull_sync_allowed_domains = vec!["sync.partner.test".to_owned()];
-
-        let validated = validated_pull_sync_url(&partner);
-        assert!(
-            validated.is_some(),
-            "should accept allowlist match after hostname normalization"
+    fn validated_pull_sync_url_uses_loaded_target_not_mutable_shadows() {
+        let registry = loaded_registry(&[pull_enabled_ec_partner("sync.partner.test")])
+            .expect("should load partner");
+        let mut partner = registry
+            .get("sync.partner.test")
+            .expect("should find partner")
+            .clone();
+        partner.pull_sync_url = Some("https://unapproved.example/pull".to_owned());
+        partner.pull_sync_allowed_domains = vec!["unapproved.example".to_owned()];
+        partner.ts_pull_token = Some(Redacted::new("untrusted-shadow".to_owned()));
+        assert_eq!(
+            validated_pull_sync_url(&partner)
+                .expect("should retain bound endpoint")
+                .as_str(),
+            "https://sync.partner.test/sync"
         );
     }
 
     #[test]
     fn build_pull_request_url_appends_ec_id() {
-        let url = Url::parse("https://sync.partner.test/pull?x=1").expect("should parse URL");
+        let url = Url::parse("https://sync.partner.test/pull").expect("should parse URL");
         let result = build_pull_request_url(url, "ecid123");
 
         let query = result.query().expect("should have query string");
-        assert!(query.contains("x=1"), "should preserve existing query");
-        assert!(query.contains("ec_id=ecid123"), "should append ec_id");
+        assert_eq!(query, "ec_id=ecid123", "should append exactly one ec_id");
         assert!(
             !query.contains("ip="),
             "should not forward client IP to partners"
@@ -895,11 +850,70 @@ mod tests {
 
     use crate::ec::kv::TombstoneOutcome;
     use crate::error::TrustedServerError;
-    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
+    use crate::platform::test_support::{
+        RecordingBackend, StubHttpClient, build_services_with_http_client,
+    };
     use crate::settings::EcPartner;
     use crate::test_support::tests::create_test_settings;
     use error_stack::Report;
     use std::sync::Arc;
+
+    #[test]
+    fn pull_secret_bindings_force_tls_and_never_follow_redirects() {
+        for status in [301, 302, 303, 307, 308] {
+            let mut settings = create_test_settings();
+            settings.proxy.certificate_check = false;
+            let registry = loaded_registry(&[pull_enabled_ec_partner("sync.example.com")])
+                .expect("should load registry");
+            let graph = KvIdentityGraph::in_memory("pull_store");
+            let ec_id = snapshot_ec_id();
+            let snapshot = seed_present_snapshot(&graph, &ec_id);
+            let backend = Arc::new(RecordingBackend::default());
+            let http = Arc::new(StubHttpClient::new());
+            http.push_response_with_headers(
+                status,
+                Vec::new(),
+                vec![("location", "https://unapproved.example/stolen")],
+            );
+            let services = RuntimeServices::builder()
+                .config_store(Arc::new(crate::platform::test_support::NoopConfigStore))
+                .secret_store(Arc::new(crate::platform::test_support::NoopSecretStore))
+                .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+                .backend(backend.clone())
+                .http_client(http.clone())
+                .geo(Arc::new(crate::platform::test_support::NoopGeo))
+                .client_info(crate::platform::ClientInfo::default())
+                .build();
+            dispatch_pull_sync(
+                &settings,
+                &graph,
+                &registry,
+                &AllowAllRateLimiter,
+                &PullSyncContext {
+                    ec_id: ec_id.clone(),
+                    snapshot,
+                },
+                &services,
+            );
+            assert_eq!(
+                http.recorded_request_uris(),
+                vec![format!("https://sync.example.com/sync?ec_id={ec_id}")]
+            );
+            let specs = backend.specs();
+            assert_eq!(specs.len(), 1);
+            assert!(specs[0].certificate_check);
+            assert_eq!(specs[0].host_header_override, None);
+            assert!(
+                graph
+                    .get(&ec_id)
+                    .expect("should read row")
+                    .expect("should have row")
+                    .0
+                    .ids
+                    .is_empty()
+            );
+        }
+    }
 
     struct AllowAllRateLimiter;
 
@@ -919,6 +933,7 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
+            api_token_enabled: true,
             api_token: Some(Redacted::new(format!(
                 "{source_domain}-api-token-32-bytes-minimum"
             ))),
@@ -928,8 +943,19 @@ mod tests {
             pull_sync_allowed_domains: vec![source_domain.to_owned()],
             pull_sync_ttl_sec: 3600,
             pull_sync_rate_limit: 100,
-            ts_pull_token: Some(Redacted::new("outbound-token".to_owned())),
+            ts_pull_token: Some(Redacted::new(
+                "fictional-outbound-token-with-32-bytes".to_owned(),
+            )),
         }
+    }
+
+    fn loaded_registry(
+        partners: &[EcPartner],
+    ) -> Result<PartnerRegistry, Report<TrustedServerError>> {
+        let mut settings = create_test_settings();
+        settings.ec.partners = partners.to_vec();
+        crate::test_support::secret_bindings::install_test_bindings(&mut settings)?;
+        PartnerRegistry::from_settings(&settings)
     }
 
     fn snapshot_ec_id() -> String {
@@ -948,7 +974,7 @@ mod tests {
         let mut settings = create_test_settings();
         // Force one partner per concurrency batch so responses span batches.
         settings.ec.pull_sync_concurrency = 1;
-        let registry = PartnerRegistry::from_config(&[
+        let registry = loaded_registry(&[
             pull_enabled_ec_partner("alpha.example.com"),
             pull_enabled_ec_partner("beta.example.com"),
         ])
@@ -1001,7 +1027,7 @@ mod tests {
     fn dispatch_pull_sync_calls_and_persists_only_missing_partner() {
         let mut settings = create_test_settings();
         settings.ec.pull_sync_concurrency = 4;
-        let registry = PartnerRegistry::from_config(&[
+        let registry = loaded_registry(&[
             pull_enabled_ec_partner("alpha.example.com"),
             pull_enabled_ec_partner("beta.example.com"),
         ])
@@ -1064,9 +1090,8 @@ mod tests {
     fn dispatch_pull_sync_skips_non_present_snapshots() {
         let mut settings = create_test_settings();
         settings.ec.pull_sync_concurrency = 4;
-        let registry =
-            PartnerRegistry::from_config(&[pull_enabled_ec_partner("alpha.example.com")])
-                .expect("should build registry");
+        let registry = loaded_registry(&[pull_enabled_ec_partner("alpha.example.com")])
+            .expect("should build registry");
         let graph = KvIdentityGraph::in_memory("pull_store");
         let ec_id = snapshot_ec_id();
         let stub = Arc::new(StubHttpClient::new());
@@ -1109,9 +1134,8 @@ mod tests {
     fn dispatch_pull_sync_skips_tombstone_snapshot() {
         let mut settings = create_test_settings();
         settings.ec.pull_sync_concurrency = 4;
-        let registry =
-            PartnerRegistry::from_config(&[pull_enabled_ec_partner("alpha.example.com")])
-                .expect("should build registry");
+        let registry = loaded_registry(&[pull_enabled_ec_partner("alpha.example.com")])
+            .expect("should build registry");
         let graph = KvIdentityGraph::in_memory("pull_store");
         let ec_id = snapshot_ec_id();
         let snapshot = EcKvSnapshot::Present {
@@ -1149,9 +1173,8 @@ mod tests {
         // identity the user just withdrew.
         let mut settings = create_test_settings();
         settings.ec.pull_sync_concurrency = 4;
-        let registry =
-            PartnerRegistry::from_config(&[pull_enabled_ec_partner("alpha.example.com")])
-                .expect("should build registry");
+        let registry = loaded_registry(&[pull_enabled_ec_partner("alpha.example.com")])
+            .expect("should build registry");
         let graph = KvIdentityGraph::in_memory("pull_store");
         let ec_id = snapshot_ec_id();
         let snapshot = seed_present_snapshot(&graph, &ec_id);
@@ -1204,9 +1227,8 @@ mod tests {
         // a KV operation.
         let mut settings = create_test_settings();
         settings.ec.pull_sync_concurrency = 4;
-        let registry =
-            PartnerRegistry::from_config(&[pull_enabled_ec_partner("alpha.example.com")])
-                .expect("should build registry");
+        let registry = loaded_registry(&[pull_enabled_ec_partner("alpha.example.com")])
+            .expect("should build registry");
         let graph = KvIdentityGraph::in_memory("pull_store");
         let ec_id = snapshot_ec_id();
         let mut entry = KvEntry::tombstone(1000);

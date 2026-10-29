@@ -1,4 +1,4 @@
-use crate::common::config::cloudflare_config_json;
+use crate::common::config::{cloudflare_config_json, integration_native_fixtures};
 use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult, origin_port,
 };
@@ -36,6 +36,20 @@ fn write_generated_ci_config(wrangler_dir: &Path, config_json: &str) -> TestResu
             template_path.display()
         ))?;
     let generated = inject_cloudflare_config(&template, config_json)?;
+    let mut generated: toml::Value =
+        toml::from_str(&generated).map_err(|_| Report::new(TestError::ConfigGeneration))?;
+    let vars = generated
+        .get_mut("vars")
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| Report::new(TestError::ConfigGeneration))?;
+    for fixture in integration_native_fixtures("cloudflare")? {
+        vars.insert(
+            fixture.native.native_name,
+            toml::Value::String(fixture.value),
+        );
+    }
+    let generated =
+        toml::to_string(&generated).map_err(|_| Report::new(TestError::ConfigGeneration))?;
     let output_path = wrangler_dir.join(GENERATED_CI_CONFIG);
     std::fs::write(&output_path, generated)
         .change_context(TestError::RuntimeSpawn)
@@ -67,11 +81,8 @@ impl RuntimeEnvironment for CloudflareWorkers {
 
     fn spawn(&self, _wasm_path: &Path) -> TestResult<RuntimeProcess> {
         let wrangler_dir = self.wrangler_dir();
-        let config = if std::env::var("CI").is_ok() {
-            write_generated_ci_config(&wrangler_dir, &cloudflare_config_json(origin_port())?)?
-        } else {
-            "wrangler.toml".to_string()
-        };
+        let config =
+            write_generated_ci_config(&wrangler_dir, &cloudflare_config_json(origin_port())?)?;
         self.spawn_wrangler(&wrangler_dir, &config)
     }
 

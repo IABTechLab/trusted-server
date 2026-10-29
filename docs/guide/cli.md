@@ -3,6 +3,35 @@
 The Trusted Server CLI binary is `ts`. It is a host-target operator tool for
 configuration, page audits, and EdgeZero-backed lifecycle commands.
 
+## App credential commands
+
+`ts secrets plan` renders active context-derived native identities for
+`fastly`, `axum`, `cloudflare`, and `spin`. Direct `set` supports Fastly only.
+
+```bash
+ts secrets plan --adapter fastly --app-config trusted-server.toml --no-env --out bindings.json
+ts secrets set tinybird.auction --adapter fastly --app-config trusted-server.toml --no-env --plan bindings.json
+ts secrets check --adapter fastly --app-config trusted-server.toml --no-env --plan bindings.json
+```
+
+Shared flags are `--adapter`, `--app-config`, `--manifest`, `--no-env`, and
+Fastly-only `--service-id`. `--manifest` defaults to `EDGEZERO_MANIFEST`,
+otherwise `edgezero.toml`; the app-config default is `<app.name>.toml` beside
+it. `plan --out` writes secret-free JSON; without it the plan goes to stdout.
+
+`set ROLE` requires `--plan`, accepts an optional generated `--binding`
+entry ID for repeated roles, and uses confirmation followed by hidden input.
+Automation uses `--stdin --yes`; no value argument exists. Unsupported adapter
+writes reject before input. A noninteractive repeated role requires
+`--binding`. Full-plan drift rejects before credential input or mutation.
+
+`check --plan` is presence-only. Fastly uses metadata without reading values,
+Axum checks the current process environment, and Cloudflare/Spin report
+unsupported with a nonzero result. It does not prove credential validity,
+delivery, TLS/no-follow, or state refresh. See [Provision app credentials](./secrets),
+[protected CI](./secrets-ci), and [migration](./secret-binding-migration).
+Native/provider/IAM rehearsals remain release gates.
+
 ## Command index
 
 The table summarizes native `--help` output on Linux and macOS. Platform-only
@@ -123,12 +152,10 @@ fields to existing configs before relying on their overrides. Pass `--no-env`
 for file-only operation. See [Configuration](/guide/configuration#environment-variable-overrides-typed-cli)
 for migration and rollback guidance.
 
-`config diff`, `config push --dry-run`, and the confirmation preview shown by
-`config push` render resolved app-config values. Store-backed secret fields are
-key names at this stage, but deliberately inline values such as
-`trusted_client_ip.shared_secret` can appear verbatim. Use `--no-diff` for a
-push when terminal output or CI logs are not an approved place for inline
-configuration secrets; `--no-diff` does not change validation or publication.
+`config diff`, `config push --dry-run`, and the confirmation preview render
+ordinary effective config. App credential properties are absent, not inline or
+key-name values. Review deployment metadata access too. `--no-diff` suppresses
+the push preview; it does not change validation or publication.
 
 `config push` publishes a single EdgeZero `BlobEnvelope` containing the validated
 Trusted Server settings JSON. This blob model is intentional because full

@@ -10,7 +10,8 @@ use error_stack::{Report, ResultExt as _};
 
 use crate::error::TrustedServerError;
 use crate::redacted::Redacted;
-use crate::settings::EcPartner;
+use crate::secret_bindings::{ResolvedBinding, normalize_pull_endpoint};
+use crate::settings::{EcPartner, Settings};
 
 use super::partner::{hash_api_key, normalize_partner_source_domain};
 
@@ -45,8 +46,10 @@ pub struct PartnerConfig {
     pub pull_sync_ttl_sec: u64,
     /// Max pull sync calls per EC hash per partner per hour.
     pub pull_sync_rate_limit: u32,
-    /// Outbound bearer token for pull sync requests.
+    /// Redacted compatibility shadow, never outbound authorization.
     pub ts_pull_token: Option<Redacted<String>>,
+    /// Loaded credential and recipient, never manufactured from loose fields.
+    pub(crate) pull_binding: Option<ResolvedBinding>,
 }
 
 /// In-memory partner registry with O(1) lookups by source domain and API key hash.
@@ -64,8 +67,8 @@ impl PartnerRegistry {
     /// Validates partner structure without inspecting secret values.
     ///
     /// This is the push-time half of partner validation. API-token length,
-    /// placeholder, and collision checks remain in [`Self::from_config`],
-    /// after secret references have been resolved.
+    /// placeholder, and collision checks remain in [`Self::from_settings`],
+    /// after the native credential bindings have been resolved.
     ///
     /// # Errors
     ///
@@ -75,7 +78,6 @@ impl PartnerRegistry {
         partners: &[EcPartner],
     ) -> Result<(), Report<TrustedServerError>> {
         let mut source_domains = HashSet::with_capacity(partners.len());
-        let mut api_token_key_references = HashMap::with_capacity(partners.len());
 
         for partner in partners {
             let normalized_source = normalize_partner_source_domain(&partner.source_domain)
@@ -91,18 +93,6 @@ impl PartnerRegistry {
                 }));
             }
 
-            if let Some(api_token) = &partner.api_token
-                && let Some(previous_source) =
-                    api_token_key_references.insert(api_token.expose(), normalized_source.clone())
-            {
-                return Err(Report::new(TrustedServerError::Configuration {
-                    message: format!(
-                        "ec.partners: API token key reference is shared by source_domain \
-                         '{previous_source}' and '{normalized_source}'"
-                    ),
-                }));
-            }
-
             validate_rate_limits_values(partner.batch_rate_limit, partner.pull_sync_rate_limit)
                 .map_err(|error| {
                     Report::new(TrustedServerError::Configuration {
@@ -113,20 +103,13 @@ impl PartnerRegistry {
                 })?;
 
             if partner.pull_sync_enabled {
-                validate_pull_sync_fields(
-                    partner.pull_sync_url.as_deref(),
-                    &partner.pull_sync_allowed_domains,
-                    partner
-                        .ts_pull_token
-                        .as_ref()
-                        .map(|token| token.expose().as_str()),
-                    false,
-                )
-                .change_context(TrustedServerError::Configuration {
-                    message: format!(
-                        "ec.partners: pull sync config invalid for '{normalized_source}'"
-                    ),
-                })?;
+                normalize_pull_endpoint(partner, "ec.partners.pull_sync_url").change_context(
+                    TrustedServerError::Configuration {
+                        message: format!(
+                            "ec.partners: pull sync config invalid for '{normalized_source}'"
+                        ),
+                    },
+                )?;
             }
         }
 
@@ -141,6 +124,64 @@ impl PartnerRegistry {
     /// invalid source domain, duplicate source domain, duplicate API token hash,
     /// or invalid pull sync configuration.
     pub fn from_config(partners: &[EcPartner]) -> Result<Self, Report<TrustedServerError>> {
+        if partners.iter().any(|partner| partner.pull_sync_enabled) {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "ec.partners: enabled pull requires loaded credential bindings".to_owned(),
+            }));
+        }
+        Self::build(partners)
+    }
+
+    /// Builds a registry from one validated settings/binding snapshot.
+    ///
+    /// # Errors
+    /// Returns an error if an enabled use has no matching loaded capability.
+    ///
+    /// # Examples
+    /// ```
+    /// use trusted_server_core::{ec::registry::PartnerRegistry, settings::Settings};
+    /// # fn inspect(settings: &Settings) {
+    /// let registry = PartnerRegistry::from_settings(settings);
+    /// # }
+    /// ```
+    pub fn from_settings(settings: &Settings) -> Result<Self, Report<TrustedServerError>> {
+        let plan = crate::secret_bindings::compile_bindings(settings)?;
+        let mut partners = settings.ec.partners.clone();
+        for (index, partner) in partners.iter_mut().enumerate() {
+            partner.api_token = if partner.api_token_enabled {
+                let binding = settings.resolved_bindings.require_for_plan(
+                    &plan,
+                    "ec.inbound",
+                    &format!("ec.partners[{index}].api_token"),
+                )?;
+                Some(Redacted::new(binding.credential().to_owned()))
+            } else {
+                None
+            };
+        }
+        let mut registry = Self::build(&partners)?;
+        for (index, partner) in settings.ec.partners.iter().enumerate() {
+            if !partner.pull_sync_enabled {
+                continue;
+            }
+            let binding = settings.resolved_bindings.require_for_plan(
+                &plan,
+                "ec.pull",
+                &format!("ec.partners[{index}].ts_pull_token"),
+            )?;
+            let source = normalize_partner_source_domain(&partner.source_domain).map_err(|_| {
+                Report::new(TrustedServerError::Configuration {
+                    message: "ec.partners: invalid source_domain".to_owned(),
+                })
+            })?;
+            if let Some(config) = registry.by_source_domain.get_mut(&source) {
+                config.pull_binding = Some(binding.clone());
+            }
+        }
+        Ok(registry)
+    }
+
+    fn build(partners: &[EcPartner]) -> Result<Self, Report<TrustedServerError>> {
         let mut by_source_domain = HashMap::with_capacity(partners.len());
         let mut by_api_key_hash = HashMap::with_capacity(partners.len());
 
@@ -158,7 +199,13 @@ impl PartnerRegistry {
                 }));
             }
 
-            let api_key_hash = if let Some(api_token) = &partner.api_token {
+            let api_key_hash = if partner.api_token_enabled {
+                let api_token = partner.api_token.as_ref().ok_or_else(|| {
+                    Report::new(TrustedServerError::Configuration {
+                        message: "ec.partners.api_token: required enabled credential unavailable"
+                            .to_owned(),
+                    })
+                })?;
                 validate_api_token(&normalized_source, api_token.expose())?;
 
                 let api_key_hash = hash_api_key(api_token.expose());
@@ -185,12 +232,14 @@ impl PartnerRegistry {
             })?;
 
             if config.pull_sync_enabled {
-                validate_pull_sync(&config).change_context(TrustedServerError::Configuration {
-                    message: format!(
-                        "ec.partners: pull sync config invalid for '{}'",
-                        config.source_domain
-                    ),
-                })?;
+                normalize_pull_endpoint(partner, "ec.partners.pull_sync_url").change_context(
+                    TrustedServerError::Configuration {
+                        message: format!(
+                            "ec.partners: pull sync config invalid for '{}'",
+                            config.source_domain
+                        ),
+                    },
+                )?;
             }
 
             if let Some(api_key_hash) = api_key_hash {
@@ -305,6 +354,7 @@ fn build_partner_config(
         pull_sync_ttl_sec: partner.pull_sync_ttl_sec,
         pull_sync_rate_limit: partner.pull_sync_rate_limit,
         ts_pull_token: partner.ts_pull_token.clone(),
+        pull_binding: None,
     }
 }
 
@@ -333,82 +383,6 @@ fn validate_rate_limits_values(
     Ok(())
 }
 
-fn validate_pull_sync(config: &PartnerConfig) -> Result<(), Report<TrustedServerError>> {
-    validate_pull_sync_fields(
-        config.pull_sync_url.as_deref(),
-        &config.pull_sync_allowed_domains,
-        config
-            .ts_pull_token
-            .as_ref()
-            .map(|token| token.expose().as_str()),
-        true,
-    )
-}
-
-fn validate_pull_sync_fields(
-    url: Option<&str>,
-    allowed_domains: &[String],
-    token_value: Option<&str>,
-    require_nonempty_token: bool,
-) -> Result<(), Report<TrustedServerError>> {
-    let url_str = url.unwrap_or("");
-    if url_str.is_empty() {
-        return Err(Report::new(TrustedServerError::Configuration {
-            message: "pull_sync_url is required when pull_sync_enabled is true".to_owned(),
-        }));
-    }
-
-    if token_value.is_none() {
-        return Err(Report::new(TrustedServerError::Configuration {
-            message: "ts_pull_token is required when pull_sync_enabled is true".to_owned(),
-        }));
-    }
-
-    let parsed = url::Url::parse(url_str).map_err(|e| {
-        Report::new(TrustedServerError::Configuration {
-            message: format!("pull_sync_url is not a valid URL: {e}"),
-        })
-    })?;
-
-    if parsed.scheme() != "https" {
-        return Err(Report::new(TrustedServerError::Configuration {
-            message: format!(
-                "pull_sync_url must use HTTPS, got scheme '{}'",
-                parsed.scheme()
-            ),
-        }));
-    }
-
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| {
-            Report::new(TrustedServerError::Configuration {
-                message: "pull_sync_url has no hostname".to_owned(),
-            })
-        })?
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-
-    let domain_match = allowed_domains.iter().any(|d| {
-        let normalized = d.trim_end_matches('.').to_ascii_lowercase();
-        host == normalized
-    });
-
-    if !domain_match {
-        return Err(Report::new(TrustedServerError::Configuration {
-            message: format!("pull_sync_url hostname '{host}' not in pull_sync_allowed_domains"),
-        }));
-    }
-
-    if require_nonempty_token && token_value.is_some_and(|value| value.trim().is_empty()) {
-        return Err(Report::new(TrustedServerError::Configuration {
-            message: "ts_pull_token must not be empty when pull sync is enabled".to_owned(),
-        }));
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,6 +398,7 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: false,
+            api_token_enabled: true,
             api_token: Some(Redacted::new(api_token.to_owned())),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: false,
@@ -477,6 +452,7 @@ mod tests {
     fn partner_without_api_token_is_only_indexed_by_source_domain() {
         let mut partner = make_partner("ssp.example.com", &valid_api_token("unused"));
         partner.api_token = None;
+        partner.api_token_enabled = false;
         let registry =
             PartnerRegistry::from_config(&[partner]).expect("should build registry without token");
 
@@ -526,19 +502,15 @@ mod tests {
     }
 
     #[test]
-    fn deploy_validation_rejects_duplicate_api_token_key_references() {
+    fn deploy_validation_ignores_legacy_shadow_reference_equality() {
         let shared_key = "partner_api_token";
         let partners = vec![
             make_partner("first.example.com", shared_key),
             make_partner("second.example.com", shared_key),
         ];
 
-        let error = PartnerRegistry::validate_config_for_deploy(&partners)
-            .expect_err("should reject duplicate API token key references");
-        let message = error.to_string();
-
-        assert!(message.contains("first.example.com"));
-        assert!(message.contains("second.example.com"));
+        PartnerRegistry::validate_config_for_deploy(&partners)
+            .expect("should ignore equal credential shadows during deploy validation");
     }
 
     #[test]
@@ -569,20 +541,92 @@ mod tests {
         assert!(result.is_err(), "should reject invalid source domain");
     }
 
+    fn settings_with_test_bindings(partners: &[EcPartner]) -> Settings {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.ec.partners = partners.to_vec();
+        crate::test_support::secret_bindings::install_test_bindings(&mut settings)
+            .expect("should resolve fixture bindings");
+        settings
+    }
+
+    fn registry_with_test_bindings(partners: &[EcPartner]) -> PartnerRegistry {
+        PartnerRegistry::from_settings(&settings_with_test_bindings(partners))
+            .expect("should build loaded registry")
+    }
+
+    #[test]
+    fn plain_partner_fields_cannot_enable_pull() {
+        let mut partner = make_partner("ssp.example.com", &valid_api_token("shadow"));
+        partner.api_token_enabled = false;
+        assert!(
+            PartnerRegistry::from_config(&[partner.clone()])
+                .expect("should allow a partner with inbound authentication disabled")
+                .get("ssp.example.com")
+                .expect("should have partner")
+                .api_key_hash
+                .is_none()
+        );
+        partner.pull_sync_enabled = true;
+        partner.pull_sync_url = Some("https://sync.example.com/pull".to_owned());
+        partner.ts_pull_token = Some(Redacted::new(
+            "fictional-pull-token-with-32-bytes-minimum".to_owned(),
+        ));
+        assert!(
+            PartnerRegistry::from_config(&[partner]).is_err(),
+            "loose fields cannot grant export authority"
+        );
+    }
+
+    #[test]
+    fn inbound_activation_and_loaded_authority_ignore_mutable_shadow() {
+        let partner = make_partner("ssp.example.com", &valid_api_token("shadow"));
+        let mut settings = settings_with_test_bindings(&[partner]);
+        let registry = PartnerRegistry::from_settings(&settings).expect("should build registry");
+        let expected = registry
+            .get("ssp.example.com")
+            .expect("should have partner")
+            .api_key_hash
+            .clone();
+        settings.ec.partners[0].api_token = Some(Redacted::new(valid_api_token("changed-shadow")));
+        let actual =
+            PartnerRegistry::from_settings(&settings).expect("should ignore shadow change");
+        assert_eq!(
+            actual
+                .get("ssp.example.com")
+                .expect("should have partner")
+                .api_key_hash,
+            expected
+        );
+        settings.resolved_bindings = Default::default();
+        assert!(PartnerRegistry::from_settings(&settings).is_err());
+        settings.ec.partners[0].api_token_enabled = false;
+        assert!(
+            PartnerRegistry::from_settings(&settings)
+                .expect("should allow disabled auth")
+                .get("ssp.example.com")
+                .expect("should have partner")
+                .api_key_hash
+                .is_none()
+        );
+    }
+
     #[test]
     fn pull_enabled_partners_filters_correctly() {
         let mut pull_partner = make_partner("pull.example.com", &valid_api_token("token-p"));
         pull_partner.api_token = None;
+        pull_partner.api_token_enabled = false;
         pull_partner.pull_sync_enabled = true;
         pull_partner.pull_sync_url = Some("https://pull.example.com/sync".to_owned());
         pull_partner.pull_sync_allowed_domains = vec!["pull.example.com".to_owned()];
-        pull_partner.ts_pull_token = Some(Redacted::new("outbound-token".to_owned()));
+        pull_partner.ts_pull_token = Some(Redacted::new(
+            "fictional-outbound-token-with-32-bytes".to_owned(),
+        ));
 
         let partners = vec![
             make_partner("nopull.example.com", &valid_api_token("token-np")),
             pull_partner,
         ];
-        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let registry = registry_with_test_bindings(&partners);
 
         let pull_enabled = registry.pull_enabled_partners();
         assert_eq!(
@@ -604,7 +648,7 @@ mod tests {
                 .as_ref()
                 .expect("should keep pull token")
                 .expose(),
-            "outbound-token",
+            "fictional-outbound-token-with-32-bytes",
             "should preserve the token without unwrapping it in the registry"
         );
     }
@@ -615,9 +659,11 @@ mod tests {
         partner.pull_sync_enabled = true;
         partner.pull_sync_url = Some("https://pull.example.com/sync".to_owned());
         partner.pull_sync_allowed_domains = vec!["pull.example.com".to_owned()];
-        partner.ts_pull_token = Some(Redacted::new("outbound-token".to_owned()));
+        partner.ts_pull_token = Some(Redacted::new(
+            "fictional-outbound-token-with-32-bytes".to_owned(),
+        ));
 
-        let registry = PartnerRegistry::from_config(&[partner]).expect("should build registry");
+        let registry = registry_with_test_bindings(&[partner]);
         let configured = registry
             .get("pull.example.com")
             .expect("should find configured partner");

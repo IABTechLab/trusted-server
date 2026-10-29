@@ -17,17 +17,18 @@ configuration.
 
 ## Prerequisites
 
-Spin 4.1.0 or newer, pinned as `spin` in `.tool-versions`. `spin-sdk` 7 imports
-`wasi:http/types@0.3.0`, which Spin 4.0.x does not provide, so an older runtime
-cannot start the component. Install or upgrade from the
-[Spin install guide](https://spinframework.dev/install).
+Spin 4.1.0 or newer, pinned as `spin` in `.tool-versions`. This branch temporarily
+uses `spin-sdk` 6 to match the unreleased EdgeZero secret-provisioning APIs;
+the runtime minimum remains unchanged. `spin-sdk` 7 imports
+`wasi:http/types@0.3.0`, which Spin 4.0.x does not provide. Install or upgrade
+from the [Spin releases](https://github.com/spinframework/spin/releases).
 
 asdf has no first-party Spin plugin, so `asdf install` does not provide this
 one; install it directly, or add a community plugin if you want asdf to manage
 it. The pin records the required version and is what the smoke checks against.
 
-Nothing in the build catches this. The component compiles, `cargo
-test-spin` passes, and only `spin up` reports:
+With `spin-sdk` 7, the build does not catch an older runtime. The component
+compiles, `cargo test-spin` passes, and only `spin up` reports:
 
 ```
 Error: component imports instance `wasi:http/types@0.3.0`, but a
@@ -52,12 +53,12 @@ config push --adapter spin --local`. Without that mapping, the push can land in
 a store the runtime never reads. Local push writes the temporary
 `.spin/sqlite_key_value.db`; no repository-local Spin state is used.
 
-Spin encodes `v_<store>_v_<key>` names. The smoke supplies these exact
-variables:
-
-- `v_trusted_x5fserver_x5fsecrets_v_handler_x5fpassword`
-- `v_trusted_x5fserver_x5fsecrets_v_publisher_x5fproxy_x5fsecret`
-- `v_trusted_x5fserver_x5fsecrets_v_ec_x5fpassphrase`
+Generate exact names and both application/component declarations with
+`ts secrets plan --adapter spin`. Follow the
+[native variable walkthrough](./secrets#spin-native-variables). Merge component
+entries into one table, retain required secret declarations without plaintext
+defaults, and use protected provider input. `secret = true` alone does not
+encrypt storage. The local smoke must use generated contexts, not old labels.
 
 It first launches `spin up` before config is pushed, then relaunches it while
 omitting each variable independently. Every publisher request must return 503,
@@ -71,18 +72,22 @@ manifest, SQLite store, response captures, and logs.
 
 ## Runtime boundaries
 
-Use the same store mapping and encoded variables in the deployment provider;
-empty variable defaults fail closed. Spin's request-time store registry is
+Use the same store mapping and generated declarations in the deployment provider.
+Direct `set` and native presence `check` are unsupported; `check` exits nonzero.
+Verify native component reads, provider/name limits, HTTPS/no-follow, and
+config-writer permission separation before release. Host tests do not prove them. Spin's request-time store registry is
 currently unwired, so EC KV lookup, request-signing key variables, and key
 rotation are unavailable. The read-only `/_ts/admin/eids` diagnostic remains
 available. Forwarded client-IP headers are sanitized, and Spin derives its
 runtime authority, scheme, and client-address headers in the innermost
 normalization layer.
 
-Spin is not installed in the integration CI environment. The recurring manual
-smoke therefore needs a named owner, tested commit, exact tool versions, and an
-expiry; those details are recorded with each run in the documentation-refresh
-evidence ledger.
+CI installs the pinned Spin runtime for `scripts/secret-bindings-runtime.sh spin`.
+This native contract check uses a `test-utils` integration to invoke the shared
+credential exporter, because Spin does not currently dispatch S3 asset routes.
+It verifies real variable reads, HTTPS, and no-follow behavior, not shipping
+S3 routing or provider IAM. Keep the complete config-push handoff smoke and
+deployment rehearsals separate; track release evidence in [#1479](https://github.com/IABTechLab/trusted-server/issues/1479).
 
 Compare the [Fastly](./fastly), [Cloudflare](./cloudflare), and
 [Axum](./axum-dev) adapter journeys.

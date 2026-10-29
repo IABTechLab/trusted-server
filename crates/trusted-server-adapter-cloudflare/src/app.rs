@@ -157,6 +157,7 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
     let secret_store = crate::platform::CloudflareSecretStoreAdapter { env };
     let default_secret_store = StoreName::from(DEFAULT_SECRET_STORE_ID);
     settings_from_config_blob(envelope, &secret_store, &default_secret_store)
+        .map(|loaded| loaded.settings().clone())
 }
 
 #[cfg(any(test, target_arch = "wasm32"))]
@@ -406,8 +407,14 @@ fn publisher_fallback_methods() -> [Method; 7] {
     ]
 }
 
-/// Returns a [`RouterService`] that responds to every route with the startup error.
+/// Returns a [`RouterService`] with the safe startup-error response.
+/// The operator diagnostic includes only the outer context, never native causes.
 fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
+    #[cfg(target_arch = "wasm32")]
+    worker::console_error!("failed to build application state: {}", e.current_context());
+    #[cfg(not(target_arch = "wasm32"))]
+    log::error!("failed to build application state: {}", e.current_context());
+
     let message = Arc::new(format!("{}\n", e.current_context().user_message()));
     let status = e.current_context().status_code();
 
@@ -449,10 +456,7 @@ impl Hooks for TrustedServerApp {
     fn routes() -> RouterService {
         let state = match build_state() {
             Ok(s) => s,
-            Err(ref e) => {
-                log::error!("failed to build application state: {:?}", e);
-                return startup_error_router(e);
-            }
+            Err(ref e) => return startup_error_router(e),
         };
 
         build_router(&state)
@@ -649,7 +653,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .get(
                 "/_ts/admin/eids",
                 make_handler(Arc::clone(&state), |s, _services, req| async move {
-                    let partner_registry = PartnerRegistry::from_config(&s.settings.ec.partners)?;
+                    let partner_registry = PartnerRegistry::from_settings(&s.settings)?;
                     handle_admin_eids_lookup(&partner_registry, &req)
                 }),
             )
@@ -778,6 +782,40 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn startup_error_router_keeps_native_sources_out_of_response() {
+        let report = Report::new(TrustedServerError::BadRequest {
+            message: "NATIVE_CREDENTIAL_SENTINEL".to_owned(),
+        })
+        .change_context(TrustedServerError::Configuration {
+            message: "Cloudflare TRUSTED_SERVER_CONFIG is required".to_owned(),
+        })
+        .attach("NATIVE_BINDING_NAME_SENTINEL");
+        let diagnostic = report.current_context().to_string();
+        assert!(diagnostic.contains("Cloudflare TRUSTED_SERVER_CONFIG is required"));
+        assert!(!diagnostic.contains("NATIVE_CREDENTIAL_SENTINEL"));
+        assert!(!diagnostic.contains("NATIVE_BINDING_NAME_SENTINEL"));
+
+        let request = edgezero_core::http::request_builder()
+            .method("GET")
+            .uri("/")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build an anonymous startup-error request");
+        let response = startup_error_router(&report)
+            .oneshot(request)
+            .await
+            .expect("should serve the anonymous startup-error response");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response
+                .into_body()
+                .into_bytes()
+                .expect("should read the startup-error response body")
+                .as_ref(),
+            b"An internal error occurred\n"
+        );
+    }
 
     fn aps_profile_settings() -> Settings {
         let mut settings = Settings::from_toml(

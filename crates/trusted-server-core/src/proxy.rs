@@ -916,30 +916,81 @@ fn asset_origin_host_header(
 }
 
 fn apply_asset_origin_auth(
+    settings: &Settings,
+    route: &ProxyAssetRoute,
     method: &Method,
     target_url: &url::Url,
     headers: &mut http::HeaderMap,
-    auth: &AssetOriginAuth,
 ) -> Result<(), Report<TrustedServerError>> {
-    match auth {
-        AssetOriginAuth::S3SigV4(config) => {
-            let credentials = S3Credentials {
-                access_key_id: config.access_key_id.expose().clone(),
-                secret_access_key: config.secret_access_key.clone(),
-                session_token: config.session_token.clone(),
-            };
-            s3_sigv4::sign_headers(
-                method,
-                target_url,
-                headers,
-                &config.region,
-                &credentials,
-                // s3_sigv4 converts this via chrono's `DateTime::<Utc>::from`, which
-                // only accepts `std::time::SystemTime`.
-                crate::ec::std_system_time_now(),
-            )
-        }
+    let Some(AssetOriginAuth::S3SigV4(config)) = &route.auth else {
+        return Ok(());
+    };
+    let fail = || {
+        Report::new(TrustedServerError::Configuration {
+            message: "proxy.asset_routes.auth: loaded S3 authorization mismatch".to_owned(),
+        })
+    };
+    if !matches!(*method, Method::GET | Method::HEAD) {
+        return Err(fail());
     }
+    let index = settings
+        .proxy
+        .asset_routes
+        .iter()
+        .position(|candidate| candidate.prefix == route.prefix)
+        .ok_or_else(fail)?;
+    // Check the actual route passed by the caller, not only the same-index route
+    // in settings. Reinterpreting an old capability for a new route is forbidden.
+    let mut effective = settings.clone();
+    effective.proxy.asset_routes[index] = route.clone();
+    let plan = crate::secret_bindings::compile_bindings(&effective)?;
+    let id = settings.resolved_bindings.require_for_plan(
+        &plan,
+        "s3.access-id",
+        &format!("proxy.asset_routes[{index}].auth.access_key_id"),
+    )?;
+    let secret = settings.resolved_bindings.require_for_plan(
+        &plan,
+        "s3.secret",
+        &format!("proxy.asset_routes[{index}].auth.secret_access_key"),
+    )?;
+    let session = if config.session_token_enabled {
+        Some(settings.resolved_bindings.require_for_plan(
+            &plan,
+            "s3.session",
+            &format!("proxy.asset_routes[{index}].auth.session_token"),
+        )?)
+    } else {
+        None
+    };
+    let origin = id.endpoint().ok_or_else(fail)?;
+    let bound = url::Url::parse(origin).map_err(|_| fail())?;
+    if target_url.scheme() != "https"
+        || target_url.origin() != bound.origin()
+        || !target_url.username().is_empty()
+        || target_url.password().is_some()
+        || target_url.fragment().is_some()
+        || headers.get(header::HOST) != Some(&asset_origin_host_header(target_url)?)
+        || secret.endpoint() != Some(origin)
+        || session.is_some_and(|binding| binding.endpoint() != Some(origin))
+    {
+        return Err(fail());
+    }
+    let credentials = S3Credentials {
+        access_key_id: crate::redacted::Redacted::new(id.credential().to_owned()),
+        secret_access_key: crate::redacted::Redacted::new(secret.credential().to_owned()),
+        session_token: session
+            .map(|binding| crate::redacted::Redacted::new(binding.credential().to_owned())),
+    };
+    let region = id.s3_region().ok_or_else(fail)?;
+    s3_sigv4::sign_headers(
+        method,
+        target_url,
+        headers,
+        region,
+        &credentials,
+        crate::ec::std_system_time_now(),
+    )
 }
 
 fn build_asset_platform_request(
@@ -989,8 +1040,10 @@ async fn send_asset_origin_request(
         .http_client()
         .send(platform_req)
         .await
-        .change_context(TrustedServerError::Proxy {
-            message: "Failed to proxy asset request".to_string(),
+        .map_err(|_| {
+            Report::new(TrustedServerError::Proxy {
+                message: "Failed to proxy asset request".to_string(),
+            })
         })?;
 
     if stream_response {
@@ -1023,6 +1076,7 @@ fn should_preflight_s3(
 }
 
 async fn preflight_s3_origin_for_image_optimizer(
+    settings: &Settings,
     services: &RuntimeServices,
     route: &ProxyAssetRoute,
     target_url: &url::Url,
@@ -1030,7 +1084,7 @@ async fn preflight_s3_origin_for_image_optimizer(
     unsigned_headers: &http::HeaderMap,
     backend_name: &str,
 ) -> Result<Option<AssetProxyResponse>, Report<TrustedServerError>> {
-    let Some(auth @ AssetOriginAuth::S3SigV4(_)) = route.auth.as_ref() else {
+    let Some(AssetOriginAuth::S3SigV4(_)) = route.auth.as_ref() else {
         return Ok(None);
     };
 
@@ -1038,7 +1092,13 @@ async fn preflight_s3_origin_for_image_optimizer(
     // HEAD preflight lets missing or unauthorized objects return raw S3 errors
     // without invoking IO on the failure path.
     let mut head_headers = unsigned_headers.clone();
-    apply_asset_origin_auth(&Method::HEAD, target_url, &mut head_headers, auth)?;
+    apply_asset_origin_auth(
+        settings,
+        route,
+        &Method::HEAD,
+        target_url,
+        &mut head_headers,
+    )?;
     let head_response = send_asset_origin_request(
         services,
         backend_name,
@@ -1061,7 +1121,7 @@ async fn preflight_s3_origin_for_image_optimizer(
     }
 
     let mut get_headers = unsigned_headers.clone();
-    apply_asset_origin_auth(&Method::GET, target_url, &mut get_headers, auth)?;
+    apply_asset_origin_auth(settings, route, &Method::GET, target_url, &mut get_headers)?;
     let mut response = send_asset_origin_request(
         services,
         backend_name,
@@ -1126,22 +1186,6 @@ pub async fn handle_asset_proxy_request(
         })
     })?;
 
-    let backend_name = services
-        .backend()
-        .ensure(&PlatformBackendSpec {
-            scheme: scheme.to_string(),
-            host: host.to_string(),
-            port: target_url.port(),
-            host_header_override: None,
-            certificate_check: settings.proxy.certificate_check,
-            first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
-            between_bytes_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
-            discriminator: None,
-        })
-        .change_context(TrustedServerError::Proxy {
-            message: "asset backend registration failed".to_string(),
-        })?;
-
     let mut outbound_headers = http::HeaderMap::new();
     for header_name in ASSET_PROXY_FORWARD_HEADERS {
         if let Some(value) = req.headers().get(&header_name) {
@@ -1150,8 +1194,33 @@ pub async fn handle_asset_proxy_request(
     }
     outbound_headers.insert(header::HOST, asset_origin_host_header(&target_url)?);
 
+    apply_asset_origin_auth(
+        settings,
+        route,
+        req.method(),
+        &target_url,
+        &mut outbound_headers,
+    )?;
+
+    let backend_name = services
+        .backend()
+        .ensure(&PlatformBackendSpec {
+            scheme: scheme.to_string(),
+            host: host.to_string(),
+            port: target_url.port(),
+            host_header_override: None,
+            certificate_check: route.auth.is_some() || settings.proxy.certificate_check,
+            first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+            between_bytes_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+            discriminator: None,
+        })
+        .change_context(TrustedServerError::Proxy {
+            message: "asset backend registration failed".to_string(),
+        })?;
+
     if should_preflight_s3(route, image_optimizer.is_some(), req.method())
         && let Some(response) = preflight_s3_origin_for_image_optimizer(
+            settings,
             services,
             route,
             &target_url,
@@ -1162,10 +1231,6 @@ pub async fn handle_asset_proxy_request(
         .await?
     {
         return Ok(response);
-    }
-
-    if let Some(auth) = &route.auth {
-        apply_asset_origin_auth(req.method(), &target_url, &mut outbound_headers, auth)?;
     }
 
     let mut platform_req =
@@ -1182,8 +1247,10 @@ pub async fn handle_asset_proxy_request(
         .http_client()
         .send(platform_req)
         .await
-        .change_context(TrustedServerError::Proxy {
-            message: "Failed to proxy asset request".to_string(),
+        .map_err(|_| {
+            Report::new(TrustedServerError::Proxy {
+                message: "Failed to proxy asset request".to_string(),
+            })
         })?;
 
     let mut response = if stream_response {
@@ -2248,12 +2315,13 @@ mod tests {
     use crate::creative;
     use crate::error::{IntoHttpResponse, TrustedServerError};
     use crate::platform::test_support::{
-        HashMapSecretStore, StubHttpClient, build_services_with_http_client,
+        HashMapSecretStore, RecordingBackend, StubHttpClient, build_services_with_http_client,
         build_services_with_secret_and_http_client, noop_services,
     };
     use crate::platform::{
         PlatformError, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
-        PlatformResponse, PlatformSecretStore, PlatformSelectResult, StoreId, StoreName,
+        PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
+        StoreName,
     };
     use crate::redacted::Redacted;
     use crate::settings::{
@@ -5475,6 +5543,111 @@ mod tests {
         }
     }
 
+    fn credential_services(
+        backend: Arc<RecordingBackend>,
+        http: Arc<StubHttpClient>,
+    ) -> RuntimeServices {
+        RuntimeServices::builder()
+            .config_store(Arc::new(crate::platform::test_support::NoopConfigStore))
+            .secret_store(Arc::new(crate::platform::test_support::NoopSecretStore))
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+            .backend(backend)
+            .http_client(http)
+            .geo(Arc::new(crate::platform::test_support::NoopGeo))
+            .client_info(crate::platform::ClientInfo::default())
+            .build()
+    }
+
+    #[test]
+    fn s3_secret_bindings_reject_missing_or_mutated_policy_before_backend() {
+        let mut original = create_test_settings();
+        let mut route = test_s3_image_optimizer_route();
+        route.image_optimizer = None;
+        route.path_pattern = Some("^/(.*)$".to_owned());
+        route.target_path = Some("/$1".to_owned());
+        authorize_s3_test_route(&mut original, &route);
+        for mutation in 0..9 {
+            let mut settings = original.clone();
+            let mut changed = route.clone();
+            match mutation {
+                0 => settings.resolved_bindings = Default::default(),
+                1 => changed.origin_url = "https://unapproved.example".to_owned(),
+                2 => changed.prefix = "/different/".to_owned(),
+                3 => changed.path_pattern = Some("^/.images/(.*)$".to_owned()),
+                4 => changed.target_path = Some("/different".to_owned()),
+                5 => {
+                    if let Some(AssetOriginAuth::S3SigV4(auth)) = changed.auth.as_mut() {
+                        auth.region = "us-west-2".to_owned();
+                    }
+                }
+                6 => {
+                    if let Some(AssetOriginAuth::S3SigV4(auth)) = changed.auth.as_mut() {
+                        auth.origin_query = Some(OriginQueryPolicy::Strip);
+                    }
+                }
+                8 => {
+                    if let Some(AssetOriginAuth::S3SigV4(auth)) = changed.auth.as_mut() {
+                        auth.session_token_enabled = true;
+                    }
+                }
+                _ => {}
+            }
+            let backend = Arc::new(RecordingBackend::default());
+            let http = Arc::new(StubHttpClient::new());
+            let services = credential_services(backend.clone(), http.clone());
+            let method = if mutation == 7 {
+                Method::POST
+            } else {
+                Method::GET
+            };
+            let req = build_http_request(method, "https://www.example.com/.images/foo.jpg");
+            assert!(
+                futures::executor::block_on(handle_asset_proxy_request(
+                    &settings, &services, req, &changed
+                ))
+                .is_err()
+            );
+            assert!(
+                backend.specs().is_empty(),
+                "rejection must precede backend creation"
+            );
+            assert!(
+                http.recorded_backend_names().is_empty(),
+                "no unauthorized request"
+            );
+        }
+    }
+
+    #[test]
+    fn s3_secret_bindings_force_tls_and_never_follow_redirects() {
+        for status in [301, 302, 303, 307, 308] {
+            let mut settings = create_test_settings();
+            settings.proxy.certificate_check = false;
+            let mut route = test_s3_image_optimizer_route();
+            route.image_optimizer = None;
+            authorize_s3_test_route(&mut settings, &route);
+            let backend = Arc::new(RecordingBackend::default());
+            let http = Arc::new(StubHttpClient::new());
+            http.push_response_with_headers(
+                status,
+                Vec::new(),
+                vec![("location", "https://unapproved.example/stolen")],
+            );
+            let services = credential_services(backend.clone(), http.clone());
+            let req = build_http_request(Method::GET, "https://www.example.com/.images/foo.jpg");
+            let response = futures::executor::block_on(handle_asset_proxy_request(
+                &settings, &services, req, &route,
+            ))
+            .expect("should surface origin redirect");
+            assert_eq!(response.response().status().as_u16(), status);
+            assert_eq!(http.recorded_request_uris().len(), 1);
+            let specs = backend.specs();
+            assert_eq!(specs.len(), 1);
+            assert!(specs[0].certificate_check);
+            assert_eq!(specs[0].host_header_override, None);
+        }
+    }
+
     fn test_s3_secrets() -> HashMap<String, Vec<u8>> {
         HashMap::from([
             (
@@ -5486,6 +5659,12 @@ mod tests {
                 b"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_vec(),
             ),
         ])
+    }
+
+    fn authorize_s3_test_route(settings: &mut Settings, route: &ProxyAssetRoute) {
+        settings.proxy.asset_routes = vec![route.clone()];
+        crate::test_support::secret_bindings::install_test_bindings(settings)
+            .expect("should resolve fixture bindings");
     }
 
     fn test_s3_image_optimizer_route() -> ProxyAssetRoute {
@@ -5501,6 +5680,7 @@ mod tests {
                 "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
             ),
             session_token: None,
+            session_token_enabled: false,
             origin_query: None,
         }));
         route.image_optimizer = Some(AssetImageOptimizerConfig {
@@ -5547,9 +5727,12 @@ mod tests {
                     "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
                 ),
                 session_token: None,
+                session_token_enabled: false,
                 origin_query: Some(OriginQueryPolicy::Strip),
             }));
 
+            let mut settings = settings;
+            authorize_s3_test_route(&mut settings, &route);
             handle_asset_proxy_request(&settings, &services, req, &route)
                 .await
                 .expect("should proxy signed S3 asset request");
@@ -5613,9 +5796,12 @@ mod tests {
                     "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
                 ),
                 session_token: Some(Redacted::new("session-token".to_string())),
+                session_token_enabled: true,
                 origin_query: None,
             }));
 
+            let mut settings = settings;
+            authorize_s3_test_route(&mut settings, &route);
             handle_asset_proxy_request(&settings, &services, req, &route)
                 .await
                 .expect("should proxy optimized S3 asset request");
@@ -5639,6 +5825,13 @@ mod tests {
                         .any(|(name, value)| name == "x-amz-security-token"
                             && value == "session-token")),
                 "should sign both requests with the cached session token"
+            );
+            assert!(
+                headers.iter().all(
+                    |sent| sent.iter().any(|(name, value)| name == "authorization"
+                        && value.contains("/us-east-1/s3/aws4_request"))
+                ),
+                "should sign both requests using the compiled S3 region"
             );
         });
     }
@@ -5846,6 +6039,8 @@ mod tests {
             );
             let route = test_s3_image_optimizer_route();
 
+            let mut settings = settings;
+            authorize_s3_test_route(&mut settings, &route);
             let response = handle_asset_proxy_request(&settings, &services, req, &route)
                 .await
                 .expect("should proxy raw SVG asset through S3 route")
@@ -5892,6 +6087,8 @@ mod tests {
             );
             let route = test_s3_image_optimizer_route();
 
+            let mut settings = settings;
+            authorize_s3_test_route(&mut settings, &route);
             let (response, stream_body) =
                 handle_asset_proxy_request(&settings, &services, req, &route)
                     .await
@@ -5971,6 +6168,7 @@ mod tests {
             );
             let route = test_s3_image_optimizer_route();
 
+            authorize_s3_test_route(&mut settings, &route);
             let asset_response = handle_asset_proxy_request(&settings, &services, req, &route)
                 .await
                 .expect("should return raw S3 error response");
@@ -6043,6 +6241,8 @@ mod tests {
             );
             let route = test_s3_image_optimizer_route();
 
+            let mut settings = settings;
+            authorize_s3_test_route(&mut settings, &route);
             let (response, stream_body) =
                 handle_asset_proxy_request(&settings, &services, req, &route)
                     .await

@@ -6,166 +6,75 @@ Learn how to configure Trusted Server for your deployment.
 
 Trusted Server uses a flexible configuration system based on:
 
-1. **TOML Files** - `trusted-server.toml` for ordinary configuration and secret key names
+1. **TOML Files** - `trusted-server.toml` for ordinary feature, identity, and destination settings
 2. **Environment Variables** - Typed CLI overrides with the `TRUSTED_SERVER__` prefix
 3. **EdgeZero Stores** - Config and secret stores for the pushed blob and runtime secret values
 
 ## Quick Start
 
-### Minimal Configuration
+### Minimal configuration
 
-Create `trusted-server.toml` in your project root. Generate both secret values
-first with `openssl rand -base64 32`; the placeholders below are intentionally
-rejected until replaced.
+Start from `trusted-server.example.toml`. App config has no credential properties:
 
 ```toml
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+
 [publisher]
-domain = "publisher.com"
-cookie_domain = ".publisher.com"
-origin_url = "https://origin.publisher.com"
-proxy_secret = "publisher_proxy_secret"
+domain = "example.com"
+cookie_domain = ".example.com"
+origin_url = "https://origin.example.com"
 
 [ec]
-passphrase = "ec_passphrase"
+ec_store = "ec_identity_store"
 ```
 
-### Environment Variable Overrides
+Provision generated `publisher.proxy`, `ec.passphrase`, and `handler.password` bindings before startup. These are fixed CLI selectors, not TOML fields. See [Provision app credentials](./secrets) for plan review, secure input, and native instructions.
 
-Environment variables are merged into existing TOML values by the typed
-`ts config validate`, `ts config diff`, and `ts config push` flows. They are not
-read by the deployed application at request time.
+### Environment variable overrides
+
+Typed `ts config validate`, `diff`, and `push` apply ordinary `TRUSTED_SERVER__...` scalar overlays unless `--no-env` is set. They are not request-time runtime settings. Never use overlays for credential values or names.
 
 ```bash
-# Format: TRUSTED_SERVER__SECTION__FIELD
-export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
-export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
-# Secret overrides, when needed, are key names—not secret values.
-export TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=publisher_proxy_secret
-export TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
-
-# Replace the rejected placeholder values in trusted-server.toml, then validate.
+export TRUSTED_SERVER__PUBLISHER__DOMAIN=example.com
+export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.example.com
 ts config validate
-ts config push --adapter fastly
 ```
 
-### Static secret references
+### Context-derived secret bindings
 
-Static app-config credentials contain stable key names only. This includes
-publisher, trusted-client-IP, EC, handler, Tinybird, DataDome, and S3 fields:
+All active app credentials use the logical `trusted_server_secrets` store and trusted native deployment mapping. Config supplies feature activation, identity, and destination; core derives the only allowed lookup. Enabled roles require their binding. Disabled roles make no secret reads.
 
-- `publisher.proxy_secret`
-- `trusted_client_ip.shared_secret`, when trusted client-IP forwarding is configured
-- `ec.passphrase`
-- `ec.partners[*].api_token`, when inbound identify or batch sync is used
-- `ec.partners[*].ts_pull_token`, when pull sync is enabled
-- `handlers[*].password`
-- `tinybird.auction_token_secret`, when Tinybird auction telemetry is enabled
-- `integrations.datadome.server_side_key_secret_name`, when protection is enabled
-- `integrations.datadome.protection_test_bypass.credential_secret_name`, when the bypass is enabled
-- `proxy.asset_routes[*].auth.access_key_id`, `secret_access_key`, and optional `session_token`
+All twelve removed credential properties reject even on disabled features. See the [migration table](./secret-binding-migration#removed-properties) and new optional-credential flags. No inline values, secret references, generated-key overrides, labels, or per-field store selectors belong in new config.
 
-Their values belong in the logical `trusted_server_secrets` store and are
-resolved only while an instance builds runtime settings. An adapter can map the
-logical ID to a different physical name. For example, Fastly commonly maps
-`trusted_server_secrets` to physical store `ts_secrets`.
+Trusted-client-IP credentials are store-backed, not inline. The former inline description was wrong. Deprecated Tinybird `access_token_secret` remains discarded; `access_enabled = true` is rejected. Deprecated Tinybird/DataDome/S3 store selectors remain ignored and absent from serialization. `s3_sig_v4` remains a deserialize alias for `s3_sigv4`.
 
-Two accepted secret-shaped fields are deliberately different:
+Runtime publishes credentials and compiled targets as one snapshot. Native value replacement does not refresh existing states. Request-signing and management credentials retain their separate fixed-store paths.
 
-- `trusted_client_ip.shared_secret` is an inline value in the app-config blob;
-  it is redacted by debug formatting but is not resolved from a secret store.
-- `tinybird.access_token_secret` is deprecated input. It is accepted for
-  migration, then discarded and omitted from serialized config; use
-  `tinybird.auction_token_secret` as the store key name instead.
+### Secret store migration
 
-The four deprecated `secret_store` selectors under Tinybird, DataDome, its
-protection-test bypass, and S3 route authentication are also accepted and
-discarded. Store selection comes from the adapter's EdgeZero mapping.
+Follow [Migrate app secret bindings](./secret-binding-migration). Review the new config and plan, provision generated identities first, deploy matching binary/config in isolation, recreate state, and retire legacy/context keys within an owned window. Old/new binaries require separate compatible config snapshots/stores during mixed rollout. No raw-key fallback exists.
 
-::: warning CLI output and inline secrets
-`ts config diff`, `ts config push --dry-run`, and the interactive push preview
-can print deliberately inline values. Use `ts config push --no-diff` when that
-output is not safe for the current terminal or CI log. The flag suppresses the
-diff; it does not move inline values to a secret store.
-:::
-
-The following table records the independent lifecycle, key-identity,
-serialization, runtime, and secret axes for every exceptional field:
-
-| Path                                                         | Lifecycle  | Key identity                        | Serialization | Runtime              | Secret handling          |
-| ------------------------------------------------------------ | ---------- | ----------------------------------- | ------------- | -------------------- | ------------------------ |
-| `AssetOriginAuth.s3_sig_v4`                                  | deprecated | alias of `AssetOriginAuth.s3_sigv4` | skipped       | deserialization only | none                     |
-| `DataDomeConfig.server_side_key_secret_name`                 | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `DataDomeConfig.server_side_key_secret_store`                | deprecated | canonical                           | skipped       | normalized away      | none                     |
-| `DataDomeProtectionTestBypassConfig.credential_secret_name`  | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `DataDomeProtectionTestBypassConfig.credential_secret_store` | deprecated | canonical                           | skipped       | normalized away      | none                     |
-| `Ec.passphrase`                                              | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `EcPartner.api_token`                                        | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `EcPartner.ts_pull_token`                                    | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `Handler.password`                                           | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `Publisher.proxy_secret`                                     | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `S3SigV4AuthConfig.access_key_id`                            | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `S3SigV4AuthConfig.secret_access_key`                        | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `S3SigV4AuthConfig.secret_store`                             | deprecated | canonical                           | skipped       | normalized away      | none                     |
-| `S3SigV4AuthConfig.session_token`                            | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `TinybirdSettings.access_token_secret`                       | deprecated | canonical                           | skipped       | normalized away      | accepted, then discarded |
-| `TinybirdSettings.auction_token_secret`                      | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `TinybirdSettings.secret_store`                              | deprecated | canonical                           | skipped       | normalized away      | none                     |
-| `TrustedClientIpConfig.shared_secret`                        | canonical  | canonical                           | serialized    | active               | deliberately inline      |
-
-Prepare an initial reference-based deployment in this order:
-
-1. Create the physical store and configure its `trusted_server_secrets` mapping.
-2. Choose a stable key name for each active credential field in the app config.
-3. Write each credential value under its referenced key without exposing it in
-   command arguments, shell history, logs, or CI output.
-4. Run `ts config validate`, then `ts config push --adapter fastly`.
-5. Start or deploy instances after the store and pushed config are both ready.
-
-Migrate an existing deployment in this order:
-
-1. Populate the physical store mapped from `trusted_server_secrets` with the
-   existing credential values without printing them in shell history, logs, or
-   CI output.
-2. Replace each active credential value with a stable key name and remove the
-   legacy Tinybird, DataDome, and S3 `secret_store` selectors.
-3. Run `ts config validate`, then `ts config push --adapter fastly --no-diff`.
-4. Restart/redeploy instances as needed to load the new values. Rotation is
-   startup-scoped; changing a store value does not alter already-built state.
-
-Keep `publisher.proxy_secret` and `ec.passphrase` stable unless intentionally
-rotating signed URLs or EC identifiers. On Spin, the app-config blob is stored
-under the `trusted_server_config` key in Spin's built-in `default` key-value
-store. Set the corresponding CLI store mapping before pushing so the write
-matches the runtime lookup:
+Spin still reads app config from its built-in `default` KV store:
 
 ```bash
 export EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=default
 ts config push --adapter spin
 ```
 
-For local Spin development, add `--local` to the push command. Also declare a
-component variable for each chosen secret key name using the encoder documented
-in `spin.toml`. Missing stores, keys, invalid UTF-8, and empty values fail
-closed; inline plaintext fallback is not supported.
+Use [generated application and component declarations](./secrets#spin-native-variables), not hand-encoded labels.
 
 ### Tinybird auction telemetry
-
-Tinybird uses the same typed secret-reference path as the other static
-credentials. Do not configure a feature-specific store:
 
 ```toml
 [tinybird]
 enabled = true
-api_host = "api.example.com"
+api_host = "api.tinybird.example.com"
 auction_dataset = "auction_events_raw"
-auction_token_secret = "tinybird_auction_append_token"
 ```
 
-Store the APPEND token value under `tinybird_auction_append_token` in the
-physical store mapped from `trusted_server_secrets`. The token is resolved once
-at startup. Disabled Tinybird telemetry does not require or resolve the token.
-The legacy `tinybird.secret_store` field is accepted for one migration release,
-but it is ignored and omitted from newly pushed config.
+Obtain a restricted APPEND token outside TS and provision the generated `tinybird.auction` binding for its exact endpoint and dataset. Do not add a token-name property. See the [Fastly tutorial](./secrets#first-fastly-setup-with-tinybird).
 
 ### Generate Secure Secrets
 
@@ -214,18 +123,19 @@ fail and the service will return its startup-error response.
 
 ## Example: Production Setup
 
-Generate and substitute every `replace-with-*` value before validation or
-deployment.
+Review ordinary deployment settings and provision generated credentials separately.
 
 ```toml
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+
 [publisher]
-domain = "publisher.com"
-cookie_domain = ".publisher.com"
-origin_url = "https://origin.publisher.com"
-proxy_secret = "publisher_proxy_secret"
+domain = "example.com"
+cookie_domain = ".example.com"
+origin_url = "https://origin.example.com"
 
 [ec]
-passphrase = "ec_passphrase"
 
 [request_signing]
 enabled = true
@@ -273,8 +183,8 @@ rerunning validation and pushing the resolved config, not rebuilding the binary.
 The pinned EdgeZero loader only overrides leaves that already exist in the
 parsed TOML; it does not create missing fields. Add newly introduced defaulted
 fields to an existing config before relying on their environment overrides.
-Secret overlays still contain key names, never secret values. Pass `--no-env`
-to use file values without the overlay.
+Credential properties are absent from app config and cannot be supplied through
+overlays. Pass `--no-env` to use ordinary file values without the overlay.
 
 ### Format
 
@@ -315,7 +225,6 @@ Core publisher settings for domain, origin, and proxy configuration.
 | `cookie_domain`                | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                               |
 | `origin_url`                   | String  | Yes      | Full URL of publisher origin server                                                  |
 | `origin_host_header_override`  | String  | No       | Outbound Host header to send while connecting to `origin_url`                        |
-| `proxy_secret`                 | String  | Yes      | Secret-store key name for the proxy URL secret                                       |
 | `max_buffered_body_bytes`      | Integer | No       | Buffered-body cap / Fastly stream raw+decoded byte ceiling (default 16 MiB)          |
 | `allow_async_html_finish`      | Boolean | No       | Explicit permission for async HTML EOF work and its delivery cost (default false)    |
 | `html_finalization_timeout_ms` | Integer | No       | Shared optional EOF budget after decoder/parser EOF (default 5000 ms; range 1–60000) |
@@ -323,26 +232,24 @@ Core publisher settings for domain, origin, and proxy configuration.
 > **Note:** EC cookies (`ts-ec`) derive their domain automatically as `.{domain}` and
 > do not use `cookie_domain`. The `cookie_domain` field is used by other cookie helpers.
 
-**Example** (replace the rejected secret placeholder before validation):
+**Example**:
 
 ```toml
 [publisher]
-domain = "publisher.com"
-cookie_domain = ".publisher.com"
-origin_url = "https://origin.publisher.com"
+domain = "example.com"
+cookie_domain = ".example.com"
+origin_url = "https://origin.example.com"
 # Optional: connect to origin_url but send this outbound Host header.
-# origin_host_header_override = "www.publisher.com"
-proxy_secret = "publisher_proxy_secret"
+# origin_host_header_override = "www.example.com"
 ```
 
 **Environment Override**:
 
 ```bash
-TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
-TRUSTED_SERVER__PUBLISHER__COOKIE_DOMAIN=.publisher.com
-TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
-TRUSTED_SERVER__PUBLISHER__ORIGIN_HOST_HEADER_OVERRIDE=www.publisher.com
-TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=publisher_proxy_secret
+TRUSTED_SERVER__PUBLISHER__DOMAIN=example.com
+TRUSTED_SERVER__PUBLISHER__COOKIE_DOMAIN=.example.com
+TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.example.com
+TRUSTED_SERVER__PUBLISHER__ORIGIN_HOST_HEADER_OVERRIDE=www.example.com
 TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
 TRUSTED_SERVER__PUBLISHER__ALLOW_ASYNC_HTML_FINISH=false
 TRUSTED_SERVER__PUBLISHER__HTML_FINALIZATION_TIMEOUT_MS=5000
@@ -361,10 +268,10 @@ TRUSTED_SERVER__PUBLISHER__HTML_FINALIZATION_TIMEOUT_MS=5000
 
 **Format**: Hostname without protocol or path
 
-- ✅ `publisher.com`
-- ✅ `www.publisher.com`
-- ❌ `https://publisher.com`
-- ❌ `publisher.com/path`
+- ✅ `example.com`
+- ✅ `www.example.com`
+- ❌ `https://example.com`
+- ❌ `example.com/path`
 
 #### `cookie_domain`
 
@@ -377,10 +284,10 @@ TRUSTED_SERVER__PUBLISHER__HTML_FINALIZATION_TIMEOUT_MS=5000
 
 **Format**: Domain with optional leading dot
 
-- `.publisher.com` - Shares across all subdomains
-- `publisher.com` - Exact domain only
+- `.example.com` - Shares across all subdomains
+- `example.com` - Exact domain only
 
-**Best Practice**: Use leading dot (`.publisher.com`) for subdomain sharing.
+**Best Practice**: Use leading dot (`.example.com`) for subdomain sharing.
 
 #### `origin_url`
 
@@ -394,10 +301,10 @@ TRUSTED_SERVER__PUBLISHER__HTML_FINALIZATION_TIMEOUT_MS=5000
 
 **Format**: Full URL with protocol
 
-- ✅ `https://origin.publisher.com`
-- ✅ `https://origin.publisher.com:8080`
+- ✅ `https://origin.example.com`
+- ✅ `https://origin.example.com:8080`
 - ✅ `http://192.168.1.1:9000`
-- ❌ `origin.publisher.com` (missing protocol)
+- ❌ `origin.example.com` (missing protocol)
 
 **Port Handling**: Includes port if non-standard (not 80/443).
 
@@ -414,18 +321,16 @@ connecting to the host in `origin_url`.
 
 **Format**: Hostname with optional port, without protocol, path, query, or fragment
 
-- ✅ `www.publisher.com`
-- ✅ `www.publisher.com:8443`
-- ❌ `https://www.publisher.com`
-- ❌ `www.publisher.com/path`
+- ✅ `www.example.com`
+- ✅ `www.example.com:8443`
+- ❌ `https://www.example.com`
+- ❌ `www.example.com/path`
 
 **Default**: When omitted, Trusted Server sends the host from `origin_url`.
 
-#### `proxy_secret`
+#### Proxy signing credential
 
-**Purpose**: Secret-store key name for the HMAC-SHA256 value used to sign proxy URLs.
-
-The referenced value is resolved from `trusted_server_secrets` at startup.
+The implicit `publisher.proxy` binding supplies the HMAC-SHA256 value used to sign proxy URLs. It is resolved from `trusted_server_secrets` at startup.
 Generate it with a cryptographically secure random source; at least 32 random
 bytes are recommended. Keep that value confidential, rotate it only
 intentionally, and never put it in the TOML file or pushed app-config blob.
@@ -438,7 +343,7 @@ intentionally, and never put it in the TOML file or pushed app-config blob.
 - Prevents URL tampering
 
 ::: danger Security Warning
-Changing `proxy_secret` invalidates all existing signed URLs. Plan rotations carefully and use graceful transition periods.
+Changing the proxy credential value invalidates all existing signed URLs. Plan rotations carefully and use graceful transition periods.
 :::
 
 #### `allow_async_html_finish`
@@ -548,13 +453,12 @@ it but keep using their own runtime client address.
 
 ### `[trusted_client_ip]`
 
-| Field           | Type   | Required | Description                                                      |
-| --------------- | ------ | -------- | ---------------------------------------------------------------- |
-| `ip_header`     | String | Yes      | Header containing exactly one reader IP address                  |
-| `auth_header`   | String | Yes      | Header containing exactly one shared-secret value                |
-| `shared_secret` | String | Yes      | Key in `trusted_server_secrets` for the front-door shared secret |
+| Field         | Type   | Required | Description                                       |
+| ------------- | ------ | -------- | ------------------------------------------------- |
+| `ip_header`   | String | Yes      | Header containing exactly one reader IP address   |
+| `auth_header` | String | Yes      | Header containing exactly one shared-secret value |
 
-All three fields are required when the section exists. When the section is
+Both header fields and the generated `clientip.shared` native binding are required when the section exists. When the section is
 absent, Trusted Server continues to use the immediate peer address, and
 `ts config push` omits the section from the published config blob so instances
 running an older binary keep accepting the blob.
@@ -572,7 +476,6 @@ this order wrong takes the service down rather than degrading it.
 [trusted_client_ip]
 ip_header = "x-ts-client-ip"
 auth_header = "x-ts-client-ip-auth"
-shared_secret = "trusted_client_ip_shared_secret"
 ```
 
 Prefer a dedicated `x-` name for `ip_header`, as shown. `fastly-client-ip` is
@@ -584,7 +487,7 @@ front-door configuration this section depends on.
 
 The front door must overwrite both headers on every request it forwards to
 Trusted Server, and must remove client-supplied copies on its other routes.
-Trusted Server resolves `shared_secret` from `trusted_server_secrets` at startup.
+Trusted Server resolves the implicit `clientip.shared` binding from `trusted_server_secrets` at startup.
 It accepts the forwarded address only when the request has exactly one
 `auth_header` value that matches the resolved secret byte-for-byte and exactly
 one `ip_header` value that parses directly as IPv4 or IPv6. Values are not
@@ -606,8 +509,7 @@ Trusted Server removes the configured headers before routing.
 
 Generate the referenced secret value with a cryptographically secure random
 generator, encode it as hex or base64url, and store the same value only in the
-front door and the physical store mapped from `trusted_server_secrets`. Put only
-the key name in Trusted Server configuration. The resolved value must contain at
+front door and the generated `clientip.shared` binding in the mapped native store. No credential property belongs in app config. The resolved value must contain at
 least 32 ASCII graphic bytes (`!` through `~`) with no whitespace, controls, DEL,
 or non-ASCII bytes.
 
@@ -627,11 +529,10 @@ client-IP resolution.
 ```bash
 TRUSTED_SERVER__TRUSTED_CLIENT_IP__IP_HEADER=x-ts-client-ip
 TRUSTED_SERVER__TRUSTED_CLIENT_IP__AUTH_HEADER=x-ts-client-ip-auth
-TRUSTED_SERVER__TRUSTED_CLIENT_IP__SHARED_SECRET=trusted_client_ip_shared_secret
 ```
 
 Because the typed environment overlay cannot create a missing section, add
-`[trusted_client_ip]` and all three fields to the TOML before using these
+`[trusted_client_ip]` and both header fields to the TOML before using these
 overrides.
 
 ## Tester Cookie Configuration
@@ -693,12 +594,10 @@ Legacy consent-store records are not read or migrated into `ec.ec_store`. Their 
 
 ### `[ec]`
 
-`passphrase` is a key name in `trusted_server_secrets`; the resolved value must
-be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
+The implicit `ec.passphrase` binding supplies a value of at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 
 | Field                     | Type           | Required | Description                                                             |
 | ------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
-| `passphrase`              | String         | Yes      | Publisher passphrase used as HMAC key                                   |
 | `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
 | `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response              |
 | `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                     |
@@ -709,48 +608,34 @@ be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.
 :::
 
-`api_token` is optional. Set it to a key in `trusted_server_secrets` only when
-the partner calls the inbound identify or batch-sync APIs. A partner without
-`api_token` remains available for source-domain lookup, bidstream EIDs, and
-outbound pull sync, but cannot authenticate to those inbound APIs.
+Set boolean `api_token_enabled = true` when the partner calls inbound identify or batch-sync APIs. It requires the generated `ec.inbound` binding. The default is false. A partner without inbound auth remains available for source-domain lookup, bidstream EIDs, and outbound pull sync, which requires its separate `ec.pull` binding.
 
 **Example**:
 
 ```toml
 [ec]
-passphrase = "ec_passphrase"
 ec_store = "ec_identity_store"
 
 [[ec.partners]]
 name = "Mocktioneer SSP"
-source_domain = "mocktioneer.example"
+source_domain = "partner.example.com"
 bidstream_enabled = true
-# api_token = "partner_api_token"  # only for inbound identify or batch sync
-# ts_pull_token = "partner_ts_pull_token"  # required when pull sync is enabled
+api_token_enabled = false
+pull_sync_enabled = false
+# pull_sync_url = "https://sync.example.com/pull"
 ```
 
 **Environment Override**:
 
 ```bash
-TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
 TRUSTED_SERVER__EC__EC_STORE=ec_identity_store
 ```
 
 ### Field Details
 
-#### `passphrase`
+#### EC derivation credential
 
-**Purpose**: Secret-store key name whose resolved value is the HMAC key for EC ID generation.
-
-**Security**:
-
-- The key name is stored in app config; the value is stored in `trusted_server_secrets`
-- Keep the value stable unless intentionally rotating EC identifiers
-- Do not place the value in environment overlays or the pushed blob
-
-**Validation**: Application startup fails if:
-
-- Empty string
+Provision `ec.passphrase` through a reviewed plan, outside config. Keep its value stable unless intentionally rotating EC identifiers. Missing, short, or placeholder values fail loading. Never put values in ordinary overlays or the pushed blob.
 
 ## Consent Configuration
 
@@ -988,7 +873,6 @@ Path-based HTTP Basic Authentication.
 | ---------- | -------------- | -------- | --------------------------------- |
 | `path`     | String (Regex) | Yes      | Regular expression matching paths |
 | `username` | String         | Yes      | HTTP Basic Auth username          |
-| `password` | String         | Yes      | HTTP Basic Auth password          |
 
 **Example**:
 
@@ -997,33 +881,21 @@ Path-based HTTP Basic Authentication.
 [[handlers]]
 path = "^/_ts/admin"
 username = "admin"
-password = "admin_password"
 
 # Multiple handlers
 [[handlers]]
 path = "^/secure"
 username = "user1"
-password = "secure_handler_password"
 
 [[handlers]]
 path = "^/api/private"
 username = "api-user"
-password = "api_handler_password"
 ```
 
-**Environment Override**:
-
-```bash
-# Handler 0
-TRUSTED_SERVER__HANDLERS__0__PATH="^/_ts/admin"
-TRUSTED_SERVER__HANDLERS__0__USERNAME="admin"
-TRUSTED_SERVER__HANDLERS__0__PASSWORD="admin_password"
-
-# Handler 1
-TRUSTED_SERVER__HANDLERS__1__PATH="^/api/private"
-TRUSTED_SERVER__HANDLERS__1__USERNAME="api-user"
-TRUSTED_SERVER__HANDLERS__1__PASSWORD="api_handler_password"
-```
+Each handler requires its generated `handler.password` binding. The exact regex
+and username determine the context. Edit handler arrays in TOML; the scalar-only
+environment overlay cannot edit them. Provision repeated roles using the
+reviewed generated entry ID. See [credential provisioning](./secrets).
 
 ### Path Patterns
 
@@ -1101,8 +973,8 @@ scheduled for removal
 
 **Password Storage**:
 
-- `handlers[*].password` is a key name in `trusted_server_secrets`
-- Store the resolved password only in the platform secret store
+- Each handler implies a generated `handler.password` binding
+- Store the raw password only at its reviewed native identity
 - Rotate passwords through the store and restart/redeploy instances
 
 **Limitations**:
@@ -1114,8 +986,8 @@ scheduled for removal
 
 ::: warning Production Use
 Do not put handler passwords in `trusted-server.toml`, environment overlays, or
-app-config blobs. Provision the referenced key in `trusted_server_secrets`
-before pushing the config.
+app-config blobs. Provision the generated binding in `trusted_server_secrets`
+before pushing the matching config.
 :::
 
 ## URL Rewrite Configuration
@@ -1366,34 +1238,30 @@ target_path = "/image/upload/$1.$2"
 
 ### `[proxy.asset_routes.auth]`
 
-The first supported origin auth type is `s3_sigv4`.
+The first supported origin auth type is `s3_sigv4`. Boolean `session_token_enabled` defaults to false; true also requires the generated session-token binding.
 
-| Field               | Type   | Required | Default             | Description                                                  |
-| ------------------- | ------ | -------- | ------------------- | ------------------------------------------------------------ |
-| `type`              | String | Yes      | none                | Must be `s3_sigv4`                                           |
-| `region`            | String | Yes      | none                | AWS region used in the SigV4 credential scope                |
-| `access_key_id`     | String | No       | `access_key_id`     | Default-store secret reference for the AWS access key ID     |
-| `secret_access_key` | String | No       | `secret_access_key` | Default-store secret reference for the AWS secret access key |
-| `session_token`     | String | No       | unset               | Optional secret key containing a session token               |
-| `origin_query`      | String | No       | route default       | `preserve` or `strip`                                        |
+| Field                   | Type    | Required | Default       | Description                                   |
+| ----------------------- | ------- | -------- | ------------- | --------------------------------------------- |
+| `type`                  | String  | Yes      | none          | Must be `s3_sigv4`                            |
+| `region`                | String  | Yes      | none          | AWS region used in the SigV4 credential scope |
+| `session_token_enabled` | Boolean | No       | `false`       | Require the generated session-token binding   |
+| `origin_query`          | String  | No       | route default | `preserve` or `strip`                         |
 
 **Example**:
 
 ```toml
 [[proxy.asset_routes]]
 prefix = "/.image/"
-origin_url = "https://bucket.s3.us-east-1.amazonaws.com"
+origin_url = "https://assets.example.com"
 
 [proxy.asset_routes.auth]
 type = "s3_sigv4"
 region = "us-east-1"
 origin_query = "strip"
-access_key_id = "s3_access_key_id"
-secret_access_key = "s3_secret_access_key"
-# session_token = "s3_session_token"
+session_token_enabled = false
 ```
 
-S3 auth uses header-based AWS SigV4 with `UNSIGNED-PAYLOAD`. It is scoped to read-only asset requests and expects `origin_url` to use the S3 host that AWS validates. Credential references resolve from `trusted_server_secrets` at startup, and request signing performs no secret-store reads.
+S3 auth uses header-based AWS SigV4 with `UNSIGNED-PAYLOAD`. It is scoped to read-only asset requests and expects `origin_url` to use the S3 host that AWS validates. Implicit `s3.access-id` and `s3.secret` bindings are required; `session_token_enabled = true` also requires `s3.session`. All bind the effective route policy. Request signing performs no secret-store reads. See [S3 provisioning](./asset-routes#secret-store-values).
 
 Effective `origin_query` precedence is auth-level `origin_query`, then enabled Image Optimizer `origin_query`, then the route default.
 
@@ -1494,21 +1362,26 @@ emitter is active only when `enabled = true`; access-log emission is not wired.
 
 ### `[tinybird]`
 
-| Field                  | Type           | Default                | Contract                                                           |
-| ---------------------- | -------------- | ---------------------- | ------------------------------------------------------------------ |
-| `enabled`              | Boolean        | `false`                | Enable auction telemetry                                           |
-| `api_host`             | String         | `""`                   | Required when enabled; regional host without scheme, port, or path |
-| `auction_dataset`      | String         | `"auction_events_raw"` | 1–128 ASCII letters, digits, or `_`                                |
-| `auction_token_secret` | String or null | `null`                 | Store key required when enabled; resolved value must be nonempty   |
-| `access_enabled`       | Boolean        | `false`                | Reserved; `true` fails startup because no emitter is wired         |
-| `access_dataset`       | String         | `"access_logs_raw"`    | Reserved access-log dataset name                                   |
-| `access_sample_rate`   | Number         | `0.0`                  | `0.0..=1.0`; reserved while access emission is disabled            |
-| `max_body_bytes`       | Integer        | `1048576`              | At least `1024` bytes                                              |
+| Field                | Type    | Default                | Contract                                                                 |
+| -------------------- | ------- | ---------------------- | ------------------------------------------------------------------------ |
+| `enabled`            | Boolean | `false`                | Enable auction telemetry                                                 |
+| `api_host`           | String  | `""`                   | Required when enabled; DNS host with optional `:port`, no scheme or path |
+| `auction_dataset`    | String  | `"auction_events_raw"` | 1–128 ASCII letters, digits, or `_`                                      |
+| `access_enabled`     | Boolean | `false`                | Reserved; `true` fails startup because no emitter is wired               |
+| `access_dataset`     | String  | `"access_logs_raw"`    | Reserved access-log dataset name                                         |
+| `access_sample_rate` | Number  | `0.0`                  | `0.0..=1.0`; reserved while access emission is disabled                  |
+| `max_body_bytes`     | Integer | `1048576`              | At least `1024` bytes                                                    |
 
 `secret_store` and `access_token_secret` are deprecated compatibility inputs.
 Both are removed during normalization; neither reaches runtime or serialized
-output. New configurations use only `auction_token_secret`, whose value is
-resolved through `trusted_server_secrets`.
+output. Enabled telemetry requires the implicit `tinybird.auction` binding for its endpoint and exact dataset.
+
+`api_host` accepts a DNS host with an optional HTTPS port, such as
+`api.tinybird.example.com:8443`. Do not include a scheme, path, userinfo, query,
+or fragment. The shared endpoint parser builds `https://{api_host}/v0/events`,
+normalizes explicit port `443` away, and preserves other valid ports. It rejects
+forbidden original syntax before normalization. A nondefault port is part of
+the credential's approved destination and changes its binding.
 
 The complete enabled example appears in
 [Tinybird auction telemetry](#tinybird-auction-telemetry).
@@ -1708,7 +1581,6 @@ and exclusion-rule syntax. This table covers every canonical top-level field:
 | `cache_ttl_seconds`                    | Integer        | `3600`                           | `60..=86400` seconds                                            |
 | `rewrite_sdk`                          | Boolean        | `true`                           | Rewrite matching SDK URLs                                       |
 | `enable_protection`                    | Boolean        | `false`                          | Call the Protection API before route matching                   |
-| `server_side_key_secret_name`          | String or null | `null`                           | Secret-store key required when protection is enabled            |
 | `protection_api_origin`                | URL            | `https://api-fastly.datadome.co` | Protection API origin                                           |
 | `timeout_ms`                           | Integer        | `1500`                           | `1..=10000` milliseconds                                        |
 | `protection_excluded_methods`          | Array[String]  | `["OPTIONS"]`                    | Methods that bypass protection                                  |
@@ -1732,9 +1604,7 @@ matcher: `path_exact`, `path_prefix`, `path_regex`,
 `query_param_non_empty`, `asn`, `ip_cidr`, or `ip_cidr_source`.
 
 When `protection_test_bypass` is present, its `enabled` field defaults to
-`false`; `credential_secret_name` identifies the secret-store key and becomes
-required only when the bypass is enabled. The resolved credential must contain
-at least 32 bytes.
+`false`. Enabled Protection requires `datadome.server`; an enabled bypass also requires the separate `datadome.bypass` binding with at least 32 bytes. Neither section accepts a credential-name property.
 
 The deprecated `server_side_key_secret_store` and nested
 `credential_secret_store` inputs are accepted and discarded. Do not add them
@@ -3079,7 +2949,7 @@ Configuration is validated at startup:
 
 **EC Validation**:
 
-- The `passphrase` key name is non-empty at push time
+- The implicit `ec.passphrase` role is included in the generated plan
 - The resolved passphrase is at least 32 bytes at runtime
 - Known placeholder values are rejected after resolution
 
@@ -3121,13 +2991,12 @@ Configuration error: provider `pbs-main` endpoint must be an absolute HTTPS URL
 [publisher]
 domain = "localhost"
 origin_url = "http://localhost:3000"
-proxy_secret = "publisher_proxy_secret"
 ```
 
 **Staging and production**:
 
-- Provision the same key names in the target `trusted_server_secrets` store.
-- Keep only the key names in `trusted-server.toml` and environment overlays.
+- Review a generated plan and provision its native identities in the selected deployment.
+- Keep credential properties absent from `trusted-server.toml` and ordinary overlays.
 - Push the config after provisioning and restart/redeploy after rotation.
 
 ### Secret Management
@@ -3138,7 +3007,7 @@ proxy_secret = "publisher_proxy_secret"
 - ✅ Rotate values deliberately and restart/redeploy instances
 - ✅ Generate values locally without printing them to logs
 - ✅ Use different values per environment when appropriate
-- ✅ Keep stable key names for rotation
+- ✅ Replace the same generated binding for unchanged-context rotation
 
 **Don't**:
 
@@ -3185,9 +3054,9 @@ trusted-server.dev.toml      # Development overrides
 
 **"Configuration field '...' is set to a known placeholder value"**:
 
-- Confirm the referenced key exists in `trusted_server_secrets`
+- Confirm the reviewed generated binding exists in the mapped native store
 - Ensure the resolved value is non-empty and not a known placeholder
-- Do not replace the key name with a plaintext value in the app config
+- Keep credential values and key-name properties absent from app config
 - Rotate the value in the platform secret store, then restart/redeploy
 
 **"Invalid regex"**:

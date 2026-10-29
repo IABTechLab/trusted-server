@@ -1,4 +1,4 @@
-name: "Run Tests"
+name: 'Run Tests'
 
 permissions:
   contents: read
@@ -108,6 +108,13 @@ jobs:
           TMPDIR: ${{ runner.temp }}
         run: ./scripts/async-html-finalization-local-test.sh fastly --release --auction
 
+      - name: Verify native credential TLS, redirects, and config-only attacks
+        timeout-minutes: 10
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          TMPDIR: ${{ runner.temp }}
+        run: ./scripts/secret-bindings-runtime.sh fastly
+
       - name: Upload EOF runtime diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -148,6 +155,9 @@ jobs:
 
       - name: Run Axum adapter tests
         run: cargo test-axum
+
+      - name: Verify native security harness process cleanup
+        run: node --test scripts/secret-bindings-runtime.test.mjs
 
       - name: Verify finalization harness process cleanup
         run: cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --target x86_64-unknown-linux-gnu --features html-eof-runtime --test html_eof_runtime
@@ -223,6 +233,24 @@ jobs:
       - name: Run Cloudflare adapter tests (native host)
         run: cargo test-cloudflare
 
+      - name: Install pinned local Workers tools
+        shell: bash
+        run: |
+          WORKER_VERSION=$(awk '/^name = "worker"$/ { getline; gsub(/"/, "", $3); print $3; exit }' Cargo.lock)
+          WRANGLER_VERSION=$(awk '$1 == "wrangler" { print $2 }' .tool-versions)
+          cargo install worker-build --version "$WORKER_VERSION" --locked
+          npm install --prefix "$RUNNER_TEMP/secret-bindings-tools" --no-save "wrangler@$WRANGLER_VERSION"
+
+      # No shipping S3 route on this adapter. A test-utils integration drives
+      # the shared exporter through real workerd stores and transport.
+      - name: Verify native credential TLS, redirects, and config-only attacks
+        timeout-minutes: 10
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          TMPDIR: ${{ runner.temp }}
+          WRANGLER_BIN: ${{ runner.temp }}/secret-bindings-tools/node_modules/.bin/wrangler
+        run: ./scripts/secret-bindings-runtime.sh cloudflare
+
   test-spin:
     name: cargo check/build/test (spin native + wasm32-wasip1)
     runs-on: ubuntu-latest
@@ -263,11 +291,31 @@ jobs:
           TRUSTED_SERVER__PUBLISHER__ORIGIN_URL: http://127.0.0.1:8080
           TRUSTED_SERVER__PUBLISHER__PROXY_SECRET: integration-test-proxy-secret
           TRUSTED_SERVER__EC__PASSPHRASE: integration-test-ec-secret-padded-32
-          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
+          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: 'false'
         run: cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
 
       - name: Run Spin adapter tests (native host)
         run: cargo test-spin
+
+      - name: Install pinned Spin runtime
+        shell: bash
+        run: |
+          VERSION=$(awk '$1 == "spin" { print $2 }' .tool-versions)
+          mkdir -p "$RUNNER_TEMP/secret-bindings-tools"
+          curl --fail --silent --show-error --location \
+            "https://github.com/spinframework/spin/releases/download/v$VERSION/spin-v$VERSION-linux-amd64.tar.gz" \
+            --output "$RUNNER_TEMP/spin.tar.gz"
+          tar -xzf "$RUNNER_TEMP/spin.tar.gz" -C "$RUNNER_TEMP/secret-bindings-tools" spin
+
+      # No shipping S3 route on this adapter. A test-utils integration drives
+      # the shared exporter through real Spin stores and transport.
+      - name: Verify native credential TLS, redirects, and config-only attacks
+        timeout-minutes: 10
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          TMPDIR: ${{ runner.temp }}
+          SPIN_BIN: ${{ runner.temp }}/secret-bindings-tools/spin
+        run: ./scripts/secret-bindings-runtime.sh spin
 
   test-parity:
     name: cargo test (cross-adapter parity)
@@ -312,7 +360,7 @@ jobs:
       - name: Set up Rust toolchain
         uses: ./.github/actions/setup-rust
         with:
-          components: "clippy, rustfmt"
+          components: 'clippy, rustfmt'
           cache-key: cargo-cli
 
       - name: Read pinned Node.js version
@@ -392,7 +440,7 @@ jobs:
           # main and this job only runs on PRs; `save-cache` keeps it
           # restore-only if either changes.
           cache-key: cargo-cli
-          save-cache: "false"
+          save-cache: 'false'
 
       # Building `ts` compiles trusted-server-core, whose trusted-server-js
       # build script runs the TSJS build with the `npm` on PATH, so pin Node
@@ -428,7 +476,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
-          cache: "npm"
+          cache: 'npm'
           cache-dependency-path: crates/trusted-server-js/lib/package.json
 
       - name: Install dependencies

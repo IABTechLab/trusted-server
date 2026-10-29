@@ -597,7 +597,7 @@ fn apply_edgezero_ec_finalize(
     ec_state: &mut EcFinalizeState,
     response: &mut HttpResponse,
 ) -> Result<PartnerRegistry, Report<TrustedServerError>> {
-    let partner_registry = PartnerRegistry::from_config(&settings.ec.partners)?;
+    let partner_registry = PartnerRegistry::from_settings(settings)?;
     let finalize_kv_graph = if ec_state.use_finalize_kv {
         maybe_identity_graph(settings)
     } else {

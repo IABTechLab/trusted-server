@@ -27,6 +27,6 @@ id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
 # envelope before deploying or running `wrangler dev` against real traffic.
 TRUSTED_SERVER_CONFIG = '{"trusted_server_config":""}'
 
-# App-config secret values are provisioned as Worker secrets with
-# `wrangler secret put <key-name>`. The pushed blob contains only those key
-# names; never add secret values to this file.
+# Generate native identities with `ts secrets plan --adapter cloudflare`.
+# Provision production values as Worker secrets at those generated names.
+# App config contains feature settings, never secret values or key names.

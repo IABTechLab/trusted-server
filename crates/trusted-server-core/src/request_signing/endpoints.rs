@@ -259,6 +259,18 @@ fn validate_kid_format(kid: &str) -> Result<(), Report<TrustedServerError>> {
 fn validate_kid(kid: &str) -> Result<(), Report<TrustedServerError>> {
     validate_kid_format(kid)?;
 
+    // Cloudflare has a flat secret namespace. Signing writes must never replace
+    // an app credential, including aliases under Axum's case normalization.
+    if kid
+        .to_ascii_lowercase()
+        .replace(['-', '.', ' '], "_")
+        .starts_with("ts1_")
+    {
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: "kid uses the reserved app-credential namespace".into(),
+        }));
+    }
+
     if !kid.starts_with(|c: char| c.is_ascii_lowercase()) {
         return Err(Report::new(TrustedServerError::BadRequest {
             message: "kid must start with a lowercase ASCII letter".into(),
@@ -1073,6 +1085,23 @@ mod tests {
             StatusCode::PAYLOAD_TOO_LARGE,
             "should return 413 for deactivate-key body over limit"
         );
+    }
+
+    #[test]
+    fn app_binding_namespace_is_reserved_but_legacy_keys_remain_removable() {
+        for kid in [
+            "ts1_fictional",
+            "ts1_FICTIONAL",
+            "tS1_fictional",
+            "tS1-fictional",
+            "ts1.fictional",
+        ] {
+            assert!(
+                validate_kid(kid).is_err(),
+                "should reject reserved namespace"
+            );
+            validate_kid_format(kid).expect("should permit legacy binding removal");
+        }
     }
 
     #[test]

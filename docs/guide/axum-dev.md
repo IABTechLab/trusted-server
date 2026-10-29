@@ -28,12 +28,17 @@ the temporary `.edgezero/` directory; the Axum process does not read that file
 directly. The script reads the envelope and exports it as
 `TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG`.
 
-Secrets use `TRUSTED_SERVER_SECRET_{STORE}_{KEY}`. The exact required variables
-are:
+App credentials use generated names from
+`ts secrets plan --adapter axum --app-config trusted-server.toml --no-env`.
+The renderer uses the runtime's actual environment mapping. Do not reuse
+`HANDLER_PASSWORD`, `PUBLISHER_PROXY_SECRET`, or `EC_PASSPHRASE` labels.
+Follow the [native input walkthrough](./secrets#axum-native-environment-input):
+inject each raw value into the shell or supervisor that actually launches Axum.
+A child process cannot export into its parent.
 
-- `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_HANDLER_PASSWORD`
-- `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PUBLISHER_PROXY_SECRET`
-- `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_PASSPHRASE`
+`ts secrets check --adapter axum` checks only its own environment for presence,
+not remote process injection, credential validity, or delivery. Direct `set`
+is unsupported. Native reads and TLS/no-follow rehearsal remain release gates.
 
 Before the positive request, the smoke omits the config and each secret in
 separate process starts. Each request must return 500 and its log must identify

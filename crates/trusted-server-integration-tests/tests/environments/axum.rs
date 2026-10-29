@@ -1,4 +1,4 @@
-use crate::common::config::integration_app_config_envelope;
+use crate::common::config::{integration_app_config_envelope, integration_native_fixtures};
 use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult, origin_port,
 };
@@ -7,34 +7,9 @@ use std::io::{BufRead as _, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use trusted_server_adapter_axum::platform::config_env_var;
-use trusted_server_core::settings_data::{default_config_key, default_config_store_name};
 
 /// Default port the Axum dev server binds to when no `PORT` env var is supplied.
 const AXUM_DEFAULT_PORT: u16 = 8787;
-
-/// Secret-store entries referenced by the integration app-config fixture.
-const INTEGRATION_SECRET_ENV: &[(&str, &str)] = &[
-    (
-        "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_INTEGRATION_ADMIN_PASSWORD",
-        "integration-admin-password-32-bytes-ok",
-    ),
-    (
-        "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_INTEGRATION_PROXY_SECRET",
-        "integration-test-proxy-secret-32-bytes-ok",
-    ),
-    (
-        "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_INTEGRATION_EC_PASSPHRASE",
-        "integration-test-ec-secret-padded-32",
-    ),
-    (
-        "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_INTEGRATION_PARTNER_TOKEN_ALPHA",
-        "integration-test-token-alpha-32-bytes-ok",
-    ),
-    (
-        "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_INTEGRATION_PARTNER_TOKEN_BRAVO",
-        "integration-test-token-bravo-32-bytes-ok",
-    ),
-];
 
 /// Axum native dev-server runtime environment.
 ///
@@ -59,14 +34,29 @@ impl RuntimeEnvironment for AxumDevServer {
         let port = super::find_available_port().unwrap_or(AXUM_DEFAULT_PORT);
 
         let app_config = integration_app_config_envelope(origin_port())?;
-        let store_name = default_config_store_name();
-        let config_key = default_config_key();
-        let config_variable = config_env_var(store_name.as_ref(), &config_key);
+        let config_variable = config_env_var("trusted_server_config", "trusted_server_config");
 
+        let fixtures = integration_native_fixtures("axum")?;
         let mut child = Command::new(&binary)
             .env("PORT", port.to_string())
+            .env(
+                "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME",
+                "trusted_server_config",
+            )
+            .env(
+                "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY",
+                "trusted_server_config",
+            )
+            .env(
+                "EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME",
+                "trusted_server_secrets",
+            )
             .env(config_variable, app_config)
-            .envs(INTEGRATION_SECRET_ENV.iter().copied())
+            .envs(
+                fixtures
+                    .into_iter()
+                    .map(|fixture| (fixture.native.native_name, fixture.value)),
+            )
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
