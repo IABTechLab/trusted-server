@@ -468,3 +468,55 @@ fn pushed_envelope_sha_is_stable_for_one_context_key_allowlist() {
         );
     }
 }
+
+#[test]
+fn config_validate_and_push_reject_unknown_integration_ids_and_fields() {
+    let cases = [
+        ("prebdi", "enabled", true, "prebdi"),
+        ("gpt", "rewrite_scripts", false, "rewrite_scripts"),
+        ("gpt", "enable", false, "enable"),
+        ("osano", "made_up_key", false, "made_up_key"),
+    ];
+    for (id, field, field_value, expected) in cases {
+        for command in ["validate", "push"] {
+            let project = migrated_project();
+            let mut document = fs::read_to_string(&project.config_path)
+                .expect("should read valid config")
+                .parse::<DocumentMut>()
+                .expect("should parse valid config");
+            document["integrations"][id] = toml_edit::table();
+            document["integrations"][id][field] = value(field_value);
+            fs::write(&project.config_path, document.to_string())
+                .expect("should write invalid integration config");
+            let mut process = Command::new(env!("CARGO_BIN_EXE_ts"));
+            process
+                .args(["config", command, "--manifest"])
+                .arg(&project.manifest_path)
+                .arg("--app-config")
+                .arg(&project.config_path)
+                .current_dir(project.directory.path());
+            if command == "push" {
+                process.args(["--adapter", "axum", "--yes", "--no-diff"]);
+            }
+
+            let output = process.output().expect("should run config command");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success(),
+                "should reject {id}.{field} during {command}: {stderr}"
+            );
+            assert!(
+                stderr.contains(expected),
+                "should name {expected} during {command}: {stderr}"
+            );
+            assert!(
+                !project
+                    .directory
+                    .path()
+                    .join(".edgezero/local-config-trusted_server_config.json")
+                    .exists(),
+                "should reject invalid configuration before writing a local blob"
+            );
+        }
+    }
+}

@@ -24,6 +24,7 @@ use rsc_stream::NextJsRscStreamProcessorFactory;
 use script_rewriter::NextJsNextDataRewriter;
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct NextJsIntegrationConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,

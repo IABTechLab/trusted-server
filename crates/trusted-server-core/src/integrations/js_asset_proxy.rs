@@ -37,6 +37,7 @@ const ERROR_ORIGIN_STATUS: &str = "js-asset-origin-status";
 
 /// Configuration for the JavaScript asset proxy integration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct JsAssetProxyConfig {
     /// Enables or disables the integration.
     #[serde(default)]

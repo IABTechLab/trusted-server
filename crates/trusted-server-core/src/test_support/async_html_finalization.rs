@@ -29,6 +29,7 @@ const ORIGINAL: &[u8] = b"EXAMPLE_UNSIGNED";
 const REPLACEMENT: &[u8] = b"EXAMPLE_FINALIZED";
 
 #[derive(Clone, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct FixtureConfig {
     enabled: bool,
     #[validate(url)]

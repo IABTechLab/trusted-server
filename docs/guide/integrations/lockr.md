@@ -43,27 +43,32 @@ Add Lockr configuration to `trusted-server.toml`:
 ```toml
 [integrations.lockr]
 enabled = true
-api_endpoint = "https://api.lockr.io"
-organization_id = "your-org-id"
-project_id = "your-project-id"
+app_id = "example-app"
 ```
 
 ### Configuration Options
 
-| Field             | Type    | Required | Description                                   |
-| ----------------- | ------- | -------- | --------------------------------------------- |
-| `enabled`         | boolean | No       | Enable/disable integration (default: `false`) |
-| `api_endpoint`    | string  | Yes      | Lockr API endpoint URL                        |
-| `organization_id` | string  | Yes      | Your Lockr organization ID                    |
-| `project_id`      | string  | Yes      | Your Lockr project ID                         |
+| Field               | Type    | Required | Description                                                          |
+| ------------------- | ------- | -------- | -------------------------------------------------------------------- |
+| `enabled`           | boolean | No       | Enable/disable integration (default: `true` when the section exists) |
+| `app_id`            | string  | Yes      | Non-empty Lockr application ID                                       |
+| `api_endpoint`      | string  | No       | API base URL; defaults to the integration's API host                 |
+| `sdk_url`           | string  | No       | SDK URL; defaults to the integration's trust-server SDK              |
+| `cache_ttl_seconds` | integer | No       | SDK cache TTL, 60–86400 seconds (default: `3600`)                    |
+| `rewrite_sdk`       | boolean | No       | Rewrite SDK URLs in HTML (default: `true`)                           |
+| `origin_override`   | string  | No       | Override the Origin header sent to the API                           |
+| `rewrite_sdk_host`  | boolean | No       | Deprecated compatibility field; host routing is handled by the SDK   |
+
+Unknown fields, including the unsupported `organization_id` and `project_id`,
+are rejected. Remove them before upgrading and configure `app_id` instead.
 
 ### Environment Variables
 
+The CLI applies overrides to matching fields already present in the config:
+
 ```bash
 TRUSTED_SERVER__INTEGRATIONS__LOCKR__ENABLED=true
-TRUSTED_SERVER__INTEGRATIONS__LOCKR__API_ENDPOINT=https://api.lockr.io
-TRUSTED_SERVER__INTEGRATIONS__LOCKR__ORGANIZATION_ID=your-org-id
-TRUSTED_SERVER__INTEGRATIONS__LOCKR__PROJECT_ID=your-project-id
+TRUSTED_SERVER__INTEGRATIONS__LOCKR__APP_ID=example-app
 ```
 
 ## Features
@@ -211,7 +216,7 @@ curl https://edge.example.com/
 
 **Solutions**:
 
-- Verify `organization_id` and `project_id` are correct
+- Verify `app_id` is correct
 - Check Lockr API endpoint is reachable
 - Ensure GDPR consent is granted
 - Review Lockr API credentials

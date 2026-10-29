@@ -298,6 +298,19 @@ pub trait IntegrationConfig: DeserializeOwned + Validate {
 }
 
 impl IntegrationSettings {
+    fn parse_error(integration_id: &str, error: serde_json::Error) -> Report<TrustedServerError> {
+        let detail = error.to_string();
+        let mut message =
+            format!("Integration '{integration_id}' configuration could not be parsed");
+        // Field diagnostics identify schema keys. Other serde errors can echo
+        // configuration values, so retain them only in the report's cause chain.
+        if detail.starts_with("unknown field ") || detail.starts_with("missing field ") {
+            message.push_str(": ");
+            message.push_str(&detail);
+        }
+        Report::new(error).change_context(TrustedServerError::Configuration { message })
+    }
+
     /// Inserts a configuration value for an integration.
     ///
     /// # Errors
@@ -368,21 +381,13 @@ impl IntegrationSettings {
         };
 
         if Self::is_explicitly_disabled(raw) {
-            T::validate_disabled_schema(raw).change_context(TrustedServerError::Configuration {
-                message: format!(
-                    "Integration '{integration_id}' configuration could not be parsed"
-                ),
-            })?;
+            T::validate_disabled_schema(raw)
+                .map_err(|error| Self::parse_error(integration_id, error))?;
             return Ok(None);
         }
 
-        let config: T = serde_json::from_value(raw.clone()).change_context(
-            TrustedServerError::Configuration {
-                message: format!(
-                    "Integration '{integration_id}' configuration could not be parsed"
-                ),
-            },
-        )?;
+        let config: T = serde_json::from_value(raw.clone())
+            .map_err(|error| Self::parse_error(integration_id, error))?;
 
         // Field validation runs only for integrations that resolve to enabled.
         // An integration whose `enabled` flag is omitted falls back to its
@@ -2046,6 +2051,7 @@ impl Proxy {
 
 /// Direct Tinybird Events API telemetry configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TinybirdSettings {
     /// Master enablement for auction telemetry ingestion.
     #[serde(default)]
@@ -2952,6 +2958,7 @@ pub enum AuctionDebugCommentFormat {
 
 /// Tester-cookie endpoint configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct TesterCookieConfig {
     /// Enable tester-cookie endpoints that set and clear `ts-tester`.
     #[serde(default)]
@@ -4072,7 +4079,7 @@ mod tests {
     use super::*;
     use crate::auction::build_orchestrator;
     use crate::integrations::{
-        IntegrationRegistry, gpt::GptConfig, nextjs::NextJsIntegrationConfig,
+        IntegrationRegistry, gpt::GptConfig, lockr::LockrConfig, nextjs::NextJsIntegrationConfig,
         prebid::PrebidIntegrationConfig,
     };
     use crate::redacted::Redacted;
@@ -5928,6 +5935,63 @@ origin_host_header_overide = "www.example.com""#,
             assert!(
                 result.is_err(),
                 "origin_host_header_override {override_value:?} should fail validation"
+            );
+        }
+    }
+
+    #[test]
+    fn integration_parse_errors_hide_invalid_values() {
+        for enabled in [true, false] {
+            let mut integrations = IntegrationSettings::default();
+            integrations.insert(
+                "gpt".to_string(),
+                json!({
+                    "enabled": enabled,
+                    "gam_attribution_enabled": "fictional-private-value",
+                }),
+            );
+
+            let error = integrations
+                .get_typed::<GptConfig>("gpt")
+                .expect_err("should reject an invalid boolean for enabled and disabled configs");
+            let message = error.to_string();
+            assert!(
+                message.contains("Integration 'gpt' configuration could not be parsed"),
+                "should retain integration context"
+            );
+            assert!(
+                !message.contains("fictional-private-value"),
+                "should not echo invalid values in the outer error message"
+            );
+        }
+    }
+
+    #[test]
+    fn integration_parse_errors_name_missing_fields() {
+        let mut integrations = IntegrationSettings::default();
+        integrations.insert("lockr".to_string(), json!({ "enabled": true }));
+
+        let error = integrations
+            .get_typed::<LockrConfig>("lockr")
+            .expect_err("should reject missing required integration fields");
+        assert!(
+            error.to_string().contains("missing field"),
+            "should retain missing-field diagnostics"
+        );
+    }
+
+    #[test]
+    fn settings_reject_unknown_tester_cookie_and_tinybird_fields() {
+        for section in ["tester_cookie", "tinybird"] {
+            let source = format!(
+                "{}\n[{section}]\nmade_up_key = true\n",
+                crate_test_settings_str()
+            );
+            let error = Settings::from_toml(&source)
+                .expect_err("should reject unknown keys in strict settings sections");
+            assert!(
+                format!("{error:?}").contains("made_up_key"),
+                "should name offending {section} key: {error:?}"
             );
         }
     }

@@ -38,6 +38,7 @@ use crate::settings::{IntegrationConfig, Settings};
 
 /// Configuration for mock ad server integration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct AdServerMockConfig {
     /// Whether this integration is enabled
     #[serde(default = "default_enabled")]
