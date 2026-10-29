@@ -164,13 +164,17 @@ while IFS= read -r name; do
   export "$name=$value"
   unset value
 done < <(jq -r '.entries[].native.native_name' bindings-axum.json | sort -u)
+EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME="$(
+  jq -er '.resources.runtime_secret_store' bindings-axum.json
+)"
+export EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME
 ts secrets check --adapter axum --app-config trusted-server.toml \
   --no-env --plan bindings-axum.json
 # Start the reviewed prebuilt runtime from THIS shell, not a build subprocess.
 exec trusted-server-axum
 ```
 
-First install the matching reviewed `trusted-server-axum` binary on `PATH` and supply the config-envelope environment variable using the [Axum setup](./getting-started#option-b-axum-dev-server). `export` here is a Bash builtin, not a command carrying a credential on subprocess argv. Do not run this loop as a child script and expect it to export into its parent. A production supervisor must inject the generated names into the actual process environment through its protected secret mechanism. Avoid dumping process environments. `check` examines only its own process environment; it cannot inspect a remote process or verify credential bytes. Restart Axum to load replacements.
+First install the matching reviewed `trusted-server-axum` binary on `PATH` and supply the config-envelope environment variable using the [Axum setup](./getting-started#option-b-axum-dev-server). `export` here is a Bash builtin, not a command carrying a credential on subprocess argv. Do not run this loop as a child script and expect it to export into its parent. The store selector must also reach the runtime: planning honors manifest defaults, but the directly launched Axum binary reads this selector only from its process environment. A production supervisor must inject both the reviewed store selector and the generated credential variables into the actual process environment through its protected secret mechanism. Avoid dumping process environments. `check` examines only its own process environment; it cannot inspect a remote process or verify credential bytes. Restart Axum to load replacements.
 
 ## Cloudflare native Worker secrets
 

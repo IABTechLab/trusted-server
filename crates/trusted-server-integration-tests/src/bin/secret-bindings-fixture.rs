@@ -216,7 +216,7 @@ mod tests {
                 let loaded =
                     settings_from_config_blob(raw, &store, &"trusted_server_secrets".into());
                 if case == "original" {
-                    assert!(loaded.is_ok(), "original {adapter}: {loaded:?}");
+                    assert!(loaded.is_ok(), "original {adapter} should load");
                 } else {
                     let error = loaded.expect_err("should reject mutation");
                     let diagnostic = format!("{error:?}");
