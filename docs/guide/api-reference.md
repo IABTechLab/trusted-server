@@ -562,7 +562,10 @@ curl -X POST https://edge.example.com/first-party/sign \
 }
 ```
 
-`href` is the signed proxy path. `base` is the normalized target without its query or fragment.
+`href` is an absolute signed proxy URL on `publisher.public_origin`, falling
+back to `https://{publisher.domain}`. `base` is the normalized target without
+its query or fragment. Configure the actual browser-facing endpoint as described
+in [Publisher configuration](/guide/configuration#publisher-configuration).
 
 **Error Responses:**
 
@@ -580,7 +583,7 @@ curl -X POST https://edge.example.com/first-party/sign \
 
 ---
 
-### GET/POST /first-party/proxy-rebuild
+### POST /first-party/proxy-rebuild
 
 URL mutation recovery endpoint. Re-signs a click URL after creative JavaScript modifies its query parameters. The original `tstoken` is validated first, and `tsurl`, `tstoken`, and `tsexp` can never be added or removed.
 
@@ -607,7 +610,9 @@ Validation and re-signing depend on `publisher.proxy_secret`.
 }
 ```
 
-`tsclick` may be root-relative (the form the rewriter emits) or absolute.
+`tsclick` accepts absolute URLs emitted by the rewriter and existing
+root-relative signed URLs. The rebuilt `href` is absolute on
+`publisher.public_origin`, falling back to `https://{publisher.domain}`.
 
 **Response:**
 
@@ -629,7 +634,7 @@ Validation and re-signing depend on `publisher.proxy_secret`.
 
 ### GET /first-party/proxy-rebuild
 
-Navigation form of the same recovery, for creatives rendered in a sandboxed iframe without `allow-same-origin`. Their opaque origin makes the JSON POST a CORS-preflighted cross-origin request that the endpoint does not answer, so the click guard navigates here instead — navigations are not subject to CORS.
+Navigation form of the same recovery, for creatives rendered in a sandboxed iframe without `allow-same-origin`. Their opaque origin makes the JSON POST a CORS-preflighted cross-origin request that the endpoint does not answer, so the click guard navigates here instead. Navigations are not subject to CORS.
 
 **Query Parameters:**
 
@@ -639,7 +644,10 @@ Navigation form of the same recovery, for creatives rendered in a sandboxed ifra
 | `add`     | No       | URL-encoded JSON object of parameters to add      |
 | `del`     | No       | URL-encoded JSON array of parameter names to drop |
 
-**Response:** `302` with the rebuilt `/first-party/click?...` URL in `Location` and `Cache-Control: no-store, private`. The browser follows it to `/first-party/click`, which redirects on to the advertiser.
+**Response:** `302` with an absolute rebuilt click URL on
+`publisher.public_origin`, falling back to `https://{publisher.domain}`, in
+`Location` and `Cache-Control: no-store, private`. The browser follows it to
+`/first-party/click`, which redirects on to the advertiser.
 
 Validation is identical to the POST form.
 

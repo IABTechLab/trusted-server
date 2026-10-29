@@ -158,6 +158,8 @@ jobs:
     # once the pinned Playwright version supports the newer image.
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      VICEROY_CONFIG_GENERATOR_PATH: ${{ github.workspace }}/target/debug/generate-viceroy-config
     steps:
       - uses: actions/checkout@v4
 
@@ -200,6 +202,12 @@ jobs:
         run: |
           npm ci
           npx playwright install --with-deps chromium
+
+      # startViceroy retargets the config after choosing its listener port. Build
+      # on this runner rather than relying on an uncached binary or a native
+      # artifact from prepare-artifacts' potentially newer Ubuntu image.
+      - name: Build browser config generator
+        run: cargo build --package trusted-server-integration-tests --bin generate-viceroy-config
 
       - name: Test initial render fixture escaping
         working-directory: crates/trusted-server-integration-tests/browser

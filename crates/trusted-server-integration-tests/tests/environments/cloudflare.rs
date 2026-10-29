@@ -1,4 +1,4 @@
-use crate::common::config::cloudflare_config_json;
+use crate::common::config::{cloudflare_config_json, cloudflare_config_with_public_origin};
 use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult, origin_port,
 };
@@ -66,13 +66,12 @@ impl RuntimeEnvironment for CloudflareWorkers {
     }
 
     fn spawn(&self, _wasm_path: &Path) -> TestResult<RuntimeProcess> {
-        let wrangler_dir = self.wrangler_dir();
-        let config = if std::env::var("CI").is_ok() {
-            write_generated_ci_config(&wrangler_dir, &cloudflare_config_json(origin_port())?)?
+        if std::env::var("CI").is_ok() {
+            self.spawn_with_config_json(&cloudflare_config_json(origin_port())?)
         } else {
-            "wrangler.toml".to_string()
-        };
-        self.spawn_wrangler(&wrangler_dir, &config)
+            let port = super::find_available_port().unwrap_or(CLOUDFLARE_DEFAULT_PORT);
+            self.spawn_wrangler(&self.wrangler_dir(), "wrangler.toml", port)
+        }
     }
 
     fn health_check_path(&self) -> &str {
@@ -93,14 +92,20 @@ impl CloudflareWorkers {
     /// written or `wrangler dev` cannot be started, and
     /// [`TestError::RuntimeNotReady`] if the health check times out.
     pub fn spawn_with_config_json(&self, config_json: &str) -> TestResult<RuntimeProcess> {
+        let port = super::find_available_port().unwrap_or(CLOUDFLARE_DEFAULT_PORT);
+        let public_origin = format!("http://127.0.0.1:{port}");
+        let config_json = cloudflare_config_with_public_origin(config_json, &public_origin)?;
         let wrangler_dir = self.wrangler_dir();
-        let config = write_generated_ci_config(&wrangler_dir, config_json)?;
-        self.spawn_wrangler(&wrangler_dir, &config)
+        let config = write_generated_ci_config(&wrangler_dir, &config_json)?;
+        self.spawn_wrangler(&wrangler_dir, &config, port)
     }
 
-    fn spawn_wrangler(&self, wrangler_dir: &Path, config: &str) -> TestResult<RuntimeProcess> {
-        let port = super::find_available_port().unwrap_or(CLOUDFLARE_DEFAULT_PORT);
-
+    fn spawn_wrangler(
+        &self,
+        wrangler_dir: &Path,
+        config: &str,
+        port: u16,
+    ) -> TestResult<RuntimeProcess> {
         #[cfg(unix)]
         let child = {
             use std::os::unix::process::CommandExt as _;

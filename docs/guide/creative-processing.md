@@ -312,11 +312,11 @@ it does not control whether the processed `adm` is present.
 
 ```html
 <!-- Original -->
-<iframe src="https://advertiser.com/creative.html"></iframe>
+<iframe src="https://advertiser.example.com/creative.html"></iframe>
 
 <!-- Rewritten -->
 <iframe
-  src="https://ads.publisher.example/first-party/proxy?tsurl=https://advertiser.com/creative.html&tstoken=sig"
+  src="https://ads.publisher.example/first-party/proxy?tsurl=https://advertiser.example.com/creative.html&tstoken=sig"
 ></iframe>
 ```
 
@@ -584,18 +584,18 @@ Descriptors are preserved exactly as written:
 <!-- Original -->
 <img
   srcset="
-    https://cdn.com/small.jpg   480w,
-    https://cdn.com/medium.jpg  800w,
-    https://cdn.com/large.jpg  1200w
+    https://cdn.example.com/small.jpg   480w,
+    https://cdn.example.com/medium.jpg  800w,
+    https://cdn.example.com/large.jpg  1200w
   "
 />
 
 <!-- Rewritten -->
 <img
   srcset="
-    /first-party/proxy?tsurl=https://cdn.com/small.jpg&tstoken=sig1   480w,
-    /first-party/proxy?tsurl=https://cdn.com/medium.jpg&tstoken=sig2  800w,
-    /first-party/proxy?tsurl=https://cdn.com/large.jpg&tstoken=sig3  1200w
+    https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/small.jpg&tstoken=sig1   480w,
+    https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/medium.jpg&tstoken=sig2  800w,
+    https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/large.jpg&tstoken=sig3  1200w
   "
 />
 ```
@@ -606,13 +606,13 @@ Srcset can mix absolute and relative URLs:
 
 ```html
 <!-- Original -->
-<img srcset="/local/small.jpg 1x, https://cdn.com/large.jpg 2x" />
+<img srcset="/local/small.jpg 1x, https://cdn.example.com/large.jpg 2x" />
 
 <!-- Rewritten (only absolute URL) -->
 <img
   srcset="
-    /local/small.jpg                                               1x,
-    /first-party/proxy?tsurl=https://cdn.com/large.jpg&tstoken=sig 2x
+    /local/small.jpg                                                                                    1x,
+    https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/large.jpg&tstoken=sig 2x
   "
 />
 ```
@@ -645,23 +645,23 @@ Common properties with `url()` values:
 
 ```css
 /* Background images */
-background: url(https://cdn.com/bg.jpg);
-background-image: url(https://cdn.com/pattern.png);
+background: url(https://cdn.example.com/bg.jpg);
+background-image: url(https://cdn.example.com/pattern.png);
 
 /* Borders */
-border-image: url(https://cdn.com/border.svg);
+border-image: url(https://cdn.example.com/border.svg);
 
 /* List styles */
-list-style-image: url(https://cdn.com/bullet.png);
+list-style-image: url(https://cdn.example.com/bullet.png);
 
 /* Cursors */
-cursor: url(https://cdn.com/cursor.cur), pointer;
+cursor: url(https://cdn.example.com/cursor.cur), pointer;
 
 /* Masks */
-mask-image: url(https://cdn.com/mask.svg);
+mask-image: url(https://cdn.example.com/mask.svg);
 
 /* Filters */
-filter: url(https://cdn.com/filter.svg#blur);
+filter: url(https://cdn.example.com/filter.svg#blur);
 ```
 
 **All `url()` occurrences are rewritten** regardless of property.
@@ -674,16 +674,16 @@ Properties can have multiple `url()` values:
 /* Original */
 .element {
   background:
-    url(https://cdn.com/top.png) top,
-    url(https://cdn.com/bottom.png) bottom;
+    url(https://cdn.example.com/top.png) top,
+    url(https://cdn.example.com/bottom.png) bottom;
 }
 
 /* Rewritten */
 .element {
   background:
-    url(https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.com/top.png&tstoken=sig1)
+    url(https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/top.png&tstoken=sig1)
       top,
-    url(https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.com/bottom.png&tstoken=sig2)
+    url(https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/bottom.png&tstoken=sig2)
       bottom;
 }
 ```
@@ -694,10 +694,10 @@ CSS `@import` with URLs:
 
 ```css
 /* Original */
-@import url(https://fonts.googleapis.com/css?family=Roboto);
+@import url(https://fonts.example.com/css?family=Roboto);
 
 /* Rewritten */
-@import url(https://ads.publisher.example/first-party/proxy?tsurl=https://fonts.googleapis.com/css?family=Roboto&tstoken=sig);
+@import url(https://ads.publisher.example/first-party/proxy?tsurl=https://fonts.example.com/css?family=Roboto&tstoken=sig);
 ```
 
 ## Exclude Domains
@@ -747,7 +747,7 @@ Matches:
 **Trusted Partners**:
 
 ```toml
-exclude_domains = ["*.trusted-cdn.com"]
+exclude_domains = ["*.trusted-cdn.example.com"]
 ```
 
 Skip rewriting for partners already providing first-party scripts.
