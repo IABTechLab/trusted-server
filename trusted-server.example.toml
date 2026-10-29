@@ -130,8 +130,13 @@ pull_sync_concurrency = 3
 
 # First-party HTML/CSS rewriting controls.
 # [rewrite]
-# Domains left as-is (not proxied/rewritten). Supports "*.example.com" wildcards.
+# Hosts never rewritten: assets stay direct and click-through links are not
+# wrapped. Supports "*.example.com" wildcards (matches the apex too).
 # exclude_domains = ["*.cdn.example.com"]
+# When non-empty, only asset URLs on these hosts are proxied; other assets load
+# directly. Click-through links are not affected. Set this in TOML; environment
+# overrides cannot replace arrays.
+# include_domains = ["assets.example.com", "*.img.example.com"]
 
 # Trust a fronting CDN's reader IP only when the same request also supplies
 # the matching shared secret. The front door must set both headers on requests
@@ -501,11 +506,13 @@ auction_timeout_ms = 500
 # OPTIONAL — Integrations
 # =============================================================================
 # Every integration is off by default. Most are fully commented out; uncomment a
-# block and set `enabled = true` to activate it. Four (gpt, didomi, datadome,
-# google_tag_manager) are kept as active `enabled = false` stubs so the `ts audit`
-# CLI can flip them in place — leave those sections present. Integrations whose
-# `enabled` defaults to true (prebid, permutive, lockr, ...) still stay OFF while
-# their section is commented out. Required fields are noted per block.
+# block and set `enabled = true` to activate it. GPT, Didomi, DataDome, and Google
+# Tag Manager are kept as active `enabled = false` stubs — leave those sections
+# present. The `ts audit` CLI can enable GPT, DataDome, and Google Tag Manager;
+# Didomi requires manual review of its trusted geo and loader-caching setup.
+# Integrations whose `enabled` defaults to true (prebid, permutive, lockr, ...)
+# still stay OFF while their section is commented out. Required fields are noted
+# per block.
 # =============================================================================
 
 # Browser-side Prebid.js integration. Server-side bidder routing belongs under
@@ -573,8 +580,9 @@ client_side_bidders = []          # bidders running via native Prebid.js adapter
 # timeout_ms = 1200
 # rewrite_scripts = true
 
-# Didomi CMP SDK/API first-party proxy. Kept active but disabled so `ts audit`
-# can flip `enabled` to true when Didomi is detected on the audited page.
+# Didomi CMP SDK/API first-party proxy. Detection by `ts audit` leaves this
+# disabled and adds a manual-review note. Before enabling it, review trusted geo
+# coverage and the loader-caching rollout requirements in the Didomi guide.
 [integrations.didomi]
 enabled = false
 geo_query_parameters = false

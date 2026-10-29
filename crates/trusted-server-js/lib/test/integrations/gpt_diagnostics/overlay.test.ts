@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { log } from '../../../src/core/log';
 import type { GptDiagnosticsBinding } from '../../../src/core/types';
+import { GPT_DIAGNOSTICS_CREATIVE_FAILURES } from '../../../src/core/types';
 import type { GptDiagnosticsBindingView } from '../../../src/integrations/gpt_diagnostics/binding';
 import {
   GPT_DIAGNOSTICS_HOST_ID,
@@ -714,5 +715,43 @@ describe('GptDiagnosticsOverlay', () => {
     overlay.show();
     expect(document.querySelectorAll(`#${GPT_DIAGNOSTICS_HOST_ID}`)).toHaveLength(1);
     overlay.destroy();
+  });
+  // The doc comment on GPT_DIAGNOSTICS_CREATIVE_FAILURES relies on the overlay's
+  // switch having no `default`, so a new category is a compile error there. No CI
+  // gate compiles this file with that check, so a missing case would render the
+  // text `undefined` instead. Drive every declared category through the overlay.
+  it('renders a fact for every declared creative failure category', () => {
+    for (const reason of GPT_DIAGNOSTICS_CREATIVE_FAILURES) {
+      const frames: Array<() => void> = [];
+      let now = 0;
+      const store = new GptDiagnosticsStore({
+        now: () => now,
+        schedule: (callback) => callback(),
+        defer: () => undefined,
+      });
+      const bindings = new FakeBindings();
+      const target = slot(`category-${reason}`);
+      store.recordTrustedServerOpportunity(target, `auction-${reason}`, 'renderable_candidate');
+      store.recordSlotRequested(target);
+      const attemptId = store.recordTrustedServerCreativeRequest(`auction-${reason}`);
+      expect(attemptId, `should open an attempt for \`${reason}\``).toEqual(expect.any(Number));
+      now += 1;
+      store.recordTrustedServerCreativeFailure(attemptId as number, reason);
+
+      let root: ShadowRoot | undefined;
+      const overlay = new GptDiagnosticsOverlay(store, bindings, {
+        scheduleFrame: (callback) => frames.push(callback),
+        onShadowRoot: (createdRoot) => {
+          root = createdRoot;
+        },
+      });
+      runNextFrame(frames);
+      runNextFrame(frames);
+
+      const article = slotArticle(root!, `category-${reason}`).textContent ?? '';
+      expect(article, `should record \`${reason}\` in the store`).toContain('failure');
+      expect(article, `should render a fact for \`${reason}\``).not.toContain('undefined');
+      overlay.destroy();
+    }
   });
 });

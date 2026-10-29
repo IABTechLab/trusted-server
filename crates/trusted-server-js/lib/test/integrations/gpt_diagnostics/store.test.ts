@@ -15,6 +15,7 @@ import {
   TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS,
   type GptDiagnosticsSlotLike,
 } from '../../../src/integrations/gpt_diagnostics/store';
+import { GPT_DIAGNOSTICS_CREATIVE_FAILURES } from '../../../src/core/types';
 
 function fakeSlot(elementId: string, adUnitPath = `/example/${elementId}`): GptDiagnosticsSlotLike {
   return {
@@ -1584,6 +1585,27 @@ describe('GptDiagnosticsStore', () => {
     now = 1;
     store.recordTrustedServerCreativeResponse(attemptId);
     expect(store.snapshot().slots[0].requests[0].delivery).toBe('trusted_server_response_sent');
+  });
+
+  // The runtime allowlist and the exported union are derived from one array, so
+  // a member that exists at compile time must also be recordable at runtime. A
+  // hand-written allowlist previously drifted and dropped reasons silently.
+  it('records every declared creative failure category', () => {
+    for (const reason of GPT_DIAGNOSTICS_CREATIVE_FAILURES) {
+      const store = new GptDiagnosticsStore({ now: () => 0, defer: () => undefined });
+      const slot = fakeSlot(`declared-${reason}`);
+      associateSlot(store, slot, `auction-${reason}`);
+      store.recordSlotRequested(slot);
+      const attemptId = store.recordTrustedServerCreativeRequest(`auction-${reason}`)!;
+
+      store.recordTrustedServerCreativeFailure(attemptId, reason);
+
+      expect(
+        store.snapshot().slots[0].requests[0].trustedServerCreativeFailures,
+        `should record the \`${reason}\` category`
+      ).toEqual([reason]);
+      expect(store.snapshot().attributionIssues).toEqual([]);
+    }
   });
 
   it('keeps an asynchronous response on its originating cycle after a newer refresh', () => {
